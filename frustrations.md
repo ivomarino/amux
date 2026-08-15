@@ -2766,3 +2766,31 @@ TITLE: `tmux send-keys ... Enter` does NOT submit a codex TUI prompt — amux se
 WHAT HAPPENED: Tested qwen worker (codex --oss --local-provider ollama). Used `tmux send-keys -t "amux-qwen" "task text" Enter` to send prompts. Enter appended a NEWLINE to codex's multi-line input buffer rather than submitting — the prompt accumulated silently, never reached the model. Discovered only after ~45 min of apparent "no response" — the model was idle, not processing. Same issue hit xhigh reasoning effort (qwen does not support extended thinking), which added ~30 min of wasted wait time. Eventually discovered that `POST /api/sessions/<name>/send` correctly submits (amux uses the pane's send protocol that delivers Ctrl+Enter or similar). After switching to the API send, the agent immediately started Working and produced correct output.
 COST: ~75 min (45 min for unresponsive session + 30 min debugging xhigh), wrong conclusion that the worker was broken (it was not — the submission method was wrong).
 FIX: `POST /api/sessions/<name>/send` is the correct way to send tasks to codex/ollama workers. `tmux send-keys ... Enter` is wrong for codex TUI — it inserts a newline, not a submit. No amux docs or session-card says this; it is an easy mistake for any session testing a codex worker. Also: codex's global config `model_reasoning_effort = "xhigh"` is incompatible with local qwen models (qwen does not support extended thinking API); workers using `--oss --local-provider ollama` need `-c model_reasoning_effort=low` to be responsive.
+
+---
+
+## Three copies of "report state to amux" exist and global settings.json pointed at the poorest one — model + tokens silently regressed to zero
+AREA: hooks
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-15
+SESSION: amux-frustrations
+CARD: AMUX-2936
+SYMPTOM: `~/.claude/settings.json` Stop/UserPromptSubmit/PostToolUse all ran an inline one-liner posting exactly `{"state":"idle","source":"stop-hook"}` — no model, no tokens, no conversation id — while `~/.amux/hook-report.sh` sat on disk extracting all three. The server-side consequence was already recorded in code: "292 report POSTs, 0 carrying tokens".
+  Fixing the blind-cotenant window I went to add one field to the state-report hook and found THREE implementations on this machine: an inline one-liner baked into ~/.claude/settings.json (posts {state, source} only), ~/.amux/hooks/amux-report.sh (a delegate), and ~/.amux/hook-report.sh (the real one — parses the payload, extracts model and real token count). settings.json pointed at the INLINE one, so every session started since that regression reported no model and no tokens, and auto-compact (AMUX-2829) lost its only input for the second time. amux-report.sh's own header documents this exact fork happening in 2026-08-11 and says "two implementations of one thing is what produced this bug; do not re-fork it" — and I still nearly shipped a FOURTH copy, because that warning lives in an unversioned runtime file nobody reads before editing. The reason it keeps recurring is structural: hook-report.sh was untracked, so there was no reviewable, diffable, rollback-able canonical copy, and no check could compare what is running against what was intended.
+COST: ~25 min to discover the existing script and unwind my duplicate, plus an unknown number of days of model/tokens reporting zero fleet-wide, which silently disables auto-compact. The near-miss is the real cost: a fourth copy would have regressed model+tokens AGAIN while looking like a fix.
+FIX: SHIPPED (ce87481). hook-report.sh now lives in the repo at scripts/hooks/hook-report.sh and is installed from there with a recorded sha256, mirroring the git-shared-guard treatment at install.sh:134 that exists for exactly this reason. settings.json repointed at it (restores model+tokens AND adds the conversation id). Remaining gap, not closed: there is no invariant comparing the RUNNING ~/.amux/hook-report.sh against the committed copy the way `hooks.shared_guard_matches_committed` does for the git guard — so drift is now detectable by hand but still not self-announcing. Worth adding; it is a near-copy of an invariant that already exists.
+
+---
+
+## A shared CARGO_TARGET_DIR is mandated, and concurrent builds in it evict each other's artifacts
+AREA: build
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux-frustrations
+CARD: AMUX-2936
+SYMPTOM: `error: extern location for serde_core does not exist: ~/.amux/rust-build-target/debug/deps/libserde_core-0d2476c6ed9be3cc.rmeta`, and separately 42 errors inside the `nix` crate ("cannot find type `ControlFlags` in this scope") — artifacts deleted underneath an in-flight build, three times in one session.
+  CLAUDE.md requires ONE shared build dir (~/.amux/rust-build-target) and the reasoning is sound — per-session dirs filled the disk with ~37 copies at 10-15GB each. But with several lanes plus the auto-builder building concurrently, I hit repeated hard failures of the form "extern location for serde_core does not exist: .../libserde_core-<hash>.rmeta" and 42 errors inside the `nix` crate, i.e. artifacts deleted underneath an in-flight build. Not a lock contention wait, which is what the CLAUDE.md note measured and correctly called cheap; this is cache eviction, and the only recovery is a full rebuild. Hit it three times in one session, roughly 4 minutes of rebuild each.
+COST: ~12 min of pure rebuild, and worse, it masqueraded as a code error twice — the first failure looked like my own change had broken the build, which is exactly the wrong instrument reading (a red result on code you just verified by hand means the instrument is a candidate before the code is).
+FIX: Not fixed; needs a decision, not a workaround. Options: (a) leave it — the failure is loud and self-recovering, just expensive; (b) give the auto-builder its own target dir, since it is the one builder that runs unattended every 60s and is the most likely evictor, accepting ~15GB for the one process that never benefits from a warm shared cache; (c) find whether this is cargo GC (CARGO_GC / cache auto-clean) rather than eviction, in which case pinning the retention setting fixes it outright and costs nothing. (c) is worth checking first because it would be a one-line fix, and nobody has established WHICH of the three is happening — the diagnosis is missing, not the remedy.
