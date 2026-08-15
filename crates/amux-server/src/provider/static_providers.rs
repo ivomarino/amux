@@ -133,7 +133,7 @@ pub struct OllamaAdapter {
 impl Default for OllamaAdapter {
     fn default() -> Self {
         Self {
-            default_model: "llama3".into(),
+            default_model: "qwen3.8:27b".into(),
         }
     }
 }
@@ -241,14 +241,14 @@ mod tests {
 
     #[test]
     fn ollama_interactive_is_run_model() {
-        let a = OllamaAdapter::with_model("qwen3:8b");
+        let a = OllamaAdapter::with_model("qwen3.8:27b");
         assert_eq!(
             a.build_command(PromptMode::Interactive),
-            vec!["ollama", "run", "qwen3:8b"]
+            vec!["ollama", "run", "qwen3.8:27b"]
         );
         assert_eq!(
             a.build_command(PromptMode::HeadlessStructured),
-            vec!["ollama", "run", "qwen3:8b"]
+            vec!["ollama", "run", "qwen3.8:27b"]
         );
     }
 
@@ -264,10 +264,10 @@ mod tests {
     fn parses_ollama_list_output() {
         let fixture = "NAME               ID              SIZE      MODIFIED\n\
                        llama3:latest      365c0bd3c000    4.7 GB    2 weeks ago\n\
-                       qwen3:8b           500a1f067a9f    5.2 GB    3 days ago\n";
+                       qwen3.8:27b           500a1f067a9f    5.2 GB    3 days ago\n";
         assert_eq!(
             parse_ollama_list(fixture),
-            vec!["llama3:latest", "qwen3:8b"]
+            vec!["llama3:latest", "qwen3.8:27b"]
         );
         assert!(parse_ollama_list("").is_empty());
         assert!(parse_ollama_list("NAME  ID  SIZE  MODIFIED\n").is_empty());
