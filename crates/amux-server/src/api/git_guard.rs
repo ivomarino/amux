@@ -415,6 +415,22 @@ fn is_pure_read_command(cmd: &str) -> bool {
         "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
         "pwd", "echo", "printf",
     ];
+    // `git <read-subcommand>` is how a careful VERIFIER reads a file — `git show`,
+    // `git log --stat`, `git diff`, `git grep`, `git blame` to chase a specific
+    // row (AMUX-3128 follow-up, gtm-ticker). The verb is `git`, which is NOT in
+    // READ_ONLY_VERBS, so these minted an inferred edit record and flagged the
+    // reader as co-author of the file they were only inspecting — blocking the
+    // real committer, and worse, punishing careful verification: the harder a peer
+    // checks your output, the more it blocks you, which trains toward GN=1 where
+    // the guard stops protecting anything. WRITE subcommands (add/commit/checkout/
+    // reset/restore/rm/mv/apply/stash/merge/rebase/pull/am/…) are ABSENT on
+    // purpose, so a real working-tree mutation still falls through to the mtime
+    // gate and keeps its attribution.
+    const GIT_READ_SUBCMDS: &[&str] = &[
+        "show", "log", "diff", "status", "blame", "grep", "cat-file", "shortlog",
+        "describe", "rev-parse", "rev-list", "ls-files", "ls-tree", "reflog",
+        "whatchanged", "annotate", "name-rev", "show-ref", "for-each-ref",
+    ];
     let mut saw = false;
     for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
         let seg = seg.trim();
@@ -429,6 +445,29 @@ fn is_pure_read_command(cmd: &str) -> bool {
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or(tok);
+        if verb == "git" {
+            // Find the subcommand, skipping global flags and the argument of the
+            // arg-taking ones (`-C <dir>`, `-c <cfg>`), then require it be read-only.
+            // A bare `git` or a write/unknown subcommand falls through (return
+            // false) exactly as before — conservative by design.
+            let mut rest = seg.split_whitespace().skip(1);
+            let mut sub = None;
+            while let Some(t) = rest.next() {
+                if t == "-C" || t == "-c" {
+                    rest.next(); // consume its argument
+                    continue;
+                }
+                if t.starts_with('-') {
+                    continue; // other global flag, e.g. --no-pager
+                }
+                sub = Some(t);
+                break;
+            }
+            match sub {
+                Some(s) if GIT_READ_SUBCMDS.contains(&s) => continue,
+                _ => return false,
+            }
+        }
         if !READ_ONLY_VERBS.contains(&verb) {
             return false;
         }
@@ -1498,6 +1537,43 @@ mod tests {
             "sudo head secret.md",
         ] {
             assert!(!is_pure_read_command(cmd), "should NOT be pure read: {cmd}");
+        }
+    }
+
+    /// AMUX-3128 RECURRED (gtm-ticker): a careful VERIFIER reads a digest with
+    /// `git show` / `git log --stat` / `git diff` / `git grep` / `git blame`, whose
+    /// verb is `git` (absent from READ_ONLY_VERBS), so each minted an inferred edit
+    /// and flagged the reader as co-author — blocking the committer and PUNISHING
+    /// verification (the harder they check, the more they block; trains to GN=1).
+    /// The exact commands the reporting verifier uses lead this list; git WRITES
+    /// must still fall through so a real mutation keeps its attribution.
+    #[test]
+    fn git_read_subcommands_attribute_nothing_but_writes_fall_through() {
+        for cmd in [
+            "git show HEAD:digests/2026-08-15.md",
+            "git log --stat -- digests/2026-08-15.md",
+            "git diff HEAD~1 -- digests/2026-08-15.md",
+            "git grep -n breach digests/",
+            "git blame digests/2026-08-15.md",
+            "git -C /repo show abc123",
+            "git --no-pager log --oneline -5",
+            "git cat-file -p HEAD:a.md",
+            "git show X | grep -n row",
+        ] {
+            assert!(is_pure_read_command(cmd), "git read should attribute nothing: {cmd}");
+        }
+        for cmd in [
+            "git add digests/2026-08-15.md",
+            "git commit -m x",
+            "git checkout -- digests/2026-08-15.md",
+            "git reset --hard HEAD",
+            "git restore digests/2026-08-15.md",
+            "git apply patch.diff",
+            "git stash pop",
+            "git",
+            "git show X && git add Y",
+        ] {
+            assert!(!is_pure_read_command(cmd), "git write/unknown must fall through: {cmd}");
         }
     }
 
