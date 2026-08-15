@@ -5047,20 +5047,29 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                 if m.is_empty() { default_model_for_provider("ollama") } else { m }
             };
             // An ollama worker's model belongs in CC_MODEL (read just above); a
-            // `--model` in CC_FLAGS is a mis-wire — this arm launches with
-            // CC_MODEL and never appends CC_FLAGS, so the stray flag is silently
+            // `--model` in CC_FLAGS is inert here — this arm launches with
+            // CC_MODEL and never appends CC_FLAGS, so that flag is silently
             // ignored and the worker runs a DIFFERENT model than a CC_FLAGS-based
-            // view (its own row) reports. That is exactly the create-path bug
-            // AMUX-3182 fixed; WARN here so any residual mis-wired worker (made
-            // before the fix, or by a future path that reintroduces it) SELF-
-            // ANNOUNCES in the server log and a sweep of /api/logs finds it,
-            // rather than staying invisible (the two-fixes rule).
+            // view (its own row) reports.
+            //
+            // This WARN is LOAD-BEARING, not merely defensive (amux-frustrations,
+            // AMUX-3182 review). The create path can STILL produce this input: a
+            // caller who passes explicit `flags` containing `--model X` gets
+            // CC_FLAGS="--model X" AND CC_MODEL=<model> written together
+            // (worker_model_env honours explicit flags verbatim per AMUX-3114),
+            // and env_config::render_worker_env has no explicit-flags concept at
+            // all, so the two env routes DIVERGE for exactly this shape. This is
+            // the only thing standing between that input and a silently-wrong
+            // model, so do NOT read "AMUX-3182 fixed the create path" as licence
+            // to delete it. It also self-announces any residual pre-fix worker,
+            // so a sweep of /api/logs finds it rather than a human noticing the
+            // wrong model first (the two-fixes rule).
             if flags.contains("--model") {
                 tracing::warn!(
                     session = %name,
                     cc_flags = %flags,
                     cc_model = %model,
-                    "ollama worker carries a stray --model in CC_FLAGS (ignored; model comes from CC_MODEL) — mis-wired create path, see AMUX-3182"
+                    "ollama worker carries a --model in CC_FLAGS (inert; model comes from CC_MODEL) — explicit-flags or pre-fix mis-wire, see AMUX-3182"
                 );
             }
             let ollama_yolo = PROVIDER_YOLO_FLAGS.iter().any(|f| flags.contains(f));
