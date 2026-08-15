@@ -2798,3 +2798,29 @@ FIX: Fixed at root in send_text_inner's empty-send path: gate on the SELECTOR ST
   (a hit there means a detect_claude_status gap). Rate-limit menus are excluded so their
   dedicated handler keeps stamping credit_limited. Unit test locks the discriminator.
   crates/amux-server/src/api/session_verbs.rs (uncommitted).
+
+## litestream DR replication died fleet-wide and nothing in amux could express it; it was found by grepping container logs on the box
+AREA: cloud
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux-cloud (hit) / amux (diagnosed)
+CARD: AC-349
+SYMPTOM: All 5 real-org litestream sidecars failing with "attempt to write a readonly
+  database (8)" on _litestream_seq, consecutive_errors 300+, after a disk-full container
+  recreate pulled a non-root litestream:latest. No /api endpoint, invariant, or job report
+  expresses DR-replication health: /api/logs/analyze, /api/debug/*, and
+  /api/health/invariants all say nothing about a sidecar that has stopped replicating. The
+  signal lived only in the litestream container's own stderr and its Prometheus metrics,
+  neither of which amux reads.
+COST: The failure was invisible until a human noticed and hand-diagnosed it: reproducing on
+  the box, rm-ing state dirs, and reading container logs per org. A DR-coverage gap ran
+  overnight (08-14 into 08-15) with nobody able to see it from amux; had a customer db
+  actually corrupted in that window, the first signal would have been data loss rather than a
+  probe.
+FIX: Root cause fixed at the template (AMUX-3127, b8b358f: pin litestream 0.5.16 + user:0,
+  plus a deploy guard that trips on reintroduction). The OBSERVABILITY half is AC-349 (routed
+  to amux-cloud): the gateway should poll each sidecar's replica lag / consecutive_errors and
+  expose it via /api/observability or a health invariant, so the next DR failure
+  self-announces. Open until that runtime signal exists; the CI guard only catches the repo
+  reintroduction, not a live replication stall.
