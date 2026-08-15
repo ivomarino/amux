@@ -4785,6 +4785,81 @@ fn trust_seed_merge(mut doc: Value, dir: &str) -> Option<Value> {
     Some(doc)
 }
 
+/// Codex analog of [`seed_dir_trust`] (AC-346 / AMUX-3159 seed direction). A
+/// `codex` process — which is how BOTH the `codex` and `ollama` providers launch
+/// (ollama runs `codex --oss --local-provider ollama`) — stops at its own
+/// "Do you trust the contents of this directory?" dialog the first time it runs
+/// in a directory. codex persists that decision in `~/.codex/config.toml` as
+///
+/// ```toml
+/// [projects."/abs/dir"]
+/// trust_level = "trusted"
+/// ```
+///
+/// (surface confirmed 2026-08-15: every dir codex has trusted, including amux's
+/// own e2e dirs, is recorded in exactly this shape). So SEED it up front and the
+/// worker starts straight at the composer — make the state correct rather than
+/// detect the picker and press Enter, which is the D1 terminal-scraping pattern
+/// the ethos is trying to leave (amux, 2026-08-15).
+///
+/// APPEND-ONLY and strictly FAIL-OPEN. This runs on the worker-spawn path, so a
+/// missing / unreadable / unparseable config must NEVER block a launch. It only
+/// APPENDS a `[projects."<dir>"]` table when the dir has NO entry yet, so codex's
+/// own `model` / `personality` / `[notice]` settings and every other project are
+/// preserved byte-for-byte — nothing existing is rewritten. A dir codex (or the
+/// user) has ALREADY decided on, trusted OR untrusted, is left untouched: we do
+/// not override an existing choice, and appending a duplicate table header would
+/// be a TOML error.
+fn seed_codex_dir_trust(work_dir: &str) {
+    if work_dir.is_empty() {
+        return;
+    }
+    let Some(home) = std::env::var_os("HOME") else { return };
+    let path = std::path::Path::new(&home).join(".codex/config.toml");
+    let text = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(_) => return, // unreadable: fail-open, never block a launch
+    };
+    if codex_dir_already_known(&text, work_dir) {
+        return;
+    }
+    // Append the trust table without touching a single existing byte.
+    let mut body = text;
+    if !body.is_empty() {
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push('\n');
+    }
+    body.push_str(&format!("[projects.\"{work_dir}\"]\ntrust_level = \"trusted\"\n"));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    // Atomic write: temp + rename, so a concurrent codex reader never sees a torn
+    // file (same discipline as seed_dir_trust).
+    let tmp = path.with_extension("toml.amux-trust-tmp");
+    if std::fs::write(&tmp, body.as_bytes()).is_ok() {
+        let _ = std::fs::rename(&tmp, &path);
+    }
+}
+
+/// Whether codex's config already records ANY trust decision for `dir`. PARSED,
+/// not a text scan, so header spacing/quoting cannot fool it. Returns `true` when
+/// the dir has an entry — seeding is then a no-op that respects codex's or the
+/// user's existing choice — and, crucially, `true` for an UNPARSEABLE config too:
+/// we refuse to append into a file we cannot understand rather than risk a
+/// duplicate table or corruption. Pure, so it is tested without a real `~/.codex`.
+fn codex_dir_already_known(config_text: &str, dir: &str) -> bool {
+    let Ok(doc) = config_text.parse::<toml::Value>() else {
+        return true; // fail-safe: never append into a file we can't parse
+    };
+    doc.get("projects")
+        .and_then(|p| p.as_table())
+        .map(|projects| projects.contains_key(dir))
+        .unwrap_or(false)
+}
+
 async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
@@ -4834,6 +4909,14 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     // work_dir does not stop at the first-run "trust this folder?" dialog. Runs
     // BEFORE the pane starts claude; strictly fail-open (see seed_dir_trust).
     seed_dir_trust(&work_dir);
+    // AMUX-3159 seed direction (codex analog of AC-346): a codex/ollama worker
+    // launches `codex`, which has its OWN "trust this directory?" dialog. Seed its
+    // trust config up front so the worker starts at the composer instead of parking
+    // on the picker — make the state correct, don't detect-and-dismiss (D1). Same
+    // fail-open discipline; only touches ~/.codex for codex-launching providers.
+    if matches!(provider_of(&cfg).as_str(), "codex" | "ollama") {
+        seed_codex_dir_trust(&work_dir);
+    }
     let mut flags = cfg.get_or("CC_FLAGS", "").to_string();
     #[cfg(unix)]
     {
@@ -11875,6 +11958,28 @@ mod tests {
 
         // Unmergeable shape (root is not an object) -> None, leave it alone.
         assert!(trust_seed_merge(json!("not an object"), "/work/dir").is_none());
+    }
+
+    /// AMUX-3159 seed direction (codex analog of AC-346): the codex trust seed
+    /// only appends when a dir has NO entry, respects an existing decision
+    /// (trusted OR untrusted), and REFUSES to act on an unparseable config —
+    /// fail-safe, so it never appends a duplicate table or corrupts codex's own
+    /// settings. `codex_dir_already_known` is the pure gate; the append is I/O.
+    #[test]
+    fn codex_dir_known_gates_the_seed() {
+        let cfg = "model = \"gpt-5.5\"\n\n[projects.\"/a\"]\ntrust_level = \"trusted\"\n";
+        assert!(codex_dir_already_known(cfg, "/a"), "an existing project is known -> no re-seed");
+        assert!(!codex_dir_already_known(cfg, "/b"), "a fresh dir has no entry -> seedable");
+        // No file (empty) parses to an empty doc: a fresh dir is seedable, and the
+        // caller creates the file with the trust table.
+        assert!(!codex_dir_already_known("", "/b"), "empty config -> fresh dir seedable");
+        // An existing UNTRUSTED decision is respected, not overridden (appending a
+        // duplicate [projects."/c"] would be a TOML error anyway).
+        let untrusted = "[projects.\"/c\"]\ntrust_level = \"untrusted\"\n";
+        assert!(codex_dir_already_known(untrusted, "/c"), "a deliberate untrust is left alone");
+        // Unparseable config -> treated as known -> we do NOT append into a file we
+        // cannot understand (fail-safe).
+        assert!(codex_dir_already_known("[unclosed table", "/b"), "unparseable -> refuse to append");
     }
 
     /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
