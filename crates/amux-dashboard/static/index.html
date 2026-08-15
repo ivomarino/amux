@@ -1993,7 +1993,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
     <button class="peek-tab" id="peek-tab-logs" onclick="setPeekTab('logs')" title="HTTP request log for this worker"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span><span class="peek-tab-count" id="peek-tab-logs-count"></span></button>
     <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
-    <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
+    <!-- The menu itself is NOT here on purpose — it is a direct child of the
+         document body, at the end of this file. `.peek-tabs` is a ~44px
+         horizontal scroller (overflow-x:auto; overflow-y:hidden;
+         -webkit-overflow-scrolling:touch) and a ~380px menu inside it is
+         clipped to nothing on mobile Safari. -->
   </div>
   <!-- Working directory bar -->
   <div class="peek-dir-bar">
@@ -2858,5 +2862,18 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="dt-log-area" id="dt-info-area"></div>
   </div>
 </div>
+<!-- Worker tab picker menu. Deliberately a direct child of the document body,
+     NOT of `.peek-tabs` where its button lives.
+     `.peek-tabs` is a horizontal scroller: overflow-x:auto, overflow-y:hidden,
+     -webkit-overflow-scrolling:touch, and about 44px tall. This menu renders
+     ~380px tall, so inside that box it is clipped to nothing on engines where a
+     position:fixed child does not escape a touch-scrolling ancestor — which is
+     what "the button next to Logs does nothing" was.
+     It is position:fixed and JS assigns top/left from the button's
+     getBoundingClientRect, so its placement never depended on where it sits in
+     the DOM — only its CLIPPING did. The main dashboard's equivalent
+     (#tab-customizer-menu) has always worked because it lives in
+     `.tab-customize-wrap`: position:relative, and not a scroller. -->
+<div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
 </body>
 </html>

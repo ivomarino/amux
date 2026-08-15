@@ -2922,7 +2922,10 @@ function render() {
   function _renderSessionCard(s) {
     const isExp = expanded.has(s.name);
     const flags = s.flags || '';
-    const isYolo = flags.includes('--dangerously-skip-permissions') || flags.includes('--dangerously-bypass-approvals-and-sandbox') || flags.includes('--yolo') || !!s.auto_continue;
+    // Server verdict, not a re-derivation: see session_verbs::yolo_enabled.
+    // The old local form ORed in `s.auto_continue`, which is default-ON, so it
+    // badged lanes YOLO that would still stop and ask for approval.
+    const isYolo = !!s.yolo;
     const provider = sessionProvider(s);
     const model = sessionConfiguredModel(s);
     const effort = provider === 'claude' ? flagValue(flags, '--effort') : '';
@@ -4926,13 +4929,17 @@ async function toggleYolo(session) {
       const claudeFlag = '--dangerously-skip-permissions';
       const codexFlag = '--dangerously-bypass-approvals-and-sandbox';
       const geminiFlag = '--yolo';
-      const wasYolo = (s.flags || '').includes(claudeFlag) || (s.flags || '').includes(codexFlag) || (s.flags || '').includes(geminiFlag) || (s.flags || '').includes('--approval-mode=yolo') || (s.flags || '').includes('--approval-mode yolo') || !!s.auto_continue;
+      // Same server verdict the badge uses — the toggle must not disagree with
+      // what the card shows, or one tap appears to do nothing.
+      const wasYolo = !!s.yolo;
       if (wasYolo) {
         s.flags = stripProviderYoloFlags(s.flags || '');
         s.auto_continue = false;
+        s.yolo = false;   // the field the badge reads — the server will confirm
       } else {
         s.flags = ((s.flags || '') + ' ' + providerYoloFlag(s.provider)).trim();
         s.auto_continue = true;
+        s.yolo = true;
       }
       lastSessionsJSON = '';
       render();
@@ -26408,19 +26415,42 @@ async function pullFromRemote(btn) {
   const el = document.getElementById('pull-status');
   btn.disabled = true; btn.textContent = '⏳ Pulling...';
   el.textContent = '';
+  // `r` is declared out here so the catch can tell a transport failure (no response
+  // at all) from a response we could not parse. The old code could not: it reported
+  // BOTH as 'Network error', so a 405 with an empty body — what a build without
+  // /api/pull actually returns — sent the reader to check their wifi.
+  let r = null;
   try {
-    const r = await fetch(API + '/api/pull', { method: 'POST' });
-    const d = await r.json();
-    el.textContent = d.output || (d.ok ? 'Up to date' : 'Failed');
-    el.style.color = d.ok ? 'var(--green)' : 'var(--red)';
-    if (d.ok && !d.output.includes('Already up to date')) {
-      setTimeout(() => forceUpdate(), 1500);
+    r = await fetch(API + '/api/pull', { method: 'POST' });
+    // Read as text first. r.json() throws on an empty body, and that throw is
+    // indistinguishable from a network fault once it reaches the catch.
+    const body = await r.text();
+    let d = null;
+    try { d = JSON.parse(body); } catch (_) { /* handled below, with the status */ }
+
+    if (d) {
+      el.textContent = d.output || (d.ok ? 'Up to date' : 'Failed');
+      el.style.color = d.ok ? 'var(--green)' : 'var(--red)';
+      if (d.ok && !(d.output || '').includes('Already up to date')) {
+        setTimeout(() => forceUpdate(), 1500);
+      }
+      return;
     }
-  } catch(e) {
-    el.textContent = 'Network error';
+
+    // Responded, but not with JSON. Say what actually came back.
+    const snippet = body.trim().slice(0, 200);
+    el.textContent = 'HTTP ' + r.status + (r.statusText ? ' ' + r.statusText : '') +
+      (snippet ? ': ' + snippet
+               : ' (empty body) — this build may not serve /api/pull');
     el.style.color = 'var(--red)';
+  } catch (e) {
+    // Only a genuine transport failure can reach here now.
+    el.textContent = (r ? 'Failed reading response: ' : 'Network error: ') + e.message;
+    el.style.color = 'var(--red)';
+  } finally {
+    // finally, because the success path now returns early.
+    btn.disabled = false; btn.textContent = '⬇ Pull from remote';
   }
-  btn.disabled = false; btn.textContent = '⬇ Pull from remote';
 }
 
 // ── DevTools Panel ──────────────────────────────────────────────

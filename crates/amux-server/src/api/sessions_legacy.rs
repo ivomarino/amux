@@ -1623,6 +1623,17 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // flag) — a card without flags renders the wrong YOLO badge
             // (Ethan: "the lightning button isn't correct").
             "flags": flags,
+            // The YOLO badge's source of truth, computed by the SAME function the
+            // toggle acts on (`session_verbs::yolo_enabled`). The SPA previously
+            // derived this itself as `flags.includes(...) || !!s.auto_continue`,
+            // but `auto_continue` below is `standing_orders_on`, which is
+            // DEFAULT-ON — so lanes with no skip-permissions flag rendered a YOLO
+            // badge and users trusted a worker not to stop for approval when it
+            // would. Ship the verdict, not the ingredients.
+            "yolo": crate::api::session_verbs::yolo_enabled(
+                &flags,
+                env.get("CC_AUTO_CONTINUE").map(|v| v.as_str()),
+            ),
             "creator": env.get("CC_CREATOR").cloned().unwrap_or_default(),
             "backend": backend,
             // Same predicate as board_drive's nudge gate — the view must not
