@@ -5065,3 +5065,117 @@
   .sysjob-toggle { min-height: 44px; }
   .sysjob-detail { min-height: 44px; display: inline-flex; align-items: center; }
 }
+
+/* ── Reusable themed calendar picker (AMUX-3070) ──────────────────────────────
+   Replaces the visual rendering of every <input.amux-dp>. The native input is
+   kept in the DOM as the value store but display:none'd; a themed trigger button
+   drives a single shared popover. Themed only via existing CSS vars so light and
+   dark both work. */
+.amux-dp-native { display: none !important; }
+
+.amux-dp-trigger {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 6px 10px; min-height: 34px;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-family: inherit; font-size: 0.85rem; line-height: 1.2;
+  text-align: left; cursor: pointer; outline: none;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.amux-dp-trigger::before {
+  content: "📅"; font-size: 0.85em; opacity: 0.8; flex: 0 0 auto;
+}
+.amux-dp-trigger:hover { border-color: var(--accent); }
+.amux-dp-trigger:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(88,166,255,0.35); }
+.amux-dp-trigger.empty { color: var(--dim); }
+
+.amux-dp-backdrop {
+  display: none; position: fixed; inset: 0; z-index: 100000;
+  background: rgba(0,0,0,0.45);
+}
+.amux-dp-pop {
+  display: none; position: fixed; z-index: 100001;
+  width: 288px; max-width: calc(100vw - 16px);
+  background: var(--card); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.45);
+  padding: 10px; color: var(--text); font-family: inherit;
+  user-select: none; -webkit-user-select: none;
+}
+.amux-dp-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  margin-bottom: 8px;
+}
+.amux-dp-title { font-size: 0.9rem; font-weight: 600; text-align: center; flex: 1; }
+.amux-dp-nav {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); cursor: pointer; font-size: 1rem; line-height: 1;
+  width: 32px; height: 32px; flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.amux-dp-nav:hover { border-color: var(--accent); color: var(--accent); }
+.amux-dp-week {
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px;
+  margin-bottom: 4px;
+}
+.amux-dp-week span {
+  text-align: center; font-size: 0.68rem; color: var(--dim);
+  padding: 2px 0; text-transform: uppercase; letter-spacing: 0.02em;
+}
+.amux-dp-grid {
+  display: grid; grid-template-columns: repeat(7, 1fr); gap: 2px;
+}
+.amux-dp-day {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 34px; padding: 0; border: 1px solid transparent; border-radius: 6px;
+  background: none; color: var(--text); font-family: inherit; font-size: 0.82rem;
+  cursor: pointer; outline: none;
+}
+.amux-dp-day:hover { background: var(--bg); border-color: var(--border); }
+.amux-dp-day.adjacent { color: var(--dim); opacity: 0.55; }
+.amux-dp-day.today { border-color: var(--accent); font-weight: 600; }
+.amux-dp-day.selected { background: var(--accent); color: #fff; border-color: var(--accent); font-weight: 600; }
+.amux-dp-day.selected:hover { background: var(--accent); }
+.amux-dp-day:focus-visible { box-shadow: 0 0 0 2px rgba(88,166,255,0.55); }
+.amux-dp-time {
+  display: flex; align-items: center; gap: 6px; margin-top: 10px;
+  padding-top: 10px; border-top: 1px solid var(--border);
+}
+.amux-dp-time label { font-size: 0.78rem; color: var(--dim); margin-right: 2px; }
+.amux-dp-time input {
+  width: 48px; padding: 5px 6px; text-align: center;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-family: inherit; font-size: 0.85rem; outline: none;
+}
+.amux-dp-time input:focus { border-color: var(--accent); }
+.amux-dp-colon { color: var(--dim); }
+.amux-dp-done {
+  margin-left: auto; padding: 5px 12px;
+  background: var(--accent); border: 1px solid var(--accent); border-radius: 6px;
+  color: #fff; font-family: inherit; font-size: 0.82rem; cursor: pointer;
+}
+.amux-dp-foot {
+  display: flex; align-items: center; justify-content: space-between; gap: 6px;
+  margin-top: 8px;
+}
+.amux-dp-foot button {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--dim); font-family: inherit; font-size: 0.78rem;
+  padding: 5px 12px; cursor: pointer; min-height: 32px;
+}
+.amux-dp-foot button:hover { border-color: var(--accent); color: var(--text); }
+
+/* Mobile: bottom sheet pinned to the physical bottom edge, full width, with the
+   dimmed backdrop. Touch targets grow to >=44px. Must fit a 375px screen. */
+@media (max-width: 600px) {
+  .amux-dp-pop.sheet {
+    position: fixed; left: 0; right: 0; bottom: 0; top: auto;
+    width: 100%; max-width: none;
+    border-radius: 14px 14px 0 0; border-bottom: none;
+    padding: 12px 12px calc(12px + env(safe-area-inset-bottom));
+  }
+  .amux-dp-pop.sheet .amux-dp-nav { width: 44px; height: 44px; }
+  .amux-dp-pop.sheet .amux-dp-day { min-height: 44px; font-size: 0.9rem; }
+  .amux-dp-pop.sheet .amux-dp-time input { min-height: 44px; width: 56px; }
+  .amux-dp-pop.sheet .amux-dp-done,
+  .amux-dp-pop.sheet .amux-dp-foot button { min-height: 44px; }
+  .amux-dp-trigger { min-height: 40px; }
+}

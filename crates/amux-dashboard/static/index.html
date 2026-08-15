@@ -1159,7 +1159,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <select id="msgs-session-filter" onchange="_msgsCounts=null;_messagesLoad(true,this.value)" style="max-width:190px;font-size:0.82rem;padding:6px 9px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);">
       <option value="">All workers</option>
     </select>
-    <input type="date" id="msgs-date-jump" onchange="_msgsJumpToDate(this.value)" title="Jump to a date" style="font-size:0.82rem;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);color-scheme:dark;">
+    <input type="date" id="msgs-date-jump" class="amux-dp" onchange="_msgsJumpToDate(this.value)" title="Jump to a date" style="font-size:0.82rem;padding:5px 8px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);color-scheme:dark;">
     <span id="msgs-count" style="font-size:0.75rem;color:var(--dim);white-space:nowrap;"></span>
   </div>
   <div id="msgs-kind-filter" style="display:flex;gap:6px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;margin-bottom:10px;flex-shrink:0;align-items:center;">
@@ -1622,7 +1622,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <!-- ONCE -->
       <div id="sched-panel-once" class="sched-panel" style="display:none;">
         <label class="field-label">Run at</label>
-        <input id="sched-run-at" type="datetime-local" class="board-detail-session-select" style="width:100%;margin-bottom:0;">
+        <input id="sched-run-at" type="datetime-local" class="board-detail-session-select amux-dp" style="width:100%;margin-bottom:0;">
         <div class="sched-mode-help"><b>Once</b> — runs a single time, then disables itself.</div>
       </div>
       <!-- The hidden sched-watch / sched-watch-timeout carriers were here.
@@ -1676,7 +1676,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="field-group">
       <label class="field-label">Due date <span class="field-optional">(optional)</span></label>
       <div style="display:flex;gap:0.5rem;">
-        <input id="be-due" type="date" style="flex:1;">
+        <input id="be-due" type="date" class="amux-dp" style="flex:1;">
         <input id="be-due-time" type="time" style="width:110px;" title="Time (optional — leave blank for all-day)">
       </div>
     </div>
@@ -1712,7 +1712,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     </div>
     <div class="board-detail-row">
       <span style="font-size:0.78rem;color:var(--dim);">Due:</span>
-      <input type="date" id="bd-due" class="board-detail-session-select" style="flex:1;cursor:pointer;">
+      <input type="date" id="bd-due" class="board-detail-session-select amux-dp" style="flex:1;cursor:pointer;">
       <input type="time" id="bd-due-time" class="board-detail-session-select" style="width:110px;cursor:pointer;" title="Time (optional — leave blank for all-day)">
     </div>
     <div class="board-detail-row" style="align-items:flex-start;">
@@ -2208,7 +2208,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="peek-tasks-add" style="gap:8px;padding:8px 10px;">
       <input type="search" id="peek-messages-search" placeholder="Search messages sent to this worker&hellip;" oninput="_peekMessagesRender()"
         style="flex:1;min-width:0;background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:5px 10px;font-size:0.82rem;color:var(--text);outline:none;">
-      <input type="date" id="peek-msgs-date-jump" onchange="_peekMsgsJumpToDate(this.value)" title="Jump to a date" style="font-size:0.8rem;padding:5px 7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);color-scheme:dark;">
+      <input type="date" id="peek-msgs-date-jump" class="amux-dp" onchange="_peekMsgsJumpToDate(this.value)" title="Jump to a date" style="font-size:0.8rem;padding:5px 7px;background:var(--bg);border:1px solid var(--border);border-radius:6px;color:var(--text);color-scheme:dark;">
       <span id="peek-messages-count" style="font-size:0.72rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
     </div>
     <div id="peek-messages-filter" style="display:flex;gap:5px;padding:0 10px 8px;flex-wrap:nowrap;overflow-x:auto;-webkit-overflow-scrolling:touch;scrollbar-width:none;"></div>

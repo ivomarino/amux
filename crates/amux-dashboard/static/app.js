@@ -7557,7 +7557,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.633';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.634';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -20319,6 +20319,11 @@ function _bfCloseMenu() {
 }
 function _bfOutside(e) {
   const m = document.getElementById('bf-menu');
+  // The shared calendar picker (AMUX-3070) lives on <body>, outside this menu.
+  // Its date inputs (#bf-<key>-a/b) are the menu's value store, so a click in the
+  // popover must NOT count as "outside": that would close the menu and yank the
+  // inputs out from under the pick.
+  if (_dpEl && _dpEl.contains(e.target)) return;
   if (m && !m.contains(e.target)) _bfCloseMenu();
 }
 function _bfOpenMenu(ev, target) {
@@ -20341,8 +20346,8 @@ function _bfOpenMenu(ev, target) {
     opt('today', key + ':<1d'), opt('last 7 days', key + ':<7d'), opt('last 30 days', key + ':<30d'),
     opt('older than 7 days', key + ':>7d'),
     '<div class="bf-opt" style="display:flex;gap:4px;align-items:center;" onclick="event.stopPropagation()">'
-      + '<input type="date" id="bf-' + key + '-a" style="font-size:0.72rem;max-width:120px;">\u2013'
-      + '<input type="date" id="bf-' + key + '-b" style="font-size:0.72rem;max-width:120px;">'
+      + '<input type="date" id="bf-' + key + '-a" class="amux-dp" style="font-size:0.72rem;max-width:120px;">\u2013'
+      + '<input type="date" id="bf-' + key + '-b" class="amux-dp" style="font-size:0.72rem;max-width:120px;">'
       + '<button class="btn" style="font-size:0.7rem;padding:2px 8px;" onclick="(function(){'
       + 'var a=document.getElementById(\'bf-' + key + '-a\').value,b=document.getElementById(\'bf-' + key + '-b\').value;'
       + 'if(a&&b)_bfAppend(\'' + key + ':\'+a+\'..\'+b);})()">apply</button></div>',
@@ -21647,6 +21652,8 @@ function openSchedModal(editId) {
   setSchedMode(mode);
   setLoopEvery(document.getElementById('sched-loop-every').value);
   markRoutineChip(document.getElementById('sched-expr').value);
+  // Programmatic .value set above fires no event, so refresh the picker label.
+  try { _dpSyncLabel(document.getElementById('sched-run-at')); } catch (e) {}
   schedCmdSwitchMode('edit');
   // reset editor expand state + char count
   const _box = overlay.querySelector('.board-edit-box');
@@ -21748,7 +21755,7 @@ function openBoardAdd(statusOrDate, prefillDate) {
   const beGateEl = document.getElementById('be-gate');
   if (beGateEl) beGateEl.value = '';
   const dueEl = document.getElementById('be-due');
-  if (dueEl) dueEl.value = dueDate;
+  if (dueEl) { dueEl.value = dueDate; try { _dpSyncLabel(dueEl); } catch (e) {} }
   const dueTimeEl2 = document.getElementById('be-due-time');
   if (dueTimeEl2) dueTimeEl2.value = '';
   const sel = document.getElementById('be-status');
@@ -21891,7 +21898,7 @@ function openBoardDetail(id) {
     };
   }
   const dueEl = document.getElementById('bd-due');
-  if (dueEl) dueEl.value = draft ? (draft.due || '') : (item.due || '');
+  if (dueEl) { dueEl.value = draft ? (draft.due || '') : (item.due || ''); try { _dpSyncLabel(dueEl); } catch (e) {} }
   const dueTimeEl = document.getElementById('bd-due-time');
   if (dueTimeEl) dueTimeEl.value = draft ? (draft.due_time || '') : (item.due_time || '');
   const gateEl = document.getElementById('bd-gate');
@@ -22789,12 +22796,12 @@ function openEventModal(editId, startStr, endStr, allDay) {
         </label>
         <div style="display:flex;gap:8px;align-items:center">
           <span style="font-size:0.8rem;color:var(--dim);min-width:34px">Start</span>
-          <input type="date" id="ev-sdate" class="input" value="${s.date}">
+          <input type="date" id="ev-sdate" class="input amux-dp" value="${s.date}">
           <input type="time" id="ev-stime" class="input" value="${s.time || '09:00'}" ${isAllDay ? 'style="display:none"' : ''}>
         </div>
         <div style="display:flex;gap:8px;align-items:center">
           <span style="font-size:0.8rem;color:var(--dim);min-width:34px">End</span>
-          <input type="date" id="ev-edate" class="input" value="${e.date}">
+          <input type="date" id="ev-edate" class="input amux-dp" value="${e.date}">
           <input type="time" id="ev-etime" class="input" value="${e.time}" ${isAllDay ? 'style="display:none"' : ''}>
         </div>
         <input id="ev-loc" class="input" placeholder="Location (optional)" value="${ev && ev.location ? esc(ev.location) : ''}">
@@ -30630,7 +30637,7 @@ function _jrnlRenderEditor() {
 
   let html = '<div class="jrnl-editor">';
   html += '<div style="display:flex;gap:10px;align-items:center;">';
-  html += '<input type="date" id="jrnl-ed-date" value="' + esc(entry.date) + '" style="flex:0 0 auto;">';
+  html += '<input type="date" id="jrnl-ed-date" class="amux-dp" value="' + esc(entry.date) + '" style="flex:0 0 auto;">';
   html += '<label style="margin:0;display:flex;align-items:center;gap:4px;cursor:pointer;"><input type="checkbox" id="jrnl-ed-star" ' + (entry.starred ? 'checked' : '') + '> Starred</label>';
   html += '</div>';
 
@@ -30835,7 +30842,7 @@ function _jrnlCalDayClick(date) {
     _jrnlActiveId = '__new__';
     _jrnlSwitchSub('list');
     _jrnlRenderEditor();
-    setTimeout(() => { const el = document.getElementById('jrnl-ed-date'); if (el) el.value = date; }, 10);
+    setTimeout(() => { const el = document.getElementById('jrnl-ed-date'); if (el) { el.value = date; try { _dpSyncLabel(el); } catch (e) {} } }, 10);
   }
 }
 
@@ -30939,3 +30946,372 @@ async function _jrnlSaveConfig() {
   document.getElementById('jrnl-config-overlay')?.remove();
   _jrnlRenderEditor();
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Reusable themed calendar picker (AMUX-3070)
+//
+// Native <input type=date|datetime-local> renders inconsistently (ugly
+// mm/dd/yyyy on desktop) and ignores amux theming. Rather than rewrite every
+// call site, this PROGRESSIVELY ENHANCES each `input.amux-dp`: the native input
+// stays in the DOM as the value store (hidden), a themed trigger button shows
+// the formatted value, and one shared popover drives selection. On pick we write
+// the input's .value in the EXACT native format and dispatch input+change, so
+// every existing onchange contract fires unchanged. A dynamic input (built via
+// innerHTML) is caught by a debounced MutationObserver + DOMContentLoaded scan.
+// Programmatic .value writes fire no event, so known setters call _dpSyncLabel().
+// ─────────────────────────────────────────────────────────────────────────────
+const _DP_MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+const _DP_MONTHS_FULL = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+const _DP_DOW = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'];
+const _DP_DOW_SHORT = ['Su','Mo','Tu','We','Th','Fr','Sa'];
+const _dpPad = n => (n < 10 ? '0' : '') + n;
+
+// Shared popover state
+let _dpEl = null, _dpBack = null;       // popover + backdrop (built once)
+let _dpInput = null, _dpTrigger = null; // the input being edited + its trigger
+let _dpIsDT = false;                    // datetime-local vs date
+let _dpView = null;                     // {y, mo} month currently shown
+let _dpSel = null;                      // {y, mo, d} selected day, or null
+let _dpFocus = null;                    // Date object with keyboard focus in grid
+let _dpH = 9, _dpM = 0;                 // time-of-day for datetime-local
+
+function _dpParse(v) {
+  if (!v) return null;
+  const m = String(v).match(/^(\d{4})-(\d{2})-(\d{2})(?:T(\d{2}):(\d{2}))?/);
+  if (!m) return null;
+  return { y: +m[1], mo: +m[2] - 1, d: +m[3],
+           hh: m[4] !== undefined ? +m[4] : null, mm: m[5] !== undefined ? +m[5] : null };
+}
+// "Aug 14, 2026" (date) or "Aug 14, 2026 15:30" (datetime-local)
+function _dpFmtLabel(v, isDT) {
+  const p = _dpParse(v);
+  if (!p) return v || '';
+  let s = _DP_MONTHS[p.mo] + ' ' + p.d + ', ' + p.y;
+  if (isDT) s += ' ' + _dpPad(p.hh || 0) + ':' + _dpPad(p.mm || 0);
+  return s;
+}
+function _dpIsDateTime(input) {
+  return input.type === 'datetime-local' || input.getAttribute('type') === 'datetime-local';
+}
+
+// Refresh the trigger label from the input's CURRENT .value (call after any
+// programmatic .value write, which fires no event). No-op if not yet enhanced.
+function _dpSyncLabel(input) {
+  if (!input || !input._dpTrigger) return;
+  const t = input._dpTrigger;
+  const isDT = _dpIsDateTime(input);
+  const v = input.value;
+  if (!v) {
+    t.textContent = isDT ? 'Pick date & time' : 'Pick a date';
+    t.classList.add('empty');
+  } else {
+    t.textContent = _dpFmtLabel(v, isDT);
+    t.classList.remove('empty');
+  }
+  t.setAttribute('aria-label', t.textContent + (isDT ? ', choose date and time' : ', choose date'));
+}
+
+function _dpEnhance(input) {
+  if (!input || input.getAttribute('data-dp') === '1') return;
+  input.setAttribute('data-dp', '1');
+  const trigger = document.createElement('button');
+  trigger.type = 'button';
+  trigger.className = 'amux-dp-trigger';
+  trigger.setAttribute('aria-haspopup', 'dialog');
+  // Copy layout sizing so the trigger occupies the same slot as the input it
+  // replaced (appearance itself is uniform, from .amux-dp-trigger CSS).
+  ['flex', 'width', 'maxWidth', 'minWidth', 'margin', 'marginBottom', 'marginTop',
+   'marginLeft', 'marginRight', 'fontSize'].forEach(p => {
+    if (input.style[p]) trigger.style[p] = input.style[p];
+  });
+  // .input date fields get flex:1 from CSS (not inline), so mirror that.
+  if (input.classList.contains('input')) {
+    if (!trigger.style.flex) trigger.style.flex = '1';
+    trigger.style.minWidth = '0';
+  }
+  trigger.addEventListener('click', () => _dpOpen(input, trigger));
+  trigger.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' || e.key === ' ' || e.key === 'Spacebar') {
+      e.preventDefault();
+      _dpOpen(input, trigger);
+    }
+  });
+  input.classList.add('amux-dp-native');            // visually hidden (value store only)
+  if (input.parentNode) input.parentNode.insertBefore(trigger, input);
+  input._dpTrigger = trigger;
+  trigger._dpInput = input;
+  _dpSyncLabel(input);
+}
+
+function _dpScan() {
+  const list = document.querySelectorAll('input.amux-dp:not([data-dp="1"])');
+  for (let i = 0; i < list.length; i++) _dpEnhance(list[i]);
+}
+
+function _dpBuildEl() {
+  if (_dpEl) return;
+  _dpBack = document.createElement('div');
+  _dpBack.className = 'amux-dp-backdrop';
+  _dpBack.addEventListener('click', _dpClose);
+  _dpEl = document.createElement('div');
+  _dpEl.className = 'amux-dp-pop';
+  _dpEl.setAttribute('role', 'dialog');
+  _dpEl.setAttribute('aria-modal', 'false');
+  _dpEl.setAttribute('aria-label', 'Choose a date');
+  _dpEl.innerHTML =
+    '<div class="amux-dp-head">'
+    + '<button type="button" class="amux-dp-nav" data-dp="prev" aria-label="Previous month">‹</button>'
+    + '<div class="amux-dp-title" aria-live="polite"></div>'
+    + '<button type="button" class="amux-dp-nav" data-dp="next" aria-label="Next month">›</button>'
+    + '</div>'
+    + '<div class="amux-dp-week">' + _DP_DOW_SHORT.map(d => '<span>' + d + '</span>').join('') + '</div>'
+    + '<div class="amux-dp-grid" role="grid"></div>'
+    + '<div class="amux-dp-time" style="display:none;">'
+    + '<label>Time</label>'
+    + '<input type="number" class="amux-dp-hh" min="0" max="23" inputmode="numeric" aria-label="Hour">'
+    + '<span class="amux-dp-colon">:</span>'
+    + '<input type="number" class="amux-dp-mm" min="0" max="59" inputmode="numeric" aria-label="Minute">'
+    + '<button type="button" class="amux-dp-done">Done</button>'
+    + '</div>'
+    + '<div class="amux-dp-foot">'
+    + '<button type="button" class="amux-dp-clear">Clear</button>'
+    + '<button type="button" class="amux-dp-today">Today</button>'
+    + '</div>';
+  // Wire static controls
+  _dpEl.querySelector('[data-dp="prev"]').addEventListener('click', () => _dpShiftMonth(-1));
+  _dpEl.querySelector('[data-dp="next"]').addEventListener('click', () => _dpShiftMonth(1));
+  _dpEl.querySelector('.amux-dp-clear').addEventListener('click', _dpClear);
+  _dpEl.querySelector('.amux-dp-today').addEventListener('click', () => {
+    const n = new Date();
+    _dpPick(n.getFullYear(), n.getMonth(), n.getDate());
+  });
+  _dpEl.querySelector('.amux-dp-done').addEventListener('click', _dpClose);
+  const hh = _dpEl.querySelector('.amux-dp-hh'), mm = _dpEl.querySelector('.amux-dp-mm');
+  const onTime = () => {
+    let h = parseInt(hh.value, 10); if (isNaN(h)) h = 0; h = Math.max(0, Math.min(23, h));
+    let m = parseInt(mm.value, 10); if (isNaN(m)) m = 0; m = Math.max(0, Math.min(59, m));
+    _dpH = h; _dpM = m;
+    if (_dpSel) _dpCommit();   // only writes once a day is chosen
+  };
+  hh.addEventListener('input', onTime);
+  mm.addEventListener('input', onTime);
+  hh.addEventListener('blur', () => { hh.value = _dpPad(_dpH); });
+  mm.addEventListener('blur', () => { mm.value = _dpPad(_dpM); });
+  _dpEl.addEventListener('keydown', _dpKeydown);
+  document.body.appendChild(_dpBack);
+  document.body.appendChild(_dpEl);
+}
+
+function _dpRender() {
+  if (!_dpEl) return;
+  _dpEl.querySelector('.amux-dp-title').textContent = _DP_MONTHS_FULL[_dpView.mo] + ' ' + _dpView.y;
+  const grid = _dpEl.querySelector('.amux-dp-grid');
+  const y = _dpView.y, mo = _dpView.mo;
+  const first = new Date(y, mo, 1);
+  const start = new Date(y, mo, 1 - first.getDay());   // Sunday of the first row
+  const now = new Date();
+  const todayKey = now.getFullYear() + '-' + now.getMonth() + '-' + now.getDate();
+  const focusKey = _dpFocus.getFullYear() + '-' + _dpFocus.getMonth() + '-' + _dpFocus.getDate();
+  let html = '';
+  for (let i = 0; i < 42; i++) {
+    const cur = new Date(start.getFullYear(), start.getMonth(), start.getDate() + i);
+    const cy = cur.getFullYear(), cm = cur.getMonth(), cd = cur.getDate();
+    const key = cy + '-' + cm + '-' + cd;
+    const cls = ['amux-dp-day'];
+    if (cm !== mo) cls.push('adjacent');
+    if (key === todayKey) cls.push('today');
+    if (_dpSel && _dpSel.y === cy && _dpSel.mo === cm && _dpSel.d === cd) cls.push('selected');
+    const tabindex = key === focusKey ? '0' : '-1';
+    const aria = _DP_DOW[cur.getDay()] + ', ' + _DP_MONTHS_FULL[cm] + ' ' + cd + ', ' + cy;
+    html += '<button type="button" class="' + cls.join(' ') + '" role="gridcell" tabindex="' + tabindex
+      + '" data-y="' + cy + '" data-mo="' + cm + '" data-d="' + cd + '" aria-label="' + aria + '">' + cd + '</button>';
+  }
+  grid.innerHTML = html;
+  const cells = grid.querySelectorAll('.amux-dp-day');
+  for (let i = 0; i < cells.length; i++) {
+    const b = cells[i];
+    b.addEventListener('click', () => _dpPick(+b.getAttribute('data-y'), +b.getAttribute('data-mo'), +b.getAttribute('data-d')));
+  }
+}
+
+function _dpFocusCell() {
+  if (!_dpEl) return;
+  const b = _dpEl.querySelector('.amux-dp-day[tabindex="0"]');
+  if (b) try { b.focus(); } catch (e) {}
+}
+
+function _dpShiftMonth(delta) {
+  let mo = _dpView.mo + delta, y = _dpView.y;
+  while (mo < 0) { mo += 12; y--; }
+  while (mo > 11) { mo -= 12; y++; }
+  _dpView = { y, mo };
+  // Keep keyboard focus inside the visible month.
+  const d = Math.min(_dpFocus.getDate(), new Date(y, mo + 1, 0).getDate());
+  _dpFocus = new Date(y, mo, d);
+  _dpRender();
+  _dpFocusCell();
+}
+
+function _dpMoveFocus(days) {
+  _dpFocus = new Date(_dpFocus.getFullYear(), _dpFocus.getMonth(), _dpFocus.getDate() + days);
+  _dpView = { y: _dpFocus.getFullYear(), mo: _dpFocus.getMonth() };
+  _dpRender();
+  _dpFocusCell();
+}
+
+function _dpKeydown(e) {
+  const k = e.key;
+  if (k === 'Escape') { e.preventDefault(); _dpClose(); return; }
+  // Let the time inputs handle their own typing.
+  if (e.target && e.target.classList && e.target.classList.contains('amux-dp-day')) {
+    if (k === 'ArrowLeft') { e.preventDefault(); _dpMoveFocus(-1); }
+    else if (k === 'ArrowRight') { e.preventDefault(); _dpMoveFocus(1); }
+    else if (k === 'ArrowUp') { e.preventDefault(); _dpMoveFocus(-7); }
+    else if (k === 'ArrowDown') { e.preventDefault(); _dpMoveFocus(7); }
+    else if (k === 'PageUp') { e.preventDefault(); _dpShiftMonth(-1); }
+    else if (k === 'PageDown') { e.preventDefault(); _dpShiftMonth(1); }
+    else if (k === 'Home') { e.preventDefault(); _dpMoveFocus(-_dpFocus.getDay()); }
+    else if (k === 'End') { e.preventDefault(); _dpMoveFocus(6 - _dpFocus.getDay()); }
+    else if (k === 'Enter' || k === ' ' || k === 'Spacebar') {
+      e.preventDefault();
+      _dpPick(_dpFocus.getFullYear(), _dpFocus.getMonth(), _dpFocus.getDate());
+    }
+  }
+}
+
+// Write the value in the EXACT native format and fire input+change so every
+// existing onchange contract runs. datetime-local combines day + time row.
+function _dpCommit() {
+  if (!_dpInput || !_dpSel) return;
+  let val = _dpSel.y + '-' + _dpPad(_dpSel.mo + 1) + '-' + _dpPad(_dpSel.d);
+  if (_dpIsDT) val += 'T' + _dpPad(_dpH) + ':' + _dpPad(_dpM);
+  _dpInput.value = val;
+  _dpInput.dispatchEvent(new Event('input', { bubbles: true }));
+  _dpInput.dispatchEvent(new Event('change', { bubbles: true }));
+  _dpSyncLabel(_dpInput);
+}
+
+function _dpPick(y, mo, d) {
+  _dpSel = { y, mo, d };
+  _dpView = { y, mo };
+  _dpFocus = new Date(y, mo, d);
+  _dpCommit();
+  if (_dpIsDT) {
+    _dpRender();       // reflect selection; keep open so time can be adjusted
+    _dpFocusCell();
+  } else {
+    _dpClose();        // date-only: a day pick completes the selection
+  }
+}
+
+function _dpClear() {
+  if (_dpInput) {
+    _dpInput.value = '';
+    _dpInput.dispatchEvent(new Event('input', { bubbles: true }));
+    _dpInput.dispatchEvent(new Event('change', { bubbles: true }));
+    _dpSyncLabel(_dpInput);
+  }
+  _dpClose();
+}
+
+function _dpPosition() {
+  const mobile = window.innerWidth <= 600;
+  if (mobile) {
+    _dpEl.classList.add('sheet');
+    _dpBack.style.display = 'block';
+    _dpEl.style.left = _dpEl.style.top = '';
+    return;
+  }
+  _dpEl.classList.remove('sheet');
+  _dpBack.style.display = 'none';
+  const z = _uiZoomFactor();
+  const r = _cssRect(_dpTrigger);
+  const vw = window.innerWidth / z, vh = window.innerHeight / z;
+  _dpEl.style.visibility = 'hidden';
+  _dpEl.style.display = 'block';
+  const pw = _dpEl.offsetWidth, ph = _dpEl.offsetHeight;
+  let left = r.left;
+  if (left + pw > vw - 8) left = Math.max(8, vw - pw - 8);
+  let top = r.bottom + 6;
+  if (top + ph > vh - 8) {
+    const above = r.top - 6 - ph;
+    top = above > 8 ? above : Math.max(8, vh - ph - 8);
+  }
+  _dpEl.style.left = left + 'px';
+  _dpEl.style.top = top + 'px';
+  _dpEl.style.visibility = '';
+}
+
+function _dpOnScroll() { if (_dpEl && _dpTrigger && window.innerWidth > 600) _dpPosition(); }
+function _dpOnDocDown(e) {
+  if (!_dpEl) return;
+  if (_dpEl.contains(e.target)) return;
+  if (_dpTrigger && (e.target === _dpTrigger || _dpTrigger.contains(e.target))) return;
+  _dpClose();
+}
+
+function _dpOpen(input, trigger) {
+  _dpBuildEl();
+  _dpInput = input;
+  _dpTrigger = trigger;
+  _dpIsDT = _dpIsDateTime(input);
+  const p = _dpParse(input.value);   // re-read live value on every open
+  const now = new Date();
+  _dpSel = p ? { y: p.y, mo: p.mo, d: p.d } : null;
+  _dpView = p ? { y: p.y, mo: p.mo } : { y: now.getFullYear(), mo: now.getMonth() };
+  _dpFocus = p ? new Date(p.y, p.mo, p.d) : new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  _dpH = p && p.hh != null ? p.hh : 9;
+  _dpM = p && p.mm != null ? p.mm : 0;
+  // Time row only for datetime-local
+  const timeRow = _dpEl.querySelector('.amux-dp-time');
+  timeRow.style.display = _dpIsDT ? 'flex' : 'none';
+  if (_dpIsDT) {
+    _dpEl.querySelector('.amux-dp-hh').value = _dpPad(_dpH);
+    _dpEl.querySelector('.amux-dp-mm').value = _dpPad(_dpM);
+  }
+  _dpEl.setAttribute('aria-label', _dpIsDT ? 'Choose date and time' : 'Choose a date');
+  _dpRender();
+  _dpEl.style.display = 'block';
+  _dpPosition();
+  document.addEventListener('mousedown', _dpOnDocDown, true);
+  window.addEventListener('resize', _dpPosition);
+  window.addEventListener('scroll', _dpOnScroll, true);
+  // Focus the active day for keyboard nav (skip auto-focus on mobile to avoid
+  // yanking the viewport around the bottom sheet).
+  if (window.innerWidth > 600) requestAnimationFrame(_dpFocusCell);
+}
+
+function _dpClose() {
+  if (!_dpEl) return;
+  _dpEl.style.display = 'none';
+  _dpEl.classList.remove('sheet');
+  _dpBack.style.display = 'none';
+  document.removeEventListener('mousedown', _dpOnDocDown, true);
+  window.removeEventListener('resize', _dpPosition);
+  window.removeEventListener('scroll', _dpOnScroll, true);
+  const t = _dpTrigger;
+  _dpInput = null;
+  _dpTrigger = null;
+  if (t) try { t.focus(); } catch (e) {}
+}
+
+// Catch dynamically-rendered inputs (#bf-*, #ev-*, #jrnl-ed-date are built via
+// innerHTML). Debounced so a burst of DOM writes triggers a single scan.
+let _dpScanTimer = null;
+function _dpScheduleScan() {
+  if (_dpScanTimer) return;
+  _dpScanTimer = setTimeout(() => { _dpScanTimer = null; try { _dpScan(); } catch (e) {} }, 50);
+}
+function _dpInit() {
+  try { _dpScan(); } catch (e) {}
+  try {
+    const mo = new MutationObserver((muts) => {
+      for (let i = 0; i < muts.length; i++) {
+        if (muts[i].addedNodes && muts[i].addedNodes.length) { _dpScheduleScan(); return; }
+      }
+    });
+    mo.observe(document.body, { childList: true, subtree: true });
+  } catch (e) {}
+}
+if (document.body) _dpInit();
+else document.addEventListener('DOMContentLoaded', _dpInit);
