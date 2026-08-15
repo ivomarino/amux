@@ -136,7 +136,7 @@ struct GroupSpec {
     goal: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 struct WorkerSpec {
     name: String,
     #[serde(default)]
@@ -828,4 +828,85 @@ fn write_env_atomic(path: &std::path::Path, body: &str) -> std::io::Result<()> {
         f.sync_all()?;
     }
     std::fs::rename(&tmp, path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::sessions_legacy::worker_model_env;
+
+    // Pull the value of a CC_ key out of render_worker_env's `K="V"` body.
+    fn env_val(body: &str, key: &str) -> String {
+        for line in body.lines() {
+            if let Some(rest) = line.strip_prefix(&format!("{key}=\"")) {
+                return rest.trim_end_matches('"').to_string();
+            }
+        }
+        String::new()
+    }
+
+    /// AF-58 (AMUX-3182 review, amux-frustrations): 0d809ff's commit message and
+    /// worker_model_env's own doc-comment claim it "cannot drift from
+    /// env_config::render", but nothing enforced that: both functions were
+    /// private and the property was two comments agreeing (ethos rule 6: grep
+    /// for the thing the docstring promises). This makes the promise a CHECK:
+    /// the create path (worker_model_env) and the env-apply path
+    /// (render_worker_env) must produce the SAME provider-shaped model wiring.
+    ///
+    /// Scoped to the inputs both routes accept: no explicit flags and no
+    /// create-only default model, because render_worker_env has neither concept.
+    /// That single remaining divergence (ollama + explicit CC_FLAGS carrying
+    /// --model) is deliberately NOT asserted here; it is caught at launch by
+    /// the ollama start-arm WARN (session_verbs.rs), which the review confirmed
+    /// is load-bearing for exactly that shape.
+    #[test]
+    fn create_path_and_render_agree_on_provider_model_wiring() {
+        for (provider, model) in [
+            ("ollama", "qwen3.8:27b"),
+            ("ollama", "qwen2.5vl:7b"),
+            ("codex", "gpt-5.5"),
+            ("claude", "opus"),
+            ("gemini", "gemini-2.5-pro"),
+            ("ollama", ""),
+            ("claude", ""),
+        ] {
+            let spec = WorkerSpec {
+                provider: provider.to_string(),
+                model: model.to_string(),
+                ..Default::default()
+            };
+            let rendered = render_worker_env(&spec);
+            let render_cc_model = env_val(&rendered, "CC_MODEL");
+            let render_cc_flags = env_val(&rendered, "CC_FLAGS");
+
+            // Same inputs, no explicit flags, no default, the subset
+            // render_worker_env is limited to.
+            let (create_cc_flags, create_cc_model, _) = worker_model_env(provider, model, "", "");
+
+            assert_eq!(
+                render_cc_model, create_cc_model,
+                "CC_MODEL disagrees for {provider}/{model:?}: render={render_cc_model:?} create={create_cc_model:?}"
+            );
+            assert_eq!(
+                render_cc_flags, create_cc_flags,
+                "CC_FLAGS disagrees for {provider}/{model:?}: render={render_cc_flags:?} create={create_cc_flags:?}"
+            );
+        }
+        // Positive control: the routes MUST diverge if worker_model_env's ollama
+        // branch is lost. Simulate that drift by asking the create helper for the
+        // claude-shaped wiring of an ollama model, which pins --model in CC_FLAGS,
+        // which is exactly what render does NOT do for ollama. If this ever
+        // matched, the agreement assertions above would be vacuous.
+        let (drift_flags, drift_model, _) = worker_model_env("claude", "qwen3.8:27b", "", "");
+        let ollama_render = render_worker_env(&WorkerSpec {
+            provider: "ollama".into(),
+            model: "qwen3.8:27b".into(),
+            ..Default::default()
+        });
+        assert_ne!(
+            drift_flags, env_val(&ollama_render, "CC_FLAGS"),
+            "control: claude-shaped wiring must differ from ollama render CC_FLAGS"
+        );
+        assert!(drift_model.is_empty(), "control: claude path yields no CC_MODEL");
+    }
 }

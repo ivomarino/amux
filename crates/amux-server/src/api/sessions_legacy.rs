@@ -1358,7 +1358,7 @@ fn write_env_file(path: &std::path::Path, pairs: &[(&str, String)]) -> std::io::
 /// Explicit `flags` always win (AMUX-3114): honoured verbatim as `cc_flags`.
 /// `resolved_model` is what the create response echoes so a defaulted/unpinned
 /// model is visible at create time.
-fn worker_model_env(
+pub(crate) fn worker_model_env(
     provider: &str,
     raw_model: &str,
     explicit_flags: &str,
