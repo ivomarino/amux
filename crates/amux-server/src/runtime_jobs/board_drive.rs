@@ -265,6 +265,13 @@ pub struct DriveReport {
     /// here so a promotion (or its absence) is visible in
     /// `/api/debug/board-drive` without reading logs (ethos rule 4).
     pub promoted: usize,
+    /// Cards whose `depends_on` are all terminal but which stayed parked in
+    /// `backlog` because the owner set a live `source_ref` trigger (a wake
+    /// condition that is not "deps done"). Counted so the promotion pass HOLDING
+    /// a card is as visible as a promotion — the interaction that made MG-1388
+    /// look like it "wouldn't stay parked" was invisible in this report until
+    /// the field existed (ethos rule 4).
+    pub held_on_trigger: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -853,16 +860,42 @@ fn promotable_deps(conn: &Connection, row: &bs::IssueRow) -> Option<Vec<String>>
     }
 }
 
+/// Is this card parked on a live `source_ref` trigger? A non-empty `source_ref`
+/// is an explicit, owner-set wake condition ("re-check when a namespace holds
+/// both an archive- and a competitor-shaped collection") that the OWNING session
+/// re-evaluates by hand — it is NOT "deps terminal". The drive-to-verified
+/// promotion pass must leave such a card parked even when its `depends_on` are
+/// all terminal, exactly as the drain and rot sweeps already do (their DELETE
+/// guards carry `COALESCE(source_ref,'')=''`).
+///
+/// Without this, a card carrying a satisfied dependency AND a live trigger is
+/// dragged out of `backlog` every tick — the promotion sees terminal deps and
+/// fires, fighting the owner's park. MG-1388 was re-activated five times in two
+/// hours against mixpeek-general's explicit re-parks (2026-08-15); that is ethos
+/// rule 8, the harness deciding what was the owning session's to decide.
+fn parked_on_live_trigger(row: &bs::IssueRow) -> bool {
+    row.source_ref
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+}
+
 /// Fleet-wide scan for the drive-to-verified pass: every agent-owned, live,
 /// non-archived, non-dormant `backlog` card that has a NON-EMPTY `depends_on`
-/// with EVERY dependency terminal. Returns `(card_id, cleared_dep_ids)`.
+/// with EVERY dependency terminal AND no live `source_ref` trigger. Returns
+/// `(promotions, held_on_trigger)`: each promotion is `(card_id,
+/// cleared_dep_ids)`, and `held_on_trigger` counts cards that WOULD have
+/// promoted on their deps but were left parked because the owner set a trigger.
+/// The count is surfaced in [`DriveReport`] so the hold is visible without
+/// reading a card's log (ethos rule 4: a card sitting in `backlog` despite
+/// terminal deps must be explainable from the report).
 ///
 /// Uses [`bs::list_issues`] filtered to `backlog` — the same tested read path
 /// the board list endpoint uses — rather than a bespoke query, so `depends_on`
 /// parsing cannot drift from the canonical decode. Runs once per tick; the
 /// cost profile matches a single dashboard board refresh, of which there are
 /// already many per minute.
-fn backlog_dep_promotions(conn: &Connection) -> Vec<(String, Vec<String>)> {
+fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usize) {
     let rows = bs::list_issues(
         conn,
         &["backlog".to_string()],
@@ -870,12 +903,26 @@ fn backlog_dep_promotions(conn: &Connection) -> Vec<(String, Vec<String>)> {
         bs::ArchivedFilter::ActiveOnly,
     )
     .unwrap_or_default();
-    rows.into_iter()
-        .filter(|r| r.owner_type == "agent")
-        .filter(|r| !is_dormant_type(&r.item_type))
-        .filter(|r| !r.depends_on.is_empty())
-        .filter_map(|r| promotable_deps(conn, &r).map(|deps| (r.id.clone(), deps)))
-        .collect()
+    let mut promotions = Vec::new();
+    let mut held_on_trigger = 0usize;
+    for r in rows {
+        if r.owner_type != "agent" || is_dormant_type(&r.item_type) {
+            continue;
+        }
+        // Deps must be present and all terminal to be a candidate at all
+        // (`promotable_deps` returns None for an empty or non-terminal set).
+        let Some(deps) = promotable_deps(conn, &r) else {
+            continue;
+        };
+        // The owner's own trigger OVERRIDES terminal deps — hold the card, and
+        // count the hold so the promotion pass leaving it parked is visible.
+        if parked_on_live_trigger(&r) {
+            held_on_trigger += 1;
+            continue;
+        }
+        promotions.push((r.id.clone(), deps));
+    }
+    (promotions, held_on_trigger)
 }
 
 /// Drive-to-verified: re-activate every card parked in `backlog` on a
@@ -891,10 +938,10 @@ fn backlog_dep_promotions(conn: &Connection) -> Vec<(String, Vec<String>)> {
 /// dispatchable, and writes a greppable INFO line naming the card and the deps
 /// that cleared it (two-fixes: the next promotion — or a wrongful one — is
 /// self-announcing).
-async fn promote_ready_backlog(state: &AppState) -> usize {
-    let candidates = match state.store.read() {
+async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
+    let (candidates, held_on_trigger) = match state.store.read() {
         Ok(conn) => backlog_dep_promotions(&conn),
-        Err(_) => return 0,
+        Err(_) => return (0, 0),
     };
     let mut promoted = 0;
     for (card, deps) in candidates {
@@ -915,6 +962,7 @@ async fn promote_ready_backlog(state: &AppState) -> usize {
                     || row.owner_type != "agent"
                     || row.archived != 0
                     || is_dormant_type(&row.item_type)
+                    || parked_on_live_trigger(&row)
                     || promotable_deps(conn, &row).is_none()
                 {
                     return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
@@ -968,7 +1016,7 @@ async fn promote_ready_backlog(state: &AppState) -> usize {
             );
         }
     }
-    promoted
+    (promoted, held_on_trigger)
 }
 
 fn card_needsyou_asked_at(conn: &Connection, card: &str) -> Option<f64> {
@@ -2417,7 +2465,9 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     // of stalling at `parked` forever. Fleet-wide and lane-independent (a
     // dependency clearing does not care which lane is at a boundary), and FIRST
     // so a freshly promoted card is dispatchable in this same tick's lane loop.
-    report.promoted = promote_ready_backlog(state).await;
+    let (promoted, held_on_trigger) = promote_ready_backlog(state).await;
+    report.promoted = promoted;
+    report.held_on_trigger = held_on_trigger;
     for lane in fleet.lanes() {
         let trace = drive_lane(state, fleet, &lane).await;
         match trace.outcome.as_str() {
@@ -2995,6 +3045,7 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
                     assigned = r.assigned,
                     nudged = r.nudged,
                     promoted = r.promoted,
+                    held_on_trigger = r.held_on_trigger,
                     lanes = r.lanes.len(),
                     "[board-drive] tick"
                 );
@@ -3549,7 +3600,7 @@ mod tests {
         )
         .unwrap();
 
-        let got = backlog_dep_promotions(&conn);
+        let (got, _held) = backlog_dep_promotions(&conn);
         let ids: std::collections::HashSet<&str> = got.iter().map(|(i, _)| i.as_str()).collect();
 
         assert!(ids.contains("P-all-terminal"), "all-terminal deps must promote: {ids:?}");
@@ -3564,6 +3615,58 @@ mod tests {
         // The cleared deps ride along so the promotion log can name them.
         let (_, cleared) = got.iter().find(|(i, _)| i == "P-all-terminal").unwrap();
         assert_eq!(cleared.len(), 2, "both cleared deps are reported for the log line");
+    }
+
+    /// A card parked on a live `source_ref` trigger is NEVER promoted, even when
+    /// every one of its `depends_on` is terminal — the trigger is the owner's own
+    /// wake condition and outranks "deps done" (MG-1388, 2026-08-15: re-activated
+    /// five times against explicit re-parks; ethos rule 8). The hold is COUNTED so
+    /// it is visible in the drive report (ethos rule 4). A same-board control with
+    /// terminal deps and NO trigger still promotes, so the guard is not vacuous.
+    #[test]
+    fn a_live_trigger_holds_a_card_even_when_its_deps_are_terminal() {
+        let conn = board_db();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
+             VALUES ('A-done','A-done','done','me','agent','code',100)",
+            [],
+        )
+        .unwrap();
+        // The MG-1388 shape: a terminal dep AND a live source_ref trigger.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated) \
+             VALUES ('T-armed','T-armed','backlog','me','agent','investigation','[\"A-done\"]',\
+                     'some namespace holds both an archive- and a competitor-shaped collection',100)",
+            [],
+        )
+        .unwrap();
+        // Control: same terminal dep, NO trigger -> still promotes.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
+             VALUES ('T-plain','T-plain','backlog','me','agent','code','[\"A-done\"]',100)",
+            [],
+        )
+        .unwrap();
+        // A whitespace-only source_ref is NOT a live trigger -> promotes.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated) \
+             VALUES ('T-blank','T-blank','backlog','me','agent','code','[\"A-done\"]','   ',100)",
+            [],
+        )
+        .unwrap();
+
+        let (got, held) = backlog_dep_promotions(&conn);
+        let ids: std::collections::HashSet<&str> = got.iter().map(|(i, _)| i.as_str()).collect();
+        assert!(!ids.contains("T-armed"), "a live-trigger park must NOT be promoted: {ids:?}");
+        assert!(
+            ids.contains("T-plain"),
+            "a no-trigger terminal-deps card still promotes (guard not vacuous): {ids:?}"
+        );
+        assert!(
+            ids.contains("T-blank"),
+            "a whitespace-only source_ref is not a live trigger: {ids:?}"
+        );
+        assert_eq!(held, 1, "exactly the one live-trigger card is counted as held");
     }
 
     /// A card parked by the DOCUMENTED transition — core's `Doing -> NeedsYou`,
