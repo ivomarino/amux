@@ -209,6 +209,12 @@ impl ProviderAdapter for OllamaAdapter {
                 "never".into(),
                 "--sandbox".into(),
                 "workspace-write".into(),
+                // Local models don't support extended thinking (xhigh). The
+                // global ~/.codex/config.toml may set model_reasoning_effort=xhigh
+                // for OpenAI models; override it here so ollama workers use low
+                // effort and are responsive (xhigh hangs qwen, ~30min wasted: AH-81).
+                "-c".into(),
+                "model_reasoning_effort=low".into(),
             ],
             PromptMode::HeadlessStructured => vec![
                 "codex".into(),
@@ -281,6 +287,7 @@ mod tests {
         let interactive_expected = vec![
             "codex", "--oss", "--local-provider", "ollama", "--model", "qwen3.8:27b",
             "-a", "never", "--sandbox", "workspace-write",
+            "-c", "model_reasoning_effort=low",
         ];
         // HeadlessStructured: no extra flags needed (headless driver handles approvals).
         let headless_expected = vec![
