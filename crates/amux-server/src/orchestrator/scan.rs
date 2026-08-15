@@ -130,6 +130,7 @@ impl ScanLoop {
             if let Some(status) = native
                 .get(&backend_name)
                 .and_then(|m| m.get(&backend_ref))
+                .filter(|status| matches!(status.as_str(), "working" | "blocked" | "idle" | "done"))
             {
                 report.demoted_native.push(wid_str.clone());
                 let event = {
@@ -591,7 +592,7 @@ mod tests {
             vec![Arc::new(ScriptedBackend {
                 name: "herdr",
                 frame: LIMIT_FRAME.into(),
-                native: native("amux-herdr-unrelated", "idle"),
+                native: native("amux-herdr-1", "unknown"),
             })],
             Some(Arc::new(MockProtocol::new())),
         );
