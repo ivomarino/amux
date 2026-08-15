@@ -245,6 +245,21 @@ lazy_re!(
 // Tool execution progress lines (py 18512, 18551).
 lazy_re!(RE_READING_FILES, r"^Reading \d+ file"); // py 18512
 
+// A turn that has YIELDED to background subagents and is blocked on them.
+//
+// This is a working lane that looks exactly like an idle one to every other
+// signal: Claude Code draws the empty composer, and the status bar loses
+// "esc to interrupt" because the main loop is not generating — it is waiting.
+// Ethan, 2026-08-15: gtm-playbooks showed IDLE while its pane read "Waiting for
+// 9 background agents to finish" with nine subagents at 6-8 minutes each.
+//
+// Matched on the PANE text rather than the status bar's "N agents · ↓ to
+// manage" on purpose: this line is a positive statement that the main loop is
+// blocked and it disappears when the agents land, whereas an agent COUNT can
+// linger and would pin a finished lane to Active forever — the opposite error,
+// and the worse one, since a lane stuck Active never gets picked up.
+lazy_re!(RE_BG_AGENTS_WAIT, r"(?i)waiting for \d+ background agents?");
+
 // Bash/zsh prompt at line end — the CLI process is gone (py 8315).
 lazy_re!(RE_SHELL_PROMPT_END, r"[$%]\s*$"); // py 8315
 
@@ -526,6 +541,22 @@ fn claude_tui_state(clean: &str) -> TuiState {
     let ne = nonempty_trimmed(clean);
     if ne.is_empty() {
         return TuiState::Unknown;
+    }
+
+    // BLOCKED ON BACKGROUND SUBAGENTS = ACTIVE, and it must be decided here,
+    // because every downstream signal says idle: the composer is empty, the
+    // prompt is drawn, and the status bar has dropped "esc to interrupt" since
+    // the main loop is not generating. Without this, a lane orchestrating nine
+    // subagents for ten minutes reports IDLE (Ethan, 2026-08-15, gtm-playbooks).
+    //
+    // Checked BEFORE the interrupted/permission branches only in the sense of
+    // being early — those return states this must not override, so the window is
+    // the recent tail rather than the whole pane, and it looks for a positive
+    // "still waiting" statement rather than the mere presence of agents.
+    for s in ne.iter().rev().take(8) {
+        if RE_BG_AGENTS_WAIT.is_match(s) {
+            return TuiState::Active;
+        }
     }
 
     // Step 0: active spinner — highest precedence, wide window
@@ -1444,6 +1475,33 @@ Running 1 shell command · 5s…
 ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt · ← 2 agents                /rc failed";
         let st = claude_tui_state(frame);
         assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+    }
+
+    #[test]
+    fn blocked_on_background_subagents_is_active_not_idle() {
+        // Ethan, 2026-08-15: gtm-playbooks showed IDLE while orchestrating nine
+        // subagents. Frame transcribed from his screenshot — note what it does
+        // NOT contain: no spinner, no "esc to interrupt", and a bare composer.
+        // Every existing Active signal is absent, which is why it fell through
+        // to "bar visible, no signal -> idle at prompt".
+        let frame = "\u{2733} Waiting for 9 background agents to finish\n\n\
+                     \u{203a}\n\n\
+                     \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents \u{b7} \u{2193} to manage";
+        let st = claude_tui_state(frame);
+        assert!(matches!(st, TuiState::Active), "expected Active, got {st:?}");
+    }
+
+    #[test]
+    fn finished_background_agents_do_not_pin_the_lane_active() {
+        // The counterpart, and the reason this keys on the "waiting for N"
+        // SENTENCE rather than on the status bar's agent COUNT: once the agents
+        // land, the waiting line is gone and the lane must fall back to idle.
+        // A count-based check would keep this frame Active forever, which is the
+        // worse failure — a lane pinned Active is never picked up.
+        let frame = "\u{203a}\n\n\
+                     \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} \u{2190} 2 agents \u{b7} \u{2193} to manage";
+        let st = claude_tui_state(frame);
+        assert!(matches!(st, TuiState::Idle), "expected Idle, got {st:?}");
     }
 
     #[test]
