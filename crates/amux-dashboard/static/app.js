@@ -7619,7 +7619,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.647';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.648';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14012,10 +14012,14 @@ function setFileViewMode(mode) {
   const editTab = document.getElementById('file-tab-edit');
   if (editTab) editTab.classList.toggle('active', mode === 'edit');
   document.getElementById('file-save-btn').style.display = (mode === 'edit' && _fileData && (_fileData.is_markdown || _fileData._isNew)) ? '' : 'none';
-  // Search button only valid in markdown preview mode
+  // Search and Read Aloud buttons only valid in markdown preview mode
   const searchTab = document.getElementById('file-tab-search');
   if (searchTab) {
     searchTab.style.display = (_fileData && _fileData.is_markdown && mode === 'preview') ? '' : 'none';
+  }
+  const raTab = document.getElementById('file-tab-readaloud');
+  if (raTab) {
+    raTab.style.display = (_fileData && _fileData.is_markdown && mode === 'preview') ? '' : 'none';
   }
   if (mode !== 'preview') _mdSearchClose();
   if (_fileData) _renderFileBody(_fileData, mode);
@@ -14148,9 +14152,11 @@ async function openFilePreview(path) {
       // Show Edit tab only for markdown
       document.getElementById('file-tab-edit').style.display = data.is_markdown ? '' : 'none';
       document.getElementById('file-tab-teleprompter').style.display = data.is_markdown ? '' : 'none';
-      // Show Find tab only for markdown
+      // Show Find and Read Aloud tabs only for markdown
       const searchTab = document.getElementById('file-tab-search');
       if (searchTab) searchTab.style.display = (data.is_markdown && _fileViewMode === 'preview') ? '' : 'none';
+      const raTab = document.getElementById('file-tab-readaloud');
+      if (raTab) raTab.style.display = (data.is_markdown && _fileViewMode === 'preview') ? '' : 'none';
     }
     // Show download button for all files
     const dlBtn = document.getElementById('file-download-btn');
