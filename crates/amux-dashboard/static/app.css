@@ -941,7 +941,13 @@
   .file-overlay-body.file-video { display:flex;flex-direction:column;align-items:center;justify-content:center;background:#000;padding:0;white-space:normal; }
   .file-video-player { max-width:100%;max-height:calc(100% - 36px);outline:none;display:block; }
   .file-video-meta { width:100%;box-sizing:border-box;padding:6px 14px;display:flex;align-items:center;gap:12px;font-family:-apple-system,BlinkMacSystemFont,sans-serif;font-size:0.72rem;color:var(--dim);flex-shrink:0;background:rgba(0,0,0,0.7); }
-  .file-overlay-body.file-pdf { padding:0;background:var(--bg);white-space:normal; }
+  .file-overlay-body.file-pdf { padding:0;background:var(--bg);white-space:normal;overflow:auto;-webkit-overflow-scrolling:touch; }
+  /* AMUX-3068: pdf.js renders each page to a canvas, stacked and centered, so
+     PDFs preview on iOS where the native <embed> is blank. Pages fit the
+     viewport width, so nothing overflows a 375px phone. */
+  .pdf-pages { display:flex;flex-direction:column;align-items:center;gap:10px;padding:10px 8px; }
+  .pdf-page { max-width:100%;box-shadow:0 1px 8px rgba(0,0,0,0.35);border-radius:4px;background:#fff; }
+  .pdf-note { padding:16px;color:var(--dim);font-size:0.82rem;text-align:center;line-height:1.5; }
   .file-overlay-body.file-csv { white-space:normal;overflow:hidden;display:flex;flex-direction:column;padding:0; }
   /* HTML preview: the iframe fills this box and scrolls its OWN content. Don't
      size the iframe to content height — a content-height iframe has no internal

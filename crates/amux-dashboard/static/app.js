@@ -7589,7 +7589,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.640';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.641';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -13665,6 +13665,103 @@ function _fileHighlightHTML(data) {
     + '</div>';
 }
 
+// AMUX-3068: render PDFs with pdf.js so agent-produced reports preview on iOS.
+// The native <embed type=application/pdf> shows a blank box on iOS Safari / the
+// iOS PWA (mobile WebKit won't render inline PDFs), and amux is mobile-first, so
+// on the primary platform the report was invisible. pdf.js is lazy-loaded on the
+// FIRST pdf open — never in the initial shell — so the mobile bundle stays light,
+// and it falls back to the old <embed> if the CDN lib can't load (offline).
+let _pdfjsPromise = null;
+function _ensurePdfjs() {
+  if (_pdfjsPromise) return _pdfjsPromise;
+  _pdfjsPromise = new Promise((resolve, reject) => {
+    if (window.pdfjsLib) { resolve(window.pdfjsLib); return; }
+    const s = document.createElement('script');
+    s.src = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.min.js';
+    s.onload = () => {
+      if (window.pdfjsLib) {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+          'https://cdn.jsdelivr.net/npm/pdfjs-dist@3.11.174/build/pdf.worker.min.js';
+        resolve(window.pdfjsLib);
+      } else {
+        _pdfjsPromise = null;
+        reject(new Error('pdf.js loaded but pdfjsLib is missing'));
+      }
+    };
+    s.onerror = () => { _pdfjsPromise = null; reject(new Error('failed to load pdf.js')); };
+    document.head.appendChild(s);
+  });
+  return _pdfjsPromise;
+}
+
+// Mobile memory guard: rendering every page of a big report to canvas can OOM a
+// phone, so cap the inline render and point at Download for the rest — shown, not
+// silent (ethos: no silent caps).
+const _PDF_PAGE_CAP = 30;
+
+async function _renderPdf(data, body) {
+  // The server inlines PDFs as a base64 data_url; decode to bytes for pdf.js.
+  let bytes = null;
+  const b64 = (data.data_url || '').split(',')[1];
+  if (b64) {
+    try {
+      const bin = atob(b64);
+      bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+    } catch (e) { bytes = null; }
+  }
+  let pdfjs;
+  try {
+    pdfjs = await _ensurePdfjs();
+  } catch (e) {
+    // Lib unavailable (offline / CDN blocked): fall back to the native embed,
+    // which at least renders on desktop, plus the always-present Download button.
+    body.innerHTML = '<embed src="' + (data.data_url || '') + '" type="application/pdf" '
+      + 'style="width:100%;height:100%;min-height:520px;border-radius:4px;">'
+      + '<div class="pdf-note">Inline rendering needs a connection — use Download to open offline.</div>';
+    return;
+  }
+  try {
+    const src = bytes
+      ? { data: bytes }
+      : { url: _authUrl(API + '/api/file/raw?path=' + encodeURIComponent(data.path)) };
+    const pdf = await pdfjs.getDocument(src).promise;
+    // The overlay may have been closed while the lib/doc loaded.
+    const overlay = document.getElementById('file-overlay');
+    if (!overlay || !overlay.classList.contains('active')) return;
+    body.innerHTML = '';
+    const wrap = document.createElement('div');
+    wrap.className = 'pdf-pages';
+    body.appendChild(wrap);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    const pages = Math.min(pdf.numPages, _PDF_PAGE_CAP);
+    for (let n = 1; n <= pages; n++) {
+      const page = await pdf.getPage(n);
+      const cssWidth = Math.min(wrap.clientWidth || body.clientWidth || 800, 900) - 4;
+      const base = page.getViewport({ scale: 1 });
+      const vp = page.getViewport({ scale: (cssWidth / base.width) * dpr });
+      const canvas = document.createElement('canvas');
+      canvas.className = 'pdf-page';
+      canvas.width = Math.ceil(vp.width);
+      canvas.height = Math.ceil(vp.height);
+      canvas.style.width = cssWidth + 'px';
+      canvas.style.height = (vp.height / dpr) + 'px';
+      wrap.appendChild(canvas);
+      await page.render({ canvasContext: canvas.getContext('2d'), viewport: vp }).promise;
+    }
+    if (pdf.numPages > pages) {
+      const more = document.createElement('div');
+      more.className = 'pdf-note';
+      more.textContent = 'Showing ' + pages + ' of ' + pdf.numPages
+        + ' pages — use Download to open the full document.';
+      wrap.appendChild(more);
+    }
+  } catch (e) {
+    body.innerHTML = '<div class="pdf-note">Could not render this PDF ('
+      + ((e && e.message) || e) + '). Use Download to open it.</div>';
+  }
+}
+
 function _renderFileBody(data, mode) {
   _readPosDetach();   // flush + detach the previous file's reading-position tracker
   // Tear down any active markdown-search highlights before re-rendering
@@ -13689,7 +13786,8 @@ function _renderFileBody(data, mode) {
   }
   if (data.is_pdf) {
     body.className = 'file-overlay-body file-pdf';
-    body.innerHTML = `<embed src="${data.data_url}" type="application/pdf" style="width:100%;height:100%;min-height:520px;border-radius:4px;">`;
+    body.innerHTML = '<div class="pdf-note">Loading PDF…</div>';
+    _renderPdf(data, body);
     return;
   }
   // Renderable ebook (EPUB/FB2/CBZ): server already inlined everything into a
