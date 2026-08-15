@@ -727,7 +727,22 @@ fn claude_ui_visible(clean_output: &str) -> bool {
         if shell_prompt.is_match(&ls) {
             continue;
         }
-        if l.contains("\u{23f5}\u{23f5}") || ls.contains("bypass permissions") || ls.contains("plan mode") {
+        // Permission-mode footer, ALL modes. The list used to hold only the
+        // bypass (⏵⏵ / "bypass permissions") and "plan mode" footers, so a
+        // session booted WITHOUT --dangerously-skip-permissions (the default
+        // for a worker created from the dashboard modal) shows the footer
+        // "⏸ manual mode on · ? for shortcuts" and was NEVER detected as ready.
+        // send_after_ready then polled for its whole timeout and dropped the
+        // create-modal start prompt on the floor (AMUX-3055). "for shortcuts"
+        // is the mode-independent idle-composer footer Claude Code prints in
+        // every permission mode and no shell prints it, so it is a safe
+        // positive marker that closes the whole mode family at once.
+        if l.contains("\u{23f5}\u{23f5}")
+            || ls.contains("bypass permissions")
+            || ls.contains("plan mode")
+            || ls.contains("manual mode")
+            || ls.contains("for shortcuts")
+        {
             return true;
         }
         if ls.contains("codex")
@@ -3656,6 +3671,32 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
         }
         sleep_ms(500).await;
     }
+    // TIMED OUT WITH THE MESSAGE UNDELIVERED (AMUX-3055). This path used to
+    // return silently, so a dropped create-modal start prompt left NO trace
+    // anywhere (no log line, no event, no board card) and the only symptom was
+    // an empty session a human had to notice. That invisibility is exactly what
+    // the repo's "every bug fix is two fixes" rule exists to kill: the next drop
+    // of this class now self-announces in the server log AND the session-events
+    // feed, so a sweep finds it without anyone watching the pane.
+    tracing::warn!(
+        session = %name,
+        timeout_s,
+        chars = text.chars().count(),
+        "send_after_ready: Claude UI never became ready before timeout; start/wake prompt DROPPED undelivered"
+    );
+    emit_event(
+        &state,
+        &name,
+        "session.prompt_dropped",
+        Some(json!({
+            "reason": "ui_not_ready_before_timeout",
+            "timeout_s": timeout_s,
+            "chars": text.chars().count(),
+        })),
+        None,
+        "send-after-ready",
+    )
+    .await;
 }
 
 /// Which delivery mode a send takes: `true` = tmux paste-buffer, `false` =
@@ -3926,6 +3967,46 @@ async fn send_text_inner(
         // Suggested-prompt extraction (py:25501): pull the ❯ suggestion.
         let pane = tmux_capture(name, 0).await;
         let clean = strip_ansi(&pane);
+        // A SELECTOR IS NOT A SUGGESTION. ACCEPT THE HIGHLIGHTED OPTION WITH AN
+        // ENTER KEYPRESS (AMUX-3054, generalising AMUX-2952). An empty send is
+        // the user pressing "Enter" at the picker. Whatever the picker's shape,
+        // numbered ("❯ 1. Submit answers"), a bare label ("❯ Yes"), or a
+        // footered list, the correct action is the Enter KEY, which accepts the
+        // highlighted default. Extracting the ❯ line and DELIVERING IT AS TEXT
+        // re-types the label into a UI that reads KEY events, and since
+        // AMUX-2909 pastes picker-shaped panes the label lands as one
+        // bracketed-paste event that the picker swallows whole, so the Enter
+        // never lands, silently, while the response still says "sent". AMUX-2952
+        // pressed Enter for NUMBERED options only; a non-numbered highlighted
+        // option still slipped through to the paste path, and a footered picker
+        // returned "no suggestion found" so a composer empty-send with no client
+        // fallback did nothing. Gate on the SELECTOR STATE, not on the option's
+        // numbering, so every picker shape is covered by one rule.
+        //
+        // A rate-limit menu is ALSO a "waiting" selector, but it has its own
+        // handler below that STAMPS `rate_limited_since` before pressing Enter
+        // (AMUX-2820). Returning here would drop that stamp, so it is excluded
+        // and falls through to the dedicated path.
+        if detect_claude_status(&pane) == "waiting" && !is_rate_limit_menu(&pane) {
+            let (ok, msg) = send_keys_op(name, "Enter").await;
+            // WARN, not info: an empty send landing on a selector is exactly the
+            // AMUX-3054 report, and this line is the countable signal a log sweep
+            // reads to see the class recur (the two-fix rule). `ok=false` here is
+            // a genuine keystroke-delivery failure worth paging on.
+            tracing::warn!(
+                session = %name, ok, detail = %msg,
+                "[picker-enter/AMUX-3054] empty send at a selector: pressed Enter to accept the \
+                 highlighted option instead of pasting a label; keys must reach a picker as a KEYPRESS"
+            );
+            return (
+                ok,
+                if ok {
+                    "pressed Enter on the picker (accepted the highlighted option)".into()
+                } else {
+                    format!("picker Enter failed: {msg}")
+                },
+            );
+        }
         let nonblank: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
         let footer: Vec<&str> = nonblank[nonblank.len().saturating_sub(4)..]
             .iter()
@@ -3961,14 +4042,23 @@ async fn send_text_inner(
                     // Enter KEY. Scoped to options that start "N." so a plain
                     // suggested prompt ("❯ retry the failing test") still goes
                     // through the text path unchanged.
+                    //
+                    // AMUX-3054 note: the SELECTOR-STATE check above now catches
+                    // every picker `detect_claude_status` recognises as
+                    // "waiting", numbered or not, so reaching HERE means a
+                    // numbered picker that detection did NOT classify as waiting.
+                    // That is a `detect_claude_status` gap, so this fallback logs
+                    // WARN. A nonzero count is the tell that the detector needs
+                    // the shape added, and it stops the label ever being pasted.
                     let is_numbered = suggested
                         .split_once('.')
                         .is_some_and(|(n, _)| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
                     if is_numbered {
                         let (ok, msg) = send_keys_op(name, "Enter").await;
-                        tracing::info!(
+                        tracing::warn!(
                             session = %name, ok, detail = %msg,
-                            "[picker-enter/AMUX-2952] empty send at a numbered selector — pressed Enter instead of pasting the label"
+                            "[picker-enter/AMUX-2952] empty send at a numbered selector detect_claude_status \
+                             missed: pressed Enter instead of pasting the label (detection gap)"
                         );
                         return (
                             ok,
@@ -8971,7 +9061,13 @@ async fn post_dispatch(
                 let (ok, msg) = start_session(&st2, &n, "", false).await;
                 if ok {
                     if !prompt.is_empty() {
-                        send_after_ready(st2.clone(), n.clone(), prompt, 30).await;
+                        // 60s, matching the auto-wake path: a session created
+                        // from the modal is on its FIRST-run boot (fresh Claude
+                        // Code, MCP init), the slowest case, so a 30s window was
+                        // the tightest one for the very path most likely to
+                        // exceed it (AMUX-3055). The loop still exits the instant
+                        // the composer appears, so this only widens the ceiling.
+                        send_after_ready(st2.clone(), n.clone(), prompt, 60).await;
                     }
                 } else {
                     // A background failure must still be SEEN (ethos rule 4).
@@ -12106,6 +12202,14 @@ mod tests {
         let claude_idle = "some output\n\u{276f} \n  ⏵⏵ bypass permissions on (shift+tab to cycle)";
         assert!(claude_ui_visible(claude_idle));
         assert!(!at_shell_prompt(claude_idle));
+        // AMUX-3055: the DEFAULT footer (no --dangerously-skip-permissions) is
+        // "manual mode on · ? for shortcuts", NOT the bypass footer. This frame
+        // is a real capture from a modal-created worker and returned false from
+        // the old detector, so send_after_ready dropped its start prompt. The
+        // assertion fails against that old detector, which is the point.
+        let claude_manual = "some output\n\u{276f} Try \"fix typecheck errors\"\n────\n⏸ manual mode on · ? for shortcuts · ← 2 agents";
+        assert!(claude_ui_visible(claude_manual), "manual-mode idle UI must read as visible");
+        assert!(!at_shell_prompt(claude_manual));
         let shell = "Last login: Sat\nmixpeek$ ";
         assert!(!claude_ui_visible(shell));
         assert!(at_shell_prompt(shell));
@@ -12143,6 +12247,44 @@ mod tests {
         // showed through because nothing recognised the spinner).
         let gemini_working = "\u{2502} \u{22b7}  Shell sleep 15 && echo ROUND2\n \u{2819} Thinking... (esc to cancel, 9s)\n YOLO Ctrl+Y";
         assert_eq!(detect_claude_status(gemini_working), "active");
+    }
+
+    /// AMUX-3054: an empty send is the user pressing "Enter" at a picker. The
+    /// server must ACCEPT the highlighted option with an Enter KEYPRESS, not
+    /// paste the ❯ label as text (which a picker reading key events swallows,
+    /// so the Enter never lands). The load-bearing decision is the gate
+    /// `detect_claude_status(pane) == "waiting" && !is_rate_limit_menu(pane)`;
+    /// this asserts the discriminator directly against real picker shapes, so a
+    /// regression that reclassifies a selector cannot pass green.
+    #[test]
+    fn empty_send_at_a_selector_takes_the_enter_path() {
+        // Predicate under test: the exact gate shipped in send_text_inner.
+        let picker_enter = |pane: &str| detect_claude_status(pane) == "waiting" && !is_rate_limit_menu(pane);
+
+        // AskUserQuestion review/submit screen (AMUX-2952 shape): numbered, no
+        // "enter to select" footer. Must take the Enter path.
+        let submit = "  Here is my plan.\n\u{2502} \u{276f} 1. Submit answers\n\u{2502}   2. Edit answer 1";
+        assert!(picker_enter(submit), "numbered submit screen must press Enter");
+
+        // A FOOTERED selector: previously the footer guard returned "no
+        // suggestion found" and a composer empty-send (no client fallback) did
+        // nothing. Now it presses Enter here on the server, before that guard.
+        let footered = "Do you want to proceed?\n\u{276f} 1. Yes\n  2. No\n  \u{2191}\u{2193} to navigate \u{00b7} enter to select";
+        assert!(picker_enter(footered), "footered selector must press Enter, not no-op");
+
+        // A rate-limit menu is a "waiting" selector too, but it owns a dedicated
+        // handler that STAMPS credit_limited before pressing 1 (AMUX-2820).
+        // Excluding it here keeps that stamp, so the gate must NOT fire.
+        let ratelimit = "What do you want to do?\n\u{276f} 1. Stop and wait for limit to reset\n  2. Switch to usage credits\n  3. Switch to Team plan";
+        assert_eq!(detect_claude_status(ratelimit), "waiting");
+        assert!(!picker_enter(ratelimit), "rate-limit menu must fall through to its own handler");
+
+        // CONTROL: an IDLE composer showing a genuine suggested prompt is NOT a
+        // selector, so it must stay on the text path and get the suggestion
+        // typed and submitted, not turned into a bare Enter.
+        let idle_suggestion = "\u{276f} retry the failing test\n────\n\u{23f8} manual mode on \u{00b7} ? for shortcuts";
+        assert_ne!(detect_claude_status(idle_suggestion), "waiting");
+        assert!(!picker_enter(idle_suggestion), "an idle suggested prompt must NOT be treated as a picker");
     }
 
     // ---- AMUX-2612: session identity survives a resume --------------------

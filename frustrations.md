@@ -2750,3 +2750,51 @@ COST: Two genuinely-verified cards cannot reach `verified`; the strongest verifi
   available (the affected user, who also reported the bug) does not count toward the gate.
 FIX: The verified gate should accept verification by the originating reporter, or by any
   worker when the card records who plus their evidence (AMUX-3119).
+
+## Create-modal start prompt dropped silently when a worker boots in the default (manual) permission mode
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-14
+SESSION: amux
+CARD: AMUX-3055
+SYMPTOM: Creating a worker from the dashboard modal with a start prompt, then peeking the
+  new session: Claude Code was up and idle ("❯ Try ...", footer "⏸ manual mode on · ? for
+  shortcuts"), but the start prompt was never delivered (composer empty, status stayed idle,
+  the prompt token never appeared). send_after_ready polled claude_ui_visible for its whole
+  timeout and returned with NOTHING logged (no server line, no session event, no board card).
+COST: The initial prompt for every non-bypass worker created from the modal was lost, and
+  the loss was invisible: the only symptom was an empty session a human had to notice. Root
+  cause was a footer allow-list (claude_ui_visible matched only ⏵⏵/"bypass permissions"/"plan
+  mode"), so a default manual-mode worker read as "UI not ready" forever.
+FIX: Fixed at root. claude_ui_visible now also matches "manual mode" / "for shortcuts"
+  (the mode-independent idle footer), send_after_ready now WARN-logs and emits a
+  session.prompt_dropped event on timeout so the next drop self-announces, the create-start
+  timeout was widened 30s->60s for first-run boots, and a regression test asserts the real
+  manual-mode frame reads as visible. crates/amux-server/src/api/session_verbs.rs (uncommitted).
+
+## Pressing Enter at a non-numbered/footered picker pasted the option label instead of pressing Enter, so the key never landed
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-14
+SESSION: amux
+CARD: AMUX-3054
+SYMPTOM: A worker sat at an interactive input picker (input list / menu). Pressing the
+  dashboard "Enter" affordance did nothing, silently, while the API answered ok. The Enter
+  affordances route through an empty send (POST /api/sessions/<n>/send {text:""}) which
+  extracts the highlighted ❯ line. AMUX-2952 pressed a real Enter only when the option was
+  NUMBERED; a non-numbered highlighted option ("❯ Yes") was extracted and DELIVERED AS TEXT,
+  and since AMUX-2909 pastes picker-shaped panes it landed as one bracketed-paste event the
+  picker swallowed whole. A footered picker returned "no suggestion found" and the composer
+  empty-send (no client fallback) also did nothing.
+COST: Every attempt to answer certain pickers from the dashboard was a silent no-op; the
+  worker stayed blocked at the picker and the human had to fall back to a raw keypress. The
+  next occurrence left no trace (info-level log at best, only on the numbered path).
+FIX: Fixed at root in send_text_inner's empty-send path: gate on the SELECTOR STATE
+  (detect_claude_status == "waiting" && !is_rate_limit_menu), not on the option's numbering,
+  and press Enter to accept the highlighted option for every picker shape. Emits a WARN
+  [picker-enter/AMUX-3054] so the class is countable; the numbered fallback now WARNs too
+  (a hit there means a detect_claude_status gap). Rate-limit menus are excluded so their
+  dedicated handler keeps stamping credit_limited. Unit test locks the discriminator.
+  crates/amux-server/src/api/session_verbs.rs (uncommitted).
