@@ -162,10 +162,24 @@ test('board: create shows the card; Clear done visibly removes it', async ({ pag
 test('alert settings toggle: save answers with a toast (new no-silent-actions feedback)', async ({ page }) => {
   await settle(page);
   await page.click('#settings-btn');
+  // AMUX-2975 (ec031ce) grouped settings into tabs; the alert toggle's panel is
+  // display:none until its tab is active, which timed out scrollIntoViewIfNeeded.
+  // Reveal all panels (the same approach settings.spec.ts's openSettings uses and
+  // that settings_alerts_config / settings_theme_toggle pass green on all three
+  // engines) rather than click the tab: on WebKit a tab-button click left the
+  // panel shown but the subsequent track-click's save/toast never fired, while the
+  // CSS reveal matches the flow those tests already verify cross-engine.
+  await page.addStyleTag({
+    content: '#settings-menu .settings-tab-panel{display:block !important}',
+  });
   const cb = page.locator('#alert-push-cb');
   await cb.scrollIntoViewIfNeeded();
-  // The input sits under a styled track; click the track as a user would.
-  await page.locator('label:has(#alert-push-cb) .theme-track').click();
+  // Click the LABEL, not the inner .theme-track span: on WebKit clicking the span
+  // toggled the checkbox visually but did not dispatch the input's `change` event,
+  // so saveAlertConfig() (bound via onchange) never ran and no toast appeared.
+  // Clicking the associated <label> reliably fires change on every engine, and is
+  // equally "as a user would" — the whole toggle is the label.
+  await page.locator('label:has(#alert-push-cb)').click();
   const toast = page.locator('#toast.visible');
   await expect(toast).toBeVisible({ timeout: 2_000 });
   await expect(toast).toContainText(/Alert settings saved|Failed to save alert settings/);

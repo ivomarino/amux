@@ -111,6 +111,17 @@ async function openSettings(page: Page): Promise<void> {
     await page.click('#settings-btn');
   }
   await expect(menu).toHaveClass(/open/);
+  // AMUX-2975 (ec031ce) grouped the 17 settings sections into 5 tabs, so only the
+  // ACTIVE tab's panel is `display:block` and controls in the other four are
+  // `display:none` — which timed out every fill/click/scrollIntoView in this file
+  // (a control the user reaches by clicking its tab). These tests exercise each
+  // control's ENDPOINT, not the tab chrome, so reveal ALL panels: any control is
+  // then interactable regardless of which tab is active. The tab-switching UX
+  // itself is a separate concern (a user really does click the tab); this only
+  // removes the visibility gate the endpoint tests never meant to assert.
+  await page.addStyleTag({
+    content: '#settings-menu .settings-tab-panel{display:block !important}',
+  });
 }
 
 /** Bearer token as the SPA received it from the served bootstrap. */
