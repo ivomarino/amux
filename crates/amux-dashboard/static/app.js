@@ -7557,7 +7557,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.634';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.635';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -12133,8 +12133,16 @@ function _peekMessagesRender() {
       pbar.style.display = 'flex';
     } else { pbar.innerHTML = ''; pbar.style.display = 'none'; }
   }
-  list.innerHTML = (pendingHTML + histHTML)
-    || `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${_empty}</div>`;
+  // Load-older affordance at the BOTTOM (rows are newest-first, so older loads
+  // below). Shown whenever the server has more pages, even when the current
+  // kind/search filter leaves the visible set small — that is exactly when you
+  // need to page back to find more of it.
+  const moreHTML = _peekMsgDone ? '' :
+    '<button class="btn" id="peek-msgs-more-btn" style="align-self:center;margin:8px auto;font-size:0.78rem;min-height:36px;" onclick="_peekMessagesLoad(true)">Load older</button>';
+  const _body = pendingHTML + histHTML;
+  list.innerHTML = (_body
+    || `<div style="color:var(--dim);font-size:0.85rem;padding:20px;text-align:center;">${_empty}</div>`)
+    + moreHTML;
   _peekMessagesBadge();
 }
 // Jump the per-worker Messages list to a chosen day. Unlike the global timeline
@@ -12142,8 +12150,21 @@ function _peekMessagesRender() {
 // pure scroll: land on the day's header, or the nearest one on/before it, and
 // flash it. If the day predates the loaded window there is nothing to page in, so
 // say so rather than silently scrolling to the oldest row.
-function _peekMsgsJumpToDate(dateStr) {
+async function _peekMsgsJumpToDate(dateStr) {
   if (!dateStr) return;
+  const target = new Date(dateStr + 'T00:00:00').getTime();  // local start-of-day, ms
+  // The view is paged now, so an older day is reachable: keep loading older
+  // pages until the target day is in range (or the store is exhausted), then
+  // scroll to it — the same behaviour the global timeline's date-jump has.
+  let guard = 0;
+  while (!_peekMsgDone && guard < 80) {
+    const items = _peekMessagesFor();          // newest-first
+    const last = items[items.length - 1];      // oldest loaded row
+    const oldest = last ? (last.time || last.ts || Infinity) : Infinity;
+    if (oldest <= target + 86400000) break;    // loaded into (or past) that day
+    await _peekMessagesLoad(true);
+    guard++;
+  }
   const list = document.getElementById('peek-messages-list');
   if (!list) return;
   const hdrs = [...list.querySelectorAll('.msgs-date-header')];  // newest first
@@ -12154,7 +12175,7 @@ function _peekMsgsJumpToDate(dateStr) {
     hdr.classList.add('msgs-date-flash');
     setTimeout(() => hdr.classList.remove('msgs-date-flash'), 1500);
   } else if (typeof showToast === 'function') {
-    showToast('No messages loaded on or before that date');
+    showToast('No messages on or before that date');
   }
 }
 // The shared _cmdHistory cache is a GLOBAL 500-row window, and on a busy fleet
@@ -12162,8 +12183,15 @@ function _peekMsgsJumpToDate(dateStr) {
 // that down to one session's human messages left almost nothing — the peek tab
 // for mixpeek-orchestrator showed "Human 0" while the session had plenty.
 // Fetch a SESSION-SCOPED window instead, so each session gets its own 500.
-let _peekMsgRows = null;      // server rows for peekSession, or null = not loaded
+let _peekMsgRows = null;      // MERGED display rows (server + pending), oldest-first, or null
 let _peekMsgRowsFor = '';     // which session _peekMsgRows belongs to
+// Pagination for the per-worker Messages tab (AMUX: paginate worker like global).
+// The view used to load ONE 500-row session window with no way to reach older
+// messages; it now pages by offset like the global timeline (_messagesLoad).
+let _peekMsgServerRows = [];  // raw server rows accumulated across pages, current session
+let _peekMsgOffset = 0;       // server offset = count of raw server rows fetched so far
+let _peekMsgDone = false;     // no older server page remains
+const _PEEK_MSG_PAGE = 200;   // page size, matching the global _MSGS_PAGE
 
 // Local entries that the server has not echoed yet (no id) must survive the
 // swap to server-scoped rows, or a message you just sent vanishes until the
@@ -12181,29 +12209,37 @@ function _mergeUnechoed(serverRows, session) {
 // group or global caller exists — the sequencing amux-cloud called the most
 // valuable paragraph on the original card, and the same order that made the
 // Scope tab's second caller a one-liner instead of a second renderer.
-async function _peekMsgFetch(scope) {
+async function _peekMsgFetch(scope, offset) {
   const sc = (typeof scope === 'string') ? { level: 'worker', name: scope } : (scope || {});
   const q = sc.level === 'group'  ? '&group=' + encodeURIComponent(sc.name)
           : sc.level === 'global' ? ''
           : '&session=' + encodeURIComponent(sc.name);
-  const r = await fetch(API + '/api/history?limit=500' + q, { headers: _authHeaders() });
+  const r = await fetch(API + '/api/history?limit=' + _PEEK_MSG_PAGE + '&offset=' + (offset || 0) + q, { headers: _authHeaders() });
   if (!r.ok) throw new Error('history ' + r.status);
-  const rows = (await r.json()).map(_msgNorm);
-  // Locally-queued sends belong to a WORKER; merging them into a group or global
-  // view would attribute one worker's unsent messages to the whole scope.
-  return _mergeUnechoed(rows.reverse(), sc.level === 'worker' ? sc.name : '');
+  // Raw server page (newest-first). The pending-unechoed merge and the time sort
+  // happen ONCE in _peekMessagesLoad, on the full accumulated set — merging
+  // per-page would prepend the same locally-queued sends to every page.
+  return (await r.json()).map(_msgNorm);
 }
 
-async function _peekMessagesLoad() {
+async function _peekMessagesLoad(more) {
   const sess = peekSession;
-  if (_peekMsgRowsFor !== sess) { _peekMsgRows = null; _peekMsgRowsFor = sess; }
-  _peekMessagesRender();                       // paint from local cache instantly
+  if (_peekMsgRowsFor !== sess) {              // session changed -> full reset, treat as first page
+    _peekMsgRows = null; _peekMsgServerRows = []; _peekMsgOffset = 0; _peekMsgDone = false;
+    _peekMsgRowsFor = sess; more = false;
+  }
+  if (more && _peekMsgDone) return;            // nothing older to load
+  if (!more) { _peekMsgServerRows = []; _peekMsgOffset = 0; _peekMsgDone = false; }
+  _peekMessagesRender();                        // paint what we have instantly
   try {
-    const rows = await _peekMsgFetch({ level: 'worker', name: sess });
-    if (peekSession !== sess) return;          // user moved on mid-flight
-    _peekMsgRows = rows;
+    const rows = await _peekMsgFetch({ level: 'worker', name: sess }, _peekMsgOffset);
+    if (peekSession !== sess) return;           // user moved on mid-flight
+    _peekMsgServerRows = _peekMsgServerRows.concat(rows);
+    _peekMsgOffset += rows.length;
+    _peekMsgDone = rows.length < _PEEK_MSG_PAGE; // a short page is the last page
+    _peekMsgRows = _mergeUnechoed(_peekMsgServerRows, sess); // pending merge + time sort, once, on the full set
   } catch(e) {
-    try { await _loadCmdHistoryFromServer(); } catch(e2) {}   // fall back to the shared cache
+    if (!more) { try { await _loadCmdHistoryFromServer(); } catch(e2) {} } // fall back to the shared cache on first load only
   }
   _peekMessagesRender();
 }
