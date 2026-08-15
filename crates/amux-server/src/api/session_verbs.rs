@@ -6891,6 +6891,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                             Some(json!({
                                 "reason": "pickup-stale", "card": card_id,
                                 "became": became, "delay_s": delay_s,
+                                "delivered": false,
                                 "preview": chars_truncate(&text, 80),
                             })),
                             Some(format!("void:{id}")),
@@ -6899,6 +6900,38 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                         .await;
                         continue;
                     }
+                } else {
+                    // READ FAILED (Err), so the stale-check could not run: fall
+                    // through and DELIVER (fail-open — losing a valid pickup is
+                    // worse than a spurious one). But emit a signal, because the
+                    // void event only fires on the DROP path, so a stale pickup let
+                    // through here would otherwise be invisible. Without this, a
+                    // degrading DB makes the measured void rate FALL while the true
+                    // stale rate rises, reading as the fix working better exactly
+                    // when the guard has stopped running (gtm-engine, AMUX-3052).
+                    // Same message.voided type with delivered=true keeps the
+                    // denominator (caught + let-through) queryable in one place; a
+                    // nonzero count here is independently page-worthy — the guard is
+                    // deployed but blind.
+                    tracing::warn!(
+                        session = %session, id = %id, card = %card_id,
+                        "auto-pickup stale-check read FAILED — delivering (fail-open); \
+                         the AMUX-3052 guard could not run for this pickup, so a stale \
+                         one could slip through uncounted"
+                    );
+                    emit_event(
+                        state,
+                        &session,
+                        "message.voided",
+                        Some(json!({
+                            "reason": "pickup-check-failed", "card": card_id,
+                            "delivered": true,
+                            "preview": chars_truncate(&text, 80),
+                        })),
+                        Some(format!("checkfail:{id}")),
+                        "board-drive",
+                    )
+                    .await;
                 }
             }
         }
