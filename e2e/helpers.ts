@@ -1,4 +1,4 @@
-import { expect, Locator } from '@playwright/test';
+import { expect, BrowserContext, Locator } from '@playwright/test';
 
 /**
  * Click something inside a scroll-snap container (the board kanban) reliably.
@@ -64,4 +64,25 @@ export async function clickSnapped(target: Locator, label = 'element') {
       `product. AF-47 was filed that way once: a silent miss looks exactly like a broken button.\n` +
       `Last error: ${last}`,
   );
+}
+
+
+/**
+ * Grant clipboard write where the permission EXISTS, and nowhere else.
+ *
+ * WebKit has no 'clipboard-write' permission, and asking for it is a hard error
+ * — `browserContext.grantPermissions: Unknown permission: clipboard-write` —
+ * which fails the test before the page loads. It allows the write under a user
+ * gesture instead, which a real click is.
+ *
+ * A helper rather than an inline `if`, because the inline version is exactly
+ * what did not get carried forward: it was written once in feedback-smoke.spec
+ * (AMUX-3057), then omitted from msg-id-copy.spec, which reached CI as a
+ * deterministic ios-safari failure. One import is harder to forget than one
+ * remembered condition, and if the engine gap ever changes there is a single
+ * place to change it.
+ */
+export async function grantClipboard(context: BrowserContext, browserName: string) {
+  if (browserName === 'webkit') return;
+  await context.grantPermissions(['clipboard-write']);
 }

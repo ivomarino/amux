@@ -78,6 +78,22 @@ export default defineConfig({
   retries: 0,
   use: {
     ignoreHTTPSErrors: true, // self-signed cert is the product behavior
+    // SERVICE WORKERS OFF BY DEFAULT — opt-OUT, not opt-in (AMUX-3057 class).
+    //
+    // sw.js reloads the page on `controllerchange` the moment a freshly
+    // registered worker claims the client, which on the clean profile each
+    // project gets lands mid-`page.evaluate` and throws "Execution context was
+    // destroyed, most likely because of a navigation". It also swallows
+    // page.route stubs, since a request passing through the worker's fetch
+    // handler is invisible to them.
+    //
+    // This was fixed three times per-spec (tab-customizer, system-jobs,
+    // peek-tab-menu-anchor) and then omitted from the next three specs I wrote,
+    // which is how it reached CI. A per-file convention that must be REMEMBERED
+    // is the thing that failed; the default has to carry it. sw-fail-bar.spec.ts
+    // — the one spec that actually tests the worker — opts back in with
+    // test.use({ serviceWorkers: 'allow' }).
+    serviceWorkers: 'block',
   },
   projects: TARGETS.map((t) => ({
     name: t.name,

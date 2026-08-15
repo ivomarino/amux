@@ -1,5 +1,10 @@
 import { test, expect } from '@playwright/test';
 
+// OPT BACK IN: this is the one spec whose subject IS the service worker, so the
+// config's global `serviceWorkers: 'block'` would make every assertion here
+// vacuous — the bar it checks for exists precisely because registration fails.
+test.use({ serviceWorkers: 'allow' });
+
 // PINNED TO 375px, not left to whichever project runs it. The bug and its
 // control are both WIDTH-DEPENDENT: at 375 the bar's message wraps to three or
 // four lines and swallows the action row, while at desktop width it is a single

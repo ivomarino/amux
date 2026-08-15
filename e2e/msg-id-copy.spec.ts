@@ -1,6 +1,8 @@
 import { test, expect } from '@playwright/test';
-test('copying a message id puts the MSG- prefix on the clipboard', async ({ page, context }) => {
-  await context.grantPermissions(['clipboard-write', 'clipboard-read']);
+import { grantClipboard } from './helpers';
+test('copying a message id puts the MSG- prefix on the clipboard', async ({ page, context, browserName }) => {
+  // WebKit has no such permission and asking is a hard error — see grantClipboard.
+  await grantClipboard(context, browserName);
   await page.goto('/');
   await page.waitForFunction(() => typeof (window as any)._copyMsgId === 'function', { timeout: 20000 });
   // Drive the real function, capturing what it writes — the clipboard is the
