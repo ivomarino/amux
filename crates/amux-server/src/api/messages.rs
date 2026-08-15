@@ -178,6 +178,79 @@ fn message_body(m: &Message) -> Value {
     serde_json::to_value(m).unwrap_or_else(|_| json!({ "id": m.id.as_str() }))
 }
 
+/// Resolve a recipient key — a `wrk_.../grp_...` id, the literal "human", or a
+/// worker name/alias — to a MessageTarget. `Ok(None)` means a worker name that
+/// does not exist. Shared by POST /api/messages and /api/env/apply's messages
+/// stanza so recipients resolve through ONE path (ethos D6).
+pub(crate) fn resolve_recipient(
+    conn: &Connection,
+    key: &str,
+) -> rusqlite::Result<Option<MessageTarget>> {
+    if let Ok(w) = WorkerId::parse(key) {
+        Ok(Some(MessageTarget::Worker(w)))
+    } else if let Ok(g) = GroupId::parse(key) {
+        Ok(Some(MessageTarget::Group(g)))
+    } else if key.eq_ignore_ascii_case("human") {
+        Ok(Some(MessageTarget::Human))
+    } else {
+        queries::get_worker(conn, key)?
+            .map(|row| WorkerId::parse(&row.id).map(MessageTarget::Worker).map_err(corrupt))
+            .transpose()
+    }
+}
+
+/// Insert one message and enqueue its AtTurnBoundary deliveries — a group target
+/// fans out to per-member children (Invariant 12/29), a worker enqueues one, a
+/// human queues nothing. THE delivery seam: POST /api/messages and
+/// /api/env/apply both go through here, so a delivery is never spelled twice
+/// (ethos D6; Invariant 9 no-double-queue holds via the derived idempotency key).
+/// Returns (parent, fan-out child ids, deliveries enqueued, revision events).
+pub(crate) fn insert_message_and_deliver(
+    conn: &Connection,
+    from: Actor,
+    target: MessageTarget,
+    text: String,
+    thread: Option<MessageId>,
+    now: DateTime<Utc>,
+) -> rusqlite::Result<(Message, Vec<String>, usize, Vec<PendingEvent>)> {
+    let parent = Message::new(
+        MessageId::from_ulid(ulid::Ulid::new()),
+        from,
+        target.clone(),
+        text,
+        thread,
+        now,
+    );
+    insert_message(conn, &parent)?;
+    let mut events = vec![ev(EntityType::Message, parent.id.as_str(), MutationKind::Created)];
+    let mut children_ids = Vec::new();
+    let mut commands_enqueued = 0usize;
+    match &target {
+        MessageTarget::Worker(w) => {
+            enqueue_delivery(conn, w, &parent.id, now)?;
+            commands_enqueued += 1;
+        }
+        MessageTarget::Group(g) => {
+            // Per-recipient children (Invariant 29/12); an empty group honestly
+            // fans out to nothing — the parent row still records the send.
+            let members = group_members(conn, g)?;
+            let mut mint = || MessageId::from_ulid(ulid::Ulid::new());
+            for child in fan_out(&parent, &members, &mut mint) {
+                insert_message(conn, &child)?;
+                events.push(ev(EntityType::Message, child.id.as_str(), MutationKind::Created));
+                if let MessageTarget::Worker(w) = &child.to {
+                    enqueue_delivery(conn, w, &child.id, now)?;
+                    commands_enqueued += 1;
+                }
+                children_ids.push(child.id.as_str().to_string());
+            }
+        }
+        // Human: surfaced via the message list/SSE; nothing to queue.
+        MessageTarget::Human => {}
+    }
+    Ok((parent, children_ids, commands_enqueued, events))
+}
+
 // ---- POST /api/messages ---------------------------------------------------
 
 /// How the caller names the recipient. A bare string is resolved
@@ -269,33 +342,24 @@ pub async fn create_message(
     let write = state
         .store
         .write_async(move |conn| {
-            // Resolve the recipient against current state, inside the
-            // writer transaction so it cannot race a delete.
+            // Resolve the recipient against current state, inside the writer
+            // transaction so it cannot race a delete — through the SAME resolver
+            // /api/env/apply uses (ethos D6).
             let target: MessageTarget = match &to_spec {
                 ToSpec::Target(t) => t.clone(),
-                ToSpec::Key(s) => {
-                    if let Ok(w) = WorkerId::parse(s) {
-                        MessageTarget::Worker(w)
-                    } else if let Ok(g) = GroupId::parse(s) {
-                        MessageTarget::Group(g)
-                    } else if s.eq_ignore_ascii_case("human") {
-                        MessageTarget::Human
-                    } else {
-                        match queries::get_worker(conn, s)? {
-                            Some(row) => MessageTarget::Worker(
-                                WorkerId::parse(&row.id).map_err(corrupt)?,
-                            ),
-                            None => {
-                                return finish(
-                                    &slot_w,
-                                    CreateOutcome::NotFound { what: format!("worker '{s}'") },
-                                    no_write(),
-                                )
-                            }
-                        }
+                ToSpec::Key(s) => match resolve_recipient(conn, s)? {
+                    Some(t) => t,
+                    None => {
+                        return finish(
+                            &slot_w,
+                            CreateOutcome::NotFound { what: format!("worker '{s}'") },
+                            no_write(),
+                        )
                     }
-                }
+                },
             };
+            // An object-target Worker may name a since-deleted worker; the Key
+            // path above already resolved a live one.
             if let MessageTarget::Worker(w) = &target {
                 if queries::get_worker(conn, w.as_str())?.is_none() {
                     return finish(
@@ -318,43 +382,8 @@ pub async fn create_message(
             }
 
             let now = Utc::now();
-            let parent = Message::new(
-                MessageId::from_ulid(ulid::Ulid::new()),
-                from.clone(),
-                target.clone(),
-                text.clone(),
-                thread.clone(),
-                now,
-            );
-            insert_message(conn, &parent)?;
-            let mut events = vec![ev(EntityType::Message, parent.id.as_str(), MutationKind::Created)];
-            let mut children_ids = Vec::new();
-            let mut commands_enqueued = 0usize;
-
-            match &target {
-                MessageTarget::Worker(w) => {
-                    enqueue_delivery(conn, w, &parent.id, now)?;
-                    commands_enqueued += 1;
-                }
-                MessageTarget::Group(g) => {
-                    // Per-recipient children (Invariant 29/12); an empty
-                    // group honestly fans out to nothing — the parent row
-                    // still records that the message was sent.
-                    let members = group_members(conn, g)?;
-                    let mut mint = || MessageId::from_ulid(ulid::Ulid::new());
-                    for child in fan_out(&parent, &members, &mut mint) {
-                        insert_message(conn, &child)?;
-                        events.push(ev(EntityType::Message, child.id.as_str(), MutationKind::Created));
-                        if let MessageTarget::Worker(w) = &child.to {
-                            enqueue_delivery(conn, w, &child.id, now)?;
-                            commands_enqueued += 1;
-                        }
-                        children_ids.push(child.id.as_str().to_string());
-                    }
-                }
-                // Human: surfaced via the message list/SSE; nothing to queue.
-                MessageTarget::Human => {}
-            }
+            let (parent, children_ids, commands_enqueued, events) =
+                insert_message_and_deliver(conn, from.clone(), target, text.clone(), thread.clone(), now)?;
 
             finish(
                 &slot_w,

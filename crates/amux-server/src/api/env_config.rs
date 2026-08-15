@@ -59,6 +59,12 @@ struct EnvSpec {
     // the YAML so the whole env round-trips. Idempotent by (worker,title).
     #[serde(default)]
     cards: Vec<CardSpec>,
+    // `messages` (seeded inbox — a vertical's kickoff/coordination messages) is
+    // APPLIED (AC-352, Ethan's "entirely via YAML"): resolved + delivered through
+    // the SAME create-message path POST /api/messages uses (ethos D6), so group
+    // fan-out and AtTurnBoundary delivery match exactly. Was silently dropped.
+    #[serde(default)]
+    messages: Vec<MessageSpec>,
     // Still phase-2, parsed-and-reported so a full spec is not rejected.
     #[serde(default)]
     columns: Vec<Value>,
@@ -83,6 +89,17 @@ struct CardSpec {
     /// Optional epic (semantic id of a type=epic card) to roll this card under.
     #[serde(default)]
     epic: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageSpec {
+    /// Recipient: a worker name/id, a group name/id, or the literal "human".
+    to: String,
+    /// Sender: a worker name/id, or "human"/"owner". Defaults to the owner — an
+    /// env is applied by the owner, so an unspecified sender is honestly them.
+    #[serde(default)]
+    from: String,
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -143,11 +160,12 @@ struct WorkerSpec {
 
 async fn schema() -> Response {
     Json(json!({
-        "applied_now": ["groups", "workers", "files", "schedules", "cards", "worker.prompt"],
+        "applied_now": ["groups", "workers", "files", "schedules", "cards", "messages", "worker.prompt"],
         "phase_2": ["columns", "gates", "global"],
         "files_shape": [{"path": "/abs/path/doc.md", "content": "literal file content"}],
         "schedules_shape": [{"worker": "backend-dev", "title": "nightly", "expr": "daily at 02:00", "enabled": false, "command": "the prompt"}],
         "cards_shape": [{"worker": "backend-dev", "title": "First issue", "desc": "...", "status": "backlog", "type": "code", "epic": ""}],
+        "messages_shape": [{"to": "backend-dev (worker name/id, group, or \"human\")", "from": "(worker or \"human\"/\"owner\", default owner)", "text": "the message body"}],
         "worker_prompt": "a `prompt` string on each worker — steered as the first task, on create only",
         "example": {
             "groups": [{"name": "engineering", "department": "Engineering", "goal": "Ship the platform"}],
@@ -375,6 +393,18 @@ async fn apply(
         }
     }
 
+    // ---- messages: seeded inbox — reported here, delivered in the write phase
+    // through the SAME create-message path (ethos D6). Idempotent by
+    // (recipient, text), so a re-applied env does not re-send.
+    for m in &spec.messages {
+        let (to, text) = (m.to.trim(), m.text.trim());
+        if to.is_empty() || text.is_empty() {
+            report.push(json!({"kind": "message", "action": "error", "detail": "to and text are required"}));
+            continue;
+        }
+        report.push(json!({"kind": "message", "to": to, "action": "create"}));
+    }
+
     // Phase-2 stanzas still parsed-and-reported (not silently dropped).
     if !spec.columns.is_empty() {
         report.push(json!({"kind": "columns", "action": "not-yet-applied", "count": spec.columns.len(),
@@ -567,6 +597,76 @@ async fn apply(
             .await;
         if let Err(e) = res {
             errors.push(json!({"kind": "card", "error": e.to_string()}));
+        }
+    }
+
+    // ---- messages: resolve recipients + deliver, idempotent by (target, body)
+    // Reuses messages::resolve_recipient + insert_message_and_deliver — the ONE
+    // create-message path, so group fan-out and AtTurnBoundary delivery match
+    // POST /api/messages exactly (ethos D6, Invariant 9 no-double-queue).
+    if !spec.messages.is_empty() {
+        let msgs: Vec<(String, String, String)> = spec
+            .messages
+            .iter()
+            .filter(|m| !m.to.trim().is_empty() && !m.text.trim().is_empty())
+            .map(|m| (m.to.trim().to_string(), m.from.trim().to_string(), m.text.trim().to_string()))
+            .collect();
+        let res = state
+            .store
+            .write_async(move |conn| {
+                let now = chrono::Utc::now();
+                let mut events = vec![];
+                for (to, from, text) in &msgs {
+                    // Unknown worker name -> skip (a message to nobody is a no-op).
+                    let target = match super::messages::resolve_recipient(conn, to)? {
+                        Some(t) => t,
+                        None => continue,
+                    };
+                    // Sender: a worker name/id -> that worker; else the owner (an
+                    // env is applied by the owner, so an empty from is honestly them).
+                    let is_owner = from.is_empty()
+                        || from.eq_ignore_ascii_case("human")
+                        || from.eq_ignore_ascii_case("owner");
+                    let from_actor = if is_owner {
+                        amux_core::events::Actor::Human {
+                            name: if from.is_empty() { "owner".into() } else { from.clone() },
+                        }
+                    } else {
+                        match super::messages::resolve_recipient(conn, from)? {
+                            Some(amux_core::message::MessageTarget::Worker(w)) => {
+                                amux_core::events::Actor::Worker { id: w }
+                            }
+                            _ => amux_core::events::Actor::Human { name: "owner".into() },
+                        }
+                    };
+                    // Idempotency: skip an identical (recipient, body) already sent.
+                    let target_json = serde_json::to_string(&target).unwrap_or_default();
+                    let exists: bool = conn
+                        .query_row(
+                            "SELECT 1 FROM _amux_messages WHERE target = ?1 AND body = ?2 LIMIT 1",
+                            rusqlite::params![target_json, text],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+                    if exists {
+                        continue;
+                    }
+                    let (_p, _c, _n, evs) = super::messages::insert_message_and_deliver(
+                        conn,
+                        from_actor,
+                        target,
+                        text.clone(),
+                        None,
+                        now,
+                    )?;
+                    events.extend(evs);
+                }
+                Ok(WriteOutcome { applied: true, events })
+            })
+            .await;
+        if let Err(e) = res {
+            errors.push(json!({"kind": "message", "error": e.to_string()}));
         }
     }
 
