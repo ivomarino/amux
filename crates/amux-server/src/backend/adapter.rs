@@ -919,12 +919,39 @@ fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
             return events;
         }
     }
-    // Idle: › prompt or the model status line "gpt-5.5 xhigh · ~/path"
-    // (py 18600-18606).
+    // Trust-directory picker: codex shows this at startup BEFORE the composer.
+    // It blocks message delivery until the user selects "1. Yes, continue".
+    // Detect by the question text or the selected option bullet so the delivery
+    // path can see the block (AMUX-3159; auto-dismiss is a separate action there).
+    let tail8 = last_n_raw_lines(clean, 8);
+    if tail8.contains("Do you trust the contents of this directory")
+        || tail8.contains("1. Yes, continue")
+    {
+        events.push(WorkerEvent::Waiting(WaitReason {
+            reason: "trust_prompt".to_string(),
+            detail: Some("codex directory trust dialog".to_string()),
+        }));
+        return events;
+    }
+
+    // Idle: › prompt or the model status line "gpt-5.5 xhigh · ~/path".
+    // The model bar format for ALL providers is "<model> <effort> · <path>".
+    // Original check only matched OpenAI model names; ollama workers show
+    // "qwen3.8:27b low · ~" which has the same structure but different prefix.
+    // Detect by presence of an effort word alongside the · separator so any
+    // model name (including future local ones) works. (py 18600-18606)
     for s in ne.iter().rev().take(5) {
         let sl = s.to_lowercase();
+        let has_effort = sl.contains(" low ")
+            || sl.contains(" medium ")
+            || sl.contains(" high ")
+            || sl.contains(" xhigh ")
+            || sl.contains(" default ");
         let model_bar = s.contains('·')
-            && (sl.contains("gpt-") || sl.contains("o3") || sl.contains("o4"));
+            && (has_effort
+                || sl.contains("gpt-")
+                || sl.contains("o3")
+                || sl.contains("o4"));
         let prompt = s.starts_with('›') && (sl.contains("implement") || *s == "›");
         if model_bar || prompt {
             events.push(WorkerEvent::Waiting(WaitReason {
@@ -1519,5 +1546,41 @@ Running 1 shell command · 5s…
     fn ollama_codex_usage_limit_is_detected() {
         let ev = adapter("ollama").scan(FX_CODEX_LIMIT);
         assert!(!limits(&ev).is_empty(), "codex usage-limit must be detected on ollama workers");
+    }
+
+    #[test]
+    fn codex_trust_dialog_is_detected_as_waiting() {
+        // codex shows this at startup before the composer; message delivery
+        // must see it as a block (AMUX-3159) so the session isn't marked idle.
+        let frame = "Welcome to Codex, OpenAI's command-line coding agent\n\n\
+                     > You are in /Users/ethan\n\n\
+                     Do you trust the contents of this directory? Working with untrusted\n\
+                     contents comes with higher risk of prompt injection.\n\n\
+                     \u{203a} 1. Yes, continue\n\
+                       2. No, quit\n\n\
+                       Press enter to continue";
+        let ev = adapter("codex").scan(frame);
+        let reasons = waiting_reasons(&ev);
+        assert!(
+            reasons.contains(&"trust_prompt"),
+            "codex trust dialog must produce trust_prompt waiting reason; got {reasons:?}"
+        );
+    }
+
+    #[test]
+    fn ollama_model_bar_is_detected_as_idle() {
+        // ollama workers show "qwen3.8:27b low · ~" — the model bar uses a
+        // local model name, not gpt-/o3/o4. The old check missed it entirely,
+        // leaving the session in an unknown state instead of idle.
+        let frame = "  Tip: Our most capable model\n\n\
+                     \u{26a0} Model metadata for `qwen3.8:27b` not found.\n\n\
+                     \u{203a} what is 2+2?\n\n\
+                       qwen3.8:27b low \u{b7} ~";
+        let ev = adapter("ollama").scan(frame);
+        let reasons = waiting_reasons(&ev);
+        assert!(
+            reasons.contains(&"idle_prompt"),
+            "ollama model bar must produce idle_prompt waiting reason; got {reasons:?}"
+        );
     }
 }
