@@ -373,34 +373,6 @@ FIX: A review that produces an out-of-scope finding needs somewhere to put it th
 NOTE: related to the `watch`-type blindness in ethos.md (a card surfaced by nothing is a note,
   not a monitor) — same root, different container: here the invisible thing is a paragraph
   inside a terminal-status card rather than a card outside every query.
-## A peer's save restarts the server mid-measurement, and the timings blame your subject
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-08
-SESSION: amux-frustrations
-CARD: AF-11
-SYMPTOM: Benchmarking `GET /api/board?slim=1` against the unprojected fetch, I measured slim
-  timing out at 60s while the FULL 6.6MB payload returned in 16.9s — a projection added to make
-  the fetch cheap looking 4x SLOWER than no projection at all. Second run: full 78s, slim
-  HTTP 000 at 22s, then both 000 instantly. Every number was an artifact. A peer session wrote
-  amux-server.py in this shared checkout at 12:39:48, the server auto-restarted at 12:40:24, and
-  my requests spanned the restart. Re-measured on a confirmed-healthy server: slim 828KB/0.10s,
-  full 6.6MB/0.11s. The projection is fine.
-COST: ~6 minutes and a near-miss on filing a fabricated performance defect against `slim=`
-  (AMUX-2223's own feature) with three runs of "evidence" behind it. The failure mode is the
-  dangerous direction: the restart produces symptoms — timeouts, truncated reads, connection
-  failures — that are indistinguishable from the subject being slow, so the wrong conclusion
-  arrives fully corroborated. I only caught it by checking the server's mtime, which I had no
-  particular reason to do.
-FIX: Any timing or availability measurement against the local server needs the restart to be
-  VISIBLE in the result, not inferred afterward. Cheapest version: `/health` already responds —
-  have it report the process start time, so a caller can bracket a measurement (start_ts before,
-  start_ts after) and know the server it finished on is the one it began on. That turns a silent
-  confound into a checkable precondition, and it costs one field. Today the only way to learn
-  this is to stat the file and read the restart log, which nobody does before believing a number.
-NOTE: the shared checkout is the amplifier (see AMUX-2443, open) — my working tree was clean and
-  I had made no edit, so nothing in MY session hinted that the binary under test had changed.
 ## SUPERSEDES the restart-framed-its-subject entry above: BOTH causes were real, and the instrument already existed
 AREA: instruments
 SEVERITY: slows
@@ -570,35 +542,6 @@ FIX: candidate fixes, someone's to pick up: (a) staged-guard lists ALL staged
   paths not touched by the committing session's diff, loudly; (b) fleet convention:
   `git commit -- <own paths>` instead of bare commit (commit takes pathspecs and
   bypasses the index sweep); (c) both. (b) is zero-code and I am adopting it now.
-## A peer's scoped `git add` swept my STAGED files, because git commits the index not the paths
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-08
-SESSION: amux-frustrations
-CARD: AF-19
-SYMPTOM: I had AF-12's fix staged (amux-server.py hunks + a new test file). amux ran
-  `git add amux-server.py` and committed. git commits the INDEX, so their commit swallowed
-  my staged test file and my staged hunks. 762e06e is titled "fix(herdr): first real e2e
-  contact … (AMUX-2554)" and its contents are largely my AF-12 work. My own
-  `git commit` then reported "nothing added to commit", which is how I found out.
-COST: ~10 minutes tracing where my work went, and a permanently wrong history in both
-  directions: a bisect for the board_full race lands on a herdr commit, and an audit of
-  what shipped under AMUX-2554 finds a cache generation guard. The amend was correctly
-  blocked (no HEAD-moving on a shared checkout), so it cannot be repaired — only recorded.
-  amux raised it themselves; neither of us lost work.
-FIX: The staged-guard already detects a co-edited FILE and prints an insertion count to
-  reconcile — it fired for me twice today and I used it correctly both times. It reasons
-  about the one file being committed and has no opinion about OTHER paths in the shared
-  index. Name them: "your index also contains N path(s) staged by another session: <path>
-  (<session>, <age>) — `git commit -- <paths>` commits only yours." The remedy amux named
-  (`git commit -- <paths>`) is the one to publish, in the guard's existing
-  honest-path-is-the-easy-path idiom.
-NOTE: distinct from the two shapes AMUX-2443 already covers. Not `git add` sweeping peer
-  HUNKS in a file you both edited, and not a pull --rebase replaying an unpushed commit:
-  here the file is entirely mine, the committer never touched it, and their `git add` never
-  named it. The guard's blind spot is that it is FILE-scoped while the sweep is INDEX-scoped
-  — a check aimed one level below the mechanism it is protecting against.
 ## The reviewer-identity check fires on done->verified, blocking the peer amux routed the verification to
 AREA: gates
 SEVERITY: slows
@@ -845,30 +788,6 @@ RESOLVED 2026-08-09 by the python retirement, NOT by a fix — recorded because 
   The finding survives as AMUX-2638: when the nudge is ported it must resolve ownership through the staged-guard path, not from dirty-tree membership — that substitution IS the bug and a fresh port reintroduces it by default, because `git status` is the obvious source.
   Also note the capability is simply GONE meanwhile: nothing tells any session about uncommitted work, on a shared checkout with ~7 lanes and 82 dirty files.
 
-
-## Two entries validated and deleted today have already recurred
-AREA: board
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-38
-SYMPTOM: Under the new protocol (fix -> originating session validates -> delete the entry), 35
-  entries were deleted on 2026-08-09. Within hours, two of that day's validated-fixed classes
-  recurred: AC-284 (assignment notices for deleted cards - amux-cloud produced counter-evidence
-  DURING the sweep, so it was caught and reopened before deletion) and AC-300 (the idle nudge
-  telling a session to commit a peer's in-flight work - deleted as confirmed-fixed, then hit me
-  hours later, now AF-38).
-COST: no work lost yet. The cost is diagnostic: when AC-300's class recurred, the entry
-  describing it was gone, so recognising it as a RECURRENCE rather than a novel bug depended on
-  me happening to remember deleting it that morning. The next session will not have that.
-FIX: not a request to reverse the protocol - deletion is Ethan's call and he made it, and git
-  history at e35bf7d preserves the text. The cheap mitigation is already half-built: the sweep
-  appends each deleted entry's COST line to its card before deleting (30 done). Extending that
-  to carry the SYMPTOM line too would make a recurrence recognisable from the card alone, which
-  is where someone hitting it again would actually look. amux-cloud argued the general form of
-  this before the deletions and was told, correctly, that the call was made; this entry is the
-  evidence they asked for rather than a re-litigation.
 
 ## The rust request log recorded a ~15-second restart choreography as a 76ms request
 AREA: instruments
@@ -2589,52 +2508,6 @@ FIX: open — decision is Ethan's (ethos rule 8: recycling 48 lanes can interrup
 
 ---
 
-## A CI job named "chromium + webkit" had never run a webkit scenario — its browser filter matched no project and a `|| run-everything` fallback kept it green
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-13
-SESSION: amux-frustrations
-CARD: AF-46
-SYMPTOM: rust-nightly-deep.yml runs `npx playwright test --project=*${{ matrix.browser }}* || npx playwright test <everything>`. The project names are desktop/mobile/ios-safari, so neither glob matches: `Error: No projects matched. Available projects: "desktop", "mobile", "ios-safari"`. Every leg therefore errored on the filter and fell through the `||` to running ALL projects on whichever single browser it had installed. The chromium leg was green while testing chromium twice; the webkit leg was red for its own unrelated reason. The job name asserted webkit coverage that had never once run.
-COST: No webkit coverage at all for however long the ios-safari-less config stood, while a green nightly said otherwise. Directly: it nearly cost a third red main — adding a real webkit project turned the latent misconfiguration into an immediate failure in two OTHER workflows, discovered only because a peer reviewed the commit before pushing rather than because any check spoke up.
-FIX: ebe18ce — explicit browser->projects matrix mapping, and the `||` fallback DELETED. The fallback is the actual defect: it converts "my selector matched nothing" into a green run of the wrong thing, which is the failure mode a test matrix exists to prevent. Any `<selector> || <run everything>` in CI is this bug waiting; the selector must be allowed to fail loudly.
-
----
-
-## e2e projects shared one server and one AMUX_HOME — cross-project races read as WebKit flakiness
-DATE: 2026-08-13
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-SESSION: amux-frustrations
-CARD: AF-46
-SYMPTOM: The e2e harness booted ONE server on ONE AMUX_HOME and pointed every playwright
-  project at it. Projects multiply spec files, so settings.spec.ts — which POSTs global
-  server state (/api/prefs, /api/settings/*) and then asserts the UI reflects the value it
-  just wrote — ran three times CONCURRENTLY against one pref store. The three copies
-  overwrote each other and whichever lost reported a product bug. The failure SET changed
-  between runs (7 tests, then 3, then a different 3), which is the shape that gets called
-  flakiness.
-COST: A real iOS target was pinned to four spec files by a `testMatch` for ~1 day, on the
-  documented belief that WebKit was at fault — the config said so in a comment, in detail,
-  and was wrong. The suite was green the whole time while covering 4 files instead of 15 on
-  the one target that motivated the project. The near-miss is the expensive part: the
-  obvious next move was to "fix" the racing assertions or add retries, which would have
-  bought green by deleting the signal and left the isolation gap for the next person to
-  rediscover the moment they added a fourth project.
-FIX: b31bcac — one server and one AMUX_HOME per project. Control, same command:
-  settings.spec.ts 3 failed/51 passed -> 0 failed/54 passed; full suite 210 passed, 0 failed
-  with ios-safari unscoped. The `testMatch` is deleted.
-  The signal that was missing, and the reason this sat: nothing distinguished "ios-safari
-  passed 4 files" from "ios-safari passed" in any output anyone reads. A green check that
-  covers less than its name promises is invisible by construction — there is no red to
-  investigate. The config now prints each target's coverage every run and names any scoping,
-  verified against a deliberately scoped target so the notice can actually report the bad
-  state. Any future narrowing announces itself.
-
----
-
 ## A page.route stub defeated by a service worker fails LOUDLY and blames the wrong subsystem
 DATE: 2026-08-13
 AREA: instruments
@@ -2662,138 +2535,6 @@ FIX: `test.use({ serviceWorkers: 'block' })` on the specs that do not test the w
   such helper today and every future page.route stub inherits the same silence.
 
 ---
-
-## A missed click reads as a broken feature — I filed it against the product and was wrong
-DATE: 2026-08-13
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-SESSION: amux-frustrations
-CARD: AF-47
-SYMPTOM: A click that silently does not land is indistinguishable from a feature that does
-  not work. e2e feedback-smoke.spec.ts failed on "the card is still on the board" at iPhone
-  width. The button lives in the `done` column of a scroll-snap kanban (.board-col is
-  flex:0 0 86vw under scroll-snap-type:x proximity), and under WebKit the snap animation is
-  still running when playwright computes the click coordinates, so the click lands where the
-  button used to be. clearDone() was never invoked and NO request was issued — measured by
-  wrapping the handler and counting calls: mobile/Chromium 1 call + POST 200, WebKit 0 calls.
-COST: I filed a board card against the PRODUCT — "board overflows horizontally at phone
-  width, Clear done ~1000px off-screen, a phone user must scroll 1000px to reach it" — from
-  the geometry alone, without checking design intent. The layout was correct: 86vw columns
-  in a swipeable kanban put the 4th column at x≈1001 by construction. One wrong card, and a
-  test quarantined via test.fixme for a bug that did not exist. The assertion pointed at the
-  product because that is the only thing it could say.
-FIX: 4250840 — e2e/helpers.ts clickSnapped(): scroll, wait for the box to come to REST
-  inside the viewport, then click, retrying the whole sequence (renderBoard() detaches the
-  node, and scrollIntoViewIfNeeded does not re-resolve its locator the way locator.click()
-  does — the first version of the helper fixed WebKit and broke desktop+mobile exactly that
-  way). The durable part is the failure MESSAGE: it names the scroll-snap container and says
-  "this is a HARNESS problem, do NOT file it against the product", so the next occurrence
-  arrives with the right diagnosis attached instead of inducing the wrong one. Error path
-  verified with a negative control rather than assumed. test.fixme removed; 211 passed, 0
-  failed.
-  The generalisable lesson, and the reason this is logged rather than quietly fixed: an
-  interaction that MISSES produces a perfectly plausible product-shaped failure, and the
-  natural response is to go read the product's code. Anywhere a test drives a real gesture,
-  the miss and the malfunction need to be distinguishable at the assertion.
-
----
-
-## A shipped capability read as ABSENT to a working lane — from a truncated extraction
-DATE: 2026-08-13
-AREA: instruments
-SEVERITY: blocks
-STATUS: open
-SESSION: amux-frustrations
-CARD: AMUX-3073
-SYMPTOM: A capability that has shipped for months read as ABSENT to a working lane. amux-gtm
-  reported that the dashboard Browser view is a screenshot feed with no keystroke or click
-  forwarding, and proposed building it. It already exists and did the whole time:
-  #bw-viewport (index.html:1318) carries tabindex=0 + onkeydown=_bwViewportKey, which
-  forwards per-character `type` plus named keys; #bw-img has onclick=_bwClick, which scales
-  display coords to viewport coords and posts {action:click,x,y}; #bw-type is a bulk
-  type-into-page box. Shipped in 3976de4. The report described the toolbar accurately for its
-  FIRST row and concluded the feature was missing; the interaction row is a plain sibling
-  .bw-row, not hidden and not conditional.
-COST: A full day of stall on a customer integration (Wexus/NetSuite), four staged login
-  windows abandoned one keystroke from done, and a NetSuite stand-in built specifically to
-  avoid needing credentials. The reporter concluded the fleet was structurally incapable of
-  remote sign-in and designed around it. Then the near-miss on the other side: taken at face
-  value the report cards as "wire dashboard input through to /api/browser/action" — a second
-  implementation of a shipped feature, which is the re-invent-a-primitive shape CLAUDE.md
-  exists to stop. One verification step separated the two outcomes.
-FIX: Not fixed — the missing thing is not the feature. AMUX-3073 carries the two real gaps
-  (no way for an agent to raise "needs human sign-in", no deep link to the browser view;
-  hash routing has #path= for Files and #bq= for board search but no view route).
-  The frustration worth counting is the CLASS: ethos rule 1 asks whether capability reaches
-  the model or merely exists, and the usual answer is a feature flag nobody enrolled in. This
-  is the same failure with no flag involved — the feature was on, default, in the UI, and a
-  competent lane still could not see it, so it improved nothing. Nothing in amux tells a
-  session what a view can do; discovery is "scroll and notice", which does not survive an
-  agent that is task-focused.
-
-CORRECTION 2026-08-13, same day, by amux-frustrations after amux-gtm self-reported the
-  actual cause. The paragraph above originally guessed a stale cached SPA bundle, "unconfirmed
-  but likely here", and cited AF-45 as an open instance of the same thing. THAT IS WRONG and
-  the guess is withdrawn. amux-gtm verified against the LIVE served dashboard: four .bw-row
-  divs served, _bwViewportKey/_bwClick/_bwType all present. The server was serving the full
-  UI the whole time.
-  REAL CAUSE, and it reclassifies this entry: they never rendered the dashboard. They ran
-    sed -n '/id="browser-view"/,/^.\{0,200\}<\/div>/p'
-  which terminates at the FIRST </div>, returning row 1 and nothing else — then reported the
-  absence of rows 2-4 as a missing capability. So this is NOT a discoverability defect in the
-  UI. It is another instance of the class ethos.md rule 7 already documents at length: a
-  hand-written probe is a GUESS about where the answer lives, and a guess that misses is
-  indistinguishable from an answer that is absent. The nine instances listed there are now
-  ten, and this one is the most expensive of them, because the truncated extraction did not
-  merely mislead its author — it was reported outward as a structural gap in the platform and
-  was one verification step from becoming a duplicate implementation of a shipped feature.
-  Worth recording precisely because the author had spent the same day building a hard-fail
-  for silent truncation in amux's eval (8000-char cap, 23 of 34 records returned), then made
-  the identical mistake by hand, in the direction of a STRONGER claim. Writing the guard does
-  not install the habit — ethos.md says exactly this about itself, and here it is again.
-  AF-45 IS NOT CORROBORATED BY THIS ENTRY. Do not count it as a stale-bundle data point; its
-  stale-bundle hypothesis stands or falls on Ethan's device alone.
-  What survives as a genuine gap is only AMUX-3073 (no agent-raisable "needs human sign-in",
-  no deep link to the browser view). The "browser view should advertise its own verbs" idea
-  is downgraded to speculation: nobody has yet been shown to miss these controls while
-  actually LOOKING at the rendered page.
-
----
-
-## A green lint gate carried no rule for duplicate function declarations
-DATE: 2026-08-13
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-SESSION: amux-frustrations
-CARD: AF-48
-SYMPTOM: Three functions were declared TWICE at top level in app.js — _fmtBytes, _fmtDur and
-  timeAgo. In a classic script the last declaration silently wins, so half of each pair was
-  dead code that reads as live code. timeAgo was not cosmetic: the earlier copy returns '' for
-  a falsy timestamp and the LATER (governing) copy has no such guard, so every caller without
-  a timestamp rendered "NaNd ago" for undefined and "20679d ago" for null/0. A guard that
-  exists in the file, is correct, and never runs.
-COST: Unknown duration — nothing could have reported it. It surfaced only because amux-gtm
-  reported an unrelated cosmetic bug ("0.0 MB" for a 5707-byte xlsx) and the fix happened to
-  reach for the shared formatter. The dangerous cost is the one not yet paid: editing a
-  shadowed copy changes NOTHING on screen, so the debugging loop is "my fix does not work"
-  against code that reads correctly — the same shape as the worktree dep-info trap that
-  manufactured three consecutive wrong verdicts on 2026-08-12.
-FIX: 9794f6b. Deduped all three (deleted the dead copy where behaviour-preserving; for
-  timeAgo deleted the LATER copy on purpose, which is the behaviour fix), and both file-viewer
-  sites now use _fmtBytes.
-  The signal is the point: scripts/spa-lint.sh already gates this SPA in CI and already
-  carried no-dupe-keys for the OBJECT-literal case. The function case was simply never
-  enabled, so three live instances sat under a green gate. Now no-redeclare with
-  builtinGlobals:false — that option is load-bearing, because this SPA's top-level names are
-  its cross-file API and spa-lint regenerates them into the globals allowlist every run, so
-  the default flags every top-level declaration and buries the 3 real errors under ~700 false
-  ones. A rule tuned wrong here would have been worse than no rule: nobody reads 700 errors.
-  Gate verified able to FAIL (re-added duplicate -> exit 1 naming it), not just observed green.
-  Generalisable: when a lint gate carries a rule for the object-literal form of a defect, ask
-  whether the function/variable form is covered too. no-dupe-keys without no-redeclare is half
-  a guard, and the uncovered half is the one where shadowing can disable a correctness check.
 
 ## Verified gate rejects a cross-group reporter's verification, so the strongest evidence cannot close the card
 AREA: gates
