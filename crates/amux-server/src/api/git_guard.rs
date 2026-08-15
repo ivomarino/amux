@@ -273,6 +273,112 @@ fn parse_ts(raw: &str) -> Option<f64> {
         .map(|n| n.and_utc().timestamp() as f64)
 }
 
+/// AMUX-3128: does a shell command write a file via an output redirection?
+/// `> f`, `>> f`, `&> f` write a file; fd dups (`2>&1`, `>&2`) do not. Used to
+/// keep `is_pure_read_command` from treating `echo x > f` as a read.
+fn has_output_redirection(cmd: &str) -> bool {
+    let b = cmd.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'>' {
+            let mut j = i + 1;
+            if j < b.len() && b[j] == b'>' {
+                j += 1;
+            }
+            while j < b.len() && matches!(b[j], b' ' | b'\t') {
+                j += 1;
+            }
+            // `>&...` is a file-descriptor dup/merge, not a write to a file.
+            if j < b.len() && b[j] != b'&' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// AMUX-3128: a purely read-only shell command must not mint an INFERRED edit
+/// record. `recent_edit_paths` claims a Bash-named path when the file's mtime
+/// moved within the slack window, but that cannot tell "I wrote foo.md" from "I
+/// READ foo.md while a peer wrote it": a lane that ran `head -40 digests/x.md`
+/// (a read) was flagged as a co-author of the digest because its mtime happened
+/// to move under the digest producer's write. So if EVERY segment of the command
+/// leads with a known read-only tool AND there is no output redirection, claim
+/// nothing. Conservative on purpose: anything unrecognized (`sed -i`, `cp`, `mv`,
+/// python heredocs, a prefixed `sudo head`) falls through to the mtime gate
+/// exactly as before, so no real inferred WRITE loses its attribution — only the
+/// unambiguous readers are excluded.
+fn is_pure_read_command(cmd: &str) -> bool {
+    if has_output_redirection(cmd) {
+        return false;
+    }
+    const READ_ONLY_VERBS: &[&str] = &[
+        "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep",
+        "rg", "ag", "wc", "stat", "file", "find", "cmp", "diff", "sort", "uniq",
+        "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
+        "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
+        "pwd", "echo", "printf",
+    ];
+    let mut saw = false;
+    for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        saw = true;
+        let Some(tok) = seg.split_whitespace().next() else {
+            return false;
+        };
+        let verb = Path::new(tok)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(tok);
+        if !READ_ONLY_VERBS.contains(&verb) {
+            return false;
+        }
+    }
+    saw
+}
+
+/// AMUX-3128 surfacing half: every INFERRED edit record (a Bash command whose
+/// named path moved mtime within slack) is logged so the class stays countable.
+/// A future false co-authorship now leaves a trace naming the verb — and if a
+/// sweep sees a READ verb here (head/cat/ls...), a reader slipped
+/// `is_pure_read_command` and the exclusion list is missing it. Deduped per
+/// (session, path basename, verb) for an hour so legit `sed -i` churn cannot spam.
+static INFERRED_WARNED: Mutex<Option<HashMap<String, f64>>> = Mutex::new(None);
+fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
+    let verb = cmd
+        .split(['|', ';', '&', '\n', '(', ')', '`'])
+        .filter_map(|s| s.split_whitespace().next())
+        .next()
+        .map(|t| Path::new(t).file_name().and_then(|s| s.to_str()).unwrap_or(t))
+        .unwrap_or("?");
+    let base = Path::new(abs_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(abs_path);
+    let now = now_epoch();
+    let key = format!("{session}\u{1}{base}\u{1}{verb}");
+    if let Ok(mut g) = INFERRED_WARNED.lock() {
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.get(&key).is_some_and(|at| now - at < 3600.0) {
+            return;
+        }
+        m.insert(key, now);
+    }
+    tracing::warn!(
+        target: "staged_guard",
+        "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} — ownership \
+         INFERRED from a bash command, not a firsthand Edit/Write. A READ verb here means \
+         is_pure_read_command missed a reader and it may be minting false co-authorship.",
+        if session.is_empty() { "(none)" } else { session },
+        base,
+        verb,
+    );
+}
+
 /// py:19207. `{abs realpath: epoch ts}` of files this session edited inside
 /// the window, read from its own JSONL transcript.
 ///
@@ -329,6 +435,13 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                     if cmd.is_empty() {
                         continue;
                     }
+                    // AMUX-3128: a read-only command (head/ls/cat/grep...) names a
+                    // path but writes nothing. The mtime gate below cannot tell a
+                    // read from a write, so a PEER's write moving the mtime under
+                    // a reader would mint a false co-author. Reads attribute nothing.
+                    if is_pure_read_command(cmd) {
+                        continue;
+                    }
                     for m in pathlike_re().find_iter(cmd) {
                         let cand = m.as_str().trim_matches(|c| "'\"),;:".contains(c));
                         if cand.len() < 4 {
@@ -360,6 +473,7 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                         if (mt - ts).abs() <= slack {
                             let ap = realpath(&abs);
                             if mt > *scan.paths.get(&ap).unwrap_or(&0.0) {
+                                warn_inferred_edit(name, &ap, cmd);
                                 scan.paths.insert(ap, mt);
                             }
                         }
@@ -1061,6 +1175,61 @@ mod tests {
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
         g.theirs_firsthand.insert(format!("/repo/{path}"));
         g
+    }
+
+    /// AMUX-3128 FIRING PATH: a read-only command must not mint an inferred edit,
+    /// so a lane inspecting a peer's file is never flagged as its co-author. The
+    /// reported specimen (`ls -t digests/`, `head -40 digests/<f>`) leads this list.
+    #[test]
+    fn read_only_commands_attribute_nothing() {
+        for cmd in [
+            "ls -t digests/",
+            "head -40 digests/2026-08-15.md",
+            "cat crates/foo.rs",
+            "grep -n needle src/lib.rs",
+            "tail -20 logs/server.log",
+            "wc -l a.py",
+            "stat file.json",
+            "diff a.txt b.txt",
+            "find . -name x.rs",
+            "head foo.md | grep x",
+            "cat a.md | head -5 | wc -l",
+        ] {
+            assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
+        }
+    }
+
+    /// The other half of the discriminator, and the anti-regression guarantee:
+    /// a real inferred WRITE (the case the mechanism exists for) is NOT pure-read,
+    /// so it still falls through to the mtime gate and keeps attributing.
+    #[test]
+    fn writers_and_unrecognized_commands_fall_through() {
+        for cmd in [
+            "sed -i 's/a/b/' f.rs",
+            "cat template > out.md",
+            "echo hi >> log.txt",
+            "cmd &> out.log",
+            "cp a.txt b.txt",
+            "mv x.md y.md",
+            "tee report.md",
+            "python3 - <<'PY'\nopen('x.md','w')\nPY",
+            "head foo.md && sed -i s/a/b/ bar.rs",
+            "sudo head secret.md",
+        ] {
+            assert!(!is_pure_read_command(cmd), "should NOT be pure read: {cmd}");
+        }
+    }
+
+    #[test]
+    fn output_redirection_is_a_write_but_fd_dup_is_not() {
+        assert!(has_output_redirection("echo x > f.txt"));
+        assert!(has_output_redirection("cat a >> b"));
+        assert!(has_output_redirection("cmd &> out.log"));
+        assert!(has_output_redirection("foo > $LOG"));
+        assert!(!has_output_redirection("make 2>&1"));
+        assert!(!has_output_redirection("cmd >&2"));
+        assert!(!has_output_redirection("head -40 digests/x.md"));
+        assert!(!has_output_redirection("ls -t digests/"));
     }
 
     /// THE FIRING PATH. A staged file a peer wrote and this session never
