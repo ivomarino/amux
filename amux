@@ -2635,7 +2635,21 @@ except ValueError: sys.exit('amux server not responding')
 if d.get('error'): sys.exit('alert failed: ' + str(d['error']))
 if d.get('deduped'): print('(deduped — an identical alert fired <60s ago)'); sys.exit(0)
 ch = d.get('channels', {})
-print('alert sent →', ', '.join('%s: %s' % (k, v) for k, v in ch.items()) or '(no channels)')
+detail = ', '.join('%s: %s' % (k, v) for k, v in ch.items()) or '(no channels)'
+# KEY OFF THE SERVER'S EXPLICIT VERDICT, never the presence of a channels map
+# (AMUX-3151/GCA-96): leading with 'sent' + exit 0 on a zero-channel delivery is
+# a lying fire alarm that swallowed real security escalations. delivered_any is
+# authoritative; the string fallback only covers an older server that predates it.
+delivered = d.get('delivered_any')
+if delivered is None:
+    delivered = any((str(v).lower() == 'sent') if k == 'push' else (str(v).lower() in ('twilio', 'imessage'))
+                    for k, v in ch.items())
+if not delivered:
+    sys.stderr.write('ALERT FAILED — the owner was NOT paged (reached no channel): %s\n' % detail)
+    fb = d.get('fallback') or 'no channel delivered — post to the board and say so in your turn output'
+    sys.stderr.write(fb + '\n')
+    sys.exit(3)
+print('alert delivered →', detail)
 "
 }
 

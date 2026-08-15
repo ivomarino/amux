@@ -191,6 +191,51 @@ async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
+/// Has `owner` already COMMITTED their work on `path`, more recently than the
+/// edit record that triggered the notice?
+///
+/// The victim-side notice fires on EDIT RECORDS, which cannot tell "edited and
+/// committed" from "edited and still staged". Measured 2026-08-15: four notices
+/// in one day for files whose owner had already committed, against one real
+/// absorption. A recipient has to run `git log` every time to find out which.
+///
+/// This does not SUPPRESS the notice — the asymmetry forbids it. A false alarm
+/// costs a `git log`; a missed alarm costs work that the sweep exists to save.
+/// So the notice keeps firing and gains the discriminator instead, which is the
+/// ethos answer: make the instrument express the difference rather than guess.
+///
+/// Authorship is by the Amux-Session TRAILER, not `%an` — every lane on this
+/// machine commits as the same person, so `%an` cannot discriminate (CLAUDE.md
+/// deploy section).
+async fn owner_committed_since(dir: &str, path: &str, owner: &str, edit_age_secs: i64) -> Option<String> {
+    let out = git_out(
+        dir,
+        &["log", "-8", "--format=%h%x09%ct%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
+    )
+    .await?;
+    let now = now_epoch() as i64;
+    for line in out.lines() {
+        let mut it = line.split('\t');
+        let (sha, ts, who) = (it.next()?, it.next()?, it.next().unwrap_or("").trim());
+        if who != owner {
+            continue;
+        }
+        let ts: i64 = ts.trim().parse().ok()?;
+        // Their commit is STRICTLY NEWER than the edit that triggered this notice,
+        // so the work in question is already theirs and in history.
+        //
+        // Strict, not `<=`: at equal age the two are indistinguishable at
+        // one-second resolution, and the tie must fall to "not settled". Getting
+        // this backwards tells a victim "nothing at risk" about work that is
+        // still only staged — the one direction this function must never get
+        // wrong. Caught by the 0-second case in the test below, not by review.
+        if (now - ts) < edit_age_secs {
+            return Some(sha.to_string());
+        }
+    }
+    None
+}
+
 /// py:19380 `_repo_root`, memoized — a commit is latency-sensitive and this is
 /// called once per session per check.
 ///
@@ -1093,31 +1138,53 @@ pub async fn staged_guard_inner(
         // channel (delivered at the owner's next turn boundary, which is the
         // soonest they could act on it anyway).
         if let Some(st) = state.as_ref() {
-            let mut by_owner: BTreeMap<String, Vec<String>> = BTreeMap::new();
+            let mut by_owner: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
             for f in &v.foreign {
                 let owner = f["owner"].as_str().unwrap_or("").to_string();
                 let path = f["path"].as_str().unwrap_or("").to_string();
                 if owner.is_empty() || owner == session || path.is_empty() {
                     continue;
                 }
-                by_owner.entry(owner).or_default().push(path);
+                let age = f["age_secs"].as_i64().unwrap_or(0);
+                by_owner.entry(owner).or_default().push((path, age));
             }
             for (owner, paths) in by_owner {
                 // DEDUPE, because a pre-commit hook fires on every attempt and
                 // a session that keeps retrying a blocked commit would
                 // otherwise message the owner once per keystroke-adjacent
                 // retry. Keyed on (owner, committer, path-set) for an hour.
-                let key = format!("{owner}|{session}|{}", paths.join(","));
+                let path_names: Vec<String> = paths.iter().map(|(p, _)| p.clone()).collect();
+                let key = format!("{owner}|{session}|{}", path_names.join(","));
                 if !notify_once(&key) {
                     continue;
                 }
-                let list = paths
-                    .iter()
-                    .take(10)
-                    .map(|p| format!("  {p}"))
-                    .collect::<Vec<_>>()
-                    .join("\n");
+                // Per path, say whether the owner's work is ALREADY COMMITTED. The
+                // notice fires on edit records, which cannot distinguish "edited and
+                // committed" from "edited and still staged" — so it used to hand the
+                // recipient a `git log` to run every time. Now it runs it for them.
+                let mut lines: Vec<String> = Vec::new();
+                let mut all_settled = true;
+                for (pth, age) in paths.iter().take(10) {
+                    match owner_committed_since(&wd, pth, &owner, *age).await {
+                        Some(sha) => lines
+                            .push(format!("  {pth}  — already committed by you in {sha}; nothing at risk")),
+                        None => {
+                            all_settled = false;
+                            lines.push(format!("  {pth}  — NO commit of yours since that edit; CHECK THIS ONE"));
+                        }
+                    }
+                }
+                let list = lines.join("\n");
                 let more = paths.len().saturating_sub(10);
+                let verdict = if all_settled {
+                    "\n\nEVERY path above is already committed by you, so this is almost certainly \
+                     noise — the notice fires on EDIT RECORDS and cannot tell \"edited and committed\" \
+                     from \"edited and staged\" on its own. Kept rather than suppressed because a \
+                     false alarm costs you a glance and a missed one costs work."
+                } else {
+                    "\n\nAt least one path has no commit of yours since the edit — that is the one to \
+                     reconcile."
+                };
                 let text = format!(
                     "[amux staged-guard] Session `{}` is committing in {} and the staged set \
                      includes {} file(s) whose edit records are YOURS:\n{}{}\n\n\
@@ -1126,13 +1193,14 @@ pub async fn staged_guard_inner(
                      usually survives, the reasoning does not.\n\n\
                      Check with:  git log -2 --stat -- {}\n\
                      If your work was absorbed, do not rewrite shared history — record the \
-                     reasoning where it belongs (a follow-up commit, or the card) and say so.",
+                     reasoning where it belongs (a follow-up commit, or the card) and say so.{}",
                     session,
                     wd_root,
                     paths.len(),
                     list,
                     if more > 0 { format!("\n  … and {more} more") } else { String::new() },
-                    paths.first().cloned().unwrap_or_default(),
+                    path_names.first().cloned().unwrap_or_default(),
+                    verdict,
                 );
                 crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
                     .await;
@@ -1164,6 +1232,55 @@ use crate::config::amux_home;
 
 #[cfg(test)]
 mod tests {
+    /// The victim-notice discriminator (2026-08-15). This decides whether a
+    /// recipient is told "nothing at risk", so a WRONG `Some` is the dangerous
+    /// direction — it tells someone to relax about work that was actually
+    /// absorbed. Both directions are asserted against a real git repo, because
+    /// the whole function is `git log` behaviour and a mock would only prove the
+    /// mock.
+    ///
+    /// Authorship is the Amux-Session TRAILER, never %an: every lane on this
+    /// machine commits as the same person, so %an cannot discriminate at all.
+    #[tokio::test]
+    async fn owner_committed_since_distinguishes_committed_from_still_staged() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "Shared Name"]);
+
+        std::fs::write(dir.path().join("a.txt"), "one\n").unwrap();
+        git(&["add", "a.txt"]);
+        git(&["commit", "-q", "-m", "mine\n\nAmux-Session: alice"]);
+        std::fs::write(dir.path().join("b.txt"), "one\n").unwrap();
+        git(&["add", "b.txt"]);
+        git(&["commit", "-q", "-m", "theirs\n\nAmux-Session: bob"]);
+
+        // alice edited a.txt 3600s ago and HAS committed since -> settled.
+        assert!(
+            owner_committed_since(&d, "a.txt", "alice", 3600).await.is_some(),
+            "alice committed a.txt after her edit; the notice must say nothing is at risk"
+        );
+        // bob has no commit touching a.txt at all -> unsettled, must NOT reassure.
+        assert!(
+            owner_committed_since(&d, "a.txt", "bob", 3600).await.is_none(),
+            "bob never committed a.txt — reassuring him would be the dangerous direction"
+        );
+        // alice's commit is OLDER than a 0-second-old edit: she edited again
+        // just now and has not committed it. Must not reassure.
+        assert!(
+            owner_committed_since(&d, "a.txt", "alice", 0).await.is_none(),
+            "an edit newer than the last commit is exactly the at-risk case"
+        );
+        // %an is identical for both lanes, so a name-based check would pass all
+        // three above; the trailer is what makes this discriminate.
+        let log = String::from_utf8(git(&["log", "--format=%an"]).stdout).unwrap();
+        assert!(log.lines().all(|l| l == "Shared Name"), "fixture must share %an: {log:?}");
+    }
+
     use super::*;
 
     fn pair(rel: &str) -> (String, String) {

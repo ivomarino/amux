@@ -564,10 +564,23 @@ async fn post_owner(
 
     let home = amux_home();
     let mut out_channels = Map::new();
+    // Track ACTUAL delivery, not the per-channel string. The CLI used to infer
+    // "sent" from the presence of a channels map and printed "alert sent" + exit
+    // 0 even when push reached zero subscriptions AND sms had no phone — a lying
+    // fire alarm that swallowed two prod-security escalations (AMUX-3151/GCA-96).
+    // The server already knows the truth (push_delivery_verdict Err, sms ok=false);
+    // this makes it EXPLICIT in the response so no caller has to guess.
+    let mut push_delivered = false;
+    let mut sms_delivered = false;
     if effective_env(&home, "AMUX_URGENT_PUSH").unwrap_or_else(|| "1".into()) != "0" {
         match channels.push(&state, &session, &msg).await {
-            Ok(()) => out_channels.insert("push".into(), json!("sent")),
-            Err(e) => out_channels.insert("push".into(), json!(format!("error: {}", truncate(&e, 80)))),
+            Ok(()) => {
+                out_channels.insert("push".into(), json!("sent"));
+                push_delivered = true;
+            }
+            Err(e) => {
+                out_channels.insert("push".into(), json!(format!("error: {}", truncate(&e, 80))));
+            }
         };
     } else {
         // Symmetric with the sms branch below: a channel that was switched off
@@ -602,19 +615,44 @@ async fn post_owner(
             "amux URGENT: ".to_string()
         };
         let (ok, detail) = channels.sms(&phone, &format!("{sms_prefix}{}", msg.replace('\n', " — "))).await;
+        sms_delivered = ok;
         out_channels.insert("sms".into(), json!(if ok { detail } else { format!("failed: {detail}") }));
     }
     record_owner_alert(&state, &origin, &session, &msg, &reason, &out_channels, false).await;
-    tracing::info!(
-        "[urgent-alert] origin={origin:?} claimed={session:?} reason={reason:?} channels={:?} msg={:?}",
-        out_channels,
-        truncate(message, 120)
-    );
-    Json(json!({
+    let delivered = (push_delivered as u8 + sms_delivered as u8) as i64;
+    let delivered_any = delivered > 0;
+    if delivered_any {
+        tracing::info!(
+            "[urgent-alert] DELIVERED ({delivered} channel(s)) origin={origin:?} claimed={session:?} reason={reason:?} channels={:?} msg={:?}",
+            out_channels,
+            truncate(message, 120)
+        );
+    } else {
+        // TWO-FIXES (AMUX-3151/GCA-96): the fire alarm reached NOBODY. This was an
+        // info! line — byte-identical to a delivered page in a log sweep — so an
+        // escalation nobody received left no distinct trace. A WARN makes
+        // "the owner was NOT paged" greppable, which is the entire point of an
+        // alarm that must not fail silently. grep "reached ZERO channels".
+        tracing::warn!(
+            "[urgent-alert] reached ZERO channels — the owner was NOT paged. origin={origin:?} claimed={session:?} reason={reason:?} channels={:?} msg={:?}",
+            out_channels,
+            truncate(message, 120)
+        );
+    }
+    let mut resp = json!({
+        // `ok` = the request was processed; `delivered_any` = a human was actually
+        // paged. They differ exactly in the case this fixes, so the CLI keys off
+        // delivered_any, never `ok`.
         "ok": true, "channels": out_channels, "message": msg,
         "origin": origin, "claimed": session, "provenance_mismatch": mismatch,
-    }))
-    .into_response()
+        "delivered": delivered, "delivered_any": delivered_any,
+    });
+    if !delivered_any {
+        resp["fallback"] = json!(
+            "no channel delivered — the owner was NOT paged; post to the board and say so in your turn output"
+        );
+    }
+    Json(resp).into_response()
 }
 
 // ---- GET /api/alert/owner ---------------------------------------------------
@@ -1082,6 +1120,34 @@ mod tests {
         assert_eq!(v["channels"]["push"], json!("error: vapid: unreadable key"));
         assert_eq!(v["channels"]["sms"], json!("failed: imessage error: -1743"));
         assert_eq!(v["ok"], json!(true));
+        // AMUX-3151/GCA-96: `ok:true` is "request processed", NOT "owner paged".
+        // With BOTH channels failed the response must say so explicitly, or the
+        // CLI reports a swallowed escalation as a delivered page.
+        assert_eq!(v["delivered_any"], json!(false), "both channels failed → delivered_any must be false");
+        assert_eq!(v["delivered"], json!(0));
+        assert!(v["fallback"].is_string(), "a zero-delivery response must carry the board fallback");
+    }
+
+    /// The positive half: when a channel ACTUALLY delivers, delivered_any is true
+    /// and no fallback is emitted — so the CLI's non-zero exit fires ONLY on a
+    /// real miss, never on a working page.
+    #[tokio::test]
+    async fn owner_alert_reports_delivered_when_a_channel_lands() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        set_server_env_key(dir.path(), "AMUX_OWNER_PHONE", "+15550000003").unwrap();
+        let mock = Arc::new(MockChannels {
+            pushes: Mutex::new(vec![]),
+            smses: Mutex::new(vec![]),
+            push_result: Ok(()),
+            sms_result: (true, "imessage".into()),
+        });
+        let app = app(mock);
+        let (_, v) =
+            send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "a real page" }))).await;
+        assert_eq!(v["delivered_any"], json!(true));
+        assert_eq!(v["delivered"], json!(2), "push + sms both landed");
+        assert!(v.get("fallback").is_none(), "a delivered page must NOT carry the failure fallback");
     }
 
     #[tokio::test]
