@@ -2723,3 +2723,33 @@ FIX: The durable fix is not "remember not to `git add <sharedfile>`" — it is p
   edits — it warned about env_config.rs minutes earlier — but it warns the committer, not the
   victim, and does not block). Filed AC-355. Same family as [[amux-project-reference]]
   shared-checkout races; three attribution entries now share this seam.
+
+## The shared git INDEX let my `git commit` sweep a peer's STAGED work (mirror of AC-355)
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux
+CARD: AC-355
+SYMPTOM: I ran `git add <my 3 files>` then `git commit -F` for AMUX-3148. The commit landed
+  14 files, not 3 (440 insertions), sweeping 11 files of amux-cloud's and amux-frustrations'
+  work (provider/*, backend/*, workers.rs, opencode/*, app.js, the amux CLI) into 4becada
+  under MY message and trailer. Root mechanism is worse than AC-355's `git add <sharedfile>`:
+  the git INDEX (.git/index) is SHARED across every session in this checkout, so a peer who
+  had `git add`-ed their files but not yet committed had their STAGED work committed by MY
+  commit — path-scoped `git add` gives no isolation when the index already holds a cotenant's
+  staged hunks. The staged-guard NOTE fired ("also edited by amux-frustrations 37m ago") but,
+  exactly as AC-355 says, warned me and did not block. When I tried to un-sweep, the
+  shared-checkout guard correctly BLOCKED `git reset --soft HEAD~1` (moving shared HEAD can
+  decapitate peers' commits), so there was no clean recovery: revert would delete their work.
+COST: The work is safe (compiles, not pushed, preserved in 4becada) but attribution is wrong
+  on 11 files and there is no in-repo way to fix it without owner sign-off; reconciliation was
+  a manual heads-up to two peers. ~15 min. The un-sweep being unreachable from the sanctioned
+  tooling is itself an ethos-6 gap.
+FIX: Two concrete, either closes it: (1) before committing, assert the staged set equals your
+  intended paths — `git diff --cached --name-only` must match what you added, and any extra is
+  a cotenant's staged work to `git restore --staged` (scoped, guard-allowed) BEFORE commit; a
+  pre-commit hook could enforce this automatically (refuse a commit whose staged set contains a
+  file with another live session's uncommitted/staged hunks). (2) per-lane worktrees so the
+  index is never shared. Same seam as AC-355; four attribution entries now share it, which is
+  the argument for worktree isolation rather than another warning nobody can act on.
