@@ -185,6 +185,53 @@ impl ScanLoop {
             let adapter =
                 crate::backend::adapter::TerminalAdapter::new(ProviderId(provider.clone()));
             let events = adapter.scan(&captured);
+
+            // ACTIVE via scrape (AMUX-3165). A hookless codex/ollama pane's
+            // "• Working (…esc to interrupt)" is the ONLY signal that reaches
+            // the store that the worker is generating — it has no
+            // Stop/UserPromptSubmit hooks (claude) and no structured session
+            // (opencode), so unlike every other lane its active state has
+            // nowhere else to come from. `scan` cannot carry it (Active needs a
+            // turn id and `scan` is pure), so it is reported as a boolean and
+            // minted here, treated EXACTLY like a backend's native `working`
+            // report: `native_status_event` fires TurnStarted on the
+            // idle->active EDGE only and returns None once Active, so a pane
+            // that stays "• Working" across scans does not mint a turn row +
+            // StatusChanged every pass (Invariant 37, ethos rule 5). Runs
+            // before the empty-events guard because an active pane's scan is
+            // empty by design.
+            if adapter.generating(&captured) {
+                let event = {
+                    let conn = self.store.read()?;
+                    let prior = crate::db::queries::get_worker(&conn, &wid_str)
+                        .ok()
+                        .flatten()
+                        .map(|r| r.state);
+                    let open_turn = open_turn_id(&conn, &wid_str);
+                    native_status_event(prior.as_ref(), "working", open_turn)
+                };
+                if let Some(ev) = event {
+                    let w = worker.clone();
+                    match self
+                        .store
+                        .write_async(move |conn| {
+                            crate::orchestrator::events::apply_event(
+                                conn,
+                                &w,
+                                &ev,
+                                chrono::Utc::now(),
+                            )
+                        })
+                        .await
+                    {
+                        Ok(_) => report.events_applied += 1,
+                        Err(e) => {
+                            tracing::warn!(worker = %worker, error = %e, "codex active event apply failed")
+                        }
+                    }
+                }
+            }
+
             if events.is_empty() {
                 continue;
             }
@@ -385,6 +432,27 @@ mod tests {
 
     fn seed_herdr_worker(store: &SharedStore, w: &WorkerId, backend_ref: &str) {
         seed_worker(store, w, "herdr", backend_ref);
+    }
+
+    /// A tmux worker whose provider is codex (hookless: the scrape is its only
+    /// voice), for the AMUX-3165 active-via-scrape path.
+    fn seed_codex_worker(store: &SharedStore, w: &WorkerId) {
+        let (id, sid) = (w.to_string(), format!("ses_{w}"));
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_workers (id, display_name, provider, created_at, updated_at)
+                     VALUES (?1, 'term', 'codex', 'now', 'now')",
+                    params![id],
+                )?;
+                conn.execute(
+                    "INSERT INTO _amux_sessions (id, worker_id, backend, backend_ref, started_at)
+                     VALUES (?1, ?2, 'tmux', 'amux-cx', 'now')",
+                    params![sid, id],
+                )?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
     }
 
     fn seed_worker(store: &SharedStore, w: &WorkerId, backend: &str, backend_ref: &str) {
@@ -707,5 +775,65 @@ mod tests {
             native_status_event(Some(&active), "idle", None),
             Some(WorkerEvent::TurnCompleted(_))
         ));
+    }
+
+    // ---- codex/ollama active via scrape (AMUX-3165) ------------------------
+
+    // The pane the live incident showed: a working ollama lane that read
+    // running=false the whole time because nothing emitted its active state.
+    const CODEX_WORKING: &str = "\u{203a} do the thing\n\n\u{2022} Working (12s \u{2022} esc to interrupt)";
+    // The idle model bar — must NOT mark the lane active.
+    const CODEX_IDLE: &str = "\u{203a} implement {feature}\n\n  gpt-5.5 xhigh \u{b7} ~/Dev/amux";
+
+    #[tokio::test]
+    async fn codex_working_pane_marks_active_and_does_not_churn() {
+        let store = store();
+        let w = wid(20);
+        seed_codex_worker(&store, &w);
+        // Hookless: no protocol session, so the scrape is this lane's only voice.
+        let scan = ScanLoop::new(
+            store.clone(),
+            vec![Arc::new(ScriptedBackend {
+                name: "tmux",
+                frame: CODEX_WORKING.into(),
+                native: BTreeMap::new(),
+            })],
+            Some(Arc::new(MockProtocol::new())),
+        );
+        let r1 = scan.scan_once().await.unwrap();
+        assert_eq!(r1.scanned, vec![w.to_string()]);
+        assert_eq!(r1.events_applied, 1, "working pane -> TurnStarted: {r1:?}");
+        assert!(
+            matches!(worker_state(&store, &w), WorkerState::Active { .. }),
+            "a '• Working' codex pane must read Active, not running=false (AMUX-3165)"
+        );
+        // Still working next pass: EDGE-gated, so no new turn / StatusChanged
+        // churn (Invariant 37) even though the fresh scan is not deduped.
+        let r2 = scan.scan_once().await.unwrap();
+        assert_eq!(r2.events_applied, 0, "already-Active must not re-fire: {r2:?}");
+        assert!(matches!(worker_state(&store, &w), WorkerState::Active { .. }));
+    }
+
+    #[tokio::test]
+    async fn codex_idle_pane_is_not_marked_active() {
+        let store = store();
+        let w = wid(21);
+        seed_codex_worker(&store, &w);
+        let scan = ScanLoop::new(
+            store.clone(),
+            vec![Arc::new(ScriptedBackend {
+                name: "tmux",
+                frame: CODEX_IDLE.into(),
+                native: BTreeMap::new(),
+            })],
+            Some(Arc::new(MockProtocol::new())),
+        );
+        let r = scan.scan_once().await.unwrap();
+        assert_eq!(r.scanned, vec![w.to_string()]);
+        // The idle model bar emits idle_prompt (Waiting), never Active.
+        assert!(
+            !matches!(worker_state(&store, &w), WorkerState::Active { .. }),
+            "an idle codex model bar must not read Active"
+        );
     }
 }

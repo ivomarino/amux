@@ -325,6 +325,33 @@ impl TerminalAdapter {
             _ => Vec::new(),
         }
     }
+
+    /// Does the pane show the worker actively GENERATING, by scrape?
+    ///
+    /// Kept SEPARATE from [`scan`](Self::scan) because "active" has no
+    /// `WorkerEvent` to carry it: `WorkerState::Active` is produced only by a
+    /// turn STARTING, and a turn id must be minted by the clock-holding caller
+    /// — `scan` is pure (module purity contract: reads no clock, keeps no
+    /// state). So the scanner reports the boolean and the caller
+    /// (`orchestrator::scan`) mints the turn, exactly as it already does for a
+    /// backend's native `working` report.
+    ///
+    /// Only codex/ollama answer true. claude and gemini report their active
+    /// state through hooks / the structured protocol (the D1 exit), never the
+    /// scrape — so their `scan` already, correctly, emits nothing on active and
+    /// this stays false for them. A hookless codex/ollama worker has no such
+    /// voice: no Stop/UserPromptSubmit hooks, no structured session, so this
+    /// scrape of "• Working (…esc to interrupt)" is the ONLY signal that reaches
+    /// the store that the worker is running (AMUX-3165: a working ollama lane
+    /// read `running=false` the whole time because nothing emitted this).
+    pub fn generating(&self, captured: &str) -> bool {
+        let clean = strip_ansi(captured);
+        match self.provider.as_str() {
+            // ollama runs codex --oss --local-provider ollama; same pane format.
+            "codex" | "ollama" => codex_generating(&clean),
+            _ => false,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -894,6 +921,19 @@ fn scan_gemini(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     events
 }
 
+/// The codex/ollama "generating" pane: a bullet-led status line carrying
+/// "working" / "running" / "esc to interrupt" (py 18591-18599). Pure — the
+/// single source of truth for the pattern, shared by `scan_codex` (to
+/// short-circuit idle/trust) and [`TerminalAdapter::generating`] (which the
+/// clock-holding caller uses to mint the turn that makes the worker Active).
+fn codex_generating(clean: &str) -> bool {
+    nonempty_trimmed(clean).iter().rev().take(12).any(|s| {
+        let sl = s.to_lowercase();
+        s.starts_with('•')
+            && (sl.contains("esc to interrupt") || sl.contains("working") || sl.contains("running"))
+    })
+}
+
 fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     let mut events = Vec::new();
     let tail30 = last_n_raw_lines(clean, 30);
@@ -909,15 +949,13 @@ fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
             m.as_str().trim().to_string(),
         ));
     }
-    let ne = nonempty_trimmed(clean);
-    // Active: "• Working (Xs • esc to interrupt)" (py 18591-18599).
-    for s in ne.iter().rev().take(12) {
-        let sl = s.to_lowercase();
-        if s.starts_with('•')
-            && (sl.contains("esc to interrupt") || sl.contains("working") || sl.contains("running"))
-        {
-            return events;
-        }
+    // Active: "• Working (Xs • esc to interrupt)" (py 18591-18599). The active
+    // STATE is applied by the caller via `TerminalAdapter::generating` (Active
+    // needs a turn id, which the pure scanner cannot mint) — here it only
+    // short-circuits the idle/trust checks below so a generating pane is never
+    // misread as idle.
+    if codex_generating(clean) {
+        return events;
     }
     // Trust-directory picker: codex shows this at startup BEFORE the composer.
     // It blocks message delivery until the user selects "1. Yes, continue".
@@ -940,6 +978,7 @@ fn scan_codex(clean: &str, provider: &ProviderId) -> Vec<WorkerEvent> {
     // "qwen3.8:27b low · ~" which has the same structure but different prefix.
     // Detect by presence of an effort word alongside the · separator so any
     // model name (including future local ones) works. (py 18600-18606)
+    let ne = nonempty_trimmed(clean);
     for s in ne.iter().rev().take(5) {
         let sl = s.to_lowercase();
         let has_effort = sl.contains(" low ")
@@ -1582,5 +1621,49 @@ Running 1 shell command · 5s…
             reasons.contains(&"idle_prompt"),
             "ollama model bar must produce idle_prompt waiting reason; got {reasons:?}"
         );
+    }
+
+    // -- Codex/ollama active scrape (AMUX-3165) ------------------------------
+    // The working pane carries no WorkerEvent (Active needs a turn id the pure
+    // scanner cannot mint), so the state is driven by `generating`. A working
+    // ollama worker read `running=false` for its whole run because nothing
+    // reported this — codex/ollama are hookless, so the scrape is their voice.
+
+    // "• Working (12s • esc to interrupt)" — the pane the live incident showed.
+    const FX_CODEX_WORKING: &str = "\
+› do the thing
+
+• Working (12s • esc to interrupt)";
+
+    #[test]
+    fn codex_working_pane_is_generating() {
+        assert!(
+            adapter("codex").generating(FX_CODEX_WORKING),
+            "the '• Working (…esc to interrupt)' pane must read as generating"
+        );
+        // ollama runs codex --oss, same pane format.
+        assert!(adapter("ollama").generating(FX_CODEX_WORKING));
+    }
+
+    #[test]
+    fn codex_idle_and_trust_panes_are_not_generating() {
+        // The idle model bar must NOT read as generating (would pin it active).
+        assert!(!adapter("codex").generating(FX_CODEX_IDLE));
+        let ollama_idle = "\u{203a} what is 2+2?\n\n  qwen3.8:27b low \u{b7} ~";
+        assert!(!adapter("ollama").generating(ollama_idle));
+        // The trust dialog is a block (Waiting), not active work.
+        let trust = "Do you trust the contents of this directory?\n\n\u{203a} 1. Yes, continue";
+        assert!(!adapter("codex").generating(trust));
+    }
+
+    #[test]
+    fn claude_and_gemini_never_scrape_generating() {
+        // Their active state is reported by hooks / the structured protocol
+        // (the D1 exit), never the scrape — so `generating` is false for them
+        // even on a visibly-active frame, and the caller mints no turn for a
+        // lane whose harness speaks for itself.
+        let claude_active = "\u{2733} Thinking\u{2026}\n\n\u{23f5}\u{23f5} bypass permissions on \u{b7} esc to interrupt";
+        assert!(!adapter("claude-code").generating(claude_active));
+        assert!(!adapter("gemini").generating(claude_active));
     }
 }
