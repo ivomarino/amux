@@ -424,6 +424,13 @@ cmd_register() {
 
 cmd_start() {
   local name dry_run=false detach=false
+  # AMUX_API is referenced bare below (the tmux `-e AMUX_URL=$AMUX_API` inject at
+  # the real-launch path) but was never declared local here the way _api_start /
+  # _api_stop / send all do — so under `set -u` a real `amux start` (non-dry-run)
+  # died with "AMUX_API: unbound variable" whenever AMUX_API wasn't already
+  # exported. Dry-run returns before that line, which is why it hid. Fall back to
+  # AMUX_URL (the canonical, commonly-set base) then the default port.
+  local AMUX_API="${AMUX_API:-${AMUX_URL:-https://localhost:8824}}"
   name=$(resolve_session "${1:-}")
   shift 2>/dev/null || true
   # Strip our own flags before inline claude args. Placed before `--` so
