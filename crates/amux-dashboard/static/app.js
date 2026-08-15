@@ -7596,7 +7596,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.643';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.644';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19080,13 +19080,27 @@ function _copySchedId(id) {
 }
 // Message-id copy, mirroring _copySchedId (Ethan, 2026-08-12: "each message row
 // has a message ID that I can copy similar to the schedule ID"). The value is
-// the cmd_history row id; we render it as MSG-<id> so a pasted reference is
-// unambiguous (a bare integer could be anything), and strip the prefix back off
-// on copy so what lands on the clipboard is the raw id the API keys on.
+// the cmd_history row id, rendered as MSG-<id> so a pasted reference is
+// unambiguous (a bare integer could be anything).
+//
+// COPY THE PREFIXED FORM (Ethan, 2026-08-15: "when i copy a message id include
+// MSG-"). This used to strip the prefix, on the reasoning that the clipboard
+// should hold "the raw id the API keys on". That premise is no longer true:
+// GET /api/history/{id} accepts BOTH (verified — MSG-28003 -> 200, 28003 -> 200,
+// and it was written that way deliberately, see e1df13e "accepts MSG-27463 or
+// 27463"). So stripping bought nothing and cost the thing the prefix exists for:
+// what you paste into a card, a commit message or a peer message is a bare
+// integer that nobody can resolve.
+//
+// It also made the toast a lie — it said "MSG-28003 copied" while 28003 was on
+// the clipboard. Now the toast and the clipboard agree, which is the part that
+// would otherwise keep this bug hidden: the confirmation described the intent
+// rather than the action.
 function _copyMsgId(id) {
   const raw = String(id).replace(/^MSG-/, '');
-  try { navigator.clipboard.writeText(raw); } catch(e) {}
-  if (typeof showToast === 'function') showToast('MSG-' + raw + ' copied');
+  const full = 'MSG-' + raw;
+  try { navigator.clipboard.writeText(full); } catch(e) {}
+  if (typeof showToast === 'function') showToast(full + ' copied');
 }
 function toggleSchedExpand(id) {
   const el = document.getElementById('sched-cmd-' + id);
