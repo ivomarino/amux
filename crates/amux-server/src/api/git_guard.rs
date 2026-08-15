@@ -1137,19 +1137,51 @@ pub async fn staged_guard_inner(
     // the loud case. A STOPPED one can only contribute pre-stop edits inside
     // the window; possible, so it is still disclosed, but compactly and
     // without the per-name klaxon.
+    // ABSENT IS NOT BLIND (AMUX-2936, decided 2026-08-15 with amux).
+    //
+    // `blind` already means exactly one thing: no resolvable transcript. Split
+    // on liveness and the two halves are different FACTS, not degrees:
+    //
+    //   no transcript + RUNNING  -> BLIND. A live lane we cannot see. It may be
+    //                               staging work right now, so it gates the
+    //                               AC-355 block and stays the loud case.
+    //   no transcript + stopped  -> ABSENT. Not a lane the guard cannot see —
+    //                               a lane that is not there. No recorded
+    //                               activity at all, so there is no invisible
+    //                               work for it to hide.
+    //
+    // THE EXCLUSION KEYS ON "NO RESOLVABLE TRANSCRIPT", never on liveness alone
+    // and never on env mtime. A STOPPED lane WITH a transcript is a real
+    // cotenant and keeps blocking — its pre-stop staged work is precisely the
+    // sweep target AC-355 exists for. Folding this into a "stopped" or
+    // "stale-env" flag re-breaks that case, which is why the two are separate
+    // verdicts and separate messages.
+    //
+    // The fact that settled it: amux-helper made every commit on this checkout
+    // report PARTIAL forever. Measured — newest commit 2026-07-28 (18 days, by
+    // author AND committer date, so no rebase is hiding it), not running, no
+    // pane, env file 85 bytes from May 5, no resolvable transcript. AMUX-2936
+    // had rejected the env-mtime proxy on the grounds that it "committed to this
+    // repo TODAY"; that turned out to be false, so the card was stuck on a fact
+    // rather than a judgement.
     let mut blind_live: Vec<String> = Vec::new();
-    let mut blind_stopped = 0usize;
+    let mut absent: Vec<String> = Vec::new();
     for b in &blind {
         if crate::api::session_verbs::is_running(b).await {
             blind_live.push(b.clone());
         } else {
-            blind_stopped += 1;
+            absent.push(b.clone());
         }
     }
-    if blind_stopped > 0 {
+    if !absent.is_empty() {
+        // Reported, not silent — but as what it is. "Unreadable transcript"
+        // invited the reader to imagine hidden work; "no such lane" does not.
         degraded.push(format!(
-            "{blind_stopped} stopped cotenant(s) with unreadable transcripts — pre-stop edits \
-             inside the window (if any) are invisible; a stopped lane cannot be mid-edit"
+            "{} cotenant(s) with no recorded activity at all — {} — treated as ABSENT, not \
+             blind: not running, no resolvable transcript, so there is no invisible work to \
+             hide. These do NOT gate the unattributable-path block.",
+            absent.len(),
+            absent.join(", ")
         ));
     }
     if !blind_live.is_empty() {
@@ -1207,7 +1239,8 @@ pub async fn staged_guard_inner(
         // what gets swept, and the degraded message already admits those edits are
         // invisible. Liveness answers "can they be editing now", which is a
         // different question from "could this staged file be theirs".
-        blind_cotenant: !blind.is_empty(),
+        // BLIND only — absent lanes are excluded (see the partition above).
+        blind_cotenant: !blind_live.is_empty(),
 };
     let v = classify(&pairs, now, window, &inputs);
 
