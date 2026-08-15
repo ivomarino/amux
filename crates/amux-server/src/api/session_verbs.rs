@@ -4940,6 +4940,12 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             if !opts.contains("--dangerously-bypass") && !opts.contains("-a ") {
                 opts += if ollama_yolo { " --dangerously-bypass-approvals-and-sandbox" } else { " -a never" };
             }
+            // Default codex sandbox is read-only; explicitly opt into workspace-write
+            // so file editing actually works (matches the codex arm's same logic at
+            // line ~4867; without this flag writes are OS-sandboxed away).
+            if !ollama_yolo && !opts.contains("--dangerously-bypass") && !opts.contains("--sandbox") && !opts.contains("-s ") {
+                opts += " --sandbox workspace-write";
+            }
             if let Some(gr) = run_cmd("git", &["-C", &work_dir, "rev-parse", "--show-toplevel"], OP_TIMEOUT).await {
                 if gr.status.success() {
                     let root = String::from_utf8_lossy(&gr.stdout).trim().to_string();
