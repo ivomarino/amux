@@ -796,38 +796,189 @@ pub struct LaneReport {
 /// with plain strings. Unreadable (e.g. a single-tenant container that never
 /// installed the hook) is Unknown, not Fail — no environment branch, the check
 /// simply reports it could not reach a verdict there.
-pub fn shared_guard_matches_committed(
+///
+/// GENERALISED for AMUX-2936 (2026-08-15). The report hook needed the identical
+/// check, and "mirror it exactly, it is a near-copy" is precisely how a repo
+/// acquires two implementations of one rule that must then be kept in step
+/// forever (ethos D6). The rule does not differ between the two scripts — what
+/// RUNS must equal what is COMMITTED — so only the nouns are parameters, and a
+/// third installed script costs one const rather than one more copy.
+pub struct InstalledScript {
+    /// Kept STABLE across this refactor: consumers match on `invariant_id`, so
+    /// renaming one would silently orphan whatever is keyed to it.
+    pub id: &'static str,
+    /// What the reader must go look at, e.g. `~/.amux/hook-report.sh`.
+    pub runtime_path: &'static str,
+    /// Repo-relative source `install.sh` copies from.
+    pub committed_path: &'static str,
+    /// Noun for the prose ("guard", "report hook").
+    pub noun: &'static str,
+}
+
+/// AMUX-3033: the PreToolUse Bash hook that gates git in shared checkouts.
+pub const GIT_SHARED_GUARD: InstalledScript = InstalledScript {
+    id: "hooks.shared_guard_matches_committed",
+    runtime_path: "~/.amux/hooks/git-shared-guard.py",
+    committed_path: "scripts/git-hooks/git-shared-guard.py",
+    noun: "guard",
+};
+
+/// AMUX-2936: the Stop / UserPromptSubmit / PostToolUse hook that reports each
+/// lane's state, model and token count — the D1 control plane, and the sole
+/// input to auto-compact (D5). It spent months as an UNVERSIONED runtime file
+/// carrying a warning about its own forking, which is where that warning died.
+pub const REPORT_HOOK: InstalledScript = InstalledScript {
+    id: "hooks.report_hook_matches_committed",
+    runtime_path: "~/.amux/hook-report.sh",
+    committed_path: "scripts/hooks/hook-report.sh",
+    noun: "report hook",
+};
+
+pub fn installed_script_matches_committed(
+    spec: &InstalledScript,
     committed_src: &str,
     runtime: Result<String, String>,
 ) -> Vec<InvariantResult> {
-    const ID: &str = "hooks.shared_guard_matches_committed";
+    let id = spec.id;
     let committed_sha = sha256_hex(committed_src.as_bytes());
     match runtime {
         Err(e) => vec![InvariantResult::unknown(
-            ID,
-            format!("runtime guard ~/.amux/hooks/git-shared-guard.py unreadable: {e}"),
+            id,
+            format!("runtime {} {} unreadable: {e}", spec.noun, spec.runtime_path),
         )],
         Ok(content) => {
             let runtime_sha = sha256_hex(content.as_bytes());
             if runtime_sha == committed_sha {
-                vec![InvariantResult::pass(ID)]
+                vec![InvariantResult::pass(id)]
             } else {
                 vec![InvariantResult::fail(
-                    ID,
-                    format!("runtime guard == committed sha {}", &committed_sha[..12]),
+                    id,
+                    format!("runtime {} == committed sha {}", spec.noun, &committed_sha[..12]),
                     format!(
-                        "runtime guard sha {} DRIFTED from scripts/git-hooks/git-shared-guard.py \
-                         — the fleet is running an unreviewed hand-edit. Reinstall from source \
-                         (install.sh) or fold the edit back into the committed copy.",
-                        &runtime_sha[..12]
+                        "runtime {} sha {} DRIFTED from {} — the fleet is running an unreviewed \
+                         hand-edit. Reinstall from source (install.sh) or fold the edit back into \
+                         the committed copy.",
+                        spec.noun,
+                        &runtime_sha[..12],
+                        spec.committed_path,
                     ),
                 )
                 .evidence(json!({
                     "committed_sha": committed_sha,
                     "runtime_sha": runtime_sha,
+                    "runtime_path": spec.runtime_path,
+                    "committed_path": spec.committed_path,
                 }))]
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6b. Are the report hooks WIRED to that script at all? (AMUX-2936)
+// ---------------------------------------------------------------------------
+
+/// One report-hook entry as configured in `~/.claude/settings.json`.
+pub struct ReportHookEntry {
+    /// `Stop` | `UserPromptSubmit` | `PostToolUse` | ...
+    pub event: String,
+    pub command: String,
+    /// `None` = the group carries no `matcher` key at all.
+    pub matcher: Option<String>,
+}
+
+/// INCIDENT (AMUX-2936, 2026-08-15): three implementations of "report state to
+/// amux" existed — `~/.amux/hook-report.sh` (the good one: state + model +
+/// tokens), `~/.amux/amux-report.sh`, and inline one-liners. Global
+/// `settings.json` pointed at the INLINE one-liners, which POST only
+/// `{state, source}`. So **model and tokens read zero fleet-wide**, and tokens
+/// is auto-compact's only input (D5 / AMUX-2829) — lanes ran to the context wall
+/// with the policy never called. `hook-report.sh` itself was correct and
+/// untouched the entire time.
+///
+/// Which is exactly why the sha check above CANNOT be the whole answer: it would
+/// have passed, green, every hour of that regression, because the file it
+/// compares was never the broken thing. Shipping only the near-copy would be a
+/// check that cannot fail on the incident that motivated it — the purest form of
+/// ethos rule 7, certified by its own incident report.
+///
+/// INVARIANT: every report hook configured in settings.json actually INVOKES
+/// `hook-report.sh`, and (the documented second trap, AMUX-2538) a tool event's
+/// entry carries a matcher that is a valid REGEX — `"*"` is not one, and an
+/// entry without one is silently ignored. Both failure modes leave a
+/// settings.json that reads as correct and a hook that never runs or runs
+/// impoverished.
+///
+/// Selection is by "does this command mention the report script or the report
+/// ENDPOINT", so a fork is INSIDE the denominator rather than filtered out of
+/// it — a wiring check that only looks at correctly-wired entries can only pass.
+pub fn report_hooks_wired(entries: Result<Vec<ReportHookEntry>, String>) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.report_hooks_wired";
+    let entries = match entries {
+        Err(e) => return vec![InvariantResult::unknown(ID, e)],
+        Ok(v) => v,
+    };
+    if entries.is_empty() {
+        // Not a Fail: a container or a fresh box legitimately has no amux hooks
+        // in ~/.claude/settings.json, and ACTUAL absence of reports already
+        // fails `session.self_reports_landing` on the outcome. Named here so the
+        // reader is routed there instead of concluding nothing checks it.
+        return vec![InvariantResult::unknown(
+            ID,
+            "no report hook configured in ~/.claude/settings.json (absence of \
+             reports is covered by session.self_reports_landing)",
+        )];
+    }
+    let mut broken: Vec<String> = Vec::new();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    for e in &entries {
+        let wired = e.command.contains("hook-report.sh");
+        // A tool event without a valid regex matcher is INERT — it parses, it
+        // reads as configured, and it never fires. Lifecycle events take none.
+        let tool_event = matches!(e.event.as_str(), "PreToolUse" | "PostToolUse");
+        let matcher_ok = !tool_event
+            || e.matcher.as_deref().is_some_and(|m| regex::Regex::new(m).is_ok());
+        if !wired {
+            broken.push(format!(
+                "{}: does not invoke hook-report.sh (an inline reimplementation — this is the \
+                 fork that zeroed model+tokens fleet-wide)",
+                e.event
+            ));
+        }
+        if !matcher_ok {
+            broken.push(match e.matcher.as_deref() {
+                None => format!("{}: tool event with NO matcher — the entry is inert", e.event),
+                Some(m) => format!(
+                    "{}: matcher {m:?} is not a valid regex — the entry is inert (use \".*\")",
+                    e.event
+                ),
+            });
+        }
+        let mut row = json!({
+            "event": e.event,
+            "invokes_hook_report": wired,
+            "matcher_ok": matcher_ok,
+            "matcher": e.matcher,
+        });
+        if !wired || !matcher_ok {
+            // Only for FAILING rows, and only a head: enough to identify the
+            // fork, without dumping a user's settings file into an API response.
+            let head: String = e.command.chars().take(120).collect();
+            row["command_head"] = json!(head);
+        }
+        rows.push(row);
+    }
+    let evidence = json!({ "entries": rows });
+    if broken.is_empty() {
+        vec![InvariantResult::pass(ID).evidence(evidence)]
+    } else {
+        vec![InvariantResult::fail(
+            ID,
+            "every report hook in ~/.claude/settings.json invokes ~/.amux/hook-report.sh, \
+             and tool events carry a valid regex matcher",
+            broken.join("; "),
+        )
+        .evidence(evidence)]
     }
 }
 
@@ -1575,16 +1726,111 @@ mod negative_controls {
     #[test]
     fn shared_guard_drift_is_detected() {
         let committed = "#!/usr/bin/env python3\n# canonical guard source\n";
-        let same = shared_guard_matches_committed(committed, Ok(committed.to_string()));
+        let same =
+            installed_script_matches_committed(&GIT_SHARED_GUARD, committed, Ok(committed.into()));
         assert_eq!(same[0].status, Status::Pass, "identical must pass: {same:?}");
 
-        let drifted =
-            shared_guard_matches_committed(committed, Ok(committed.to_string() + "# HAND EDIT\n"));
+        let drifted = installed_script_matches_committed(
+            &GIT_SHARED_GUARD,
+            committed,
+            Ok(committed.to_string() + "# HAND EDIT\n"),
+        );
         assert_eq!(drifted[0].status, Status::Fail, "a hand-edit must fail: {drifted:?}");
         assert!(drifted[0].observed.contains("DRIFTED"), "{}", drifted[0].observed);
 
-        let missing =
-            shared_guard_matches_committed(committed, Err("No such file (os error 2)".into()));
+        let missing = installed_script_matches_committed(
+            &GIT_SHARED_GUARD,
+            committed,
+            Err("No such file (os error 2)".into()),
+        );
         assert_eq!(missing[0].status, Status::Unknown, "unreadable is Unknown not pass: {missing:?}");
+
+        // The generalisation must not have silently renamed the ids consumers
+        // match on, and the two specs must not collide onto one id.
+        assert_eq!(same[0].invariant_id, "hooks.shared_guard_matches_committed");
+        let rep = installed_script_matches_committed(&REPORT_HOOK, committed, Ok(committed.into()));
+        assert_eq!(rep[0].invariant_id, "hooks.report_hook_matches_committed");
+        // ...and the prose must follow the spec, not stay hardcoded to the guard.
+        let rep_drift = installed_script_matches_committed(
+            &REPORT_HOOK,
+            committed,
+            Ok(committed.to_string() + "x"),
+        );
+        assert!(
+            rep_drift[0].observed.contains("scripts/hooks/hook-report.sh"),
+            "report-hook drift must name ITS OWN source, not the guard's: {}",
+            rep_drift[0].observed
+        );
+    }
+
+    fn ent(event: &str, command: &str, matcher: Option<&str>) -> ReportHookEntry {
+        ReportHookEntry {
+            event: event.into(),
+            command: command.into(),
+            matcher: matcher.map(String::from),
+        }
+    }
+
+    /// AMUX-2936. The load-bearing case is `the_incident`: the sha check above
+    /// passes throughout the real regression, so this is the leg that has to
+    /// fail on it. Built from the ACTUAL settings.json shape found on 2026-08-15
+    /// — an inline curl posting `{state,source}` — not from a convenient
+    /// fixture, because the convenient fixture is convenient precisely by
+    /// lacking the property that made the incident.
+    #[test]
+    fn report_hook_wiring_faults_are_detected() {
+        const GOOD: &str = r#"bash "$HOME/.amux/hook-report.sh" idle stop-hook"#;
+        const INLINE: &str = r#"curl -sk -m 3 -X POST -H 'Content-Type: application/json' -d "{\"state\":\"idle\",\"source\":\"stop-hook\"}" "$AMUX_URL/api/sessions/$AMUX_SESSION/report""#;
+
+        let healthy = report_hooks_wired(Ok(vec![
+            ent("Stop", GOOD, None),
+            ent("UserPromptSubmit", GOOD, None),
+            ent("PostToolUse", GOOD, Some(".*")),
+        ]));
+        assert_eq!(healthy[0].status, Status::Pass, "correct wiring must pass: {healthy:?}");
+
+        let the_incident = report_hooks_wired(Ok(vec![
+            ent("Stop", INLINE, None),
+            ent("UserPromptSubmit", INLINE, None),
+            ent("PostToolUse", INLINE, Some(".*")),
+        ]));
+        assert_eq!(
+            the_incident[0].status,
+            Status::Fail,
+            "THE incident (settings.json pointing at inline one-liners, hook-report.sh itself \
+             untouched) must fail — this is the case the sha check cannot see: {the_incident:?}"
+        );
+        assert_eq!(
+            the_incident[0].observed.matches("does not invoke").count(),
+            3,
+            "all three forked entries must be named, not just the first: {}",
+            the_incident[0].observed
+        );
+
+        // AMUX-2538's trap: correctly wired, still inert. `"*"` is not a regex,
+        // and a tool event with no matcher is ignored outright.
+        let bad_matcher =
+            report_hooks_wired(Ok(vec![ent("PostToolUse", GOOD, Some("*"))]));
+        assert_eq!(bad_matcher[0].status, Status::Fail, "\"*\" is not a regex: {bad_matcher:?}");
+        assert!(bad_matcher[0].observed.contains("inert"), "{}", bad_matcher[0].observed);
+
+        let no_matcher = report_hooks_wired(Ok(vec![ent("PostToolUse", GOOD, None)]));
+        assert_eq!(no_matcher[0].status, Status::Fail, "tool event needs a matcher: {no_matcher:?}");
+
+        // A LIFECYCLE event legitimately has none — the check must not invent a
+        // failure there, or it fires forever on a correct config and gets muted.
+        let lifecycle = report_hooks_wired(Ok(vec![ent("Stop", GOOD, None)]));
+        assert_eq!(lifecycle[0].status, Status::Pass, "Stop takes no matcher: {lifecycle:?}");
+
+        // Absence and unreadability are Unknown, never a false pass.
+        assert_eq!(report_hooks_wired(Ok(vec![]))[0].status, Status::Unknown);
+        assert_eq!(report_hooks_wired(Err("no such file".into()))[0].status, Status::Unknown);
+
+        // Evidence must carry the fork's command head for a FAILING row and
+        // withhold it otherwise — the head is what identifies which of the three
+        // implementations is wired, and dumping every command would put a user's
+        // settings file into an API response.
+        assert!(the_incident[0].evidence["entries"][0]["command_head"].is_string());
+        assert!(healthy[0].evidence["entries"][0]["command_head"].is_null());
     }
 }

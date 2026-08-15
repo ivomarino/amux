@@ -100,12 +100,38 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/git-hooks/git-shared-guard.py"
         ));
-        let runtime_path = crate::config::ServerConfig::from_process_env()
-            .amux_home
-            .join("hooks/git-shared-guard.py");
-        let runtime = std::fs::read_to_string(&runtime_path).map_err(|e| e.to_string());
-        out.extend(checks::shared_guard_matches_committed(COMMITTED_GUARD, runtime));
+        let amux_home = crate::config::ServerConfig::from_process_env().amux_home;
+        let runtime = std::fs::read_to_string(amux_home.join("hooks/git-shared-guard.py"))
+            .map_err(|e| e.to_string());
+        out.extend(checks::installed_script_matches_committed(
+            &checks::GIT_SHARED_GUARD,
+            COMMITTED_GUARD,
+            runtime,
+        ));
+
+        // -- 6a. the REPORT hook, same rule, same function (AMUX-2936). It is
+        // the D1 control plane and auto-compact's only token source, and it
+        // spent months as an unversioned runtime file whose own header warned
+        // about the forking that then happened anyway — a warning nobody reads
+        // before editing is not a control.
+        const COMMITTED_REPORT_HOOK: &str = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../scripts/hooks/hook-report.sh"
+        ));
+        let runtime = std::fs::read_to_string(amux_home.join("hook-report.sh"))
+            .map_err(|e| e.to_string());
+        out.extend(checks::installed_script_matches_committed(
+            &checks::REPORT_HOOK,
+            COMMITTED_REPORT_HOOK,
+            runtime,
+        ));
     }
+
+    // -- 6b. and is anything WIRED to that script? The sha check above would
+    // have passed green through the entire AMUX-2936 regression, because the
+    // file it compares was correct the whole time and settings.json simply
+    // pointed elsewhere. This is the leg that fails on the actual incident.
+    out.extend(report_hooks_check());
 
     // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
     // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
@@ -332,6 +358,135 @@ fn self_reports_check(state: &AppState) -> Vec<InvariantResult> {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3600.0);
     checks::self_reports_landing(&lanes, min_lanes, max_freshest_s)
+}
+
+/// Read the report hooks OUT of `~/.claude/settings.json` (AMUX-2936).
+///
+/// Selection predicate: a command that mentions the report SCRIPT or the report
+/// ENDPOINT. Both halves matter — matching only `hook-report.sh` would filter
+/// every fork out of the denominator, leaving a check that can only ever pass,
+/// and the fork this card exists for is exactly a command that hits the endpoint
+/// without going through the script.
+fn report_hooks_check() -> Vec<InvariantResult> {
+    const ID: &str = "hooks.report_hooks_wired";
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".claude/settings.json");
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(|e| format!("{} unreadable: {e}", path.display()))
+        .and_then(|text| {
+            serde_json::from_str::<serde_json::Value>(&text)
+                .map_err(|e| format!("{} is not valid JSON: {e}", path.display()))
+        })
+        .map(|v| extract_report_hooks(&v));
+    if let Err(ref why) = parsed {
+        tracing::debug!(target: "invariants", "{ID}: {why}");
+    }
+    checks::report_hooks_wired(parsed)
+}
+
+/// PURE so it can be driven by the incident's own settings.json shape.
+///
+/// Split out deliberately: an extractor that silently selects nothing makes the
+/// whole check Unknown forever, which reads as "not applicable here" rather than
+/// "broken" — the silent-probe failure, and the one shape a live green run
+/// cannot distinguish. Tested below against both the correct wiring and the
+/// forked wiring, so a selection bug fails a test instead of muting an invariant.
+fn extract_report_hooks(v: &serde_json::Value) -> Vec<checks::ReportHookEntry> {
+    let mut entries = Vec::new();
+    for (event, groups) in v["hooks"].as_object().into_iter().flatten() {
+        for g in groups.as_array().into_iter().flatten() {
+            for h in g["hooks"].as_array().into_iter().flatten() {
+                let command = h["command"].as_str().unwrap_or_default().to_string();
+                if !(command.contains("hook-report.sh")
+                    || command.contains("amux-report.sh")
+                    || command.contains("/report"))
+                {
+                    continue;
+                }
+                entries.push(checks::ReportHookEntry {
+                    event: event.clone(),
+                    command,
+                    matcher: g["matcher"].as_str().map(String::from),
+                });
+            }
+        }
+    }
+    entries
+}
+
+#[cfg(test)]
+mod report_hook_wiring_tests {
+    use super::*;
+    use crate::invariants::Status;
+
+    /// The settings.json shapes verbatim: the one running now (correct), and the
+    /// AMUX-2936 fork it replaced. Both must be SELECTED — the fork especially,
+    /// since filtering it out is what would leave a check that cannot fail.
+    #[test]
+    fn the_extractor_selects_both_the_wired_and_the_forked_shape() {
+        let wired = serde_json::json!({"hooks": {
+            "Stop": [{"hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" idle stop-hook"}]}],
+            "PostToolUse": [{"matcher": ".*", "hooks": [{"type": "command",
+                "command": "bash \"$HOME/.amux/hook-report.sh\" active tool-hook"}]}]
+        }});
+        let got = extract_report_hooks(&wired);
+        assert_eq!(got.len(), 2, "both report hooks must be selected");
+        assert_eq!(
+            got.iter().find(|e| e.event == "PostToolUse").unwrap().matcher.as_deref(),
+            Some(".*"),
+            "the matcher lives on the GROUP, not the hook — reading the wrong level \
+             reports every tool entry as matcher-less"
+        );
+        assert_eq!(checks::report_hooks_wired(Ok(got))[0].status, Status::Pass);
+
+        let forked = serde_json::json!({"hooks": {
+            "Stop": [{"hooks": [{"type": "command",
+                "command": "curl -sk -X POST -d '{\"state\":\"idle\"}' \
+                            \"$AMUX_URL/api/sessions/$AMUX_SESSION/report\""}]}]
+        }});
+        let got = extract_report_hooks(&forked);
+        assert_eq!(got.len(), 1, "an inline fork must be IN the denominator, not filtered out");
+        assert_eq!(
+            checks::report_hooks_wired(Ok(got))[0].status,
+            Status::Fail,
+            "the incident shape must fail end to end, extractor included"
+        );
+
+        // A settings.json full of unrelated hooks must not be dragged in.
+        let unrelated = serde_json::json!({"hooks": {
+            "PostToolUse": [{"matcher": "Write|Edit", "hooks": [{"type": "command",
+                "command": "bash .claude/check-and-commit.sh"}]}]
+        }});
+        assert!(extract_report_hooks(&unrelated).is_empty(), "unrelated hooks must not be selected");
+    }
+
+    /// Wiring, on the REAL file. Vacuous where there is no settings.json (CI),
+    /// and it says so rather than passing quietly — but on a machine that HAS
+    /// report hooks, the monitor must reach a real verdict about them. This is
+    /// the assertion that catches the extractor going blind against the actual
+    /// on-disk shape, which no synthetic fixture can.
+    #[test]
+    fn the_report_hook_check_reaches_a_verdict_on_the_real_settings_file() {
+        let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".claude/settings.json");
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            eprintln!("no {} — vacuous here, real on a fleet machine", path.display());
+            return;
+        };
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else { return };
+        if extract_report_hooks(&v).is_empty() {
+            eprintln!("no report hooks configured — vacuous here");
+            return;
+        }
+        let rs = report_hooks_check();
+        assert_ne!(
+            rs[0].status,
+            Status::Unknown,
+            "settings.json HAS report hooks but the monitor reached no verdict — the \
+             extractor and the live file disagree: {rs:?}"
+        );
+    }
 }
 
 /// The steering queue, joined against each target's reported state.
