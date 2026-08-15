@@ -3969,6 +3969,14 @@ function togglePeekTabCustomizer() {
       // LEFT-ANCHORED under the button (Ethan, 2026-08-14: "fixed to the left
       // dropdown ... always visible on the screen"), then clamped so the right
       // edge can never leave the viewport. Both clamps use the MEASURED width.
+      // NEUTRALISE `right` FIRST. .tab-customizer-menu sets `right: 0` (app.css),
+      // and this menu carries that class as well as its id, so an inline `left`
+      // alone does not anchor it — with left AND right both set and width:auto the
+      // box is pinned to the right edge and stretched, which is why it kept landing
+      // on the far side of the screen from its button no matter what `left` said.
+      // Setting right:auto is what makes `left` authoritative.
+      menu.style.right = 'auto';
+      menu.style.width = 'auto';
       let left = Math.min(r.left, vw - mw - PAD);
       if (left < PAD) left = PAD;
       menu.style.left = left + 'px';
@@ -7581,7 +7589,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.638';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.639';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
