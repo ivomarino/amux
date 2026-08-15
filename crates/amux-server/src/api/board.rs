@@ -64,6 +64,11 @@ pub fn routes() -> Router<AppState> {
         // most expensive shape available.
         .route("/{id}/status-request", post(status_request))
         .route("/{id}/status-update", post(status_update))
+        // AMUX-3131: the claim the assignment notifications tell every session to
+        // run. It was never mounted, so `amux board claim <id>` hit the GET-only
+        // SPA catch-all (405) and the CLI (pre-fix) exited 0 with the card
+        // untouched — AMUX-2140 one layer down. Same mechanism auto-pickup uses.
+        .route("/{id}/claim", post(claim_item))
 }
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.
@@ -1456,6 +1461,116 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
         Ok(Ok(None)) => not_found(&id),
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
+    }
+}
+
+/// POST /api/board/{id}/claim — atomically take a `todo` card and start it.
+///
+/// The assignment notifications tell every session to run `amux board claim
+/// <id>`, and the CLI has always POSTed here — but the route was never mounted,
+/// so the call hit the GET-only SPA catch-all (405), the CLI printed a good
+/// message and (pre-fix) exited 0, and the card was untouched (AMUX-3131, the
+/// AMUX-2140 class one layer down: the sanctioned instruction was theatre). It
+/// now runs the SAME operation auto-pickup uses (`claim_card`: compare-and-swap
+/// todo->doing, assign the claimer, emit `task.claimed` for the 24h re-claim
+/// cooldown), so a manual claim and an auto-pickup are one mechanism.
+pub async fn claim_item(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    // Claimer: X-Amux-Worker / X-Amux-Session (canonical), else a body
+    // {"session":...} (the bash CLI sends both). A claim with no claimer is
+    // meaningless, so refuse rather than record an anonymous owner.
+    let (_actor, mut session) = actor_from_headers(&headers);
+    if session == "api-anonymous" {
+        if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+            if let Some(s) = v.get("session").and_then(Value::as_str) {
+                let s = s.trim();
+                if !s.is_empty() {
+                    session = s.to_string();
+                }
+            }
+        }
+    }
+    if session == "api-anonymous" || session.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "claim needs a claimer — send X-Amux-Session: <your session> (the `amux board` CLI does this for you)",
+                "id": id,
+            })),
+        )
+            .into_response();
+    }
+    // Read current status + owner first, so every branch reports the truth
+    // (claimed / already yours / not claimable / not found) instead of a bare
+    // 409 the caller cannot act on.
+    let store = state.store.clone();
+    let key = id.clone();
+    let row = match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        Ok(bs::get_issue(&conn, &key)?)
+    })
+    .await
+    {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+    let Some(row) = row else {
+        return not_found(&id);
+    };
+    let owner = row.session.clone().unwrap_or_default().trim().to_string();
+    match row.status.as_str() {
+        "todo" => {
+            if !owner.is_empty() && owner != session {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": format!("card is assigned to '{owner}', not yours to claim — reassign it first"),
+                        "id": id, "status": "todo", "session": owner,
+                    })),
+                )
+                    .into_response();
+            }
+            if crate::runtime_jobs::board_drive::claim_card(&state, &session, &id).await {
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "ok": true, "id": id, "status": "doing", "session": session, "claimed": true,
+                    })),
+                )
+                    .into_response()
+            } else {
+                // Raced out of `todo` between the read above and the swap
+                // (owner closed it, or a peer claimed first).
+                (
+                    StatusCode::CONFLICT,
+                    Json(json!({
+                        "error": "claim raced — the card left 'todo' between read and write; re-check its status",
+                        "id": id,
+                    })),
+                )
+                    .into_response()
+            }
+        }
+        "doing" if owner == session => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true, "id": id, "status": "doing", "session": session, "already": true,
+            })),
+        )
+            .into_response(),
+        other => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("card is '{other}', not claimable — only a 'todo' card can be claimed (move it first: amux board todo {id})"),
+                "id": id, "status": other, "session": owner,
+            })),
+        )
+            .into_response(),
     }
 }
 

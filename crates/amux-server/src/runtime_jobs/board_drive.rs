@@ -2710,13 +2710,19 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
 /// stale view is the same failure this closes — the write sees the real row).
 pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
     let card_s = card.to_string();
+    // Assign the claimer as part of the swap. For auto-pickup this is a no-op
+    // (the card is already `i.session=lane`), but it makes a MANUAL claim
+    // (AMUX-3131: POST /api/board/{id}/claim) take ownership of an unassigned
+    // card in the same atomic step, rather than leaving it `doing` with a stale
+    // owner.
+    let session_s = session.to_string();
     let reply = state
         .store
         .write_async(move |conn| {
             let now = now_f64() as i64;
             let n = conn.execute(
-                "UPDATE issues SET status='doing', updated=?1 WHERE id=?2 AND status='todo'",
-                rusqlite::params![now, card_s],
+                "UPDATE issues SET status='doing', session=?1, updated=?2 WHERE id=?3 AND status='todo'",
+                rusqlite::params![session_s, now, card_s],
             )?;
             if n == 0 {
                 // Not todo any more (closed, discarded, already doing, or gone):

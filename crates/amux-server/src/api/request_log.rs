@@ -981,6 +981,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // every layer that mentions them kept routing sessions at them.
     RouteEntry { path: "/api/board/{id}/status-request", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/status-update", methods: &["POST"] },
+    // AMUX-3131: `amux board claim <id>` POSTs here; it was unmounted (405) and
+    // the CLI exited 0 with the card untouched. Now routed to claim_card.
+    RouteEntry { path: "/api/board/{id}/claim", methods: &["POST"] },
     // -- skills / slash-commands / map / history
     RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },
