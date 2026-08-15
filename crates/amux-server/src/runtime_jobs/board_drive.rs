@@ -260,6 +260,11 @@ pub struct DriveReport {
     pub finished_at: f64,
     pub assigned: usize,
     pub nudged: usize,
+    /// Cards re-activated from `backlog` to `todo` this tick because every one
+    /// of their `depends_on` dependencies reached a terminal status. Surfaced
+    /// here so a promotion (or its absence) is visible in
+    /// `/api/debug/board-drive` without reading logs (ethos rule 4).
+    pub promoted: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -774,6 +779,196 @@ fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
         })
         .cloned()
         .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Drive to verified — re-activate a card parked on a dependency once it clears
+// ---------------------------------------------------------------------------
+
+/// Types that never auto-promote out of `backlog`: containers and dormant
+/// triggers. Deliberately the SAME set [`DISPATCHABLE_WHERE`] excludes — a card
+/// that could not be dispatched even sitting in `todo` must not be re-activated
+/// INTO `todo`. (An epic is a container whose children carry the work; a
+/// tripwire/watch fires on a condition, not on a dependency clearing.)
+fn is_dormant_type(t: &str) -> bool {
+    matches!(t, "tripwire" | "watch" | "epic")
+}
+
+/// Is a single dependency's stored status TERMINAL for the promotion pass?
+/// Terminal here means COMPLETED: `done` or `verified` only. `discarded` is
+/// deliberately excluded — a discarded dependency is an abandonment a human
+/// should notice, not an all-clear that should silently re-activate the work
+/// that depended on it. This is narrower than [`deps_blocking`] (which lets a
+/// `discarded` dep un-block, because you cannot work an id that resolves to
+/// nothing) on purpose: not-blocking is not the same as cleared.
+fn dep_status_terminal(status: &str) -> bool {
+    matches!(
+        bs::parse_status(status),
+        Some(TaskStatus::Done) | Some(TaskStatus::Verified)
+    )
+}
+
+/// Pure: does this dependency set license a promotion? True iff there is at
+/// least one dependency AND every one is terminal. An EMPTY slice returns
+/// `false` — a card with no `depends_on` is not dependency-parked and this pass
+/// must never touch it (a triggers-only park stays parked). Split out as a pure
+/// function so the promotion rule is tested without a live DB.
+fn deps_all_terminal(dep_statuses: &[&str]) -> bool {
+    !dep_statuses.is_empty() && dep_statuses.iter().all(|s| dep_status_terminal(s))
+}
+
+/// If `row` is a dependency-parked card whose EVERY dependency resolves to a
+/// live card in a terminal status, return the dependency ids (so the promotion
+/// log can name what cleared); otherwise `None`. Conservative by construction:
+/// a `depends_on` id that resolves to no live row (missing/deleted) is treated
+/// as non-terminal, so a card is promoted ONLY when all its deps are provably
+/// terminal. Mirrors [`deps_blocking`]'s per-id status lookup.
+fn promotable_deps(conn: &Connection, row: &bs::IssueRow) -> Option<Vec<String>> {
+    if row.depends_on.is_empty() {
+        return None;
+    }
+    let statuses: Vec<Option<String>> = row
+        .depends_on
+        .iter()
+        .map(|d| {
+            conn.query_row(
+                "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                rusqlite::params![d],
+                |r| r.get::<_, String>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+        })
+        .collect();
+    // A dependency that did not resolve to a live row is not terminal.
+    if statuses.iter().any(Option::is_none) {
+        return None;
+    }
+    let refs: Vec<&str> = statuses.iter().map(|s| s.as_deref().unwrap_or("")).collect();
+    if deps_all_terminal(&refs) {
+        Some(row.depends_on.clone())
+    } else {
+        None
+    }
+}
+
+/// Fleet-wide scan for the drive-to-verified pass: every agent-owned, live,
+/// non-archived, non-dormant `backlog` card that has a NON-EMPTY `depends_on`
+/// with EVERY dependency terminal. Returns `(card_id, cleared_dep_ids)`.
+///
+/// Uses [`bs::list_issues`] filtered to `backlog` — the same tested read path
+/// the board list endpoint uses — rather than a bespoke query, so `depends_on`
+/// parsing cannot drift from the canonical decode. Runs once per tick; the
+/// cost profile matches a single dashboard board refresh, of which there are
+/// already many per minute.
+fn backlog_dep_promotions(conn: &Connection) -> Vec<(String, Vec<String>)> {
+    let rows = bs::list_issues(
+        conn,
+        &["backlog".to_string()],
+        &[],
+        bs::ArchivedFilter::ActiveOnly,
+    )
+    .unwrap_or_default();
+    rows.into_iter()
+        .filter(|r| r.owner_type == "agent")
+        .filter(|r| !is_dormant_type(&r.item_type))
+        .filter(|r| !r.depends_on.is_empty())
+        .filter_map(|r| promotable_deps(conn, &r).map(|deps| (r.id.clone(), deps)))
+        .collect()
+}
+
+/// Drive-to-verified: re-activate every card parked in `backlog` on a
+/// `depends_on` dependency the moment ALL of its dependencies reach a terminal
+/// status. Without this, a command decomposed into "do B after A" stalls at
+/// `parked` forever — board-drive dispatches only `todo`, so a backlog card
+/// never re-enters the loop when its blocker completes (the "board doesn't
+/// drive to completion" case named at the top of the idle-drain cooldown).
+///
+/// Returns the number promoted. Each promotion emits the SAME board-mutation
+/// event a status change from the board API emits (`StatusChanged`, with the
+/// post-mutation snapshot) so SSE clients refetch and the card becomes
+/// dispatchable, and writes a greppable INFO line naming the card and the deps
+/// that cleared it (two-fixes: the next promotion — or a wrongful one — is
+/// self-announcing).
+async fn promote_ready_backlog(state: &AppState) -> usize {
+    let candidates = match state.store.read() {
+        Ok(conn) => backlog_dep_promotions(&conn),
+        Err(_) => return 0,
+    };
+    let mut promoted = 0;
+    for (card, deps) in candidates {
+        let card_w = card.clone();
+        let reply = state
+            .store
+            .write_async(move |conn| {
+                // Re-check under the write lock. The card must STILL be a
+                // dependency-parked agent backlog card whose deps are all
+                // terminal — it could have been moved, archived, deleted, or
+                // its deps changed between the read scan and here. `WHERE
+                // status='backlog'` makes the swap atomic against a concurrent
+                // move (mirrors claim_card's `WHERE status='todo'`).
+                let Some(row) = bs::get_issue(conn, &card_w)? else {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                };
+                if row.status != "backlog"
+                    || row.owner_type != "agent"
+                    || row.archived != 0
+                    || is_dormant_type(&row.item_type)
+                    || promotable_deps(conn, &row).is_none()
+                {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                let now = now_f64() as i64;
+                let existing: Option<String> = conn
+                    .query_row(
+                        "SELECT log FROM issues WHERE id=?1",
+                        rusqlite::params![card_w],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                let log = bs::append_log(
+                    existing.as_deref(),
+                    &hhmm,
+                    "Re-activated: all depends_on dependencies reached a terminal status",
+                );
+                let n = conn.execute(
+                    "UPDATE issues SET status='todo', updated=?1, log=?2 \
+                     WHERE id=?3 AND status='backlog'",
+                    rusqlite::params![now, log, card_w],
+                )?;
+                if n == 0 {
+                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                }
+                // The post-mutation snapshot the SSE/replay journal carries —
+                // the identical shape board.rs emits on a status PATCH, so the
+                // fan-out is a real StatusChanged, not a bare revision bump.
+                let next = bs::get_issue(conn, &card_w)?
+                    .expect("row present immediately after its own promote");
+                let event = crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Task,
+                    entity_id: next.id.clone(),
+                    mutation: amux_core::revision::MutationKind::StatusChanged {
+                        from: "backlog".into(),
+                        to: "todo".into(),
+                    },
+                    payload: Some(next.snapshot()),
+                };
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![event] })
+            })
+            .await;
+        if matches!(reply, Ok(r) if r.applied) {
+            promoted += 1;
+            let cleared = deps.join(",");
+            tracing::info!(
+                target: "amux::board_drive", %card, deps = %cleared,
+                "board_drive: re-activated {card} — all depends_on terminal ({cleared})"
+            );
+        }
+    }
+    promoted
 }
 
 fn card_needsyou_asked_at(conn: &Connection, card: &str) -> Option<f64> {
@@ -2216,6 +2411,13 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
         started_at: now_f64(),
         ..Default::default()
     };
+    // DRIVE TO VERIFIED, BEFORE DISPATCH. A card parked in `backlog` on a
+    // `depends_on` dependency re-activates to `todo` the moment every dependency
+    // reaches a terminal status, so a "do B after A" command completes instead
+    // of stalling at `parked` forever. Fleet-wide and lane-independent (a
+    // dependency clearing does not care which lane is at a boundary), and FIRST
+    // so a freshly promoted card is dispatchable in this same tick's lane loop.
+    report.promoted = promote_ready_backlog(state).await;
     for lane in fleet.lanes() {
         let trace = drive_lane(state, fleet, &lane).await;
         match trace.outcome.as_str() {
@@ -2788,10 +2990,11 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
         async move {
             let fleet = LiveFleet { state: state.clone() };
             let r = drive_tick(&state, &fleet).await;
-            if r.assigned > 0 || r.nudged > 0 {
+            if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 {
                 tracing::info!(
                     assigned = r.assigned,
                     nudged = r.nudged,
+                    promoted = r.promoted,
                     lanes = r.lanes.len(),
                     "[board-drive] tick"
                 );
@@ -3273,6 +3476,94 @@ mod tests {
             backlog_candidates(&conn, "elane2", now as i64).is_empty(),
             "an epic in backlog is a container, not drainable work"
         );
+    }
+
+    /// The promotion RULE, pure. Terminal for drive-to-verified is COMPLETION —
+    /// `done`/`verified` only — and there must be at least one dependency, so a
+    /// card with no `depends_on` (empty slice) is never "all terminal".
+    #[test]
+    fn deps_all_terminal_requires_at_least_one_and_all_completed() {
+        assert!(deps_all_terminal(&["done", "verified"]), "all completed → promote");
+        assert!(deps_all_terminal(&["verified"]), "a single verified dep is terminal");
+        assert!(
+            !deps_all_terminal(&[]),
+            "no deps is not 'all terminal' — an unparked card must never be touched"
+        );
+        assert!(!deps_all_terminal(&["done", "doing"]), "one open dep blocks promotion");
+        assert!(!deps_all_terminal(&["backlog"]), "backlog is not completion");
+        assert!(
+            !deps_all_terminal(&["discarded"]),
+            "discarded is an abandonment, not a completion — must NOT re-activate"
+        );
+    }
+
+    /// Drive-to-verified (the "board doesn't drive to completion" case). A card
+    /// parked in `backlog` on a `depends_on` re-activates to `todo` ONLY when
+    /// every dependency has completed, is NOT promoted while any dep is still
+    /// open or missing, is NOT promoted when it has no deps (a triggers-only
+    /// park), and is NEVER promoted for a container/dormant type or a human's
+    /// card. Each `assert!` has a control on the same board so none passes
+    /// vacuously (the one card that DOES promote proves the selector fires).
+    #[test]
+    fn backlog_promotes_only_when_every_dependency_is_terminal() {
+        let conn = board_db();
+        // Dependencies in the states that matter.
+        let dep = |id: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
+                 VALUES (?1,?1,?2,'me','agent','code',100)",
+                rusqlite::params![id, status],
+            )
+            .expect("dep");
+        };
+        dep("A-done", "done");
+        dep("A-verified", "verified");
+        dep("A-open", "doing");
+
+        // Parked backlog cards of every shape (owner_type='agent').
+        let parked = |id: &str, typ: &str, deps: &str| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
+                 VALUES (?1,?1,'backlog','me','agent',?2,?3,100)",
+                rusqlite::params![id, typ, deps],
+            )
+            .expect("parked");
+        };
+        parked("P-all-terminal", "code", r#"["A-done","A-verified"]"#); // promote
+        parked("P-one-open", "code", r#"["A-done","A-open"]"#); // NOT: one dep still open
+        parked("P-missing", "code", r#"["A-done","GONE"]"#); // NOT: a dep resolves to nothing
+        parked("W-watch", "watch", r#"["A-done"]"#); // NOT: dormant type
+        parked("E-epic", "epic", r#"["A-verified"]"#); // NOT: container type
+        // A triggers-only park: NULL depends_on, terminal-deps irrelevant.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
+             VALUES ('P-nodeps','P-nodeps','backlog','me','agent','code',100)",
+            [],
+        )
+        .unwrap();
+        // A human's card with a completed dep — ethos rule 8, never swept.
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
+             VALUES ('H-1','H-1','backlog','me','human','code','[\"A-done\"]',100)",
+            [],
+        )
+        .unwrap();
+
+        let got = backlog_dep_promotions(&conn);
+        let ids: std::collections::HashSet<&str> = got.iter().map(|(i, _)| i.as_str()).collect();
+
+        assert!(ids.contains("P-all-terminal"), "all-terminal deps must promote: {ids:?}");
+        assert!(!ids.contains("P-one-open"), "one open dep must NOT promote");
+        assert!(!ids.contains("P-missing"), "a missing dep must NOT promote (conservative)");
+        assert!(!ids.contains("W-watch"), "a watch is dormant — never promote");
+        assert!(!ids.contains("E-epic"), "an epic is a container — never promote");
+        assert!(!ids.contains("P-nodeps"), "a card with no depends_on is not dependency-parked");
+        assert!(!ids.contains("H-1"), "never re-activate a human's card (ethos rule 8)");
+        assert_eq!(ids.len(), 1, "exactly the one promotable card: {ids:?}");
+
+        // The cleared deps ride along so the promotion log can name them.
+        let (_, cleared) = got.iter().find(|(i, _)| i == "P-all-terminal").unwrap();
+        assert_eq!(cleared.len(), 2, "both cleared deps are reported for the log line");
     }
 
     /// A card parked by the DOCUMENTED transition — core's `Doing -> NeedsYou`,
