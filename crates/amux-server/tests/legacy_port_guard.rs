@@ -76,6 +76,13 @@ const ALLOW: &[(&str, &str)] = &[
          process env — the hook itself resolves the URL, it does not hardcode one",
     ),
     (
+        "scripts/git-hooks/git-shared-guard.py",
+        "same docstring as amux-staged-guard, in the versioned copy of the shared-guard hook \
+         (AMUX-3033): it explains why pre-cutover sessions carry AMUX_URL=https://localhost:8822 \
+         and self-heals it, hardcoding nothing. Must stay byte-identical to the runtime hook — \
+         the AMUX-3033 drift invariant shas them — so it cannot be reworded, only allowlisted",
+    ),
+    (
         "scripts/test-amux-url.sh",
         "feeds a retired https://localhost:8822 to `amux url` as TEST INPUT, to prove the \
          resolver ignores the dead port and returns the canonical one; the literal is the \

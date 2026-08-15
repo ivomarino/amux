@@ -7596,7 +7596,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.641';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.642';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10898,7 +10898,7 @@ async function _ttsSpeak(text, btn) {
     // Make the next occurrence visible without a screenshot (this one cost three
     // reports and two wrong hypotheses before the error text was seen).
     try {
-      if (typeof _clientDebug === 'function') _clientDebug('tts-error', { name: e && e.name, msg: e && e.message });
+      if (typeof window._clientDebug === 'function') window._clientDebug('tts-error', { name: e && e.name, msg: e && e.message });
       else navigator.sendBeacon && navigator.sendBeacon('/api/client-debug',
         new Blob([JSON.stringify({ kind: 'tts-error', name: e && e.name, msg: e && e.message })],
                  { type: 'application/json' }));
