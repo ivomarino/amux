@@ -35,13 +35,20 @@ fn normalize(p: &Path) -> PathBuf {
     out
 }
 
-/// The repo-top-level names an `include_str!` under `src/` resolves to, EXCLUDING
-/// anything under `crates/` (that rides in via `COPY crates crates`).
-fn external_include_roots() -> BTreeSet<String> {
-    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+/// The repo-top-level names an `include_str!` under `<crate_manifest>/src/`
+/// resolves to, EXCLUDING anything under `crates/` (that rides in via
+/// `COPY crates crates`). Parameterized by crate so the check can cover EVERY
+/// crate the Dockerfile builds, not just this test's own — amux-frustrations'
+/// catch: a class-kill must not share the blind spot of the gates it guards, and
+/// the image build compiles amux-cli too.
+fn external_include_roots(crate_manifest: &Path) -> BTreeSet<String> {
     let root = repo_root();
     let mut roots = BTreeSet::new();
-    let mut stack = vec![manifest.join("src")];
+    let src = crate_manifest.join("src");
+    if !src.is_dir() {
+        return roots;
+    }
+    let mut stack = vec![src];
     while let Some(dir) = stack.pop() {
         for e in std::fs::read_dir(&dir).unwrap().flatten() {
             let p = e.path();
@@ -54,7 +61,7 @@ fn external_include_roots() -> BTreeSet<String> {
             }
             let text = std::fs::read_to_string(&p).unwrap();
             let src_dir = p.parent().unwrap();
-            for abs in include_str_targets(&text, src_dir, &manifest) {
+            for abs in include_str_targets(&text, src_dir, crate_manifest) {
                 if let Ok(rr) = abs.strip_prefix(&root) {
                     if let Some(first) = rr.components().next().and_then(|c| c.as_os_str().to_str()) {
                         if !first.is_empty() && first != "crates" {
@@ -66,6 +73,22 @@ fn external_include_roots() -> BTreeSet<String> {
         }
     }
     roots
+}
+
+/// The crates the Dockerfile's `cargo build --release -p X -p Y` compiles, read
+/// FROM the Dockerfile so the coverage tracks the build line and cannot drift.
+/// Package name == crate dir here (workspace convention); a missing dir just
+/// contributes nothing.
+fn built_crate_dirs(dockerfile: &str, root: &Path) -> Vec<PathBuf> {
+    let line = dockerfile
+        .lines()
+        .find(|l| l.contains("cargo build --release"))
+        .expect("Dockerfile builds the workspace with `cargo build --release`");
+    line.split("-p ")
+        .skip(1)
+        .filter_map(|s| s.split_whitespace().next())
+        .map(|name| root.join("crates").join(name))
+        .collect()
 }
 
 /// Every `include_str!` target in `text`, resolved to a normalized absolute path.
@@ -154,16 +177,24 @@ fn dockerfile_copied_sources(dockerfile: &str) -> BTreeSet<String> {
 
 #[test]
 fn dockerfile_copies_every_external_include_str_input() {
-    let needed = external_include_roots();
-    // The scraper must find the two known external inputs, or it is broken and a
-    // green pass here would be meaningless (the empty-probe trap).
+    let root = repo_root();
+    let dockerfile = std::fs::read_to_string(root.join("cloud/docker/Dockerfile"))
+        .expect("cloud/docker/Dockerfile is readable");
+
+    // Union the external include_str! roots across EVERY crate the Dockerfile
+    // builds, not just this test's own crate — the image build compiles amux-cli
+    // too, so a gap there breaks it the same way (amux-frustrations' catch).
+    let mut needed = BTreeSet::new();
+    for crate_dir in built_crate_dirs(&dockerfile, &root) {
+        needed.extend(external_include_roots(&crate_dir));
+    }
+    // The scraper must find the two known amux-server externals, or it is broken
+    // and a green pass here would be meaningless (the empty-probe trap).
     assert!(
         needed.contains("amux") && needed.contains("scripts"),
         "the include_str! scraper found {needed:?} — expected at least {{amux, scripts}}; it is broken"
     );
 
-    let dockerfile = std::fs::read_to_string(repo_root().join("cloud/docker/Dockerfile"))
-        .expect("cloud/docker/Dockerfile is readable");
     let copied = dockerfile_copied_sources(&dockerfile);
 
     let missing: Vec<&String> = needed.iter().filter(|r| !copied.contains(*r)).collect();
