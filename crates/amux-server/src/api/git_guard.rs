@@ -615,6 +615,18 @@ pub(crate) struct GuardInputs {
     pub theirs_firsthand: HashSet<String>,
     /// abs realpath of files with UNSTAGED changes right now.
     pub dirty: HashSet<String>,
+    /// Is ANY cotenant invisible to this verdict (transcript unreadable)?
+    ///
+    /// AC-355's block is scoped to this, on AMUX-2936's own measurement: the
+    /// absorption vector IS blind cotenants — an invisible lane cannot produce a
+    /// `foreign` row, so its staged work lands in `unclaimed`. With full
+    /// attribution, `unclaimed` means something different and much less
+    /// dangerous: nobody touched it in the window, most often the committer's
+    /// own pre-window or tool-generated work. Blocking that too would add a
+    /// blocking class to a guard already refusing ~18/hour, and AMUX-2936 named
+    /// exactly that as what gets the guard switched off (ethos rule 3 — a
+    /// constraint people cannot live with is one they disable).
+    pub blind_cotenant: bool,
 }
 
 #[derive(Default)]
@@ -737,7 +749,7 @@ pub(crate) fn classify(
             }));
             continue;
         }
-        // AC-355: UNCLAIMED NOW BLOCKS. It used to warn, on the reasoning that
+        // AC-355: UNCLAIMED BLOCKS **WHEN A COTENANT IS INVISIBLE**. It used to warn, on the reasoning that
         // there is "no owner to defer to" — which treated UNKNOWN as SAFE, and
         // that is the whole bug. Staged, and no session can account for it,
         // means someone put it in the shared index and the guard cannot see
@@ -764,6 +776,12 @@ pub(crate) fn classify(
         // staged bytes may still be the peer's. That needs content-level
         // detection (staged blob vs the committer's last-written bytes) or
         // per-lane worktrees (MI-4183).
+        if !inp.blind_cotenant {
+            // Fully-attributed checkout: nobody's, but nobody is hidden either.
+            // Stays a warning, as before.
+            v.unclaimed.push(json!({"path": rel, "has_unstaged_changes": is_dirty}));
+            continue;
+        }
         v.foreign.push(json!({
             "path": rel,
             "owner": "",
@@ -771,9 +789,10 @@ pub(crate) fn classify(
             "has_unstaged_changes": is_dirty,
             "why": format!(
                 "staged, but NO session has an edit record for it in the last {}m — including \
-                 you. On a shared index that is most often a peer's staged work whose transcript \
-                 is unreadable, and committing it ships their work under your message. If it is \
-                 genuinely yours, AMUX_VERIFIED_SOLO=1 after checking `git diff --cached -- {}`",
+                 you — AND a cotenant on this checkout is invisible to the guard right now, so \
+                 the likeliest owner is the lane we cannot see. Committing it ships their work \
+                 under your message. If it is genuinely yours, AMUX_VERIFIED_SOLO=1 after \
+                 checking `git diff --cached -- {}`",
                 (window / 60.0) as i64,
                 rel
             ),
@@ -1145,7 +1164,12 @@ pub async fn staged_guard_inner(
         theirs,
         theirs_firsthand: theirs_fh,
         dirty,
-    };
+            // Live or stopped alike: a stopped lane's PRE-STOP staged work is exactly
+        // what gets swept, and the degraded message already admits those edits are
+        // invisible. Liveness answers "can they be editing now", which is a
+        // different question from "could this staged file be theirs".
+        blind_cotenant: !blind.is_empty(),
+};
     let v = classify(&pairs, now, window, &inputs);
 
     if !v.foreign.is_empty() {
@@ -1605,7 +1629,9 @@ mod tests {
         //
         // Kept and inverted rather than deleted, so the change of contract is
         // visible in the diff to anyone who wonders why unclaimed now blocks.
-        let v = classify(&[pair("mystery.txt")], 1600.0, 21600.0, &GuardInputs::default());
+        // Blind cotenant present: this is the sweep case, and it must BLOCK.
+        let blind = GuardInputs { blind_cotenant: true, ..Default::default() };
+        let v = classify(&[pair("mystery.txt")], 1600.0, 21600.0, &blind);
         assert_eq!(v.foreign.len(), 1, "an unattributable staged path must BLOCK");
         assert_eq!(v.foreign[0]["path"], json!("mystery.txt"));
         assert_eq!(v.foreign[0]["owner"], json!(""), "no owner can be named — that IS the finding");
@@ -1618,6 +1644,15 @@ mod tests {
         // installed hooks act on (module docs). A new key would be ignored by
         // every hook already on disk.
         assert!(v.unclaimed.is_empty(), "must not ALSO sit in the non-blocking list");
+
+        // FULLY ATTRIBUTED checkout: nobody is hidden, so the same path is NOT a
+        // sweep — it is most often the committer's own pre-window or generated
+        // work. It stays a warning. Without this scoping the block adds a class
+        // to a guard already refusing ~18/hour, which AMUX-2936 measured and
+        // named as what gets the guard disabled outright.
+        let clear = classify(&[pair("mystery.txt")], 1600.0, 21600.0, &GuardInputs::default());
+        assert!(clear.foreign.is_empty(), "must NOT block when every cotenant is visible");
+        assert_eq!(clear.unclaimed.len(), 1, "still disclosed, just not blocking");
     }
 
     /// The envelope shape the installed hooks parse. Every key on every path,
