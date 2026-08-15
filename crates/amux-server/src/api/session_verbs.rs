@@ -1852,7 +1852,7 @@ fn render_session_transcript(name: &str, max_chars: usize) -> String {
 // contract).
 // ---------------------------------------------------------------------------
 
-const SESSION_PROVIDERS: [&str; 4] = ["claude", "codex", "gemini", "iterm2"];
+const SESSION_PROVIDERS: [&str; 5] = ["claude", "codex", "gemini", "iterm2", "ollama"];
 const PROVIDER_YOLO_FLAGS: [&str; 3] = [
     "--dangerously-skip-permissions",
     "--dangerously-bypass-approvals-and-sandbox",
@@ -2197,6 +2197,9 @@ fn default_model_for_provider(provider: &str) -> String {
     match provider {
         "codex" => "gpt-5.5".into(),
         "gemini" => "auto".into(),
+        // Ollama is `ollama run <model>`; the model is a positional argv, so a
+        // launchable default must exist here (this box has qwen3.8:27b pulled).
+        "ollama" => "qwen3.8:27b".into(),
         _ => get_default_model(),
     }
 }
@@ -2207,6 +2210,7 @@ fn provider_label(provider: &str) -> &str {
         "codex" => "Codex",
         "gemini" => "Gemini",
         "iterm2" => "iTerm2",
+        "ollama" => "Ollama",
         other => {
             if other.is_empty() {
                 "Claude Code"
@@ -2455,16 +2459,42 @@ fn mint_capture_card(
     if session_name.trim().is_empty() {
         return Ok(None);
     }
-    // A worker already holding an open agent card is being STEERED, not handed a
-    // new task — no second card (capture_prompt_card parity, and the dedup that
-    // stops a delivered prompt double-carding a lane that is already mid-work).
-    let open: i64 = conn.query_row(
+    // AMUX-3147: the old dedup skipped capturing ANY new task whenever the session
+    // held ANY open agent card — so only the FIRST task of a work-session reached
+    // the board and every later prompt was silent ("none of these have board
+    // items"). It applied a STEERING-path guard to genuine new user tasks: this
+    // path is `is_user` only, and a user prompt IS a new task (orchestrator steers
+    // arrive via the delivered path, not here). Manual work cards also counted, so
+    // being mid-work on ANY card blanked the ledger entirely.
+    //
+    // Narrowed to the guard's real purpose: don't double-card a RAPID re-send of
+    // one thought (the user pastes a spec across two sends). Skip ONLY when THIS
+    // mechanism minted a capture card (`desc` starts with the `**Prompt:**`
+    // marker) for this session within the window; a distinct task seconds+ later
+    // still cards, and a manual work card never blocks a capture. Captures mint
+    // `doing` (never re-dispatched), so an extra card cannot re-run work — the
+    // AMUX-2613 double-run the old dedup was conflated with stays fixed by the
+    // `doing` mint, not by this skip.
+    let window_s: i64 = std::env::var("AMUX_CAPTURE_DEDUP_WINDOW_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(45);
+    let cutoff = (now_ms / 1000) - window_s;
+    let recent_capture: i64 = conn.query_row(
         "SELECT COUNT(*) FROM issues WHERE session = ?1 AND deleted IS NULL \
-         AND owner_type = 'agent' AND status NOT IN ('done','verified','discarded')",
-        rusqlite::params![session_name],
+         AND owner_type = 'agent' AND creator = 'amux' AND status = 'doing' \
+         AND substr(desc, 1, 11) = '**Prompt:**' AND created > ?2",
+        rusqlite::params![session_name, cutoff],
         |r| r.get(0),
     )?;
-    if open > 0 {
+    if recent_capture > 0 {
+        // Surface the skip (two-fixes rule): a dropped capture must leave a trace,
+        // not just an absent "auto-captured" line. grep "ledger: capture deduped".
+        tracing::info!(
+            session = %session_name,
+            window_s,
+            "ledger: capture deduped — a capture card was minted <{window_s}s ago (rapid re-send guard)"
+        );
         return Ok(None);
     }
     let needs_self = amux_core::board::title_needs_self_description(&title);
@@ -4851,6 +4881,20 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
                 format!("gemini{opts} --session-id {}", sh_quote(&new_id))
             }
         }
+        "ollama" => {
+            // Ollama is a bare local model REPL — `ollama run <model>`. No agent
+            // flags, no resume, no sandbox, no MCP; the model name is the only
+            // argv it needs (OllamaAdapter docstring). Model precedence: the
+            // worker's CC_MODEL, else the provider default (qwen3.8:27b). We
+            // append NO trailing prompt on purpose: `ollama run <model>` with no
+            // prompt opens the interactive REPL a long-lived worker needs, while
+            // a trailing arg is taken as a one-shot and exits immediately.
+            let model = {
+                let m = cfg.get_or("CC_MODEL", "").trim().to_string();
+                if m.is_empty() { default_model_for_provider("ollama") } else { m }
+            };
+            format!("ollama run {}", sh_quote(&model))
+        }
         _ => build_claude_cmd(&cfg, &flags, &default_flags, &session_flag, extra_flags),
     };
 
@@ -4858,7 +4902,7 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     // cd, source the global agent credentials.
     let mut has_oauth = false;
     let mut shell_rc = String::new();
-    if provider != "codex" && provider != "gemini" {
+    if provider != "codex" && provider != "gemini" && provider != "ollama" {
         shell_rc.push_str("unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; ");
         if let Ok(t) = std::fs::read_to_string(PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".claude.json")) {
             if let Ok(v) = serde_json::from_str::<Value>(&t) {
@@ -4890,7 +4934,46 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
     } else {
         shell_rc.push_str(&format!("cd {}; ", sh_quote(&work_dir)));
     }
-    if provider != "codex" && provider != "gemini" && has_oauth {
+    // SCOPE LAYERS: global -> group(s) -> worker (AMUX-3106).
+    //
+    // `/api/scope` has advertised `env` at ["global","group","worker"] since the
+    // cutover and the scope UI writes all three files (scope.rs `env_file`), but
+    // launch sourced ONLY the global `amux.env` above — so setting anything at
+    // group or worker level wrote a file that never reached the running session.
+    // It saved, and it changed nothing. Same shape as the standing-order bug that
+    // produced `scoped_setting_in`: that fixed the READ path for one key at a
+    // time; this fixes DELIVERY of the whole layer into the process.
+    //
+    // Ordering is the mechanism, not a detail: `source` lets the LAST assignment
+    // win, so global-then-group-then-worker yields worker > group > global —
+    // exactly `scoped_setting_in`'s precedence. If the two ever disagreed, a key
+    // would resolve one way when a gate read it and another way inside the lane's
+    // shell, which is the kind of split nobody would think to look for.
+    //
+    // Groups come from `lane_groups`, i.e. CC_TAGS in the worker's own env file —
+    // the same source `scoped_setting_in` reads. Deliberately not a second
+    // spelling of "which groups is this in".
+    //
+    // This is the prerequisite the connectors design names (docs/design/connectors.md,
+    // "The one real gap"): scoping a connector to a worker has nowhere to land
+    // until below-global scope actually reaches the worker.
+    for g in lane_groups(name) {
+        let gp = home().join("env").join(format!("{g}.env"));
+        if gp.exists() {
+            shell_rc.push_str(&format!(
+                "set -a; source {} 2>/dev/null; set +a; ",
+                sh_quote(&gp.to_string_lossy())
+            ));
+        }
+    }
+    let worker_env = home().join("sessions").join(format!("{name}.env"));
+    if worker_env.exists() {
+        shell_rc.push_str(&format!(
+            "set -a; source {} 2>/dev/null; set +a; ",
+            sh_quote(&worker_env.to_string_lossy())
+        ));
+    }
+    if provider != "codex" && provider != "gemini" && provider != "ollama" && has_oauth {
         shell_rc.push_str("unset ANTHROPIC_API_KEY; ");
     }
     let mut env_args: Vec<String> = Vec::new();
@@ -13051,6 +13134,54 @@ mod steer_boundary_tests {
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     [&blob],
                 )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+    }
+
+    /// AMUX-3147: a new user prompt must card even while the session holds an open
+    /// MANUAL card — that was the "none of these have board items" bug, the old
+    /// dedup skipping on ANY open agent card. Only a RAPID re-send within the
+    /// window is deduped; a distinct task past the window cards again.
+    #[tokio::test]
+    async fn capture_cards_new_tasks_past_a_manual_card_but_dedups_a_rapid_resend() {
+        use crate::db::board_store::{create_issue, NewIssue};
+        let (state, _tmp) = tstate();
+        let now_ms = 1_700_000_000_000i64;
+        state
+            .store
+            .write_async(move |conn| {
+                // A manual work card — NOT a capture (its desc has no **Prompt:** marker).
+                create_issue(
+                    conn,
+                    &NewIssue {
+                        title: "manual work".into(),
+                        desc: "some manual work".into(),
+                        status: "doing".into(),
+                        session: Some("s".into()),
+                        item_type: "code".into(),
+                        creator: "amux".into(),
+                        owner_type: "agent".into(),
+                        due: None,
+                        due_time: None,
+                        reviewer: None,
+                        shepherd: None,
+                        gate: vec![],
+                        depends_on: vec![],
+                        tags: vec![],
+                    },
+                    now_ms / 1000,
+                )?;
+                // The open manual card must NOT block a new user task.
+                let first = super::mint_capture_card(conn, "s", "build the connectors tab", now_ms)?;
+                assert!(first.is_some(), "a new task must card even with an open manual card");
+                // A rapid re-send within the window IS deduped.
+                let rapid = super::mint_capture_card(conn, "s", "also wire slack", now_ms + 2_000)?;
+                assert!(rapid.is_none(), "a rapid re-send within the window must dedup");
+                // A distinct task past the window cards again.
+                let later = super::mint_capture_card(conn, "s", "now add gmail", now_ms + 60_000)?;
+                assert!(later.is_some(), "a distinct task past the dedup window must card");
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await
