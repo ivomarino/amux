@@ -327,18 +327,13 @@ fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
     let mut i = 0usize;
     while let Some(p) = sh[i..].find("/api/") {
         let start = i + p;
-        // The literal runs until anything that ends a shell word or starts an
-        // expansion. `$` stops it because `/api/board/$id` is a PREFIX, not a
-        // path — same rule the JS scanner uses, for the same reason.
-        let rest = &sh[start..];
-        let endrel = rest
-            .find(|c: char| {
-                c.is_whitespace()
-                    || matches!(c, '"' | '\'' | '`' | '$' | '?' | '\\' | ')' | ';' | '|' | '>')
-            })
-            .unwrap_or(rest.len());
-        let raw = &rest[..endrel];
-        i = start + endrel.max(1);
+        // The literal runs until a shell word terminator. A `$id` that is a WHOLE
+        // mid-path segment is kept as a `:id` placeholder and scanning continues,
+        // so a suffix after the param (the `/claim` in `/api/board/$id/claim`) is
+        // checked, not discarded (AMUX-3134); a trailing or mid-segment `$` (and a
+        // backtick) still ends the literal as an interpolated PREFIX.
+        let (raw, consumed, mut interpolated) = extract_shell_path(&sh[start..]);
+        i = start + consumed.max(1);
 
         let path = raw.trim_end_matches('/');
         if path.len() < 5 || !path.starts_with("/api/") {
@@ -359,10 +354,9 @@ fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
         if path.contains('*') || path.contains('{') || path.contains('%') {
             continue;
         }
-        // Interpolated if the literal was cut short by an expansion or ended in
-        // a slash — then it is a prefix and must match leniently.
-        let cut_char = rest[endrel..].chars().next();
-        let interpolated = raw.ends_with('/') || matches!(cut_char, Some('$') | Some('`'));
+        // A trailing slash is also a prefix (`/api/board/` before a space);
+        // `extract_shell_path` already set `interpolated` for a cutting `$`/backtick.
+        interpolated = interpolated || raw.ends_with('/');
 
         // Backward to the anchoring `curl`. Bash puts flags BEFORE the URL, so
         // backward is correct here — the opposite of the SPA, where the method
@@ -401,6 +395,73 @@ fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
         });
     }
     out
+}
+
+/// Extract the request path of a `/api/...` shell call, KEEPING a mid-path shell
+/// expansion (`$id`, `${id}`, `$1`) that forms a WHOLE segment as a `:id`
+/// placeholder and continuing past it — so the LITERAL SUFFIX after the param
+/// (the `/claim` in `/api/board/$id/claim`) is checked against the route table
+/// instead of discarded (AMUX-3134). Returns `(path, bytes_consumed, interpolated)`.
+///
+/// The pre-AMUX-3134 scanner stopped at the first `$` and marked the whole thing
+/// an interpolated PREFIX, so `/api/board/$id/claim` was recorded as
+/// `/api/board/` and the `/claim` suffix — the part that was unrouted — was never
+/// checked. That is why the claim endpoint was invisible to the very invariant
+/// that exists to catch it.
+///
+/// Phantom-failure resistance is preserved (amux-frustrations' constraint: never
+/// trade a false negative for a false positive on a check people act on): a `$`
+/// is reconstructed ONLY when it is a whole segment (preceded by `/`, followed by
+/// `/`). A trailing `$id`, a mid-segment `$` (`foo$bar`), or a `` ` `` still ends
+/// the literal as an interpolated prefix, exactly as before — the reconstruction
+/// only ADDS the mid-path-param shape, and the `:id` placeholder matches only at a
+/// route PARAM position (via `segments_match`), so a wrong suffix finds no route
+/// and a right one matches, with no path ever guessed.
+fn extract_shell_path(rest: &str) -> (String, usize, bool) {
+    let b = rest.as_bytes();
+    let mut out = String::new();
+    let mut j = 0usize;
+    let mut interpolated = false;
+    while j < b.len() {
+        let c = b[j];
+        if c == b'`' {
+            interpolated = true;
+            break;
+        }
+        if c.is_ascii_whitespace()
+            || matches!(c, b'"' | b'\'' | b'?' | b'\\' | b')' | b';' | b'|' | b'>')
+        {
+            break;
+        }
+        if c == b'$' {
+            // Bound the `$var` / `${var}` token.
+            let tok_end = if j + 1 < b.len() && b[j + 1] == b'{' {
+                rest[j..].find('}').map(|k| j + k + 1)
+            } else {
+                let mut k = j + 1;
+                while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+                    k += 1;
+                }
+                (k > j + 1).then_some(k)
+            };
+            match tok_end {
+                // A WHOLE mid-path segment: preceded by '/', followed by '/'.
+                Some(te) if out.ends_with('/') && te < b.len() && b[te] == b'/' => {
+                    out.push_str(":id");
+                    j = te;
+                    continue;
+                }
+                // Trailing or mid-segment expansion: a prefix, stop here.
+                _ => {
+                    interpolated = true;
+                    break;
+                }
+            }
+        }
+        out.push(c as char);
+        j += 1;
+    }
+    (out, j, interpolated)
 }
 
 /// Pull `API + '/api/...'` call sites out of the SPA, with their method.
@@ -579,6 +640,65 @@ mod tests {
                     || r.invariant_id == "status.contradicts_fresh_idle_report"
             }),
             "unexpected invariant id — the sweep contract greps for these exact strings"
+        );
+    }
+
+    /// AMUX-3134: a mid-path `$id` is kept as a `:id` placeholder so the suffix
+    /// after it is still extracted, while a trailing or mid-segment `$` stays an
+    /// interpolated prefix (no path guessed). The absence of this is what hid
+    /// /api/board/{id}/claim from route.callers_have_routes.
+    #[test]
+    fn extract_shell_path_keeps_a_mid_path_param_suffix() {
+        let (p, _, interp) = extract_shell_path("/api/board/$id/claim\"");
+        assert_eq!(p, "/api/board/:id/claim");
+        assert!(!interp, "a whole path with a param is NOT an interpolated prefix");
+        let (p, _, interp) = extract_shell_path("/api/board/${card}/archive ");
+        assert_eq!(p, "/api/board/:id/archive");
+        assert!(!interp);
+        // trailing $id -> prefix, still interpolated (unchanged, no guess)
+        let (p, _, interp) = extract_shell_path("/api/board/$id\"");
+        assert_eq!(p, "/api/board/");
+        assert!(interp);
+        // mid-segment $ (not a whole segment) -> prefix, interpolated
+        let (p, _, interp) = extract_shell_path("/api/foo$bar/x ");
+        assert_eq!(p, "/api/foo");
+        assert!(interp);
+    }
+
+    /// The end-to-end regression, and the whole point of AMUX-3134: a CLI curl to
+    /// /api/board/$id/claim is now a FULL caller path, so route.callers_have_routes
+    /// reports Missing when the route is unmounted (the catch AMUX-3131 evaded and
+    /// a human sweep had to make) and Ok once it is mounted — with no phantom on a
+    /// path that IS routed.
+    #[test]
+    fn a_mid_path_param_caller_is_checked_against_the_route_table() {
+        use crate::invariants::Status;
+        let sh = "curl -sk -X POST \"$AMUX_API/api/board/$id/claim\"";
+        let callers = scan_shell_calls(sh, "cli:amux");
+        let claim = callers
+            .iter()
+            .find(|c| c.path.contains("claim"))
+            .expect("the claim caller must be extracted");
+        assert_eq!(claim.path, "/api/board/:id/claim");
+        assert!(!claim.interpolated, "a full path, not a lenient prefix");
+        assert_eq!(claim.method, "POST");
+
+        // Unmounted -> Missing (the pre-AMUX-3131 world; THIS is the catch).
+        let without: &[(&str, &[&str])] = &[("/api/board/{id}", &["GET", "PATCH"])];
+        assert!(
+            checks::route_callers_have_routes(without, &callers)
+                .iter()
+                .any(|r| r.status == Status::Fail && r.entity_key == "POST /api/board/:id/claim"),
+            "an unrouted mid-path suffix must FAIL"
+        );
+
+        // Mounted -> Ok (no phantom on a routed path).
+        let with: &[(&str, &[&str])] = &[("/api/board/{id}/claim", &["POST"])];
+        assert!(
+            checks::route_callers_have_routes(with, &callers)
+                .iter()
+                .any(|r| r.status == Status::Pass && r.entity_key == "POST /api/board/:id/claim"),
+            "a mounted mid-path route must PASS"
         );
     }
 
