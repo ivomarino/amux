@@ -740,12 +740,21 @@ fn render_worker_env(w: &WorkerSpec) -> String {
     if !w.desc.is_empty() {
         pairs.push(("CC_DESC", w.desc.clone()));
     }
-    let provider = if w.provider.is_empty() { "claude".into() } else { w.provider.clone() };
+    let provider = if w.provider.is_empty() { "claude".to_string() } else { w.provider.clone() };
     if provider != "claude" {
-        pairs.push(("CC_PROVIDER", provider));
+        pairs.push(("CC_PROVIDER", provider.clone()));
     }
     if !w.model.is_empty() {
-        pairs.push(("CC_FLAGS", format!("--model {}", w.model)));
+        // Model wiring is provider-shaped. Agent CLIs (claude/codex/gemini) take
+        // `--model X` as a flag, so it rides in CC_FLAGS. Ollama is
+        // `ollama run <model>` — the model is a POSITIONAL the launcher reads
+        // from CC_MODEL; writing `--model` into CC_FLAGS would corrupt its argv
+        // (`ollama run <default> --model X` is not a valid invocation).
+        if provider == "ollama" {
+            pairs.push(("CC_MODEL", w.model.clone()));
+        } else {
+            pairs.push(("CC_FLAGS", format!("--model {}", w.model)));
+        }
     }
     pairs.iter().map(|(k, v)| format!("{k}=\"{v}\"")).collect::<Vec<_>>().join("\n")
 }

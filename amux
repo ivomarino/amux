@@ -506,17 +506,26 @@ cmd_start() {
     else
       cmd="codex"
     fi
+  elif [[ "$provider" == "ollama" ]]; then
+    # Ollama is a bare local model REPL: `ollama run <model>`. The model is a
+    # POSITIONAL arg (CC_MODEL, default qwen3.8:27b) — no Claude flags apply, so
+    # the CC_DEFAULT_FLAGS / CC_FLAGS / --model-sonnet / shell-setup blocks below
+    # all exclude ollama. No trailing prompt: bare `ollama run <model>` opens the
+    # interactive REPL a worker needs (a trailing arg is a one-shot and exits).
+    cmd="ollama run ${CC_MODEL:-qwen3.8:27b}"
   else
     cmd="${AMUX_CLAUDE_CMD:-claude}"
   fi
-  # Apply global defaults from defaults.env (skip for codex — Claude flags don't apply)
-  if [[ "$provider" != "codex" && -n "${CC_DEFAULT_FLAGS:-}" ]]; then
+  # Apply global defaults from defaults.env (skip for codex/ollama — Claude flags don't apply)
+  if [[ "$provider" != "codex" && "$provider" != "ollama" && -n "${CC_DEFAULT_FLAGS:-}" ]]; then
     local q
     q=$(quote_flags "$CC_DEFAULT_FLAGS") || die "failed to quote CC_DEFAULT_FLAGS"
     [[ -n "$q" ]] && cmd="$cmd $q"
   fi
-  # Apply session flags from <name>.env
-  if [[ -n "${CC_FLAGS:-}" ]]; then
+  # Apply session flags from <name>.env (skip for ollama — CC_FLAGS carries
+  # Claude/agent flags like `--model sonnet` that `ollama run` cannot accept;
+  # ollama's model comes from CC_MODEL, positional, above)
+  if [[ "$provider" != "ollama" && -n "${CC_FLAGS:-}" ]]; then
     local q
     q=$(quote_flags "$CC_FLAGS") || die "failed to quote CC_FLAGS"
     [[ -n "$q" ]] && cmd="$cmd $q"
@@ -543,6 +552,8 @@ cmd_start() {
         [[ -d "$git_root/.git" ]] && cmd="$cmd --add-dir $(printf '%q' "$git_root/.git")"
       fi
     fi
+  elif [[ "$provider" == "ollama" ]]; then
+    : # ollama's model is already positional in `ollama run <model>` — no --model default
   else
     [[ "$cmd" == *"--model"* ]] || cmd="$cmd --model sonnet"
   fi
@@ -553,7 +564,7 @@ cmd_start() {
   # to prevent auth conflict — BYO-key users don't have oauthAccount so they're
   # unaffected.
   local shell_setup=""
-  if [[ "$provider" != "codex" ]]; then
+  if [[ "$provider" != "codex" && "$provider" != "ollama" ]]; then
     shell_setup="unset CLAUDECODE CLAUDE_CODE_ENTRYPOINT; "
     if [[ -f "$HOME/.claude.json" ]] && grep -q '"oauthAccount"' "$HOME/.claude.json" 2>/dev/null; then
       shell_setup="${shell_setup}unset ANTHROPIC_API_KEY; "
