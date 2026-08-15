@@ -236,6 +236,56 @@ async fn owner_committed_since(dir: &str, path: &str, owner: &str, edit_age_secs
     None
 }
 
+/// What actually happened to a path, for the victim notice. Three states,
+/// because two of them need OPPOSITE responses and the first version of this
+/// collapsed them (amux, 2026-08-15).
+#[derive(Debug, PartialEq)]
+pub(crate) enum PathFate {
+    /// The owner committed it themselves. Nothing to do.
+    SettledByOwner(String),
+    /// The BYTES are in HEAD, but under someone else's commit — an absorption
+    /// that already happened cleanly. The CODE is safe; only the REASONING is
+    /// lost, so the response is "record it on the card", never "check this one".
+    /// Keying only on the owner's own trailer reported this as at-risk, which
+    /// cries wolf on every absorption that already went fine.
+    AbsorbedBy(String, String),
+    /// The path differs from HEAD and the owner has no commit for it: the work
+    /// is genuinely uncommitted and a sweep would take it. This is the state
+    /// the AC-355 block exists to prevent.
+    AtRisk,
+}
+
+/// Decide between the three. Content-in-HEAD is checked with `git diff HEAD`,
+/// which answers "are these bytes committed by ANYONE" — the question the
+/// trailer-only check could not ask.
+pub(crate) async fn path_fate(dir: &str, path: &str, owner: &str, edit_age_secs: i64) -> PathFate {
+    if let Some(sha) = owner_committed_since(dir, path, owner, edit_age_secs).await {
+        return PathFate::SettledByOwner(sha);
+    }
+    // Empty `git diff HEAD -- path` means the working tree matches HEAD, i.e.
+    // whatever was written is committed — by someone.
+    let dirty = git_out(dir, &["diff", "HEAD", "--name-only", "--", path])
+        .await
+        .map(|o| !o.trim().is_empty())
+        .unwrap_or(true); // unreadable -> assume at risk, never reassure
+    if dirty {
+        return PathFate::AtRisk;
+    }
+    let last = git_out(
+        dir,
+        &["log", "-1", "--format=%h%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
+    )
+    .await
+    .unwrap_or_default();
+    let mut it = last.trim().split('\t');
+    let sha = it.next().unwrap_or("").trim().to_string();
+    let who = it.next().unwrap_or("").trim().to_string();
+    if sha.is_empty() {
+        return PathFate::AtRisk;
+    }
+    PathFate::AbsorbedBy(sha, if who.is_empty() { "(untrailered)".into() } else { who })
+}
+
 /// py:19380 `_repo_root`, memoized — a commit is latency-sensitive and this is
 /// called once per session per check.
 ///
@@ -1201,12 +1251,24 @@ pub async fn staged_guard_inner(
                 let mut lines: Vec<String> = Vec::new();
                 let mut all_settled = true;
                 for (pth, age) in paths.iter().take(10) {
-                    match owner_committed_since(&wd, pth, &owner, *age).await {
-                        Some(sha) => lines
+                    match path_fate(&wd, pth, &owner, *age).await {
+                        PathFate::SettledByOwner(sha) => lines
                             .push(format!("  {pth}  — already committed by you in {sha}; nothing at risk")),
-                        None => {
+                        // Absorbed but SAFE. The bytes are in HEAD under someone
+                        // else's commit, so the code is fine and only the
+                        // reasoning is stranded — point at the card, do not send
+                        // anyone hunting for lost work. Reporting this as at-risk
+                        // is what cries wolf on every absorption that went fine.
+                        PathFate::AbsorbedBy(sha, who) => lines.push(format!(
+                            "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe, \
+                             record the REASONING on the card"
+                        )),
+                        PathFate::AtRisk => {
                             all_settled = false;
-                            lines.push(format!("  {pth}  — NO commit of yours since that edit; CHECK THIS ONE"));
+                            lines.push(format!(
+                                "  {pth}  — differs from HEAD and you have no commit for it; \
+                                 the WORK ITSELF is at risk — CHECK THIS ONE"
+                            ));
                         }
                     }
                 }
@@ -1277,6 +1339,48 @@ mod tests {
     ///
     /// Authorship is the Amux-Session TRAILER, never %an: every lane on this
     /// machine commits as the same person, so %an cannot discriminate at all.
+    /// The three-state refinement (amux, 2026-08-15). The first version keyed
+    /// only on the VICTIM'S OWN trailer, so an absorption that had already
+    /// happened cleanly — bytes safely in HEAD under the absorber's commit —
+    /// reported as "NO commit of yours; CHECK THIS ONE". That is a false alarm
+    /// on the most common outcome, and it points the reader at recovering work
+    /// that was never lost. Absorbed-but-safe and about-to-be-swept need
+    /// OPPOSITE responses: one is "record the reasoning on the card", the other
+    /// is "your work is at risk".
+    #[tokio::test]
+    async fn path_fate_separates_absorbed_but_safe_from_genuinely_at_risk() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "Shared Name"]);
+
+        // alice's work, committed by BOB (the absorption that already happened).
+        std::fs::write(dir.path().join("absorbed.txt"), "alice wrote this\n").unwrap();
+        git(&["add", "absorbed.txt"]);
+        git(&["commit", "-q", "-m", "bob's message\n\nAmux-Session: bob"]);
+
+        match path_fate(&d, "absorbed.txt", "alice", 3600).await {
+            PathFate::AbsorbedBy(_, who) => assert_eq!(who, "bob",
+                "must name WHO absorbed it, so the victim knows where the reasoning went"),
+            other => panic!("expected AbsorbedBy, got {other:?} — this is the cry-wolf case"),
+        }
+
+        // alice's work that is NOT in HEAD: genuinely at risk.
+        std::fs::write(dir.path().join("atrisk.txt"), "uncommitted\n").unwrap();
+        assert_eq!(path_fate(&d, "atrisk.txt", "alice", 3600).await, PathFate::AtRisk);
+
+        // and a file alice committed herself stays settled.
+        std::fs::write(dir.path().join("mine.txt"), "alice\n").unwrap();
+        git(&["add", "mine.txt"]);
+        git(&["commit", "-q", "-m", "alice\n\nAmux-Session: alice"]);
+        assert!(matches!(path_fate(&d, "mine.txt", "alice", 3600).await,
+                         PathFate::SettledByOwner(_)));
+    }
+
     #[tokio::test]
     async fn owner_committed_since_distinguishes_committed_from_still_staged() {
         let dir = tempfile::tempdir().unwrap();
