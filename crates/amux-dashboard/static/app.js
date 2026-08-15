@@ -7596,7 +7596,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.642';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.643';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28434,7 +28434,17 @@ function _msgLocate(session, encText) {
 // message tab contents for global amux is the same tab contents as session
 // message, for example I cant locate a message that was sent." The kind chips
 // still narrow; they just no longer narrow SILENTLY as the starting state.
-let _msgsKind = 'all';          // all | human | session | schedule
+// Default HUMAN, not all (Ethan, 2026-08-15). The other two message views
+// already opened on human — _cmdHistKind and _peekMsgFilter are both 'human' —
+// so this was the odd one out rather than a considered difference.
+// Safe with the chips because the counts are fetched SEPARATELY and unfiltered
+// (?counts=1 with no kind param), so every chip keeps its true total instead of
+// reading 0 for the unselected kinds — the failure the comment at the fetch site
+// already warns about. Verified live: counts=1 and counts=1&kind=human return
+// identical totals (all 8555, human 3094, session 3941, schedule 607, amux 913).
+// It also makes the first load SMALLER: kind is applied at the server, so the
+// opening page is 3094 candidates instead of 8555, which matters on mobile.
+let _msgsKind = 'human';        // all | human | session | schedule
 let _msgsCounts = null;         // true per-kind totals from the server
 function _msgsSetKind(k) {
   _msgsKind = k;
