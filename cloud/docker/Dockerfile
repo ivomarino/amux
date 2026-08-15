@@ -42,6 +42,20 @@ COPY crates crates
 # it broke the cloud deploy on 2026-08-12 and the runtime COPY at the bottom
 # makes it look already handled.
 COPY amux ./amux
+# scripts/ ARE BUILD INPUTS too — the SAME class as `amux` above, recurred
+# (AMUX-3033 + AMUX-2936). invariants/monitor.rs include_str!s the versioned hook
+# sources to compare the RUNNING hook against the committed one:
+#   include_str!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/git-hooks/git-shared-guard.py")
+#   include_str!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/hooks/hook-report.sh")
+# so cargo cannot compile amux-server without scripts/ present. Missing here, the
+# build dies with `couldn't read .../scripts/git-hooks/git-shared-guard.py: No
+# such file` — and it stays LATENT until a deploy actually RUNS the build, because
+# rust CI compiles from the full checkout where scripts/ exists. It broke the
+# FIRST green deploy after main went green (2026-08-15): every prior deploy had
+# skipped on red CI, so the build job never ran to surface it. Copy the whole dir
+# so the next scripts/ include_str! does not re-break it; build-stage only (the
+# content is baked into the binary, the runtime stage needs none of it).
+COPY scripts scripts
 
 # --release is REQUIRED, not a preference. `rust-embed` is built without the
 # `debug-embed` feature, so a DEBUG binary reads the dashboard from
