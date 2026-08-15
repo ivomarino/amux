@@ -997,6 +997,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- skills / slash-commands / map / history
     RouteEntry { path: "/api/mcp", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/mcp/{name}", methods: &["DELETE"] },
+    // GET-only ollama model listing (workers::ollama_models) — mounted in
+    // api/mod.rs on the AMUX-3145 ollama work but never tabled, so the route
+    // census reported it unrouted while it answered fine (AMUX-2871 class).
+    RouteEntry { path: "/api/ollama/models", methods: &["GET"] },
     // Mounted-but-untabled, all found by curling the census's "missing" list
     // against the live server (AMUX-2871). Each was reported as unrouted while
     // answering, because the census reads this table.
