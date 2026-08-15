@@ -179,7 +179,10 @@ _start_via_api() {
   resp=$(curl -sk -m 90 -X POST -H "X-Amux-Session: ${AMUX_SESSION:-}" \
     "$AMUX_API/api/sessions/$name/start" 2>/dev/null) || resp=""
   if [[ -z "$resp" ]]; then
-    die "amux server unreachable — herdr workers start through the server (amux serve). NOTHING was started."
+    # herdr AND codex/ollama start through the server now (AMUX-3164), so this is
+    # no longer herdr-specific. A stranded lane whose $AMUX_URL is the retired
+    # 8822 (AMUX-3046) hits this even when the server is up — use `$(amux url)`.
+    die "amux server unreachable at ${AMUX_API} — this worker starts through the server (amux serve). If the server IS up, your \$AMUX_URL may be the retired 8822 (AMUX-3046) — retry with: AMUX_URL=\$(amux url) amux start ${name}. NOTHING was started."
   fi
   local rc=0
   RESP="$resp" TGT="$name" python3 - <<'PYEOF' || rc=$?
