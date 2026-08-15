@@ -2824,3 +2824,29 @@ FIX: Root cause fixed at the template (AMUX-3127, b8b358f: pin litestream 0.5.16
   expose it via /api/observability or a health invariant, so the next DR failure
   self-announces. Open until that runtime signal exists; the CI guard only catches the repo
   reintroduction, not a live replication stall.
+
+## The idle-drain nudge escalates forever and never names the one command that stops it
+AREA: notices
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-15
+SESSION: amux
+CARD: AMUX-3140
+SYMPTOM: After draining every clean card and staging the rest (delicate / design-change /
+  epic-child) to backlog, the `[amux]` idle-drain nudge kept firing and escalating ("repeats
+  faster the larger your backlog is"). The mechanism to stop it exists — `drainable_backlog`
+  excludes any card with a `source_ref` trigger from both firing and escalation — but the
+  nudge message lists "backlog with a trigger" as an option WITHOUT naming the `--trigger`
+  flag that sets it or saying it excludes the card. So the sanctioned escape was invisible
+  from the message: I parked cards with a prose "TRIGGER:" in the desc (sets no source_ref)
+  and kept getting re-listed, then nearly filed a card blaming the nudge for "not respecting
+  triggers" when it does.
+COST: A multi-turn loop of finish -> nudge -> stage -> re-nudge, and a near-miss filed card
+  against a mechanism that was correct (caught only by verifying the mechanism, ethos rule 7).
+  The same shape hit mixpeek-autopilot (2026-08-13, per the drainable_backlog code comment):
+  three false nudges on a standing tripwire and two externally-triggered chores.
+FIX: c7fe156 — the message now spells out `amux board <status> <id> --trigger "what unblocks
+  it"` and that it excludes the card from the nudge, and says "drainable" throughout (renamed
+  the misnamed `total_backlog` param; the call site already passed the drainable count). The
+  exclusion behavior was already correct; this makes the honest path discoverable (ethos rule
+  6). Underlying nudge friction is the same family as [[amux-project-reference]] board churn.
