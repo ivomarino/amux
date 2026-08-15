@@ -11893,6 +11893,61 @@ mod tests {
         assert_eq!(live_voided, 0, "a still-'doing' pickup must never be voided");
     }
 
+    /// AMUX-3052 fail-open SIGNAL (gtm-engine's blind spot): a DB read error at
+    /// the stale-check makes the guard DELIVER (fail-open — dropping a valid pickup
+    /// is worse than a spurious one), but it must still EMIT, or a stale pickup let
+    /// through on a degraded DB is invisible and the void rate falls exactly when
+    /// the guard has stopped running. No prod DB error can honestly exercise this,
+    /// so this is the only place the emission is proven to fire. Induces the error
+    /// by dropping the table the check reads, then asserts the delivered=true
+    /// check-failed event landed AND the row was not voided.
+    #[tokio::test]
+    async fn a_read_error_at_the_stale_check_signals_and_still_delivers() {
+        let (st, _dir) = state();
+        let now = now_f64();
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                let pick =
+                    "[amux auto-pickup] Claimed board card BET-6 from your queue - work it now.";
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
+                     VALUES('r1','lane-x',?1,?2,'board-drive')",
+                    rusqlite::params![pick, now - 20.0],
+                )?;
+                // Make the stale-check's `SELECT status FROM issues` fail with an
+                // Err (not NoRows) — the fail-open path.
+                conn.execute("DROP TABLE issues", [])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+
+        steer_deliver_tick(&st).await;
+
+        let conn = st.store.read().unwrap();
+        let signalled: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE type='message.voided' \
+                 AND data LIKE '%pickup-check-failed%' AND data LIKE '%\"delivered\":true%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            signalled, 1,
+            "a read error on the stale-check must emit a delivered=true check-failed event, not vanish"
+        );
+        let voided: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM steering_history WHERE id='r1' AND text LIKE '[VOIDED:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(voided, 0, "fail-open: a read error must deliver, never void");
+    }
+
     async fn call(
         app: &Router,
         method: &str,
