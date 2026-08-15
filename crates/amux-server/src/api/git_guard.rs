@@ -687,11 +687,47 @@ pub(crate) fn classify(
             }));
             continue;
         }
-        // THE BELT (AMUX-2443 / AF-19 residual / AC-297): staged, not yours by
-        // any record, and no peer trail either. Not blockable — no owner to
-        // defer to, and it may be the committer's own pre-window work — but
-        // silence is what made 762e06e a sweep.
-        v.unclaimed.push(json!({"path": rel, "has_unstaged_changes": is_dirty}));
+        // AC-355: UNCLAIMED NOW BLOCKS. It used to warn, on the reasoning that
+        // there is "no owner to defer to" — which treated UNKNOWN as SAFE, and
+        // that is the whole bug. Staged, and no session can account for it,
+        // means someone put it in the shared index and the guard cannot see
+        // who; on a shared checkout the likeliest who is a peer whose
+        // transcript is unreadable.
+        //
+        // Measured twice in one day, both PURE sweeps where the committer had
+        // no record of the file at all: 7d0e95d took a peer's invariants/
+        // checks.rs + monitor.rs, and 6217dc0 — MY OWN commit improving this
+        // very guard — took a peer's api/alerts.rs + the amux CLI. The guard
+        // warned on both and blocked neither. A guard-improvement commit being
+        // itself a sweep is the argument.
+        //
+        // Emitted as `foreign` rather than a new key on purpose: installed
+        // hooks live on checkouts this repo cannot see and block on exactly one
+        // thing, `foreign` being non-empty (module docs — the server adapts to
+        // the hooks, never the reverse). A new field would be ignored by every
+        // hook already on disk, which is the same silence in a new spelling.
+        //
+        // NOT CLOSED by this, and named so a reader does not over-trust the
+        // block: the BOTH-EDITED case. When two sessions edit the same file the
+        // shared index holds one blob — whoever `git add`-ed last — and the
+        // committer HAS a record for that path, so this never fires while the
+        // staged bytes may still be the peer's. That needs content-level
+        // detection (staged blob vs the committer's last-written bytes) or
+        // per-lane worktrees (MI-4183).
+        v.foreign.push(json!({
+            "path": rel,
+            "owner": "",
+            "age_secs": 0,
+            "has_unstaged_changes": is_dirty,
+            "why": format!(
+                "staged, but NO session has an edit record for it in the last {}m — including \
+                 you. On a shared index that is most often a peer's staged work whose transcript \
+                 is unreadable, and committing it ships their work under your message. If it is \
+                 genuinely yours, AMUX_VERIFIED_SOLO=1 after checking `git diff --cached -- {}`",
+                (window / 60.0) as i64,
+                rel
+            ),
+        }));
     }
     v
 }
@@ -1455,11 +1491,29 @@ mod tests {
     /// THE BELT (AMUX-2443): staged, no record from anyone. Not blocked, but
     /// never silent — silence is what made 762e06e a sweep.
     #[test]
-    fn unrecorded_path_is_reported_unclaimed() {
+    fn unrecorded_path_blocks_because_unknown_is_not_safe() {
+        // CONTRACT CHANGE, AC-355. This test previously asserted the opposite —
+        // foreign empty, unclaimed populated, i.e. warn-and-ship — and it was
+        // encoding the bug: "no session can account for this staged file" was
+        // treated as safe because there was no owner to defer to. Two sweeps in
+        // one day went through that gap, including the commit that was fixing
+        // this guard's own notice.
+        //
+        // Kept and inverted rather than deleted, so the change of contract is
+        // visible in the diff to anyone who wonders why unclaimed now blocks.
         let v = classify(&[pair("mystery.txt")], 1600.0, 21600.0, &GuardInputs::default());
-        assert!(v.foreign.is_empty());
-        assert_eq!(v.unclaimed.len(), 1);
-        assert_eq!(v.unclaimed[0]["path"], json!("mystery.txt"));
+        assert_eq!(v.foreign.len(), 1, "an unattributable staged path must BLOCK");
+        assert_eq!(v.foreign[0]["path"], json!("mystery.txt"));
+        assert_eq!(v.foreign[0]["owner"], json!(""), "no owner can be named — that IS the finding");
+        // The refusal must be actionable or it gets routed around: name the
+        // escape and the exact diff command (the AMUX-2325 lesson).
+        let why = v.foreign[0]["why"].as_str().unwrap();
+        assert!(why.contains("AMUX_VERIFIED_SOLO"), "escape not named: {why}");
+        assert!(why.contains("git diff --cached"), "no way to check it: {why}");
+        // It blocks via `foreign` specifically, because that is the only field
+        // installed hooks act on (module docs). A new key would be ignored by
+        // every hook already on disk.
+        assert!(v.unclaimed.is_empty(), "must not ALSO sit in the non-blocking list");
     }
 
     /// The envelope shape the installed hooks parse. Every key on every path,
