@@ -4340,24 +4340,21 @@ function updateRateLimitPill() {
   if (!pill || !txt) return;
   const blocked = sessions.filter(s => s.rate_limited_until);
   const credit = sessions.filter(s => s.credit_limited);
-  if (!blocked.length && !credit.length) {
+  const n = blocked.length + credit.length;
+  if (!n) {
     pill.classList.remove('show');
     return;
   }
-  if (blocked.length) {
-    // All sessions on one account share a reset time; show the earliest if
-    // they drift, and indicate "N of M" so the user sees the fleet picture.
-    const earliest = Math.min(...blocked.map(s => s.rate_limited_until));
-    const total = sessions.filter(s => !s.archived).length || blocked.length;
-    txt.textContent = blocked.length + ' of ' + total +
-      ' rate-limited, reset ' + _fmtClockTime(earliest) +
-      (credit.length ? ' · ' + credit.length + ' model-limited' : '');
-  } else {
-    // Credit/model limits only — no reset time; the fix is a model switch.
-    txt.textContent = credit.length + ' worker' + (credit.length>1?'s':'') +
-      ' hit a model limit — switch model (Bulk actions)';
-  }
-  pill.title = blocked.concat(credit).map(s => s.name).join(', ');
+  // COMPACT CHIP (Ethan, 2026-08-16). The old verbose "N workers hit a model
+  // limit, switch model" text stretched this chip into a fleet-wide red
+  // banner. Now it is just a count: "N limited" (plus the shared reset time when
+  // one is known), and tapping it jumps to the first limited worker. The full
+  // breakdown and the model-switch fix stay on the per-worker badge and its title,
+  // so the header no longer shouts.
+  txt.textContent = blocked.length
+    ? n + ' limited · reset ' + _fmtClockTime(Math.min(...blocked.map(s => s.rate_limited_until)))
+    : n + ' limited';
+  pill.title = blocked.concat(credit).map(s => s.name).join(', ') + ' (tap to jump)';
   pill.classList.add('show');
 }
 function _scrollToFirstRateLimited() {
@@ -7621,7 +7618,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.653';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.654';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

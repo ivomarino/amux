@@ -190,8 +190,8 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   </div>
   <div style="display:flex;gap:8px;align-items:center;">
     <div id="org-switcher-wrap" style="display:none;"></div>
-    <button class="btn-rate-limit" id="rate-limit-pill" title="" onclick="event.stopPropagation();openBulkActions()">
-      <span id="rate-limit-pill-text">0 rate-limited</span>
+    <button class="btn-rate-limit" id="rate-limit-pill" title="" onclick="event.stopPropagation();_scrollToFirstRateLimited()">
+      <span id="rate-limit-pill-text">0 limited</span>
     </button>
     <div class="active-wrap">
       <button class="btn-active" id="active-btn" onclick="event.stopPropagation();toggleActiveDropdown()">

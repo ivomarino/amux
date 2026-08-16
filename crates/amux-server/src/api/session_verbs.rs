@@ -4255,12 +4255,11 @@ async fn send_text_inner(
             )
             .await;
             if ok {
-                // The menu is gone; this send is no longer facing a selector.
-                // Clear the stamp: the reliable menu signal is over. Persisting a
-                // rate-limited status past the menu needs a reliable signal
-                // (reset time / hook), not a banner-word scrape that false-flags
-                // working lanes (Ethan, 2026-08-16).
-                update_meta(name, &[("rate_limited_since", json!(0))]);
+                // The menu is gone, but the lane is blocked until the limit resets.
+                // Do NOT clear the stamp here: the rate_limit_sweep clears it when
+                // the lane RESUMES generating (its own activity), so the status
+                // persists for the blocked window without any banner-word scrape.
+                // Only unblock this send.
                 waiting = false;
             }
         }
@@ -8107,10 +8106,23 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         // reliable signal amux does not have by scraping (a reset time, or a Claude
         // Code hook reporting rate-limit state, the D2 exit) — not a fuzzy banner.
         if !is_rate_limit_menu(&pane) {
-            // No menu: clear a stale stamp so the fleet view does not stay red
-            // after the lane resumes.
-            if meta_i64(&load_meta(name), "rate_limited_since") > 0 {
-                update_meta(name, &[("rate_limited_since", json!(0))]);
+            // No menu. Clear the stamp only when the lane has RESUMED: it is
+            // generating again (the limit reset and Claude picked the turn back
+            // up), or the stamp is stale beyond any reset window. A lane that
+            // answered "stop and wait" and is idle-waiting stays flagged for the
+            // whole blocked window, which is the point (Ethan, 2026-08-16: capture
+            // rate limit as a status). This uses the lane's OWN activity, never a
+            // banner-word scrape, so it cannot false-flag a working or idle lane
+            // the way the reverted banner detector did.
+            let stamped = meta_i64(&load_meta(name), "rate_limited_since");
+            if stamped > 0 {
+                let resumed = detect_claude_status(&pane) == "active";
+                // 6h > Claude's 5h window; a weekly-limited lane re-stamps if it
+                // hits the menu again, so a stale clear here cannot hide it for long.
+                let stale = now_i64() - stamped > 6 * 3600;
+                if resumed || stale {
+                    update_meta(name, &[("rate_limited_since", json!(0))]);
+                }
             }
             continue;
         }
@@ -8133,12 +8145,13 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             )
             .await;
         }
+        // Answer the menu with "stop and wait", but do NOT clear the stamp here:
+        // the lane is now blocked until reset, and the clear above fires when it
+        // actually resumes. Clearing the instant the menu closed is what made a
+        // still-blocked lane read as idle.
         if rate_limit_action() != "off" {
             let (ok, msg) = send_keys_op(name, "Enter").await;
             tracing::warn!(session = %name, ok, detail = %msg, "swept a rate-limit menu — answered 'stop and wait'");
-            if ok {
-                update_meta(name, &[("rate_limited_since", json!(0))]);
-            }
         }
     }
     found
