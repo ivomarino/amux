@@ -70,7 +70,14 @@ fn ical_subscribe_url() -> String {
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", axum::routing::get(index))
-        .route("/{*path}", axum::routing::get(serve_path))
+        // `any`, not `get` (AF-61). GET-only meant a POST/PATCH/DELETE to an
+        // UNKNOWN /api/* path never reached the JSON-404 below — axum's method
+        // router answered a bare 405 with an EMPTY body first. Measured
+        // 2026-08-15: 9 rows of `POST /api/board/{id}/backlog`, a route that has
+        // never existed, from two lanes; each got 405 and nothing to act on,
+        // while the equivalent GET answers `{"error": "not found"}`.
+        // `serve_path` still refuses to hand the SPA shell to a non-GET.
+        .route("/{*path}", axum::routing::any(serve_path))
 }
 
 /// The retired port this request arrived on, if it did. Inserted by the legacy
@@ -87,7 +94,12 @@ async fn index(State(state): State<AppState>, legacy: Legacy) -> Response {
     serve_index(&state, legacy_port_of(legacy))
 }
 
-async fn serve_path(State(state): State<AppState>, uri: Uri, legacy: Legacy) -> Response {
+async fn serve_path(
+    State(state): State<AppState>,
+    method: axum::http::Method,
+    uri: Uri,
+    legacy: Legacy,
+) -> Response {
     let path = uri.path().trim_start_matches('/');
     // UNKNOWN /api/* paths reach this catch-all (the API router only claims
     // registered routes) and must answer the Python server's JSON 404 — not
@@ -102,6 +114,13 @@ async fn serve_path(State(state): State<AppState>, uri: Uri, legacy: Legacy) -> 
             "{\"error\": \"not found\"}",
         )
             .into_response();
+    }
+    // Non-API, non-GET: 405 as before. The SPA shell is a GET-only artifact and
+    // handing it back for a POST would be worse than the bare 405 this replaces
+    // — the whole point of the JSON 404 above is that a caller can tell "no such
+    // route" from "here is a page".
+    if method != axum::http::Method::GET && method != axum::http::Method::HEAD {
+        return StatusCode::METHOD_NOT_ALLOWED.into_response();
     }
     match DashboardAssets::get(path) {
         Some(content) => {
@@ -317,6 +336,51 @@ mod tests {
     fn missing_markers_serve_untouched() {
         let html = "<head>no markers</head>";
         assert_eq!(inject_bootstrap(html, &state(None), None), html);
+    }
+
+    /// AF-61: the GET-only version of this test passed for months while every
+    /// NON-GET to an unknown /api path got a bare 405 with an empty body —
+    /// axum's method router answering before the JSON-404 branch was reached.
+    /// Measured: 9 `POST /api/board/{id}/backlog` rows from two lanes, a route
+    /// that never existed, each given nothing to act on. A test that exercises
+    /// only the method that already worked cannot fail on the one that did not.
+    #[tokio::test]
+    async fn unknown_api_path_is_a_json_404_for_every_method_not_just_get() {
+        use tower::ServiceExt;
+        for m in ["POST", "PATCH", "DELETE", "PUT", "GET"] {
+            let app = routes().with_state(state(Some("tok")));
+            let res = app
+                .oneshot(
+                    axum::http::Request::builder()
+                        .method(m)
+                        // The real specimen, not a convenient one.
+                        .uri("/api/board/AF-49/backlog")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::NOT_FOUND, "{m} must 404, not 405");
+            assert_eq!(
+                res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap(),
+                "application/json",
+                "{m} must get JSON a caller can parse"
+            );
+        }
+        // A non-GET to an unknown NON-api path must still NOT get the SPA shell:
+        // handing back HTML for a POST would be worse than the 405 it replaces.
+        let app = routes().with_state(state(Some("tok")));
+        let res = app
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/some/client/route")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED, "no SPA shell for a POST");
     }
 
     #[tokio::test]
