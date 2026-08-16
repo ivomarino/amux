@@ -154,6 +154,25 @@ pub const SCOPE_CAPS: &[ScopeCap] = &[
         merge: "replace",
         explain: "/api/board/status-scope?session={worker}",
     },
+    // Connectors: a configured third-party integration (Gmail, Slack, Drive, an
+    // MCP tool server) turned on and mapped to an account per scope. Per the
+    // connectors design (docs/design/connectors.md), a connector is NOT a new
+    // subsystem — it is a scopable capability, so it inherits the same precedence
+    // (global -> group -> worker), write authorization, and audit row as the six
+    // above. Value shape per scope:
+    //   { "<connector>": { "enabled": true, "account": "<id>", "mcp": "<server>" } }
+    // merge-by-key like skin: a worker enabling one connector must not have to
+    // restate the group's set, and a group mapping one account must not drop the
+    // global defaults. Step 3 of the build order; storage mirrors skin (prefs).
+    ScopeCap {
+        key: "connectors",
+        label: "Connectors (integrations)",
+        levels: &["global", "group", "worker"],
+        kind: "json",
+        order: &["global", "group", "worker"],
+        merge: "merge-by-key",
+        explain: "/api/connectors?worker={worker}",
+    },
 ];
 
 fn cap_by_key(key: &str) -> Option<&'static ScopeCap> {
@@ -310,6 +329,23 @@ fn read_cap_value(
                 .unwrap_or_else(|| json!({}));
             Ok((json!({ "skin": parsed }), set))
         }
+        "connectors" => {
+            // Same prefs-backed JSON storage as skin (structured config the SPA
+            // and the launch-time connector resolver read, keyed by scope).
+            let k = connectors_pref_key(level, name);
+            let raw: Option<String> = conn.and_then(|c| {
+                c.query_row("SELECT value FROM prefs WHERE key=?1", rusqlite::params![k], |r| {
+                    r.get::<_, String>(0)
+                })
+                .ok()
+            });
+            let set = raw.as_deref().map(|v| !v.trim().is_empty()).unwrap_or(false);
+            let parsed: Value = raw
+                .as_deref()
+                .and_then(|v| serde_json::from_str(v).ok())
+                .unwrap_or_else(|| json!({}));
+            Ok((json!({ "connectors": parsed }), set))
+        }
         "memory" | "rules" => {
             let f = memory_file(home, level, name, key);
             let sz = std::fs::metadata(&f).map(|m| m.len()).unwrap_or(0) as usize;
@@ -451,6 +487,56 @@ async fn write_skin(
         })
         .await
         .map_err(|e| (500, format!("skin write failed: {e}")))?;
+    Ok(())
+}
+
+/// Where a connectors layer lives in `prefs`. One key shape for all three levels
+/// so the launch-time resolver can enumerate global -> group -> worker without
+/// knowing which exist (mirrors [`skin_pref_key`]).
+fn connectors_pref_key(level: &str, name: &str) -> String {
+    match level {
+        "global" => "connectors:global".to_string(),
+        "group" => format!("connectors:group:{name}"),
+        _ => format!("connectors:worker:{name}"),
+    }
+}
+
+/// Write a connectors layer. The value is a JSON object mapping connector name to
+/// `{ enabled, account, mcp }`; `{}` or null CLEARS the layer rather than storing
+/// an empty object, so "unset" and "set to nothing" stay distinguishable. Storage
+/// and semantics mirror [`write_skin`] exactly (prefs-backed, DB write_async).
+async fn write_connectors(
+    state: &AppState,
+    level: &str,
+    name: &str,
+    value: &Value,
+) -> Result<(), (u16, String)> {
+    let obj = value.get("connectors").unwrap_or(value);
+    if !obj.is_object() && !obj.is_null() {
+        return Err((400, "connectors must be a JSON object".into()));
+    }
+    let key = connectors_pref_key(level, name);
+    let empty = obj.is_null() || obj.as_object().map(|m| m.is_empty()).unwrap_or(true);
+    let payload = if empty { None } else { Some(obj.to_string()) };
+    state
+        .store
+        .write_async(move |conn| {
+            match &payload {
+                None => {
+                    conn.execute("DELETE FROM prefs WHERE key=?1", rusqlite::params![key])?;
+                }
+                Some(v) => {
+                    conn.execute(
+                        "INSERT INTO prefs (key, value) VALUES (?1, ?2) \
+                         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                        rusqlite::params![key, v],
+                    )?;
+                }
+            }
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .map_err(|e| (500, format!("connectors write failed: {e}")))?;
     Ok(())
 }
 
@@ -733,6 +819,7 @@ async fn scope_write(
         "gates" => write_gates(state, level, name, &value).await,
         "status_mode" => write_status_mode(state, level, name, &value).await,
         "skin" => write_skin(state, level, name, &value).await,
+        "connectors" => write_connectors(state, level, name, &value).await,
         // Structural fallback (py:16316) — unreachable while every
         // descriptor above has a write arm, kept so a future capability
         // without one fails honestly instead of silently succeeding.
@@ -1535,6 +1622,67 @@ mod tests {
         // so the second gates write is the 4th row at this target.
         assert_eq!(seq, 4, "4th write at (scope, group:alpha)");
 
+    }
+
+    /// Connectors step 3 (AMUX-3105 data model): `connectors` is a scopable
+    /// capability whose per-scope JSON round-trips through prefs, mirroring skin.
+    #[tokio::test]
+    async fn connectors_layer_writes_and_reads_back() {
+        let home = tempfile::tempdir().unwrap();
+        fleet(home.path(), &[("w1", "alpha", false)]);
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let st = state();
+        let app = app(&st);
+
+        // It is advertised as a capability (the connectors tab reads the list).
+        let (s, v) = call(&app, "PUT", "/api/scope", Some(json!({"level": "global"})), None).await;
+        assert_eq!(s, StatusCode::BAD_REQUEST);
+        let caps: Vec<&str> =
+            v["capabilities"].as_array().unwrap().iter().map(|c| c.as_str().unwrap()).collect();
+        assert!(caps.contains(&"connectors"), "connectors must be advertised: {caps:?}");
+
+        // A worker-level connector mapping round-trips.
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/scope",
+            Some(json!({"level": "worker", "name": "w1", "capability": "connectors",
+                        "value": {"gmail": {"enabled": true, "account": "ethan@mixpeek.com", "mcp": "gmail"}}})),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["set_here"], true);
+        assert_eq!(v["value"]["connectors"]["gmail"]["account"], "ethan@mixpeek.com");
+        assert_eq!(v["value"]["connectors"]["gmail"]["enabled"], true);
+
+        // A second write REPLACES the layer; cross-LEVEL merge-by-key is the
+        // resolver's job, not the writer's (mirrors skin).
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/scope",
+            Some(json!({"level": "worker", "name": "w1", "capability": "connectors",
+                        "value": {"slack": {"enabled": true, "account": "T123"}}})),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["value"]["connectors"]["slack"]["account"], "T123");
+        assert!(v["value"]["connectors"].get("gmail").is_none(), "same-level write replaces");
+
+        // `{}` CLEARS the layer (unset vs empty stays distinguishable).
+        let (s, v) = call(
+            &app,
+            "PUT",
+            "/api/scope",
+            Some(json!({"level": "worker", "name": "w1", "capability": "connectors", "value": {}})),
+            None,
+        )
+        .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["set_here"], false, "an empty object clears the layer");
     }
 
     #[tokio::test]
