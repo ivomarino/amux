@@ -10660,6 +10660,9 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
             // ABSENT != EMPTY above): the model does not change per tool call.
             let prev_model = reports[&name_s]["model"].clone();
             let prev_tokens = reports[&name_s]["tokens"].clone();
+            // Did the STATUS actually change? Only then is an SSE push worth it.
+            let status_changed = prev_state != st2;
+            let new_state = st2.clone();
             reports[&name_s] = json!({
                 "model": model_opt.clone().map(Value::from).unwrap_or(prev_model),
                 "tokens": tokens_opt.clone().unwrap_or(prev_tokens),
@@ -10671,7 +10674,26 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                  ON CONFLICT(key) DO UPDATE SET value=?1",
                 [reports.to_string()],
             )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, exact
+            // signal for active/idle/needs-input (the D1 exit), but this write used
+            // events:vec![], so a hook state change pushed NO SSE and the dashboard
+            // only caught it on the next 15s scan or a poll. Emit a Session event on
+            // a real status change so the SSE sessions push fires immediately; the
+            // scan stays the fallback for hookless lanes.
+            let events = if status_changed {
+                vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Session,
+                    entity_id: name_s.clone(),
+                    mutation: amux_core::revision::MutationKind::StatusChanged {
+                        from: prev_state,
+                        to: new_state,
+                    },
+                    payload: None,
+                }]
+            } else {
+                vec![]
+            };
+            Ok(crate::db::WriteOutcome { applied: true, events })
         })
         .await;
     match reply {

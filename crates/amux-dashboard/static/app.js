@@ -5235,6 +5235,19 @@ function hidePeekLoading() {
 
 async function doSend(name, text) {
   showSendingIndicator();
+  // OPTIMISTIC STATUS (Ethan, 2026-08-16: "very snappy"). Flip to working the
+  // instant a command is sent, before the UserPromptSubmit hook + SSE round-trip
+  // confirms it. The server now pushes a Session SSE event on the hook report, so
+  // this optimism is corrected/confirmed within a beat; if the send is refused
+  // (409 not running) the next fetch resets it.
+  try {
+    const s = (typeof sessions !== 'undefined' && sessions.find) ? sessions.find(x => x.name === name) : null;
+    if (s && s.status !== 'active' && s.status !== 'rate_limited') {
+      s.status = 'active'; s.running = true;
+      if (typeof render === 'function') render();
+      if (typeof updatePeekStatus === 'function' && typeof peekSession !== 'undefined' && peekSession === name) updatePeekStatus();
+    }
+  } catch (e) {}
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
   const isSlashCmd = /^\/[a-z]/.test(text.trim());
   amuxTrack('message_sent', { session: name, is_slash: isSlashCmd, cmd: isSlashCmd ? text.trim().split(/\s+/)[0] : null, length: text.length });
@@ -7618,7 +7631,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.655';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.656';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
