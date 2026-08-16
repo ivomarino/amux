@@ -2431,35 +2431,6 @@ FIX: none yet. CLAUDE.md documents the mirror of this ("a peer's commit can
   I have used the path-scoped form elsewhere today; I did not here, and that is
   the difference.
 
-## Dead port returns empty string — reads as malformed/missing card, not a dead endpoint
-AREA: cli
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux-homepage
-CARD: AMUX-3046
-SYMPTOM: AMUX_URL was baked as https://localhost:8822 in a long-lived session's process env.
-  When 8822 was decommissioned mid-session, `curl -sk $AMUX_URL/...` returned an empty string
-  rather than a connection error. Piping the empty response into `python3 -c "...json.load(sys.stdin)"` 
-  raised JSONDecodeError, which looks identical to a malformed or missing card — NOT a dead endpoint.
-  Writes to the dead port also returned empty with no error, so a session that did not re-read
-  its own PATCH response had no signal that the write was lost.
-COST: ~5 min to diagnose after the amux session flagged it. ts-gke nearly filed a phantom 
-  missing-card bug before catching it. All writes in this session happened to land while 8822 
-  was still alive as the compat bind, so no data was lost — this time. RECURRED 2026-08-14: the
-  amux session itself burned six diagnostic calls concluding "server down" before spotting its
-  own $AMUX_URL was the retired 8822 — the same trap, one lane deeper.
-FIX: SHIPPED 2026-08-14 (commit 66c8243, AMUX-3046). `amux url` is the durable resolver every
-  recipe can call: it reads the server-written ~/.amux/endpoint.json and prints the canonical
-  base, so `$(amux url)` in place of `$AMUX_URL` self-heals past a stale/retired port AND
-  survives the next port move. `amux url --verify` distinguishes a dead port from a live one by
-  asserting /health parses as the API shape, which answers the empty-response-vs-missing-card
-  ambiguity this entry is about. Guidance + the resolver are now in CLAUDE.md in place of raw
-  `$AMUX_URL`. Already-shipped companions: the CLI warns once/session when $AMUX_URL is dead
-  (AMUX-2944), and the server logs an hourly WARN naming stranded sessions (AMUX-2988). RESIDUAL
-  (owner call, rule 8): the ~46 lanes still holding the dead env clear only by adopting `$(amux
-  url)` going forward or being recycled — restarting a lane picks up the correct base.
-
 ## A dev server on the default AMUX_HOME silently clobbers the shared endpoint.json
 AREA: instruments
 SEVERITY: blocks
@@ -2498,13 +2469,13 @@ FIX: AC-344 — a signal that joins live-cloud-build-hash vs latest-green-main a
 ## Docs say the 8822 bind is live and `:8822/health` proves it — but Ethan dropped the bind, so 48 lanes' raw `$AMUX_URL` curls silently fail
 AREA: docs
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-13
 SESSION: amux
 CARD: AMUX-3046
 SYMPTOM: Chasing a peer's :8822 observation, found the top-of-repo CLAUDE.md (L9-13, L236) still describes the 8822 compat-bind as ACTIVE and tells you to verify it with `curl -sk https://localhost:8822/health` — which now returns HTTP 000 (nothing listens). Ethan dropped the bind 2026-08-11 ("no more 8822 just rust", legacy_port.rs:340), and legacy_port.rs's OWN module doc (L5-46) still narrates the bind in the present tense, contradicting its L340. Ground truth via `GET /api/debug/legacy-port`: `enabled:false`, `stranded_count:48` — 48 running lanes (incl. this one) still carry `AMUX_URL=https://localhost:8822` in their PROCESS env, so every documented `curl -sk $AMUX_URL/...` recipe fails at connect for them. The `amux` CLI is unaffected because it HARDCODES `:8824` and ignores `$AMUX_URL` — which is the same literal-that-caused-this, one level over, and why the fleet looks healthy.
 COST: a deep cross-file investigation to establish that a documented, "proven" verification step is dead; and 48 lanes are one hardcode away from re-stranding on the next port change. The friction is self-inflicted by the guidance: CLAUDE.md teaches `curl $AMUX_URL/...`, and `$AMUX_URL` is a process-env literal that cannot be rotated in a live lane. Instrumentation is COMPLETE (hourly WARN independent of the bind, verdict STRANDED, endpoint.json self-heals baked-in hooks) — the gap is that the human-facing docs contradict it, and there is no shared shell resolver so raw callers fall back to the stale literal.
-FIX: open — decision is Ethan's (ethos rule 8: recycling 48 lanes can interrupt in-flight work). Durable root fix surfaced by gtm-engine, who already ships `gtm/engine/amux_endpoint.py::amux_base()`: read the server-written `~/.amux/endpoint.json` (`canonical_url` + `retired_ports`), refuse a retired port even when `$AMUX_URL` names it, liveness-probe before returning. Every script in that lane imports it, which is why its raw curls kept working today. The fleet fix is a shared resolver (a `amux url` subcommand backed by endpoint.json, taught in CLAUDE.md in place of `curl $AMUX_URL/...`) — NOT 48 hardcoded `:8824` literals, which re-teach the exact bug. Interim workaround: use `amux ...` subcommands or `https://localhost:8824` explicitly. Also owed regardless: reconcile CLAUDE.md L9-13/L236 and legacy_port.rs L5-46 to the dropped-bind reality.
+FIX: VERIFIED FIXED by amux-frustrations 2026-08-16 — all three remedies this entry asked for have shipped: (1) CLAUDE.md L9-11 now states the bind is GONE and that :8822/health no longer answers; (2) legacy_port.rs's module doc opens "now that its bind is gone", past tense, reconciled with L340; (3) the shared resolver exists as `amux url`, backed by endpoint.json, and CLAUDE.md teaches `$(amux url)` in place of `curl $AMUX_URL/...`. Awaiting amux's sign-off before deletion. ORIGINAL: decision was Ethan's (ethos rule 8: recycling 48 lanes can interrupt in-flight work). Durable root fix surfaced by gtm-engine, who already ships `gtm/engine/amux_endpoint.py::amux_base()`: read the server-written `~/.amux/endpoint.json` (`canonical_url` + `retired_ports`), refuse a retired port even when `$AMUX_URL` names it, liveness-probe before returning. Every script in that lane imports it, which is why its raw curls kept working today. The fleet fix is a shared resolver (a `amux url` subcommand backed by endpoint.json, taught in CLAUDE.md in place of `curl $AMUX_URL/...`) — NOT 48 hardcoded `:8824` literals, which re-teach the exact bug. Interim workaround: use `amux ...` subcommands or `https://localhost:8824` explicitly. Also owed regardless: reconcile CLAUDE.md L9-13/L236 and legacy_port.rs L5-46 to the dropped-bind reality.
 
 ---
 
@@ -2883,26 +2854,3 @@ CARD: AC-360
 SYMPTOM: The CLOUD FRESHNESS TICK step-1 probe `curl -sk https://cloud.amux.io/app.js | grep APP_VER` returns EMPTY. Unauthenticated `app.js` now 302s to `/sign-in` (http=302, size=0). `/health` and `/version` also 302; `/api/health` and `/api/version` 401. There is no auth-free endpoint on the gateway that reveals the served build, so the recipe's `served=` is always blank for whoever runs the tick.
 COST: A blank `served` compared against a non-empty `head` reads as "cloud is behind origin/main" and, taken literally, would dispatch `recreate=yes` — which STOPS every worker container and does not restore them. That is precisely the false-positive-recreate-before-a-demo harm the 2026-08-12 guard was added to prevent, and here the trigger is a broken probe rather than a real drift. Caught only because I recognised the empty read as a probe fault, not a signal (ethos rule 7: an empty grep is not a measurement). A less careful run recreates prod to "fix" a drift that does not exist.
 FIX: (proposed on AC-360) Drop the app.js scrape. The robust, auth-free freshness signal already exists: the newest SUCCESSFUL `deploy-cloud` run's headSha vs origin/main. `gh run list --workflow=deploy-cloud.yml --json headSha,conclusion` -> newest `success` sha, then `git rev-list --count <sha>..origin/main`; 0 means the deployed image is current. Used exactly that this tick (last success 31914150334 built 73fce92; origin/main tip == 73fce92, 0 behind). The recipe change is Ethan's to make (it is his standing scheduler prompt, ethos rule 8) — proposed, not silently rewritten. Distinct from AC-344 (deploy-cloud SKIP is silent); this is the tick's own comparison being unable to read the served version at all.
-
-## The owner-alert fire alarm reached nobody for weeks and no sweep could see it
-AREA: notices
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-16
-SESSION: amux
-CARD: AMUX-3203
-SYMPTOM: GET /api/alert/config reported both channels enabled (push:true, sms:true) while
-  neither had a destination: push_subscriptions held 0 rows and AMUX_OWNER_PHONE was empty.
-  The five most recent owner_alerts (ids 93-97) each recorded channels
-  {"push":"error: no push subscriptions","sms":"no phone configured"}, a prod-down, a
-  fleet-burn, and two security holes (GCA-100, GCA-95), every one dropped. Nothing
-  proactively said the alarm was disconnected; the only trace was a per-send WARN that
-  fires only when an alert is sent, in a log nobody tails.
-COST: Weeks of silent non-delivery. Two security escalations and a prod-down page never
-  reached the owner; 171 board cards piled up in needsyou with no escalation, and the
-  dead state was only found by a peer measuring the backlog by hand (mixpeek-homepage-claude).
-FIX: c6bd42b. New invariant alert.channel_can_deliver fails continuously in
-  /api/health/invariants when an enabled channel has no reachable destination, so a sweep
-  catches the dead alarm. Verified failing live 2026-08-16. Connecting a destination stays
-  the owner's action (subscribe to push from the PWA, or set AMUX_OWNER_PHONE); the check
-  reports it, it does not repair it (ethos rule 8).
