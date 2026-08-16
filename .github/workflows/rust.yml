@@ -25,6 +25,29 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test (workspace)
         run: cargo test --workspace
+      # AF-74. The `amux` bash CLI is a shipped client with no compiler behind
+      # it, and `bash -n` (the pre-commit gate) proves the file PARSES, not that
+      # its names resolve. This catches the classes shellcheck CAN see.
+      #
+      # IT DOES NOT COVER AMUX-3145, the incident that motivated the card, and
+      # that is measured, not assumed: I rebuilt the specimen (deleted the
+      # `local AMUX_API=...` decl from cmd_start so the later use is unbound)
+      # and this gate exits 0 on it. SC2154 only fires for a name assigned
+      # NOWHERE in the file; `AMUX_API` is assigned in other functions, and
+      # shellcheck does not do per-function `local` scope analysis. A comment
+      # here claiming it guards the unbound-var class would be exactly the
+      # theatre ethos rule 7 is about. That class needs a runtime smoke test
+      # (mocked tmux, AMUX_API unset, reach the real inject) -- filed as AF-78.
+      #
+      # -e excludes the 9 findings present when this landed, each deliberate:
+      #   SC1090 dynamic `source`; SC2016 single-quoted python heredocs (the
+      #   whole point is NOT expanding); SC2221/SC2222 overlapping case globs in
+      #   the sign-in matcher; SC2015 two intentional A && B || C; SC1039 an
+      #   indented heredoc terminator.
+      # A DENY-LIST on purpose: a new code fails the build instead of being
+      # silently absorbed, which is what an allow-list would do.
+      - name: shellcheck the amux CLI (new classes only; NOT the AMUX-3145 scope shape)
+        run: shellcheck -S warning -e SC1090,SC2016,SC2221,SC2222,SC2015,SC1039 amux
 
   e2e:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
