@@ -173,8 +173,16 @@ pub fn build(
              forward and SILENTLY REVERT origin (no conflict, the older file just wins, \
              AMUX-3000):\n\
              {list}\
-             Restore each to origin's version instead, and do not commit it: \
-             `git checkout origin/main -- <path>`."
+             But do NOT blind-restore them either. Behind-on-history does not prove the \
+             worktree is a pure old copy: a path can be behind origin AND carry NOVEL \
+             uncommitted content (mid-edit), and `git checkout origin/main -- <path>` DELETES \
+             that novel work irreversibly (AMUX-3172/AMUX-3188; social-media caught 16 such \
+             paths whose worktree matched NEITHER local HEAD nor origin). PROVE the direction \
+             per path first: `git cat-file -e $(git hash-object <path>) 2>/dev/null`. If the \
+             object EXISTS, this exact content was committed before, so it is an older revision \
+             and `git checkout origin/main -- <path>` safely restores it. If it does NOT (or \
+             `git diff origin/main -- <path>` shows the worktree ADDING content origin lacks), \
+             it is MID-EDIT: leave it, that is the owner's call, not a restore."
         ));
     }
 
@@ -1264,6 +1272,24 @@ mod tests {
             !msg.contains("uncommitted change(s)"),
             "a stale-only tree has NO commit-worthy work; it must not render the commit nudge: {msg}"
         );
+    }
+
+    /// AMUX-3188 (social-media): behind-on-history does NOT prove the worktree is
+    /// a pure old copy. A stale path can carry novel mid-edit content, and an
+    /// unconditional `git checkout origin/main -- <path>` DELETES it irreversibly
+    /// (social-media caught 16 such paths). The STALE section must carry the same
+    /// prove-the-direction guard the MINE/UNKNOWN paths already do (AMUX-3172),
+    /// or the nudge prescribes data loss.
+    #[test]
+    fn a_stale_file_warns_before_a_blind_restore_destroys_mid_edit_work() {
+        let dirty = s(&["stale.rs"]);
+        let fresh = Freshness { stale: s(&["stale.rs"]), ..Default::default() };
+        let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance")
+            .expect("a stale file is worth warning about");
+        assert!(msg.contains("do NOT blind-restore"), "must not prescribe an unconditional restore: {msg}");
+        assert!(msg.contains("MID-EDIT") || msg.contains("mid-edit"), "must name the mid-edit case: {msg}");
+        assert!(msg.contains("hash-object"), "must give the prove-the-direction check: {msg}");
+        assert!(msg.contains("owner's call"), "must hand a mid-edit file back to its owner: {msg}");
     }
 
     /// A STALE file among genuine work: the stale warning comes FIRST, and the
