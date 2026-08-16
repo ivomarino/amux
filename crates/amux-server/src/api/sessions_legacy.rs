@@ -430,18 +430,44 @@ impl FleetSignals {
         // counts as shell-only only if EVERY pane is a shell.
         let mut shell_only = BTreeSet::new();
         if let Ok(o) = std::process::Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_current_command}"])
+            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"])
             .output()
         {
             const SHELLS: [&str; 8] = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
             let mut any_live: BTreeSet<String> = BTreeSet::new();
             let mut seen: BTreeSet<String> = BTreeSet::new();
+            // Panes whose FOREGROUND command is a shell but which might still host
+            // an agent as a CHILD: (session, pane_pid). Collected here and probed
+            // below only for sessions not already proven live by another pane.
+            let mut shell_panes: Vec<(String, String)> = Vec::new();
             for l in String::from_utf8_lossy(&o.stdout).lines() {
-                let Some((sess, cmd)) = l.rsplit_once(':') else { continue };
+                // format is session:pid:cmd, but a session NAME can contain ':',
+                // so split from the RIGHT twice: cmd, then pid.
+                let Some((rest, cmd)) = l.rsplit_once(':') else { continue };
+                let Some((sess, pid)) = rest.rsplit_once(':') else { continue };
                 seen.insert(sess.to_string());
                 let cmd = cmd.trim().trim_start_matches('-');
                 if !SHELLS.contains(&cmd) {
                     any_live.insert(sess.to_string());
+                } else {
+                    shell_panes.push((sess.to_string(), pid.trim().to_string()));
+                }
+            }
+            // AMUX-3: a foreground SHELL can still host a live agent as a child.
+            // ai-video-editor read as not-running while claude (working, 80k tokens)
+            // ran as a child of its pane's bash, so #{pane_current_command}="bash".
+            // The live is_running() already uses pgrep -P; do the same here so the
+            // fleet list agrees with it instead of hiding a running lane behind a
+            // shell it never actually returned to. Bounded: only shell-foreground
+            // panes whose session is not already proven live by another pane.
+            for (sess, pid) in shell_panes {
+                if any_live.contains(&sess) || pid.is_empty() {
+                    continue;
+                }
+                if let Ok(ch) = std::process::Command::new("pgrep").args(["-P", &pid]).output() {
+                    if !ch.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                        any_live.insert(sess.clone());
+                    }
                 }
             }
             for s in seen {
