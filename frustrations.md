@@ -1837,7 +1837,7 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-10
 SESSION: autofix (subagent)
-CARD: AF-69
+CARD: AF-69 (investigation, signed off) + AMUX-3221 (the FIX, open)
 SYMPTOM: Started an isolated server (`AMUX_HOME=/tmp/amux-af-home`, port 8899, own DB) to
   verify a change without touching the fleet. Within 4 seconds its log showed:
     pane-size: restoring detached window ... session=amux-amux from=220x50 to=220x50
@@ -1852,9 +1852,25 @@ COST: Killed the instance and rebuilt the whole live verification as in-process 
   but that is luck: a peer is running `/tmp/amux-sched-target/debug/amux-server` on this
   same box right now, and the repo's own docs tell you to build to a private target dir
   and run it.
-FIX: Give `pane_size` and `ghost_rescue` the same `AMUX_<JOB>_SECS=0` disable knob the
-  other two runtime jobs already have, and default them OFF when `AMUX_HOME` is not the
-  real `~/.amux` — a server pointed at a scratch home has no business steering the fleet.
+FIX: STILL OPEN — the hazard is live. AF-69 (the INVESTIGATION) was signed off by amux
+  2026-08-16; the FIX is AMUX-3221 and has not been started. Signing off an investigation
+  is not the same as fixing the thing, and this entry stays until AMUX-3221 lands.
+  CONFIRMED STILL BROKEN 2026-08-16: pane_size and ghost_rescue have NO env knob;
+  commit_nudge (AMUX_COMMIT_NUDGE_SECS) and board_drive (AMUX_BOARD_DRIVE_SECS) do. No
+  global isolation guard exists (grepped AMUX_NO_FLEET / AMUX_ISOLATED / is_isolated /
+  AMUX_TMUX_READONLY — none).
+  THE ENTRY'S OWN PROPOSED FIX IS INCOMPLETE, measured not assumed: adding the knob at the
+  top of `pane_size::spawn` covers only its one-shot `sweep(true)`; the SAME function then
+  calls `super::spawn_periodic("pane_size", TICK_SECS, ..)`, which keeps sweeping the fleet.
+  A per-job knob there looks done and is not. That half-fix is stashed, not committed
+  ("AF-69: incomplete pane_size guard").
+  CORRECT SEAM (amux verified it): `runtime_jobs/mod.rs:128 spawn_periodic_every` is the
+  ONLY constructor of a PeriodicTask — its own comment already leans on that to guarantee
+  every job appears in the registry — so a knob there, derived from the job name
+  (pane_size -> AMUX_PANE_SIZE_SECS, ghost-rescue -> AMUX_GHOST_RESCUE_SECS), gives every
+  periodic job a disable for free, including ones written later. Requires a test proving a
+  0 knob stops the sweep while a normal value still ticks, and that a disabled job stays
+  REGISTERED (inert, not invisible) so it does not become a silent skip.
 
 ## A correct refusal shipped as HTTP 500 for months, and poisoned the error sweep
 AREA: instruments
