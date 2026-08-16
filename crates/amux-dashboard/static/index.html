@@ -445,6 +445,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             </select>
           </div>
           <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Counts stay visible in every mode</div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;gap:8px;">
+            <span style="font-size:0.85rem;">Which tabs</span>
+            <div style="display:flex;gap:6px;">
+              <button class="btn" id="tabs-customize" style="font-size:0.78rem;padding:4px 10px;min-height:36px;" onclick="event.stopPropagation();toggleTabCustomizer()" title="Show, hide and reorder the main tabs">Main</button>
+              <button class="btn" id="peek-tab-customize" style="font-size:0.78rem;padding:4px 10px;min-height:36px;" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show, hide and reorder worker tabs">Worker</button>
+            </div>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Show, hide and reorder the main tabs and worker tabs</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:8px;">
             <span style="font-size:0.85rem;">Zoom</span>
             <div style="display:flex;align-items:center;gap:6px;">
@@ -507,11 +515,12 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-terminal" onclick="switchView('terminal')"><span class="tab-ico">⮞</span><span class="tab-lbl">Terminal</span></button>
   <button id="tab-browser" onclick="switchView('browser')"><span class="tab-ico">◳</span><span class="tab-lbl">Browser</span></button>
 </div>
-<div class="tab-customize-wrap">
-  <button class="tab-customize-btn" id="tabs-icons-toggle" onclick="event.stopPropagation();toggleTabsIcons()" title="Icons only (hide labels)">&#x21F1;</button>
-  <button class="tab-customize-btn" onclick="event.stopPropagation();toggleTabCustomizer()" title="Show/hide tabs">&#x229E;</button>
-  <div class="tab-customizer-menu" id="tab-customizer-menu" style="display:none;"></div>
-</div>
+<!-- Tab display + show/hide/reorder controls moved into Settings > Device >
+     Appearance (AMUX-3201-adjacent): they ate scarce tab-bar real estate and are
+     display preferences. The #tab-customizer-menu popup now lives as a body child
+     (fixed-positioned, next to #peek-tab-customizer-menu) and anchors to the
+     settings trigger. The icons-only toggle is dropped here because the
+     Appearance "Tabs" dropdown already does icons/text/both. -->
 </div>
 <div id="session-view">
 <div style="padding:0 12px;margin-top:4px;display:flex;align-items:center;gap:8px;">
@@ -1997,7 +2006,9 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <button class="peek-tab" id="peek-tab-memory" onclick="setPeekTab('memory')"><span class="tab-ico">&#x1F4DD;</span><span class="tab-lbl">Memory</span></button>
     <button class="peek-tab" id="peek-tab-git" onclick="setPeekTab('git')"><span class="tab-ico">⎇</span><span class="tab-lbl">Worktree</span></button>
     <button class="peek-tab" id="peek-tab-logs" onclick="setPeekTab('logs')" title="HTTP request log for this worker"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span><span class="peek-tab-count" id="peek-tab-logs-count"></span></button>
-    <button class="tab-customize-btn" id="peek-tab-customize" onclick="event.stopPropagation();togglePeekTabCustomizer()" title="Show/hide/reorder worker tabs" style="flex:0 0 auto;">&#x229E;</button>
+    <!-- Worker-tab show/hide/reorder moved to Settings > Device > Appearance
+         (the #peek-tab-customize trigger now lives there). Frees the peek tab
+         strip, which is a ~44px horizontal scroller on a phone. -->
     <!-- The menu itself is NOT here on purpose — it is a direct child of the
          document body, at the end of this file. `.peek-tabs` is a ~44px
          horizontal scroller (overflow-x:auto; overflow-y:hidden;
@@ -2881,5 +2892,10 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
      (#tab-customizer-menu) has always worked because it lives in
      `.tab-customize-wrap`: position:relative, and not a scroller. -->
 <div class="tab-customizer-menu" id="peek-tab-customizer-menu" style="display:none;"></div>
+<!-- Main-tab customizer, relocated out of the tab bar into Settings > Appearance
+     (AMUX-3201-adjacent). Now a fixed body child like the peek one, so it renders
+     over the scrolling settings menu instead of being clipped by it; toggleTabCustomizer
+     positions it against the #tabs-customize settings button. -->
+<div class="tab-customizer-menu" id="tab-customizer-menu" style="display:none;position:fixed;z-index:300;"></div>
 </body>
 </html>
