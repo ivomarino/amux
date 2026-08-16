@@ -1705,6 +1705,47 @@ Sets the session whose sign-off is required for review -> done."
       echo "$result" | _board_outcome "$id" "" "reviewer set to ${who:-none}"
       return $?
       ;;
+    show|cat)
+      # AF-66. Assignment/idle nudges tell agents to read a card with
+      # `amux board show <ID>` -- and the verb did not exist, so it fell through
+      # to the help text (exit 2). That instruction is emitted SPECIFICALLY when
+      # the card body is withheld from the nudge (it contains an at-mention or a
+      # leading slash, which opens Claude Code's file picker), i.e. exactly when
+      # `show` is the ONLY way to read the card. The sanctioned path was
+      # unwalkable in the one case it existed for, and the fallback is a raw
+      # curl, which is how attribution gets lost (AMUX-2325 / AMUX-2140).
+      local id="${1:-}"
+      _board_id_guard "show" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board show <ISSUE-ID>"
+      curl -sk "$AMUX_API/api/board/$id" | python3 -c '
+import json, sys
+raw = sys.stdin.read()
+try:
+    d = json.loads(raw)
+except ValueError:
+    sys.exit("amux board show: server returned no JSON (restarting?) -- retry in a moment")
+if d.get("error") or not d.get("id"):
+    sys.exit("amux board show: " + str(d.get("error") or "no such card"))
+print("%s  [%s]  type=%s" % (d["id"], d.get("status", "?"), d.get("type", "?")))
+print(d.get("title") or "(no title)")
+meta = [("session", d.get("session")), ("reviewer", d.get("reviewer")),
+        ("owner_type", d.get("owner_type")), ("depends_on", d.get("depends_on")),
+        ("source_ref", d.get("source_ref"))]
+line = "  ".join("%s=%s" % (k, v) for k, v in meta if v)
+if line:
+    print(line)
+desc = d.get("desc") or ""
+if desc:
+    print()
+    print(desc)
+log = d.get("log") or ""
+if log:
+    print()
+    print("--- log ---")
+    print(log)
+'
+      return $?
+      ;;
     retitle)
       # AMUX-2604. Capture flags a card whose title has no referent ("This
       # should be one row", "Fix the logo") and asks the worker that received
