@@ -251,6 +251,38 @@ struct Acc {
     kinds: HashMap<&'static str, u64>,
 }
 
+/// Bytes this file actually occupies on disk.
+///
+/// `len()` is the APPARENT size and it is the wrong number for a disk tool.
+/// It ignores sparse files (which report a huge logical size while occupying
+/// almost nothing) and APFS transparent compression (which occupies less than
+/// it reports). The first run of this scanner used `len()` and reported 1.14 TB
+/// for a home directory that `du` measures at ~820 GB — a 40% overstatement,
+/// which in a cleanup UI reads as "there is way more to reclaim than there is".
+/// `st_blocks` is in 512-byte units by definition and is what `du` counts.
+fn disk_bytes(md: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    md.blocks().saturating_mul(512)
+}
+
+/// Hardlink/clone de-duplication key. A file with `nlink > 1` is reachable at
+/// several paths; counting it once per path inflates every total that contains
+/// it. `du` dedupes by inode and so must this, or two directories both "contain"
+/// the same gigabytes and the treemap adds up to more than the disk holds.
+#[derive(Default)]
+struct SeenInodes(std::collections::HashSet<(u64, u64)>);
+
+impl SeenInodes {
+    /// True if this file should be counted (first sighting, or not hardlinked).
+    fn count(&mut self, md: &std::fs::Metadata) -> bool {
+        use std::os::unix::fs::MetadataExt;
+        if md.nlink() <= 1 {
+            return true;
+        }
+        self.0.insert((md.dev(), md.ino()))
+    }
+}
+
 struct ScanCfg {
     roots: Vec<PathBuf>,
     tree_depth: i32,
@@ -317,6 +349,8 @@ fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u
     let now = now_secs();
     // size -> paths, for the duplicate fingerprint pass
     let mut by_size: HashMap<u64, Vec<PathBuf>> = HashMap::new();
+    // Shared across roots: a hardlink spanning two roots must still count once.
+    let mut seen = SeenInodes::default();
 
     for root in &cfg.roots {
         if cancel.load(Ordering::Relaxed) {
@@ -397,8 +431,14 @@ fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u
                     continue;
                 }
 
-                // regular file
-                let sz = md.len();
+                // regular file. `sz` is on-disk bytes (see `disk_bytes`); the
+                // large-file threshold uses apparent size, because a user
+                // hunting "large files" means the 8GB video, not its footprint.
+                if !seen.count(&md) {
+                    continue;
+                }
+                let sz = disk_bytes(&md);
+                let apparent = md.len();
                 let mt = md.mtime();
                 out.files += 1;
                 out.bytes += sz;
@@ -407,7 +447,7 @@ fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u
                 local.newest_mtime = local.newest_mtime.max(mt);
                 *local.kinds.entry(kind_of(&name)).or_default() += sz;
 
-                if sz >= cfg.large_file_floor {
+                if apparent >= cfg.large_file_floor {
                     if guard_path(&path).is_ok() {
                         let age = now - mt;
                         let age_d = age.max(0) / 86400;
@@ -446,15 +486,15 @@ fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u
                     *e.kinds.entry(k).or_default() += v;
                 }
             }
+            // Roll `local` up the ancestor chain. `depth` is already known from
+            // the stack, so this walks at most `tree_depth` levels and never
+            // recomputes component counts — the previous version called
+            // `components().count()` twice per ancestor per directory, which is
+            // O(depth^2) string work on every one of ~90k directories.
             let mut cur = dir.as_path();
-            while let Some(parent) = cur.parent() {
-                if !root.starts_with(parent) && !parent.starts_with(root) {
-                    break;
-                }
-                let pd = parent.components().count() as i32 - root.components().count() as i32;
-                if pd < 0 {
-                    break;
-                }
+            let mut pd = depth - 1;
+            while pd >= 0 {
+                let Some(parent) = cur.parent() else { break };
                 if pd <= cfg.tree_depth {
                     let e = out.tree.entry(parent.to_path_buf()).or_default();
                     e.bytes += local.bytes;
@@ -467,6 +507,7 @@ fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u
                     break;
                 }
                 cur = parent;
+                pd -= 1;
             }
         }
     }
@@ -530,9 +571,14 @@ fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u
 }
 
 /// Total a subtree without recording per-dir detail.
+///
+/// Same accounting rules as the main walk: on-disk blocks rather than apparent
+/// size, and hardlinked files counted once. A cargo `target/` dir is full of
+/// hardlinks, so this is not a corner case here.
 fn subtree_totals(root: &FsPath, dev_filter: u64, cancel: &AtomicBool) -> Acc {
     use std::os::unix::fs::MetadataExt;
     let mut acc = Acc::default();
+    let mut seen = SeenInodes::default();
     let mut stack = vec![root.to_path_buf()];
     let mut n = 0u32;
     while let Some(dir) = stack.pop() {
@@ -554,8 +600,8 @@ fn subtree_totals(root: &FsPath, dev_filter: u64, cancel: &AtomicBool) -> Acc {
             }
             if md.is_dir() {
                 stack.push(entry.path());
-            } else {
-                acc.bytes += md.len();
+            } else if seen.count(&md) {
+                acc.bytes += disk_bytes(&md);
                 acc.files += 1;
                 acc.newest_mtime = acc.newest_mtime.max(md.mtime());
             }
@@ -1495,6 +1541,58 @@ mod tests {
         let (free, total) = df_bytes(&home_dir()).expect("statfs must answer for $HOME");
         assert!(total > 0, "total capacity should be positive");
         assert!(free <= total, "free ({free}) cannot exceed total ({total})");
+    }
+
+    /// The bug this pins: a sparse file reports a huge `len()` while occupying
+    /// almost no disk. Sizing by `len()` made the first scan report 1.14 TB for
+    /// a home directory `du` measures at ~820 GB. Built from a real sparse file
+    /// rather than a mock, because the whole point is what the filesystem does.
+    #[test]
+    fn sizing_uses_allocated_blocks_not_apparent_size() {
+        use std::io::{Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let p = dir.path().join("sparse.bin");
+        let mut f = std::fs::File::create(&p).expect("create");
+        // 512MB apparent, one byte written at the end => nearly zero allocated.
+        f.seek(SeekFrom::Start(512 * 1024 * 1024)).expect("seek");
+        f.write_all(b"x").expect("write");
+        f.sync_all().ok();
+        drop(f);
+
+        let md = std::fs::symlink_metadata(&p).expect("stat");
+        let apparent = md.len();
+        let on_disk = disk_bytes(&md);
+        assert!(apparent > 512 * 1024 * 1024, "apparent size should be huge");
+        assert!(
+            on_disk < apparent / 2,
+            "on-disk ({on_disk}) should be far below apparent ({apparent}) for a sparse file — \
+             if these are equal, disk_bytes has regressed to len()"
+        );
+    }
+
+    /// A cargo `target/` dir is full of hardlinks, so counting per-path
+    /// double-counts real gigabytes. Asserts the dedup actually suppresses the
+    /// second sighting, and that it does NOT suppress ordinary files.
+    #[test]
+    fn hardlinks_are_counted_once_but_normal_files_are_not_suppressed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let a = dir.path().join("a.bin");
+        std::fs::write(&a, vec![7u8; 4096]).expect("write");
+        let b = dir.path().join("b.bin");
+        std::fs::hard_link(&a, &b).expect("hard_link");
+
+        let mut seen = SeenInodes::default();
+        let ma = std::fs::symlink_metadata(&a).expect("stat a");
+        let mb = std::fs::symlink_metadata(&b).expect("stat b");
+        assert!(seen.count(&ma), "first sighting of a hardlink must count");
+        assert!(!seen.count(&mb), "second path to the same inode must NOT count");
+
+        // A plain file with nlink == 1 must always count, even twice-seen
+        // metadata objects, or ordinary files would go missing from totals.
+        let c = dir.path().join("c.bin");
+        std::fs::write(&c, vec![1u8; 128]).expect("write c");
+        let mc = std::fs::symlink_metadata(&c).expect("stat c");
+        assert!(seen.count(&mc), "an unlinked-once file must count");
     }
 
     #[test]
