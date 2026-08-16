@@ -1,5 +1,35 @@
 [
   {
+    "sha": "1678a5b",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "Owner alerts fire via email and iMessage — critical agent events reach you without any manual setup"
+  },
+  {
+    "sha": "ec08a71",
+    "date": "2026-08-16",
+    "type": "fix",
+    "title": "Browser automation reconnects to an existing Chrome session before launching a new one"
+  },
+  {
+    "sha": "c6bd42b",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "Health invariant alert.channel_can_deliver — a disconnected owner-alert channel now shows red in the dashboard"
+  },
+  {
+    "sha": "6ebef13",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "Codex, Ollama, and Gemini CLI agents now load your amux rules automatically via AGENTS.md and GEMINI.md symlinks"
+  },
+  {
+    "sha": "2b00af8",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "New CLI command: amux board show <ID> — inspect any board card from the terminal without opening the browser"
+  },
+  {
     "sha": "ec031ce",
     "date": "2026-08-15",
     "type": "feat",
