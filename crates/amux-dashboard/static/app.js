@@ -7631,7 +7631,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.656';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.657';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -27796,6 +27796,429 @@ function _metricsRender() {
 function _metricsSelectSession(name) {
   _metricsSelectedSession = _metricsSelectedSession === name ? null : name;
   _metricsRender();
+}
+
+// ── Metrics > Disk Cleanup (reclaim) ─────────────────────────────────────────
+// Scan / findings / treemap / quarantine over /api/reclaim.
+//
+// The one number this UI must never fake: "reclaimed". A move within a volume
+// frees nothing, and on APFS even a delete frees nothing while a local snapshot
+// still references the blocks — measured on 2026-08-16, deleting 22GB of ollama
+// models moved `df` by ~0. So every reclaim figure shown here is a real
+// free-space delta reported by the server, and estimates are labelled as such.
+let _metricsMode = 'system';
+let _reclaimScan = null;
+let _reclaimTimer = null;
+let _reclaimSel = new Set();
+let _reclaimTreePath = null;
+let _reclaimTree = null;
+let _reclaimQuarantine = null;
+let _reclaimCat = null;
+
+const _RECLAIM_CATS = {
+  build:     { label: 'Build artifacts', hint: 'Regenerable. Costs a rebuild, not data.', safe: true },
+  cache:     { label: 'Caches',          hint: 'Regenerable. Apps refill these on demand.', safe: true },
+  devtool:   { label: 'Dev tool stores', hint: 'Models, images, registries. Re-download can be slow.', safe: true },
+  large:     { label: 'Large files',     hint: 'Recently touched. Review individually.', safe: false },
+  stale:     { label: 'Stale files',     hint: 'Large and untouched for 90d+. Review individually.', safe: false },
+  duplicate: { label: 'Likely duplicates', hint: 'Same size + head/tail fingerprint, NOT a full hash. Verify before deleting.', safe: false },
+  snapshot:  { label: 'APFS snapshots',  hint: 'Holds deleted blocks. Not deletable from here.', safe: false },
+};
+
+const _KIND_COLORS = {
+  model: '#a371f7', media: '#f0883e', image: '#3fb950', archive: '#e3b341',
+  data: '#58a6ff', code: '#6e7681', build: '#f85149', doc: '#39c5cf', other: '#484f58',
+};
+
+function _fmtBytes(n) {
+  n = +n || 0;
+  if (n >= 1099511627776) return (n / 1099511627776).toFixed(2) + ' TB';
+  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
+  if (n >= 1048576) return (n / 1048576).toFixed(0) + ' MB';
+  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
+  return n + ' B';
+}
+
+function _metricsSetMode(mode) {
+  _metricsMode = mode;
+  document.getElementById('metricsmode-system')?.classList.toggle('active', mode === 'system');
+  document.getElementById('metricsmode-disk')?.classList.toggle('active', mode === 'disk');
+  const mc = document.getElementById('metrics-content');
+  const rc = document.getElementById('reclaim-content');
+  if (mc) mc.style.display = mode === 'system' ? '' : 'none';
+  if (rc) rc.style.display = mode === 'disk' ? '' : 'none';
+  const sb = document.getElementById('metrics-sidebar');
+  if (sb) sb.style.display = mode === 'disk' ? 'none' : '';
+  if (mode === 'disk') _reclaimLoad(); else _reclaimStopPolling();
+}
+
+function _reclaimStopPolling() {
+  if (_reclaimTimer) { clearInterval(_reclaimTimer); _reclaimTimer = null; }
+}
+
+async function _reclaimLoad() {
+  try {
+    const [scan, quar] = await Promise.all([
+      fetch(API + '/api/reclaim/scan/latest').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch(API + '/api/reclaim/quarantine').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    _reclaimScan = scan;
+    _reclaimQuarantine = quar;
+    _reclaimRender();
+    const st = scan?.scan?.status;
+    if (st === 'running' && !_reclaimTimer) _reclaimTimer = setInterval(_reclaimPoll, 1500);
+    if (st !== 'running') _reclaimStopPolling();
+    if (st === 'done' && !_reclaimTree) _reclaimLoadTree(null);
+  } catch (e) {
+    const el = document.getElementById('reclaim-content');
+    if (el) el.innerHTML = '<div style="color:var(--red);padding:20px;">Could not load reclaim data: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function _reclaimPoll() {
+  const r = await fetch(API + '/api/reclaim/scan/latest').then(r => r.ok ? r.json() : null).catch(() => null);
+  if (!r) return;
+  const wasRunning = _reclaimScan?.scan?.status === 'running';
+  _reclaimScan = r;
+  _reclaimRender();
+  if (r.scan?.status !== 'running') {
+    _reclaimStopPolling();
+    if (wasRunning) { _reclaimTree = null; _reclaimLoadTree(null); showToast('Disk scan complete'); }
+  }
+}
+
+async function _reclaimStartScan() {
+  const btn = document.getElementById('reclaim-scan-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+  try {
+    const r = await fetch(API + '/api/reclaim/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast(d.error || 'Scan could not start'); }
+    _reclaimSel = new Set();
+    await _reclaimLoad();
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Rescan'; }
+  }
+}
+
+async function _reclaimCancelScan() {
+  const id = _reclaimScan?.scan?.id;
+  if (!id) return;
+  await fetch(API + '/api/reclaim/scan/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+  _reclaimLoad();
+}
+
+async function _reclaimLoadTree(path) {
+  const id = _reclaimScan?.scan?.id;
+  if (!id) return;
+  const qs = path ? '?path=' + encodeURIComponent(path) : '';
+  _reclaimTree = await fetch(API + '/api/reclaim/tree/' + encodeURIComponent(id) + qs)
+    .then(r => r.ok ? r.json() : null).catch(() => null);
+  _reclaimTreePath = path;
+  _reclaimRender();
+}
+
+function _reclaimToggle(path) {
+  if (_reclaimSel.has(path)) _reclaimSel.delete(path); else _reclaimSel.add(path);
+  _reclaimRender();
+}
+
+function _reclaimSetCat(cat) {
+  _reclaimCat = (_reclaimCat === cat || !cat) ? null : cat;
+  _reclaimRender();
+}
+
+function _reclaimSelectCategory(cat) {
+  // Only regenerable categories are bulk-selectable. Stale/duplicate/large are
+  // judgment calls and stay one-at-a-time on purpose (ethos rule 8).
+  const rows = (_reclaimScan?.findings || []).filter(f => f.category === cat && f.regenerable);
+  const allOn = rows.length && rows.every(f => _reclaimSel.has(f.path));
+  rows.forEach(f => allOn ? _reclaimSel.delete(f.path) : _reclaimSel.add(f.path));
+  _reclaimRender();
+}
+
+async function _reclaimQuarantineSelected() {
+  const paths = [..._reclaimSel];
+  if (!paths.length) return;
+  const est = (_reclaimScan?.findings || []).filter(f => _reclaimSel.has(f.path))
+    .reduce((a, f) => a + (f.bytes || 0), 0);
+  const msg = 'Move ' + paths.length + ' item(s) to quarantine?\n\n'
+    + 'Estimated size: ' + _fmtBytes(est) + '\n\n'
+    + 'Nothing is deleted. Files move to ~/.amux/quarantine and can be restored '
+    + 'with one click. Space is NOT returned until you purge the batch.\n\n'
+    + paths.slice(0, 12).join('\n') + (paths.length > 12 ? '\n…and ' + (paths.length - 12) + ' more' : '');
+  if (!confirm(msg)) return;
+  const r = await fetch(API + '/api/reclaim/quarantine', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths, scan_id: _reclaimScan?.scan?.id }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (d.refused && d.refused.length) {
+    alert('Staged ' + (d.moved || 0) + ' item(s).\n\nRefused ' + d.refused.length + ':\n'
+      + d.refused.map(x => x.path + ' — ' + x.reason).join('\n'));
+  } else {
+    showToast('Staged ' + (d.moved || 0) + ' item(s) — ' + _fmtBytes(d.bytes || 0));
+  }
+  _reclaimSel = new Set();
+  _reclaimLoad();
+}
+
+async function _reclaimRestore(batchId) {
+  if (!confirm('Restore every file in this batch to its original location?')) return;
+  const r = await fetch(API + '/api/reclaim/quarantine/' + encodeURIComponent(batchId) + '/restore', { method: 'POST' });
+  const d = await r.json().catch(() => ({}));
+  showToast('Restored ' + (d.restored || 0) + ' item(s)');
+  if (d.failed && d.failed.length) alert('Failed:\n' + d.failed.map(x => x.path + ' — ' + x.reason).join('\n'));
+  _reclaimLoad();
+}
+
+async function _reclaimPurge(batchId, bytes) {
+  const msg = 'PERMANENTLY DELETE this quarantine batch?\n\n'
+    + 'Size: ' + _fmtBytes(bytes) + '\n\n'
+    + 'This cannot be undone. Restore will no longer be possible.';
+  if (!confirm(msg)) return;
+  if (prompt('Type PURGE to confirm permanent deletion:') !== 'PURGE') { showToast('Cancelled'); return; }
+  const r = await fetch(API + '/api/reclaim/quarantine/' + encodeURIComponent(batchId)
+    + '?confirm=' + encodeURIComponent(batchId), { method: 'DELETE' });
+  const d = await r.json().catch(() => ({}));
+  // Report the REAL delta, and say so when it disappoints.
+  showToast('Purged · free space +' + _fmtBytes(d.actually_freed || 0));
+  if (d.note) alert(d.note);
+  _reclaimLoad();
+}
+
+// Squarified treemap. Colour encodes the dominant file-type bucket, area
+// encodes bytes, so a big red block is a big pile of build output.
+function _reclaimTreemapSvg(nodes, w, h) {
+  const total = nodes.reduce((a, n) => a + (n.bytes || 0), 0);
+  if (!total) return '<div style="color:var(--dim);padding:20px;font-size:0.82rem;">No size data for this folder.</div>';
+  const items = nodes.filter(n => n.bytes > 0).map(n => ({ ...n, area: n.bytes / total * w * h }));
+  const rects = [];
+  let x = 0, y = 0, cw = w, ch = h, i = 0;
+
+  while (i < items.length) {
+    const vertical = cw >= ch;
+    const side = vertical ? ch : cw;
+    let row = [], rowArea = 0, best = Infinity;
+    while (i + row.length < items.length) {
+      const cand = [...row, items[i + row.length]];
+      const ca = rowArea + items[i + row.length].area;
+      const len = ca / side;
+      const worst = Math.max(...cand.map(r => Math.max(len / (r.area / len || 1e-9), (r.area / len || 1e-9) / len)));
+      if (row.length && worst > best) break;
+      row = cand; rowArea = ca; best = worst;
+    }
+    if (!row.length || side <= 0) break;
+    const len = rowArea / side;
+    if (!(len > 0)) break;
+    let off = 0;
+    row.forEach(r => {
+      const seg = (r.area / rowArea) * side;
+      rects.push(vertical
+        ? { ...r, x, y: y + off, w: len, h: seg }
+        : { ...r, x: x + off, y, w: seg, h: len });
+      off += seg;
+    });
+    if (vertical) { x += len; cw -= len; } else { y += len; ch -= len; }
+    i += row.length;
+  }
+
+  const body = rects.map(r => {
+    const name = (r.path || '').split('/').pop() || r.path;
+    const color = _KIND_COLORS[r.kind || 'other'] || _KIND_COLORS.other;
+    const showLabel = r.w > 54 && r.h > 22;
+    const t = esc(name + ' — ' + _fmtBytes(r.bytes));
+    return `<g class="tm-cell" onclick="_reclaimLoadTree('${escJs(r.path)}')">
+      <title>${t}</title>
+      <rect x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${Math.max(0,r.w-1.5).toFixed(1)}" height="${Math.max(0,r.h-1.5).toFixed(1)}"
+            fill="${color}" fill-opacity="0.78" stroke="var(--bg)" stroke-width="1" rx="2"/>
+      ${showLabel ? `<text x="${(r.x+6).toFixed(1)}" y="${(r.y+15).toFixed(1)}" font-size="10.5" fill="#fff" font-weight="600" pointer-events="none">${esc(name.slice(0,22))}</text>
+      <text x="${(r.x+6).toFixed(1)}" y="${(r.y+27).toFixed(1)}" font-size="9.5" fill="#fff" fill-opacity="0.82" pointer-events="none">${_fmtBytes(r.bytes)}</text>` : ''}
+    </g>`;
+  }).join('');
+
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block;border-radius:8px;overflow:hidden;">${body}</svg>`;
+}
+
+function _reclaimRender() {
+  const el = document.getElementById('reclaim-content');
+  if (!el) return;
+  const scan = _reclaimScan?.scan;
+  const findings = _reclaimScan?.findings || [];
+  const totals = _reclaimScan?.totals || [];
+  let html = '';
+
+  // Header + volume state
+  const freePct = scan?.df_total ? (scan.df_free / scan.df_total * 100) : null;
+  const critical = freePct !== null && freePct < 10;
+  html += `<div class="metrics-hdr">
+    <div class="metrics-hdr-left">
+      <span class="metrics-hdr-title">Disk Cleanup</span>
+      ${scan?.df_total ? `<span class="metrics-hostname">${_fmtBytes(scan.df_free)} free of ${_fmtBytes(scan.df_total)}</span>` : ''}
+      ${critical ? `<span style="color:var(--red);font-size:0.72rem;font-weight:600;">${freePct.toFixed(1)}% free</span>` : ''}
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      ${scan?.status === 'running'
+        ? `<button class="btn" onclick="_reclaimCancelScan()" style="font-size:0.8rem;padding:5px 12px;">Stop scan</button>`
+        : `<button class="btn" id="reclaim-scan-btn" onclick="_reclaimStartScan()" style="font-size:0.8rem;padding:5px 12px;">${scan ? 'Rescan' : 'Run scan'}</button>`}
+    </div>
+  </div>`;
+
+  if (!scan) {
+    html += `<div class="reclaim-empty">
+      <div style="font-weight:600;margin-bottom:6px;">No scan yet</div>
+      <div style="font-size:0.82rem;color:var(--dim);line-height:1.6;max-width:620px;">
+        Walks your home directory plus the dev-tool stores that live outside it, and ranks what can be
+        reclaimed. The scan is read-only and runs at background I/O priority so it does not compete
+        with the amux server for disk. Nothing is deleted without you selecting it.
+      </div>
+    </div>`;
+    el.innerHTML = html;
+    return;
+  }
+
+  // Progress
+  if (scan.status === 'running') {
+    html += `<div class="reclaim-progress">
+      <div class="reclaim-spinner"></div>
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:0.85rem;font-weight:600;margin-bottom:3px;">Scanning…</div>
+        <div style="font-size:0.75rem;color:var(--dim);">
+          ${(scan.dirs_walked||0).toLocaleString()} folders · ${(scan.files_walked||0).toLocaleString()} files · ${_fmtBytes(scan.bytes_seen)} seen
+        </div>
+        <div class="reclaim-curpath">${esc(scan.current_path || '')}</div>
+      </div>
+    </div>`;
+  }
+
+  // Snapshot warning — the thing that makes cleanup look broken.
+  const snapFinding = findings.find(f => f.category === 'snapshot');
+  if (snapFinding) {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">⚠ ${scan.snapshot_count} APFS local snapshots are holding deleted space</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        Until these expire or are thinned, <b>deleting files will not increase your free space</b> — the
+        blocks stay referenced by the snapshot. This is why a cleanup can look like it did nothing.
+        <div style="margin-top:6px;">Release them from a terminal (needs sudo, so amux will not run it for you):</div>
+        <code class="reclaim-code">sudo tmutil thinlocalsnapshots / 21474836480 4</code>
+      </div>
+    </div>`;
+  }
+
+  // Category totals
+  const actionable = totals.filter(t => t.category !== 'snapshot');
+  if (actionable.length) {
+    html += '<div class="metrics-section-title">Reclaimable by category</div><div class="metrics-cards">';
+    actionable.forEach(t => {
+      const meta = _RECLAIM_CATS[t.category] || { label: t.category, hint: '' };
+      const on = _reclaimCat === t.category;
+      html += `<div class="metrics-card reclaim-catcard${on ? ' active' : ''}" onclick="_reclaimSetCat('${escJs(t.category)}')" title="${esc(meta.hint)}">
+        <div class="metrics-card-title">${esc(meta.label)}</div>
+        <div class="metrics-card-value" style="font-size:1.2rem;">${_fmtBytes(t.bytes)}</div>
+        <div class="metrics-card-sub">${t.count} item${t.count === 1 ? '' : 's'}${meta.safe ? ' · regenerable' : ''}</div>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  // Treemap
+  if (_reclaimTree) {
+    const rootPath = _reclaimTree.root?.path || _reclaimTreePath || '~';
+    const parent = rootPath.includes('/') ? rootPath.slice(0, rootPath.lastIndexOf('/')) : null;
+    html += `<div class="metrics-section-title" style="margin-top:18px;">Disk map
+      <span style="text-transform:none;letter-spacing:0;font-weight:400;">— click a block to drill in</span></div>`;
+    html += `<div class="reclaim-mapbar">
+      ${parent ? `<button class="btn reclaim-upbtn" onclick="_reclaimLoadTree('${escJs(parent)}')">↑ up</button>` : ''}
+      <span class="reclaim-mappath">${esc(rootPath)}</span>
+      ${_reclaimTree.root ? `<span style="color:var(--dim);font-size:0.75rem;">${_fmtBytes(_reclaimTree.root.bytes)}</span>` : ''}
+    </div>`;
+    html += '<div class="reclaim-map">' + _reclaimTreemapSvg(_reclaimTree.children || [], 900, 340) + '</div>';
+    html += '<div class="reclaim-legend">' + Object.entries(_KIND_COLORS).map(([k, c]) =>
+      `<span class="reclaim-legend-item"><i style="background:${c}"></i>${k}</span>`).join('') + '</div>';
+  }
+
+  // Findings table
+  const shown = _reclaimCat ? findings.filter(f => f.category === _reclaimCat) : findings.filter(f => f.category !== 'snapshot');
+  const selBytes = findings.filter(f => _reclaimSel.has(f.path)).reduce((a, f) => a + (f.bytes || 0), 0);
+
+  html += `<div class="metrics-section-title" style="margin-top:18px;">
+    Findings${_reclaimCat ? ' — ' + esc(_RECLAIM_CATS[_reclaimCat]?.label || _reclaimCat) : ''}
+    <span style="text-transform:none;letter-spacing:0;font-weight:400;">(${shown.length})</span>
+    ${_reclaimCat ? `<button class="btn reclaim-minibtn" onclick="_reclaimSetCat(null)">clear filter</button>` : ''}
+    ${_reclaimCat && _RECLAIM_CATS[_reclaimCat]?.safe ? `<button class="btn reclaim-minibtn" onclick="_reclaimSelectCategory('${escJs(_reclaimCat)}')">select all regenerable</button>` : ''}
+  </div>`;
+
+  if (_reclaimSel.size) {
+    html += `<div class="reclaim-actionbar">
+      <span><b>${_reclaimSel.size}</b> selected · <b>${_fmtBytes(selBytes)}</b> <span style="color:var(--dim);">(estimated)</span></span>
+      <span style="display:flex;gap:8px;">
+        <button class="btn" onclick="_reclaimSel=new Set();_reclaimRender()">Clear</button>
+        <button class="btn reclaim-danger" onclick="_reclaimQuarantineSelected()">Move to quarantine…</button>
+      </span>
+    </div>`;
+  }
+
+  html += '<div class="metrics-table-wrap"><table class="metrics-table"><thead><tr>';
+  html += '<th style="width:28px;"></th><th>Path</th><th>Category</th><th>Size</th><th>Files</th><th>Detail</th>';
+  html += '</tr></thead><tbody>';
+  if (!shown.length) {
+    html += '<tr><td colspan="6" style="text-align:center;color:var(--dim);padding:20px;">'
+      + (scan.status === 'running' ? 'Scan in progress…' : 'Nothing found in this category.') + '</td></tr>';
+  } else {
+    shown.slice(0, 400).forEach(f => {
+      const meta = _RECLAIM_CATS[f.category] || { label: f.category };
+      const checked = _reclaimSel.has(f.path) ? ' checked' : '';
+      html += `<tr class="${_reclaimSel.has(f.path) ? 'row-selected' : ''}">
+        <td><input type="checkbox"${checked} onchange="_reclaimToggle('${escJs(f.path)}')"></td>
+        <td style="font-family:var(--mono,monospace);font-size:0.74rem;word-break:break-all;">${esc(f.path)}</td>
+        <td style="font-size:0.74rem;">${esc(meta.label)}${f.regenerable ? '' : ' <span style="color:var(--yellow,#e3b341);" title="Not regenerable — review before removing">⚠</span>'}</td>
+        <td style="font-weight:600;">${_fmtBytes(f.bytes)}</td>
+        <td style="font-size:0.74rem;color:var(--dim);">${(f.file_count||0).toLocaleString()}</td>
+        <td style="font-size:0.72rem;color:var(--dim);">${esc(f.detail || '')}</td>
+      </tr>`;
+    });
+  }
+  html += '</tbody></table></div>';
+  if (shown.length > 400) {
+    html += `<div style="font-size:0.72rem;color:var(--dim);margin-top:6px;">Showing the 400 largest of ${shown.length}. Narrow with a category filter to see the rest.</div>`;
+  }
+
+  // Quarantine ledger
+  const batches = (_reclaimQuarantine?.batches || []).filter(b => b.status !== 'purged' || b.item_count);
+  if (batches.length) {
+    html += '<div class="metrics-section-title" style="margin-top:20px;">Quarantine</div>';
+    html += '<div class="metrics-table-wrap"><table class="metrics-table"><thead><tr>';
+    html += '<th>Staged</th><th>Items</th><th>Size</th><th>Actually freed</th><th>Status</th><th></th>';
+    html += '</tr></thead><tbody>';
+    batches.forEach(b => {
+      const freed = (b.df_free_after != null && b.df_free_before != null)
+        ? b.df_free_after - b.df_free_before : null;
+      const staged = b.status === 'staged';
+      html += `<tr>
+        <td style="font-size:0.75rem;">${_metricsRelTime(new Date(b.created_at * 1000).toISOString())}</td>
+        <td>${b.item_count}</td>
+        <td style="font-weight:600;">${_fmtBytes(b.bytes)}</td>
+        <td style="font-size:0.75rem;color:${freed > 0 ? '#3fb950' : 'var(--dim)'};">${freed == null ? '—' : (freed > 0 ? '+' : '') + _fmtBytes(freed)}</td>
+        <td style="font-size:0.75rem;">${esc(b.status)}</td>
+        <td style="text-align:right;white-space:nowrap;">
+          ${staged ? `<button class="btn reclaim-minibtn" onclick="_reclaimRestore('${escJs(b.id)}')">Restore</button>
+          <button class="btn reclaim-minibtn reclaim-danger" onclick="_reclaimPurge('${escJs(b.id)}',${b.bytes})">Purge</button>` : ''}
+        </td>
+      </tr>`;
+    });
+    html += '</tbody></table></div>';
+    html += `<div style="font-size:0.72rem;color:var(--dim);margin-top:6px;line-height:1.5;">
+      Staged files live in <code>${esc(_reclaimQuarantine?.root || '~/.amux/quarantine')}</code>.
+      "Actually freed" is the real free-space change, not the sum of file sizes — a move frees nothing
+      until purge, and snapshots can hold the blocks after that.</div>`;
+  }
+
+  el.innerHTML = html;
 }
 
 // ── Torrents tab ─────────────────────────────────────────────────────────────

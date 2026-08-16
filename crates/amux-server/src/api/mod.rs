@@ -48,6 +48,7 @@ pub mod org;
 pub mod prefs;
 pub mod proxies;
 pub mod py_proxy;
+pub mod reclaim;
 pub mod request_log;
 pub mod review;
 pub mod saved_messages;
@@ -132,6 +133,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
+        .nest("/api/reclaim", reclaim::routes())
         .nest("/api/usage", usage::routes())
         .nest("/api/review", review::routes())
         .nest("/api/channels", channels::routes())
