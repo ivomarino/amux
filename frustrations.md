@@ -1878,7 +1878,7 @@ FIX: One `RouteEntry` per runtime-job debug route, or better — have `routes()`
 ## The live-DB migration guard test fails on any target dir not literally named `target`
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-10
 SESSION: autofix (subagent)
 CARD: AF-71
@@ -1891,8 +1891,19 @@ SYMPTOM: `db::migrate::guard_tests::it_actually_refuses_a_pending_migration_agai
 COST: ~10 minutes proving a red test was not mine — and the failure message says
   "precondition", which reads like the test is protecting something real rather than
   pattern-matching a path. A session in a hurry files a bug against its own change.
-FIX: Match on the cargo-provided fact rather than the path spelling — `OUT_DIR`/
-  `CARGO_TARGET_TMPDIR`, or accept any path ending `/debug/deps/`.
+FIX: FIXED in 490ea3a, and the real bug was WORSE than this entry saw. `is_cargo_target_build`
+  no longer looks for the literal `/target/debug/`; it matches any path COMPONENT equal to
+  `debug` or `release`, which is the "cargo-provided fact rather than the path spelling"
+  this entry asked for.
+  Read that commit's subject: "the live-DB migration guard was OFF for the mandated build
+  dir (AMUX-2799)". This entry reported a red TEST. The underlying defect was that the
+  GUARD ITSELF — the thing that stops an ordinary `cargo run` migrating the fleet's real
+  `~/.amux/amux.db` — was not firing for the exact build dir CLAUDE.md mandates. A safety
+  check silently off, presenting as a noisy test.
+  Verified by amux-frustrations 2026-08-16 against the entry's own failing condition:
+  ran the named test with `CARGO_TARGET_DIR=~/.amux/rust-build-target` (a dir whose name
+  is `rust-build-target`, so the literal `/target/` substring is absent) — 1 passed.
+  Awaiting the originating session's sign-off; see the SESSION caveat.
 
 ## Two alerts tests pass alone and fail together — a process-global HOME race
 AREA: instruments
