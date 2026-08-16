@@ -1326,16 +1326,54 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     Ok(json)
 }
 
-pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
+pub async fn list_sessions_legacy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     match legacy_sessions_array(&state.store) {
         Ok(json) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
-            json,
+            filter_isolated_for_peer(&json, &headers),
         )
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Whether the caller is a PEER worker rather than the owner. A peer's request
+/// carries a server-verified worker/session header (the `amux` CLI stamps it);
+/// the owner's dashboard is a browser and sends neither. Same owner-vs-peer
+/// split the send guard uses (empty origin = owner).
+fn caller_is_peer(headers: &axum::http::HeaderMap) -> bool {
+    ["x-amux-worker", "x-amux-session"].iter().any(|k| {
+        headers
+            .get(*k)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+/// ISOLATED (AMUX-3232): strip isolated (raw-agent) workers from the fleet list
+/// a PEER sees, so they are undiscoverable to other sessions. The OWNER
+/// dashboard sees the full fleet (it must still control them), so the shared
+/// cache stays owner-complete and the peer view is applied per request here.
+/// Greppable trace on a real strip so the exclusion is not silent.
+fn filter_isolated_for_peer(json: &str, headers: &axum::http::HeaderMap) -> String {
+    if !caller_is_peer(headers) {
+        return json.to_string();
+    }
+    let Ok(mut arr) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return json.to_string();
+    };
+    let before = arr.len();
+    arr.retain(|s| !s.get("isolated").and_then(serde_json::Value::as_bool).unwrap_or(false));
+    let hidden = before - arr.len();
+    if hidden > 0 {
+        tracing::debug!(hidden, "sessions list: isolated worker(s) hidden from a peer caller");
+    }
+    serde_json::to_string(&arr).unwrap_or_else(|_| json.to_string())
 }
 
 // ---- POST /api/sessions — CREATE a fleet worker --------------------------
@@ -1815,6 +1853,11 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // UI (Ethan's finding).
             "tags": env.get("CC_TAGS").map(|t| t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>()).unwrap_or_default(),
             "pinned": env.get("CC_PINNED").map(|v| v == "1").unwrap_or(false),
+            // ISOLATED (AMUX-3232): a raw agent (tmux + the CLI, no amux
+            // harness). The OWNER dashboard reads this to show the toggle state /
+            // badge; the peer-facing list strips these entries entirely in
+            // list_sessions_legacy (a peer must not even see it exists).
+            "isolated": env.get("CC_ISOLATED").map(|v| v == "1").unwrap_or(false),
             "steering_queue": [],
             "managed_by": "python",
         }));
@@ -2288,6 +2331,43 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// ISOLATED (AMUX-3232): the peer-facing fleet list strips isolated
+    /// (raw-agent) workers so peers cannot discover them, while the OWNER
+    /// dashboard (no worker header) sees the full fleet. The normal worker is the
+    /// negative control that lets this test actually fail.
+    #[test]
+    fn peer_list_hides_isolated_workers_owner_sees_all() {
+        let arr = serde_json::to_string(&serde_json::json!([
+            {"name": "normal", "isolated": false},
+            {"name": "secret", "isolated": true},
+        ]))
+        .unwrap();
+
+        // A PEER carries a server-stamped worker header, so the isolated worker
+        // is gone and the normal one remains.
+        let mut peer = axum::http::HeaderMap::new();
+        peer.insert("x-amux-worker", "some-peer".parse().unwrap());
+        let peer_view: Vec<serde_json::Value> =
+            serde_json::from_str(&filter_isolated_for_peer(&arr, &peer)).unwrap();
+        let peer_names: Vec<&str> =
+            peer_view.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(peer_names, vec!["normal"], "peer must not see the isolated worker");
+
+        // The OWNER dashboard sends no worker/session header, so it sees BOTH.
+        let owner = axum::http::HeaderMap::new();
+        let owner_view: Vec<serde_json::Value> =
+            serde_json::from_str(&filter_isolated_for_peer(&arr, &owner)).unwrap();
+        let owner_names: Vec<&str> =
+            owner_view.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(owner_names, vec!["normal", "secret"], "owner sees the full fleet");
+
+        // An EMPTY worker header is the owner, not a peer (the send guard's same
+        // rule), so it must not trigger the strip.
+        let mut empty = axum::http::HeaderMap::new();
+        empty.insert("x-amux-worker", "".parse().unwrap());
+        assert!(!caller_is_peer(&empty), "an empty header is the owner, not a peer");
+    }
 
     /// AMUX-3182: the create modal could not honestly make an ollama worker.
     /// An ollama worker's model must land in CC_MODEL (the start arm reads it),

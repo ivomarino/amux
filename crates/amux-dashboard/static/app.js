@@ -2957,6 +2957,7 @@ function render() {
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','model','${escJs(model||"")}','${escJs(provider)}')"><span class="mi">&#x2699;</span> Model${model ? ': '+esc(model) : ''}</div>
           ${provider === 'claude' ? `<div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','effort','${escJs(effort||"")}','${escJs(provider)}')"><span class="mi">&#x1F9E0;</span> Effort${effort ? ': '+esc(effort) : ' (default)'}</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();toggleYolo('${s.name}')"><span class="mi">${isYolo?'&#x2611;':'&#x2610;'}</span> YOLO mode</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleIsolated('${s.name}')" title="Run as a raw agent: just tmux plus the CLI, no amux harness, hidden from peers. The owner can still peek and send."><span class="mi">${s.isolated?'&#x2611;':'&#x2610;'}</span> Isolated (raw agent, no amux harness)</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','desc','${escJs(s.desc||"")}')"><span class="mi">&#x1F4DD;</span> Description</div>
           ${/* field is 'tags', the INTERNAL name — b009f6e's vocab pass renamed
                this argument to 'groups' as if it were a display string, and
@@ -4987,6 +4988,26 @@ async function togglePin(session) {
     body: JSON.stringify({ toggle_pin: true })
   });
   if (!r && s && was !== null) { s.pinned = was; lastSessionsJSON = ''; render(); }
+  await fetchSessions();
+}
+
+// Isolated (raw agent, no amux harness), AMUX-3232. Persists CC_ISOLATED via
+// the same config PATCH every other worker flag uses; the server strips the
+// harness (AMUX_SESSION/URL env, self-report hooks, --mcp-config) and hides the
+// worker from peers at the NEXT spawn, so the toast says restart to apply. Paint
+// the flip immediately like togglePin, then let fetchSessions be the truth.
+async function toggleIsolated(session) {
+  closeAllMenus();
+  const s = sessions.find(x => x.name === session);
+  const was = s ? !!s.isolated : null;
+  const next = !(was || false);
+  if (s) { s.isolated = next; lastSessionsJSON = ''; render(); }
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ isolated: next })
+  });
+  if (!r && s && was !== null) { s.isolated = was; lastSessionsJSON = ''; render(); }
+  else if (r) { showToast(next ? 'Isolated on (raw agent). Restart the worker to apply.' : 'Isolated off. Restart the worker to apply.'); }
   await fetchSessions();
 }
 
@@ -7631,7 +7652,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.657';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.658';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

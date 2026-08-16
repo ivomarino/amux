@@ -2743,7 +2743,11 @@ pub(crate) async fn cmd_hist_record_full(
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
     // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
     // messages are not the recipient's task and must not spam the board.
-    if is_user && !skip_board {
+    // ISOLATED (AMUX-3232): a raw agent leaves no board trace; its prompts are
+    // not auto-captured as ledger cards. It has no session/URL to run `amux
+    // board`, so a card minted here would name work nobody can drive, and the
+    // accountability sweep is likewise told to skip it.
+    if is_user && !skip_board && !session_is_isolated(&cap_session) {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -4702,16 +4706,21 @@ fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_fla
     if !extra_flags.is_empty() {
         cmd = format!("{cmd} {}", shell_quote_flags(extra_flags));
     }
-    let mcp_val = cfg.get_or("CC_MCP", "").trim().to_lowercase();
-    if !matches!(mcp_val.as_str(), "off" | "none" | "0") {
-        if let Some(reg) = mcp_registry_path() {
-            cmd = format!("{cmd} --mcp-config {}", sh_quote(&reg.to_string_lossy()));
+    // ISOLATED (AMUX-3232): a raw agent gets no MCP servers injected. The
+    // whole harness is stripped, and `--mcp-config` is part of it. Guarded on
+    // the worker's own env, the same map CC_MCP itself lives in.
+    if !env_flag_on(cfg.get("CC_ISOLATED")) {
+        let mcp_val = cfg.get_or("CC_MCP", "").trim().to_lowercase();
+        if !matches!(mcp_val.as_str(), "off" | "none" | "0") {
+            if let Some(reg) = mcp_registry_path() {
+                cmd = format!("{cmd} --mcp-config {}", sh_quote(&reg.to_string_lossy()));
+            }
         }
-    }
-    if mcp_val == "chrome" {
-        let chrome = home().join("mcp-chrome.json");
-        if chrome.exists() {
-            cmd = format!("{cmd} --mcp-config {}", sh_quote(&chrome.to_string_lossy()));
+        if mcp_val == "chrome" {
+            let chrome = home().join("mcp-chrome.json");
+            if chrome.exists() {
+                cmd = format!("{cmd} --mcp-config {}", sh_quote(&chrome.to_string_lossy()));
+            }
         }
     }
     if !cmd.contains("--model") {
@@ -4900,6 +4909,11 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         return (false, format!("session '{name}' not found"));
     }
     let cfg = parse_env(name);
+    // ISOLATED (AMUX-3232): computed once here from the worker's own env so the
+    // spawn path can strip the harness (env injection below, --mcp-config in
+    // build_claude_cmd). Read from cfg, the same map every other CC_* flag on
+    // this launch uses.
+    let isolated = env_flag_on(cfg.get("CC_ISOLATED"));
     if !iterm2_id(&cfg).is_empty() {
         return (false, "iTerm2-backed sessions are not supported by the rust origin yet".into());
     }
@@ -5274,16 +5288,36 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             "new-session".into(), "-d".into(), "-s".into(), tmux_sess.clone(),
             "-n".into(), name.into(), "-c".into(), work_dir.clone(),
             "-x".into(), cols, "-y".into(), rows,
-            "-e".into(), format!("TMUX_SESSION_NAME={name}"),
-            "-e".into(), format!("AMUX_WORKER={name}"),
-            "-e".into(), format!("AMUX_SESSION={name}"),
-            // The port THIS server answers on, never a literal: a new lane must
-            // reach the server that started it. The old hardcoded 8822 outlived
-            // its own deployment — it kept minting the retired address into
-            // every new session locally, and it forced the cloud image to bind
-            // 8822 to match (cloud/docker/Dockerfile named this line).
-            "-e".into(), format!("AMUX_URL={scheme}://localhost:{}", crate::config::canonical_port()),
         ];
+        // ISOLATED (AMUX-3232): a raw agent is "just tmux plus Claude Code". The
+        // amux harness reaches a lane through these four env vars. AMUX_SESSION
+        // and AMUX_URL are what the global Claude Code hooks
+        // (Stop/UserPromptSubmit/PostToolUse self-report) and every `amux`
+        // command key on, so NOT injecting them is the root-cause suppression:
+        // the hooks no-op, board attribution has no session to name, and the
+        // session cannot discover the fleet. The OWNER still peeks/sends because
+        // amux drives the pane with send-keys + capture from OUTSIDE, which needs
+        // nothing set inside the session. Suppressing at the injection point (not
+        // downstream) is why a better model does not route around it.
+        if isolated {
+            tracing::info!(
+                session = %name,
+                "spawn: ISOLATED worker, amux harness suppressed (no AMUX_SESSION/AMUX_URL/AMUX_WORKER env, no --mcp-config); owner peek/send still work, peers cannot discover or target it"
+            );
+        } else {
+            args.extend([
+                "-e".into(), format!("TMUX_SESSION_NAME={name}"),
+                "-e".into(), format!("AMUX_WORKER={name}"),
+                "-e".into(), format!("AMUX_SESSION={name}"),
+                // The port THIS server answers on, never a literal: a new lane
+                // must reach the server that started it. The old hardcoded 8822
+                // outlived its own deployment: it kept minting the retired
+                // address into every new session locally, and it forced the
+                // cloud image to bind 8822 to match (cloud/docker/Dockerfile
+                // named this line).
+                "-e".into(), format!("AMUX_URL={scheme}://localhost:{}", crate::config::canonical_port()),
+            ]);
+        }
         args.extend(env_args.iter().cloned());
         args.push(user_shell());
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -6659,6 +6693,12 @@ fn fleet_roster() -> String {
             if env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false) {
                 continue;
             }
+            // ISOLATED (AMUX-3232): a raw agent is undiscoverable to peers, so it
+            // never appears in the fleet roster written into every OTHER worker's
+            // shared memory table. Same skip as archived.
+            if env_flag_on(env.get("CC_ISOLATED").map(String::as_str)) {
+                continue;
+            }
             let groups = env
                 .get("CC_TAGS")
                 .map(|t| {
@@ -8017,6 +8057,12 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         let Some(name) = path.file_stem().and_then(|x| x.to_str()) else { continue };
         let cfg = parse_env(name);
         if cfg.get("CC_ARCHIVED") == Some("1") {
+            continue;
+        }
+        // ISOLATED (AMUX-3232): a raw agent gets no status scrape and no
+        // rate-limit auto-answer. amux does not press keys into a lane whose
+        // whole point is to run untouched. Same skip as archived.
+        if env_flag_on(cfg.get("CC_ISOLATED")) {
             continue;
         }
         if !is_running(name).await {
@@ -9903,6 +9949,29 @@ pub(crate) fn templates_dir() -> Option<PathBuf> {
 // Group scoping for worker-to-worker sends (Ethan, 2026-08-11)
 // ---------------------------------------------------------------------------
 
+/// Whether a per-worker env value is switched ON (`1`/`true`/`yes`, quotes and
+/// case ignored). The one spelling every boolean CC_* flag is read through here.
+pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().trim_matches('"').to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Whether a worker runs "isolated" (AMUX-3232): a RAW agent (tmux + the
+/// underlying CLI) with the amux harness stripped, and undiscoverable to peers.
+///
+/// The flag is the per-worker env key `CC_ISOLATED`, the SAME environment
+/// primitive that already holds `CC_MCP` / `CC_TAGS` / `CC_ARCHIVED`, so it
+/// persists across reload and applies at the next spawn with no new store to
+/// keep in step (deliberately not a second spelling in a SQLite column). This
+/// function is the single source of truth every isolation decision consults:
+/// spawn-env suppression, `--mcp-config`, board auto-capture, the peer fleet
+/// list, the fleet roster, the peer-send guard, and the status/rate-limit sweep.
+pub(crate) fn session_is_isolated(name: &str) -> bool {
+    env_flag_on(parse_env(name).get("CC_ISOLATED"))
+}
+
 /// A lane's groups, from `CC_TAGS` in its env file.
 pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
     parse_env(lane)
@@ -9968,6 +10037,19 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
     if origin.is_empty() || origin == target {
         return Ok("self-or-human");
+    }
+    // ISOLATED TARGET (AMUX-3232): a raw agent is not a peer/relay target. The
+    // OWNER (empty origin) already returned above, so this refuses ONLY a PEER
+    // send; owner peek/send from the dashboard is untouched. The refusal names
+    // "isolated" so a sweep of the request log / send.cross_group_refused events
+    // can find it (the two-fixes rule: the exclusion is greppable, not silent).
+    if session_is_isolated(target) {
+        return Err(format!(
+            "send refused: '{target}' is an isolated (raw-agent) worker with the amux harness \
+             stripped. It is not a peer or relay target and is reachable only by the owner from \
+             the dashboard. This applies only to sends carrying a worker origin; a human send is \
+             never restricted."
+        ));
     }
     let (og, tg) = (lane_groups(origin), lane_groups(target));
     if !og.is_disjoint(&tg) {
@@ -11934,6 +12016,38 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         return j200(json!({"ok": true, "message": "pin toggled"}));
     }
 
+    // Isolated (raw agent, no amux harness), AMUX-3232. Persisted as the env
+    // key CC_ISOLATED (the environment primitive, not a new store), so it
+    // survives reload and is read on the NEXT spawn: the harness (AMUX_SESSION /
+    // AMUX_URL env, the self-report hooks that key on them, --mcp-config) is not
+    // injected, and the worker becomes undiscoverable to peers (fleet list,
+    // roster, peer-send guard). The owner still controls it from the dashboard.
+    // Explicit boolean rather than a toggle, so the UI switch is idempotent.
+    if let Some(iv) = body.get("isolated") {
+        let on = py_truthy(iv);
+        cfg.set("CC_ISOLATED", if on { "1" } else { "" });
+        if cfg.write(&f).is_err() {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        }
+        // The roster peers read is fleet-wide data; toggling isolation adds or
+        // removes this worker from it, so refresh like desc/tags do.
+        let refreshed = refresh_fleet_rosters();
+        tracing::info!(
+            session = %name, isolated = on,
+            "config: isolated toggled; harness suppression + peer-undiscoverable apply at next spawn"
+        );
+        return j200(json!({
+            "ok": true,
+            "isolated": on,
+            "rosters_refreshed": refreshed,
+            "message": if on {
+                "isolated on (raw agent, no amux harness); restart the worker to apply"
+            } else {
+                "isolated off; restart the worker to apply"
+            },
+        }));
+    }
+
     // Branch (py:76679).
     if let Some(bv) = body.get("branch") {
         cfg.set("CC_BRANCH", bv.as_str().unwrap_or("").trim());
@@ -12293,6 +12407,43 @@ mod tests {
         // An untagged lane shares no group with anyone — including other
         // untagged lanes. Consistent with "untagged sees itself".
         assert!(cross_group_send_ok("lonely", "gtm-engine").is_err());
+    }
+
+    /// ISOLATED (AMUX-3232): a raw-agent worker is undiscoverable to peers and
+    /// cannot be targeted by a peer send, while a normal worker in the SAME group
+    /// stays reachable (the negative control that lets this test fail). The owner
+    /// (empty origin) is never blocked.
+    #[test]
+    fn isolated_worker_is_not_a_peer_send_target() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let write = |n: &str, body: &str| {
+            std::fs::write(sessions.join(format!("{n}.env")), body).expect("write");
+        };
+        // Two same-group peers plus a same-group ISOLATED worker.
+        write("caller", "CC_TAGS=\"amux\"\n");
+        write("normal", "CC_TAGS=\"amux\"\n");
+        write("secret", "CC_TAGS=\"amux\"\nCC_ISOLATED=\"1\"\n");
+
+        // The flag itself: on for the isolated worker, off for the normal one
+        // (the negative control: if session_is_isolated matched everything, the
+        // guard below would be vacuous).
+        assert!(session_is_isolated("secret"), "CC_ISOLATED=1 must read as isolated");
+        assert!(!session_is_isolated("normal"), "a normal worker must NOT read as isolated");
+
+        // A PEER send to the isolated worker is refused, and the reason names it.
+        let err = cross_group_send_ok("caller", "secret").expect_err("peer send to isolated must refuse");
+        assert!(err.contains("isolated"), "refusal must name the reason: {err}");
+
+        // NEGATIVE CONTROL: the same peer, same group, reaching a NON-isolated
+        // worker is allowed, proving the refusal is the isolation, not the group.
+        assert_eq!(cross_group_send_ok("caller", "normal").unwrap(), "same-group");
+
+        // The OWNER (empty origin, e.g. the dashboard) is never blocked, so
+        // owner peek/send to an isolated worker still works.
+        assert_eq!(cross_group_send_ok("", "secret").unwrap(), "self-or-human");
     }
     use axum::body::Body;
     use axum::http::Request;
