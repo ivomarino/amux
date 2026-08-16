@@ -1737,7 +1737,17 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "sched_on": 0,
             "sched_off": 0,
             "name": name,
-            "status": status,
+            // Rate-limit IS a status (Ethan, 2026-08-16: "capture workers rate
+            // limit as a status"). A lane blocked on a provider usage limit must be
+            // distinguishable in the fleet view, not hidden behind idle/waiting with
+            // only the side boolean `credit_limited` two lines down. Derives from the
+            // same meta stamp the rate_limit_sweep now keeps set for the whole
+            // blocked window (menu OR post-menu banner).
+            "status": if meta["rate_limited_since"].as_i64().unwrap_or(0) > 0 {
+                json!("rate_limited")
+            } else {
+                json!(status.clone())
+            },
             "running": is_running,
             "provider": env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into()),
             "model": env.get("CC_MODEL").cloned().unwrap_or_default(),

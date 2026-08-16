@@ -930,6 +930,28 @@ pub(crate) fn is_rate_limit_menu(raw: &str) -> bool {
         && clean.contains("switch to usage credits")
 }
 
+/// The POST-menu rate-limit BANNER (Ethan, 2026-08-16: "capture workers rate
+/// limit as a status"). After amux answers the menu with "stop and wait", or
+/// when Claude simply reaches the cap, the TUI shows a persistent banner
+/// (usage-credits offer / reset time) while the lane is STILL BLOCKED. The menu
+/// is gone, so `is_rate_limit_menu` no longer matches and the stamp was cleared,
+/// leaving the fleet showing the lane as idle. This catches the banner so the
+/// rate-limited status persists while the lane is actually blocked, and clears
+/// only when neither the menu nor the banner is on screen.
+///
+/// Kept SPECIFIC to Claude's OWN banner strings so a lane merely DISCUSSING usage
+/// limits in its work does not trip it. This is the ethos rule-7 content-vs-state
+/// trap and it already bit once here: a naive fleet grep for "usage limit" flagged
+/// `backend` because it was working a task about "the ops key hit its usage limit"
+/// ("its", a third party), not because backend itself was limited. Claude's banner
+/// says "YOUR usage limit"; the credit offer is the literal slash command.
+pub(crate) fn is_rate_limited_banner(raw: &str) -> bool {
+    let clean = strip_ansi(raw).to_lowercase();
+    clean.contains("usage-credits to finish")
+        || clean.contains("your usage limit")
+        || (clean.contains("weekly limit") && clean.contains("reset"))
+}
+
 /// The policy for what amux does with a rate-limit menu (ethos D2).
 ///
 /// `wait` (default) presses 1. `off` leaves the menu for a human and reports it.
@@ -4255,11 +4277,12 @@ async fn send_text_inner(
             )
             .await;
             if ok {
-                // The menu is gone; this send is no longer facing a selector.
-                // Clear the stamp in the SAME breath — a `credit_limited` that
-                // is set and never cleared is the mirror of one that is never
-                // set, and it would leave the fleet view permanently red.
-                update_meta(name, &[("rate_limited_since", json!(0))]);
+                // The MENU is gone, but the lane is still blocked until the limit
+                // resets (it now sits on the banner). Do NOT clear the stamp here:
+                // the rate_limit_sweep clears it only when neither the menu nor the
+                // banner is on screen, i.e. when the lane actually resumes. Clearing
+                // it the instant the menu closed is what made a still-blocked lane
+                // read as idle (Ethan, 2026-08-16). Only unblock this send.
                 waiting = false;
             }
         }
@@ -8097,9 +8120,16 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             }
         }
 
-        if !is_rate_limit_menu(&pane) {
-            // Recovered on its own (or was never limited): clear a stale stamp
-            // so the fleet view does not stay red after the fact.
+        // Limited = the interactive menu OR the persistent post-menu banner. The
+        // menu is what amux answers; the banner is what a lane sits on AFTER
+        // "stop and wait", still blocked until the limit resets. Flagging both is
+        // what makes the rate-limited status persist for the whole blocked window
+        // instead of vanishing the instant the menu closes (Ethan, 2026-08-16).
+        let menu = is_rate_limit_menu(&pane);
+        let limited = menu || is_rate_limited_banner(&pane);
+        if !limited {
+            // Recovered (menu answered AND banner gone): clear the stamp so the
+            // fleet view does not stay red after the lane resumes.
             if meta_i64(&load_meta(name), "rate_limited_since") > 0 {
                 update_meta(name, &[("rate_limited_since", json!(0))]);
             }
@@ -8118,18 +8148,19 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 state,
                 name,
                 "session.rate_limited",
-                Some(json!({"detected_by": "sweep"})),
+                Some(json!({"detected_by": if menu { "sweep-menu" } else { "sweep-banner" }})),
                 Some(format!("rl:{name}:{}", now_i64() / 3600)),
                 "rate-limit",
             )
             .await;
         }
-        if rate_limit_action() != "off" {
+        // Answer ONLY the interactive menu; the banner has no selector, and a
+        // stray Enter into a working lane injects a newline. Do NOT clear the
+        // stamp after answering: the lane is still blocked (the banner remains),
+        // and the top-of-loop clear removes it when the lane actually resumes.
+        if menu && rate_limit_action() != "off" {
             let (ok, msg) = send_keys_op(name, "Enter").await;
             tracing::warn!(session = %name, ok, detail = %msg, "swept a rate-limit menu — answered 'stop and wait'");
-            if ok {
-                update_meta(name, &[("rate_limited_since", json!(0))]);
-            }
         }
     }
     found
@@ -14907,6 +14938,40 @@ mod steer_max_age_tests {
         // Case and ANSI must not defeat it — the real pane is full of colour.
         let ansi = "\x1b[1m   What do you want to do?\x1b[0m\n ❯ 1. STOP AND WAIT FOR LIMIT TO RESET\n 2. Switch to Usage Credits";
         assert!(is_rate_limit_menu(ansi));
+    }
+
+    /// The POST-menu banner (Ethan, 2026-08-16). It must catch Claude's OWN
+    /// rate-limit banner so a still-blocked lane keeps its status, and must NOT
+    /// fire on a lane merely DISCUSSING a limit in its work. That is the ethos
+    /// rule-7 content-vs-state trap a naive fleet grep for "usage limit" fell into
+    /// on `backend`, which was working a task about "the ops key hit ITS usage
+    /// limit" (a third party), not itself limited.
+    #[test]
+    fn rate_limited_banner_catches_the_banner_not_the_conversation() {
+        // Claude's own banner (post-menu, still blocked until reset).
+        assert!(is_rate_limited_banner(
+            "Run /upgrade or /usage-credits to finish what you're working on."
+        ));
+        assert!(is_rate_limited_banner("You've reached your usage limit."));
+        assert!(is_rate_limited_banner("Weekly limit reached, resets Monday 9am."));
+        // ANSI + case must not defeat it (the real pane is full of colour).
+        assert!(is_rate_limited_banner(
+            "\x1b[33m/USAGE-CREDITS to finish\x1b[0m what you're working on"
+        ));
+
+        // THE CONTENT-VS-STATE TRAP: a lane whose WORK is about a THIRD PARTY's
+        // limit ("its", not "your") is not itself limited. This is backend's real
+        // false positive, and it is why the matcher keys on "your usage limit" and
+        // the literal slash command, never the bare words.
+        assert!(!is_rate_limited_banner(
+            "the ops Anthropic key hit its usage limit until 2026-09-01"
+        ));
+        assert!(!is_rate_limited_banner(
+            "title: [rb2b] Ops key hit its usage limit; reveal emails failing"
+        ));
+        // A normal working frame is not limited.
+        assert!(!is_rate_limited_banner("✻ Crunched for 2m 2s"));
+        assert!(!is_rate_limited_banner("❯ type a message"));
     }
 
     /// The policy is the human's, set once (D2). Default is `wait` — press 1 —

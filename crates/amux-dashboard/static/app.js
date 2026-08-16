@@ -429,6 +429,7 @@ let filterStatuses = new Set();    // 'working' | 'waiting' | 'idle' | 'stopped'
 // Stable status key for filtering: card WORKING = 'active' internally.
 function _sessStatusKey(s) {
   if (!s.running) return 'stopped';
+  if (s.status === 'rate_limited') return 'rate_limited';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
@@ -2577,6 +2578,7 @@ function updatePeekStatus() {
   // trade off, the phone wins.
   if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
+  else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
   if (s.rate_limited_until) {
@@ -7619,7 +7621,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.652';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.653';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
