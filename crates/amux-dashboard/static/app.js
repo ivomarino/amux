@@ -28017,7 +28017,7 @@ async function _reclaimLoad() {
     // Any terminal status, not just 'done'. A cancelled or interrupted scan
     // still persists the tree it built before it stopped, and gating on 'done'
     // meant the map silently never appeared for the two statuses that are most
-    // common here — the server restarts on every commit to this checkout.
+    // common here - the server restarts on every commit to this checkout.
     if (st && st !== 'running' && !_reclaimTree) _reclaimLoadTree(null);
   } catch (e) {
     const el = document.getElementById('reclaim-content');
