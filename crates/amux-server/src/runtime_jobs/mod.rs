@@ -131,7 +131,7 @@ fn per_job_disable_var(name: &str) -> String {
     format!("AMUX_{}_SECS", name.to_uppercase().replace('-', "_"))
 }
 
-/// Why this periodic job must NOT run, if it must not — the fleet-isolation
+/// Why this periodic job must NOT run, if it must not - the fleet-isolation
 /// decision (AF-69), split from the env read (`get`) so it has a negative
 /// control without touching process-global env, which cargo's parallel tests
 /// share.
@@ -141,7 +141,7 @@ fn per_job_disable_var(name: &str) -> String {
 /// them. A SECOND or TEST amux-server pointed at the production tmux socket would
 /// therefore press Enter and resize panes in the real lanes. Two switches turn a
 /// job off, both returning the exact switch string for the log and the registry:
-///   - a GLOBAL isolation switch (`AMUX_ISOLATED=1` / `AMUX_NO_FLEET=1`) — the
+///   - a GLOBAL isolation switch (`AMUX_ISOLATED=1` / `AMUX_NO_FLEET=1`) - the
 ///     one knob a dev/test server sets ONCE to opt the whole process out;
 ///   - a PER-JOB `AMUX_<NAME>_SECS=0` opt-out, to silence one loop.
 fn isolation_reason_with<F: Fn(&str) -> Option<String>>(name: &str, get: F) -> Option<String> {
@@ -173,18 +173,18 @@ where
     let name = name.into();
 
     // FLEET ISOLATION (AF-69). REGISTER FIRST, THEN decide whether to spawn the
-    // tick loop — the ordering is load-bearing. A job that returned before
+    // tick loop - the ordering is load-bearing. A job that returned before
     // registering would vanish from /api/system-jobs, turning a live
     // fleet-driving hazard into a silent skip (ethos rule 4; this is the exact
     // failure the registry's own docs cite). So a suppressed job is registered
     // inert-but-visible, marked `disabled` with the switch that stopped it, and
-    // its body NEVER runs — which is the whole point: a second/test amux-server
+    // its body NEVER runs - which is the whole point: a second/test amux-server
     // must not press Enter or resize panes in the production tmux lanes.
     if let Some(reason) = fleet_isolation_reason(&name) {
         registry::register_disabled(&name, "periodic", Some(interval), reason.clone());
         // Two-fixes rule: the NEXT time a stray/test server is pointed at the
         // prod socket, its log names every fleet-driving loop it refused to run
-        // and why — so a log sweep catches "a second server was about to drive
+        // and why - so a log sweep catches "a second server was about to drive
         // prod" without a human noticing first.
         tracing::info!(
             job = %name,
@@ -339,7 +339,7 @@ mod tests {
         );
 
         // NEGATIVE CONTROLS. A non-1 global value must NOT disable (AMUX_ISOLATED=0
-        // is "off", not "on"), and a non-0 interval must NOT disable — otherwise
+        // is "off", not "on"), and a non-0 interval must NOT disable - otherwise
         // AMUX_BOARD_DRIVE_SECS=20 would silently kill a healthy loop.
         assert_eq!(
             isolation_reason_with("pane_size", |k| (k == "AMUX_ISOLATED").then(|| "0".to_string())),
@@ -358,11 +358,11 @@ mod tests {
     /// while an un-switched job spawned the same way DOES tick (prod default
     /// unchanged). The counter is observed directly, so this asserts the loop's
     /// EFFECT, not merely that a flag was read. It also asserts the suppressed
-    /// job stays visible in the registry, marked disabled with its reason — the
+    /// job stays visible in the registry, marked disabled with its reason - the
     /// card's sharpened requirement (inert, not invisible; ethos rule 4).
     #[tokio::test]
     async fn an_isolated_periodic_job_registers_but_never_ticks() {
-        // NEGATIVE CONTROL — no switch set: the body must run.
+        // NEGATIVE CONTROL - no switch set: the body must run.
         let live_ct = Arc::new(AtomicUsize::new(0));
         let c = live_ct.clone();
         let live = spawn_periodic_every("af69-live-probe", Duration::from_millis(20), move || {
@@ -397,7 +397,7 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(120)).await;
 
-        // (1) The body did NOT run — the whole safety guarantee.
+        // (1) The body did NOT run - the whole safety guarantee.
         assert_eq!(
             iso_ct.load(Ordering::SeqCst),
             0,
@@ -405,7 +405,7 @@ mod tests {
         );
 
         // (2) It is STILL registered and visible, marked disabled with its
-        // reason — a suppressed fleet hazard must be inert, not invisible.
+        // reason - a suppressed fleet hazard must be inert, not invisible.
         let row = registry::snapshot()
             .into_iter()
             .find(|s| s.id == name)
