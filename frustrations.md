@@ -1897,7 +1897,7 @@ FIX: Match on the cargo-provided fact rather than the path spelling — `OUT_DIR
 ## Two alerts tests pass alone and fail together — a process-global HOME race
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-10
 SESSION: autofix (subagent)
 CARD: AF-72
@@ -1910,9 +1910,20 @@ COST: Two of the three red tests in my first full run were not mine; separating 
   my own work took a serial re-run plus a per-test run to confirm. I then hit the SAME
   class twice in my own new tests within the hour (one set `AMUX_AUTOFIX_WINDOW_H`, one
   set `AMUX_HOME`) — which is the argument that this is a pattern, not an accident.
-FIX: A shared `static ENV_LOCK: Mutex<()>` that every env-mutating test takes, or pass the
-  home in as an argument. Anything a test writes to the process environment is shared
-  state with every other test in the binary.
+FIX: ALREADY IMPLEMENTED — verified by amux-frustrations 2026-08-16, and it is the exact
+  remedy this entry proposed. `test_env::set_home` (api/settings.rs:574) acquires a static
+  `LOCK` and holds the `MutexGuard` inside the returned `HomeGuard`, so the override is
+  released only when the guard drops. Every caller is serialized WITHOUT needing to
+  remember a convention — the honest path is the only path.
+  Evidence: both named tests exist, both call `test_env::set_home`, and the exact failing
+  pair (`owner_alert_full_send_shape_channels_and_ledger` +
+  `owner_alert_60s_dedupe_and_ledger_visibility`) passes 3/3 consecutive parallel runs;
+  all 16 `api::alerts::` tests pass together at default thread count; the full suite is
+  1022 passed / 0 failed.
+  NOTE for whoever validates: the guard predates this entry (it landed with 8cc5391), so
+  either the race was a different env key than AMUX_HOME, or these tests did not take the
+  guard yet on 2026-08-10. Either way the shape the entry asks for is present and holding
+  today. Awaiting the originating session's sign-off — see the SESSION caveat below.
 
 ## A correct refusal shipped as HTTP 500 for months, and poisoned the error sweep
 AREA: instruments
