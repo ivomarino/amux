@@ -494,13 +494,44 @@ function _peekKickFast() {
   if (peekSession && !document.hidden) _schedulePeekPoll();
 }
 let _peekPollGen = 0;
+// Raw timer clear, used on every reschedule, so it must stay beacon-free.
 function _stopPeekPoll() { _peekPollGen++; if (peekTimer) { clearTimeout(peekTimer); peekTimer = null; } }
+// Open-view poller lifecycle beacon (AMUX-3242, two-fixes rule): a leaked or
+// wedged open-view poller must be visible in /api/client-debug rather than
+// silent. We beacon only the real transitions (start / stop with target
+// session), NOT the per-tick reschedule, so a stuck poller shows a 'start' with
+// no matching 'stop'. _peekPollActive tracks the transition; _peekPollSession
+// remembers the target so a 'stop' after peekSession was cleared still names it.
+let _peekPollActive = false;
+let _peekPollSession = null;
+function _peekPollBeacon(action, session, extra) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify(Object.assign({ kind: 'peek-poll', action, session: session || null,
+        ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?'), hidden: document.hidden ? 1 : 0 }, extra || {}))
+    }).catch(() => {});
+  } catch (e) {}
+}
+// Lifecycle STOP: the poller truly winds down (view closed, switched, or the tab
+// backgrounded). Distinct from the per-tick _stopPeekPoll() above; this is the
+// one that beacons, so start/stop pair up.
+function _peekPollStop(reason) {
+  _stopPeekPoll();
+  if (_peekPollActive) { _peekPollBeacon('stop', _peekPollSession, { reason: reason || 'stop' }); _peekPollActive = false; _peekPollSession = null; }
+}
 let _peekLastFullMs = 0;    // when the FULL payload (history) was last fetched
 let _peekPrevStatus = '';   // peeked session's status on the previous poll tick
 const _PEEK_HISTORY_REFRESH_MS = 30000;  // fallback full-refresh cadence while open
 function _schedulePeekPoll() {
   _stopPeekPoll();
-  if (!peekSession || document.hidden) return;
+  if (!peekSession || document.hidden) {
+    // Winding down (no open peek, or tab backgrounded): close out the lifecycle
+    // so the start/stop beacons pair up.
+    if (_peekPollActive) { _peekPollBeacon('stop', _peekPollSession, { reason: document.hidden ? 'hidden' : 'no-session' }); _peekPollActive = false; _peekPollSession = null; }
+    return;
+  }
+  if (!_peekPollActive) { _peekPollActive = true; _peekPollSession = peekSession; _peekPollBeacon('start', peekSession, { interval_ms: _peekPollInterval() }); }
   const gen = _peekPollGen;
   peekTimer = setTimeout(async () => {
     peekTimer = null;
@@ -513,6 +544,11 @@ function _schedulePeekPoll() {
       const needFull = turnEnded || (performance.now() - _peekLastFullMs > _PEEK_HISTORY_REFRESH_MS);
       await refreshPeek(!needFull);
       _peekUpdateBranch();
+      // Keep the open view's STATUS indicator live too, not just the log. The
+      // session status arrives via the sessions array (SSE or the polling
+      // fallback); refreshPeek repaints the log, this repaints the badge, so a
+      // flip to "needs input" shows without closing and reopening the view.
+      if (typeof updatePeekStatus === 'function') updatePeekStatus();
     } catch(e) {}
     if (gen !== _peekPollGen) return;
     _schedulePeekPoll();
@@ -7667,7 +7703,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.660';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.661';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7864,7 +7900,7 @@ function _paintCachedPeek(cached) {
 }
 function openPeek(name, opts) {
   try { _applyPeekTabVisibility(); } catch(e) {}
-  _stopPeekPoll();
+  _peekPollStop('switch');   // wind down any prior open-view poller (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   const _tb = document.getElementById('peek-transcript-body');
   if (_tb) { _tb.innerHTML = ''; _tb._lastHTML = null; }
@@ -8135,7 +8171,7 @@ function closePeek() {
     document.body.style.width = '';
     window.scrollTo(0, _peekScrollLockY || 0);
   }
-  _stopPeekPoll();
+  _peekPollStop('close');   // open-view poller stops when the view closes (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   sessionStorage.removeItem('peekState');
 }
@@ -14876,12 +14912,12 @@ function _feBuildRow(entry, parentPath, depth, q) {
     // Folders open on a single click on every device (fast, and mobile-friendly).
     row.onclick = () => loadFiles(entryPath);
   } else if (_feTouchDevice()) {
-    // Touch: a single tap opens the file — mobile-first, no hover or double-tap.
+    // Touch: a single tap opens the file. Mobile-first, no hover or double-tap.
     row.onclick = () => openFilePreview(entryPath);
   } else {
     // Desktop pointer: single click selects the row, double-click opens it in the
     // existing viewer, matching a familiar OS file manager. openFilePreview is
-    // unchanged — this only changes what gesture triggers it.
+    // unchanged; this only changes what gesture triggers it.
     row.title = 'Double-click to open';
     row.onclick = () => _feSelectRow(row);
     row.ondblclick = () => openFilePreview(entryPath);
@@ -24627,6 +24663,20 @@ function connectSSE() {
           try { localStorage.setItem('amux_sessions_cache', j); }
           catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
           render();
+          // Keep an OPEN peek/worker view live on a session event, not only the
+          // card/list. render() above refreshed the list; the open detail view
+          // has its own status badge and terminal log, so a status flip (e.g. to
+          // "needs input") must repaint here and the log must refetch now rather
+          // than wait for the next poll tick. The refetch is a cheap 304 when the
+          // peeked frame is unchanged; the while-open poll still carries the
+          // continuous mid-turn stream that SSE-on-change alone would miss.
+          try {
+            const _pov = document.getElementById('peek-overlay');
+            if (typeof peekSession !== 'undefined' && peekSession && _pov && _pov.classList.contains('active')) {
+              if (typeof updatePeekStatus === 'function') updatePeekStatus();
+              if (!document.hidden && typeof refreshPeek === 'function') refreshPeek();
+            }
+          } catch (ePk) {}
           // If workspace is open but no panes were restored yet (e.g. sessions
           // cache was empty on startup), retry restoration now that we have data.
           if (firstLoad && _grid && Object.keys(_gridPanes).length === 0) {
@@ -24762,9 +24812,11 @@ function _resyncEverything() {
   _runDeltaSync();
 }
 function _onClientResume(reason) {
-  if (document.hidden) { _stopPeekPoll(); return; }   // tab backgrounded → pause peek polling
-  // Resume adaptive peek polling if we're on a peek and it was paused while hidden.
-  if (peekSession && !peekTimer) { refreshPeek(); _schedulePeekPoll(); }
+  if (document.hidden) { _peekPollStop('hidden'); return; }   // tab backgrounded → pause the open-view poller (beaconed)
+  // Resume the open-view poller if we're on a peek and it was paused while
+  // hidden; also refetch the log and repaint the status badge so a tab that
+  // comes back to the foreground is instantly current (visibility/pageshow/focus/online).
+  if (peekSession && !peekTimer) { refreshPeek(); if (typeof updatePeekStatus === 'function') updatePeekStatus(); _schedulePeekPoll(); }
   if (window._peekEmbed) { refreshPeek(); return; }
   // Always pull fresh state — cheap and the user expects up-to-date data.
   if (_lastDataTime && Date.now() - _lastDataTime > _SSE_REFRESH_MS) {
@@ -27962,7 +28014,11 @@ async function _reclaimLoad() {
     const st = scan?.scan?.status;
     if (st === 'running' && !_reclaimTimer) _reclaimTimer = setInterval(_reclaimPoll, 1500);
     if (st !== 'running') _reclaimStopPolling();
-    if (st === 'done' && !_reclaimTree) _reclaimLoadTree(null);
+    // Any terminal status, not just 'done'. A cancelled or interrupted scan
+    // still persists the tree it built before it stopped, and gating on 'done'
+    // meant the map silently never appeared for the two statuses that are most
+    // common here — the server restarts on every commit to this checkout.
+    if (st && st !== 'running' && !_reclaimTree) _reclaimLoadTree(null);
   } catch (e) {
     const el = document.getElementById('reclaim-content');
     if (el) el.innerHTML = '<div style="color:var(--red);padding:20px;">Could not load reclaim data: ' + esc(String(e)) + '</div>';
