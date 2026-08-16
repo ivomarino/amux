@@ -1837,7 +1837,7 @@ SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-10
 SESSION: autofix (subagent)
-CARD: none — needs filing; see the autofix handoff report
+CARD: AF-69
 SYMPTOM: Started an isolated server (`AMUX_HOME=/tmp/amux-af-home`, port 8899, own DB) to
   verify a change without touching the fleet. Within 4 seconds its log showed:
     pane-size: restoring detached window ... session=amux-amux from=220x50 to=220x50
@@ -1862,7 +1862,7 @@ SEVERITY: annoys
 STATUS: open
 DATE: 2026-08-10
 SESSION: autofix (subagent)
-CARD: none — needs filing; owner is whoever owns api/request_log.rs
+CARD: AF-70
 SYMPTOM: `/api/debug/board-drive` is mounted (api/mod.rs merges `board_drive::routes()`)
   and answers, but it is absent from `ROUTE_TABLE`, so `/api/debug/routes` — the
   instrument CLAUDE.md tells you to consult INSTEAD of grepping — does not list it. I hit
@@ -1881,7 +1881,7 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-10
 SESSION: autofix (subagent)
-CARD: none — needs filing
+CARD: AF-71
 SYMPTOM: `db::migrate::guard_tests::it_actually_refuses_a_pending_migration_against_the_live_db`
   panics with "precondition: the test binary should live under a cargo target dir, got
   /tmp/amux-autofix-target/debug/deps/amux_server-...". `is_cargo_target_build` requires
@@ -1900,7 +1900,7 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-10
 SESSION: autofix (subagent)
-CARD: none — needs filing
+CARD: AF-72
 SYMPTOM: `cargo test -p amux-server` failed `api::alerts::tests::owner_alert_full_send_shape_channels_and_ledger`
   (channels came back `{"sms":"imessage"}` instead of `{"push":"sent","sms":"imessage"}`)
   and `..._60s_dedupe_and_ledger_visibility`. Both pass with `--test-threads=1`. They use
