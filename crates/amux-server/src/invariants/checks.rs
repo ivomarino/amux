@@ -1309,8 +1309,8 @@ pub fn alert_channel_can_deliver(s: &AlertChannelState) -> Vec<InvariantResult> 
     };
     let email_state = match (s.email_enabled, s.email_reachable) {
         (false, _) => "disabled (AMUX_URGENT_EMAIL=0)".to_string(),
-        (true, false) => "enabled but no AMUX_OWNER_EMAIL and no connected Gmail account".to_string(),
-        (true, true) => "enabled, owner email or connected Gmail account present".to_string(),
+        (true, false) => "enabled but no connected Gmail account with a fresh token (a stale refresh_token fails invalid_grant, amux-cloud 2026-08-16)".to_string(),
+        (true, true) => "enabled, a connected Gmail account with a fresh token".to_string(),
     };
     let evidence = json!({
         "class": "fire-alarm-reachability",

@@ -84,16 +84,25 @@ impl AlertChannels for RealChannels {
 
     async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
         let gc = crate::integrations::email::GmailClient::new_default();
-        // Send FROM a connected account; its own inbox is the default owner
-        // destination (self-send), so this needs no phone and no push
-        // subscription — the whole point of the channel.
-        let Some(from) = gc.connected_accounts().into_iter().next() else {
+        // Try connected accounts NEWEST-TOKEN-FIRST until one actually sends. A
+        // stale account whose refresh_token is dead (invalid_grant) must not
+        // silently win: during a live cloud outage the fire alarm reached NOBODY
+        // because it picked the first-ALPHABETICAL account (esteininger21@gmail.com,
+        // token dead) while ethan@mixpeek.com was fresh and sending fine moments
+        // later (amux-cloud, 2026-08-16). Trying each in turn means the alarm
+        // delivers if ANY connected account can, not just if the first one can.
+        let accounts = crate::integrations::email::connected_accounts_by_freshness_in(gc.home());
+        if accounts.is_empty() {
             return (false, "no connected Gmail account to send from".into());
-        };
-        match gc.compose_send(&from, to, subject, body, "", "", "", "", true).await {
-            Ok(_) => (true, format!("email via {from}")),
-            Err(e) => (false, format!("email error: {}", truncate(&e, 100))),
         }
+        let mut last_err = String::new();
+        for from in &accounts {
+            match gc.compose_send(from, to, subject, body, "", "", "", "", true).await {
+                Ok(_) => return (true, format!("email via {from}")),
+                Err(e) => last_err = format!("email error via {from}: {}", truncate(&e, 80)),
+            }
+        }
+        (false, if last_err.is_empty() { "email send failed".into() } else { last_err })
     }
 }
 
@@ -645,7 +654,7 @@ async fn post_owner(
     let email_enabled = effective_env(&home, "AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
     let owner_email = effective_env(&home, "AMUX_OWNER_EMAIL")
         .filter(|e| !e.trim().is_empty())
-        .or_else(|| crate::integrations::email::connected_accounts_in(&home).into_iter().next());
+        .or_else(|| crate::integrations::email::connected_accounts_by_freshness_in(&home).into_iter().next());
     if !email_enabled {
         out_channels.insert("email".into(), json!("disabled (AMUX_URGENT_EMAIL=0)"));
     } else if owner_email.is_none() {

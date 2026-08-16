@@ -177,10 +177,21 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
     let sms_enabled = ev("AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0";
     let phone_configured = !ev("AMUX_OWNER_PHONE").unwrap_or_default().trim().is_empty();
     let email_enabled = ev("AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
-    // Reachable when an owner email is set OR any Gmail account is connected (its
-    // own inbox is the default destination). Same resolution the sender uses.
-    let email_reachable = !ev("AMUX_OWNER_EMAIL").unwrap_or_default().trim().is_empty()
-        || !crate::integrations::email::connected_accounts_in(&home).is_empty();
+    // Reachable only if a connected Gmail account has a plausibly-LIVE token. "An
+    // account exists" is NOT enough: the alarm reached nobody during a cloud outage
+    // because the selected account's refresh_token was dead (invalid_grant) while
+    // it still had a token FILE (amux-cloud, 2026-08-16). Proxy for liveness: the
+    // freshest token file was rewritten within EMAIL_TOKEN_STALE_S. An active
+    // account refreshes its token ~hourly; the incident's dead account was a month
+    // stale. It is a proxy, not a live refresh, but the sender now tries EVERY
+    // account newest-first, so actual delivery is more robust than this check.
+    const EMAIL_TOKEN_STALE_S: u64 = 14 * 24 * 3600;
+    let email_reachable = crate::integrations::email::newest_token_age_secs_in(
+        &home,
+        std::time::SystemTime::now(),
+    )
+    .map(|age| age < EMAIL_TOKEN_STALE_S)
+    .unwrap_or(false);
 
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
