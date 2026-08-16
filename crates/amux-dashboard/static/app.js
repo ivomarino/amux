@@ -4411,6 +4411,9 @@ function _orchReset() {
   _orchShowStep('record');
   _orchStatus('Tap the mic and speak a command for the fleet');
   document.getElementById('orch-mic')?.classList.remove('recording');
+  // Clear the text path's field too (AMUX-3234), so a fresh open / start-over
+  // does not carry the previous command's pasted text.
+  const typed = document.getElementById('orch-typed'); if (typed) typed.value = '';
 }
 function _orchStatus(t) { const s = document.getElementById('orch-status'); if (s) s.textContent = t; }
 function _orchToggleRec() { if (_orchRecording) _orchStopRec(false); else _orchStartRec(); }
@@ -4490,6 +4493,18 @@ async function _orchTranscribe() {
     _orchShowStep('transcript');
     if ((d.text || '').trim()) _orchPlan();   // auto-route; the transcript stays editable for a re-route
   } catch (e) { _orchStatus('Transcription failed: ' + (e.message || 'error') + ' — tap the mic to retry'); }
+}
+// Text path (AMUX-3234): route typed / pasted text through the SAME flow the
+// dictation transcript takes. It writes the text into #orch-transcript (the one
+// field _orchPlan reads) and calls _orchPlan, so amux infers the intent, finds
+// the workers, drafts the per-worker commands, and the user APPROVES before
+// anything sends. Nothing downstream changes; this is only another way in.
+function _orchTextRoute() {
+  const typed = (document.getElementById('orch-typed')?.value || '').trim();
+  if (!typed) { showToast('Type or paste a command first'); return; }
+  const el = document.getElementById('orch-transcript');
+  if (el) el.value = typed;   // the transcript stays editable for a re-route
+  _orchPlan();                // identical infer-find-draft-approve path
 }
 async function _orchPlan() {
   const transcript = (document.getElementById('orch-transcript')?.value || '').trim();
@@ -7652,7 +7667,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.658';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.659';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

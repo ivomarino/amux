@@ -1761,7 +1761,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
 <div id="orch-overlay" class="edit-overlay" onclick="if(event.target===this)_orchClose()">
   <div class="edit-box orch-box">
     <h3 style="display:flex;align-items:center;gap:8px;">&#x1F399;&#xFE0F; Orchestrate the fleet
-      <span style="font-size:0.68rem;font-weight:400;color:var(--dim);">speak once — routed to the right workers</span></h3>
+      <span style="font-size:0.68rem;font-weight:400;color:var(--dim);">speak or paste, then approve before it sends</span></h3>
 
     <!-- Step 1: record -->
     <div id="orch-step-record" class="orch-step">
@@ -1773,6 +1773,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <span class="dict-bar"></span><span class="dict-bar"></span><span class="dict-bar"></span>
       </div>
       <div id="orch-status" class="orch-status">Tap the mic and speak a command for the fleet</div>
+      <!-- Text path (AMUX-3234): type or paste instead of speaking. It feeds the
+           SAME transcript field the dictation writes, so it enters the identical
+           infer-find-draft-approve flow (amux drafts per-worker commands, you
+           review and approve before anything sends). Voice is unchanged. -->
+      <div class="orch-or" style="text-align:center;color:var(--dim);font-size:0.72rem;margin:10px 0 4px;">or type / paste a command</div>
+      <textarea id="orch-typed" class="orch-textarea" rows="3" spellcheck="true"
+        placeholder="Type or paste a command for the fleet. You will review and approve the per-worker messages before anything is sent."
+        onkeydown="if((event.metaKey||event.ctrlKey)&&event.key==='Enter'){event.preventDefault();_orchTextRoute();}"></textarea>
+      <div class="orch-actions">
+        <button class="btn primary" onclick="_orchTextRoute()">Route to workers &rarr;</button>
+      </div>
     </div>
 
     <!-- Step 2: transcript (editable) -->
