@@ -454,6 +454,7 @@ async fn async_main() {
         ),
         Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
     }
+    crate::api::reclaim::reap_orphaned_scans(&store);
     let orch_tick_secs = runtime.tick_secs.max(1);
     jobs::spawn_loop(jobs::ids::ORCH_RUNTIME, Some(secs(orch_tick_secs)), runtime.clone().run());
 

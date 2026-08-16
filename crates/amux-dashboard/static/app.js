@@ -14198,6 +14198,9 @@ async function openFilePreview(path) {
   _fileData = null;
   _fileViewMode = 'preview';
   document.getElementById('file-title').textContent = path.split('/').pop();
+  // Title bar shows the file name plus the folder it lives in, like a file manager.
+  const _subEl = document.getElementById('file-subpath');
+  if (_subEl) { const _dir = path.slice(0, path.lastIndexOf('/')) || '/'; _subEl.textContent = _dir; _subEl.title = path; }
   document.getElementById('file-body').className = 'file-overlay-body';
   document.getElementById('file-body').textContent = 'Loading...';
   document.getElementById('file-view-tabs').style.display = 'none';
@@ -14403,6 +14406,10 @@ function _filesUpdateSortHeaders() {
   });
 }
 
+// Recognizable file-type icon chosen by extension (folder, code, data, image,
+// markdown, text, archive, document, generic). Each non-folder type keeps the
+// same page outline but carries a small category glyph so the kind is readable
+// at a glance the way it is in a desktop file manager.
 function _fileTypeIcon(name, type) {
   if (type === 'dir') {
     return `<svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M1 4.5A1.5 1.5 0 0 1 2.5 3h3.172a1 1 0 0 1 .707.293L7.5 4.5H13.5A1.5 1.5 0 0 1 15 6v6a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12V4.5Z" fill="#E8A020"/></svg>`;
@@ -14411,17 +14418,34 @@ function _fileTypeIcon(name, type) {
   const CODE = new Set(['js','ts','jsx','tsx','py','go','rs','java','c','cpp','h','cs','rb','php','swift','sh','bash','zsh','fish']);
   const DATA = new Set(['json','yaml','yml','toml','xml','csv','sql','graphql']);
   const IMG  = new Set(['png','jpg','jpeg','gif','svg','webp','ico','bmp','avif']);
-  const DOC  = new Set(['md','txt','rst','log','env']);
+  const MD   = new Set(['md','markdown','mdx','rst']);
+  const TEXT = new Set(['txt','log','env','ini','cfg','conf']);
   const ARCH = new Set(['zip','tar','gz','bz2','xz','7z','rar']);
-  const PDF  = new Set(['pdf','doc','docx','xls','xlsx','ppt','pptx']);
-  let color = '#8b949e', opacity = '0.5';
-  if (CODE.has(ext))  { color = '#58a6ff'; opacity = '0.85'; }
-  else if (DATA.has(ext)) { color = '#3fb950'; opacity = '0.85'; }
-  else if (IMG.has(ext))  { color = '#a78bfa'; opacity = '0.85'; }
-  else if (DOC.has(ext))  { color = '#ffa657'; opacity = '0.85'; }
-  else if (ARCH.has(ext)) { color = '#ff7b72'; opacity = '0.85'; }
-  else if (PDF.has(ext))  { color = '#f85149'; opacity = '0.85'; }
-  return `<svg width="13" height="15" viewBox="0 0 13 15" fill="none"><path d="M1 1h7.5L12 4.5V14H1V1Z" fill="${color}" opacity="0.18"/><path d="M1 1h7.5L12 4.5V14H1V1Z" stroke="${color}" stroke-width="1" opacity="${opacity}"/><path d="M8 1v4h4" stroke="${color}" stroke-width="1" fill="none" opacity="${opacity}"/></svg>`;
+  const DOC  = new Set(['pdf','doc','docx','xls','xlsx','ppt','pptx']);
+  let color = '#8b949e', opacity = '0.55', glyph = '';
+  if (CODE.has(ext)) {
+    color = '#58a6ff'; opacity = '0.85';
+    glyph = `<path d="M4.7 8 3.4 9.4l1.3 1.4M8.3 8l1.3 1.4-1.3 1.4M7 7.7 6.1 11.1" stroke="${color}" stroke-width="0.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+  } else if (DATA.has(ext)) {
+    color = '#3fb950'; opacity = '0.85';
+    glyph = `<path d="M3.7 8.3h2.1M3.7 9.8h2.1M3.7 11.3h1.3" stroke="${color}" stroke-width="0.9" stroke-linecap="round" fill="none"/><circle cx="8.4" cy="8.3" r="0.6" fill="${color}"/><circle cx="8.4" cy="9.8" r="0.6" fill="${color}"/>`;
+  } else if (IMG.has(ext)) {
+    color = '#a78bfa'; opacity = '0.85';
+    glyph = `<circle cx="4.8" cy="8" r="0.9" fill="${color}"/><path d="M3.3 11.6 5.5 9.2l1.3 1.2 1.5-1.8 1.4 2.2" stroke="${color}" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+  } else if (MD.has(ext)) {
+    color = '#ffa657'; opacity = '0.85';
+    glyph = `<path d="M3.7 11.2V8.2L5 9.8 6.3 8.2V11.2" stroke="${color}" stroke-width="0.95" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M8.2 8.2v2.2M7.5 9.6l.7.8.7-.8" stroke="${color}" stroke-width="0.95" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+  } else if (TEXT.has(ext)) {
+    color = '#c9d1d9'; opacity = '0.7';
+    glyph = `<path d="M3.6 8h5.2M3.6 9.6h5.2M3.6 11.2h3.4" stroke="${color}" stroke-width="0.9" stroke-linecap="round" fill="none"/>`;
+  } else if (ARCH.has(ext)) {
+    color = '#ff7b72'; opacity = '0.85';
+    glyph = `<path d="M6.5 5.5v6" stroke="${color}" stroke-width="0.9" stroke-dasharray="1.1 1"/><rect x="5.6" y="9.2" width="1.8" height="2.3" rx="0.3" stroke="${color}" stroke-width="0.9" fill="none"/>`;
+  } else if (DOC.has(ext)) {
+    color = '#f85149'; opacity = '0.85';
+    glyph = `<path d="M3.6 8.4h5M3.6 10h5M3.6 11.6h3" stroke="${color}" stroke-width="0.9" stroke-linecap="round" fill="none"/>`;
+  }
+  return `<svg width="13" height="15" viewBox="0 0 13 15" fill="none"><path d="M1 1h7.5L12 4.5V14H1V1Z" fill="${color}" opacity="0.16"/><path d="M1 1h7.5L12 4.5V14H1V1Z" stroke="${color}" stroke-width="1" opacity="${opacity}"/><path d="M8 1v4h4" stroke="${color}" stroke-width="1" fill="none" opacity="${opacity}"/>${glyph}</svg>`;
 }
 // ═══════ FILES TAB (inline directory browser) ═══════
 let _filesPath = '/';
@@ -14848,8 +14872,39 @@ function _feBuildRow(entry, parentPath, depth, q) {
     `<div class="fe-cell-size">${sizeStr}</div>` +
     `<div class="fe-cell-date">${dateStr}</div>` +
     `<div class="fe-cell-actions"><button class="fe-menu-btn" title="Options" onclick="event.stopPropagation();_showFilesMenu('${ep}',this,'${entry.type}')">⋯</button></div>`;
-  row.onclick = entry.type === 'dir' ? () => loadFiles(entryPath) : () => openFilePreview(entryPath);
+  if (entry.type === 'dir') {
+    // Folders open on a single click on every device (fast, and mobile-friendly).
+    row.onclick = () => loadFiles(entryPath);
+  } else if (_feTouchDevice()) {
+    // Touch: a single tap opens the file — mobile-first, no hover or double-tap.
+    row.onclick = () => openFilePreview(entryPath);
+  } else {
+    // Desktop pointer: single click selects the row, double-click opens it in the
+    // existing viewer, matching a familiar OS file manager. openFilePreview is
+    // unchanged — this only changes what gesture triggers it.
+    row.title = 'Double-click to open';
+    row.onclick = () => _feSelectRow(row);
+    row.ondblclick = () => openFilePreview(entryPath);
+  }
   return row;
+}
+// True on touch devices (no fine pointer / no hover), where a single tap must
+// keep opening files. On desktop we use single-click-to-select, double-click-to-open.
+function _feTouchDevice() {
+  return !!(window.matchMedia && window.matchMedia('(hover: none), (pointer: coarse)').matches);
+}
+// Single-selection highlight for the file list (desktop). Clears any prior
+// selection so exactly one row is highlighted, like a desktop file manager.
+function _feSelectRow(row) {
+  const body = document.getElementById('files-body');
+  if (body) body.querySelectorAll('.fe-row.fe-selected').forEach(r => r.classList.remove('fe-selected'));
+  row.classList.add('fe-selected');
+}
+// Navigate to the parent of the current Files-tab folder (the "Up" action).
+function _filesUp() {
+  const p = (_filesPath || '/').replace(/\/+$/, '');
+  const i = p.lastIndexOf('/');
+  loadFiles(i > 0 ? p.slice(0, i) : '/');
 }
 // Toggle a folder's inline expansion (accordion). Inserts/removes the folder's
 // child rows right after it, without navigating into the folder.
@@ -28131,6 +28186,20 @@ function _reclaimRender() {
           ${(scan.dirs_walked||0).toLocaleString()} folders · ${(scan.files_walked||0).toLocaleString()} files · ${_fmtBytes(scan.bytes_seen)} seen
         </div>
         <div class="reclaim-curpath">${esc(scan.current_path || '')}</div>
+      </div>
+    </div>`;
+  }
+
+  // An interrupted scan must say so. The server restarts on every commit to
+  // the shared checkout, so a scan dying mid-walk is common, and a UI that
+  // kept spinning would read as "still working" forever.
+  if (scan.status === 'interrupted' || (scan.status === 'cancelled' && scan.error)) {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">Scan did not finish</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        ${esc(scan.error || 'The scan was cancelled.')}
+        Results below are partial: ${(scan.dirs_walked||0).toLocaleString()} folders were walked before it stopped.
+        Run it again to get a complete picture.
       </div>
     </div>`;
   }

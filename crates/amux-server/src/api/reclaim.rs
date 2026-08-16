@@ -56,6 +56,38 @@ pub fn routes() -> Router<AppState> {
         .route("/snapshots", axum::routing::get(list_snapshots))
 }
 
+/// Mark scans left `running` by a previous process as interrupted.
+///
+/// A scan lives on a plain thread, so it dies with the process. On this repo
+/// the builder restarts the server whenever ANYONE commits to the shared
+/// checkout, so a scan being killed mid-walk is the common case, not an edge
+/// one — during development three consecutive scans were orphaned this way by
+/// the author's own deploys.
+///
+/// Without this, the row keeps claiming `running` forever: the dashboard spins
+/// on a scan that has no thread, and the "one scan at a time" guard refuses
+/// every future scan with 409. Silence would read as work in progress, which
+/// is the failure ethos rule 4 is about — so the row is reaped AND says why.
+pub(crate) fn reap_orphaned_scans(store: &crate::db::SharedStore) {
+    let res = store.write(|c| {
+        let n = c.execute(
+            "UPDATE reclaim_scans
+                SET status='interrupted', finished_at=?1, current_path=NULL,
+                    error='server restarted mid-scan; the scan thread did not survive'
+              WHERE status='running'",
+            rusqlite::params![now_secs()],
+        )?;
+        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+    });
+    match res {
+        Ok(r) if r.applied => {
+            tracing::warn!("reaped reclaim scan(s) orphaned by a server restart")
+        }
+        Ok(_) => {}
+        Err(e) => tracing::error!(error = %e, "failed to reap orphaned reclaim scans"),
+    }
+}
+
 // ── cancellation registry ────────────────────────────────────────────────────
 
 fn cancel_registry() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
@@ -342,7 +374,20 @@ struct Finding {
 /// at build/cache directories: their total is recorded as one finding and the
 /// walker does not descend, which is both faster and the right granularity —
 /// nobody wants 40,000 individual `node_modules` files listed.
-fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u64, &FsPath)) -> WalkOut {
+/// Progress + flush callback: (dirs, files, bytes, current path, pending findings).
+type ProgressFn<'a> = dyn FnMut(u64, u64, u64, &FsPath, &mut Vec<Finding>) + 'a;
+
+/// `progress` is also the FLUSH point: it drains the findings accumulated so
+/// far. Findings are independent per-path facts, complete the moment they are
+/// discovered, so there is no reason to hold them until the end — and every
+/// reason not to, since a scan killed at minute 19 of 20 would otherwise
+/// persist nothing at all. (Tree rollups genuinely cannot be flushed early:
+/// an ancestor's total is not known until its last descendant is walked.)
+fn walk(
+    cfg: &ScanCfg,
+    cancel: &AtomicBool,
+    progress: &mut ProgressFn<'_>,
+) -> WalkOut {
     set_background_io();
 
     let mut out = WalkOut {
@@ -386,7 +431,7 @@ fn walk(cfg: &ScanCfg, cancel: &AtomicBool, progress: &mut dyn FnMut(u64, u64, u
                 // Cheap politeness on a loaded box: the throttled I/O policy
                 // handles disk, this keeps us off a core.
                 std::thread::sleep(std::time::Duration::from_millis(1));
-                progress(out.dirs, out.files, out.bytes, &dir);
+                progress(out.dirs, out.files, out.bytes, &dir, &mut out.findings);
             }
 
             let entries = match std::fs::read_dir(&dir) {
@@ -763,33 +808,61 @@ fn shellexpand_home(s: &str) -> String {
     }
 }
 
+/// One insert path, used by both the incremental flush and the final write, so
+/// a column added in one place can never be silently missing from the other.
+fn insert_finding(c: &rusqlite::Connection, scan_id: &str, f: &Finding) -> rusqlite::Result<()> {
+    c.execute(
+        "INSERT OR REPLACE INTO reclaim_findings
+           (scan_id, category, path, bytes, file_count, mtime, regenerable, detail)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
+        rusqlite::params![
+            scan_id,
+            f.category,
+            f.path.to_string_lossy(),
+            f.bytes as i64,
+            f.file_count as i64,
+            f.mtime,
+            f.regenerable as i64,
+            f.detail
+        ],
+    )?;
+    Ok(())
+}
+
 fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel: Arc<AtomicBool>) {
     let t0 = std::time::Instant::now();
     let mut last_flush = std::time::Instant::now();
     let sid_p = scan_id.clone();
     let store_p = store.clone();
 
+    let mut flushed_findings = 0usize;
     let out = {
-        let mut progress = |dirs: u64, files: u64, bytes: u64, cur: &FsPath| {
-            if last_flush.elapsed() < std::time::Duration::from_millis(700) {
-                return;
-            }
-            last_flush = std::time::Instant::now();
-            let (sid, cur) = (sid_p.clone(), cur.to_string_lossy().into_owned());
-            let _ = store_p.write(move |c| {
-                c.execute(
-                    "UPDATE reclaim_scans SET dirs_walked=?2, files_walked=?3, bytes_seen=?4, current_path=?5 WHERE id=?1",
-                    rusqlite::params![sid, dirs as i64, files as i64, bytes as i64, cur],
-                )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
-            });
-        };
+        let mut progress =
+            |dirs: u64, files: u64, bytes: u64, cur: &FsPath, pending: &mut Vec<Finding>| {
+                if last_flush.elapsed() < std::time::Duration::from_millis(700) {
+                    return;
+                }
+                last_flush = std::time::Instant::now();
+                let (sid, cur) = (sid_p.clone(), cur.to_string_lossy().into_owned());
+                let batch: Vec<Finding> = std::mem::take(pending);
+                flushed_findings += batch.len();
+                let _ = store_p.write(move |c| {
+                    c.execute(
+                        "UPDATE reclaim_scans SET dirs_walked=?2, files_walked=?3, bytes_seen=?4, current_path=?5 WHERE id=?1",
+                        rusqlite::params![sid, dirs as i64, files as i64, bytes as i64, cur],
+                    )?;
+                    for f in &batch {
+                        insert_finding(c, &sid, f)?;
+                    }
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                });
+            };
         walk(&cfg, &cancel, &mut progress)
     };
 
     let cancelled = cancel.load(Ordering::Relaxed);
     let elapsed = t0.elapsed().as_secs_f64();
-    let n_find = out.findings.len();
+    let n_find = flushed_findings + out.findings.len();
     let n_tree = out.tree.len();
 
     // Snapshot-held space as a first-class finding. Without this the UI shows
@@ -802,21 +875,7 @@ fn run_scan(store: crate::db::SharedStore, scan_id: String, cfg: ScanCfg, cancel
     let finished = now_secs();
     let res = store.write(move |c| {
         for f in &out.findings {
-            c.execute(
-                "INSERT OR REPLACE INTO reclaim_findings
-                   (scan_id, category, path, bytes, file_count, mtime, regenerable, detail)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8)",
-                rusqlite::params![
-                    sid,
-                    f.category,
-                    f.path.to_string_lossy(),
-                    f.bytes as i64,
-                    f.file_count as i64,
-                    f.mtime,
-                    f.regenerable as i64,
-                    f.detail
-                ],
-            )?;
+            insert_finding(c, &sid, f)?;
         }
         if !snaps.is_empty() {
             c.execute(
