@@ -118,7 +118,10 @@ async fn boundary_routes_proxied_to_python_native_stays_native() {
         .collect();
     assert_eq!(
         keys,
-        vec!["memory", "rules", "env", "gates", "skin", "status_mode"],
+        // `connectors` is the 7th, added intentionally (df798ca): a connector is
+        // a scopable capability, not a new subsystem (docs/design/connectors.md).
+        // Publication order is SCOPE_CAPS order, so it follows status_mode.
+        vec!["memory", "rules", "env", "gates", "skin", "status_mode", "connectors"],
         "the scope contract's capabilities, in publication order: {body}"
     );
     // The hermetic fleet (w1: alpha, beta) shows through the global read.
