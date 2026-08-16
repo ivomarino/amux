@@ -1811,7 +1811,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button type="button" id="create-provider-claude" class="btn provider-btn selected" onclick="_selectProvider('claude')">Claude Code</button>
         <button type="button" id="create-provider-codex" class="btn provider-btn" onclick="_selectProvider('codex')">Codex</button>
         <button type="button" id="create-provider-gemini" class="btn provider-btn" onclick="_selectProvider('gemini')">Gemini</button>
+        <button type="button" id="create-provider-ollama" class="btn provider-btn" onclick="_selectProvider('ollama')">Ollama</button>
       </div>
+    </div>
+    <!-- Local model: only for Ollama, and populated from the machine's own
+         `ollama list` via /api/ollama/models. Hidden for every other provider
+         because they pin their model through CC_FLAGS elsewhere. -->
+    <div class="field-group" id="create-localmodel-field" style="display:none;">
+      <label class="field-label">Local model</label>
+      <select id="create-localmodel"></select>
+      <div id="create-localmodel-hint" style="font-size:0.72rem;color:var(--dim);margin-top:4px;"></div>
     </div>
     <div class="field-group">
       <label class="field-label">Working directory</label>

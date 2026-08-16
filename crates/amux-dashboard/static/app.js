@@ -7619,7 +7619,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.649';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.650';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15768,11 +15768,60 @@ let _createBranchEdited = false;  // track if user manually changed branch name
 let _createDirIsGit = false;     // track if current dir is a git repo
 
 let _createProvider = 'claude';
+
+// Populate the New-worker local-model picker from the machine's own Ollama.
+//
+// SAY WHICH EMPTY IT IS. "No models" and "cannot reach Ollama" need different
+// actions from the user — one is `ollama pull`, the other is `ollama serve` —
+// and collapsing them into one blank dropdown is the unactionable-message bug
+// this dashboard keeps producing (AMUX-43). The hint line carries the remedy.
+async function _loadLocalModels() {
+  const sel = document.getElementById('create-localmodel');
+  const hint = document.getElementById('create-localmodel-hint');
+  if (!sel) return;
+  sel.innerHTML = '<option value="">Loading local models…</option>';
+  if (hint) hint.textContent = '';
+  let d;
+  try {
+    const r = await fetch(API + '/api/ollama/models', { headers: _authHeaders() });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    d = await r.json();
+  } catch (e) {
+    sel.innerHTML = '<option value="">Could not reach Ollama</option>';
+    if (hint) hint.textContent = 'Is Ollama running? Start it with: ollama serve';
+    return;
+  }
+  const models = d.models || [];
+  sel.innerHTML = '';
+  if (!models.length) {
+    const o = document.createElement('option');
+    o.value = ''; o.textContent = 'No local models installed';
+    sel.appendChild(o);
+    if (hint) hint.textContent = 'Ollama is running but has no models. Pull one, e.g: ollama pull qwen3-coder:30b';
+    return;
+  }
+  models.forEach(name => {
+    const o = document.createElement('option');
+    o.value = name; o.textContent = name;
+    sel.appendChild(o);
+  });
+  if (hint) hint.textContent = models.length + ' local model' + (models.length === 1 ? '' : 's') + ' available';
+}
+
 function _selectProvider(p) {
   _createProvider = p;
   document.getElementById('create-provider-claude').classList.toggle('selected', p === 'claude');
   document.getElementById('create-provider-codex').classList.toggle('selected', p === 'codex');
   document.getElementById('create-provider-gemini').classList.toggle('selected', p === 'gemini');
+  const ollamaBtn = document.getElementById('create-provider-ollama');
+  if (ollamaBtn) ollamaBtn.classList.toggle('selected', p === 'ollama');
+  // Local model picker: Ollama only. Loaded on selection rather than on dialog
+  // open so a machine with no Ollama pays nothing for a provider it will not use.
+  const lmField = document.getElementById('create-localmodel-field');
+  if (lmField) {
+    lmField.style.display = p === 'ollama' ? '' : 'none';
+    if (p === 'ollama') _loadLocalModels();
+  }
   // Hide branch/template/session-name options for non-Claude providers since they use different mechanics
   const isClaude = p === 'claude';
   document.getElementById('create-branch-enabled').closest('.field-group').style.display = isClaude ? '' : 'none';
@@ -15781,6 +15830,10 @@ function _selectProvider(p) {
 }
 function openCreate() {
   _createProvider = 'claude';
+  const _ob = document.getElementById('create-provider-ollama');
+  if (_ob) _ob.classList.remove('selected');
+  const _lm = document.getElementById('create-localmodel-field');
+  if (_lm) _lm.style.display = 'none';
   document.getElementById('create-provider-claude').classList.add('selected');
   document.getElementById('create-provider-codex').classList.remove('selected');
   document.getElementById('create-provider-gemini').classList.remove('selected');
@@ -16034,6 +16087,11 @@ async function submitCreate() {
   // open to fix — apiCall would pop a generic "Error: 409" with the form gone.
   const createBody = { name, dir, creator: _getDeviceName() };
   if (_createProvider !== 'claude') createBody.provider = _createProvider;
+  if (_createProvider === 'ollama') {
+    const lm = document.getElementById('create-localmodel');
+    const chosen = lm && lm.value ? lm.value : '';
+    if (chosen) createBody.model = chosen;
+  }
   if (worktreeEnabled) createBody.worktree = true;
   let r;
   try {
