@@ -930,6 +930,28 @@ pub(crate) fn is_rate_limit_menu(raw: &str) -> bool {
         && clean.contains("switch to usage credits")
 }
 
+/// Claude's "you have hit your usage limit, continuing on usage credits" BANNER.
+/// This is the state Ethan sees ("workers with a rate limit") that the menu misses:
+/// a lane past the menu, still working but ON CREDITS (2026-08-16, general-canvas-
+/// apps / backend / sherpa showed it while amux's menu-only detection reported 0).
+///
+/// Reliability rests on two things, and the caller MUST honour the first. First,
+/// the caller passes ONLY THE FOOTER (the last ~8 lines of the live frame, the
+/// Claude status region above the input box), never the whole pane: the earlier
+/// whole-pane scrape flagged `amux` for CODING the banner strings, because that
+/// code sits in scrollback (ethos rule 7, content-vs-state), and Claude renders
+/// this banner one line above the spinner, so footer-scoping excludes scrollback.
+/// Second, it matches Claude's FULL user-facing SENTENCE, not the bare words, and
+/// a lane discussing usage credits does not emit that exact sentence as a footer
+/// line. Validated live across all 47 running lanes: flags exactly the 3 on-credits
+/// lanes and leaves amux (mid-edit on this very code) clean.
+pub(crate) fn is_rate_limited_credit_banner(footer: &str) -> bool {
+    // Claude uses a curly apostrophe in "you're"; normalise before matching.
+    let clean = strip_ansi(footer).to_lowercase().replace('\u{2019}', "'");
+    clean.contains("usage-credits to finish what you're working on")
+        || clean.contains("reached your usage limit and")
+}
+
 /// The policy for what amux does with a rate-limit menu (ethos D2).
 ///
 /// `wait` (default) presses 1. `off` leaves the menu for a human and reports it.
@@ -8105,24 +8127,26 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         // it cannot be conversation. Persisting the status past the menu needs a
         // reliable signal amux does not have by scraping (a reset time, or a Claude
         // Code hook reporting rate-limit state, the D2 exit) — not a fuzzy banner.
-        if !is_rate_limit_menu(&pane) {
-            // No menu. Clear the stamp only when the lane has RESUMED: it is
-            // generating again (the limit reset and Claude picked the turn back
-            // up), or the stamp is stale beyond any reset window. A lane that
-            // answered "stop and wait" and is idle-waiting stays flagged for the
-            // whole blocked window, which is the point (Ethan, 2026-08-16: capture
-            // rate limit as a status). This uses the lane's OWN activity, never a
-            // banner-word scrape, so it cannot false-flag a working or idle lane
-            // the way the reverted banner detector did.
-            let stamped = meta_i64(&load_meta(name), "rate_limited_since");
-            if stamped > 0 {
-                let resumed = detect_claude_status(&pane) == "active";
-                // 6h > Claude's 5h window; a weekly-limited lane re-stamps if it
-                // hits the menu again, so a stale clear here cannot hide it for long.
-                let stale = now_i64() - stamped > 6 * 3600;
-                if resumed || stale {
-                    update_meta(name, &[("rate_limited_since", json!(0))]);
-                }
+        // LIMITED = the interactive menu OR Claude's on-credits BANNER in the
+        // FOOTER (the status region above the input box). The menu is transient
+        // (amux answers it); the credit banner is the persistent state Ethan sees
+        // as "workers with a rate limit" — a lane past the menu, still working ON
+        // CREDITS. Footer-scoped + full-sentence so a lane CODING the banner (amux
+        // itself) is not flagged; the earlier whole-pane scrape was the false
+        // positive. pane = tmux_capture(name, 30) ends at the current footer, so
+        // its last 8 lines ARE the footer.
+        let menu = is_rate_limit_menu(&pane);
+        let footer = {
+            let ls: Vec<&str> = pane.lines().collect();
+            ls[ls.len().saturating_sub(8)..].join("\n")
+        };
+        let limited = menu || is_rate_limited_credit_banner(&footer);
+        if !limited {
+            // Neither the menu nor the credit banner is on screen: clear the stamp.
+            // Presence-based, and both signals are footer/menu-scoped, so scrollback
+            // ABOUT limits never flags and a lane clears as soon as its banner goes.
+            if meta_i64(&load_meta(name), "rate_limited_since") > 0 {
+                update_meta(name, &[("rate_limited_since", json!(0))]);
             }
             continue;
         }
@@ -8139,17 +8163,16 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 state,
                 name,
                 "session.rate_limited",
-                Some(json!({"detected_by": "sweep"})),
+                Some(json!({"detected_by": if menu { "menu" } else { "credit-banner" }})),
                 Some(format!("rl:{name}:{}", now_i64() / 3600)),
                 "rate-limit",
             )
             .await;
         }
-        // Answer the menu with "stop and wait", but do NOT clear the stamp here:
-        // the lane is now blocked until reset, and the clear above fires when it
-        // actually resumes. Clearing the instant the menu closed is what made a
-        // still-blocked lane read as idle.
-        if rate_limit_action() != "off" {
+        // Answer ONLY the interactive menu (a banner has no selector, and a stray
+        // Enter into a working lane injects a newline). The presence-based clear
+        // above handles everything else.
+        if menu && rate_limit_action() != "off" {
             let (ok, msg) = send_keys_op(name, "Enter").await;
             tracing::warn!(session = %name, ok, detail = %msg, "swept a rate-limit menu — answered 'stop and wait'");
         }
@@ -14929,6 +14952,31 @@ mod steer_max_age_tests {
         // Case and ANSI must not defeat it — the real pane is full of colour.
         let ansi = "\x1b[1m   What do you want to do?\x1b[0m\n ❯ 1. STOP AND WAIT FOR LIMIT TO RESET\n 2. Switch to Usage Credits";
         assert!(is_rate_limit_menu(ansi));
+    }
+
+    /// The on-credits BANNER (Ethan, 2026-08-16: "workers with a rate limit" the
+    /// menu misses). Reliable because the caller passes only the FOOTER and this
+    /// matches Claude's FULL sentence. The false positive it replaces: a lane
+    /// CODING the banner strings (amux) had them in scrollback, so a whole-pane
+    /// scrape flagged it. Curly apostrophe (Claude's actual glyph) must match.
+    #[test]
+    fn credit_banner_flags_the_real_footer_banner_not_code_that_mentions_it() {
+        // The real footer, curly apostrophe, one line above the spinner.
+        let footer = "     /usage-credits to finish what you\u{2019}re working on.\n \u{273B} Saut\u{e9}ed for 5m 33s\n \u{2500}\u{2500}\u{2500}\n \u{276f}";
+        assert!(is_rate_limited_credit_banner(footer), "the live specimen must match");
+        // Straight apostrophe too.
+        assert!(is_rate_limited_credit_banner("/usage-credits to finish what you're working on."));
+
+        // amux CODING the banner: the phrase appears as a code string / comment,
+        // NOT as Claude's full footer sentence. Must NOT flag.
+        assert!(!is_rate_limited_credit_banner(
+            "clean.contains(\"usage-credits to finish\") || clean.contains(\"your usage limit\")"
+        ));
+        assert!(!is_rate_limited_credit_banner("// the /usage-credits offer banner (AMUX-3203)"));
+        // A lane DISCUSSING a third party's limit is not itself limited.
+        assert!(!is_rate_limited_credit_banner("the ops key hit its usage limit until 2026-09-01"));
+        // A normal working footer is clean.
+        assert!(!is_rate_limited_credit_banner(" \u{273B} Crunched for 2m\n \u{276f} type a message"));
     }
 
 
