@@ -147,7 +147,76 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // self-announces instead of a lying capability report.
     out.extend(provider_launch_check());
 
+    // -- 9. fire-alarm reachability: can the owner-alert channel reach a human?
+    // (AMUX-3203). Both channels read healthy-enabled while neither had a
+    // destination (0 push subs, empty phone), so five serious pages (a prod-down
+    // and two security holes) dropped silently while 171 cards waited on the
+    // owner. The per-send WARN only fires on a dropped page; this makes a
+    // disconnected alarm a CONTINUOUS health failure instead.
+    out.extend(alert_channel_check(state));
+
     out
+}
+
+/// AMUX-3203. Reads the SAME config keys and `push_subscriptions` table
+/// `api::alerts` reads when it sends, so the check cannot disagree with the
+/// sender. The verdict is reachability (config + subscription count); the recent
+/// drop tally is corroborating evidence, computed from the `owner_alerts` ledger
+/// whose `ts` is in SECONDS (unlike cmd_history's ms — the ethos rule 7 landmine).
+fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "alert.channel_can_deliver";
+    let home = crate::config::amux_home();
+    let ev = |k: &str| crate::api::settings::effective_env(&home, k);
+    let push_enabled = ev("AMUX_URGENT_PUSH").unwrap_or_else(|| "1".into()) != "0";
+    let sms_enabled = ev("AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0";
+    let phone_configured = !ev("AMUX_OWNER_PHONE").unwrap_or_default().trim().is_empty();
+
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let push_sub_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM push_subscriptions", [], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as usize)
+        .unwrap_or(0);
+    // owner_alerts written in the last 24h, and how many reached zero channels. A
+    // deduped/muted row is a suppression, not a delivery attempt (channels "{}"),
+    // so exclude it; a delivered row carries a success token in its channels JSON
+    // ("imessage"/"twilio"/"sent").
+    let (recent_alerts, recent_zero_delivery) = {
+        let mut total = 0usize;
+        let mut dropped = 0usize;
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT channels, deduped FROM owner_alerts WHERE ts > (strftime('%s','now') - 86400)",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for (channels, deduped) in rows.flatten() {
+                    if deduped != 0 {
+                        continue;
+                    }
+                    total += 1;
+                    let delivered = channels.contains("imessage")
+                        || channels.contains("twilio")
+                        || channels.contains("\"sent\"");
+                    if !delivered {
+                        dropped += 1;
+                    }
+                }
+            }
+        }
+        (total, dropped)
+    };
+    drop(conn);
+
+    checks::alert_channel_can_deliver(&checks::AlertChannelState {
+        push_enabled,
+        push_sub_count,
+        sms_enabled,
+        phone_configured,
+        recent_alerts,
+        recent_zero_delivery,
+    })
 }
 
 /// AMUX-3153 / RR-0043: for each provider, compare the binary the SERVER launch

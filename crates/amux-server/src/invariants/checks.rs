@@ -12,7 +12,7 @@
 //! this repo has shipped a green `if True:` fixture, a grep that could not
 //! match, and a spin-catcher that ranked sleeping threads, all of which "passed".
 
-use super::InvariantResult;
+use super::{InvariantResult, Status};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1193,6 +1193,97 @@ pub fn launch_matches_adapter(rows: &[ProviderLaunch]) -> Vec<InvariantResult> {
 }
 
 // ---------------------------------------------------------------------------
+// Fire-alarm reachability: the owner-alert channel must have a live destination.
+// ---------------------------------------------------------------------------
+
+/// The delivery state the owner-alert sender reads to decide where a page goes.
+/// The monitor fills this from the SAME config keys and the SAME
+/// `push_subscriptions` table the sender uses (`api::alerts`), so this check
+/// cannot disagree with the path it describes.
+#[derive(Debug, Clone)]
+pub struct AlertChannelState {
+    pub push_enabled: bool,
+    pub push_sub_count: usize,
+    pub sms_enabled: bool,
+    pub phone_configured: bool,
+    /// `owner_alerts` rows written in the lookback window, and how many reached
+    /// zero channels. Corroboration, not the verdict: reachability decides
+    /// Pass/Fail, but a nonzero drop count turns "config looks unfinished" into
+    /// "N real pages were already lost".
+    pub recent_alerts: usize,
+    pub recent_zero_delivery: usize,
+}
+
+/// INCIDENT (AMUX-3203, measured 2026-08-16): both channels were ENABLED yet the
+/// owner-alert channel had no destination, 0 `push_subscriptions` and an empty
+/// `AMUX_OWNER_PHONE`, so `amux alert` reached nobody. The five most recent pages
+/// were a prod-down, a fleet-burn and two security holes, every one dropped
+/// silently, while 171 board cards waited on a decision that never escalated.
+///
+/// The per-alert WARN ("reached ZERO channels", AMUX-3151) fires only WHEN an
+/// alert is sent and lands in a log nobody tails, so a disconnected alarm sat
+/// load-bearing for weeks. This is the proactive leg: an alarm with no wire to a
+/// human is a CONTINUOUS health failure, visible in `/api/health/invariants`
+/// without waiting for the next dropped escalation.
+///
+/// INVARIANT: at least one owner-alert channel is enabled AND has a reachable
+/// destination (a registered push subscription, or a configured phone).
+///
+/// Connecting the destination is the owner's action (the push subscription is
+/// created when he grants the PWA notification permission; the phone is his to
+/// set), so this REPORTS, it never repairs (ethos rule 8). Both channels
+/// deliberately OFF is the owner's own choice to silence the alarm, so that is
+/// `Skipped`-with-reason rather than a failure of his config.
+pub fn alert_channel_can_deliver(s: &AlertChannelState) -> Vec<InvariantResult> {
+    const ID: &str = "alert.channel_can_deliver";
+    let push_state = match (s.push_enabled, s.push_sub_count) {
+        (false, _) => "disabled (AMUX_URGENT_PUSH=0)".to_string(),
+        (true, 0) => "enabled but 0 push subscriptions".to_string(),
+        (true, n) => format!("enabled, {n} subscription(s)"),
+    };
+    let sms_state = match (s.sms_enabled, s.phone_configured) {
+        (false, _) => "disabled (AMUX_URGENT_SMS=0)".to_string(),
+        (true, false) => "enabled but AMUX_OWNER_PHONE is empty".to_string(),
+        (true, true) => "enabled, phone configured".to_string(),
+    };
+    let evidence = json!({
+        "class": "fire-alarm-reachability",
+        "push": push_state,
+        "sms": sms_state,
+        "push_sub_count": s.push_sub_count,
+        "recent_alerts_24h": s.recent_alerts,
+        "recent_zero_delivery_24h": s.recent_zero_delivery,
+        "incident": "AMUX-3203: 0 subs + empty phone dropped 5 serious pages \
+                     (prod-down, security x2) while 171 cards waited on the owner",
+        "fix": "owner action: subscribe to push from the PWA (grant notification \
+                permission), or set AMUX_OWNER_PHONE in ~/.amux/server.env",
+    });
+
+    // Both channels off is the owner deliberately silencing the alarm. Report it,
+    // do not fail his choice.
+    if !s.push_enabled && !s.sms_enabled {
+        let mut r = InvariantResult::new(ID, Status::Skipped).entity("owner-alert").evidence(evidence);
+        r.observed = "owner-alert is OFF by config (both AMUX_URGENT_PUSH and AMUX_URGENT_SMS are 0)".into();
+        return vec![r];
+    }
+
+    let push_ok = s.push_enabled && s.push_sub_count > 0;
+    let sms_ok = s.sms_enabled && s.phone_configured;
+    if push_ok || sms_ok {
+        return vec![InvariantResult::pass(ID).entity("owner-alert").evidence(evidence)];
+    }
+    // Armed but disconnected: at least one channel is enabled and none can reach a
+    // human. This is the incident state, and it is unambiguously broken, not a choice.
+    vec![InvariantResult::fail(
+        ID,
+        "owner-alert reaches a human: >=1 enabled channel with a destination",
+        format!("no reachable destination. push: {push_state}; sms: {sms_state}"),
+    )
+    .entity("owner-alert")
+    .evidence(evidence)]
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -1200,6 +1291,65 @@ pub fn launch_matches_adapter(rows: &[ProviderLaunch]) -> Vec<InvariantResult> {
 mod negative_controls {
     use super::*;
     use crate::invariants::Status;
+
+    /// AMUX-3203, rebuilt from the incident artifact: both channels ENABLED with
+    /// no destination (0 subs, empty phone) is the disconnected fire alarm that
+    /// dropped five serious pages while reading healthy. The check must FAIL on
+    /// that exact state and clear the moment ANY single destination appears; both
+    /// channels OFF is the owner's deliberate silence and must be Skipped, not
+    /// Failed (ethos rule 8).
+    #[test]
+    fn detects_the_fire_alarm_with_no_destination() {
+        // The incident state: armed, no wire to a human.
+        let incident = AlertChannelState {
+            push_enabled: true,
+            push_sub_count: 0,
+            sms_enabled: true,
+            phone_configured: false,
+            recent_alerts: 5,
+            recent_zero_delivery: 5,
+        };
+        let r = alert_channel_can_deliver(&incident);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].status, Status::Fail, "disconnected alarm must fail: {:?}", r[0]);
+        assert!(r[0].observed.contains("no reachable destination"), "{:?}", r[0]);
+
+        // A push subscription alone clears it.
+        let with_push = AlertChannelState { push_sub_count: 1, ..incident.clone() };
+        assert_eq!(alert_channel_can_deliver(&with_push)[0].status, Status::Pass);
+
+        // A phone alone clears it.
+        let with_phone = AlertChannelState { phone_configured: true, ..incident.clone() };
+        assert_eq!(alert_channel_can_deliver(&with_phone)[0].status, Status::Pass);
+
+        // One channel enabled+reachable, the OTHER disabled, still passes.
+        let push_only = AlertChannelState {
+            push_enabled: true,
+            push_sub_count: 2,
+            sms_enabled: false,
+            phone_configured: false,
+            recent_alerts: 0,
+            recent_zero_delivery: 0,
+        };
+        assert_eq!(alert_channel_can_deliver(&push_only)[0].status, Status::Pass);
+
+        // A subscription behind a DISABLED push channel, and a phone behind a
+        // DISABLED sms channel, are NOT reachable: with both channels off the
+        // alarm is silenced by choice -> Skipped, never a cheerful Pass.
+        let both_off = AlertChannelState {
+            push_enabled: false,
+            push_sub_count: 5,
+            sms_enabled: false,
+            phone_configured: true,
+            recent_alerts: 0,
+            recent_zero_delivery: 0,
+        };
+        assert_eq!(
+            alert_channel_can_deliver(&both_off)[0].status,
+            Status::Skipped,
+            "both channels off is the owner's choice, reported not failed"
+        );
+    }
 
     /// AMUX-3153, rebuilt from the incident artifact: ollama's adapter builds
     /// `codex` (and advertises hooks), but the server launch arm still emits
