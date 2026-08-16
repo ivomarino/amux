@@ -3659,10 +3659,11 @@ function closeAllMenus() {
 document.addEventListener('click', e => {
   closeAllMenus(); closeActiveDropdown(e); closeAddMenu();
   if (!e.target.closest('.sort-wrap')) closeSortMenu();
-  // The tab customizer now closes via its own _tabCustOutside handler (added on
-  // open), mirroring the peek customizer. The old `.tab-customize-wrap` closest()
-  // check is gone because the trigger moved into Settings and that wrap no longer
-  // exists, which would have made this branch fire on every click and never open.
+  if (_tabCustomizerOpen && !e.target.closest('.tab-customize-wrap')) {
+    _tabCustomizerOpen = false;
+    const m = document.getElementById('tab-customizer-menu');
+    if (m) m.style.display = 'none';
+  }
 });
 
 const ALL_TABS = [
@@ -3751,50 +3752,16 @@ function _applyTabVisibility() {
 let _tabCustomizerOpen = false;
 let _tabMenuSortable = null;
 
-function _tabCustOutside(e) {
-  const menu = document.getElementById('tab-customizer-menu');
-  const btn = document.getElementById('tabs-customize');
-  if (menu && !menu.contains(e.target) && e.target !== btn && !(btn && btn.contains(e.target))) {
-    _tabCustomizerOpen = false;
-    menu.style.display = 'none';
-    document.removeEventListener('click', _tabCustOutside, true);
-  }
-}
 function toggleTabCustomizer() {
   _tabCustomizerOpen = !_tabCustomizerOpen;
   const menu = document.getElementById('tab-customizer-menu');
   if (!menu) return;
   if (_tabCustomizerOpen) {
     _renderTabCustomizerMenu();
-    // The trigger moved into Settings > Appearance, so this menu is now a fixed
-    // body child anchored to #tabs-customize, the same DISPLAY-THEN-MEASURE-THEN-PLACE
-    // recipe the peek customizer uses, so it can never clip inside the scrolling
-    // settings menu or run off a narrow screen.
-    const btn = document.getElementById('tabs-customize');
-    menu.style.visibility = 'hidden';
     menu.style.display = '';
-    if (btn) {
-      const r = btn.getBoundingClientRect();
-      const vw = document.documentElement.clientWidth || window.innerWidth;
-      const vh = document.documentElement.clientHeight || window.innerHeight;
-      const PAD = 8;
-      menu.style.right = 'auto';
-      menu.style.width = 'auto';
-      const mw = menu.offsetWidth || 230;
-      let left = Math.min(r.left, vw - mw - PAD);
-      if (left < PAD) left = PAD;
-      menu.style.left = left + 'px';
-      const top = r.bottom + 4;
-      menu.style.top = top + 'px';
-      menu.style.maxHeight = Math.max(120, vh - top - PAD) + 'px';
-      menu.style.overflowY = 'auto';
-    }
-    menu.style.visibility = '';
     _tabCustBeacon(menu, 'global');
-    setTimeout(() => document.addEventListener('click', _tabCustOutside, true), 0);
   } else {
     menu.style.display = 'none';
-    document.removeEventListener('click', _tabCustOutside, true);
   }
 }
 
@@ -7652,7 +7619,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.651';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.652';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
