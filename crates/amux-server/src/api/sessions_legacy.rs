@@ -542,7 +542,36 @@ impl FleetSignals {
     /// Call this instead of touching `running` directly, or the two answers
     /// drift again.
     pub fn agent_running(&self, tmux_name: &str) -> bool {
-        self.running.contains(tmux_name) && !self.shell_only.contains(tmux_name)
+        // The tmux SESSION must exist either way — a self-report cannot resurrect a
+        // lane whose session is gone.
+        if !self.running.contains(tmux_name) {
+            return false;
+        }
+        // Primary: the pane scrape says an agent is the foreground command (or, via
+        // the pgrep rescue, a child of a foreground shell).
+        if !self.shell_only.contains(tmux_name) {
+            return true;
+        }
+        // AF-82 / D1: a lane that SELF-REPORTED an active agent recently is running,
+        // even when the pane scrape reads shell-only — an agent launched as a child
+        // of a wrapper shell, or nested a level deeper than the pgrep rescue reaches.
+        // The self-report is the harness reporting its own state (the D1 exit) and
+        // the scrape is the FALLBACK; `running` ignored it while `status` already
+        // honoured it, so ai-video-editor read running=False with an `active` report
+        // 57s old. Same freshness guards the status override uses (from_this_life +
+        // live), active/waiting only (an idle report does not assert a live agent).
+        if let Some(name) = tmux_name.strip_prefix("amux-") {
+            if let Some(rep) = self.reports.get(name) {
+                let st = rep["state"].as_str().unwrap_or("");
+                let ts = rep["ts"].as_f64().unwrap_or(0.0);
+                let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= ts;
+                let live = self.now - ts < env_secs("AMUX_HOOKS_LIVE_S", 1800.0);
+                if from_this_life && live && (st == "active" || st == "waiting") {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// How recent must physical evidence be to falsify a reported `idle`, and
@@ -2435,6 +2464,49 @@ mod tests {
             panes: BTreeMap::new(),
             now: 1_000_000.0,
         }
+    }
+
+    /// AF-82 / D1: `running` must honour a fresh self-report, not only the pane
+    /// scrape. A lane launched as a child of a wrapper shell scrapes shell_only,
+    /// but an `active` report 57s old means an agent IS running (the exact
+    /// ai-video-editor case). The scrape is the fallback; ignoring the report is
+    /// what showed a working lane as stopped.
+    #[test]
+    fn agent_running_honours_a_fresh_active_self_report_over_a_shell_scrape() {
+        let mut s = signals();
+        let tmux = "amux-avetest";
+        s.running.insert(tmux.into()); // the tmux session exists
+        s.shell_only.insert(tmux.into()); // but the pane scrapes as a bare shell
+        assert!(!s.agent_running(tmux), "shell scrape + no report reads not-running");
+
+        // A fresh active report from THIS life -> running, despite the shell scrape.
+        s.started.insert("avetest".into(), s.now - 1000.0);
+        s.reports = serde_json::json!({ "avetest": { "state": "active", "ts": s.now - 57.0 } });
+        assert!(s.agent_running(tmux), "a 57s-old active self-report means an agent is running");
+
+        // A PREVIOUS-LIFE report (before the session (re)started) must NOT count.
+        s.started.insert("avetest".into(), s.now - 10.0);
+        assert!(!s.agent_running(tmux), "a report from before the last start is a dead life");
+
+        // An idle report does not assert a live agent.
+        s.started.insert("avetest".into(), s.now - 1000.0);
+        s.reports = serde_json::json!({ "avetest": { "state": "idle", "ts": s.now - 5.0 } });
+        assert!(!s.agent_running(tmux), "an idle report does not make it running");
+
+        // A STALE active report (older than the live window) must NOT count.
+        s.reports = serde_json::json!({ "avetest": { "state": "active", "ts": s.now - 4000.0 } });
+        assert!(!s.agent_running(tmux), "a stale active report (>30min) is not a live agent");
+
+        // The session GONE: no report resurrects it.
+        s.running.clear();
+        s.reports = serde_json::json!({ "avetest": { "state": "active", "ts": s.now - 5.0 } });
+        assert!(!s.agent_running(tmux), "a report cannot resurrect a lane whose session is gone");
+
+        // Normal case: a non-shell foreground pane is running with no report at all.
+        s.running.insert(tmux.into());
+        s.shell_only.clear();
+        s.reports = serde_json::Value::Null;
+        assert!(s.agent_running(tmux), "a non-shell foreground pane is running");
     }
 
     #[test]
