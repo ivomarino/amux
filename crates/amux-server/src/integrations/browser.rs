@@ -373,6 +373,55 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
     true
 }
 
+/// Before launching, make sure no Chrome from a PRIOR server process still holds
+/// `target_dir`. The in-memory RUNNING registry does not survive the builder's
+/// re-exec, so a live orphan is invisible to `start()`, and a second Chrome on
+/// the same `--user-data-dir` delegates to that orphan and exits 0 before binding
+/// any debug port ("Chrome exited 0 before CDP came up", AMUX-3207). Two cases,
+/// both closed here so the launch never delegates:
+///   - orphan with LIVE CDP: adopt it into RUNNING, so start()'s replace-check
+///     stops it by pid (the reported incident: pid 54237, CDP 53470, still alive).
+///   - orphan whose CDP has WEDGED: adopt cannot speak to it and clears the file,
+///     but the process still owns the dir. Kill it by the pid the running-file
+///     recorded, or the next launch delegates to a zombie forever.
+async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
+    // Snapshot the persisted pid/dir BEFORE adopt, which clears the file on dead CDP.
+    let persisted = std::fs::read_to_string(running_state_path(home))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    // Live-CDP orphan: adopt so start()'s replace path stops it.
+    if adopt_if_orphaned(home).await {
+        return;
+    }
+    // Dead-CDP orphan still holding the dir: kill by pid so the launch does not
+    // delegate to it. Only when the recorded dir matches what we are about to
+    // launch on, so we never kill a browser on an unrelated profile.
+    if let Some(v) = persisted {
+        let pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
+        let dir = v.get("user_data_dir").and_then(serde_json::Value::as_str).unwrap_or_default();
+        if pid != 0 && Path::new(dir) == target_dir {
+            let alive = tokio::process::Command::new("kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .await
+                .map(|s| s.success())
+                .unwrap_or(false);
+            if alive {
+                tracing::warn!(
+                    pid, dir,
+                    "browser: killing an orphan Chrome that held the profile but whose CDP was \
+                     unreachable — a launch on this dir would delegate to it and exit 0 (AMUX-3207)"
+                );
+                let _ = tokio::process::Command::new("kill")
+                    .args(["-KILL", &pid.to_string()])
+                    .status()
+                    .await;
+                clear_running(home);
+            }
+        }
+    }
+}
+
 pub static RUNNING: LazyLock<Mutex<Option<RunningBrowser>>> = LazyLock::new(|| Mutex::new(None));
 
 /// Locate a Chrome/Chromium binary. None is an honest answer the API
@@ -476,16 +525,28 @@ pub async fn start(
         anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
     })?;
 
-    // One running browser: replace, never silently stack a second Chrome on
-    // the same profile (two Chromes on one user-data-dir corrupt it).
+    // A Chrome from a PREVIOUS server process may still hold this profile. The
+    // RUNNING registry is in-memory and does not survive the builder's constant
+    // re-exec, so start() used to be blind to that orphan: it checked only
+    // RUNNING, found nothing, and launched a SECOND Chrome on the same
+    // --user-data-dir. Chrome delegates to the instance already holding the
+    // profile and exits 0, so the new debug port never binds ("Chrome exited 0
+    // before CDP came up", AMUX-3207). The driver-verb path already reconciles
+    // via adopt_if_orphaned (connect_session); start() did not. Reconcile here,
+    // before the replace-check, so the orphan is STOPPED rather than delegated to.
+    let target = launch_target(home, &chrome_user_data_dir(), profile);
+    reconcile_orphan_before_launch(home, &target.user_data_dir).await;
+
+    // One running browser: replace, never silently stack a second Chrome on the
+    // same profile (two Chromes on one user-data-dir corrupt it). After the
+    // reconcile above, a live orphan is adopted into RUNNING and stopped here.
     if RUNNING.lock().expect("browser registry poisoned").is_some() {
         let _ = stop(home).await;
     }
 
-    let target = launch_target(home, &chrome_user_data_dir(), profile);
     if is_amux_owned(home, &target.user_data_dir) {
         std::fs::create_dir_all(&target.user_data_dir)?;
-        // Our child registry is empty (checked above), so any lock here is a
+        // The child registry is empty (stopped above), so any lock here is a
         // leftover from a dead Chrome and would block this launch.
         let removed = clean_locks(&target.user_data_dir);
         if !removed.is_empty() {
@@ -551,8 +612,29 @@ pub async fn start(
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     loop {
         if let Ok(Some(status)) = child.try_wait() {
+            // A CLEAN exit (status 0) before CDP is the delegation signature: the
+            // new Chrome handed its URL to an instance already holding this
+            // profile and quit. reconcile_orphan_before_launch should now prevent
+            // it, so reaching here means an orphan slipped past reconciliation
+            // (e.g. an untracked Chrome outside the running-file). Name the cause
+            // and WARN so a log sweep catches the class, not just this instance.
+            let delegated = status.success();
+            let hint = if delegated {
+                " — exit 0 is the delegation signature: another Chrome already holds this \
+                 --user-data-dir. amux reconciles known orphans before launch (AMUX-3207); an \
+                 untracked Chrome on this profile can still cause it. Try again, or GET \
+                 /api/browser/status and stop it first."
+            } else {
+                ""
+            };
+            if delegated {
+                tracing::warn!(
+                    ?pid, port, dir = %target.user_data_dir.display(),
+                    "browser: launch delegated to an existing Chrome and exited 0 before CDP bound (AMUX-3207)"
+                );
+            }
             anyhow::bail!(
-                "Chrome (pid {pid:?}) exited {status} before CDP on port {port} came up{}",
+                "Chrome (pid {pid:?}) exited {status} before CDP on port {port} came up{}{hint}",
                 chrome_stderr_tail(&stderr_path)
             );
         }
