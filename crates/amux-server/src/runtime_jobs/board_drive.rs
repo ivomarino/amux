@@ -4366,6 +4366,12 @@ mod tests {
         };
         assert!(prompt.contains("T-1"), "the card id must survive: {prompt}");
         assert!(prompt.contains("amux board show T-1"), "must point at the card: {prompt}");
+        // ...and the verb must EXIST. Asserting only that we TELL an agent to run
+        // a command, while nothing checks the command is real, is how AF-66
+        // shipped: `amux board show` fell through to the help text and exited 2,
+        // and it is named precisely when the card body is withheld, i.e. when it
+        // is the only way to read the card (AMUX-2140's shape).
+        assert_cli_verbs_exist(&prompt);
         assert!(
             !crate::api::session_verbs::at_picker_text(&prompt),
             "a board-drive prompt must never open the picker: {prompt}"
@@ -4705,4 +4711,65 @@ mod tests {
         ins("E-2", now - BACKLOG_STALE_AGE_S - 1); // one second past
         assert_eq!(stale_backlog_count(&conn, "lane", now), 1, "one second past the cutoff is stale");
     }
+    /// The board verbs the SHIPPED bash CLI actually handles, parsed from
+    /// `cmd_board()`'s own case labels. Reading the CLI source is the point: a
+    /// hardcoded list here would drift from the CLI exactly like the docs did.
+    fn cli_board_verbs() -> std::collections::HashSet<String> {
+        const CLI: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../amux"));
+        let start = CLI.find("cmd_board() {").expect("the CLI defines cmd_board");
+        // Stop at the next top-level function so a later function's labels
+        // cannot smuggle a verb in (`show)` really does live in cmd_defaults).
+        let rest = &CLI[start + 13..];
+        let end = rest.find("\ncmd_").map(|e| start + 13 + e).unwrap_or(CLI.len());
+        let body = &CLI[start..end];
+        let re = regex::Regex::new(r"(?m)^\s{4}([a-z][a-z0-9|_-]*)\)").unwrap();
+        let mut out = std::collections::HashSet::new();
+        for c in re.captures_iter(body) {
+            for v in c[1].split('|') {
+                if !v.is_empty() {
+                    out.insert(v.to_string());
+                }
+            }
+        }
+        out
+    }
+
+    /// Assert every `amux board <verb>` a generated prompt names is real.
+    fn assert_cli_verbs_exist(prompt: &str) {
+        let verbs = cli_board_verbs();
+        // The parser must have found REAL verbs, or every membership test below
+        // passes vacuously against an empty set.
+        assert!(
+            verbs.contains("done") && verbs.contains("doing") && verbs.contains("review"),
+            "cli_board_verbs parsed {} labels and is missing known ones — the parser is broken, \
+             so the assertions below would be meaningless: {verbs:?}",
+            verbs.len()
+        );
+        let re = regex::Regex::new(r"amux board ([a-z][a-z0-9_-]*)").unwrap();
+        for c in re.captures_iter(prompt) {
+            let v = &c[1];
+            assert!(
+                verbs.contains(v),
+                "this prompt tells an agent to run `amux board {v}`, which cmd_board() does not \
+                 handle — it will fall through to the help text. Add the verb or fix the prompt \
+                 (AF-66). Known verbs: {verbs:?}"
+            );
+        }
+    }
+
+    /// The check above can only be trusted if it FIRES. A prompt naming a verb
+    /// that does not exist must panic — this is the exact AF-66 specimen, whose
+    /// original test happily passed while `show` did not exist.
+    #[test]
+    #[should_panic(expected = "does not handle")]
+    fn a_prompt_naming_a_nonexistent_board_verb_is_caught() {
+        assert_cli_verbs_exist("read it with `amux board shwo AF-64`");
+    }
+
+    /// And the real verbs must pass, so the check is not simply always-panicking.
+    #[test]
+    fn the_real_board_verbs_are_accepted() {
+        assert_cli_verbs_exist("amux board show X, amux board done X, amux board reviewer X y");
+    }
+
 }
