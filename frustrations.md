@@ -1884,67 +1884,6 @@ FIX: FIXED for both routes this entry named. Verified live 2026-08-16 by amux-fr
   scope is closed, but its predicted third instance already exists.
   Awaiting the originating session's sign-off; see the SESSION caveat.
 
-## The live-DB migration guard test fails on any target dir not literally named `target`
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: autofix (subagent)
-CARD: AF-71
-SYMPTOM: `db::migrate::guard_tests::it_actually_refuses_a_pending_migration_against_the_live_db`
-  panics with "precondition: the test binary should live under a cargo target dir, got
-  /tmp/amux-autofix-target/debug/deps/amux_server-...". `is_cargo_target_build` requires
-  the literal substring `/target/debug/`, and `/tmp/amux-autofix-target/debug/` does not
-  contain it. Building to a private `CARGO_TARGET_DIR` is exactly what this repo tells
-  sessions to do so they do not clobber each other's builds.
-COST: ~10 minutes proving a red test was not mine — and the failure message says
-  "precondition", which reads like the test is protecting something real rather than
-  pattern-matching a path. A session in a hurry files a bug against its own change.
-FIX: FIXED in 490ea3a, and the real bug was WORSE than this entry saw. `is_cargo_target_build`
-  no longer looks for the literal `/target/debug/`; it matches any path COMPONENT equal to
-  `debug` or `release`, which is the "cargo-provided fact rather than the path spelling"
-  this entry asked for.
-  Read that commit's subject: "the live-DB migration guard was OFF for the mandated build
-  dir (AMUX-2799)". This entry reported a red TEST. The underlying defect was that the
-  GUARD ITSELF — the thing that stops an ordinary `cargo run` migrating the fleet's real
-  `~/.amux/amux.db` — was not firing for the exact build dir CLAUDE.md mandates. A safety
-  check silently off, presenting as a noisy test.
-  Verified by amux-frustrations 2026-08-16 against the entry's own failing condition:
-  ran the named test with `CARGO_TARGET_DIR=~/.amux/rust-build-target` (a dir whose name
-  is `rust-build-target`, so the literal `/target/` substring is absent) — 1 passed.
-  Awaiting the originating session's sign-off; see the SESSION caveat.
-
-## Two alerts tests pass alone and fail together — a process-global HOME race
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: autofix (subagent)
-CARD: AF-72
-SYMPTOM: `cargo test -p amux-server` failed `api::alerts::tests::owner_alert_full_send_shape_channels_and_ledger`
-  (channels came back `{"sms":"imessage"}` instead of `{"push":"sent","sms":"imessage"}`)
-  and `..._60s_dedupe_and_ledger_visibility`. Both pass with `--test-threads=1`. They use
-  `test_env::set_home`, and cargo runs tests as threads in ONE process, so the override
-  races whichever sibling is mid-assertion.
-COST: Two of the three red tests in my first full run were not mine; separating them from
-  my own work took a serial re-run plus a per-test run to confirm. I then hit the SAME
-  class twice in my own new tests within the hour (one set `AMUX_AUTOFIX_WINDOW_H`, one
-  set `AMUX_HOME`) — which is the argument that this is a pattern, not an accident.
-FIX: ALREADY IMPLEMENTED — verified by amux-frustrations 2026-08-16, and it is the exact
-  remedy this entry proposed. `test_env::set_home` (api/settings.rs:574) acquires a static
-  `LOCK` and holds the `MutexGuard` inside the returned `HomeGuard`, so the override is
-  released only when the guard drops. Every caller is serialized WITHOUT needing to
-  remember a convention — the honest path is the only path.
-  Evidence: both named tests exist, both call `test_env::set_home`, and the exact failing
-  pair (`owner_alert_full_send_shape_channels_and_ledger` +
-  `owner_alert_60s_dedupe_and_ledger_visibility`) passes 3/3 consecutive parallel runs;
-  all 16 `api::alerts::` tests pass together at default thread count; the full suite is
-  1022 passed / 0 failed.
-  NOTE for whoever validates: the guard predates this entry (it landed with 8cc5391), so
-  either the race was a different env key than AMUX_HOME, or these tests did not take the
-  guard yet on 2026-08-10. Either way the shape the entry asks for is present and holding
-  today. Awaiting the originating session's sign-off — see the SESSION caveat below.
-
 ## A correct refusal shipped as HTTP 500 for months, and poisoned the error sweep
 AREA: instruments
 SEVERITY: slows
