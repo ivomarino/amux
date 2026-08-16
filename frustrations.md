@@ -2822,3 +2822,48 @@ CARD: DESKT-3
 SYMPTOM: `/api/metrics` reported `disk_used_gb: 11.4`, `disk_total_gb: 1858.2`, `disk_percent: 0.6` — a green "low" gauge on the dashboard — while `df -h /System/Volumes/Data` showed 1.7Ti used of 1.8Ti, 26Gi free, 99% full. Writes were already failing elsewhere on the box. Cause: `collect_system_metrics` ran `df -k /` and parsed its Used column. On APFS `/` is the SEALED READ-ONLY system snapshot (~11GB, essentially static); everything a user owns lives on `/System/Volumes/Data`. So the gauge was reading a different volume than the one that fills up, and it will read ~0% forever no matter how full the machine gets.
 COST: the disk filled to 99% with the dashboard showing green the whole way, and nobody had a reason to look. The failure mode is the expensive one: not a missing instrument (which prompts a manual check) but a confident wrong one that is trusted and read first. CLAUDE.md already records a related incident where ~37 abandoned target dirs took the volume to 741MB free with a 50-session fleet running — the gauge that was supposed to make that visible could not, by construction, ever have shown it. Also cost this session a wrong initial read of how much headroom the machine had.
 FIX: fixed in the same breath as building the reclaim scanner. `/api/metrics` now derives disk from `statfs($HOME)` through `reclaim::df_bytes` — asking about a PATH rather than a mount point is correct on APFS by construction, and sharing the helper with the scanner means the two views can never disagree (a second spelling would drift). Adds `disk_free_gb` because free space is the number you act on, and emits `tracing::warn!(disk_percent, free_gb, "disk critically full")` at >=90% so the NEXT disk-fill announces itself in a log sweep instead of waiting for someone to open the dashboard. Regression test `disk_metrics_measure_the_data_volume_not_the_sealed_system_snapshot` was verified to FAIL against the pre-fix code with "metrics reports 0.6% used but the data volume is at 90.56%".
+
+## `git commit` after `git add`-ing only my files still ships a peer's pre-staged file
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-16
+SESSION: amux (file-manager subagent)
+CARD: AMUX-3249
+SYMPTOM: I `git add`-ed exactly my four dashboard files, then `git commit`. The
+  commit landed FIVE files: my four plus `crates/amux-server/src/runtime_jobs/mod.rs`,
+  a peer's (`desktop`/`amux`) comment-only em-dash cleanup that was already sitting
+  staged in the shared index. `git commit` commits the whole index, not just the paths
+  I added, so a file another session left staged rides along under my SHA and my card.
+COST: a foreign Rust file shipped in a dashboard-UX commit (8b802e1) against an explicit
+  "do not touch Rust files / only git add your exact files" instruction. Harmless here
+  (comment-only, compiles, same-session attribution) but the mechanism ships un-reviewed
+  peer code silently. Caught only because `git show --stat` listed 5 files, not 4.
+FIX: the durable habit is `git commit -- <exact paths>` (path-scoped) or
+  `git diff --cached --name-only` + unstage foreign paths BEFORE committing — the second
+  AMUX-3242 commit used `git commit -- <paths>` and landed exactly 2 files. Worth putting
+  the path-scoped form in CLAUDE.md's Deploy section as the default on this shared checkout,
+  since a headerless `git add` of your files does not protect you from a peer's pre-staged index.
+
+## staged-guard can't see a subagent's own edits, so it blocks the subagent's real work as "foreign"
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-16
+SESSION: amux (file-manager subagent)
+CARD: AMUX-3249
+SYMPTOM: The pre-commit staged-guard bases its verdict on per-session EDIT RECORDS in a
+  time window, not on the staged diff. Running as a subagent, my Edits to app.css /
+  index.html / sw.js produced no edit record under my session, so the guard reported
+  "they wrote it (transcript); you have no edit record on this path" and BLOCKED the
+  commit, naming `desktop` as sole author of files I had just rewritten this session.
+COST: the commit was blocked; I had to read the FULL staged diff of app.css and index.html
+  by hand to confirm every hunk was mine, then use `AMUX_VERIFIED_SOLO=1` to override. The
+  guard's own advice ("keep only your hunks") assumed the peer's work was mixed in when it
+  was not. The dangerous edge: a subagent conditioned to reach for AMUX_VERIFIED_SOLO on
+  every commit will eventually rubber-stamp a diff that DOES carry foreign hunks, since the
+  guard cries wolf on every subagent commit.
+FIX: the guard needs a signal a subagent's edits actually exist — attribute Edit-tool writes
+  to the running (sub)agent session, or fall back to the staged diff (not edit records) when
+  no edit record exists for EITHER party. Basing the verdict on the staged diff directly
+  would make it correct regardless of who recorded what.
