@@ -875,6 +875,62 @@ pub fn installed_script_matches_committed(
 }
 
 // ---------------------------------------------------------------------------
+// 6c. Are session reports ATTRIBUTED? (AF-67)
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AF-67, 2026-08-16): 77% of all mutating requests in 24h carried no
+/// `X-Amux-Session`, dominated by `POST /api/sessions/<n>/report` -- 7,708 of
+/// them, from lanes still running the pre-AMUX-2936 inline hook. The attributed
+/// share was 0.0% in EVERY one of the last 12 hours across 40 lanes.
+///
+/// Nothing automated could see it. `autofix` reads only `status >= 500` from the
+/// request log, and a report POST is a 200; none of the 13 live invariants
+/// expressed attribution. The signal was in the store the whole time and the
+/// only reason it surfaced is that a human-triggered sweep happened to be named
+/// `unattributed-http`. That is ethos rule 4 exactly: a tag in a store the
+/// reader never opens is the same as no tag.
+///
+/// WHY THIS SIGNAL AND NOT "unattributed writes" GENERALLY: a rate needs a
+/// threshold, and a threshold below the baseline is not a detector (the
+/// spin-catcher lesson). Unattributed writes are legitimately non-zero forever
+/// -- the dashboard and the iPhone PWA have no session to declare. A session
+/// REPORT is different: it is emitted by `hook-report.sh`, which always sends
+/// the header, so the healthy value is structurally ZERO and no parameter has to
+/// be guessed. It also doubles as the AMUX-2936 uptake meter: as lanes recycle
+/// onto the new hook this falls on its own, and the breach clearing IS the
+/// remediation landing.
+pub fn reports_are_attributed(total: i64, unattributed: i64) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.reports_are_attributed";
+    // No reports at all is not health: it is the control plane being down, which
+    // `session.self_reports_landing` owns. Unknown here rather than a false pass.
+    if total <= 0 {
+        return vec![InvariantResult::unknown(
+            ID,
+            "no session reports in the window — see session.self_reports_landing",
+        )];
+    }
+    if unattributed == 0 {
+        return vec![InvariantResult::pass(ID)
+            .evidence(json!({"reports": total, "unattributed": 0}))];
+    }
+    let pct = 100.0 * unattributed as f64 / total as f64;
+    vec![InvariantResult::fail(
+        ID,
+        "every session report carries X-Amux-Session (hook-report.sh always sends it)",
+        format!(
+            "{unattributed} of {total} reports ({pct:.1}%) are UNATTRIBUTED — those lanes are \
+             running the pre-AMUX-2936 inline hook, which posts no header and no model/tokens. \
+             Hook config loads at SESSION START, so they cannot be fixed in place; they clear \
+             only as lanes restart. This falling to 0 is what AMUX-2936 being in effect looks like."
+        ),
+    )
+    .evidence(json!({
+        "reports": total, "unattributed": unattributed, "pct_unattributed": pct,
+        "card": "AF-67", "remedy": "lane restart picks up ~/.amux/hook-report.sh",
+    }))]
+}
+
+// ---------------------------------------------------------------------------
 // 6b. Are the report hooks WIRED to that script at all? (AMUX-2936)
 // ---------------------------------------------------------------------------
 
@@ -1940,6 +1996,30 @@ mod negative_controls {
             "report-hook drift must name ITS OWN source, not the guard's: {}",
             rep_drift[0].observed
         );
+    }
+
+    /// AF-67. The healthy value is structurally ZERO, so this needs no tuned
+    /// threshold — which is the point of picking reports over "unattributed
+    /// writes" generally (those are legitimately non-zero forever: the dashboard
+    /// and the PWA have no session).
+    #[test]
+    fn an_unattributed_session_report_is_a_failure_and_zero_is_a_pass() {
+        // The live specimen: 0 of 1,652 attributed across 12h (AF-67).
+        let bad = reports_are_attributed(1652, 1652);
+        assert_eq!(bad[0].status, Status::Fail, "100% unattributed must fail: {bad:?}");
+        assert!(bad[0].observed.contains("100.0%"), "{}", bad[0].observed);
+        assert!(bad[0].observed.contains("SESSION START"), "must name why it cannot be fixed live");
+
+        // A partially-recycled fleet still fails, so the breach tracks uptake
+        // rather than flipping only at the very end.
+        assert_eq!(reports_are_attributed(100, 3)[0].status, Status::Fail);
+
+        // Full uptake passes — this clearing IS AMUX-2936 landing.
+        let good = reports_are_attributed(100, 0);
+        assert_eq!(good[0].status, Status::Pass, "zero unattributed must pass: {good:?}");
+
+        // No reports at all is the control plane being DOWN, not health.
+        assert_eq!(reports_are_attributed(0, 0)[0].status, Status::Unknown);
     }
 
     fn ent(event: &str, command: &str, matcher: Option<&str>) -> ReportHookEntry {

@@ -2624,29 +2624,6 @@ FIX: c7fe156 — the message now spells out `amux board <status> <id> --trigger 
   exclusion behavior was already correct; this makes the honest path discoverable (ethos rule
   6). Underlying nudge friction is the same family as [[amux-project-reference]] board churn.
 
-## `amux start <worker>` dies on "AMUX_API: unbound variable" at real launch, but dry-run works
-AREA: cli
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-15
-SESSION: amux-cloud
-CARD: AMUX-3145
-SYMPTOM: `amux start qwen-eval` printed `/Users/ethan/.local/bin/amux: line 600: AMUX_API:
-  unbound variable` and never launched the worker. `amux start qwen-eval --dry-run` a moment
-  earlier had worked and printed the correct command — so the CLI looked fine right up until a
-  real start. cmd_start references `$AMUX_API` bare on the tmux `-e AMUX_URL=$AMUX_API` inject
-  but never declares it local (the way _api_start / _api_stop / send all do), so under `set -u`
-  it is unbound whenever AMUX_API is not exported — which is the normal case (AMUX_URL is the
-  var that is set). Dry-run returns before that line, which is exactly why the break hid.
-COST: A launch that failed with a message pointing at an env var, not at the real cause (a
-  missing local). ~10 min dogfooding the ollama worker before spotting that dry-run and real
-  start diverge at the `set -u` line. A worker that silently never started.
-FIX: 7584a1f — declare `local AMUX_API="${AMUX_API:-${AMUX_URL:-https://localhost:8824}}"` at
-  the top of cmd_start. Log-signal follow-up (two-fix rule): `bash -n` cannot catch an unbound
-  var (runtime, not parse) and CI does not shellcheck the `amux` script — a shellcheck gate
-  would have flagged this as SC2154 (referenced but not assigned). That lint is the durable
-  surface for the next one; filed as a follow-up on AMUX-3145.
-
 ## amux send to a bare REPL worker: origin header is submitted as its own message, prompt body is not
 AREA: notices
 SEVERITY: slows

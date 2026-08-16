@@ -133,6 +133,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // pointed elsewhere. This is the leg that fails on the actual incident.
     out.extend(report_hooks_check());
 
+    // -- 6c. are session reports ATTRIBUTED? (AF-67). The largest signal in the
+    // request log had no automated consumer: autofix reads only status>=500 and
+    // a report is a 200, so 7,708 unattributed reports/day were visible to
+    // nobody until a human-named trigger happened to say "unattributed-http".
+    out.extend(reports_attributed_check(state));
+
     // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
     // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
     // rate" as its detector but nothing read it; this closes that loop.
@@ -562,6 +568,31 @@ mod report_hook_wiring_tests {
             "settings.json HAS report hooks but the monitor reached no verdict — the \
              extractor and the live file disagree: {rs:?}"
         );
+    }
+}
+
+/// Count this window's session reports, split on whether the write was stamped.
+///
+/// Reads `_amux_request_log` directly because that is where the ANSWER is: the
+/// `amux_session` column is the header stamp, and it is the same column the
+/// attribution audit and the send-ledger read. Deriving it from anywhere else
+/// would let the check disagree with the thing it describes.
+fn reports_attributed_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.reports_are_attributed";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let since = crate::config::now_f64() - 3600.0;
+    let row = conn.query_row(
+        "SELECT COUNT(*), SUM(CASE WHEN COALESCE(amux_session,'')='' THEN 1 ELSE 0 END) \
+         FROM _amux_request_log \
+         WHERE method='POST' AND path LIKE '/api/sessions/%/report' AND ts >= ?1",
+        [since],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+    );
+    match row {
+        Ok((total, unattr)) => checks::reports_are_attributed(total, unattr),
+        Err(e) => vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
     }
 }
 
