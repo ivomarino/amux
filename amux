@@ -2563,6 +2563,30 @@ cmd_tunnel() {
   local AMUX_API="${AMUX_API:-https://localhost:8824}"
   local subcmd="${1:-status}"; shift 2>/dev/null || true
 
+  # PREFLIGHT (AF-63). /api/tunnel/* is NOT routed in the rust server -- the
+  # endpoints were never ported at the python cutover, so every verb here hits a
+  # 404. Without this guard the CLI lies in two different directions:
+  #   status: the 404 body has no "configured" key, so `not d.get(configured)`
+  #           was true and it printed "not configured -- set AMUX_TUNNEL_TOKEN
+  #           in ~/.amux/server.env", exit 0. That sends the reader to add a
+  #           CREDENTIAL for a route that does not exist; they would edit
+  #           server.env, restart the server, and be exactly as broken.
+  #   stop:   `curl ... >/dev/null && echo "tunnel stopped"` -- curl exits 0 on
+  #           an HTTP 404 without -f, so it reported success for an operation
+  #           that reached no handler at all.
+  # Found by the 2026-08-16 log sweep via route.callers_have_routes, which names
+  # all 7 call sites; nothing else could see it, because a CLI that exits 0 is
+  # invisible to every check that looks at exit codes.
+  local _tunnel_code
+  _tunnel_code=$(curl -sk -o /dev/null -w '%{http_code}' "$AMUX_API/api/tunnel/status" 2>/dev/null || echo 000)
+  if [[ "$_tunnel_code" == "404" ]]; then
+    echo "amux tunnel: not available in this server build (HTTP 404 -- /api/tunnel/* is not routed)." >&2
+    echo "  The verb exists in this CLI but the endpoints were never ported to the rust server." >&2
+    echo "  Setting AMUX_TUNNEL_TOKEN will NOT help; that is a different failure." >&2
+    echo "  Tracked as AF-63." >&2
+    return 1
+  fi
+
   case "$subcmd" in
     start)
       local port="${1:-}"
@@ -2583,7 +2607,17 @@ print(('already running → ' if d.get('already') else 'tunnel up → ') + (d.ge
 "
       ;;
     stop)
-      curl -sk -X POST "$AMUX_API/api/tunnel/stop" >/dev/null && echo "tunnel stopped"
+      # Check the STATUS, not curl's exit code: curl returns 0 for a 404/500
+      # unless -f is passed, which is how this printed "tunnel stopped" against
+      # a route that does not exist (AF-63).
+      local _stop_code
+      _stop_code=$(curl -sk -o /dev/null -w '%{http_code}' -X POST "$AMUX_API/api/tunnel/stop" 2>/dev/null || echo 000)
+      if [[ "$_stop_code" == 2* ]]; then
+        echo "tunnel stopped"
+      else
+        echo "amux tunnel stop: server returned HTTP $_stop_code -- tunnel NOT stopped" >&2
+        return 1
+      fi
       ;;
     status|"")
       curl -sk "$AMUX_API/api/tunnel/status" | python3 -c "
