@@ -1859,7 +1859,7 @@ FIX: Give `pane_size` and `ghost_rescue` the same `AMUX_<JOB>_SECS=0` disable kn
 ## /api/debug/routes reports a mounted debug route as NOT MOUNTED
 AREA: instruments
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-10
 SESSION: autofix (subagent)
 CARD: AF-70
@@ -1872,8 +1872,17 @@ COST: Minutes deciding whether to touch a contested file. The real cost lands la
   same comment at request_log.rs:~840 records this exact failure happening once already
   ("reported it NOT MOUNTED while the handler was answering") and the fix did not
   generalise to runtime-job routes.
-FIX: One `RouteEntry` per runtime-job debug route, or better — have `routes()` of each
-  runtime job contribute its paths so the table cannot be forgotten.
+FIX: FIXED for both routes this entry named. Verified live 2026-08-16 by amux-frustrations:
+  `/api/debug/board-drive` and `/api/debug/autofix` each answer 200 AND are now present in
+  `/api/debug/routes` (table size 247). The two-route-wide gap the entry describes is closed.
+  BUT THE GENERALISATION IT ASKED FOR DID NOT HAPPEN, and it has already bitten again: the
+  entry's own preferred fix was "have `routes()` of each runtime job contribute its paths so
+  the table cannot be forgotten". That was not done — the two routes were added by hand — so
+  the table can still be forgotten, and `/api/debug/scan` now IS forgotten: `ethos.md:523`
+  says it "exists", `registry.rs:312` advertises it as a job's detail link, and it 404s with
+  no route registration anywhere. Filed as AF-80; this entry stays fixed because its own
+  scope is closed, but its predicted third instance already exists.
+  Awaiting the originating session's sign-off; see the SESSION caveat.
 
 ## The live-DB migration guard test fails on any target dir not literally named `target`
 AREA: instruments
