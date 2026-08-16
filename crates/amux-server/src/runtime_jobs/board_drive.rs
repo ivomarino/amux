@@ -375,14 +375,34 @@ impl Fleet for LiveFleet {
 /// artifact/dormant -> STRUCTURE VETO -> journal -> shell. Structure beats the
 /// fold count because a real investigation card can carry fold RESIDUE from the
 /// folding era; a true journal has folds and no structure.
-pub fn pickup_junk_reason(title: &str, desc: &str) -> String {
+pub fn pickup_junk_reason(title: &str, desc: &str, log: &str) -> String {
     use std::sync::OnceLock;
     static ARTIFACT: OnceLock<regex::Regex> = OnceLock::new();
     static CAPS_HEAD: OnceLock<regex::Regex> = OnceLock::new();
     static STRUCTURE: OnceLock<regex::Regex> = OnceLock::new();
     static PROMPT: OnceLock<regex::Regex> = OnceLock::new();
 
-    let folds = desc.matches("New task:").count();
+    // The card's HISTORY (`log`) is legitimate signal for the STRUCTURE veto and
+    // the FOLD count (content that can live in either field), so those read the
+    // combined blob. The CAPTURE brand does NOT: it must read the card's CURRENT
+    // DEFINITION (`desc`) only. `capture: session prompt` is a DURABLE LOG marker
+    // minted once at capture (session_verbs.rs) that NEVER clears, so a card
+    // auto-captured and then RESHAPED into a real task (desc rewritten, retyped)
+    // carries it in the log forever. Reading it from the blob re-branded a
+    // reshaped card "a captured chat prompt" on every 6h decompose tick and
+    // nagged a card the session had already fixed (AMUX-3187). A fresh capture's
+    // desc ALWAYS begins "**Prompt:** " (session_verbs.rs:2574), so the anchored
+    // PROMPT check below still catches every real capture on its CURRENT desc,
+    // and reshaping the desc — the sanctioned exit — now actually works.
+    let blob = if log.trim().is_empty() {
+        desc.to_string()
+    } else {
+        format!("{desc}\n{log}")
+    };
+    let folds = blob.matches("New task:").count();
+    // The marker on the CURRENT desc still brands (a card literally defined as the
+    // capture marker is a shell); but read `desc`, NOT the blob, so the durable
+    // LOG copy of a reshaped card does not (AMUX-3187, see above).
     if desc.contains("capture: session prompt") && folds < 2 {
         return "captured chat prompt, not a unit of work".into();
     }
@@ -410,12 +430,15 @@ pub fn pickup_junk_reason(title: &str, desc: &str) -> String {
         )
         .expect("structure regex")
     });
-    if caps.find_iter(desc).count() >= 2 || structure.is_match(desc) {
+    if caps.find_iter(&blob).count() >= 2 || structure.is_match(&blob) {
         return String::new();
     }
     if folds >= 2 {
         return format!("journal card ({folds} folded tasks)");
     }
+    // Anchored on the CURRENT `desc`, not the blob: a fresh capture's desc begins
+    // "**Prompt:** " and a reshaped card's does not, which is what lets the
+    // reshape clear the brand (AMUX-3187).
     let prompt = PROMPT
         .get_or_init(|| regex::Regex::new(r"(?s)^\s*\*\*Prompt:\*\*\s*(?:\[[^\]]*\]\s*)?(.*)$").expect("prompt regex"));
     if let Some(c) = prompt.captures(desc.trim()) {
@@ -1297,7 +1320,7 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
                 }
             }
         }
-        let junk = pickup_junk_reason(&row.title, &blob_desc);
+        let junk = pickup_junk_reason(&row.title, &row.desc, row.log.as_deref().unwrap_or(""));
         if !junk.is_empty() {
             shells.push((id.clone(), row.title.chars().take(70).collect()));
             skipped.push(format!("{id} — {junk}"));
@@ -1987,9 +2010,10 @@ pub fn select_advance(
     // Same not-a-task guard as pickup, via the SAME predicate with the SAME
     // inputs (py:13503 — this block used to inline its own copy of the regexes,
     // which diverged the moment the shared one gained the structure veto: three
-    // paths, three verdicts, one unchanged card).
-    let blob_desc = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
-    let why = pickup_junk_reason(&row.title, &blob_desc);
+    // paths, three verdicts, one unchanged card). desc and log are passed
+    // separately so the capture brand reads the current desc, not the durable
+    // log marker — a reshaped card no longer re-nags (AMUX-3187).
+    let why = pickup_junk_reason(&row.title, &row.desc, row.log.as_deref().unwrap_or(""));
     if !why.is_empty() {
         // TELL THE LANE, do not just log it (py:13513, board-exp-1). Refusing to
         // nudge "advance it" at a capture shell is right — nothing about a chat
@@ -4437,21 +4461,54 @@ mod tests {
     fn the_junk_predicate_matches_pythons_specimens() {
         // Structure beats the fold count: a real card with fold RESIDUE.
         let structured = "ROOT CAUSE: the thing\nNew task: a\nNew task: b\nNew task: c";
-        assert_eq!(pickup_junk_reason("MG-1328 real investigation", structured), "");
+        assert_eq!(pickup_junk_reason("MG-1328 real investigation", structured, ""), "");
         // A true journal: folds, no structure.
-        assert!(pickup_junk_reason("journal", "New task: a\nNew task: b").contains("journal card"));
+        assert!(pickup_junk_reason("journal", "New task: a\nNew task: b", "").contains("journal card"));
         // GCA-85 + creative-dna: the artifact word must be the SUBJECT.
         assert!(
-            pickup_junk_reason("Investigate the canary alerting path", "").is_empty(),
+            pickup_junk_reason("Investigate the canary alerting path", "", "").is_empty(),
             "a card ABOUT a canary is not a canary (GCA-85: three investigation cards fired \
              on a mid-title mention)"
         );
-        assert!(pickup_junk_reason("[test-hygiene] flaky suite", "").is_empty(), "area prefix is vocabulary");
-        assert!(!pickup_junk_reason("[TRIPWIRE, fires on recurrence]", "").is_empty());
-        assert!(!pickup_junk_reason("probe: is the server up", "").is_empty());
+        assert!(pickup_junk_reason("[test-hygiene] flaky suite", "", "").is_empty(), "area prefix is vocabulary");
+        assert!(!pickup_junk_reason("[TRIPWIRE, fires on recurrence]", "", "").is_empty());
+        assert!(!pickup_junk_reason("probe: is the server up", "", "").is_empty());
         // Shells.
-        assert!(pickup_junk_reason("x", "**Prompt:** /compact").contains("slash command"));
-        assert!(pickup_junk_reason("x", "**Prompt:** go fix the thing").contains("captured chat prompt"));
+        assert!(pickup_junk_reason("x", "**Prompt:** /compact", "").contains("slash command"));
+        assert!(pickup_junk_reason("x", "**Prompt:** go fix the thing", "").contains("captured chat prompt"));
+    }
+
+    /// AMUX-3187: `capture: session prompt` is a durable LOG marker, so a card
+    /// that was auto-captured and then RESHAPED into a real task keeps it forever.
+    /// The brand must read the current DESC, not the log, or the decompose nudge
+    /// re-nags a card the session already fixed.
+    #[test]
+    fn a_reshaped_capture_is_no_longer_branded_a_capture() {
+        // POSITIVE CONTROL: a still-raw capture (desc begins "**Prompt:** ", log
+        // carries the marker) IS junk. If this ever passed clean the test below
+        // would be vacuous.
+        let raw_log = "12:00 capture: session prompt";
+        assert!(
+            pickup_junk_reason("Look up the top VLLM", "**Prompt:** [05:32 PM] look up the top VLLM", raw_log)
+                .contains("captured chat prompt"),
+            "a still-raw capture must be branded"
+        );
+        // THE FIX: same log marker, but the desc has been rewritten into a real
+        // ops task (AMUX-3185's actual reshaped desc shape). Not junk.
+        let reshaped = "Ethan (2026-08-15): find the current top open-weights LLM and pull it into \
+                        ollama so it appears in the model picker. Chosen qwen3-coder:30b. \
+                        Done when the model shows in GET /api/ollama/models.";
+        assert_eq!(
+            pickup_junk_reason("Pull qwen3-coder:30b into ollama", reshaped, raw_log),
+            "",
+            "a card reshaped out of its capture form must NOT be re-branded by the durable log marker"
+        );
+        // And the marker sitting ONLY in the log never brands on its own.
+        assert_eq!(
+            pickup_junk_reason("A perfectly normal task", "Do the normal thing.", raw_log),
+            "",
+            "the capture-origin log marker alone must not brand a card"
+        );
     }
 
     #[test]
