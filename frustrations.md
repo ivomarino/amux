@@ -1856,34 +1856,6 @@ FIX: Give `pane_size` and `ghost_rescue` the same `AMUX_<JOB>_SECS=0` disable kn
   other two runtime jobs already have, and default them OFF when `AMUX_HOME` is not the
   real `~/.amux` — a server pointed at a scratch home has no business steering the fleet.
 
-## /api/debug/routes reports a mounted debug route as NOT MOUNTED
-AREA: instruments
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-10
-SESSION: autofix (subagent)
-CARD: AF-70
-SYMPTOM: `/api/debug/board-drive` is mounted (api/mod.rs merges `board_drive::routes()`)
-  and answers, but it is absent from `ROUTE_TABLE`, so `/api/debug/routes` — the
-  instrument CLAUDE.md tells you to consult INSTEAD of grepping — does not list it. I hit
-  this adding `/api/debug/autofix` and deliberately left mine unlisted too rather than
-  edit a file another lane owns, which means the gap is now two routes wide.
-COST: Minutes deciding whether to touch a contested file. The real cost lands later: the
-  same comment at request_log.rs:~840 records this exact failure happening once already
-  ("reported it NOT MOUNTED while the handler was answering") and the fix did not
-  generalise to runtime-job routes.
-FIX: FIXED for both routes this entry named. Verified live 2026-08-16 by amux-frustrations:
-  `/api/debug/board-drive` and `/api/debug/autofix` each answer 200 AND are now present in
-  `/api/debug/routes` (table size 247). The two-route-wide gap the entry describes is closed.
-  BUT THE GENERALISATION IT ASKED FOR DID NOT HAPPEN, and it has already bitten again: the
-  entry's own preferred fix was "have `routes()` of each runtime job contribute its paths so
-  the table cannot be forgotten". That was not done — the two routes were added by hand — so
-  the table can still be forgotten, and `/api/debug/scan` now IS forgotten: `ethos.md:523`
-  says it "exists", `registry.rs:312` advertises it as a job's detail link, and it 404s with
-  no route registration anywhere. Filed as AF-80; this entry stays fixed because its own
-  scope is closed, but its predicted third instance already exists.
-  Awaiting the originating session's sign-off; see the SESSION caveat.
-
 ## A correct refusal shipped as HTTP 500 for months, and poisoned the error sweep
 AREA: instruments
 SEVERITY: slows
