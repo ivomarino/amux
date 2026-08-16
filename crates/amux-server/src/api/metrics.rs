@@ -179,33 +179,46 @@ fn collect_system_metrics() -> serde_json::Value {
         }
     }
 
-    // Disk via df
-    if let Some(df_s) = cmd_output("df", &["-k", "/"]) {
-        if let Some(last_line) = df_s.lines().last() {
-            let parts: Vec<&str> = last_line.split_whitespace().collect();
-            if parts.len() >= 3 {
-                if let (Ok(tk), Ok(uk)) = (
-                    parts[1].parse::<u64>(),
-                    parts[2].parse::<u64>(),
-                ) {
-                    sys.insert(
-                        "disk_total_gb".into(),
-                        json!((tk as f64 / 1_048_576.0 * 10.0).round() / 10.0),
-                    );
-                    sys.insert(
-                        "disk_used_gb".into(),
-                        json!((uk as f64 / 1_048_576.0 * 10.0).round() / 10.0),
-                    );
-                    sys.insert(
-                        "disk_percent".into(),
-                        json!(if tk > 0 {
-                            (uk as f64 / tk as f64 * 1000.0).round() / 10.0
-                        } else {
-                            0.0
-                        }),
-                    );
-                }
-            }
+    // Disk, measured on the volume that actually holds the user's data.
+    //
+    // This used to run `df -k /` and it was wrong on every modern macOS: `/` is
+    // the SEALED READ-ONLY system snapshot (~11GB, essentially static), while
+    // everything a user owns lives on `/System/Volumes/Data`. So the gauge read
+    // 0.6% used on 2026-08-16 while the data volume was 90% full and writes
+    // were failing — a green light on a machine in trouble, which is worse than
+    // no gauge because it is trusted (ethos rule 7). Asking statfs about $HOME
+    // asks about the right volume by construction, with no mount point to keep
+    // in step. Same helper the reclaim scanner reports free space with, so the
+    // two can never disagree.
+    if let Some((free, total)) = super::reclaim::df_bytes(&super::reclaim::home_dir()) {
+        let used = total.saturating_sub(free);
+        let pct = if total > 0 {
+            used as f64 / total as f64 * 100.0
+        } else {
+            0.0
+        };
+        sys.insert(
+            "disk_total_gb".into(),
+            json!((total as f64 / 1_073_741_824.0 * 10.0).round() / 10.0),
+        );
+        sys.insert(
+            "disk_used_gb".into(),
+            json!((used as f64 / 1_073_741_824.0 * 10.0).round() / 10.0),
+        );
+        sys.insert(
+            "disk_free_gb".into(),
+            json!((free as f64 / 1_073_741_824.0 * 10.0).round() / 10.0),
+        );
+        sys.insert("disk_percent".into(), json!((pct * 10.0).round() / 10.0));
+        // Self-announcing: a disk filling up should be visible in a log sweep
+        // without anyone opening the dashboard. This is the signal that was
+        // missing while the volume went to 99%.
+        if pct >= 90.0 {
+            tracing::warn!(
+                disk_percent = pct,
+                free_gb = free as f64 / 1_073_741_824.0,
+                "disk critically full"
+            );
         }
     }
 
@@ -509,6 +522,42 @@ mod tests {
     use chrono::Utc;
     use std::sync::Arc;
     use tower::ServiceExt;
+
+    /// Regression guard for the wrong-volume disk gauge.
+    ///
+    /// `df -k /` on APFS measures the sealed read-only system snapshot, which
+    /// is ~11GB and never moves, so the dashboard reported 0.6% used while the
+    /// data volume was 90% full. The tell is cheap and specific: the system
+    /// snapshot is tiny, so a `disk_total_gb` in that range means the reading
+    /// came from the wrong volume again.
+    #[test]
+    fn disk_metrics_measure_the_data_volume_not_the_sealed_system_snapshot() {
+        let sys = super::collect_system_metrics();
+        let total = sys["disk_total_gb"].as_f64().expect("disk_total_gb present");
+        let used = sys["disk_used_gb"].as_f64().expect("disk_used_gb present");
+        let pct = sys["disk_percent"].as_f64().expect("disk_percent present");
+
+        // The data volume on any real machine dwarfs the ~11GB system snapshot.
+        assert!(
+            total > 50.0,
+            "disk_total_gb = {total} — that is the sealed system volume, not the data volume"
+        );
+        assert!(used <= total, "used ({used}) cannot exceed total ({total})");
+
+        // And it must agree with statfs on $HOME, which is where user data is.
+        let (free, statfs_total) =
+            crate::api::reclaim::df_bytes(&crate::api::reclaim::home_dir()).expect("statfs");
+        let statfs_total_gb = statfs_total as f64 / 1_073_741_824.0;
+        assert!(
+            (total - statfs_total_gb).abs() < 1.0,
+            "metrics reports {total} GB total but statfs on $HOME reports {statfs_total_gb} GB"
+        );
+        let expect_pct = (statfs_total - free) as f64 / statfs_total as f64 * 100.0;
+        assert!(
+            (pct - expect_pct).abs() < 1.0,
+            "metrics reports {pct}% used but the data volume is at {expect_pct}%"
+        );
+    }
 
     fn app() -> (axum::Router, SharedStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();

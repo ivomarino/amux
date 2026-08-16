@@ -27709,11 +27709,14 @@ function _metricsRender() {
   }
   if (sys.disk_total_gb) {
     const cls = _metricsGaugeCls(sys.disk_percent || 0);
-    html += `<div class="metrics-card">
-      <div class="metrics-card-title">Disk (/)</div>
-      <div class="metrics-card-value">${sys.disk_used_gb}<span> GB</span></div>
-      <div class="metrics-card-sub">of ${sys.disk_total_gb} GB &mdash; ${(sys.disk_percent || 0).toFixed(0)}%</div>
+    // Free space is the number you act on, so it leads. Clicking through to
+    // Disk Cleanup is the point: a red gauge with no next step is just anxiety.
+    html += `<div class="metrics-card reclaim-catcard" onclick="_metricsSetMode('disk')" title="Open Disk Cleanup">
+      <div class="metrics-card-title">Disk</div>
+      <div class="metrics-card-value">${sys.disk_free_gb != null ? sys.disk_free_gb : (sys.disk_total_gb - sys.disk_used_gb).toFixed(1)}<span> GB free</span></div>
+      <div class="metrics-card-sub">${sys.disk_used_gb} of ${sys.disk_total_gb} GB used &mdash; ${(sys.disk_percent || 0).toFixed(0)}%</div>
       <div class="metrics-gauge"><div class="metrics-gauge-fill ${cls}" style="width:${Math.min(100, sys.disk_percent || 0)}%"></div></div>
+      <div style="font-size:0.66rem;color:var(--accent,#58a6ff);margin-top:6px;">Disk Cleanup &rsaquo;</div>
     </div>`;
   }
   html += '</div>';

@@ -76,7 +76,14 @@ fn now_secs() -> i64 {
 ///
 /// This is the number the user sees in Finder, and the ONLY honest measure of
 /// whether a cleanup worked. Deliberately not derived from summing file sizes.
-fn df_bytes(path: &FsPath) -> Option<(u64, u64)> {
+///
+/// Shared with `api::metrics` on purpose. Asking about a PATH rather than a
+/// mount point is what makes it correct on APFS: `/` is the sealed read-only
+/// system snapshot (~11GB), while everything a user owns lives on
+/// `/System/Volumes/Data`. `df -k /` therefore answers about the wrong volume,
+/// which is how the metrics gauge read 0.6% used on a machine that was 90%
+/// full and failing writes.
+pub(crate) fn df_bytes(path: &FsPath) -> Option<(u64, u64)> {
     let c_path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).ok()?;
     let mut st: libc::statfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statfs(c_path.as_ptr(), &mut st) } != 0 {
@@ -165,7 +172,7 @@ fn devtool_roots() -> Vec<(PathBuf, &'static str, &'static str)> {
     ]
 }
 
-fn home_dir() -> PathBuf {
+pub(crate) fn home_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/Users/ethan".into()))
 }
 
