@@ -1206,6 +1206,11 @@ pub struct AlertChannelState {
     pub push_sub_count: usize,
     pub sms_enabled: bool,
     pub phone_configured: bool,
+    /// Email is the destination that needs no manual setup (AMUX-3203): a
+    /// connected Gmail account's own inbox reaches the owner. `email_reachable`
+    /// is true when AMUX_OWNER_EMAIL is set OR any Gmail account is connected.
+    pub email_enabled: bool,
+    pub email_reachable: bool,
     /// `owner_alerts` rows written in the lookback window, and how many reached
     /// zero channels. Corroboration, not the verdict: reachability decides
     /// Pass/Fail, but a nonzero drop count turns "config looks unfinished" into
@@ -1246,30 +1251,38 @@ pub fn alert_channel_can_deliver(s: &AlertChannelState) -> Vec<InvariantResult> 
         (true, false) => "enabled but AMUX_OWNER_PHONE is empty".to_string(),
         (true, true) => "enabled, phone configured".to_string(),
     };
+    let email_state = match (s.email_enabled, s.email_reachable) {
+        (false, _) => "disabled (AMUX_URGENT_EMAIL=0)".to_string(),
+        (true, false) => "enabled but no AMUX_OWNER_EMAIL and no connected Gmail account".to_string(),
+        (true, true) => "enabled, owner email or connected Gmail account present".to_string(),
+    };
     let evidence = json!({
         "class": "fire-alarm-reachability",
         "push": push_state,
         "sms": sms_state,
+        "email": email_state,
         "push_sub_count": s.push_sub_count,
         "recent_alerts_24h": s.recent_alerts,
         "recent_zero_delivery_24h": s.recent_zero_delivery,
         "incident": "AMUX-3203: 0 subs + empty phone dropped 5 serious pages \
                      (prod-down, security x2) while 171 cards waited on the owner",
-        "fix": "owner action: subscribe to push from the PWA (grant notification \
-                permission), or set AMUX_OWNER_PHONE in ~/.amux/server.env",
+        "fix": "email now reaches the owner with no setup (a connected Gmail \
+                account's own inbox). Or subscribe to push from the PWA, or set \
+                AMUX_OWNER_PHONE / AMUX_OWNER_EMAIL in ~/.amux/server.env",
     });
 
-    // Both channels off is the owner deliberately silencing the alarm. Report it,
+    // All channels off is the owner deliberately silencing the alarm. Report it,
     // do not fail his choice.
-    if !s.push_enabled && !s.sms_enabled {
+    if !s.push_enabled && !s.sms_enabled && !s.email_enabled {
         let mut r = InvariantResult::new(ID, Status::Skipped).entity("owner-alert").evidence(evidence);
-        r.observed = "owner-alert is OFF by config (both AMUX_URGENT_PUSH and AMUX_URGENT_SMS are 0)".into();
+        r.observed = "owner-alert is OFF by config (AMUX_URGENT_PUSH, _SMS and _EMAIL are all 0)".into();
         return vec![r];
     }
 
     let push_ok = s.push_enabled && s.push_sub_count > 0;
     let sms_ok = s.sms_enabled && s.phone_configured;
-    if push_ok || sms_ok {
+    let email_ok = s.email_enabled && s.email_reachable;
+    if push_ok || sms_ok || email_ok {
         return vec![InvariantResult::pass(ID).entity("owner-alert").evidence(evidence)];
     }
     // Armed but disconnected: at least one channel is enabled and none can reach a
@@ -1277,7 +1290,7 @@ pub fn alert_channel_can_deliver(s: &AlertChannelState) -> Vec<InvariantResult> 
     vec![InvariantResult::fail(
         ID,
         "owner-alert reaches a human: >=1 enabled channel with a destination",
-        format!("no reachable destination. push: {push_state}; sms: {sms_state}"),
+        format!("no reachable destination. push: {push_state}; sms: {sms_state}; email: {email_state}"),
     )
     .entity("owner-alert")
     .evidence(evidence)]
@@ -1300,12 +1313,14 @@ mod negative_controls {
     /// Failed (ethos rule 8).
     #[test]
     fn detects_the_fire_alarm_with_no_destination() {
-        // The incident state: armed, no wire to a human.
+        // The incident state: every channel armed, none with a destination.
         let incident = AlertChannelState {
             push_enabled: true,
             push_sub_count: 0,
             sms_enabled: true,
             phone_configured: false,
+            email_enabled: true,
+            email_reachable: false,
             recent_alerts: 5,
             recent_zero_delivery: 5,
         };
@@ -1322,32 +1337,46 @@ mod negative_controls {
         let with_phone = AlertChannelState { phone_configured: true, ..incident.clone() };
         assert_eq!(alert_channel_can_deliver(&with_phone)[0].status, Status::Pass);
 
-        // One channel enabled+reachable, the OTHER disabled, still passes.
+        // Email alone clears it — the no-setup destination (AMUX-3203). This is
+        // the case that goes green on the real machine, where a Gmail account is
+        // connected but push has 0 subs and no phone is set.
+        let with_email = AlertChannelState { email_reachable: true, ..incident.clone() };
+        assert_eq!(
+            alert_channel_can_deliver(&with_email)[0].status,
+            Status::Pass,
+            "a connected Gmail account is a reachable destination"
+        );
+
+        // One channel enabled+reachable, the OTHERS disabled, still passes.
         let push_only = AlertChannelState {
             push_enabled: true,
             push_sub_count: 2,
             sms_enabled: false,
             phone_configured: false,
+            email_enabled: false,
+            email_reachable: false,
             recent_alerts: 0,
             recent_zero_delivery: 0,
         };
         assert_eq!(alert_channel_can_deliver(&push_only)[0].status, Status::Pass);
 
-        // A subscription behind a DISABLED push channel, and a phone behind a
-        // DISABLED sms channel, are NOT reachable: with both channels off the
-        // alarm is silenced by choice -> Skipped, never a cheerful Pass.
-        let both_off = AlertChannelState {
+        // Reachable destinations behind DISABLED channels do not count: with ALL
+        // three channels off the alarm is silenced by choice -> Skipped, never a
+        // cheerful Pass.
+        let all_off = AlertChannelState {
             push_enabled: false,
             push_sub_count: 5,
             sms_enabled: false,
             phone_configured: true,
+            email_enabled: false,
+            email_reachable: true,
             recent_alerts: 0,
             recent_zero_delivery: 0,
         };
         assert_eq!(
-            alert_channel_can_deliver(&both_off)[0].status,
+            alert_channel_can_deliver(&all_off)[0].status,
             Status::Skipped,
-            "both channels off is the owner's choice, reported not failed"
+            "all channels off is the owner's choice, reported not failed"
         );
     }
 

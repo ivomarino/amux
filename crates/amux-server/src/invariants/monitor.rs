@@ -170,6 +170,11 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
     let push_enabled = ev("AMUX_URGENT_PUSH").unwrap_or_else(|| "1".into()) != "0";
     let sms_enabled = ev("AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0";
     let phone_configured = !ev("AMUX_OWNER_PHONE").unwrap_or_default().trim().is_empty();
+    let email_enabled = ev("AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
+    // Reachable when an owner email is set OR any Gmail account is connected (its
+    // own inbox is the default destination). Same resolution the sender uses.
+    let email_reachable = !ev("AMUX_OWNER_EMAIL").unwrap_or_default().trim().is_empty()
+        || !crate::integrations::email::connected_accounts_in(&home).is_empty();
 
     let Ok(conn) = state.store.read() else {
         return vec![InvariantResult::unknown(ID, "store unreadable")];
@@ -214,6 +219,8 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
         push_sub_count,
         sms_enabled,
         phone_configured,
+        email_enabled,
+        email_reachable,
         recent_alerts,
         recent_zero_delivery,
     })
