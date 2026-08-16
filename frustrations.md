@@ -2883,3 +2883,26 @@ CARD: AC-360
 SYMPTOM: The CLOUD FRESHNESS TICK step-1 probe `curl -sk https://cloud.amux.io/app.js | grep APP_VER` returns EMPTY. Unauthenticated `app.js` now 302s to `/sign-in` (http=302, size=0). `/health` and `/version` also 302; `/api/health` and `/api/version` 401. There is no auth-free endpoint on the gateway that reveals the served build, so the recipe's `served=` is always blank for whoever runs the tick.
 COST: A blank `served` compared against a non-empty `head` reads as "cloud is behind origin/main" and, taken literally, would dispatch `recreate=yes` — which STOPS every worker container and does not restore them. That is precisely the false-positive-recreate-before-a-demo harm the 2026-08-12 guard was added to prevent, and here the trigger is a broken probe rather than a real drift. Caught only because I recognised the empty read as a probe fault, not a signal (ethos rule 7: an empty grep is not a measurement). A less careful run recreates prod to "fix" a drift that does not exist.
 FIX: (proposed on AC-360) Drop the app.js scrape. The robust, auth-free freshness signal already exists: the newest SUCCESSFUL `deploy-cloud` run's headSha vs origin/main. `gh run list --workflow=deploy-cloud.yml --json headSha,conclusion` -> newest `success` sha, then `git rev-list --count <sha>..origin/main`; 0 means the deployed image is current. Used exactly that this tick (last success 31914150334 built 73fce92; origin/main tip == 73fce92, 0 behind). The recipe change is Ethan's to make (it is his standing scheduler prompt, ethos rule 8) — proposed, not silently rewritten. Distinct from AC-344 (deploy-cloud SKIP is silent); this is the tick's own comparison being unable to read the served version at all.
+
+## The owner-alert fire alarm reached nobody for weeks and no sweep could see it
+AREA: notices
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-16
+SESSION: amux
+CARD: AMUX-3203
+SYMPTOM: GET /api/alert/config reported both channels enabled (push:true, sms:true) while
+  neither had a destination: push_subscriptions held 0 rows and AMUX_OWNER_PHONE was empty.
+  The five most recent owner_alerts (ids 93-97) each recorded channels
+  {"push":"error: no push subscriptions","sms":"no phone configured"}, a prod-down, a
+  fleet-burn, and two security holes (GCA-100, GCA-95), every one dropped. Nothing
+  proactively said the alarm was disconnected; the only trace was a per-send WARN that
+  fires only when an alert is sent, in a log nobody tails.
+COST: Weeks of silent non-delivery. Two security escalations and a prod-down page never
+  reached the owner; 171 board cards piled up in needsyou with no escalation, and the
+  dead state was only found by a peer measuring the backlog by hand (mixpeek-homepage-claude).
+FIX: c6bd42b. New invariant alert.channel_can_deliver fails continuously in
+  /api/health/invariants when an enabled channel has no reachable destination, so a sweep
+  catches the dead alarm. Verified failing live 2026-08-16. Connecting a destination stays
+  the owner's action (subscribe to push from the PWA, or set AMUX_OWNER_PHONE); the check
+  reports it, it does not repair it (ethos rule 8).
