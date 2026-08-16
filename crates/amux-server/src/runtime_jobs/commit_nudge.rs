@@ -255,9 +255,13 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              Do NOT assume {} yours. `git add -A` here would commit whatever a peer is \
              mid-edit on — OR a STALE copy origin/main has moved past, which committing would \
              silently REVERT (no conflict; the older file just wins, AMUX-3000). For each, \
-             `git diff origin/main -- <path>`: worktree MISSING content origin has = stale, \
-             `git checkout origin/main -- <path>` to restore, do not commit. Stage only what \
-             you both recognise as your work AND can see is genuinely newer than origin.",
+             prove the direction with the OBJECT-EXISTENCE test, NOT the diff line-count: \
+             worktree-has-more/has-less misclassifies about 2 in 10 (studio-plg measured it on \
+             this checkout: files with MORE lines than origin that are nonetheless stale). \
+             `git cat-file -e $(git hash-object <path>) 2>/dev/null`: object EXISTS = this exact \
+             content was committed before = STALE, `git checkout origin/main -- <path>` to \
+             restore, do not commit; object ABSENT = novel = a peer's mid-edit, hands off. \
+             Stage only what you recognise as your work AND whose object does not already exist.",
             if n == 1 { "it" } else { "them" },
             if n == 1 { "it is" } else { "they are" },
         );
@@ -282,27 +286,25 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          from origin/main, but the guard does not know which side is NEWER — and on this \
          graft-push checkout the worktree is frequently the OLDER side. A stale worktree copy \
          is a LOADED REVERT: `git add -A` carries the older version forward and silently undoes \
-         the newer one on origin (no conflict, the older file just wins). So BEFORE staging, for \
-         each path run `git diff origin/main -- <path>` and read the direction:\n\
-         \u{2022} worktree ADDS content origin lacks -> real uncommitted work, commit it;\n\
-         \u{2022} worktree is MISSING content origin has AND adds nothing -> stale;\n\
-         \u{2022} no real diff -> a false positive, leave it.\n\
-         THESE ARE NOT MUTUALLY EXCLUSIVE, and that is where the remedy bites (AMUX-3172, \
-         gtm-ticker). A diff can BOTH add novel content AND lack origin's — a worktree that is \
-         AHEAD, not stale — and it matches the middle bullet too. \
-         `git checkout origin/main -- <path>` on that path DELETES the novel work, \
-         irreversibly, and the same warning fires in both directions. So before restoring \
-         ANYTHING, prove the direction:\n\
-         \u{2022} `git cat-file -e $(git hash-object <path>) 2>/dev/null` — if the object \
-         EXISTS, this exact content was committed before, so it is an older revision and \
-         restoring is safe;\n\
+         the newer one on origin (no conflict, the older file just wins). So BEFORE staging, \
+         PROVE the direction per path with the OBJECT-EXISTENCE test. Do NOT read the line-count \
+         of a `git diff` as the verdict: worktree-has-more/has-less misclassifies about 2 in 10 \
+         (studio-plg measured it on this checkout — files with MORE lines than origin that are \
+         nonetheless stale, because their exact blob was committed before and origin has since \
+         moved to a shorter version). Roughly 1 in 4 differing paths here are novel mid-edit a \
+         blind `checkout` would DESTROY irreversibly, so the object test is the headline, not a \
+         caveat:\n\
+         \u{2022} `git cat-file -e $(git hash-object <path>) 2>/dev/null` — if the object EXISTS, \
+         this exact content was committed before, so it is an older revision (STALE): \
+         `git checkout origin/main -- <path>` safely restores it, do not commit;\n\
          \u{2022} if it does NOT exist, the content has never been committed anywhere: it is \
-         NOVEL, `checkout` destroys it, and the safe action is COMMIT, not restore.\n\
+         NOVEL (a mid-edit), `checkout` destroys it, and the safe action is COMMIT, not restore.\n\
          When the check is ambiguous or you cannot run it, commit — a redundant commit is \
-         recoverable and a restore is not.\n\
-         Commit only the paths you can see are genuinely newer, with a clear message; WIP-commit \
-         anything intentionally incomplete and say so. Don't leave the working tree dirty — but \
-         don't commit a revert to clear it, either."
+         recoverable and a restore is not. (A `git diff` still shows WHAT changed; just never \
+         read worktree-has-more as newer.)\n\
+         Commit only the paths whose object does not already exist, with a clear message; \
+         WIP-commit anything intentionally incomplete and say so. Don't leave the working tree \
+         dirty — but don't commit a revert to clear it, either."
     );
 
     if !unknown.is_empty() {
