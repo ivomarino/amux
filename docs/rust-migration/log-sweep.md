@@ -171,6 +171,30 @@ fallback when a finding needs row-level inspection.
    Before filing, confirm the worker has *any* card here. If it does not, the
    honest finding is "cannot evaluate from this board", not a violation.
 
+   **Two more, both of which produced a false accusation on 2026-08-16 and were
+   caught only by re-querying the store.** Neither is hypothetical; the first is
+   this file's own rule, violated by someone who had just read it.
+
+   - **Attribute on `amux_session` ONLY. Never fall back to `worker`.** `worker`
+     is PATH-derived (`/api/sessions/{name}/*`), so an UNATTRIBUTED report *about*
+     lane X is tagged `worker=X` and reads as a mutation *by* X. That is what the
+     header of this file means by "worker logs are a filter, never a second log".
+     Using it as a fallback flagged `mixpeek-security` as working off-ledger on 5
+     requests it never made — the store showed ZERO mutating rows for it. With
+     7,708 unattributed reports/day (AF-67) this fallback manufactures a silent
+     worker for every busy lane on the board.
+   - **Test `max(created, updated)`, not `updated`.** A worker whose only board
+     action was CREATING a card has `updated` unset, so an `updated >= since`
+     check reads it as silent — exactly backwards, since minting a card IS the
+     ledger working. And a card created FOR another session (delegation, which is
+     normal and is how `amux` seeds work) is attributed to the target's `session`,
+     not the creator's, so the creator looks idle on both fields. Check the
+     request log for `POST /api/board` before calling anyone silent.
+
+   The sample is also capped: `limit=2000` is the max, and on a busy day that is
+   ~2.7 hours of a 24h window, taken from one end. Say the real span in the
+   summary, or read the store directly for the full window.
+
 6. **Status truth: does the card agree with the pane?** (AMUX-2646)
    `GET /api/health/invariants` (detail: `GET /api/debug/invariants`) — read the
    `status.agrees_with_pane` results. A `fail`
