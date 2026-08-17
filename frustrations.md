@@ -452,35 +452,6 @@ NOTE: what makes this instructive rather than just a bug is that the function ha
   ethos rule-1 note that a view must share the predicate of the mechanism it describes;
   here the guard describes "did this lane work?" with a predicate that means "does this
   lane own cards?".
-## `amux board review` cannot name the reviewer, so completing a handoff requires leaving the audited path
-AREA: cli
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-08
-SESSION: amux-frustrations
-CARD: AF-16
-FIX-NOTE: 868d893 — --reviewer added to every status verb; --outcome-stdin
-  deferred until argv validates, which also stopped the wrong error being
-  reported (it said "got empty input" instead of naming the unknown flag).
-SYMPTOM: `amux board review <ID>` has no --reviewer flag (usage: [--checked] [--ack]
-  [--type] [--override-doing] [--trigger] [--force]). A card moved to `review` with
-  reviewer=None is a card nobody has been asked to look at, and the review gate rests
-  entirely on the reviewer's X-Amux-Session being the required sign-off. So the sanctioned
-  command produces the status but not the state that means anything; the only completion is
-  a raw PATCH for `reviewer`.
-COST: Two writes and a hand-passed X-Amux-Session where one attributed command should do.
-  Compounding: `amux board review AF-15 --checked "..." --reviewer amux --outcome-stdin
-  <<EOF ...` failed on the unknown flag — loudly and correctly — but the --outcome-stdin
-  body was already consumed and was discarded with the rejected invocation, so ~40 lines of
-  review outcome had to be re-authored.
-FIX: Add --reviewer <session> to `amux board review` (arguably to every status verb, so a
-  card can be routed as it is created). Separately, validate argv BEFORE draining stdin, or
-  echo the consumed body back on rejection.
-NOTE: this is AMUX-2325 one verb over, and the same argument applies — the gate system
-  depends on attributed writes, so a gap in the audited path is precisely what manufactures
-  the unattributed ones. The second half is the ethos rule-6 corollary in its purest form:
-  the refusal destroyed the evidence needed to satisfy it. Together they are the third
-  AREA: cli entry where the sanctioned command cannot express something the gate requires.
 ## No rig can render amux at phone width, so the mobile half of `verified` is undecidable
 AREA: browser
 SEVERITY: blocks
@@ -1062,26 +1033,6 @@ every amux-originated message carried a machine-readable origin marker, the guar
 be exact instead of a heuristic. (2) Better: deliver over the structured protocol, where
 there is no composer to get stuck in and nothing to sweep for; the sweep's exit condition
 is written into its module docs for that reason.
-
-## `amux board` help executed a command out of its own help text
-AREA: cli
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-38
-SYMPTOM: `amux board discard AF-38` (a verb that does not exist) printed the unknown-verb
-  error AND `/Users/ethan/.local/bin/amux: line 1726: review: command not found`. The help
-  body is emitted with an UNQUOTED `cat <<EOF`, so backticks in it are command substitution.
-  Line 1760 had a literal `review` in backticks while lines 1753/1757 correctly escape
-  theirs, so bash ran `review`, printed the error, and spliced its empty stdout — silently
-  deleting the words from the rendered help ("handed to. " then nothing).
-COST: two minutes and a wrong first impression that the CLI was broken. The real cost is
-  latent: any backticked text anyone adds to that help block gets EXECUTED on every
-  `amux board` with no verb. This is the same class the help text itself warns about two
-  lines above, for `--outcome`.
-FIX: escaped the backticks to match the neighbouring lines (and restored the text the
-  substitution had been eating). Verified: stderr is now empty and the line renders in full.
 
 ## Usage meter said "no token" while the token was fine and Anthropic was rate-limiting
 AREA: instruments
