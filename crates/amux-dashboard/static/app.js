@@ -7704,7 +7704,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.663';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.664';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9067,6 +9067,11 @@ async function _peekLoadPlan() {
   try {
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/tasks');
     if (peekSession !== name) return;
+    // AF-83, same hole as the peek poller above: no r.ok check, so a 404 on a
+    // deleted session parsed the error body and rendered it as a plan. 1,737 of
+    // the 7,137 404s in the measured window came from HERE, so guarding only the
+    // peek fetch would have fixed 75% of a bug and left it looking fixed.
+    if (!r.ok) return;
     _peekRenderPlan(await r.json());
   } catch(e) {}
 }
@@ -9247,6 +9252,23 @@ async function refreshPeek(liveOnly, bypassTrim) {
     if (peekSession !== name) return;
     hidePeekLoading();   // a response arrived (200 painted below, or 304 = already latest) → drop the "Loading latest…" cue
     if (!liveOnly) _peekLastFullMs = performance.now();   // history is fresh (200 or 304)
+    // AF-83: a peek on a session that NO LONGER EXISTS 404s, and this poller had
+    // no r.ok check. It fell straight through to r.json(), parsed the error body
+    // {"error":"session 'X' not found"}, found no .live/.output, and painted
+    // "(no output)" — then polled again, forever. Measured 2026-08-17: one
+    // browser tab left open on a deleted session produced 5,382 peek + 1,737
+    // tasks 404s in 15h (~8/min), 95% of every error in the window, and the UI
+    // said "(no output)" rather than "this session is gone".
+    // Same r.json()-without-r.ok shape as _tunnelStatus (AF-63). Stop the poll
+    // and SAY what happened; a poller that cannot fail is how a dead tab bills
+    // the server forever.
+    if (r.status === 404) {
+      _stopPeekPoll();
+      _peekPollActive = false;
+      try { _peekPollBeacon('stop-404', name); } catch (e) {}
+      statusEl.textContent = 'Session ' + name + ' no longer exists — stopped polling.';
+      return;
+    }
     if (r.status === 304) {   // unchanged — nothing transferred, skip parse + render entirely
       if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
       return;
