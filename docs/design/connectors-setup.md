@@ -127,9 +127,25 @@ Google Admin (directory/users/groups) needs more than a normal OAuth grant:
 
 ### 3c. Granola
 
-Integration surface is under research (agent running) — the viable path and the
-exact "what Ethan must provide" for Granola land here when it returns. Likely one
-of: an API key/token, a login, or read access to Granola's local macOS cache.
+Cleanest of the five: **Granola shipped an official REST API in April 2026**,
+API-key auth, no OAuth. ("Lightfield" is a separate AI-CRM company that ships a
+Granola MCP connector, which is why the names pair up — the source system is
+Granola.)
+
+- [ethan] **Be on a Granola Business ($14/user/mo) or Enterprise plan** — the
+  free plan cannot mint an API key. This is the only gate.
+- [ethan] In the **Granola desktop app → Settings → Connectors → API keys**,
+  create a key (scope: Personal notes, and Public notes if you want workspace
+  notes). It looks like `grn_...`.
+- [ethan] **Provide the key** as `GRANOLA_API_KEY` in `~/.amux/server.env`.
+- [build] amux calls `https://public-api.granola.ai/v1/notes` and
+  `/notes/{id}?include=transcript` with `Authorization: Bearer grn_...` (rate
+  limit ~5 req/s). No OAuth broker needed — Granola is a **key-only connector**,
+  which the provider registry also supports (not everything is OAuth).
+
+Fallback if NOT on Business: Granola's local cache is now encrypted (July 2026),
+so the old `supabase.json`-token / cache-read hacks are broken or fragile. There
+is no clean no-upgrade path; the API key is the recommendation.
 
 ### 3d. Anything you may be missing (candidates to include)
 
@@ -160,7 +176,7 @@ automatically from the registry.
 | Google Calendar | OAuth (shared client) | enable API + scopes | read/write events |
 | Google Drive | OAuth (shared client) + ADC | enable API + scopes | read/write files |
 | Google Admin | OAuth admin OR SA+DWD | admin consent / DWD | directory reads |
-| Granola | (pending research) | (pending) | notes/transcript pull |
+| Granola | API key (no OAuth) | Business plan + `GRANOLA_API_KEY` | notes/transcript pull |
 | Slack | OAuth | Slack app id/secret | read/post (guarded) |
 
 ---
