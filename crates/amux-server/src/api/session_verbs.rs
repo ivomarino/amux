@@ -1525,7 +1525,12 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
 /// wander, and `session_jsonl_path`'s "newest mtime wins" discipline is applied
 /// the same way here.
 fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
-    let root = home().join(".codex/sessions");
+    // Codex writes to the OS home (`~/.codex`), NOT amux's `home()` (`~/.amux`);
+    // the two differ and the first cut pointed at `~/.amux/.codex`, so every
+    // resolution missed, which the debug trace in `codex_transcript_events`
+    // surfaced immediately (ethos rule 4). Same `$HOME`-based path shape as
+    // `claude_home()`.
+    let root = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex/sessions");
     let mut out: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
     fn walk(dir: &Path, depth: usize, out: &mut Vec<(std::time::SystemTime, PathBuf)>) {
         if depth > 3 {
