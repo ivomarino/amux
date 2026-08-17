@@ -39,6 +39,7 @@ pub mod journal;
 pub mod layout_presets;
 pub mod log_search;
 pub mod map;
+pub mod mdai;
 pub mod memories;
 pub mod metrics;
 pub mod observability;
@@ -187,6 +188,11 @@ pub fn router(state: AppState) -> Router {
         // path in python, so top-level here.
         .route("/api/library", axum::routing::any(file_viewer::library))
         .nest("/api/files", files::routes())
+        // The .mdai computed-file engine (AMUX-3240): run a node's upstream DAG,
+        // list nodes, browse run history, connect an edge. Nested one level
+        // deeper than /api/files above; files::routes() has no /mdai or wildcard,
+        // so the two prefixes do not conflict.
+        .nest("/api/files/mdai", mdai::routes())
         // /api/fs/* is the SPA's Files contract (multipart upload + dir
         // field, open/mkdir/rename/read/list/search/delete on ABSOLUTE
         // paths) — a different contract from /api/files above. NATIVE port
