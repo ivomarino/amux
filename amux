@@ -1840,8 +1840,36 @@ print(json.dumps(b))' \
       local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board status-update <ISSUE-ID> \"<what's done, next, blockers>\""
       _board_id_guard "status-update" "$id"
       shift 2>/dev/null || true
-      local text="$*"
-      if [[ "$text" == "--stdin" || "$text" == "-" ]]; then text=$(cat); fi
+      # `--file` supported and every OTHER flag refused, matching `progress`
+      # above. Without the refusal this verb swallowed a flag as prose:
+      # `status-update MHC-376 --outcome-file /tmp/x.txt` stored the literal
+      # string "--outcome-file /tmp/x.txt", printed "status update posted",
+      # exited 0, and left desc at 0 chars. Four writes lost in one session,
+      # and a peer lost twelve the same way on MG-1441 (2026-08-13), because
+      # nothing in the output distinguishes it from a real write.
+      #
+      # The help invites the mistake: it prints "Every status verb above takes
+      # the gate-satisfying flags ... --outcome-file <path>" in a block that
+      # lists this verb, and those flags belong only to the status-CHANGE verbs.
+      # Refusing here is the half that stops the data loss; the help text is
+      # corrected separately below.
+      local text
+      if [[ "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then
+        text=$(cat)
+      elif [[ "${1:-}" == "--file" ]]; then
+        [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board status-update <ISSUE-ID> --file <path>"
+        text=$(cat "$2")
+      else
+        text="$*"
+        case "$text" in
+          --*) die "amux board status-update: '${text%% *}' looks like a flag, not a status.
+Supported:  amux board status-update $id --stdin <<'EOF'   (heredoc; backticks stay literal)
+            amux board status-update $id --file <path>
+            amux board status-update $id \"plain text\"
+The gate flags (--outcome-stdin/--outcome-file/--checked/--ack) belong on the
+status-CHANGE verbs (done, verified, review, backlog), not on this one." ;;
+        esac
+      fi
       [[ -n "$text" ]] || die "status text required"
       local body result
       body=$(T="$text" python3 -c "import os,json;print(json.dumps({'text':os.environ['T'].strip()}))")
@@ -2194,6 +2222,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    this session's live browser view (Ethan clicks to sign in).
   amux board ask <ID> [question]   Ask the owning worker to post a status update
   amux board status-update <ID> …  (for the owning worker) post status to the board
+                                   (prose, --stdin or --file <path>; NOT the gate flags below)
   amux board done <ID>             Move issue to done
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review
@@ -2204,8 +2233,11 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board retitle <ID> <title>  Rewrite a title/desc so the card stands alone
                                    (--stdin/--file preferred; --desc-stdin for the body)
 
-  Every status verb above takes the gate-satisfying flags, so a gated move
-  never needs a hand-rolled curl (which is how attribution gets lost):
+  The status-CHANGE verbs (done, doing, review, todo, backlog, status) take the
+  gate-satisfying flags, so a gated move never needs a hand-rolled curl (which is
+  how attribution gets lost). ${BOLD}status-update, needsyou, progress and ask do NOT${RESET}
+  — they take prose, or --stdin/--file. Handing one of them --outcome-file used to
+  record the flag string itself as the message; it now refuses:
     --checked "crit" ["crit" ...]  acknowledge the criteria that are TRUE
     --ack                          acknowledge the whole gate at once
     --outcome "what happened"      record the outcome FIRST, as its own write,

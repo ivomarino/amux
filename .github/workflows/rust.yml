@@ -67,6 +67,16 @@ jobs:
       - name: runtime smoke -- CLI launch unbound-var (the AMUX-3145 scope shape shellcheck cannot see)
         run: bash scripts/test-cli-launch-unbound.sh
 
+      # MHC-377. `amux board status-update <ID> --outcome-file <path>` used to
+      # record the literal flag string, print "status update posted" and exit 0,
+      # losing the file. Silent, on the success path, and shellcheck cannot see
+      # it because `local text="$*"` is valid shell. Sixteen writes were lost to
+      # it across two sessions before anyone read a field back. Pins both
+      # directions: the flag shapes must refuse without POSTing, and prose,
+      # --stdin and --file must reach the wire byte-for-byte.
+      - name: runtime smoke -- board status-update refuses flag-shaped prose (MHC-377 data loss)
+        run: bash scripts/test-cli-status-update-flags.sh
+
   e2e:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
     # browser against the real server + real extracted dashboard.
