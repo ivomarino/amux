@@ -5,9 +5,15 @@ name: rust
 on:
   push:
     branches: [main]
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', '.github/workflows/rust.yml']
+    # `amux` + `scripts/**` are here so the CLI gates below (shellcheck + the AF-78
+    # launch smoke) actually FIRE when the bash CLI or its tests change. Without them
+    # a PR that touched ONLY `amux` (the exact way AMUX-3145 was reintroduced) ran
+    # neither gate, so the guard existed but never met the file it guards. The cost is
+    # that a CLI-only change also runs the cargo + e2e jobs; over-covering is the safe
+    # direction for a gate.
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', '.github/workflows/rust.yml']
   pull_request:
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**']
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', '.github/workflows/rust.yml']
 
 jobs:
   check:
@@ -48,6 +54,18 @@ jobs:
       # silently absorbed, which is what an allow-list would do.
       - name: shellcheck the amux CLI (new classes only; NOT the AMUX-3145 scope shape)
         run: shellcheck -S warning -e SC1090,SC2016,SC2221,SC2222,SC2015,SC1039 amux
+      # AF-78. The shellcheck step above says in its own name what it cannot see: the
+      # AMUX-3145 scope shape, a `local` USED outside the function that declared it.
+      # SC2154 fires only for a name assigned NOWHERE in the file, and AMUX_API is
+      # `local`-assigned in five other functions, so shellcheck exits 0 on it while
+      # `set -euo pipefail` makes the out-of-scope use a hard "unbound variable" at
+      # launch. This runtime smoke runs the REAL non-dry-run launch path (tmux stubbed,
+      # AMUX_API unset, no fleet touched) so that shape surfaces as a non-zero exit, and
+      # it carries its own negative control (a deliberately-broken copy with the
+      # declaration deleted) so the check provably CAN fail (ethos rule 7). It
+      # complements the static gate; it does not replace it.
+      - name: runtime smoke -- CLI launch unbound-var (the AMUX-3145 scope shape shellcheck cannot see)
+        run: bash scripts/test-cli-launch-unbound.sh
 
   e2e:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
