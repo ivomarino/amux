@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.670';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.671';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15514,10 +15514,33 @@ function _mdaiSerialize(cur) {
 }
 
 // ── The MDAI tab (global list of every .mdai node) ──
+let _mdaiRootPath;   // cached mdai_root pref (the local.amux folder), '' if unset
 async function _mdaiTabLoad() {
   const list = document.getElementById('mdai-list');
   const cnt = document.getElementById('mdai-count');
   if (!list) return;
+  // The MDAI tab is a file-DIRECTORY view of the local.amux folder (Ethan,
+  // AMUX-3326): render that folder with the same Files-explorer component the
+  // rest of the app uses, so a .mdai opens in-place (routed to the MDAI viewer)
+  // like any other file. Falls back to the flat computed-node list when no
+  // mdai_root is configured.
+  if (_mdaiRootPath === undefined) {
+    try { const rr = await fetch(API + '/api/prefs?key=mdai_root'); _mdaiRootPath = ((await rr.json()).value || '').trim(); }
+    catch (e) { _mdaiRootPath = ''; }
+  }
+  if (_mdaiRootPath) {
+    list.innerHTML = '<div style="padding:16px;color:var(--dim);font-size:0.85rem;">Loading…</div>';
+    try {
+      const r = await fetch(API + '/api/ls?path=' + encodeURIComponent(_mdaiRootPath));
+      const data = await r.json();
+      if (!data.error && typeof _renderFilesEntries === 'function') {
+        const n = (data.entries || []).length;
+        if (cnt) cnt.textContent = n ? (n + (n === 1 ? ' item' : ' items')) : '';
+        _renderFilesEntries(list, _mdaiRootPath, data, false);
+        return;
+      }
+    } catch (e) { /* fall through to the flat node list */ }
+  }
   list.innerHTML = '<div style="padding:16px;color:var(--dim);font-size:0.85rem;">Loading computed nodes…</div>';
   try {
     const r = await fetch(API + '/api/files/mdai');
