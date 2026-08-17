@@ -158,6 +158,30 @@ pub fn build(
 
     // STALE FIRST and most prominently. The opposite instruction to the rest of
     // the nudge: do NOT commit these, restore them.
+    //
+    // RESTORE-SAFETY DISCRIMINATOR (AMUX-3264, cold-outbound live near-miss
+    // 2026-08-17). Once a path is known behind origin, the remaining question is
+    // pure-old-copy (safe to `git checkout origin/main -- <path>`) vs
+    // carries-novel-mid-edit (a restore DELETES it irreversibly). The advice
+    // below prescribes `git log --all --oneline --find-object=<blob> -- <path>`,
+    // which answers by REACHABILITY FROM A COMMIT: non-empty means the exact
+    // content is in a commit somewhere, empty means it is in none.
+    //
+    // Both `--all` and the `-- <path>` pathspec look droppable and are NOT:
+    //   * `--all` (not HEAD-only): a blob committed on another branch or on
+    //     origin reads EMPTY under a HEAD-only search and would be misjudged
+    //     novel. `--all` widens what counts as committed so a genuine old copy
+    //     living elsewhere is still recognised.
+    //   * `-- <path>` (cold-outbound): a blob committed under a DIFFERENT path (a
+    //     move, a copied fixture) reads not-found for THIS path.
+    // Every residual edge case (other-path, an errored or timed-out command, an
+    // empty result) yields a FALSE "novel", which the advice resolves to
+    // DO-NOT-RESTORE. That bias is deliberate and MUST NOT be tightened back
+    // toward the destructive side: a declined restore is recoverable, a deleted
+    // keystroke is not. The unsound recipe this replaces,
+    // `git cat-file -e $(git hash-object <path>)`, failed OPEN: `git add` alone
+    // writes the blob into the object DB without committing, so it answered EXISTS
+    // for a never-committed mid-edit and its `git checkout` remedy deleted it.
     if !stale_paths.is_empty() {
         let n = stale_paths.len();
         let list: String = stale_paths
@@ -177,12 +201,21 @@ pub fn build(
              worktree is a pure old copy: a path can be behind origin AND carry NOVEL \
              uncommitted content (mid-edit), and `git checkout origin/main -- <path>` DELETES \
              that novel work irreversibly (AMUX-3172/AMUX-3188; social-media caught 16 such \
-             paths whose worktree matched NEITHER local HEAD nor origin). PROVE the direction \
-             per path first: `git cat-file -e $(git hash-object <path>) 2>/dev/null`. If the \
-             object EXISTS, this exact content was committed before, so it is an older revision \
-             and `git checkout origin/main -- <path>` safely restores it. If it does NOT (or \
-             `git diff origin/main -- <path>` shows the worktree ADDING content origin lacks), \
-             it is MID-EDIT: leave it, that is the owner's call, not a restore."
+             paths whose worktree matched NEITHER local HEAD nor origin). PROVE the copy is a \
+             pure old revision per path BEFORE restoring: \
+             `git log --all --oneline --find-object=$(git hash-object <path>) -- <path>`. RESTORE \
+             (`git checkout origin/main -- <path>`) ONLY if it prints a commit: that means this \
+             exact content is reachable from a commit on some ref, so it is a genuine old copy and \
+             restoring loses nothing. ANY other outcome is DO-NOT-RESTORE, commit the path \
+             instead. An empty result means the content is in NO commit anywhere, a novel mid-edit \
+             a restore would DELETE; an error, a timeout, or a result you cannot read is also \
+             DO-NOT-RESTORE, because a declined restore is recoverable and a deleted keystroke is \
+             not. Do NOT substitute `git cat-file -e $(git hash-object <path>)`: `git add` (and \
+             `git hash-object -w`) writes the blob into the object DB WITHOUT committing, so it \
+             answers yes for a never-committed mid-edit and cannot separate a committed old copy \
+             from novel work. It is strictly weaker than was-this-committed and its remedy here is \
+             a delete (cold-outbound, 2026-08-17: server-fast-checks.yml was mid-keystroke and in \
+             no commit on any ref, yet that recipe answered yes; restoring would have deleted it)."
         ));
     }
 
@@ -259,7 +292,10 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              worktree-has-more/has-less misclassifies about 2 in 10 (studio-plg measured it on \
              this checkout: files with MORE lines than origin that are nonetheless stale). \
              `git log --oneline HEAD..origin/main -- <path>`: prints a commit = origin has work \
-             you lack = STALE, `git checkout origin/main -- <path>` to restore, do not commit; \
+             you lack = STALE, so do not commit; restore with `git checkout origin/main -- <path>` \
+             ONLY after `git log --all --find-object=$(git hash-object <path>) -- <path>` prints a \
+             commit (empty or errored means the stale copy carries novel mid-edit a restore would \
+             DELETE, so commit the path instead); \
              prints NOTHING = origin has nothing you lack, so it is current content, and if it \
              is not yours it is a peer's mid-edit: hands off either way. Do NOT use \
              `git cat-file -e $(git hash-object <path>)` for this: blob existence cannot separate \
@@ -299,7 +335,10 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          so the direction test is the headline, not a caveat:\n\
          \u{2022} `git log --oneline HEAD..origin/main -- <path>`: if it prints ANY commit, \
          origin has work on this path that your HEAD lacks, so the worktree copy is genuinely \
-         older (STALE) and `git checkout origin/main -- <path>` restores it; do not commit.\n\
+         older (STALE); do not commit. Restore with `git checkout origin/main -- <path>` ONLY \
+         after `git log --all --find-object=$(git hash-object <path>) -- <path>` prints a commit; \
+         an empty or errored result means the stale copy carries novel mid-edit a restore would \
+         DELETE, so commit the path instead.\n\
          \u{2022} if it prints NOTHING, origin has nothing you lack: the content is yours to \
          keep, `checkout` would DESTROY it, and the safe action is COMMIT, not restore.\n\
          This is the same predicate the guard itself classifies with, so its verdict and your \
@@ -991,6 +1030,147 @@ mod tests {
         }
     }
 
+    /// The STALE section's RESTORE-SAFETY check must be the reachable-from-a-commit
+    /// test, never blob existence (AMUX-3264, cold-outbound near-miss 2026-08-17).
+    ///
+    /// 5b923db fixed the two DIRECTION branches but DELIBERATELY left this section
+    /// using `git cat-file -e $(git hash-object <path>)`, reasoning it answered
+    /// pure-old-copy vs mid-edit correctly. It does not: `git add` alone writes the
+    /// blob into the object DB without committing, so the recipe returns EXISTS for
+    /// a never-committed mid-edit and its `git checkout` remedy DELETES it. This
+    /// asserts on the message TEXT so a reintroduction of the recipe fails here.
+    #[test]
+    fn stale_section_prescribes_find_object_never_blob_existence() {
+        let dirty = vec!["a.rs".to_string()];
+        let fresh = Freshness { stale: vec!["a.rs".to_string()], ..Default::default() };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("stale section");
+        assert!(m.contains("STALE:"), "premise: the stale section must render: {m}");
+        // The correct restore-safety discriminator must be prescribed. A revert to
+        // the old recipe removes this substring and fails the test.
+        assert!(
+            m.contains("--find-object=$(git hash-object <path>)"),
+            "STALE section must prescribe find-object as the restore-safety check: {m}"
+        );
+        // The exact old prescription tied "object EXISTS" to "committed before" to
+        // "safely restores". Blob existence may only appear inside a do-not warning.
+        assert!(
+            !m.contains("object EXISTS, this exact content was committed before"),
+            "STALE section reintroduced blob-existence as the safe-to-restore check; git add \
+             writes the blob uncommitted, so its restore deletes mid-edits: {m}"
+        );
+        assert!(
+            m.contains("Do NOT substitute `git cat-file -e $(git hash-object <path>)`"),
+            "STALE section must name blob-existence as the recipe NOT to use: {m}"
+        );
+    }
+
+    /// cold-outbound's proof at the DISCRIMINATOR level (AMUX-3264, live 4-minute
+    /// near-miss on .github/workflows/server-fast-checks.yml, 2026-08-17), run
+    /// against a REAL repo because the whole defect is a disagreement between what
+    /// the object DB holds and what any commit holds.
+    ///
+    /// The restore-safety check must separate a pure old copy (safe to
+    /// `git checkout origin/main -- <path>`) from a NOVEL mid-edit (whose restore
+    /// is an irreversible delete), and it must FAIL CLOSED: ANY inconclusive answer
+    /// resolves to DO-NOT-RESTORE, never to safe. This asserts the PROPERTY across
+    /// states, not one case, because failing OPEN on some third state is exactly
+    /// how `git cat-file -e $(git hash-object <path>)` got here.
+    #[test]
+    fn find_object_restore_check_fails_closed_on_every_inconclusive_state() {
+        let root = std::env::temp_dir().join(format!("amux-nudge-disc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let run = |args: &[&str]| -> std::process::Output {
+            std::process::Command::new("git").arg("-C").arg(&root).args(args).output().unwrap()
+        };
+        let must = |args: &[&str]| {
+            let out = run(args);
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        let blob_of = |name: &str| {
+            String::from_utf8(run(&["hash-object", name]).stdout).unwrap().trim().to_string()
+        };
+        // The exact discriminator the advice prescribes, applied through the
+        // fail-closed rule the advice states: RESTORE only on a non-empty print
+        // from a command that SUCCEEDED; every other outcome (empty, error,
+        // timeout) is DO-NOT-RESTORE.
+        let safe_to_restore = |blob: &str, path: &str| -> bool {
+            let out = run(&["log", "--all", "--oneline", &format!("--find-object={blob}"), "--", path]);
+            out.status.success() && !String::from_utf8_lossy(&out.stdout).trim().is_empty()
+        };
+
+        must(&["init", "-b", "main"]);
+        must(&["config", "user.email", "t@t"]);
+        must(&["config", "user.name", "t"]);
+
+        // (1) A committed baseline at f.yml: reachable from a commit => SAFE.
+        std::fs::write(root.join("f.yml"), "name: ci\njobs:\n").unwrap();
+        must(&["add", "f.yml"]);
+        must(&["commit", "-m", "base"]);
+        let committed_blob = blob_of("f.yml");
+        assert!(
+            safe_to_restore(&committed_blob, "f.yml"),
+            "a genuine committed old copy must be classified safe to restore"
+        );
+
+        // (2) cold-outbound's specimen: a NEW line typed in, `git add`-ed, NEVER
+        // committed. The blob is now in the object DB, so the OLD recipe answers
+        // EXISTS, but it is in NO commit, so find-object is empty => DO-NOT-RESTORE.
+        std::fs::write(root.join("f.yml"), "name: ci\njobs:\n  build: {}\n").unwrap();
+        must(&["add", "f.yml"]);
+        let staged_blob = blob_of("f.yml");
+        assert_ne!(staged_blob, committed_blob, "premise: the mid-edit differs from the committed copy");
+        assert!(
+            run(&["cat-file", "-e", &staged_blob]).status.success(),
+            "premise: git add wrote the blob, so the UNSOUND recipe cat-file -e reports EXISTS"
+        );
+        assert!(
+            !safe_to_restore(&staged_blob, "f.yml"),
+            "a staged-but-never-committed mid-edit must be DO-NOT-RESTORE (its restore is a delete)"
+        );
+
+        // (3) A blob committed under a DIFFERENT path, queried under THIS path with
+        // the `-- <path>` pathspec: not-found here => DO-NOT-RESTORE. A false novel,
+        // deliberately so: the pathspec biases toward the safe side.
+        std::fs::write(root.join("moved.yml"), "shared: fixture\n").unwrap();
+        must(&["add", "moved.yml"]);
+        must(&["commit", "-m", "moved"]);
+        let moved_blob = blob_of("moved.yml");
+        assert!(
+            !safe_to_restore(&moved_blob, "f.yml"),
+            "content committed only under another path must be DO-NOT-RESTORE for THIS path"
+        );
+
+        // (4) A blob committed only on ANOTHER branch: a HEAD-only search reads it
+        // as a false novel, which is why the advice uses `--all`. With `--all` it
+        // is recognised as a genuine old copy => SAFE.
+        must(&["checkout", "-b", "other"]);
+        std::fs::write(root.join("f.yml"), "name: ci\njobs:\n  test: {}\n").unwrap();
+        must(&["add", "f.yml"]);
+        must(&["commit", "-m", "on other"]);
+        let other_branch_blob = blob_of("f.yml");
+        must(&["checkout", "main"]);
+        let head_only = run(&["log", "--oneline", &format!("--find-object={other_branch_blob}"), "--", "f.yml"]);
+        assert!(
+            String::from_utf8_lossy(&head_only.stdout).trim().is_empty(),
+            "premise: a HEAD-only search misses an other-branch blob, which is why --all is required"
+        );
+        assert!(
+            safe_to_restore(&other_branch_blob, "f.yml"),
+            "--all must recognise a blob committed on another branch as a genuine old copy"
+        );
+
+        // (5) A malformed object id: the command cannot answer => DO-NOT-RESTORE.
+        // Fail closed on error, never fall through to safe.
+        assert!(
+            !safe_to_restore("zzz", "f.yml"),
+            "an errored or inconclusive discriminator must resolve to DO-NOT-RESTORE"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// The reported case, run against a REAL repo because the whole defect is a
     /// disagreement between what `git status` says and what origin holds — a
     /// mocked porcelain string cannot express it (creative-dna, 2026-08-10).
@@ -1333,9 +1513,12 @@ mod tests {
     /// AMUX-3188 (social-media): behind-on-history does NOT prove the worktree is
     /// a pure old copy. A stale path can carry novel mid-edit content, and an
     /// unconditional `git checkout origin/main -- <path>` DELETES it irreversibly
-    /// (social-media caught 16 such paths). The STALE section must carry the same
-    /// prove-the-direction guard the MINE/UNKNOWN paths already do (AMUX-3172),
-    /// or the nudge prescribes data loss.
+    /// (social-media caught 16 such paths). AMUX-3264 (cold-outbound) then showed
+    /// the guard this section USED to prescribe, blob existence, is itself unsound:
+    /// `git add` writes the blob uncommitted, so it licenses the same destructive
+    /// restore for a never-committed mid-edit. The section must prescribe the
+    /// reachable-from-a-commit test and gate the restore on it, or it prescribes
+    /// data loss.
     #[test]
     fn a_stale_file_warns_before_a_blind_restore_destroys_mid_edit_work() {
         let dirty = s(&["stale.rs"]);
@@ -1343,9 +1526,22 @@ mod tests {
         let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance")
             .expect("a stale file is worth warning about");
         assert!(msg.contains("do NOT blind-restore"), "must not prescribe an unconditional restore: {msg}");
-        assert!(msg.contains("MID-EDIT") || msg.contains("mid-edit"), "must name the mid-edit case: {msg}");
-        assert!(msg.contains("hash-object"), "must give the prove-the-direction check: {msg}");
-        assert!(msg.contains("owner's call"), "must hand a mid-edit file back to its owner: {msg}");
+        assert!(msg.contains("mid-edit"), "must name the mid-edit case: {msg}");
+        // The prove-it-first guard must be the reachable-from-a-commit test, and
+        // the restore must be explicitly conditional on it printing a commit.
+        assert!(
+            msg.contains("--find-object=$(git hash-object <path>)"),
+            "must give the reachable-from-a-commit guard, not blob existence: {msg}"
+        );
+        assert!(
+            msg.contains("ONLY if it prints a commit"),
+            "the restore must be gated on the guard, never unconditional: {msg}"
+        );
+        // The unsound recipe (AMUX-3264) must never be the prescribed check.
+        assert!(
+            !msg.contains("object EXISTS, this exact content was committed before"),
+            "must not tie blob existence to a safe restore: {msg}"
+        );
     }
 
     /// A STALE file among genuine work: the stale warning comes FIRST, and the
