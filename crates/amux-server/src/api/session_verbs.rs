@@ -1520,6 +1520,119 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
     }
 }
 
+/// All `rollout-*.jsonl` files under `~/.codex/sessions`, newest first.
+/// Codex nests them `YYYY/MM/DD/`; the walk is depth-bounded (3) so it cannot
+/// wander, and `session_jsonl_path`'s "newest mtime wins" discipline is applied
+/// the same way here.
+fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
+    let root = home().join(".codex/sessions");
+    let mut out: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<(std::time::SystemTime, PathBuf)>) {
+        if depth > 3 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth + 1, out);
+            } else if p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("rollout-") && s.ends_with(".jsonl"))
+                .unwrap_or(false)
+            {
+                if let Some(t) = p.metadata().ok().and_then(|m| m.modified().ok()) {
+                    out.push((t, p));
+                }
+            }
+        }
+    }
+    walk(&root, 0, &mut out);
+    out.sort_by_key(|e| std::cmp::Reverse(e.0));
+    out
+}
+
+/// The `cwd` a rollout was recorded in, read from its first line
+/// (`session_meta`), so this stats one small read per candidate, not the whole
+/// file.
+fn rollout_cwd(path: &Path) -> Option<String> {
+    let Ok(f) = std::fs::File::open(path) else { return None };
+    let mut reader = std::io::BufReader::new(f);
+    let mut line = String::new();
+    use std::io::BufRead;
+    reader.read_line(&mut line).ok()?;
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    v.pointer("/payload/cwd")
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+}
+
+/// Map a codex/ollama worker to its live Codex rollout file. Mirrors
+/// `session_jsonl_path`'s resolution order: a recorded session-id claim first
+/// (deterministic: the id is the filename UUID), then the worker's `CC_DIR`
+/// cwd with newest mtime winning. `None` when nothing matches, which makes the
+/// caller fall back to the raw terminal (never a wrong transcript).
+pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
+    let cfg = parse_env(name);
+    let wd = cfg.get_or("CC_DIR", "").trim().to_string();
+    let sid = meta_str(&load_meta(name), "codex_session_id");
+    let files = codex_rollout_files();
+    if files.is_empty() {
+        return None;
+    }
+    // 1. session-id claim: the id is embedded in the filename, so this is a
+    //    string match, no file read.
+    if !sid.is_empty() {
+        if let Some((_, p)) = files.iter().find(|(_, p)| {
+            p.file_name().and_then(|s| s.to_str()).map(|s| s.contains(&sid)).unwrap_or(false)
+        }) {
+            return Some(p.clone());
+        }
+    }
+    // 2. cwd match, newest first. Bounded to the most recent candidates so a
+    //    years-deep history never turns one tab-open into thousands of reads.
+    if !wd.is_empty() {
+        for (_, p) in files.iter().take(80) {
+            if rollout_cwd(p).as_deref() == Some(wd.as_str()) {
+                return Some(p.clone());
+            }
+        }
+    }
+    None
+}
+
+/// A codex/ollama worker's transcript as the uniform [`TranscriptEvent`] model
+/// (AMUX-3201 slice 1). Reads a bounded tail of the rollout so a long session
+/// stays cheap, parses it via the shared `opencode::events` projection, and
+/// keeps the last `max_events` so the client renders the live end of the
+/// conversation, not megabytes of history.
+fn codex_transcript_events(
+    name: &str,
+    max_events: usize,
+) -> Option<Vec<crate::opencode::events::TranscriptEvent>> {
+    let Some(path) = codex_rollout_path(name) else {
+        // Self-announcing (ethos rule 4): a codex/ollama worker whose rollout
+        // can't be resolved returns an EMPTY transcript that looks identical to
+        // "the worker hasn't spoken yet". Trace it so "why is my codex
+        // transcript blank" is answerable from ~/.amux/logs, not a guess.
+        tracing::debug!(
+            session = %name,
+            "codex/ollama transcript: no rollout file resolved (cwd/session-id miss); peek falls back to raw terminal"
+        );
+        return None;
+    };
+    let lines = iter_jsonl_tail(&path, 4_000_000);
+    let mut evs = crate::opencode::events::codex_rollout_transcript(&lines);
+    if evs.len() > max_events {
+        evs = evs.split_off(evs.len() - max_events);
+    }
+    Some(evs)
+}
+
 // ---------------------------------------------------------------------------
 // Markdown → ANSI transcript renderer (py:5675-5957). Fail-safe: any panic
 // risk is avoided structurally; the table renderer clamps widths.
@@ -8663,12 +8776,31 @@ async fn get_dispatch(
             j200(peek_response(name, lines, live_only, no_trim).await)
         }
         "transcript" => {
+            // Codex/Ollama run a native TUI whose raw mirror is what Ethan saw
+            // looked nothing like Claude (AMUX-3201). They also write a
+            // structured rollout to disk, so return that as the uniform
+            // TranscriptEvent model and let the client render it Claude-like;
+            // Claude keeps its ANSI `output`. A worker whose rollout can't be
+            // resolved falls through to ANSI (empty for non-Claude), so the tab
+            // degrades to a message rather than a wrong transcript.
+            let provider = provider_of(&parse_env(name));
+            if matches!(provider.as_str(), "codex" | "ollama") {
+                let evs = codex_transcript_events(name, 400).unwrap_or_default();
+                let empty = evs.is_empty();
+                return j200(json!({
+                    "name": name,
+                    "provider": provider,
+                    "events": evs,
+                    "empty": empty,
+                    "source": "codex-rollout",
+                }));
+            }
             let mx: usize = qs_first(qs, "max", "40000").parse().unwrap_or(40000);
             let txt = render_session_transcript(name, mx);
             if txt.is_empty() {
-                j200(json!({"name": name, "output": "", "empty": true}))
+                j200(json!({"name": name, "provider": provider, "output": "", "empty": true}))
             } else {
-                j200(json!({"name": name, "output": txt, "source": "transcript"}))
+                j200(json!({"name": name, "provider": provider, "output": txt, "source": "transcript"}))
             }
         }
         // The worker's most recent full assistant message, clean — what the

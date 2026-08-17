@@ -5577,6 +5577,57 @@ let _peekTab = 'terminal';
 let _peekGitData = null;
 let _transcriptTimer = null;
 
+// ── Uniform provider transcript (AMUX-3201) ──────────────────────────────
+// Codex/Ollama run a native TUI whose raw mirror looks nothing like Claude
+// (Ethan's screenshot: "Updated Plan", "qwen3.8:27b low"). The server projects
+// each worker's on-disk rollout into a provider-agnostic TranscriptEvent stream
+// (opencode/events.rs), and this draws it the way Claude's transcript reads:
+// user turns, assistant prose, reasoning, tool calls with output, and the
+// update_plan checklist. One renderer, so a future provider that emits the same
+// events renders identically with no new client code.
+function _utInline(s) {
+  // Safe minimal markdown: escape FIRST, then bold + inline code, then newlines.
+  let h = esc(String(s));
+  h = h.replace(/`([^`\n]+)`/g, '<code class="ut-code">$1</code>');
+  h = h.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+  return h.replace(/\n/g, '<br>');
+}
+function _utPlanMark(status) {
+  if (status === 'completed') return '☑';      // ☑
+  if (status === 'in_progress') return '◐';    // ◐
+  return '☐';                                   // ☐
+}
+function renderUniformTranscript(events) {
+  if (!events || !events.length) return '';
+  const out = [];
+  for (const ev of events) {
+    if (ev.kind === 'user') {
+      out.push('<div class="ut-user">' + _utInline(ev.text) + '</div>');
+    } else if (ev.kind === 'assistant') {
+      out.push('<div class="ut-msg"><span class="ut-dot ut-dot-a">⏺</span>'
+        + '<div class="ut-body">' + _utInline(ev.text) + '</div></div>');
+    } else if (ev.kind === 'reasoning') {
+      out.push('<div class="ut-reason"><span class="ut-reason-lbl">thinking</span> '
+        + _utInline(ev.text) + '</div>');
+    } else if (ev.kind === 'tool') {
+      let head = '<span class="ut-dot ut-dot-t">⏺</span><span class="ut-tool">' + esc(ev.tool) + '</span>';
+      if (ev.detail) head += '<span class="ut-tool-arg">' + esc(ev.detail) + '</span>';
+      let block = '<div class="ut-toolhead">' + head + '</div>';
+      if (ev.output) block += '<pre class="ut-out">' + esc(ev.output) + '</pre>';
+      out.push('<div class="ut-msg ut-tool-msg">' + block + '</div>');
+    } else if (ev.kind === 'plan') {
+      const rows = (ev.steps || []).map(function(s) {
+        const cls = s.status === 'completed' ? 'ut-plan-done'
+          : (s.status === 'in_progress' ? 'ut-plan-active' : '');
+        return '<div class="ut-plan-row ' + cls + '"><span class="ut-plan-mark">'
+          + _utPlanMark(s.status) + '</span><span>' + esc(s.step) + '</span></div>';
+      }).join('');
+      out.push('<div class="ut-plan"><div class="ut-plan-title">Updated Plan</div>' + rows + '</div>');
+    }
+  }
+  return out.join('');
+}
+
 // ── Transcript tab: clean JSONL conversation history ──
 async function loadPeekTranscript(showLoading) {
   const body = document.getElementById('peek-transcript-body');
@@ -5588,6 +5639,25 @@ async function loadPeekTranscript(showLoading) {
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/transcript');
     const d = await r.json();
     if (_peekTab !== 'transcript' || peekSession !== name) return;
+    // Codex/Ollama: the server sends the uniform structured event stream, which
+    // we render Claude-like. Claude keeps its server-rendered ANSI `output`.
+    if (d.events) {
+      if (!d.events.length) {
+        body.innerHTML = '<div style="color:var(--dim);padding:20px;">No structured transcript yet for this '
+          + esc(d.provider || 'worker') + ' worker. The <a href="#" onclick="event.preventDefault();setPeekTab(\'terminal\')" style="color:var(--accent);">Terminal</a> tab shows the live view.</div>';
+        if (status) status.textContent = '';
+        return;
+      }
+      const atBottom = _isScrolledToBottom(body);
+      const html = '<div class="ut-wrap">' + renderUniformTranscript(d.events) + '</div>';
+      if (html !== body._lastHTML) {
+        body._lastHTML = html;
+        body.innerHTML = html;
+        if (atBottom) body.scrollTop = body.scrollHeight;
+      }
+      if (status) status.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · ' + esc(d.provider || 'codex') + ' rollout';
+      return;
+    }
     if (d.empty || !d.output) {
       body.innerHTML = '<div style="color:var(--dim);padding:20px;">No JSONL transcript found for this worker.</div>';
       if (status) status.textContent = '';
@@ -7704,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.664';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.665';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7992,6 +8062,16 @@ function openPeek(name, opts) {
     if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
   });
   _peekUpdateTabCounts();
+  // AMUX-3201: a codex/ollama peek opens straight to the Claude-like structured
+  // transcript rather than the raw native TUI (Ethan's complaint). The Terminal
+  // tab stays one tap away as the raw-terminal toggle. Guarded: a hidden
+  // Transcript tab, a non-codex provider, or a missing helper is a no-op that
+  // leaves openPeek's default terminal view untouched.
+  try {
+    const _pv = _peekSess ? sessionProvider(_peekSess) : 'claude';
+    const _hidden = (typeof peekHiddenTabs !== 'undefined' && peekHiddenTabs.has) ? peekHiddenTabs.has('transcript') : false;
+    if ((_pv === 'codex' || _pv === 'ollama') && !_hidden) setPeekTab('transcript');
+  } catch (e) {}
   loadPeekCommitGuard(name);
   updateConnectionStatus();
   const peekOv = document.getElementById('peek-overlay');

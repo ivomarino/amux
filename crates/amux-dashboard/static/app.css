@@ -5377,3 +5377,58 @@
   .mdai-hbtn, .mdai-sbtn, .mdai-picker-x { min-height: 44px; }
   .mdai-edge-actions { gap: 8px; }
 }
+
+/* Uniform provider transcript (AMUX-3201): codex/ollama rendered Claude-like.
+   Fluid width + word-break so it reads at 375px (css-mobile rule). */
+.ut-wrap { font-size: 0.82rem; line-height: 1.5; color: var(--text); padding-bottom: 8px; }
+.ut-user {
+  background: var(--card); border-left: 3px solid var(--accent);
+  border-radius: 4px; padding: 8px 10px; margin: 10px 0;
+  white-space: normal; overflow-wrap: anywhere; word-break: break-word;
+}
+.ut-msg { display: flex; gap: 8px; margin: 8px 0; align-items: flex-start; }
+.ut-tool-msg { flex-direction: column; gap: 4px; }
+.ut-dot { flex: 0 0 auto; line-height: 1.5; font-size: 0.7rem; }
+.ut-dot-a { color: var(--text); }
+.ut-dot-t { color: #3fb950; }
+.ut-body { flex: 1; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+.ut-reason {
+  color: var(--dim); font-style: italic; margin: 6px 0 6px 4px;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.ut-reason-lbl {
+  font-style: normal; font-size: 0.62rem; text-transform: uppercase;
+  letter-spacing: 0.06em; opacity: 0.7; margin-right: 4px;
+}
+.ut-toolhead { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.ut-tool { font-weight: 700; color: #3fb950; }
+.ut-tool-arg {
+  color: var(--dim); font-family: 'SF Mono','Fira Code',monospace; font-size: 0.74rem;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.ut-out {
+  margin: 2px 0 4px 16px; padding: 6px 8px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-family: 'SF Mono','Fira Code',monospace; font-size: 0.72rem;
+  color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+  max-height: 220px; overflow-y: auto;
+}
+.ut-code { font-family: 'SF Mono','Fira Code',monospace; font-size: 0.76rem;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 3px; }
+.ut-plan {
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 10px 0;
+  background: var(--card);
+}
+.ut-plan-title {
+  font-weight: 700; font-size: 0.7rem; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--dim); margin-bottom: 6px;
+}
+.ut-plan-row { display: flex; gap: 8px; align-items: flex-start; margin: 3px 0;
+  overflow-wrap: anywhere; word-break: break-word; }
+.ut-plan-mark { flex: 0 0 auto; }
+.ut-plan-done { color: var(--dim); text-decoration: line-through; }
+.ut-plan-active { color: var(--text); font-weight: 600; }
+@media (max-width: 600px) {
+  .ut-wrap { font-size: 0.8rem; }
+  .ut-out { margin-left: 8px; }
+}
