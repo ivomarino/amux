@@ -297,7 +297,7 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          nonetheless stale, because origin has since moved to a shorter version). Roughly 1 in 4 \
          differing paths here are novel mid-edit a blind `checkout` would DESTROY irreversibly, \
          so the direction test is the headline, not a caveat:\n\
-         \u{2022} `git log --oneline HEAD..origin/main -- <path>` — if it prints ANY commit, \
+         \u{2022} `git log --oneline HEAD..origin/main -- <path>`: if it prints ANY commit, \
          origin has work on this path that your HEAD lacks, so the worktree copy is genuinely \
          older (STALE) and `git checkout origin/main -- <path>` restores it; do not commit.\n\
          \u{2022} if it prints NOTHING, origin has nothing you lack: the content is yours to \
