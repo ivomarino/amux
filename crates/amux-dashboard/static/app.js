@@ -7703,7 +7703,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.661';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.662';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28192,6 +28192,10 @@ function _reclaimTreemapSvg(nodes, w, h) {
     </g>`;
   }).join('');
 
+  // viewBox is sized to the ACTUAL box (see the caller), so the map fills its
+  // container without letterboxing and without preserveAspectRatio="none" —
+  // which would fill the box but shear every text label, since non-uniform
+  // scaling distorts glyphs even though it preserves relative cell areas.
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block;border-radius:8px;overflow:hidden;">${body}</svg>`;
 }
 
@@ -28301,7 +28305,13 @@ function _reclaimRender() {
       <span class="reclaim-mappath">${esc(rootPath)}</span>
       ${_reclaimTree.root ? `<span style="color:var(--dim);font-size:0.75rem;">${_fmtBytes(_reclaimTree.root.bytes)}</span>` : ''}
     </div>`;
-    html += '<div class="reclaim-map">' + _reclaimTreemapSvg(_reclaimTree.children || [], 900, 340) + '</div>';
+    // Lay the map out at the size it will actually occupy, so the viewBox and
+    // the box agree and nothing is letterboxed. Measured from the scroll pane
+    // (minus its 16px padding either side) rather than assumed.
+    const _mapW = Math.round(Math.max(300, Math.min(1200,
+      (document.getElementById('metrics-main')?.clientWidth || 900) - 32)));
+    const _mapH = window.innerWidth < 600 ? 300 : 340;
+    html += '<div class="reclaim-map">' + _reclaimTreemapSvg(_reclaimTree.children || [], _mapW, _mapH) + '</div>';
     html += '<div class="reclaim-legend">' + Object.entries(_KIND_COLORS).map(([k, c]) =>
       `<span class="reclaim-legend-item"><i style="background:${c}"></i>${k}</span>`).join('') + '</div>';
   }
