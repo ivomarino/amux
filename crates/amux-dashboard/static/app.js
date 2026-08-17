@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.668';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.669';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8350,6 +8350,9 @@ async function _psfLoad(dirPath) {
 }
 
 async function _psfViewFile(filePath) {
+  // .mdai opens in the dedicated MDAI viewer (metadata + version scroll +
+  // runs the chain on open), same as the main file browser (AMUX-3317).
+  if (/\.mdai$/i.test(filePath || '')) { openMdaiNode(filePath); return; }
   const body = document.getElementById('psf-body');
   const bc = document.getElementById('psf-breadcrumb');
   const dir = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
@@ -14368,6 +14371,12 @@ function _mdSearchHighlightCurrent() {
 }
 
 async function openFilePreview(path) {
+  // .mdai files open in the dedicated MDAI viewer (Ethan, AMUX-3317): it shows
+  // the node's metadata (model / date / cached), lets you scroll the run
+  // versions, and RUNS THE CHAIN on open — none of which the generic file body
+  // does. Route before touching the file-overlay DOM so a .mdai opened from the
+  // file browser or a file link lands in the right viewer.
+  if (/\.mdai$/i.test(path || '')) { openMdaiNode(path); return; }
   _fileData = null;
   _fileViewMode = 'preview';
   document.getElementById('file-title').textContent = path.split('/').pop();
