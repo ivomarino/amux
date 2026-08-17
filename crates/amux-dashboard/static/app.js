@@ -28193,8 +28193,8 @@ function _reclaimTreemapSvg(nodes, w, h) {
   }).join('');
 
   // viewBox is sized to the ACTUAL box (see the caller), so the map fills its
-  // container without letterboxing and without preserveAspectRatio="none" —
-  // which would fill the box but shear every text label, since non-uniform
+  // container without letterboxing and without preserveAspectRatio="none".
+  // That would fill the box but shear every text label, since non-uniform
   // scaling distorts glyphs even though it preserves relative cell areas.
   return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block;border-radius:8px;overflow:hidden;">${body}</svg>`;
 }
@@ -28264,14 +28264,14 @@ function _reclaimRender() {
     </div>`;
   }
 
-  // Snapshot warning — the thing that makes cleanup look broken.
+  // Snapshot warning: the thing that makes cleanup look broken.
   const snapFinding = findings.find(f => f.category === 'snapshot');
   if (snapFinding) {
     html += `<div class="reclaim-warn">
       <div style="font-weight:600;margin-bottom:4px;">⚠ ${scan.snapshot_count} APFS local snapshots are holding deleted space</div>
       <div style="font-size:0.78rem;line-height:1.55;">
-        Until these expire or are thinned, <b>deleting files will not increase your free space</b> — the
-        blocks stay referenced by the snapshot. This is why a cleanup can look like it did nothing.
+        Until these expire or are thinned, <b>deleting files will not increase your free space</b>.
+        The blocks stay referenced by the snapshot. This is why a cleanup can look like it did nothing.
         <div style="margin-top:6px;">Release them from a terminal (needs sudo, so amux will not run it for you):</div>
         <code class="reclaim-code">sudo tmutil thinlocalsnapshots / 21474836480 4</code>
       </div>
@@ -28299,7 +28299,7 @@ function _reclaimRender() {
     const rootPath = _reclaimTree.root?.path || _reclaimTreePath || '~';
     const parent = rootPath.includes('/') ? rootPath.slice(0, rootPath.lastIndexOf('/')) : null;
     html += `<div class="metrics-section-title" style="margin-top:18px;">Disk map
-      <span style="text-transform:none;letter-spacing:0;font-weight:400;">— click a block to drill in</span></div>`;
+      <span style="text-transform:none;letter-spacing:0;font-weight:400;">(click a block to drill in)</span></div>`;
     html += `<div class="reclaim-mapbar">
       ${parent ? `<button class="btn reclaim-upbtn" onclick="_reclaimLoadTree('${escJs(parent)}')">↑ up</button>` : ''}
       <span class="reclaim-mappath">${esc(rootPath)}</span>
@@ -28350,7 +28350,7 @@ function _reclaimRender() {
       html += `<tr class="${_reclaimSel.has(f.path) ? 'row-selected' : ''}">
         <td><input type="checkbox"${checked} onchange="_reclaimToggle('${escJs(f.path)}')"></td>
         <td style="font-family:var(--mono,monospace);font-size:0.74rem;word-break:break-all;">${esc(f.path)}</td>
-        <td style="font-size:0.74rem;">${esc(meta.label)}${f.regenerable ? '' : ' <span style="color:var(--yellow,#e3b341);" title="Not regenerable — review before removing">⚠</span>'}</td>
+        <td style="font-size:0.74rem;">${esc(meta.label)}${f.regenerable ? '' : ' <span style="color:var(--yellow,#e3b341);" title="Not regenerable. Review before removing.">⚠</span>'}</td>
         <td style="font-weight:600;">${_fmtBytes(f.bytes)}</td>
         <td style="font-size:0.74rem;color:var(--dim);">${(f.file_count||0).toLocaleString()}</td>
         <td style="font-size:0.72rem;color:var(--dim);">${esc(f.detail || '')}</td>
@@ -28388,8 +28388,8 @@ function _reclaimRender() {
     html += '</tbody></table></div>';
     html += `<div style="font-size:0.72rem;color:var(--dim);margin-top:6px;line-height:1.5;">
       Staged files live in <code>${esc(_reclaimQuarantine?.root || '~/.amux/quarantine')}</code>.
-      "Actually freed" is the real free-space change, not the sum of file sizes — a move frees nothing
-      until purge, and snapshots can hold the blocks after that.</div>`;
+      "Actually freed" is the real free-space change rather than the sum of file sizes. A move frees
+      nothing until purge, and snapshots can hold the blocks after that.</div>`;
   }
 
   el.innerHTML = html;
