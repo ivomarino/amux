@@ -2834,6 +2834,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
     <div class="file-actions">
       <button id="mdai-run-btn" class="file-view-tab" onclick="_mdaiRun()" title="Run the DAG chain">Run</button>
       <button id="mdai-raw-btn" class="file-view-tab" onclick="_mdaiOpenRaw()" title="Open the raw .mdai file">Raw</button>
+      <button id="mdai-menu-btn" class="file-view-tab" onclick="event.stopPropagation();_mdaiMenu(this)" title="Download, copy, read aloud">&#x22EF;</button>
     </div>
     <button class="btn" onclick="closeMdaiNode()" style="flex-shrink:0;">&#x2715;</button>
   </div>

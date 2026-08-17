@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.669';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.670';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15627,6 +15627,62 @@ function _mdaiHistNav(delta) {
   const n = Math.max(0, Math.min(_mdaiHist.length - 1, _mdaiHistIdx + delta));
   if (n === _mdaiHistIdx) return;
   _mdaiHistIdx = n; _mdaiRender();
+}
+
+// Ellipsis menu on the MDAI viewer: download / copy / read aloud the currently
+// shown rendered version (Ethan, AMUX-3320). Read-aloud reuses _ttsSpeak.
+function _mdaiCurrentText() {
+  const cur = _mdaiHist[_mdaiHistIdx] || null;
+  return (cur && cur.output) ? cur.output : '';
+}
+function _mdaiMenu(btn) {
+  document.querySelectorAll('.explore-menu-popup').forEach(el => el.remove());
+  const text = _mdaiCurrentText();
+  const popup = document.createElement('div');
+  popup.className = 'explore-menu-popup';
+  const item = (label, fn) => {
+    const b = document.createElement('button');
+    b.className = 'explore-menu-item';
+    b.textContent = label;
+    b.onclick = () => { popup.remove(); fn(); };
+    popup.appendChild(b);
+  };
+  item('Download', () => _mdaiDownload(text));
+  item('Copy', () => {
+    if (!text) { showToast('Nothing to copy — run the node first'); return; }
+    navigator.clipboard.writeText(text).then(() => showToast('Copied'), () => showToast('Copy failed'));
+  });
+  item('Read aloud', () => {
+    if (!text) { showToast('Nothing to read — run the node first'); return; }
+    _ttsSpeak(text);
+  });
+  document.body.appendChild(popup);
+  const r = btn.getBoundingClientRect();
+  popup.style.position = 'fixed';
+  popup.style.top = (r.bottom + 4) + 'px';
+  popup.style.right = Math.max(8, window.innerWidth - r.right) + 'px';
+  popup.style.zIndex = '400';
+  setTimeout(() => {
+    const close = (e) => {
+      if (!popup.contains(e.target) && e.target !== btn) {
+        popup.remove();
+        document.removeEventListener('click', close);
+      }
+    };
+    document.addEventListener('click', close);
+  }, 0);
+}
+function _mdaiDownload(text) {
+  if (!text) { showToast('Nothing to download — run the node first'); return; }
+  const title = (document.getElementById('mdai-title') || {}).textContent || 'mdai';
+  const name = title.replace(/\.mdai$/i, '') + '.md';
+  const blob = new Blob([text], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = name;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+  showToast('Downloaded ' + name);
 }
 // Write the current parsed state back to disk (used by every structured edit).
 // Uses the upload endpoint (see _mdaiRootRel) because PUT /api/file rejects .mdai.
