@@ -101,19 +101,23 @@ pub fn routes() -> Router<AppState> {
 /// else `$HOME`. Deliberately the same root as `api/files.rs`, so a file browsed
 /// there and a node run here are the same file.
 fn mdai_root() -> PathBuf {
-    // A live `mdai_root` pref (set from the dashboard, no restart) wins, so the
+    // AMUX_FILES_ROOT is the EXPLICIT override (tests pin a temp root; the cloud
+    // container pins its own) and wins first, so a live `mdai_root` pref read
+    // from the real DB cannot leak into a test's isolated root (mdai_live_e2e).
+    if let Ok(r) = std::env::var("AMUX_FILES_ROOT") {
+        if !r.trim().is_empty() {
+            return PathBuf::from(r);
+        }
+    }
+    // Then a live `mdai_root` pref (set from the dashboard, no restart), so the
     // MDAI scan can be scoped to the user's notes vault. The $HOME default walks
     // the ENTIRE home tree (find_mdai_files, depth 12) and on a dev machine with
     // a huge ~/Dev that is slow enough to time out the list request, so the MDAI
-    // tab shows nothing (AMUX-3310). Then the env override, then $HOME.
+    // tab shows nothing (AMUX-3310). Finally $HOME.
     if let Some(p) = mdai_root_pref() {
         return p;
     }
-    std::env::var("AMUX_FILES_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into())
-        })
+    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into())
 }
 
 /// The live `mdai_root` pref (a path), read with a short-lived read-only
