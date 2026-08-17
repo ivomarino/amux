@@ -17,8 +17,15 @@ Why the field rots by construction, rather than by carelessness:
     covers several entries and "delete AC-300" is ambiguous
 From the file alone, a stale id and a colliding id are indistinguishable.
 
-Exit codes: 0 clean, 1 problems found, 2 could not reach the board (NOT a pass — an
-unreachable board means unchecked, and this says so rather than exiting 0).
+Exit codes: 0 clean, 1 problems found, 2 could not reach the board AND nothing
+structural was wrong (NOT a pass — an unreachable board means unchecked, and this says
+so rather than exiting 0).
+
+The "AND nothing structural was wrong" is the AEAB-19 fix, and it is the whole contract:
+structural problems are decidable without a board, so they exit 1 whether or not the
+board answered. Previously the unreachable branch returned a bare 2 and threw the
+structural verdict away — and since CI never has a board and treats 2 as a pass, the
+gate could not fail there at all.
 
     python3 scripts/frustrations_audit.py [--quiet]
 """
@@ -154,6 +161,21 @@ def main():
     # reported FIRST rather than buried under 122 lines of per-entry output.
     structure_ok = structure_check(raw, entries)
     problems, advisories = [], []
+    # AEAB-19, second instance in this same file. `structure_ok` was assigned here
+    # and NEVER READ — the drift check printed its finding and had no effect on the
+    # exit code. Its own docstring says it exists because an ad-hoc DATE-split
+    # shifted STATUS by one entry and put a live, thrice-regressed incident on a
+    # DELETION list, "seconds from receiving 'validated, deleting' text". That is
+    # the most expensive failure this file has, and the check guarding it was
+    # advisory by accident.
+    #
+    # It was firing on main at the time of this fix, and had been since 18590ca8
+    # landed a frustrations entry with NO `## ` heading — so the parser folded it
+    # into the preceding entry, which is exactly the count disagreement this check
+    # reports (DATE: 120 vs 119 entries). It reached main because the OTHER half of
+    # this bug meant `checks` could not fail. One defect hid the other.
+    #
+    # Structural drift is decidable without a board, so it fails in both branches.
 
     for e in entries:
         miss = [f for f in REQUIRED if not e.get(f)]
@@ -178,7 +200,27 @@ def main():
               % (len(entries), len(problems)))
         for p in problems:
             print("  PROBLEM  " + p)
-        return 2
+        # AEAB-19. This returned a bare 2, discarding whether `problems` is
+        # non-empty — and the board is ALWAYS unreachable in CI, which
+        # .github/workflows/checks.yml says in its own comment while treating 2 as
+        # a pass. So the structural half ran, printed its findings, and had its
+        # verdict thrown away on every push. `checks` is the only required status
+        # check on main, and this, its frustrations gate, could not fail. There
+        # was a live specimen the whole time (one entry missing SEVERITY and
+        # SYMPTOM) with the check green over it.
+        #
+        # Worse than a silent probe: a LOUD one whose output is correct and whose
+        # exit code contradicts it. The PROBLEM line was in the CI log every run,
+        # read by nobody, because the step was green — ethos rule 4's "a tag in a
+        # store the reader never opens", one layer out, where the check itself is
+        # what stops the reader opening it.
+        #
+        # The two halves are independent and now exit independently: a structural
+        # problem is decidable WITHOUT a board and so must fail; the CARD: half
+        # genuinely could not be checked and stays 2. Note the module docstring
+        # already said "2 ... (NOT a pass)" — the script and the workflow
+        # disagreed, and only the script knows whether `problems` is empty.
+        return 1 if (problems or not structure_ok) else 2
 
     for e in entries:
         c = e.get("CARD")
@@ -210,7 +252,7 @@ def main():
                 print("              %s x%d" % (k, len(v)))
         if not problems and not advisories:
             print("  clean — every CARD: resolves and plausibly matches its entry")
-    return 1 if problems else 0
+    return 1 if (problems or not structure_ok) else 0
 
 
 if __name__ == "__main__":

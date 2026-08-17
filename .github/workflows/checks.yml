@@ -56,11 +56,21 @@ jobs:
       # first run: an entry using `FIX-NOTE:` where the contract says `FIX:`, which
       # `grep '^FIX:'` silently skipped.
       #
-      # Exit codes are load-bearing: 0 clean, 1 real problems, 2 board unreachable.
-      # 2 is EXPECTED in CI (no localhost board) and must not fail the build — the
-      # structural half still ran and is what we are gating on. Only 1 fails, so a
-      # green run here means "every entry has its required fields", never "the
-      # board agreed", which CI cannot check and should not claim.
+      # Exit codes are load-bearing: 0 clean, 1 real problems, 2 board unreachable
+      # AND nothing structural wrong. 2 is EXPECTED in CI (no localhost board) and
+      # must not fail the build. Only 1 fails, so a green run here means "every entry
+      # has its required fields", never "the board agreed", which CI cannot check and
+      # should not claim.
+      #
+      # AEAB-19: the sentence above USED TO BE TRUE ONLY IN INTENT. The script's
+      # unreachable branch returned a bare 2, discarding whether it had found
+      # problems — and it always takes that branch in CI — so this step could not
+      # fail, and the older wording of this comment ("the structural half still ran
+      # and is what we are gating on") asserted a gate that did not exist. It ran; it
+      # was not gated on. A frustrations entry with no `## ` heading reached main
+      # green through this step on 2026-08-17. The script now returns 1 for a
+      # structural problem regardless of board reachability, which is what makes the
+      # claim above real; scripts/test-frustrations-audit.sh pins it.
       # The `|| rc=$?` is LOAD-BEARING, not style. GitHub runs this with
       # `shell: bash -e {0}`, and `set -uo pipefail` does NOT clear `-e` — so
       # the previous form (`python3 …` on its own line, then `rc=$?`) aborted
@@ -79,3 +89,18 @@ jobs:
           echo "frustrations_audit exit=$rc (0 clean, 1 real problems, 2 board unreachable)"
           if [ "$rc" = "1" ]; then exit 1; fi
           exit 0
+
+      # AEAB-19. This step exists because the step above could not fail, and a gate
+      # nobody can trip is worse than none — it is trusted. Same self-test logic as
+      # the secret scan at the top of this job: prove the instrument catches a planted
+      # defect before believing a clean run. Every case runs with the board pointed at
+      # a closed port, which is this job's real condition and the condition under
+      # which the gate was broken; a version run against a live board would pass
+      # against the old code and prove nothing.
+      #
+      # Runs under its own shebang and `set -uo pipefail`, so the `bash -e {0}`
+      # wrapper does not leak in and no `|| rc=$?` dance is needed.
+      - name: frustrations audit can actually fail (AEAB-19)
+        run: |
+          set -uo pipefail
+          ./scripts/test-frustrations-audit.sh
