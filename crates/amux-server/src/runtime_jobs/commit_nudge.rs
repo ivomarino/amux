@@ -255,13 +255,17 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              Do NOT assume {} yours. `git add -A` here would commit whatever a peer is \
              mid-edit on — OR a STALE copy origin/main has moved past, which committing would \
              silently REVERT (no conflict; the older file just wins, AMUX-3000). For each, \
-             prove the direction with the OBJECT-EXISTENCE test, NOT the diff line-count: \
+             prove the direction with the ANCESTRY test, NOT the diff line-count: \
              worktree-has-more/has-less misclassifies about 2 in 10 (studio-plg measured it on \
              this checkout: files with MORE lines than origin that are nonetheless stale). \
-             `git cat-file -e $(git hash-object <path>) 2>/dev/null`: object EXISTS = this exact \
-             content was committed before = STALE, `git checkout origin/main -- <path>` to \
-             restore, do not commit; object ABSENT = novel = a peer's mid-edit, hands off. \
-             Stage only what you recognise as your work AND whose object does not already exist.",
+             `git log --oneline HEAD..origin/main -- <path>`: prints a commit = origin has work \
+             you lack = STALE, `git checkout origin/main -- <path>` to restore, do not commit; \
+             prints NOTHING = origin has nothing you lack, so it is current content, and if it \
+             is not yours it is a peer's mid-edit: hands off either way. Do NOT use \
+             `git cat-file -e $(git hash-object <path>)` for this: blob existence cannot separate \
+             an OLD revision from a CURRENT one that is merely unpushed, so on a checkout ahead \
+             of origin it calls the whole tree STALE and its remedy reverts it. \
+             Stage only what you recognise as your work AND whose ancestry test prints nothing.",
             if n == 1 { "it" } else { "them" },
             if n == 1 { "it is" } else { "they are" },
         );
@@ -287,22 +291,29 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          graft-push checkout the worktree is frequently the OLDER side. A stale worktree copy \
          is a LOADED REVERT: `git add -A` carries the older version forward and silently undoes \
          the newer one on origin (no conflict, the older file just wins). So BEFORE staging, \
-         PROVE the direction per path with the OBJECT-EXISTENCE test. Do NOT read the line-count \
-         of a `git diff` as the verdict: worktree-has-more/has-less misclassifies about 2 in 10 \
-         (studio-plg measured it on this checkout — files with MORE lines than origin that are \
-         nonetheless stale, because their exact blob was committed before and origin has since \
-         moved to a shorter version). Roughly 1 in 4 differing paths here are novel mid-edit a \
-         blind `checkout` would DESTROY irreversibly, so the object test is the headline, not a \
-         caveat:\n\
-         \u{2022} `git cat-file -e $(git hash-object <path>) 2>/dev/null` — if the object EXISTS, \
-         this exact content was committed before, so it is an older revision (STALE): \
-         `git checkout origin/main -- <path>` safely restores it, do not commit;\n\
-         \u{2022} if it does NOT exist, the content has never been committed anywhere: it is \
-         NOVEL (a mid-edit), `checkout` destroys it, and the safe action is COMMIT, not restore.\n\
+         PROVE the direction per path with the ANCESTRY test. Do NOT read the line-count of a \
+         `git diff` as the verdict: worktree-has-more/has-less misclassifies about 2 in 10 \
+         (studio-plg measured it on this checkout: files with MORE lines than origin that are \
+         nonetheless stale, because origin has since moved to a shorter version). Roughly 1 in 4 \
+         differing paths here are novel mid-edit a blind `checkout` would DESTROY irreversibly, \
+         so the direction test is the headline, not a caveat:\n\
+         \u{2022} `git log --oneline HEAD..origin/main -- <path>` — if it prints ANY commit, \
+         origin has work on this path that your HEAD lacks, so the worktree copy is genuinely \
+         older (STALE) and `git checkout origin/main -- <path>` restores it; do not commit.\n\
+         \u{2022} if it prints NOTHING, origin has nothing you lack: the content is yours to \
+         keep, `checkout` would DESTROY it, and the safe action is COMMIT, not restore.\n\
+         This is the same predicate the guard itself classifies with, so its verdict and your \
+         check cannot disagree. Do NOT substitute \
+         `git cat-file -e $(git hash-object <path>)`: blob existence cannot tell an OLD revision \
+         from a CURRENT one that is merely unpushed, because both were committed at some point \
+         and both answer yes. On a checkout that sits ahead of origin every committed file \
+         answers yes, so that test reports STALE for the entire tree and its remedy reverts it \
+         (AMUX-3000 follow-up, measured 2026-08-16: five committed-but-unpushed paths, five \
+         false STALEs, one of them a whole feature shipped that day).\n\
          When the check is ambiguous or you cannot run it, commit — a redundant commit is \
          recoverable and a restore is not. (A `git diff` still shows WHAT changed; just never \
          read worktree-has-more as newer.)\n\
-         Commit only the paths whose object does not already exist, with a clear message; \
+         Commit only the paths whose ancestry test prints nothing, with a clear message; \
          WIP-commit anything intentionally incomplete and say so. Don't leave the working tree \
          dirty — but don't commit a revert to clear it, either."
     );
@@ -935,6 +946,49 @@ mod tests {
         let u = build("/repo", &dirty, &unknown, &Freshness::default(), "SCOPE-MARKER")
             .expect("unknown branch");
         assert!(u.contains("SCOPE-MARKER"), "unknown branch dropped its scope: {u}");
+    }
+
+    /// The advice a nudge PRINTS must use the same predicate the guard
+    /// CLASSIFIES with, or the reader's own check contradicts the verdict.
+    ///
+    /// This shipped broken: the direction-unknown branches told the reader to
+    /// run `git cat-file -e $(git hash-object <path>)` and treat "object
+    /// exists" as STALE, while `freshness_from_repo` classifies with
+    /// `git log HEAD..origin/main -- <path>`. Blob existence cannot separate an
+    /// OLD revision from a CURRENT one that is merely unpushed, since both were
+    /// committed at some point. On this checkout, which sits ~44 commits ahead
+    /// of origin, EVERY committed file answered "exists", so the printed recipe
+    /// reported the whole tree STALE and its remedy was a revert. Measured
+    /// 2026-08-16: five committed-but-unpushed paths, five false STALEs, one of
+    /// them a feature shipped that day.
+    ///
+    /// Asserted on the message TEXT because the text is the thing that was
+    /// wrong; the classifier was right the whole time.
+    #[test]
+    fn printed_direction_test_matches_the_classifier() {
+        let dirty = vec!["a.rs".to_string()];
+        let unknown = Ownership { unclaimed: vec!["a.rs".to_string()], ..Default::default() };
+        let msgs = [
+            build("/repo", &dirty, &Ownership::default(), &Freshness::default(), "S")
+                .expect("mine branch"),
+            build("/repo", &dirty, &unknown, &Freshness::default(), "S")
+                .expect("unknown branch"),
+        ];
+        for m in &msgs {
+            assert!(
+                m.contains("HEAD..origin/main"),
+                "nudge must prescribe the ancestry test it classifies with: {m}"
+            );
+            // The old recipe may still appear as an explicit warning NOT to use
+            // it, but never as the prescribed check.
+            let prescribes_blob = m.contains("`git cat-file -e $(git hash-object <path>) 2>/dev/null`: object EXISTS")
+                || m.contains("prove the direction with the OBJECT-EXISTENCE test");
+            assert!(
+                !prescribes_blob,
+                "nudge prescribes blob-existence as the DIRECTION test; it reports STALE for \
+                 every committed-but-unpushed file and its remedy reverts them: {m}"
+            );
+        }
     }
 
     /// The reported case, run against a REAL repo because the whole defect is a
