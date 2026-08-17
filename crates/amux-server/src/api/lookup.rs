@@ -26,9 +26,12 @@
 //! here rather than discovered later — porting the provider-riding needs the
 //! per-provider argv table, which does not exist in the Rust tree yet.
 //!
-//! The model is NOT pinned. `AMUX_HELPER_MODEL` selects it and an unset value
-//! means "whatever the CLI defaults to", so this improves when the CLI does
-//! (D3: a hardcoded weak-model helper is a bet that cannot improve).
+//! The model is not pinned to a weak local one. The DEFAULT is the cheapest
+//! Claude model (`DEFAULT_HELPER_MODEL = "haiku"`, a CLI alias that tracks the
+//! latest haiku), overridable live from the dashboard settings (`helper_model`
+//! pref) and by `AMUX_HELPER_MODEL` (D3, highest priority). An override that
+//! names an ollama model (`name:tag`) runs locally. This improves as the models
+//! do, and no longer depends on a resident ollama model being available.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -68,44 +71,67 @@ fn ollama_keep_alive() -> String {
         .unwrap_or_else(|| "30m".into())
 }
 
-/// SMALLEST model wins, because "fastest and cheapest" is what was asked for and
-/// size is the only proxy for it that ollama reports without running anything.
-/// Returns None when ollama is not running or has nothing pulled — both of which
-/// are ordinary, and neither of which should cost the caller more than the
-/// connect timeout.
-async fn smallest_local_model(client: &reqwest::Client) -> Option<String> {
-    let v: Value = client
-        .get(format!("{}/api/tags", ollama_url()))
-        .timeout(std::time::Duration::from_secs(2))
-        .send()
-        .await
-        .ok()?
-        .json()
-        .await
-        .ok()?;
-    let mut models: Vec<(u64, String)> = v["models"]
-        .as_array()?
-        .iter()
-        .filter_map(|m| {
-            Some((
-                m["size"].as_u64().unwrap_or(u64::MAX),
-                m["name"].as_str()?.to_string(),
-            ))
-        })
-        .collect();
-    models.sort();
-    models.into_iter().next().map(|(_, n)| n)
+/// The cheapest, fastest Claude model, used as the DEFAULT for every quick meta
+/// task (Look Up, the Orchestrate router, the plain-English worker summary). A
+/// bare alias, not a dated id, so it tracks the latest haiku as the CLI improves
+/// (D3: never pin a weak model). Ethan (2026-08-17): these tasks used to fall to
+/// the smallest resident ollama model, which was often qwen and "isn't always
+/// available"; the default is now Claude.
+const DEFAULT_HELPER_MODEL: &str = "haiku";
+
+/// An ollama model id is `name:tag` (e.g. `qwen3.8:27b`); Claude/codex aliases
+/// and ids never contain a colon. That is how the resolved helper model is
+/// routed to the local ollama runner vs the helper CLI.
+fn is_ollama_model(m: &str) -> bool {
+    m.contains(':')
 }
 
-/// Ask a resident local model. Returns (model, answer) or None to fall through
-/// to the CLI — never an error, because "no local model" is not a failure of the
-/// lookup, it is a machine without one.
-async fn try_local_model(prompt: &str) -> Option<(String, String)> {
+/// The live, no-restart override for the meta-task model, set from the dashboard
+/// settings and stored in the `prefs` table (`helper_model`). Read with a
+/// short-lived read-only connection so the one shared seam (`helper_answer`)
+/// stays stateless; any error (no DB, no table, no row, empty) returns None and
+/// the default applies. It never breaks a lookup.
+fn helper_model_pref() -> Option<String> {
+    let db = std::env::var("AMUX_DB")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|_| crate::config::amux_home().join("amux.db"));
+    let conn = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .ok()?;
+    let v: String = conn
+        .query_row("SELECT value FROM prefs WHERE key='helper_model'", [], |r| {
+            r.get(0)
+        })
+        .ok()?;
+    let v = v.trim().to_string();
+    (!v.is_empty()).then_some(v)
+}
+
+/// The effective meta-task model, highest priority first:
+///   1. `AMUX_HELPER_MODEL` env — the D3 knob, so server.env deployments win;
+///   2. the `helper_model` pref — the live dashboard override (any configured
+///      model across the harness: a Claude alias/id, or an ollama `name:tag`);
+///   3. `DEFAULT_HELPER_MODEL` — the cheap Claude default.
+fn resolve_helper_model() -> String {
+    if let Ok(m) = std::env::var("AMUX_HELPER_MODEL") {
+        let m = m.trim();
+        if !m.is_empty() {
+            return m.to_string();
+        }
+    }
+    helper_model_pref().unwrap_or_else(|| DEFAULT_HELPER_MODEL.to_string())
+}
+
+/// Ask a resident local model BY NAME. Returns the answer or None to fall
+/// through to the CLI — never an error, because "ollama not running / model not
+/// pulled" is not a failure of the lookup, it is a machine without that model.
+async fn try_local_model_named(prompt: &str, model: &str) -> Option<String> {
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(LOOKUP_TIMEOUT_S))
         .build()
         .ok()?;
-    let model = smallest_local_model(&client).await?;
     let v: Value = client
         .post(format!("{}/api/generate", ollama_url()))
         .json(&json!({
@@ -121,10 +147,7 @@ async fn try_local_model(prompt: &str) -> Option<(String, String)> {
         .await
         .ok()?;
     let answer = v["response"].as_str()?.trim().to_string();
-    if answer.is_empty() {
-        return None; // fall through rather than serve an empty explanation
-    }
-    Some((model, answer))
+    (!answer.is_empty()).then_some(answer)
 }
 
 /// Fastest, cheapest one-shot answer for a fully-formed prompt: a resident LOCAL
@@ -137,18 +160,26 @@ async fn try_local_model(prompt: &str) -> Option<(String, String)> {
 /// status + message. The caller supplies the WHOLE prompt (this does not wrap
 /// it), so each caller keeps its own instruction.
 pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (StatusCode, String)> {
-    if std::env::var("AMUX_HELPER_MODEL").map(|m| m.trim().is_empty()).unwrap_or(true) {
-        if let Some((model, answer)) = try_local_model(prompt).await {
+    let model = resolve_helper_model();
+    if is_ollama_model(&model) {
+        if let Some(answer) = try_local_model_named(prompt, &model).await {
             return Ok((format!("ollama:{model}"), answer));
         }
+        // The chosen local model is unavailable — fall through to the cheap
+        // Claude default rather than the CLI's own (heavier) default.
     }
     let cli = std::env::var("AMUX_HELPER_CLI").unwrap_or_else(|_| "claude".into());
+    // Use the resolved model as the CLI model, unless it was an ollama id that
+    // just failed above, in which case the cheap Claude default answers.
+    let cli_model = if is_ollama_model(&model) {
+        DEFAULT_HELPER_MODEL.to_string()
+    } else {
+        model
+    };
     let mut cmd = tokio::process::Command::new(&cli);
     cmd.arg("--print").arg(prompt);
-    if let Ok(m) = std::env::var("AMUX_HELPER_MODEL") {
-        if !m.trim().is_empty() {
-            cmd.arg("--model").arg(m.trim());
-        }
+    if !cli_model.is_empty() {
+        cmd.arg("--model").arg(&cli_model);
     }
     cmd.stdin(std::process::Stdio::null());
     match tokio::time::timeout(std::time::Duration::from_secs(LOOKUP_TIMEOUT_S), cmd.output()).await {
@@ -176,7 +207,7 @@ pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (Sta
                     },
                 ));
             }
-            Ok((cli, stdout))
+            Ok((format!("{cli}:{cli_model}"), stdout))
         }
     }
 }
@@ -217,6 +248,18 @@ pub async fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ollama_models_are_colon_tagged_and_the_default_is_cheap_claude() {
+        // Routing: colon-tagged ids go to ollama, Claude aliases/ids to the CLI.
+        assert!(is_ollama_model("qwen3.8:27b"));
+        assert!(is_ollama_model("llama3:8b"));
+        assert!(!is_ollama_model("haiku"));
+        assert!(!is_ollama_model("claude-haiku-4-5"));
+        assert!(!is_ollama_model("sonnet"));
+        // The default is the cheap Claude model, not a local model.
+        assert_eq!(DEFAULT_HELPER_MODEL, "haiku");
+    }
 
     #[test]
     fn the_prompt_carries_the_selection_verbatim() {
