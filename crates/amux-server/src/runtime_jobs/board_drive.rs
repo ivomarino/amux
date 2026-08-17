@@ -2421,7 +2421,11 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
          dormant watch).\n\n\
          You have {} more card(s) queued. Do not stall on a full queue: the aim is every card \
          driven to {}, working dependencies first. Never --force a gate you cannot satisfy — an \
-         honest blocker beats a false 'done'.",
+         honest blocker beats a false 'done'.\n\n\
+         And whatever you choose, FIRST make this card's DESCRIPTION reflect its CURRENT state \
+         (what is done, what is next, and a link to the artifact), so a reader knows the state \
+         from the card alone without reading any logs (Ethan: push every update to the board \
+         issue).",
         m.card,
         m.status,
         quoted_card_text(&m.title.chars().take(110).collect::<String>(), m.card),
