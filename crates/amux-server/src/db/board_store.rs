@@ -207,6 +207,19 @@ pub const DONE_LINK_REQUIRED_KEY: &str = "AMUX_DONE_LINK_REQUIRED";
 /// unowned card (no session) always gets the global default. Called by the
 /// board handler to decide whether to validate a link before allowing `done`.
 pub fn done_link_required(session: Option<&str>) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    }
+    // A PROCESS-ENV override wins: `AMUX_DONE_LINK_REQUIRED` in ~/.amux/server.env
+    // (loaded into process env at startup) is the global operator switch, and it
+    // is also how the test rigs turn the gate off for the mechanics/lifecycle
+    // suites that are not testing it. Unset falls through to the per-worker /
+    // group / global scope FILES below.
+    if let Ok(v) = std::env::var(DONE_LINK_REQUIRED_KEY) {
+        if !v.trim().is_empty() {
+            return !is_off(&v);
+        }
+    }
     let lane = match session.filter(|s| !s.is_empty()) {
         Some(s) => s,
         None => return true,
@@ -216,10 +229,7 @@ pub fn done_link_required(session: Option<&str>) -> bool {
         lane,
         DONE_LINK_REQUIRED_KEY,
     ) {
-        Some(v) => !matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "0" | "false" | "off" | "no"
-        ),
+        Some(v) => !is_off(&v),
         None => true,
     }
 }

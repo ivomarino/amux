@@ -16,6 +16,10 @@ use serde_json::{json, Value};
 use tower::ServiceExt;
 
 fn app() -> (axum::Router, tempfile::TempDir) {
+    // Pin the global done-link gate ON so this suite is hermetic (not dependent
+    // on whether the real ~/.amux disables it): the gate tests here provide a
+    // link where they reach done, and done_requires_an_asset_link asserts it.
+    std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("amux-test.db")).unwrap();
     let state = AppState {
@@ -400,7 +404,13 @@ async fn done_limit_caps_terminal_and_headers_announce_it() {
 #[tokio::test]
 async fn gate_blocks_with_python_body_then_gate_checked_satisfies() {
     let (app, _dir) = app();
-    let card = create(&app, json!({ "title": "gated", "status": "doing" })).await;
+    // desc carries an artifact link: the global done-link gate (AMUX-3275)
+    // requires one, and this test is about the ACK gate, not the link gate.
+    let card = create(
+        &app,
+        json!({ "title": "gated", "status": "doing", "desc": "artifact: crates/amux-server/src/api/board.rs" }),
+    )
+    .await;
     let id = card["id"].as_str().unwrap().to_string();
 
     // Unacked doing->done on a code card: the exact 409 the CLI parses.
@@ -472,7 +482,7 @@ async fn gates_derive_from_type_and_retyping_is_the_honest_exit() {
     let (app, _dir) = app();
     let card = create(
         &app,
-        json!({ "title": "self-resolved page", "status": "doing", "type": "escalation" }),
+        json!({ "title": "self-resolved page", "status": "doing", "type": "escalation", "desc": "artifact: crates/amux-server/src/api/board.rs" }),
     )
     .await;
     let id = card["id"].as_str().unwrap().to_string();
@@ -532,7 +542,7 @@ async fn retyping_clears_a_gate_override_so_the_gate_re_derives_from_the_new_typ
         &app,
         json!({
             "title": "override card", "session": "worker-1", "status": "doing",
-            "type": "investigation", "desc": "outcome: recorded here",
+            "type": "investigation", "desc": "outcome recorded (artifact: crates/amux-server/src/api/board.rs)",
             "gate": ["Implemented and merged", "Tests / lint pass"],
         }),
     )
@@ -561,7 +571,7 @@ async fn retyping_clears_a_gate_override_so_the_gate_re_derives_from_the_new_typ
 
     // NEGATIVE leg: the gate is RE-DERIVED, not bypassed. A fresh chore card must
     // still REFUSE the old code criteria — the fix did not make every ack pass.
-    let control = create(&app, json!({ "title": "control", "session": "worker-1", "status": "doing", "type": "chore" })).await;
+    let control = create(&app, json!({ "title": "control", "session": "worker-1", "status": "doing", "type": "chore", "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
     let cid = control["id"].as_str().unwrap().to_string();
     let (st, _, v) = send(
         &app,
@@ -925,12 +935,65 @@ async fn stale_expect_rev_is_409_with_current_rev() {
     assert_eq!(detail["desc"], json!("writer A"));
 }
 
+// ---- global done-link gate (AMUX-3275): done needs a real asset link ------
+
+/// The done-link gate is validated against the card text, so a full gate_ack
+/// cannot fake it (ethos rule 7); adding a real link then lets the same ack
+/// through. This is the integration coverage that was missing when the gate
+/// shipped: the unit tests exercised the detector, but no board test moved a
+/// card to done, so the fleet CI is what first proved the gate fires end to end.
+#[tokio::test]
+async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
+    let (app, _dir) = app();
+    // No link in the desc: no session, so the global default applies.
+    let card = create(
+        &app,
+        json!({ "title": "linkless", "status": "doing", "type": "chore", "desc": "just prose, nothing produced" }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("done_requires_asset_link"));
+
+    // Add a real artifact link; the same ack now reaches done.
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc": "shipped in crates/amux-server/src/api/board.rs" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], json!("done"));
+}
+
 // ---- full lifecycle through the named transitions ------------------------
 
 #[tokio::test]
 async fn lifecycle_todo_doing_review_done_verified_via_state_machine() {
     let (app, _dir) = app();
-    let card = create(&app, json!({ "title": "full run", "type": "chore" })).await;
+    // desc carries an artifact link for the global done-link gate (AMUX-3275);
+    // this test is about the lifecycle state machine, not the link gate.
+    let card = create(
+        &app,
+        json!({ "title": "full run", "type": "chore", "desc": "artifact: crates/amux-server/src/api/board.rs" }),
+    )
+    .await;
     let id = card["id"].as_str().unwrap().to_string();
 
     // Chore gates are the honest non-code bar; ack each hop.

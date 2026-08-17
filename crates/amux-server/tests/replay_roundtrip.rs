@@ -22,6 +22,9 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    // Replay round-trip exercises the event log, not the global done-link gate
+    // (which has its own coverage), so pin it OFF.
+    std::env::set_var("AMUX_DONE_LINK_REQUIRED", "0");
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("replay-test.db");
     let store = Arc::new(Store::open(&db_path).unwrap());

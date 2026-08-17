@@ -77,6 +77,9 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    // These golden scenarios test the gate/lifecycle state machine, not the
+    // global done-link gate (which has its own coverage), so pin it OFF.
+    std::env::set_var("AMUX_DONE_LINK_REQUIRED", "0");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {
@@ -632,7 +635,7 @@ async fn golden_scoped_gates() {
 
     // ---- Card 1: typed `code` (the default type) ---------------------------
     let code_sem =
-        create_task_with(app, json!({ "title": "code-typed card", "session": actor })).await;
+        create_task_with(app, json!({ "title": "code-typed card", "session": actor, "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
     // Even doing is gated for code — no ack, no move.
     let (st, v) = patch_raw(app, &code_sem, json!({ "status": "doing" }), actor).await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
@@ -670,7 +673,7 @@ async fn golden_scoped_gates() {
 
     // ---- Card 2: per-card `gate` override, set via PATCH -------------------
     let over_sem =
-        create_task_with(app, json!({ "title": "card with its own gate", "session": actor })).await;
+        create_task_with(app, json!({ "title": "card with its own gate", "session": actor, "desc": "artifact: crates/amux-server/src/api/board.rs" })).await;
     let custom = vec![
         "Golden custom criterion: staging soak green for 24h".to_string(),
         "Golden custom criterion: runbook updated".to_string(),
@@ -711,7 +714,7 @@ async fn golden_scoped_gates() {
     // ---- Card 3: typed `chore` — the honest lighter gate -------------------
     let chore_sem = create_task_with(
         app,
-        json!({ "title": "chore-typed card", "session": actor, "type": "chore" }),
+        json!({ "title": "chore-typed card", "session": actor, "type": "chore", "desc": "artifact: crates/amux-server/src/api/board.rs" }),
     )
     .await;
     let v = patch_ok(app, &chore_sem, json!({ "status": "doing", "gate_ack": true }), actor).await;
