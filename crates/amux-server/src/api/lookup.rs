@@ -181,12 +181,34 @@ pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (Sta
     if !cli_model.is_empty() {
         cmd.arg("--model").arg(&cli_model);
     }
+    // Keep the one-shot LEAN, or it 504s. Measured 2026-08-17: `claude --print`
+    // in the server's CWD with MCP on took ~12s just to answer "ok" and blew the
+    // 45s timeout under load (5x 504 on /api/orchestrate/plan, the Dictate
+    // router) the moment this default moved off local ollama onto the CLI. Two
+    // costs, both removable for a stateless helper call: MCP server startup, and
+    // loading every CLAUDE.md up the directory tree (this repo's are huge). So
+    // run with no MCP and in a neutral working dir with no CLAUDE.md. That drops
+    // it to ~2.7s. The helper prompt is self-contained (the router builds the
+    // fleet list into it; lookup passes the term), so none of that context is
+    // needed here. Claude-only flags are gated on the CLI name.
+    if cli == "claude" {
+        cmd.arg("--strict-mcp-config");
+    }
+    cmd.current_dir(std::env::temp_dir());
     cmd.stdin(std::process::Stdio::null());
     match tokio::time::timeout(std::time::Duration::from_secs(LOOKUP_TIMEOUT_S), cmd.output()).await {
-        Err(_) => Err((
-            StatusCode::GATEWAY_TIMEOUT,
-            format!("{cli} did not answer within {LOOKUP_TIMEOUT_S}s"),
-        )),
+        Err(_) => {
+            // Surfaces so a sweep catches a slow helper without a human waiting
+            // on a 504 first (two-fixes rule): grep `helper_timeout` in
+            // server-rs.log; /api/logs/analyze already groups the 504.
+            tracing::warn!(
+                "helper_timeout: {cli}:{cli_model} did not answer within {LOOKUP_TIMEOUT_S}s (meta-task 504)"
+            );
+            Err((
+                StatusCode::GATEWAY_TIMEOUT,
+                format!("{cli} did not answer within {LOOKUP_TIMEOUT_S}s"),
+            ))
+        }
         Ok(Err(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("could not run {cli}: {e}"),
