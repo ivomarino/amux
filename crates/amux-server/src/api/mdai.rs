@@ -101,11 +101,38 @@ pub fn routes() -> Router<AppState> {
 /// else `$HOME`. Deliberately the same root as `api/files.rs`, so a file browsed
 /// there and a node run here are the same file.
 fn mdai_root() -> PathBuf {
+    // A live `mdai_root` pref (set from the dashboard, no restart) wins, so the
+    // MDAI scan can be scoped to the user's notes vault. The $HOME default walks
+    // the ENTIRE home tree (find_mdai_files, depth 12) and on a dev machine with
+    // a huge ~/Dev that is slow enough to time out the list request, so the MDAI
+    // tab shows nothing (AMUX-3310). Then the env override, then $HOME.
+    if let Some(p) = mdai_root_pref() {
+        return p;
+    }
     std::env::var("AMUX_FILES_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into())
         })
+}
+
+/// The live `mdai_root` pref (a path), read with a short-lived read-only
+/// connection so this stays a sync free function; any error (no DB, no row,
+/// empty) returns None and the env/$HOME default applies.
+fn mdai_root_pref() -> Option<PathBuf> {
+    let db = std::env::var("AMUX_DB")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| crate::config::amux_home().join("amux.db"));
+    let conn =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .ok()?;
+    let v: String = conn
+        .query_row("SELECT value FROM prefs WHERE key='mdai_root'", [], |r| {
+            r.get(0)
+        })
+        .ok()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| PathBuf::from(v))
 }
 
 // ---------------------------------------------------------------------------
