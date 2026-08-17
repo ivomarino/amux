@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.665';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.666';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -26476,6 +26476,7 @@ function toggleSettings() {
     _renderInstanceSwitcher();
     _loadCloudPlan();
     loadDefaultModel();
+    loadHelperModel();
     const zd = document.getElementById('zoom-level-display');
     if (zd) zd.textContent = _zoomLevel + '%';
     // Apply cloud identity (email) or device name
@@ -26718,6 +26719,56 @@ async function saveDefaultModel(val) {
       if (defOpt) defOpt.textContent = 'Default (' + val + ')';
       showToast('Default model: ' + val);
     }
+  } catch(e) { showToast('Error: ' + e.message); }
+}
+
+// ── Meta-task model (Look Up / Orchestrate router / worker summaries) ────────────
+// The DEFAULT is the cheapest Claude model, chosen server-side in
+// lookup::helper_answer; this control writes the live `helper_model` pref that
+// overrides it (empty value = back to default). Local ollama models are listed
+// dynamically so any installed model is selectable.
+async function loadHelperModel() {
+  const sel = document.getElementById('settings-helper-model');
+  if (!sel) return;
+  try {
+    const r = await fetch(API + '/api/ollama/models', { headers: _authHeaders() });
+    if (r.ok) {
+      const d = await r.json();
+      const models = (d.models || []).filter(Boolean);
+      const og = document.getElementById('settings-helper-model-ollama');
+      if (og) {
+        og.innerHTML = '';
+        if (!models.length) { og.remove(); }
+        else models.forEach(name => {
+          const o = document.createElement('option');
+          o.value = name; o.textContent = name; og.appendChild(o);
+        });
+      }
+    }
+  } catch (e) {}
+  try {
+    const r = await fetch(API + '/api/prefs?key=helper_model', { headers: _authHeaders() });
+    if (r.ok) {
+      const d = await r.json();
+      const val = (d && d.value) || '';
+      // A saved id not in the list (e.g. a custom dated model) still shows.
+      if (val && !Array.from(sel.options).some(o => o.value === val)) {
+        const opt = document.createElement('option');
+        opt.value = val; opt.textContent = val; sel.appendChild(opt);
+      }
+      sel.value = val;
+    }
+  } catch (e) {}
+}
+async function saveHelperModel(val) {
+  try {
+    const r = await fetch(API + '/api/prefs', {
+      method: 'POST',
+      headers: Object.assign({'Content-Type':'application/json'}, _authHeaders()),
+      body: JSON.stringify({ key: 'helper_model', value: val })
+    });
+    if (r.ok) showToast(val ? ('Meta-task model: ' + val) : 'Meta-task model: default (haiku)');
+    else showToast('Could not save meta-task model');
   } catch(e) { showToast('Error: ' + e.message); }
 }
 
