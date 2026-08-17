@@ -5261,3 +5261,119 @@
   .amux-dp-pop.sheet .amux-dp-foot button { min-height: 44px; }
   .amux-dp-trigger { min-height: 40px; }
 }
+
+/* ═══════ MDAI: computed markdown DAG nodes (.mdai) ═══════
+   The global MDAI tab list, the node overlay (output + history + edit), and the
+   Connect picker. Mobile-first: everything is width-fluid and wraps at 375px. */
+#mdai-list { -webkit-overflow-scrolling: touch; }
+.mdai-row {
+  display: flex; align-items: center; gap: 10px; padding: 11px 14px;
+  border-bottom: 1px solid var(--border); cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.mdai-row:hover { background: var(--card); }
+.mdai-row-icon { flex: 0 0 auto; display: flex; align-items: center; }
+.mdai-row-main { flex: 1; min-width: 0; }
+.mdai-row-title {
+  font-size: 0.86rem; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mdai-row-path {
+  font-size: 0.68rem; color: var(--dim); font-family: 'SF Mono','Fira Code',monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
+}
+.mdai-row-meta { font-size: 0.7rem; color: var(--dim); margin-top: 3px; }
+.mdai-row-go { flex: 0 0 auto; color: var(--dim); font-size: 1.1rem; line-height: 1; }
+
+/* Node overlay body (reuses .file-overlay chrome, but normal prose, not mono). */
+.mdai-node-body {
+  flex: 1; overflow: auto; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px;
+  -webkit-overflow-scrolling: touch;
+}
+.mdai-section { margin-bottom: 16px; }
+.mdai-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.mdai-badge {
+  font-size: 0.66rem; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border); white-space: nowrap;
+}
+.mdai-badge-fresh { color: var(--green); border-color: var(--green); }
+.mdai-badge-cached { color: var(--dim); }
+.mdai-badge-model { color: var(--purple, #a371f7); border-color: var(--purple, #a371f7); font-family: 'SF Mono','Fira Code',monospace; }
+.mdai-meta-time { font-size: 0.7rem; color: var(--dim); }
+.mdai-histnav { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.mdai-hbtn {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 0.74rem; padding: 5px 10px; cursor: pointer;
+  min-height: 32px;
+}
+.mdai-hbtn:disabled { opacity: 0.4; cursor: default; }
+.mdai-hpos { font-size: 0.72rem; color: var(--dim); }
+.mdai-output {
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; overflow-wrap: anywhere;
+}
+.mdai-output > *:first-child { margin-top: 0; }
+.mdai-output > *:last-child { margin-bottom: 0; }
+.mdai-err {
+  background: rgba(248,81,73,0.12); border: 1px solid var(--red); border-radius: 8px;
+  color: var(--red); padding: 10px 12px; font-size: 0.82rem; margin-bottom: 14px;
+  overflow-wrap: anywhere;
+}
+.mdai-err-cycle { margin-top: 6px; font-family: 'SF Mono','Fira Code',monospace; font-size: 0.72rem; }
+.mdai-edit { border-top: 1px solid var(--border); padding-top: 12px; }
+.mdai-edit-h { font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 8px; }
+.mdai-note { font-size: 0.78rem; color: var(--dim); line-height: 1.5; margin-bottom: 8px; }
+.mdai-note a { color: var(--accent); }
+.mdai-edge { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+.mdai-edge-path { font-size: 0.74rem; font-family: 'SF Mono','Fira Code',monospace; color: var(--purple, #a371f7); word-break: break-all; margin-bottom: 6px; }
+.mdai-prompt, .mdai-body-ta {
+  width: 100%; box-sizing: border-box; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px;
+  font-size: 0.82rem; line-height: 1.45; resize: vertical; font-family: inherit;
+  outline: none;
+}
+.mdai-prompt:focus, .mdai-body-ta:focus { border-color: var(--accent); }
+.mdai-edge-prompt-ro { font-size: 0.8rem; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.mdai-edge-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.mdai-sbtn {
+  background: var(--accent); color: #fff; border: none; border-radius: 6px;
+  font-size: 0.74rem; font-weight: 600; padding: 6px 12px; cursor: pointer; min-height: 32px;
+}
+.mdai-sbtn-danger { background: none; color: var(--red); border: 1px solid var(--border); }
+
+/* Connect picker (a modal list of .mdai targets). */
+.mdai-picker-overlay {
+  position: fixed; inset: 0; background: rgba(1,4,9,0.6); z-index: 400;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  padding-top: max(16px, env(safe-area-inset-top)); padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+.mdai-picker {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  width: 100%; max-width: 460px; max-height: 80vh; display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.mdai-picker-h {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 0.86rem;
+}
+.mdai-picker-h b { color: var(--purple, #a371f7); }
+.mdai-picker-x { background: none; border: none; color: var(--dim); font-size: 1rem; cursor: pointer; padding: 4px 8px; min-height: 36px; min-width: 36px; }
+.mdai-picker-list { overflow-y: auto; flex: 1; -webkit-overflow-scrolling: touch; }
+.mdai-picker-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: none; border: none; border-bottom: 1px solid var(--border);
+  padding: 11px 14px; cursor: pointer; color: var(--text);
+}
+.mdai-picker-item:hover { background: var(--card); }
+.mdai-picker-item-main { flex: 1; min-width: 0; }
+.mdai-picker-item-title { display: block; font-size: 0.84rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdai-picker-item-path { display: block; font-size: 0.68rem; color: var(--dim); font-family: 'SF Mono','Fira Code',monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdai-picker-foot { padding: 10px 14px; border-top: 1px solid var(--border); }
+@media (max-width: 600px) {
+  .mdai-picker { max-height: 88vh; }
+  .mdai-row { padding: 12px 12px; }
+  /* Touch targets >= 44px on mobile (css-mobile rule). */
+  .mdai-hbtn, .mdai-sbtn, .mdai-picker-x { min-height: 44px; }
+  .mdai-edge-actions { gap: 8px; }
+}
