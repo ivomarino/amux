@@ -45,7 +45,7 @@
     "description": "Indie hackers use amux to run a 5-10 agent engineering team from their phone — shipping features overnight, automating support, and building products that compound while they sleep.",
     "url": "https://amux.io/for/indie-hackers/",
     "datePublished": "2026-07-07",
-    "dateModified": "2026-07-07",
+    "dateModified": "2026-08-17",
     "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io"},
     "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io", "logo": {"@type": "ImageObject", "url": "https://amux.io/icon.png"}},
     "image": "https://amux.io/og-image.png",
@@ -119,7 +119,7 @@
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/for/">For Developers</a> <span class="sep">›</span> <span>Indie Hackers</span></div>
 
     <h1>amux for Indie Hackers</h1>
-    <p class="subtitle">Run a 5-10 agent engineering team from your phone. Ship features overnight, automate the boring parts, and build products that compound while you sleep. <em>Updated July 2026.</em></p>
+    <p class="subtitle">Run a 5-10 agent engineering team from your phone. Ship features overnight, automate the boring parts, and build products that compound while you sleep. <em>Updated August 2026.</em></p>
 
     <p>amux is an open-source control plane for running an AI engineering team from a single dashboard or your phone. It launches, monitors, and self-heals dozens of Claude Code, Codex, or Gemini CLI sessions simultaneously. Built-in kanban board, notes, CRM, Gmail API, browser automation, and scheduler — everything an indie hacker needs to run a product without a team.</p>
 
@@ -240,6 +240,27 @@ done</code></pre>
       </table>
     </div>
     <p>At $30/night for 5 agents, you're spending $900/month on AI engineering capacity that would cost $15,000-30,000/month in freelancer time. The quality difference is real — agents need more review and correction than senior engineers — but for an indie hacker willing to review output and iterate, the leverage is extraordinary.</p>
+
+    <h2>What's New in August 2026</h2>
+    <p>Several features shipped this summer that change the economics further for indie hackers running unattended agent fleets:</p>
+
+    <h3>Owner alerts: your phone rings when an agent needs you</h3>
+    <p>The hardest part of overnight runs isn't writing tasks — it's not knowing when something actually needs a human. Owner alerts solve this. When any agent hits a gate it can't pass (needs approval, finds a blocker, produces something critical), it fires an alert to your phone via push notification and iMessage:</p>
+    <pre style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:1.2rem;overflow-x:auto;font-size:0.85rem;"><code># In ~/.amux/server.env
+AMUX_OWNER_EMAIL=you@yourdomain.com
+
+# From any agent
+amux alert "Billing module throws TypeError on upgrade path" "blocking the payment-v2 PR"</code></pre>
+    <p>Push notification and iMessage both fire. You wake up to alerts for things that matter, not to a dashboard you have to check. This changes overnight runs from "hope nothing breaks" to "get paged if something does."</p>
+
+    <h3>Computed files (.mdai): agents share knowledge automatically</h3>
+    <p>Most overnight failures happen when agents work in isolation and produce conflicting assumptions. Computed files let you define DAG relationships between project files: one agent produces a summary or analysis, other agents read it as their input. The freshness graph propagates automatically — when an upstream file changes, its dependents are flagged stale and can be recomputed on the next run. The canonical example for indie hackers: a market-research agent produces a <code>research.mdai</code> competitive summary; your feature-planning agent reads it as context before opening tasks. No manual copy-paste between sessions.</p>
+
+    <h3>Files tab: browse and edit your project from anywhere</h3>
+    <p>The dashboard now includes an OS-style file manager: browse your project directory, open files with syntax highlighting, and edit directly from the web UI or iOS app. For indie hackers traveling or working from a phone, this means you can review what an agent wrote, make a quick correction, and send a follow-up message — without opening a laptop or SSHing into anything.</p>
+
+    <h3>Mix runtimes for cost efficiency</h3>
+    <p>amux supports Claude Code (Anthropic), Codex (OpenAI), and Gemini CLI side by side in the same dashboard. The practical play for indie hackers: run Claude Sonnet for complex feature agents (highest quality), Codex for fast mechanical tasks, and Gemini Flash for docs, tests, and summaries at near-zero cost. A mixed fleet drops your per-sprint cost while maintaining quality on the tasks that need it.</p>
 
     <h2>Common Indie Hacker amux Setups</h2>
 
