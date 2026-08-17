@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.666';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.667';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28629,14 +28629,12 @@ const _KIND_COLORS = {
   data: '#58a6ff', code: '#6e7681', build: '#f85149', doc: '#39c5cf', other: '#484f58',
 };
 
-function _fmtBytes(n) {
-  n = +n || 0;
-  if (n >= 1099511627776) return (n / 1099511627776).toFixed(2) + ' TB';
-  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
-  if (n >= 1048576) return (n / 1048576).toFixed(0) + ' MB';
-  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
-  return n + ' B';
-}
+// _fmtBytes is declared once, further down (the B/KB/MB/GB version by the
+// torrent renderer). A second copy lived here; in a classic script the LAST
+// declaration wins, so this one governed nothing at runtime and only tripped
+// eslint no-redeclare, which failed the SPA static gate and kept rust.yml red
+// for 3 runs on origin/main (reported by mixpeek-homepage-claude 2026-08-17,
+// which also blocked their MHC-377 CI step from ever running). Removed.
 
 function _metricsSetMode(mode) {
   _metricsMode = mode;
