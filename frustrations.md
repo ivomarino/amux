@@ -2883,3 +2883,158 @@ CARD: AC-360
 SYMPTOM: The CLOUD FRESHNESS TICK step-1 probe `curl -sk https://cloud.amux.io/app.js | grep APP_VER` returns EMPTY. Unauthenticated `app.js` now 302s to `/sign-in` (http=302, size=0). `/health` and `/version` also 302; `/api/health` and `/api/version` 401. There is no auth-free endpoint on the gateway that reveals the served build, so the recipe's `served=` is always blank for whoever runs the tick.
 COST: A blank `served` compared against a non-empty `head` reads as "cloud is behind origin/main" and, taken literally, would dispatch `recreate=yes` — which STOPS every worker container and does not restore them. That is precisely the false-positive-recreate-before-a-demo harm the 2026-08-12 guard was added to prevent, and here the trigger is a broken probe rather than a real drift. Caught only because I recognised the empty read as a probe fault, not a signal (ethos rule 7: an empty grep is not a measurement). A less careful run recreates prod to "fix" a drift that does not exist.
 FIX: (proposed on AC-360) Drop the app.js scrape. The robust, auth-free freshness signal already exists: the newest SUCCESSFUL `deploy-cloud` run's headSha vs origin/main. `gh run list --workflow=deploy-cloud.yml --json headSha,conclusion` -> newest `success` sha, then `git rev-list --count <sha>..origin/main`; 0 means the deployed image is current. Used exactly that this tick (last success 31914150334 built 73fce92; origin/main tip == 73fce92, 0 behind). The recipe change is Ethan's to make (it is his standing scheduler prompt, ethos rule 8) — proposed, not silently rewritten. Distinct from AC-344 (deploy-cloud SKIP is silent); this is the tick's own comparison being unable to read the served version at all.
+
+## The verify nudge names `needs:you` as its escape and does not honour it
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-17
+SESSION: amux (AEAB)
+CARD: AEAB-9
+SYMPTOM: The done-verification nudge closes with "Cards that genuinely cannot be
+  verified by you ... should be tagged `needs:you` so they surface in the owner digest
+  rather than sitting here indefinitely." AEAB-5 was tagged via `amux board needsyou`
+  on 08-14 — the sanctioned command, which succeeded — and the nudge fired on it again
+  on 08-17. `done_verify_candidates` / `done_card_count` filter on session, status,
+  deleted, archived, owner_type and type, and never join `issue_tags`.
+COST: Three nudge cycles spent re-deciding a card that was already correctly parked,
+  each one re-reading the card to reach the same verdict. Worse than the minutes: the
+  nudge is the mechanism that is supposed to make a stuck done card visible, so an
+  instruction it issues and then ignores trains the reader to discount it. It also
+  double-nags — `needsyou.renag` already chases the HUMAN on these cards every 3d, so
+  the same card asks both the party who owes the answer and the party who cannot give
+  one.
+FIX: PR #106 / a9aa7177 — exclusion factored into `needs_human_sql()` next to the
+  existing `unverifiable_types_sql()` and applied to BOTH queries (they feed the
+  "... and N more" arithmetic and the file already warns they must not drift). Same
+  `LIKE 'needs:you%'` form as `select_pickup`, so `needs:you:decision` cannot slip
+  past. Test verified to FAIL on the pre-fix code, listing all three tagged cards.
+  NOT A NEW DEFECT CLASS: this is AC-223 one consumer down. That card closed the
+  auto-pickup hole and its own FIX note said the tag-vs-status representation question
+  stayed open. Every query that reads `issues` without joining `issue_tags` is a
+  candidate for the same bug — worth a sweep rather than waiting to hit the next one.
+
+## `amux board add` folds every flag into the title, and `--help` files a card
+AREA: cli
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-17
+SESSION: amux-errors-and-bugs
+CARD: AEAB-17
+SYMPTOM: `amux board add` takes only a positional title. Unknown flags are concatenated
+  into it, exit 0, no warning — proved with a control rather than inferred from missing
+  help: `amux board add "PROBE..." --totally-bogus-flag xyz` filed AEAB-16 with the flag
+  in the title. Separately, `amux board add --help` does not print help; it creates a
+  card titled `--help` (AEAB-15). The verbs that DO take flags are inconsistent with it:
+  `retitle` accepts `--stdin/--file/--desc-stdin` and `--type`, every status verb accepts
+  `--checked/--ack/--outcome-file`; `add`, the verb you reach first, accepts none.
+COST: All five cards filed in one log-review run (AEAB-9..AEAB-13) were created with
+  desc_len 0 or near-0 — every diagnosis written for them went nowhere — titles up to
+  259 chars carrying raw `--desc-file /private/tmp/claude-501/.../c26.md` paths that
+  will not exist tomorrow, and the wrong TYPE, so two cards about a production outage
+  and a dual-server fault were gated on "Implemented and merged" + "Tests / lint pass".
+  An empty card is worse than no card: it asserts the work is tracked. And the
+  discovery path is the polluting action, so the mistake is unlearnable in advance —
+  the AMUX-2140 shape (`amux board claim`) with a new verb.
+FIX: Cards repaired via the documented path (`retitle ... --desc-stdin`) and verified
+  from fresh reads; probe cards discarded after confirming they were mine. CLI not
+  fixed — not mine. Wanted: reject unknown flags, print help for `--help`, accept
+  `--type`/`--desc-file` on `add` like `retitle` does, and a title-length sanity check
+  (a 259-char title containing `/private/tmp/` is never intentional).
+MY OWN HALF, recorded because ethos.md predicted it verbatim: I verified `type` and
+  `status` on those cards from fresh reads and never checked `desc` — the exact
+  desc_append/AMUX-2161 failure rule 7 describes ("the habit gave the feeling of rigour
+  while pointing at the wrong field"). I had read that line earlier in the same session.
+  Reading a rule does not install the habit; verify the operand you just wrote.
+
+## The auto-builder ships any branch to the live fleet with no announcement
+AREA: deploy
+SEVERITY: blocks
+STATUS: open (the live deviation is fixed; the hazard is not)
+DATE: 2026-08-17
+SESSION: amux-errors-and-bugs
+CARD: AEAB-12
+SYMPTOM: `~/amux` is the BUILD SOURCE, and the builder rebuilds on any local HEAD move
+  regardless of branch; the server self-adopts in 5s. I committed a9aa7177 on a feature
+  branch there at 00:02; at 00:03:43 the builder installed it and it served the whole
+  fleet until 09:45 — 9h42m of an unreviewed, un-CI'd commit in production. The same
+  condition left the machine 29 commits behind origin/main, so SCHED-1 ("keep me on the
+  latest") fired at 09:00 and could not do its job.
+COST: 9h42m of unreviewed code live, plus the owner's standing "keep me on the latest"
+  request silently unmet while every indicator looked healthy. Diagnosing it took the
+  first ~30 minutes of a log review that was supposed to be about something else.
+FIX: Live deviation fixed — ~/amux back on main, fast-forwarded to 9d5aebf4, verified
+  by build-stamp change (663a3a84 -> ec3228af), store=ok, 0 panics/0 ERRORs since. The
+  hazard is NOT fixed and should not be fixed by refusing non-main HEADs: this machine
+  survived weeks deliberately pinned to an unmerged fix branch, so that is a supported
+  mode. The defect is that a deliberate pin and an accidental feature branch are
+  byte-identical to the builder and the accidental one is announced nowhere. Wanted:
+  one line in rust-auto-build.log naming the branch when the revision is off main, and
+  the same fact on /health or the dashboard. Workaround that works today and belongs in
+  CLAUDE.md: never develop in ~/amux — `git worktree add` and leave its HEAD on main.
+
+## Two amux servers on one SQLite DB, and endpoint.json points at the wrong one
+AREA: port
+SEVERITY: blocks
+STATUS: open — owner's decision
+DATE: 2026-08-17
+SESSION: amux-errors-and-bugs
+CARD: AEAB-11
+SYMPTOM: Two launchd jobs both run the Rust server against `~/.amux/amux.db` —
+  `com.amux.server-rs` (pid 22521, port 8824, last exit -9) and `com.amux.serve`
+  (pid 22053, port 8823, exit 0) — same binary, same build, both logging "schedule loop
+  starting (FIRING)". Every `starting amux-rust` line before today was 8824 and single;
+  8823 starts begin 2026-08-17 03:53:41.
+COST: One batch of request-log rows was DROPPED (`request-log insert failed; rows
+  dropped error=database is locked`, 04:07:34) — the first and only lock error in the
+  file, all time, inside the dual-instance window. `endpoint.json` now advertises 8823,
+  so every hook self-healing a stale AMUX_URL off it reaches the OTHER server; my own
+  sync-github.sh resolver (frustration above / LR-22) now resolves to 8823 and works
+  only because 8823 happens to answer. And it doubled the log: both instances tick the
+  same 5s stall loop, so those warnings appear twice ~200ms apart, which is 77% of the
+  24h log volume and buried the lock error above.
+  DOCS NOW WRONG, second time for this class: CLAUDE.md asserts as ground truth
+  "re-measured 2026-08-06" that "com.amux.serve.plist is the only server plist on disk"
+  and gives `launchctl kickstart -k gui/$(id -u)/com.amux.serve` as THE restart command.
+  There are two server plists now, and that command restarts 8823, not the canonical
+  port. The note is emphatic that a wrong label costs a debugging session; it is now
+  wrong itself.
+FIX: Not applied — choosing which job is canonical can take the dashboard down, and a
+  dev instance with its own AMUX_HOME is a legitimate configuration this could also be
+  (ethos rule 8). Needed: decide, `launchctl bootout` the loser, delete its plist,
+  correct CLAUDE.md's launchd note.
+
+## frustrations.md logged from ~/Developer/amux is stranded — that checkout cannot push
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-17
+SESSION: amux-errors-and-bugs
+CARD: AEAB-18
+SYMPTOM: Two copies of this file exist and the one a session is pointed at is the one
+  that cannot reach anyone. `~/Developer/amux/frustrations.md` holds 25 entries /
+  43,934 bytes; `~/amux/frustrations.md` (origin/main) holds 116 / 207,952. Same file,
+  same lineage — the local one is a stale revision that has ALSO diverged, holding at
+  least one entry that never reached origin. CLAUDE.md and `.claude/rules/frustrations.md`
+  both live in the stale checkout and say to append to "frustrations.md at the repo
+  root", which for a session cwd'd there resolves to the stranded copy. The append
+  succeeds. There is no error.
+COST: All four frustration entries from today's log review went into the stranded copy.
+  The whole argument for this file is that a single frustration is a complaint and a
+  cluster is an argument — three entries sharing an AREA is the signal. That only works
+  if they are in the file everyone reads. Mine were invisible to every other session and
+  to any AREA tally run upstream, and would have stayed so indefinitely: the unblocker
+  is the 4-unpushed-commit divergence that has been an open owner decision since
+  2026-08-13.
+  Distinct from that divergence rather than a restatement of it: that one is "the
+  checkout cannot fast-forward", which announces itself. This one is "the documented
+  place to log friction is INSIDE that checkout", so the divergence silently swallows
+  new writes instead of blocking a read.
+FIX: Migrated today's four entries here and verified against
+  `scripts/frustrations_audit.py` — no new structural problems, all four CARD ids
+  resolve on the live board. The underlying choice is open and worth making
+  deliberately: (a) resolve the divergence so the checkout syncs again — owner's call,
+  needed regardless; (b) point the rule at the build source, which can push, and say why;
+  (c) have the rule REFUSE to append to a checkout that is behind origin, or at minimum
+  warn. (c) is the one that survives the next time two checkouts drift, because this
+  failure is silent by construction.
