@@ -150,6 +150,64 @@ async fn try_local_model_named(prompt: &str, model: &str) -> Option<String> {
     (!answer.is_empty()).then_some(answer)
 }
 
+/// Map a CLI model alias to a concrete Anthropic API model id. The Messages API
+/// needs a specific id, not the CLI's `haiku`/`sonnet`/`opus` aliases; a value
+/// that is already a concrete id (`claude-*`) passes through unchanged.
+fn api_model_id(model: &str) -> String {
+    match model {
+        "haiku" => "claude-haiku-4-5-20251001".to_string(),
+        "sonnet" => "claude-sonnet-4-6".to_string(),
+        "opus" => "claude-opus-4-8".to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// One-shot answer from the Anthropic Messages API. Fast (~1-2s) and with no
+/// process boot, which is why it is preferred over the `claude` CLI for the UI
+/// meta-tasks. Returns the concatenated text blocks, or an error string so the
+/// caller falls back to the CLI.
+async fn anthropic_api_answer(prompt: &str, model: &str, key: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| e.to_string())?;
+    let resp = client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": model,
+            "max_tokens": 4096,
+            "messages": [{ "role": "user", "content": prompt }],
+        }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = resp.status();
+    let body: Value = resp.json().await.map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let msg = body["error"]["message"].as_str().unwrap_or("api error");
+        return Err(format!("{status}: {msg}"));
+    }
+    let text = body["content"]
+        .as_array()
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter_map(|b| b["text"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() {
+        return Err("empty response".into());
+    }
+    Ok(text)
+}
+
 /// Fastest, cheapest one-shot answer for a fully-formed prompt: a resident LOCAL
 /// model when no `AMUX_HELPER_MODEL` is pinned, else the helper CLI (D3 — the one
 /// knob still wins). This is the ONE place the "fastest cheapest model" seam
@@ -167,6 +225,26 @@ pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (Sta
         }
         // The chosen local model is unavailable — fall through to the cheap
         // Claude default rather than the CLI's own (heavier) default.
+    }
+    // Prefer the Anthropic Messages API when a key is present (AMUX-3301). The
+    // `claude` CLI boots a full process and auths per call, so its latency is
+    // unbounded — measured 17-45s under fleet contention, hitting the 45s
+    // timeout, which is the Orchestrate "Routing..." hang Ethan reported. A
+    // direct /v1/messages call to haiku answers in ~1-2s. Falls through to the
+    // CLI if the key is absent or the call errors, so nothing regresses without
+    // a key.
+    if !is_ollama_model(&model) {
+        if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
+            let key = key.trim().to_string();
+            if !key.is_empty() {
+                match anthropic_api_answer(prompt, &api_model_id(&model), &key).await {
+                    Ok(text) => return Ok((format!("api:{model}"), text)),
+                    Err(e) => tracing::warn!(
+                        "helper_answer: anthropic api failed ({e}); falling back to the helper CLI"
+                    ),
+                }
+            }
+        }
     }
     let cli = std::env::var("AMUX_HELPER_CLI").unwrap_or_else(|_| "claude".into());
     // Use the resolved model as the CLI model, unless it was an ollama id that
@@ -270,6 +348,15 @@ pub async fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_model_id_resolves_aliases_and_passes_ids_through() {
+        assert_eq!(api_model_id("haiku"), "claude-haiku-4-5-20251001");
+        assert_eq!(api_model_id("sonnet"), "claude-sonnet-4-6");
+        assert_eq!(api_model_id("opus"), "claude-opus-4-8");
+        // A concrete id is used as-is (so a future dated id needs no code change).
+        assert_eq!(api_model_id("claude-haiku-4-5-20251001"), "claude-haiku-4-5-20251001");
+    }
 
     #[test]
     fn ollama_models_are_colon_tagged_and_the_default_is_cheap_claude() {
