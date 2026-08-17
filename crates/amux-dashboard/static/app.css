@@ -4843,12 +4843,19 @@
     .metrics-expand-btn { display: flex; }
     /* Disk Cleanup at phone width: the treemap needs real height to stay
        readable, and the action bar must not trap its buttons off-screen. */
-    .metrics-modebtn { flex: 1; min-width: 0; }
-    .reclaim-map svg { height: 260px; }
+    .metrics-modebtn { flex: 1; min-width: 0; min-height: 44px; }
+    /* No fixed svg height here: the map is laid out at its real pixel size in
+       _reclaimRender, so a CSS height that disagreed with the viewBox is what
+       produced the letterboxed band at 390px. */
     .reclaim-actionbar { flex-direction: column; align-items: stretch; gap: 8px; }
     .reclaim-actionbar button { width: 100%; min-height: 44px; }
-    .reclaim-minibtn { min-height: 32px; }
     .reclaim-legend { gap: 7px; }
+    /* 44px on EVERY control in this tab, not just the ones in the action bar.
+       Measured at 390px: Rescan came out 40px and the treemap "up" button 32px,
+       both under the touch-target floor in .claude/rules/css-mobile.md. The
+       inline padding these carry wins over a class rule, so the floor is set
+       here on the container rather than per-button. */
+    #reclaim-content button, .reclaim-minibtn, .reclaim-upbtn { min-height: 44px; }
   }
 
   /* ── Graph / Mind Map ── */
