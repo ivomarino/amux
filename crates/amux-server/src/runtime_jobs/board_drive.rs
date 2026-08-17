@@ -3035,6 +3035,25 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
         .store
         .write_async(move |conn| {
             let now = now_f64() as i64;
+            // Read the PRIOR owner in the same transaction as the swap. The card
+            // log must be able to answer "which lane claimed this, and did it
+            // already own it", because that is the exact question AF-79 could
+            // NOT answer. A lane created a card, it was auto-picked-up, and the
+            // log said only "Auto-picked up from queue" with no lane; the owner
+            // was then reassigned one second later, so a reader inspecting the
+            // card afterward could not tell the pickup HAD honored ownership and
+            // read it as a cross-owner dispatch. Recording the claimer (and the
+            // prior owner when it differs) makes the card self-explaining and
+            // makes a genuine mis-dispatch (prior != claimer, which every
+            // caller is supposed to prevent) visible in the card's own log.
+            let prior_owner: String = conn
+                .query_row(
+                    "SELECT COALESCE(session,'') FROM issues WHERE id=?1 AND status='todo'",
+                    rusqlite::params![card_s],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .unwrap_or_default();
             let n = conn.execute(
                 "UPDATE issues SET status='doing', session=?1, updated=?2 WHERE id=?3 AND status='todo'",
                 rusqlite::params![session_s, now, card_s],
@@ -3052,8 +3071,23 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
                 )
                 .optional()?
                 .flatten();
+            let reassigned = !prior_owner.is_empty() && prior_owner != session_s;
+            let entry = if reassigned {
+                // Should be unreachable from every caller (auto-pickup selects on
+                // i.session=lane; manual claim 409s when owner != claimer), so if
+                // it fires it IS the cross-owner claim to investigate, so say so in
+                // the card log AND the server log so a sweep finds it.
+                tracing::warn!(
+                    target: "amux::board_drive", claimer = %session_s, prior = %prior_owner, card = %card_s,
+                    "claim REASSIGNED a card across owners; every caller is supposed to prevent this; \
+                     if you see this, a dispatch path let a lane claim another lane's card"
+                );
+                format!("Auto-picked up from queue by {session_s} (reassigned from {prior_owner})")
+            } else {
+                format!("Auto-picked up from queue by {session_s}")
+            };
             let hhmm = chrono::Local::now().format("%H:%M").to_string();
-            let log = bs::append_log(existing.as_deref(), &hhmm, "Auto-picked up from queue");
+            let log = bs::append_log(existing.as_deref(), &hhmm, &entry);
             conn.execute(
                 "UPDATE issues SET log=?1 WHERE id=?2",
                 rusqlite::params![log, card_s],
@@ -3912,6 +3946,107 @@ mod tests {
         assert_eq!(status_of("T-1"), "doing");
         // And a second claim of the now-doing card refuses (idempotent).
         assert!(!claim_card(&state, "lane", "T-1").await, "re-claiming a doing card must refuse");
+    }
+
+    /// AF-79 ("auto-pickup dispatches cards owned by another session"). The
+    /// dispatch predicate keys on the card's OWNER (`i.session=?1`), so a card is
+    /// only ever offered to the lane that owns it, never to the lane that
+    /// CREATED it, and never to an idle peer. This kills two of the three
+    /// hypotheses in one shot: `?1` is the owning lane (not a group, not the
+    /// creator), and there is no second selection that keys on attribution. The
+    /// incident card was owned by amux-frustrations at pickup and only reassigned
+    /// to amux one second AFTER the claim; the predicate never disagreed with the
+    /// owner. Control: the owner IS offered exactly the card, so the assertion can
+    /// fail.
+    #[test]
+    fn pickup_offers_a_card_only_to_its_session_owner() {
+        let conn = board_db();
+        // Owned by `amux`; a different lane created it (as in the incident).
+        add_card(&conn, "AF-78", "amux", "todo", "owned by amux", "SCOPE: real\n- [ ] do it");
+        assert!(
+            claimed(&select_pickup(&conn, "amux-frustrations", now_f64())).is_none(),
+            "a card owned by 'amux' must never be offered to a non-owner lane"
+        );
+        assert_eq!(
+            eligible_todo_count(&conn, "amux-frustrations", 1_000_000.0),
+            0,
+            "and it must not count as eligible for the non-owner"
+        );
+        assert_eq!(
+            claimed(&select_pickup(&conn, "amux", now_f64())),
+            Some("AF-78"),
+            "the owning lane is the only one the card is dispatched to"
+        );
+    }
+
+    /// AF-79 ROOT CAUSE: the card's own log could not say WHICH lane a pickup
+    /// handed it to. "Auto-picked up from queue" named no lane, so a legitimate
+    /// same-owner claim followed by a reassignment read as a cross-owner dispatch,
+    /// and the incident was un-reconstructable from the card. The claim log line
+    /// must NAME the claimer (same-owner case) AND record a reassignment when the
+    /// prior owner differs. The latter is the safety net for a mis-dispatch every
+    /// caller is supposed to prevent, so it must be real, not merely claimed
+    /// (ethos rule 6). On the pre-fix code the bare "Auto-picked up from queue"
+    /// line fails the first assertion.
+    #[tokio::test]
+    async fn claim_log_names_the_lane_and_records_a_reassignment() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let state = crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let ins = |id: &str, owner: &str| {
+            let (id, owner) = (id.to_string(), owner.to_string());
+            store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+                         VALUES (?1,'t','','todo',?2,100,100,'agent','code')",
+                        rusqlite::params![id, owner],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let log_of = |id: &str| -> String {
+            store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT COALESCE(log,'') FROM issues WHERE id=?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+
+        // Same-owner claim (the auto-pickup case): the log names the claimer and
+        // does NOT invent a reassignment.
+        ins("AF-78", "amux-frustrations");
+        assert!(claim_card(&state, "amux-frustrations", "AF-78").await, "a todo card claims");
+        let log = log_of("AF-78");
+        assert!(
+            log.contains("Auto-picked up from queue by amux-frustrations"),
+            "the claim log must name the claiming lane so a pickup is reconstructable: {log:?}"
+        );
+        assert!(
+            !log.contains("reassigned"),
+            "a same-owner claim is not a reassignment: {log:?}"
+        );
+
+        // Cross-owner claim (unreachable from the guarded callers; the safety net
+        // for a real mis-dispatch): the log records the ownership change.
+        ins("AF-99", "amux");
+        assert!(claim_card(&state, "amux-frustrations", "AF-99").await, "a todo card claims");
+        let log = log_of("AF-99");
+        assert!(
+            log.contains("by amux-frustrations") && log.contains("reassigned from amux"),
+            "a cross-owner claim must record the reassignment in the card log: {log:?}"
+        );
     }
 
     #[test]
