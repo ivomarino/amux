@@ -664,6 +664,15 @@ pub fn outcome_for(id: &str) -> Option<String> {
                 human_bytes(r.bytes_freed + r.rotated_bytes)
             )
         }),
+        ids::SCAN => crate::orchestrator::scan::last_scan_state().map(|s| {
+            format!(
+                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s)",
+                s.report.scanned.len(),
+                s.report.demoted_structured.len(),
+                s.report.demoted_native.len(),
+                s.report.capture_failures.len(),
+            )
+        }),
         _ => None,
     }
 }

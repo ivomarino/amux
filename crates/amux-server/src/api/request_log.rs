@@ -915,6 +915,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/manifest.json", methods: &["GET"] },
     RouteEntry { path: "/api/calendar.ics", methods: &["GET"] },
     RouteEntry { path: "/api/debug/tmux", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/scan", methods: &["GET"] },
     RouteEntry { path: "/api/debug/logs", methods: &["GET"] },
     RouteEntry { path: "/api/debug/boundary", methods: &["GET"] },
     RouteEntry { path: "/api/debug/legacy-port", methods: &["GET"] },

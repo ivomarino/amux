@@ -31,6 +31,7 @@ use sha2::Digest;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::{OnceLock, RwLock};
 
 pub struct ScanLoop {
     pub store: SharedStore,
@@ -57,6 +58,48 @@ pub struct ScanReport {
     pub native_status_failures: Vec<String>,
     pub events_applied: usize,
     pub capture_failures: Vec<String>,
+}
+
+/// The last completed scan pass, published for `GET /api/debug/scan` (AF-80):
+/// its demotion decisions plus the per-worker dedupe state, so "which lanes
+/// were skipped/demoted and why" is answerable without inferring it from
+/// silence (ethos rule 4, the D1 "scan" deviation: a skip that leaves no trace
+/// is indistinguishable from a scan that found nothing). Same `last_report()`
+/// shape as `board_drive`/`autofix`/`storage`: one publish per completed pass,
+/// read in-process so there is no second copy of the fact to drift.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct ScanState {
+    /// Unix seconds when the last pass finished. `None` until the loop has run
+    /// once, which is itself the answer to "has the terminal-scan loop ever
+    /// run?".
+    pub last_pass_at: Option<f64>,
+    /// The last pass's decisions: scanned / demoted_structured / demoted_native
+    /// / native_status_failures / capture_failures / events_applied.
+    pub report: ScanReport,
+    /// worker id -> content hash of the events the scrape last emitted for it.
+    /// An identical hash on the next pass means the banner is still on screen,
+    /// not a fresh occurrence, so a lane sitting here explains why its state did
+    /// not re-fire.
+    pub deduped: BTreeMap<String, String>,
+}
+
+static LAST_SCAN_STATE: OnceLock<RwLock<Option<ScanState>>> = OnceLock::new();
+
+fn scan_state_slot() -> &'static RwLock<Option<ScanState>> {
+    LAST_SCAN_STATE.get_or_init(|| RwLock::new(None))
+}
+
+fn publish_scan_state(state: ScanState) {
+    if let Ok(mut slot) = scan_state_slot().write() {
+        *slot = Some(state);
+    }
+}
+
+/// The last completed scan pass, or `None` if the loop has never run, which is
+/// itself the answer to "is the terminal-scan loop alive?". Read by `GET
+/// /api/debug/scan` and the `terminal-scan` outcome in `/api/system-jobs`.
+pub fn last_scan_state() -> Option<ScanState> {
+    scan_state_slot().read().ok().and_then(|s| s.clone())
 }
 
 impl ScanLoop {
@@ -270,6 +313,21 @@ impl ScanLoop {
                 }
             }
         }
+        // Publish this pass for GET /api/debug/scan (AF-80): the demotion
+        // decisions and per-worker dedupe state, so a skip leaves a trace
+        // instead of reading as a scan that found nothing (ethos rule 4, the
+        // D1 "scan" deviation). Every pass publishes, including an empty one,
+        // so a fresh last_pass_at also proves the loop is ticking.
+        let deduped = self
+            .last_scan
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.to_string(), v.clone())).collect())
+            .unwrap_or_default();
+        publish_scan_state(ScanState {
+            last_pass_at: Some(crate::runtime_jobs::registry::unix_now()),
+            report: report.clone(),
+            deduped,
+        });
         Ok(report)
     }
 
@@ -835,5 +893,39 @@ mod tests {
             !matches!(worker_state(&store, &w), WorkerState::Active { .. }),
             "an idle codex model bar must not read Active"
         );
+    }
+
+    // ---- /api/debug/scan publish (AF-80) -----------------------------------
+
+    #[tokio::test]
+    async fn scan_pass_publishes_state_for_the_debug_endpoint() {
+        // A completed pass must leave a trace in last_scan_state(), the state
+        // GET /api/debug/scan reads, or a demotion is indistinguishable from a
+        // scan that found nothing (ethos rule 4, the D1 "scan" deviation). This
+        // fails if the publish is removed from scan_once: with no test publishing,
+        // the global stays None across the binary and the expect() below fires.
+        let store = store();
+        let w = wid(30);
+        seed_terminal_worker(&store, &w);
+        let protocol = Arc::new(MockProtocol::new());
+        protocol.register(w.clone(), AgentState::Idle); // structured = demoted
+        let scan = ScanLoop::new(
+            store,
+            vec![Arc::new(ScriptedBackend {
+                name: "tmux",
+                frame: LIMIT_FRAME.into(),
+                native: BTreeMap::new(),
+            })],
+            Some(protocol),
+        );
+        let _ = scan.scan_once().await.unwrap();
+        let published = last_scan_state().expect("scan_once must publish the pass");
+        assert!(
+            published.last_pass_at.is_some(),
+            "a completed pass must stamp last_pass_at, got {published:?}"
+        );
+        // Content (which lane was demoted) is asserted on the RETURNED report by
+        // the tests above; the global is asserted only for its wiring, because a
+        // peer test's pass can overwrite it between this publish and read.
     }
 }

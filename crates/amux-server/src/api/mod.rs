@@ -333,6 +333,12 @@ pub fn router(state: AppState) -> Router {
         // Public: the PWA shell + health must load before auth happens.
         .route("/health", axum::routing::get(health::health))
         .route("/api/debug/tmux", axum::routing::get(health::debug_tmux))
+        // The terminal-scan loop's last pass (AF-80): which lanes were demoted
+        // off pane-scraping and on what basis, so a skip leaves a trace instead
+        // of reading as a scan that found nothing (ethos rule 4, the D1 "scan"
+        // deviation). Advertised in ethos.md and the job registry but unrouted
+        // until now. Public like its debug siblings (lane names and timings).
+        .route("/api/debug/scan", axum::routing::get(health::debug_scan))
         // Per-session logging health + a computed stale verdict (AMUX-2628).
         // Public like its debug siblings: session names and byte counts only.
         .route("/api/debug/logs", axum::routing::get(session_verbs::debug_logs))
