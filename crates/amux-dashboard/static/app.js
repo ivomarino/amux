@@ -7775,7 +7775,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.677';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.678';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15715,12 +15715,14 @@ async function _connectorAuth(id) {
   } catch (e) { showToast('Connect failed: ' + e); }
 }
 
+// Global writes straight through; group/worker open a searchable picker over the
+// real fleet instead of a raw prompt() (AMUX-3350).
 async function _connectorScope(id, level, enabled) {
-  let name = '';
-  if (level !== 'global') {
-    name = (prompt('Enable "' + id + '" for which ' + level + '?') || '').trim();
-    if (!name) return;
-  }
+  if (level === 'global') { _connectorScopeWrite(id, 'global', '', enabled); return; }
+  _connScopePicker(id, level, enabled);
+}
+
+async function _connectorScopeWrite(id, level, name, enabled) {
   const body = { level, name, capability: 'connectors', value: {} };
   body.value[id] = { enabled: !!enabled };
   try {
@@ -15729,6 +15731,74 @@ async function _connectorScope(id, level, enabled) {
     if (d && d.error) { showToast('Scope failed: ' + d.error); return; }
     showToast((enabled ? 'Enabled ' : 'Disabled ') + id + ' at ' + level + (name ? (' ' + name) : ''));
   } catch (e) { showToast('Scope failed: ' + e); }
+}
+
+// Fleet options for the scope picker: worker names + the groups derived from them
+// (GET /api/sessions is the real fleet). Cached for the session.
+let _connFleet = null;
+async function _connLoadFleet() {
+  if (_connFleet) return _connFleet;
+  try {
+    const arr = await (await fetch('/api/sessions')).json();
+    const list = Array.isArray(arr) ? arr : [];
+    const workers = list.filter(s => !s.archived).map(s => s.name).filter(Boolean).sort();
+    const gs = new Set();
+    list.forEach(s => (s.groups || []).forEach(g => g && gs.add(g)));
+    _connFleet = { workers, groups: [...gs].sort() };
+  } catch (e) { _connFleet = { workers: [], groups: [] }; }
+  return _connFleet;
+}
+
+function _connHl(text, q) {
+  if (!q) return esc(text);
+  const i = text.toLowerCase().indexOf(q);
+  if (i < 0) return esc(text);
+  return esc(text.slice(0, i)) + '<mark>' + esc(text.slice(i, i + q.length)) + '</mark>' + esc(text.slice(i + q.length));
+}
+
+// Searchable dropdown overlay: type-to-filter over the real workers/groups; Enter
+// takes the top match; a non-matching query can still be used verbatim (keeps the
+// old prompt()'s flexibility for a name the fleet snapshot lacks).
+async function _connScopePicker(id, level, enabled) {
+  const fleet = await _connLoadFleet();
+  const options = level === 'group' ? fleet.groups : fleet.workers;
+  document.querySelectorAll('.conn-picker-overlay').forEach(e => e.remove());
+  const ov = document.createElement('div');
+  ov.className = 'conn-picker-overlay';
+  ov.onclick = (e) => { if (e.target === ov) ov.remove(); };
+  ov.innerHTML = '<div class="conn-picker">'
+    + '<div class="conn-picker-h"><span>' + (enabled ? 'Enable' : 'Disable') + ' <b>' + esc(id) + '</b> for a ' + esc(level) + '</span>'
+    + '<button class="conn-picker-x" onclick="this.closest(\'.conn-picker-overlay\').remove()">&#10005;</button></div>'
+    + '<input class="conn-picker-search" type="text" placeholder="Search ' + esc(level) + 's…" autocomplete="off">'
+    + '<div class="conn-picker-list"></div></div>';
+  document.body.appendChild(ov);
+  const search = ov.querySelector('.conn-picker-search');
+  const list = ov.querySelector('.conn-picker-list');
+  const render = (q) => {
+    const ql = (q || '').toLowerCase().trim();
+    const hits = options.filter(o => !ql || o.toLowerCase().includes(ql));
+    if (hits.length) {
+      list.innerHTML = hits.map(o => '<button class="conn-picker-item" data-name="' + esc(o) + '">' + _connHl(o, ql) + '</button>').join('');
+    } else {
+      list.innerHTML = '<div class="conn-picker-empty">No ' + esc(level) + 's match'
+        + (ql ? '. <button class="conn-picker-use" data-use>Use &quot;' + esc(q.trim()) + '&quot;</button>' : '.') + '</div>';
+    }
+  };
+  render('');
+  search.addEventListener('input', () => render(search.value));
+  search.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      const first = list.querySelector('.conn-picker-item');
+      const name = first ? first.getAttribute('data-name') : search.value.trim();
+      if (name) { ov.remove(); _connectorScopeWrite(id, level, name, enabled); }
+    } else if (e.key === 'Escape') { ov.remove(); }
+  });
+  list.addEventListener('click', (e) => {
+    const item = e.target.closest('.conn-picker-item');
+    if (item) { ov.remove(); _connectorScopeWrite(id, level, item.getAttribute('data-name'), enabled); return; }
+    if (e.target.closest('[data-use]')) { const n = search.value.trim(); if (n) { ov.remove(); _connectorScopeWrite(id, level, n, enabled); } }
+  });
+  setTimeout(() => search.focus(), 30);
 }
 
 // Verify a connector actually WORKS (AMUX-3339): hits POST /api/connectors/<id>/test,
