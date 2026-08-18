@@ -614,6 +614,80 @@ fn record_run(store: &Store, row: RunRow) -> Result<(), MdaiError> {
         .map_err(|e| MdaiError::Io(e.to_string()))
 }
 
+/// Format a millisecond timestamp as `MM-DD HH:MM` in local time.
+fn fmt_day_min(ts_ms: i64) -> String {
+    use chrono::TimeZone;
+    chrono::Local
+        .timestamp_millis_opt(ts_ms)
+        .single()
+        .map(|dt| dt.format("%m-%d %H:%M").to_string())
+        .unwrap_or_default()
+}
+
+/// Resolve an `amux:` data source (AMUX-3294). Grammar: `messages[?days=N]`
+/// (default 14, capped at 90). Reads `cmd_history` directly from the run's DB
+/// store and returns the recent user directives as text for the synthesis
+/// prompt. `cmd_history.ts` is in MILLISECONDS.
+fn resolve_amux_source(ctx: &RunCtx, spec: &str) -> Result<String, MdaiError> {
+    let (kind, query) = spec.split_once('?').unwrap_or((spec, ""));
+    let kind = kind.trim();
+    let days: i64 = query
+        .split('&')
+        .find_map(|kv| kv.trim().strip_prefix("days="))
+        .and_then(|v| v.parse().ok())
+        .filter(|d| *d > 0 && *d <= 90)
+        .unwrap_or(14);
+    match kind {
+        "messages" => {
+            let conn = ctx
+                .store
+                .read()
+                .map_err(|e| MdaiError::Io(format!("db read: {e}")))?;
+            let cutoff_ms = (now_secs() * 1000) - days * 86_400_000;
+            let mut stmt = conn
+                .prepare(
+                    "SELECT ts, COALESCE(session,''), COALESCE(text,'') \
+                     FROM cmd_history \
+                     WHERE type='user' AND ts >= ?1 AND COALESCE(text,'') <> '' \
+                     ORDER BY ts ASC LIMIT 4000",
+                )
+                .map_err(|e| MdaiError::Io(format!("db prepare: {e}")))?;
+            let rows = stmt
+                .query_map(rusqlite::params![cutoff_ms], |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                })
+                .map_err(|e| MdaiError::Io(format!("db query: {e}")))?;
+            let mut out = String::new();
+            let mut n = 0usize;
+            for (ts_ms, session, text) in rows.flatten() {
+                out.push_str(&format!(
+                    "[{}] {session}: {}\n",
+                    fmt_day_min(ts_ms),
+                    text.replace('\n', " ").trim()
+                ));
+                n += 1;
+                if out.len() > 120_000 {
+                    out.push_str("\n… (older messages truncated)\n");
+                    break;
+                }
+            }
+            if n == 0 {
+                return Ok(format!("(no user messages in the last {days} days)"));
+            }
+            Ok(format!(
+                "The last {days} days of amux user directives ({n} messages), oldest first:\n\n{out}"
+            ))
+        }
+        other => Err(MdaiError::Io(format!(
+            "unknown amux source '{other}' (supported: messages)"
+        ))),
+    }
+}
+
 /// Resolve and run a single node, recursing into upstream `.mdai` sources first.
 /// Returns the node's output.
 fn run_node(ctx: &mut RunCtx, abs_path: &Path) -> Result<String, MdaiError> {
@@ -648,13 +722,24 @@ fn run_node(ctx: &mut RunCtx, abs_path: &Path) -> Result<String, MdaiError> {
     ctx.visiting.push(canon.clone());
     let mut blocks: Vec<String> = Vec::new();
     for src in &doc.sources {
-        let src_abs = resolve_existing(&ctx.root_canon, &base, &src.path)?;
-        let resolved = if is_mdai(&src_abs) {
-            run_node(ctx, &src_abs)?
-        } else if src_abs.is_dir() {
-            expand_folder(&src_abs)?
+        // AMUX-3294: an `amux:` source pulls LIVE amux data (currently messages)
+        // from the DB at run time, so a prompt-only node like Priorities fetches
+        // its own context instead of a static file. The run is inside the server,
+        // so this reads the DB directly — which is why the model kept answering
+        // "I can't reach amux" (a one-shot LLM has no env, no tools; the DATA has
+        // to be injected here, not fetched by the model). Handled BEFORE the
+        // filesystem resolver, which would reject the pseudo-path.
+        let resolved = if let Some(spec) = src.path.strip_prefix("amux:") {
+            resolve_amux_source(ctx, spec)?
         } else {
-            read_capped(&src_abs)?
+            let src_abs = resolve_existing(&ctx.root_canon, &base, &src.path)?;
+            if is_mdai(&src_abs) {
+                run_node(ctx, &src_abs)?
+            } else if src_abs.is_dir() {
+                expand_folder(&src_abs)?
+            } else {
+                read_capped(&src_abs)?
+            }
         };
         blocks.push(source_block(&src.path, &src.prompt, &resolved));
     }
