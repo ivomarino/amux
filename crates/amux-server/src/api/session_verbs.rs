@@ -7773,6 +7773,42 @@ fn steer_skips() -> &'static std::sync::Mutex<BTreeMap<String, SkipRecord>> {
     M.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
+/// Has this exact stall already been LOGGED in this hour, for this lane and this
+/// condition? Returns true the first time and false after, for the same key.
+///
+/// AEAB-13. `warn_on_stalled_lanes` emitted its `tracing::warn!` on every tick
+/// with no memory, while the `emit_event` calls immediately below it were
+/// already deduped on `steer-stalled:{lane}:{cond}:{bucket}` — hourly, per lane,
+/// per condition — with a comment naming the exact hazard: "no idem at all fires
+/// every tick, which is the nag AC-310 was filed about." The event path was
+/// fixed; the log line was left behind.
+///
+/// The cost was not theoretical. One undeliverable message to a lane that had
+/// been dead six days produced 921 of the 1004 log lines since the last restart
+/// — 92% of the log — and 3570 lines across the preceding 24 hours. It buried a
+/// first-ever `database is locked` line and two false scheduler warnings during
+/// a log review that existed to find exactly those.
+///
+/// This deliberately REUSES the event path's key rather than inventing a second
+/// cadence: two spellings of "the same stall" would drift, and the whole defect
+/// is that one surface deduped and the other did not.
+///
+/// In-process, not durable, and that is the right trade here: the event idem is
+/// DB-backed because a missed notification is lost, whereas re-stating an
+/// ongoing problem once per server start is useful rather than noisy. Entries
+/// from past buckets are pruned so the set cannot grow without bound.
+fn stall_log_first_this_bucket(key: &str, bucket: i64) -> bool {
+    static M: std::sync::OnceLock<std::sync::Mutex<(i64, std::collections::BTreeSet<String>)>> =
+        std::sync::OnceLock::new();
+    let m = M.get_or_init(|| std::sync::Mutex::new((i64::MIN, std::collections::BTreeSet::new())));
+    let Ok(mut g) = m.lock() else { return true };   // fail OPEN: log rather than swallow
+    if g.0 != bucket {
+        g.0 = bucket;
+        g.1.clear();
+    }
+    g.1.insert(key.to_string())
+}
+
 fn skip(session: &str, id: &str, reason: &str) {
     tracing::debug!(session = %session, id = %id, reason = %reason, "steering skipped");
     steer_skips()
@@ -7814,13 +7850,21 @@ async fn warn_on_stalled_lanes(state: &AppState) {
             .get(&session)
             .map(|(_, r, _)| r.clone())
             .unwrap_or_else(|| "unknown (no skip recorded since this process started)".into());
-        tracing::warn!(
-            session = %session,
-            queued = count,
-            oldest_min = (age / 60.0) as i64,
-            reason = %reason,
-            "steering queue STALLED — messages are not reaching this lane"
-        );
+        // `blocked`/`cond`/`bucket` are computed HERE rather than below so the log
+        // line can share the event path's dedupe key. Same call, same frequency —
+        // only the order moved.
+        let blocked = lane_block_reason(&session).await;
+        let bucket = (now / 3600.0) as i64;
+        let cond = blocked.unwrap_or("busy-past-deadline");
+        if stall_log_first_this_bucket(&format!("{session}:{cond}"), bucket) {
+            tracing::warn!(
+                session = %session,
+                queued = count,
+                oldest_min = (age / 60.0) as i64,
+                reason = %reason,
+                "steering queue STALLED — messages are not reaching this lane"
+            );
+        }
 
         // ETHOS RULE 4, which is the whole of this card: "when this goes wrong,
         // what will someone see — and will they see it WHERE THEY ALREADY
@@ -7835,12 +7879,9 @@ async fn warn_on_stalled_lanes(state: &AppState) {
         // lives). It carries the SKIP REASON, because `not-running` and
         // `no-env-file` are actionable and completely different from `busy` —
         // collapsing them to "queued" is what made this invisible.
-        let blocked = lane_block_reason(&session).await;
         // Dedupe per lane per CONDITION per hour. A permanent idem would fire
         // once and stay silent if the lane recovered and re-stalled; no idem at
         // all fires every tick, which is the nag AC-310 was filed about.
-        let bucket = (now / 3600.0) as i64;
-        let cond = blocked.unwrap_or("busy-past-deadline");
         let detail = match blocked {
             Some(r) => block_reason_explain(r, &session),
             None => format!(
@@ -15761,6 +15802,52 @@ mod refusal_status_tests {
             seen.len()
         );
         assert!(found >= 20, "literal scan found only {found} outcomes — extraction is broken");
+    }
+}
+
+#[cfg(test)]
+mod stall_log_dedupe_tests {
+    use super::*;
+
+    /// AEAB-13. The stall warning fired every tick with no memory: 921 of 1004
+    /// log lines since one restart, 3570 across the preceding 24 hours, all for
+    /// ONE undeliverable message to a lane dead six days. It buried a
+    /// first-ever `database is locked` line and two false scheduler warnings
+    /// during a log review that existed to find exactly those.
+    ///
+    /// Each assertion below is a property the fix must hold, and two of them are
+    /// the ones a naive "just log less" would break.
+    #[test]
+    fn a_stall_logs_once_per_lane_condition_and_hour() {
+        let b = 1_000_000i64;
+
+        // 1. First occurrence logs; the identical repeat does not. This is the
+        //    921-lines-per-restart case.
+        assert!(stall_log_first_this_bucket("Amux-gtm:not-running", b));
+        assert!(!stall_log_first_this_bucket("Amux-gtm:not-running", b));
+        assert!(!stall_log_first_this_bucket("Amux-gtm:not-running", b));
+
+        // 2. A DIFFERENT CONDITION on the same lane still logs. `not-running`
+        //    and `no-env-file` are actionable and completely different; the
+        //    surrounding code says collapsing them is what made this invisible,
+        //    so the dedupe must not collapse them either.
+        assert!(stall_log_first_this_bucket("Amux-gtm:no-env-file", b));
+
+        // 3. A different LANE still logs — dedupe is per lane, not global. A
+        //    global gate would silence a real second outage.
+        assert!(stall_log_first_this_bucket("other-lane:not-running", b));
+
+        // 4. THE NEXT HOUR logs again. This is the load-bearing one: a permanent
+        //    idem would fire once and then stay silent forever, so an ongoing
+        //    stall would vanish from the log entirely and the fix would be worse
+        //    than the bug. The surrounding event path makes exactly this point.
+        assert!(stall_log_first_this_bucket("Amux-gtm:not-running", b + 1));
+        assert!(!stall_log_first_this_bucket("Amux-gtm:not-running", b + 1));
+
+        // 5. Rolling the bucket must not leak memory: entries from the previous
+        //    hour are dropped, which is observable as the old key logging again
+        //    rather than being remembered.
+        assert!(stall_log_first_this_bucket("other-lane:not-running", b + 1));
     }
 }
 
