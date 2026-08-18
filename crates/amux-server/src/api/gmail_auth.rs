@@ -189,6 +189,16 @@ fn client_config(home: &Path) -> Result<ClientConfig, String> {
     Ok(cfg)
 }
 
+/// The shared Google OAuth client `(client_id, client_secret)` from
+/// `gmail-oauth-client.json`, exposed so the connectors platform can REUSE the
+/// one client Ethan already configured instead of duplicating a secret into
+/// server.env (the connectors-setup "reuse this one" note). Returns `None` when
+/// the file is absent or missing either field. The values are for the server's
+/// own OAuth flow and presence/masking only, never emitted raw.
+pub(crate) fn google_oauth_client_file(home: &Path) -> Option<(String, String)> {
+    client_config(home).ok().map(|c| (c.client_id, c.client_secret))
+}
+
 fn pending_path(home: &Path) -> PathBuf {
     home.join("gmail-pending.json")
 }

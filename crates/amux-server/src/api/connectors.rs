@@ -216,6 +216,33 @@ fn env_val(file_env: &std::collections::BTreeMap<String, String>, key: &str) -> 
         .or_else(|| std::env::var(key).ok().filter(|v| !v.trim().is_empty()))
 }
 
+/// Resolve a connector credential VALUE: server.env / process env first (an
+/// explicit override), then, for GOOGLE connectors, the shared
+/// `gmail-oauth-client.json` that `gmail_auth` already uses — so the four Google
+/// connectors REUSE the one OAuth client Ethan already configured, with no secret
+/// copied into server.env by hand (AMUX-3341, and the connectors-setup "reuse
+/// this one" note). The value is for presence/masking and the server's own OAuth
+/// flow only; never emitted raw.
+fn resolve_cred(
+    file_env: &std::collections::BTreeMap<String, String>,
+    category: &str,
+    key: &str,
+) -> Option<String> {
+    if let Some(v) = env_val(file_env, key) {
+        return Some(v);
+    }
+    if category == "Google" {
+        if let Some((cid, csec)) = crate::api::gmail_auth::google_oauth_client_file(&amux_home()) {
+            return match key {
+                "GOOGLE_OAUTH_CLIENT_ID" => Some(cid),
+                "GOOGLE_OAUTH_CLIENT_SECRET" => Some(csec),
+                _ => None,
+            };
+        }
+    }
+    None
+}
+
 /// GET /api/connectors — the registry with per-provider status. `?worker=` is
 /// accepted for parity with the scope explain link but the status here is
 /// global (credential presence + token); per-scope enablement is the scope
@@ -229,7 +256,7 @@ async fn list() -> Response {
             let key_status: Vec<Value> = keys
                 .iter()
                 .map(|k| {
-                    let v = env_val(&file_env, k);
+                    let v = resolve_cred(&file_env, p.category, k);
                     json!({
                         "name": k,
                         "set": v.is_some(),
@@ -238,6 +265,16 @@ async fn list() -> Response {
                 })
                 .collect();
             let all_creds_set = key_status.iter().all(|k| k["set"].as_bool().unwrap_or(false));
+            // Where the credential came from, so the tab can say "reusing the
+            // existing Google client" rather than looking un-configured (AMUX-3341).
+            let in_server_env = keys.iter().all(|k| env_val(&file_env, k).is_some());
+            let cred_source = if !all_creds_set {
+                Value::Null
+            } else if in_server_env {
+                json!("server.env")
+            } else {
+                json!("gmail-oauth-client.json (reused)")
+            };
             let (kind, oauth) = match p.auth {
                 Auth::ApiKey { .. } => ("apikey", Value::Null),
                 Auth::OAuth2 {
@@ -268,6 +305,7 @@ async fn list() -> Response {
                 "oauth": oauth,
                 "env_keys": key_status,
                 "status": status,
+                "cred_source": cred_source,
                 "setup_note": p.setup_note,
                 "docs": p.docs,
             })
@@ -379,7 +417,7 @@ async fn begin_auth(Path(id): Path<String>) -> Response {
             scopes,
             ..
         } => {
-            let Some(client_id) = env_val(&file_env, client_id_env) else {
+            let Some(client_id) = resolve_cred(&file_env, p.category, client_id_env) else {
                 return (
                     StatusCode::CONFLICT,
                     Json(json!({
