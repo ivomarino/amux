@@ -268,7 +268,9 @@ async fn list() -> Response {
             // Where the credential came from, so the tab can say "reusing the
             // existing Google client" rather than looking un-configured (AMUX-3341).
             let in_server_env = keys.iter().all(|k| env_val(&file_env, k).is_some());
-            let cred_source = if !all_creds_set {
+            let cred_source = if p.category == "Google" && super::google_sa::sa_config().is_some() {
+                json!("service account (domain-wide delegation)")
+            } else if !all_creds_set {
                 Value::Null
             } else if in_server_env {
                 json!("server.env")
@@ -289,8 +291,13 @@ async fn list() -> Response {
                     }),
                 ),
             };
+            // A Google connector backed by the service-account domain-wide
+            // delegation is usable with no per-user grant (AMUX-3347).
+            let sa_available = p.category == "Google" && super::google_sa::sa_config().is_some();
             // Status ladder, most-blocked first.
-            let status = if !all_creds_set {
+            let status = if sa_available {
+                "connected"
+            } else if !all_creds_set {
                 "needs_credentials"
             } else if kind == "oauth2" && !has_token(p) {
                 "needs_auth"
@@ -507,16 +514,32 @@ async fn test_connection(Path(id): Path<String>) -> Response {
                 .into_response()
             }
         },
-        Auth::OAuth2 { .. } => {
-            // No stored access token until the OAuth broker (AMUX-3192) writes one,
-            // so report honestly rather than pass off credential-presence as a
-            // live check.
-            return Json(json!({
-                "ok": false,
-                "status": "needs_auth",
-                "detail": "Connect first — the live test runs once the OAuth token exchange lands (AMUX-3192).",
-            }))
-            .into_response();
+        Auth::OAuth2 { scopes, .. } => {
+            // Mixpeek Google connectors mint an impersonated token via the
+            // service-account domain-wide delegation (AMUX-3347) — no per-user
+            // browser grant. If no SA is configured, fall back to the honest
+            // "connect first" until the OAuth broker (AMUX-3192) lands.
+            if p.category == "Google" && super::google_sa::sa_config().is_some() {
+                match super::google_sa::mint_token(scopes).await {
+                    Ok(tok) => tok,
+                    Err(e) => {
+                        tracing::warn!("connector_test: {} SA delegation failed: {}", id, e);
+                        return Json(json!({
+                            "ok": false,
+                            "status": "needs_auth",
+                            "detail": format!("service-account delegation failed: {e}. If this is 'unauthorized_client', a Workspace super-admin must authorize this connector's scope for the SA in Admin console -> Security -> API controls -> Domain-wide delegation."),
+                        }))
+                        .into_response();
+                    }
+                }
+            } else {
+                return Json(json!({
+                    "ok": false,
+                    "status": "needs_auth",
+                    "detail": "Connect first — configure a service account (GOOGLE_SA_KEY_FILE) or wait for the OAuth token exchange (AMUX-3192).",
+                }))
+                .into_response();
+            }
         }
     };
     let client = match reqwest::Client::builder()

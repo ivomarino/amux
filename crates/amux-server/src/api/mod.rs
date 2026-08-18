@@ -24,6 +24,7 @@ pub mod files;
 pub mod fs;
 pub mod git_guard;
 pub mod gmail_auth;
+pub mod google_sa;
 pub mod groups;
 pub mod crm;
 pub mod speedtest;

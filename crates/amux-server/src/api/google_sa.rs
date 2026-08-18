@@ -1,0 +1,106 @@
+//! Google service-account domain-wide delegation (AMUX-3347). Mints an
+//! impersonated OAuth access token for a scope by signing a JWT assertion
+//! (RS256) with the service-account private key and exchanging it at Google's
+//! token endpoint. This lets the Mixpeek Google connectors (Gmail send, Drive,
+//! Calendar, ...) act as a Workspace user WITHOUT a per-user browser OAuth grant.
+//!
+//! SECURITY: the SA private key lives ONLY in the key FILE (its path is
+//! `GOOGLE_SA_KEY_FILE`; the impersonation subject is `GOOGLE_SA_SUBJECT`). This
+//! module reads the file to sign and NEVER logs the key or the minted token. The
+//! token-endpoint error IS surfaced — Google's `unauthorized_client` names the
+//! missing scope, which is the Workspace-Admin-console fix a human must apply.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Deserialize)]
+struct SaKey {
+    client_email: String,
+    private_key: String,
+    #[serde(default = "default_token_uri")]
+    token_uri: String,
+}
+
+fn default_token_uri() -> String {
+    "https://oauth2.googleapis.com/token".into()
+}
+
+#[derive(Serialize)]
+struct Claims<'a> {
+    iss: &'a str,
+    sub: &'a str,
+    scope: &'a str,
+    aud: &'a str,
+    iat: i64,
+    exp: i64,
+}
+
+/// `(key_file_path, impersonation_subject)` if both are configured, else None.
+/// server.env is read fresh so a just-added key needs no restart.
+pub fn sa_config() -> Option<(String, String)> {
+    let file_env = crate::config::parse_env_file(&crate::config::amux_home().join("server.env"));
+    let get = |k: &str| {
+        file_env
+            .get(k)
+            .cloned()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
+    };
+    Some((get("GOOGLE_SA_KEY_FILE")?, get("GOOGLE_SA_SUBJECT")?))
+}
+
+/// Mint an access token for `scope` (space-delimited Google OAuth scopes),
+/// impersonating the configured subject. Returns the bearer token (NEVER log it)
+/// or an error string that is safe to surface (carries no secret).
+pub async fn mint_token(scope: &str) -> Result<String, String> {
+    let (path, subject) = sa_config().ok_or("GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT not set")?;
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read SA key file: {e}"))?;
+    let key: SaKey = serde_json::from_str(&raw).map_err(|e| format!("parse SA key JSON: {e}"))?;
+    let now = chrono::Utc::now().timestamp();
+    let claims = Claims {
+        iss: &key.client_email,
+        sub: &subject,
+        scope,
+        aud: &key.token_uri,
+        iat: now,
+        exp: now + 3600,
+    };
+    let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+    let enc = jsonwebtoken::EncodingKey::from_rsa_pem(key.private_key.as_bytes())
+        .map_err(|e| format!("SA private key is not valid RSA PEM: {e}"))?;
+    let assertion =
+        jsonwebtoken::encode(&header, &claims, &enc).map_err(|e| format!("sign JWT: {e}"))?;
+    // application/x-www-form-urlencoded body, built by hand so no extra reqwest
+    // feature is needed. The JWT (base64url + '.') and the grant-type URN carry
+    // no characters that require form-encoding.
+    let form = format!(
+        "grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer&assertion={assertion}"
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("http client: {e}"))?;
+    let resp = client
+        .post(&key.token_uri)
+        .header("Content-Type", "application/x-www-form-urlencoded")
+        .body(form)
+        .send()
+        .await
+        .map_err(|e| format!("token exchange request: {e}"))?;
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("token exchange body: {e}"))?;
+    if !status.is_success() {
+        let err = body.get("error").and_then(|v| v.as_str()).unwrap_or("error");
+        let desc = body
+            .get("error_description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        return Err(format!("{err}: {desc}"));
+    }
+    body.get("access_token")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "token exchange returned no access_token".into())
+}
