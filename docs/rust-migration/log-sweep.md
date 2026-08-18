@@ -236,6 +236,25 @@ fallback when a finding needs row-level inspection.
 Also skim `GET /api/logs/raw?lines=500` for `sources:"server_log"` lines matching
 ERROR/WARN — the tracing tail carries failures that never became a request row.
 
+## Standing checks — open verdicts a past sweep staked on a FUTURE window
+
+A fix whose confirmation needs a natural specimen cannot be verified the day it
+ships. Those land here, because the card that records them is a store this sweep
+never opens (ethos rule 4: a tag where the reader does not look is no tag). Clear
+a line when it resolves; do not let one rot unchecked.
+
+- **AF-86 — helper 504 must report the TOTAL the caller waited.** On any 504 group
+  for `/api/orchestrate/plan` or `/api/lookup`, read `error_body`. PASS is
+  `no helper answered within 90s across 2 attempt(s): ...`. FAIL is the old
+  `claude did not answer within 45s` on a row whose `latency_ms` is ~90000. The
+  discriminator is that the number in the MESSAGE must match the row's
+  `latency_ms` — exactly what disagreed on 2026-08-18 (90017ms vs "45s"). A
+  synthetic timeout does not settle it: the unit test already proves the
+  formatter (neuter-verified), what is unproven is that the LIVE path threads the
+  real total through. **If no helper 504 appears in the window, say the check
+  could not discriminate — an absent specimen is not a pass**, and zero helper
+  504s is itself worth stating.
+
 ## Triage rule (mandatory)
 
 Every finding becomes ONE board card (`amux board add --stdin`), containing:
