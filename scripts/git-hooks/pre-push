@@ -174,6 +174,7 @@ def main():
                   "  is known. Waiting will not.\n" % _brun)
             else:
                 _bstat = "unknown"
+                _api_ok = True
                 try:
                     import json as _json, ssl as _ssl, urllib.request as _rq
                     _ctx = _ssl.create_default_context()
@@ -190,15 +191,32 @@ def main():
                               else "%s%s" % (_hit.get("status") or "stopped",
                                              "" if _hit.get("running") else " (not running)"))
                 except Exception:
-                    _bstat = "unknown (api unreachable)"
-                w("  BLOCKING RUN: the %d commit(s) at the bottom belong to %s\n"
-                  "  (currently: %s). Nobody above them can push until that run ships.\n"
-                  % (_brun, _bown, _bstat))
-                if ("idle" in _bstat or "not running" in _bstat
-                        or "not a session" in _bstat or "stopped" in _bstat):
-                    w("  That lane is NOT actively working — waiting will not clear this.\n"
-                      "  Nudge it:  amux send %s \"your %d-commit run blocks the shared\n"
-                      "  push queue — push yours\"\n" % (_bown, _brun))
+                    _api_ok = False
+                if not _api_ok:
+                    # AH-91: the API was unreachable, so the blocker's LIVE status
+                    # is unknown — but the OWNER is not: it came from the
+                    # Amux-Session trailer in the commit (_bown). The old fallback
+                    # printed "(currently: unknown (api unreachable)). Nobody above
+                    # them can push until that run ships", which tells the user to
+                    # WAIT on a run whose liveness we never confirmed — a false
+                    # diagnosis. Base the guidance on the trailer we DO have, and
+                    # do not imply waiting.
+                    w("  BLOCKING RUN: the %d commit(s) at the bottom belong to %s\n"
+                      "  (from the Amux-Session trailer; the amux API was unreachable, so\n"
+                      "  that lane's live status could not be checked). Selective pushes\n"
+                      "  cannot drain past them. Either ask that lane to push its own\n"
+                      "  commits, or if you were told to ship everything:\n"
+                      "      AMUX_ALLOW_FOREIGN=1 git push ...\n"
+                      % (_brun, _bown))
+                else:
+                    w("  BLOCKING RUN: the %d commit(s) at the bottom belong to %s\n"
+                      "  (currently: %s). Nobody above them can push until that run ships.\n"
+                      % (_brun, _bown, _bstat))
+                    if ("idle" in _bstat or "not running" in _bstat
+                            or "not a session" in _bstat or "stopped" in _bstat):
+                        w("  That lane is NOT actively working — waiting will not clear this.\n"
+                          "  Nudge it:  amux send %s \"your %d-commit run blocks the shared\n"
+                          "  push queue — push yours\"\n" % (_bown, _brun))
     except Exception:
         pass
     return 1

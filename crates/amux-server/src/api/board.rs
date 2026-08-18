@@ -96,6 +96,15 @@ async fn get_contract() -> Response {
     Json(json!({
         "types": bs::KNOWN_TYPES,
         "gates": gates,
+        // Global done constraint (Ethan). Applies to EVERY type on top of the
+        // per-type gate above, and unlike those criteria it is machine-checked
+        // against the card text, so gate_ack / --checked cannot satisfy it.
+        "done_requires_asset_link": {
+            "rule": bs::ASSET_LINK_CRITERION,
+            "accepts": "a URL, a repo file path (a/b.ext), a commit sha, or a #PR/issue reference, in the card's desc or history",
+            "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
+            "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+        },
         "how_to_ack": {
             "cli": "amux board <status> <id> --checked \"criterion 1\" \"criterion 2\"",
             "api": "PATCH /api/board/<id> with gate_checked: [\"criterion 1\", ...] or gate_ack: true",
@@ -2541,6 +2550,55 @@ pub async fn patch_item(
                     let eff_gate = bs::effective_gate_configured(conn, &next, target);
                     let gates = bs::core_gates(&eff_gate, target);
                     let target_raw = bs::status_to_db(target, &next.status);
+
+                    // Global done-link constraint (Ethan, 2026-08-17): a card
+                    // cannot enter `done` without pointing at the artifact it
+                    // produced. It sits ALONGSIDE the ack gate, not inside it, so
+                    // it is MACHINE-VALIDATED against the card text here and a
+                    // `gate_ack` can never fake it (ethos rule 7). `force`
+                    // bypasses it like any gate, and a per-worker/group/global
+                    // `AMUX_DONE_LINK_REQUIRED=0` opts out (resolved worker >
+                    // group > global by `done_link_required`).
+                    let link_required = !force
+                        && target == TaskStatus::Done
+                        && bs::done_link_required(next.session.as_deref());
+                    if link_required {
+                        let has_link = bs::has_asset_link(&next.desc)
+                            || next.log.as_deref().is_some_and(bs::has_asset_link);
+                        if !has_link {
+                            // Surfaces so a sweep catches the next one without a
+                            // human noticing (two-fixes rule): grep
+                            // `done_link_gate` in server-rs.log, and the
+                            // structured `code` separates these from other 409s
+                            // in /api/logs/analyze.
+                            tracing::warn!(
+                                "done_link_gate: blocked {} -> done for session {} (no asset link on the card)",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-")
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "done requires a link to the created asset",
+                                        "code": "done_requires_asset_link",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "why": "A card cannot be marked done without pointing at the artifact it produced: a URL, a repo file path, a commit sha, or a #PR/issue. This is a global constraint and gate_ack cannot satisfy it.",
+                                        "how_to_fix": {
+                                            "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
+                                            "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
 
                     // Gate acknowledgement (AMUX-1719: gate_checked must
                     // MATCH the effective gate — every criterion present).

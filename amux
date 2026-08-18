@@ -1573,8 +1573,14 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       }
       return 0
       ;;
-    done|doing|todo|backlog|discarded|review|verified)
+    done|doing|todo|backlog|discard|discarded|review|verified)
       local status="$subcmd"
+      # `discard` is the natural spelling and is exactly what the board's own
+      # "captured prompt, not a unit of work" nudge tells you to run, but the
+      # status column is `discarded`. Accept both so the sanctioned instruction
+      # is walkable (AMUX-2140 class: a nudge naming a verb the CLI rejects is
+      # theatre — the reader types what they were told and gets an error).
+      [[ "$status" == "discard" ]] && status="discarded"
       local id="${1:-}"
       # An ID that starts with '-' is a FLAG in the id slot, never an issue id.
       # Without this, `amux board done --help` PATCHed /api/board/--help and the

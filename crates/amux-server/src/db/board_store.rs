@@ -181,6 +181,104 @@ pub fn core_item_type(raw: &str) -> ItemType {
 /// This is the FLOOR of the precedence ladder — the scoped tiers
 /// (card > worker > group > global column) live in
 /// [`effective_gate_scoped`] and land here only when nothing above matched.
+/// The one GLOBAL `done` constraint (Ethan, 2026-08-17): a card cannot be
+/// marked done without pointing at the artifact it produced. It sits ALONGSIDE
+/// the type/scope gate ladder, not inside it — the type-derived criteria are
+/// satisfied by an honest ack, but this one is MACHINE-VALIDATED in the board
+/// handler against the card's own text (`has_asset_link`), so `gate_ack` cannot
+/// fake it and only a real link satisfies it (ethos rule 7: a check that cannot
+/// fail is theatre). This constant is the human-facing LABEL for it, shown in
+/// `/api/board/contract`. It is on by default everywhere and overridable per
+/// worker / group / global through the environment primitive
+/// (`AMUX_DONE_LINK_REQUIRED=0`), resolved worker > group > global — the same
+/// ladder every scoped setting uses, so the override is not a second spelling
+/// of "scoped policy".
+pub const ASSET_LINK_CRITERION: &str =
+    "Link to the created asset is on the card (URL, file path, commit, or #PR)";
+
+/// The env key that turns the global done-link constraint off for a scope.
+pub const DONE_LINK_REQUIRED_KEY: &str = "AMUX_DONE_LINK_REQUIRED";
+
+/// Whether the done-link constraint applies to a card owned by `session`.
+/// Default ON; a worker (or its group, or global) opts out with
+/// `AMUX_DONE_LINK_REQUIRED` in {0,false,off,no}. Resolved through the same
+/// worker > group > global env ladder as every other scoped setting, so the
+/// override lives in the environment primitive rather than a new store. An
+/// unowned card (no session) always gets the global default. Called by the
+/// board handler to decide whether to validate a link before allowing `done`.
+pub fn done_link_required(session: Option<&str>) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    }
+    // A PROCESS-ENV override wins: `AMUX_DONE_LINK_REQUIRED` in ~/.amux/server.env
+    // (loaded into process env at startup) is the global operator switch, and it
+    // is also how the test rigs turn the gate off for the mechanics/lifecycle
+    // suites that are not testing it. Unset falls through to the per-worker /
+    // group / global scope FILES below.
+    if let Ok(v) = std::env::var(DONE_LINK_REQUIRED_KEY) {
+        if !v.trim().is_empty() {
+            return !is_off(&v);
+        }
+    }
+    let lane = match session.filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return true,
+    };
+    match crate::api::session_verbs::scoped_setting_in(
+        &crate::api::session_verbs::home(),
+        lane,
+        DONE_LINK_REQUIRED_KEY,
+    ) {
+        Some(v) => !is_off(&v),
+        None => true,
+    }
+}
+
+/// True when `text` contains at least one pointer to a produced artifact: an
+/// http(s) URL, a markdown link, a repo-relative file path (`a/b.ext`), a
+/// commit-sha-shaped token (7..=40 hex as a whole word), or a `#<number>`
+/// PR/issue reference. Deliberately generous on ACCEPT (a false accept only
+/// lets an honest-looking card through; a false reject would block real work),
+/// but it CAN fail: a done card that is pure prose with no artifact reference
+/// has none of these, which is exactly the case this gate exists to stop.
+pub fn has_asset_link(text: &str) -> bool {
+    if text.contains("http://") || text.contains("https://") || text.contains("](") {
+        return true;
+    }
+    // `#123` PR/issue reference.
+    let b = text.as_bytes();
+    for i in 0..b.len() {
+        if b[i] == b'#' && b.get(i + 1).is_some_and(|c| c.is_ascii_digit()) {
+            return true;
+        }
+    }
+    for raw in text.split_whitespace() {
+        // Keep path/word chars; drop surrounding prose punctuation.
+        let tok = raw.trim_matches(|c: char| {
+            !c.is_ascii_alphanumeric() && c != '/' && c != '.' && c != '_' && c != '-'
+        });
+        // Repo-relative path: has a '/', last segment carries a short alnum ext.
+        if let Some((dir, last)) = tok.rsplit_once('/') {
+            if !dir.is_empty() {
+                if let Some((stem, ext)) = last.rsplit_once('.') {
+                    if !stem.is_empty()
+                        && (1..=8).contains(&ext.len())
+                        && ext.chars().all(|c| c.is_ascii_alphanumeric())
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        // Commit sha: the whole token is 7..=40 hex digits.
+        let hex = tok.trim_matches(|c: char| !c.is_ascii_alphanumeric());
+        if (7..=40).contains(&hex.len()) && hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String> {
     let ty = core_item_type(item_type_raw);
     let list: &[&str] = match (ty, target) {
@@ -1156,6 +1254,48 @@ pub fn depends_on_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asset_link_detector_can_fail_and_accepts_real_pointers() {
+        // Pure prose with no artifact reference must FAIL (ethos rule 7).
+        assert!(!has_asset_link("Fixed it and closed out"));
+        assert!(!has_asset_link("addressed the feedback from review"));
+        assert!(!has_asset_link(""));
+        // Each real pointer shape must PASS.
+        assert!(has_asset_link("see https://amux.io/x for details"));
+        assert!(has_asset_link("wrote it up in [the doc](docs/x.md)"));
+        assert!(has_asset_link("landed in docs/design/connectors.md"));
+        assert!(has_asset_link("crates/amux-server/src/api/board.rs updated"));
+        assert!(has_asset_link("shipped as 53a868f"));
+        assert!(has_asset_link("closes #106"));
+        // A short hex-ish word is not a sha, a bare year is too short.
+        assert!(!has_asset_link("the cafe was open in 2026"));
+    }
+
+    #[test]
+    fn done_link_rule_is_a_handler_constraint_not_a_gate_criterion() {
+        // The label is stable (the contract shows it).
+        assert!(ASSET_LINK_CRITERION.starts_with("Link to the created asset"));
+        // It is enforced in the handler, NOT folded into any gate list — no
+        // type default across any status carries it, so the ack ladder tests
+        // stay clean and a `gate_ack` never touches it.
+        for ty in ["code", "investigation", "chore", "doc", "watch"] {
+            for st in [
+                TaskStatus::Doing,
+                TaskStatus::Review,
+                TaskStatus::Done,
+                TaskStatus::Verified,
+            ] {
+                assert!(
+                    !default_gates_for(ty, st).contains(&ASSET_LINK_CRITERION.to_string()),
+                    "type {ty} / {st:?} default must not embed the link label"
+                );
+            }
+        }
+        // The default is ON when no scope opts out.
+        assert!(done_link_required(Some("no-such-lane-xyz")));
+        assert!(done_link_required(None));
+    }
 
     fn tag_db() -> Connection {
         let conn = Connection::open_in_memory().unwrap();

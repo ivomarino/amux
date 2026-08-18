@@ -1054,9 +1054,26 @@ async fn whisper_available() -> bool {
     if WHISPER.lock().await.failed {
         return false;
     }
+    // Two-fixes rule (2026-08-17): whisper silently disabling itself is exactly
+    // what made Dictate "not work" — the base weights got cleaned off
+    // ~/.cache/whisper by disk pressure, so every clip fell to the gemini
+    // fallback, which hallucinates the session-name list on unclear audio.
+    // Nothing logged it; the only signal was garbage transcripts. Announce it
+    // ONCE per disappearance so a log sweep catches the next one; the flag
+    // resets when the weights return, so a re-vanish re-warns.
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WEIGHTS_WARNED: AtomicBool = AtomicBool::new(false);
     if whisper_weights_path(&name).is_none() {
+        if !WEIGHTS_WARNED.swap(true, Ordering::Relaxed) {
+            tracing::warn!(
+                "[dictation] whisper '{name}' weights ABSENT (~/.cache/whisper/{name}.pt) \
+                 — falling back to gemini, which hallucinates on unclear audio. Restore: \
+                 python3 -c \"import whisper; whisper.load_model('{name}')\""
+            );
+        }
         return false;
     }
+    WEIGHTS_WARNED.store(false, Ordering::Relaxed);
     tokio::task::spawn_blocking(whisper_python_blocking)
         .await
         .ok()
