@@ -1,11 +1,85 @@
 [
   {
+    "hash": "fe519a42682cbfc1770b93964176",
+    "short": "fe519a4",
+    "title": "Connectors tab \u2014 paste API credentials once, scope to global, group, or per-worker",
+    "date": "2026-08-16",
+    "type": "feat",
+    "tags": [
+      "connectors",
+      "credentials",
+      "integrations",
+      "dashboard"
+    ],
+    "description": "The new Connectors tab lets you configure API keys and OAuth tokens for external services \u2014 Google, Granola, or any custom API \u2014 and make them available to your agent fleet as environment variables. Set the scope once (global for all agents, group for a team of sessions, per-worker for a single session) and a Test button verifies the credential is accepted before any agent relies on it. Credentials stay out of CLAUDE.md and git history. On rotation, update one record and every agent picks up the new key on next launch."
+  },
+  {
+    "hash": "d6538cb",
+    "short": "d6538cb",
+    "title": "MDAI viewer gains Diagram and List tabs \u2014 visualize computed file DAGs and browse all nodes",
+    "date": "2026-08-18",
+    "type": "feat",
+    "tags": [
+      "mdai",
+      "computed-files",
+      "dashboard",
+      "visualization"
+    ],
+    "description": "The .mdai file viewer now has two additional bottom tabs: Diagram (a visual graph of the computed file DAG \u2014 which nodes feed which) and List (a flat browse of all nodes in the local.amux folder). Previously the viewer showed only the raw file body. The new tabs make it practical to navigate and understand a multi-node computed file pipeline at a glance, directly from the dashboard."
+  },
+  {
+    "hash": "91fdd23",
+    "short": "91fdd23",
+    "title": "MDAI data source node \u2014 pull your own amux message history into a computed file pipeline",
+    "date": "2026-08-18",
+    "type": "feat",
+    "tags": [
+      "mdai",
+      "computed-files",
+      "messages",
+      "automation"
+    ],
+    "description": "A new prompt-only MDAI node type fetches its own session message history at run time, with no additional data source configuration. Useful for pipelines that analyze a session's own conversation log \u2014 for example, a daily summary agent that reads what the fleet did overnight and produces a digest. The node resolves its messages at DAG evaluation time so the output stays current without any external wiring."
+  },
+  {
+    "hash": "65bafdc",
+    "short": "65bafdc",
+    "title": "Spreadsheet preview in Files tab \u2014 .xlsx and .xls files render as sortable tables",
+    "date": "2026-08-18",
+    "type": "feat",
+    "tags": [
+      "files",
+      "spreadsheet",
+      "dashboard",
+      "preview"
+    ],
+    "description": "Excel spreadsheets (.xlsx and .xls) now open as interactive sortable tables in the amux Files viewer \u2014 no external application required. Previously these files showed a binary download prompt. Agents can be directed to process spreadsheet data and operators can verify the content directly in the dashboard without switching to a separate tool."
+  },
+  {
+    "hash": "6f3a882",
+    "short": "6f3a882",
+    "title": "Cancel TTS \u2014 stop audio generation or playback mid-session",
+    "date": "2026-08-17",
+    "type": "feat",
+    "tags": [
+      "tts",
+      "voice",
+      "ios",
+      "dashboard"
+    ],
+    "description": "A cancel button now appears during active text-to-speech generation and playback. Previously, TTS could not be interrupted \u2014 if you triggered a read-aloud on a long document, you had to wait for it to finish. The cancel button stops both the generation request and any in-progress audio playback immediately, making voice features practical to use on the iOS app mid-session."
+  },
+  {
     "sha": "9f41809",
     "short": "9f41809",
     "date": "2026-08-17",
     "type": "feat",
-    "title": "Computed files (.mdai) — define a knowledge DAG where agents produce outputs other agents consume automatically",
-    "tags": ["files", "agents", "knowledge-graph"],
+    "title": "Computed files (.mdai) \u2014 define a knowledge DAG where agents produce outputs other agents consume automatically",
+    "tags": [
+      "files",
+      "agents",
+      "knowledge-graph"
+    ],
     "description": "A new .mdai file type introduces computed-file nodes with a DAG resolver, cache, and history. Define dependencies between files so that when one agent produces output, downstream agents automatically see the fresh result. The client UI adds a dedicated tab, node overlay, and connect controls. Combine with coding agents to build multi-step knowledge pipelines that run unattended."
   },
   {
@@ -13,8 +87,12 @@
     "short": "8b802e1",
     "date": "2026-08-16",
     "type": "feat",
-    "title": "Files tab now works like an OS file manager — browse, preview, and edit any project file from your browser or phone",
-    "tags": ["files", "dashboard", "mobile"],
+    "title": "Files tab now works like an OS file manager \u2014 browse, preview, and edit any project file from your browser or phone",
+    "tags": [
+      "files",
+      "dashboard",
+      "mobile"
+    ],
     "description": "The Files tab gained a full OS file-manager UX: directory tree, inline preview, and edit-in-place for text and code files. You can now browse your project, read agent-produced artifacts, and make quick edits without leaving the dashboard. Works at phone width so you can review and tweak files from your iOS app on the go."
   },
   {
@@ -23,7 +101,11 @@
     "date": "2026-08-17",
     "type": "feat",
     "title": "Codex and Ollama agent transcripts now render with the same Claude-style layout in the peek panel",
-    "tags": ["peek", "codex", "ollama"],
+    "tags": [
+      "peek",
+      "codex",
+      "ollama"
+    ],
     "description": "The peek panel now renders Codex and Ollama (qwen) session transcripts using the same structured message layout as Claude Code sessions. Tool calls, thinking blocks, and assistant turns are highlighted and collapsible. Easier to see what a local Codex or Ollama worker did overnight without parsing raw terminal output."
   },
   {
@@ -31,24 +113,32 @@
     "short": "6a2d0bc",
     "date": "2026-08-16",
     "type": "feat",
-    "title": "OPEN worker peek stays live — the expanded session view refreshes in place without collapsing back",
-    "tags": ["peek", "dashboard", "ux"],
-    "description": "When you open a worker's peek panel to watch it run, the view now stays live and updates in place. Previously, new activity would collapse the open view back to the summary row. Now you can keep a worker expanded and watch its transcript update in real time — useful for monitoring a long-running overnight task."
+    "title": "OPEN worker peek stays live \u2014 the expanded session view refreshes in place without collapsing back",
+    "tags": [
+      "peek",
+      "dashboard",
+      "ux"
+    ],
+    "description": "When you open a worker's peek panel to watch it run, the view now stays live and updates in place. Previously, new activity would collapse the open view back to the summary row. Now you can keep a worker expanded and watch its transcript update in real time \u2014 useful for monitoring a long-running overnight task."
   },
   {
     "sha": "cb5724e",
     "short": "cb5724e",
     "date": "2026-08-16",
     "type": "fix",
-    "title": "Disk gauge now reports the actual data volume — was measuring the sealed read-only system volume on macOS",
-    "tags": ["metrics", "macos", "fix"],
-    "description": "The disk usage gauge in the dashboard was measuring the sealed APFS system volume on macOS, which is always nearly full, instead of the Macintosh HD data volume where your project files and model weights live. The gauge now shows accurate free space on the data volume — relevant when running large local models or accumulating agent output."
+    "title": "Disk gauge now reports the actual data volume \u2014 was measuring the sealed read-only system volume on macOS",
+    "tags": [
+      "metrics",
+      "macos",
+      "fix"
+    ],
+    "description": "The disk usage gauge in the dashboard was measuring the sealed APFS system volume on macOS, which is always nearly full, instead of the Macintosh HD data volume where your project files and model weights live. The gauge now shows accurate free space on the data volume \u2014 relevant when running large local models or accumulating agent output."
   },
   {
     "sha": "1678a5b",
     "date": "2026-08-16",
     "type": "feat",
-    "title": "Owner alerts fire via email and iMessage — critical agent events reach you without any manual setup"
+    "title": "Owner alerts fire via email and iMessage \u2014 critical agent events reach you without any manual setup"
   },
   {
     "sha": "ec08a71",
@@ -60,7 +150,7 @@
     "sha": "c6bd42b",
     "date": "2026-08-16",
     "type": "feat",
-    "title": "Health invariant alert.channel_can_deliver — a disconnected owner-alert channel now shows red in the dashboard"
+    "title": "Health invariant alert.channel_can_deliver \u2014 a disconnected owner-alert channel now shows red in the dashboard"
   },
   {
     "sha": "6ebef13",
@@ -72,7 +162,7 @@
     "sha": "2b00af8",
     "date": "2026-08-16",
     "type": "feat",
-    "title": "New CLI command: amux board show <ID> — inspect any board card from the terminal without opening the browser"
+    "title": "New CLI command: amux board show <ID> \u2014 inspect any board card from the terminal without opening the browser"
   },
   {
     "sha": "ec031ce",
