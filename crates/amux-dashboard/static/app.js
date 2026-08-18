@@ -430,6 +430,7 @@ let filterStatuses = new Set();    // 'working' | 'waiting' | 'idle' | 'stopped'
 function _sessStatusKey(s) {
   if (!s.running) return 'stopped';
   if (s.status === 'rate_limited') return 'rate_limited';
+  if (s.status === 'api_error') return 'api_error';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
@@ -2615,6 +2616,7 @@ function updatePeekStatus() {
   if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
   else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
+  else if (s.status === 'api_error') badge = `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot;.">API ${esc(s.api_error_code || '5xx')}</span>`;
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
   if (s.rate_limited_until) {
@@ -3026,7 +3028,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
           ${s.credit_limited ? `<span class="status-badge rate-limited" title="${esc(s.credit_limit_model || 'Model')} usage limit — switch model or top up credits (Bulk actions)${s.credit_limited_since ? '. Detected ' + timeAgo(s.credit_limited_since) + ' — clears on model change or restart' : ''}">${esc(s.credit_limit_model || 'model')} limit${s.credit_limited_since ? ` · ${timeAgo(s.credit_limited_since)}` : ''}</span>` : ''}
-          ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code)} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code)}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
+          ${s.api_error ? `<span class="status-badge rate-limited" title="API Error ${esc(s.api_error_code || '5xx')} — server-side and retryable. Send &quot;continue&quot; (Bulk actions).">API ${esc(s.api_error_code || '5xx')}${s.api_error_count > 1 ? ' &times;' + s.api_error_count : ''}</span>` : ''}
           ${_steerHumanCount(s) ? `<span class="status-badge steering" title="${_steerHumanCount(s)} steering message${_steerHumanCount(s)>1?'s':''} queued">${_steerHumanCount(s)} queued</span>` : ''}
           ${s.last_activity ? `<span class="last-active">${timeAgo(s.last_activity)}</span>` : ''}
           ${(() => {
@@ -3136,14 +3138,16 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
     const STATUS_GROUPS = [
       { key: 'active',  label: 'Working',     defaultOpen: true  },
       { key: 'waiting', label: 'Needs Input', defaultOpen: true  },
+      { key: 'api_error', label: 'API Error', defaultOpen: true  },
       { key: 'idle',    label: 'Idle',        defaultOpen: true  },
       { key: 'stopped', label: 'Stopped',     defaultOpen: false },
     ];
-    const buckets = { active: [], waiting: [], idle: [], stopped: [] };
+    const buckets = { active: [], waiting: [], api_error: [], idle: [], stopped: [] };
     filtered.forEach(s => {
       if (!s.running)              buckets.stopped.push(s);
       else if (s.status === 'active')  buckets.active.push(s);
       else if (s.status === 'waiting') buckets.waiting.push(s);
+      else if (s.status === 'api_error') buckets.api_error.push(s);
       else                             buckets.idle.push(s);
     });
     // Sort within each bucket: alpha (pinned → name) or pinned → last activity
@@ -7775,7 +7779,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.679';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.680';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -13464,13 +13468,13 @@ function closeFiltersModal() {
 const _PROVIDER_LABELS = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', iterm2: 'iTerm2' };
 const _MODEL_LABELS = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: 'Fable', gpt: 'GPT', gemini: 'Gemini', 'o-series': 'o-series' };
 function _mLabel(x){ return _MODEL_LABELS[x] || (x.charAt(0).toUpperCase()+x.slice(1)); }
-const _STATUS_LABELS = { working: 'Working', waiting: 'Needs input', rate_limited: 'Rate limited', idle: 'Idle', stopped: 'Stopped' };
+const _STATUS_LABELS = { working: 'Working', waiting: 'Needs input', rate_limited: 'Rate limited', api_error: 'API error', idle: 'Idle', stopped: 'Stopped' };
 function renderFilterOptions() {
   const live = sessions.filter(s => !s.archived);
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
-    const opts = ['working', 'waiting', 'rate_limited', 'idle', 'stopped']
+    const opts = ['working', 'waiting', 'rate_limited', 'api_error', 'idle', 'stopped']
       .filter(k => filterStatuses.has(k) || live.some(x => _sessStatusKey(x) === k));
     sEl.innerHTML = opts.length ? opts.map(k => {
       const on = filterStatuses.has(k);

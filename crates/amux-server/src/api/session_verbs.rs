@@ -965,6 +965,24 @@ pub(crate) fn rate_limit_action() -> String {
         .unwrap_or_else(|| "wait".into())
 }
 
+/// A transient 5xx / Overloaded API-error banner sitting at the TAIL of the pane
+/// — the lane is currently STUCK on it (a retry would help), not merely that a
+/// 529 happened earlier and the lane moved on. Anchored on the marker line
+/// (`API Error: 5xx`) and tail-only (last ~8 non-empty lines), so a lane that
+/// recovered and produced newer output does not read as errored. Ethan
+/// 2026-08-18: capture this as its own status (tested on @backend, which had a
+/// 529 Overloaded and read as `idle`).
+pub(crate) fn has_current_api_error(raw_output: &str) -> bool {
+    if raw_output.is_empty() {
+        return false;
+    }
+    let clean = strip_ansi(raw_output);
+    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let n = lines.len();
+    let re = cached_re!(r"(?i)^(?:[\x{23fa}\x{25cf}\x{2022}]\s*)?API Error:\s*5\d\d\b");
+    lines[n.saturating_sub(8)..].iter().any(|l| re.is_match(l.trim()))
+}
+
 pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     if raw_output.is_empty() {
         return String::new();
@@ -13481,6 +13499,44 @@ mod tests {
         // showed through because nothing recognised the spinner).
         let gemini_working = "\u{2502} \u{22b7}  Shell sleep 15 && echo ROUND2\n \u{2819} Thinking... (esc to cancel, 9s)\n YOLO Ctrl+Y";
         assert_eq!(detect_claude_status(gemini_working), "active");
+    }
+
+    /// A 5xx / Overloaded banner sitting at the TAIL is its own status
+    /// (Ethan 2026-08-18, @backend). Claude Code ends the turn on a 529 and
+    /// returns to the prompt, so `detect_claude_status` reads `idle` — the
+    /// exact frame @backend showed while parked on the error. `has_current_api_error`
+    /// is the discriminator the status field needs, and the negatives are what
+    /// keep it from painting healthy lanes: a normal working frame, and a lane
+    /// that hit a 529 EARLIER but has since produced newer output (banner no
+    /// longer in the tail) must both read false.
+    #[test]
+    fn a_tail_5xx_banner_reads_as_api_error_and_a_recovered_lane_does_not() {
+        // The live @backend frame (⏺ = U+23FA), the whole reason this exists.
+        let stuck = "\u{23fa} Running the migration\n\
+             \u{23fa} API Error: 529 Overloaded. This is a server-side issue, usually temporary \u{2014} try again in a moment...\n\
+             \u{276f} ";
+        assert!(has_current_api_error(stuck), "a 5xx banner in the tail must read as api_error");
+        // …and detect_claude_status calls this lane idle, which is the bug.
+        assert_eq!(detect_claude_status(stuck), "idle");
+        // 503 with no glyph, banner is the last meaningful line.
+        let bare = "some earlier output\nAPI Error: 503 Service Unavailable\n\u{276f} ";
+        assert!(has_current_api_error(bare));
+        // NEGATIVE: an ordinary working frame — no banner at all.
+        let working = "\u{273b} Crunching\u{2026} (12s)\n\u{276f} typed text";
+        assert!(!has_current_api_error(working));
+        // NEGATIVE: recovered — the 529 happened but ≥8 newer non-empty lines
+        // followed, so the banner is out of the tail window and the lane is not
+        // stuck on it any more.
+        let recovered = "\u{23fa} API Error: 529 Overloaded. try again in a moment...\n\
+             \u{23fa} Retrying\n\u{23fa} Wrote file a\n\u{23fa} Wrote file b\n\u{23fa} Wrote file c\n\
+             \u{23fa} Wrote file d\n\u{23fa} Wrote file e\n\u{23fa} Wrote file f\n\u{23fa} Done\n\u{276f} ";
+        assert!(!has_current_api_error(recovered), "a lane that moved past the 529 must not read as errored");
+        // NEGATIVE: a 4xx is a client error, not the transient-retryable class
+        // this surfaces (and prose merely quoting the string must not match).
+        let client_err = "\u{23fa} API Error: 400 Bad Request\n\u{276f} ";
+        assert!(!has_current_api_error(client_err));
+        let prose = "the docs mention an API Error: 500 sometimes appears";
+        assert!(!has_current_api_error(prose), "prose quoting the phrase mid-line must not match (anchored)");
     }
 
     /// AMUX-3054: an empty send is the user pressing "Enter" at a picker. The

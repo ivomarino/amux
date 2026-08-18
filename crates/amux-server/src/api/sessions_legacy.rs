@@ -933,6 +933,27 @@ impl FleetSignals {
         {
             status = "active".into();
         }
+        // API-ERROR (5xx / Overloaded) is its own status (Ethan 2026-08-18).
+        // Claude Code ENDS the turn on a 529 and returns to the prompt, so its
+        // Stop hook reports `idle` and the scrape reads `idle` too — which is
+        // exactly what @backend showed while its pane sat on
+        // "API Error: 529 Overloaded". A stuck-on-error lane is not idle in the
+        // sense a human cares about: it wants a retry/continue, so a sweep has
+        // to be able to FIND it — surfacing it as `idle` hides it in the same
+        // bucket as every parked lane. Overrides idle/waiting but never
+        // `active`: an actively-retrying lane (spinner) is genuinely working,
+        // and `has_current_api_error` only honours the banner when it sits in
+        // the TAIL, so a lane that recovered and produced newer output does not
+        // read as errored (the bounded false-positive here costs a glance, not
+        // a wrong action — unlike ghost-rescue, nothing force-acts on this).
+        if (status == "idle" || status == "waiting")
+            && self
+                .pane_of(name)
+                .map(crate::api::session_verbs::has_current_api_error)
+                .unwrap_or(false)
+        {
+            status = "api_error".into();
+        }
         status
     }
 }
@@ -1784,12 +1805,19 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "session_created": session_created,
             "last_activity": last_activity,
             // Scanner-internal state the Python server holds in memory with
-            // no durable trace (rate/credit limits, API errors, the model
-            // detector) stays a correct-TYPED honest empty (Invariant 20:
-            // never invent). `status` is no longer in that set — it derives
-            // above from stores the Python scanner itself persists.
+            // no durable trace (rate/credit limits, the model detector) stays a
+            // correct-TYPED honest empty (Invariant 20: never invent). `status`
+            // is no longer in that set — it derives above from stores the Python
+            // scanner itself persists.
             "active_model": "",
-            "api_error": false,
+            // api_error IS computed now (Ethan 2026-08-18) — it is exactly the
+            // `api_error` status derived above, exposed as a side boolean so a
+            // log sweep / autofix can find a 5xx-stuck lane without re-deriving
+            // the status string (the ethos-rule-4 lesson from `credit_limited`:
+            // a condition whose own field says `false` is invisible to every
+            // consumer). code/count stay honest empties — the tail scrape
+            // proves a 5xx is PRESENT, not which one or how many times.
+            "api_error": status == "api_error",
             "api_error_code": "",
             "api_error_count": 0,
             // COMPUTED, NOT HARDCODED (AMUX-2820). These were literal `false`
@@ -2680,6 +2708,34 @@ mod tests {
         // is void and the pane's waiting shows through.
         s.started.insert("x".into(), 999_000.0);
         assert_eq!(s.derive_status("x", true), "waiting");
+    }
+
+    /// A lane parked on a 5xx banner reads `api_error`, not `idle` (Ethan
+    /// 2026-08-18, @backend). End-to-end through derive_status: the pane shows
+    /// the 529 banner with no spinner, so every existing signal says idle and
+    /// the override is what lifts it out of the parked bucket where a sweep
+    /// cannot find it. The control: a lane actively RETRYING (spinner in the
+    /// tail) is genuine work and stays `active` — the override never fires over
+    /// active.
+    #[test]
+    fn a_lane_parked_on_a_5xx_banner_reads_api_error() {
+        let mut s = signals();
+        s.activity.insert("amux-x".into(), 999_970); // fresh: pane admissible
+        s.panes.insert(
+            "x".into(),
+            "\u{23fa} Running the migration\n\
+             \u{23fa} API Error: 529 Overloaded. This is a server-side issue, usually temporary \u{2014} try again in a moment...\n\
+             \u{276f} "
+                .into(),
+        );
+        assert_eq!(s.derive_status("x", true), "api_error");
+        // CONTROL: actively retrying (spinner present) is genuine work.
+        s.panes.insert(
+            "x".into(),
+            "\u{23fa} API Error: 529 Overloaded. retrying...\n\u{273b} Crunching\u{2026} (3s)\n\u{276f} "
+                .into(),
+        );
+        assert_eq!(s.derive_status("x", true), "active");
     }
 
     #[test]
