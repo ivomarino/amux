@@ -2303,7 +2303,7 @@ mod tests {
             RunOutcome::ShellError { note: "exit 1".into() },
         ] {
             assert!(o.lost(), "{o:?} reached nobody and is not pending");
-            assert!(should_warn_undelivered(&[o.clone()]), "{o:?} must still warn");
+            assert!(should_warn_undelivered(std::slice::from_ref(&o)), "{o:?} must still warn");
         }
         // Nothing attempted still reads as silence — unchanged behaviour.
         assert!(should_warn_undelivered(&[]));
