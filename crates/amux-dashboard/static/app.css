@@ -5327,6 +5327,23 @@
 }
 .mdai-err-cycle { margin-top: 6px; font-family: 'SF Mono','Fira Code',monospace; font-size: 0.72rem; }
 .mdai-edit { border-top: 1px solid var(--border); padding-top: 12px; }
+/* Bottom tabs: Diagram + List (AMUX-3322) */
+.mdai-btabs { display: flex; gap: 4px; border-top: 1px solid var(--border); margin-top: 14px; padding-top: 10px; }
+.mdai-btab { background: none; border: 1px solid var(--border); border-radius: 6px 6px 0 0; color: var(--dim); font-size: 0.78rem; font-weight: 600; padding: 7px 14px; cursor: pointer; min-height: 34px; }
+.mdai-btab.active { background: var(--card-bg); color: var(--text); border-bottom-color: var(--card-bg); }
+.mdai-btab-content { border: 1px solid var(--border); border-top: none; border-radius: 0 0 8px 8px; padding: 12px; }
+.mdai-diagram { display: flex; flex-direction: column; align-items: center; gap: 2px; padding: 4px 0; }
+.mdai-dg-row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.mdai-dg-node { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; background: var(--bg); max-width: 460px; width: 100%; box-sizing: border-box; }
+.mdai-dg-src { cursor: pointer; border-left: 3px solid var(--cyan, #2a9fd6); }
+.mdai-dg-selffetch { border-left-style: dashed; }
+.mdai-dg-synth { cursor: pointer; border-left: 3px solid var(--accent); }
+.mdai-dg-out { border-left: 3px solid var(--green); }
+.mdai-dg-kind { font-size: 0.66rem; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 3px; }
+.mdai-dg-title { font-size: 0.82rem; font-weight: 600; word-break: break-all; }
+.mdai-dg-sub { font-size: 0.74rem; color: var(--dim); line-height: 1.4; word-break: break-word; }
+.mdai-dg-arrow { color: var(--dim); font-size: 1.1rem; line-height: 1; }
+@media (max-width: 600px) { .mdai-btab { min-height: 44px; } .mdai-dg-node { max-width: 100%; } }
 .mdai-edit-h { font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 8px; }
 .mdai-note { font-size: 0.78rem; color: var(--dim); line-height: 1.5; margin-bottom: 8px; }
 .mdai-note a { color: var(--accent); }

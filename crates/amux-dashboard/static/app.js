@@ -7775,7 +7775,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.675';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.676';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15963,20 +15963,42 @@ function _mdaiRender() {
   else if (!_mdaiRunError) html += '<div style="color:var(--dim);font-size:0.85rem;">This node has no output yet. Press Run to compute it.</div>';
   html += '</div></div>';
 
-  // Sources & instruction editor.
-  html += '<div class="mdai-section mdai-edit">';
+  // Bottom tabs (Ethan, AMUX-3322): (1) Diagram — the node's DAG of sources,
+  // the synthesis prompt and the output; (2) List — the same graph as an
+  // editable list. View lives in Diagram, edit in List; both always reachable.
+  html += '<div class="mdai-btabs">'
+    + '<button class="mdai-btab' + (_mdaiBottomTab === 'diagram' ? ' active' : '') + '" onclick="_mdaiSetBottomTab(\'diagram\')">&#9672; Diagram</button>'
+    + '<button class="mdai-btab' + (_mdaiBottomTab === 'list' ? ' active' : '') + '" onclick="_mdaiSetBottomTab(\'list\')">&#8801; List</button>'
+    + '</div>';
+  html += '<div class="mdai-btab-content">'
+    + (_mdaiBottomTab === 'diagram' ? _mdaiDiagramHtml(cur) : _mdaiListHtml())
+    + '</div>';
+
+  el.innerHTML = html;
+  _bindMdFileLinks(el);
+}
+
+let _mdaiBottomTab = 'diagram';   // 'diagram' | 'list' (Ethan, AMUX-3322)
+function _mdaiSetBottomTab(t) { _mdaiBottomTab = t; _mdaiRender(); }
+
+// The List tab: the editable sources + instruction (the old inline editor).
+function _mdaiListHtml() {
+  const c = _mdaiCur;
+  if (!c) return '';
+  let html = '<div class="mdai-section mdai-edit">';
   html += '<div class="mdai-edit-h">Sources</div>';
-  if (!_mdaiCur.parseOk) {
+  if (!c.parseOk) {
     html += '<div class="mdai-note">This node\'s frontmatter uses a form the inline editor will not rewrite safely. '
       + '<a href="#" onclick="event.preventDefault();_mdaiOpenRaw()">Open the raw file</a> to edit its sources.</div>';
   }
-  if (!_mdaiCur.sources.length) {
-    html += '<div class="mdai-note">No sources connected. Use a file\'s &#8942; menu in the Files tab (Connect to .mdai) to add one.</div>';
+  if (!c.sources.length) {
+    html += '<div class="mdai-note">No source files connected — this node is <b>prompt-only</b>. Its instruction fetches its own data at run time '
+      + '(e.g. Priorities pulls the last two weeks of amux messages). Add a file source via a file\'s &#8942; menu (Connect to .mdai) if you want one.</div>';
   } else {
-    _mdaiCur.sources.forEach((s, idx) => {
+    c.sources.forEach((s, idx) => {
       html += '<div class="mdai-edge">'
         + '<div class="mdai-edge-path" title="' + esc(s.path) + '">' + esc(s.path || '(unnamed source)') + '</div>';
-      if (_mdaiCur.parseOk) {
+      if (c.parseOk) {
         html += '<textarea class="mdai-prompt" id="mdai-prompt-' + idx + '" rows="2" placeholder="Edge prompt">' + esc(s.prompt || '') + '</textarea>'
           + '<div class="mdai-edge-actions">'
           + '<button class="mdai-sbtn" onclick="_mdaiSavePrompt(' + idx + ')">Save &amp; re-run</button>'
@@ -15989,16 +16011,52 @@ function _mdaiRender() {
     });
   }
   html += '<div class="mdai-edit-h" style="margin-top:12px;">Instruction (node body)</div>';
-  if (_mdaiCur.parseOk) {
-    html += '<textarea class="mdai-body-ta" id="mdai-body-ta" rows="5" placeholder="What should this node synthesize from its sources?">' + esc(_mdaiCur.body || '') + '</textarea>'
+  if (c.parseOk) {
+    html += '<textarea class="mdai-body-ta" id="mdai-body-ta" rows="5" placeholder="What should this node synthesize from its sources?">' + esc(c.body || '') + '</textarea>'
       + '<div class="mdai-edge-actions"><button class="mdai-sbtn" onclick="_mdaiSaveBody()">Save &amp; re-run</button></div>';
   } else {
-    html += '<div class="mdai-edge-prompt-ro">' + esc(_mdaiCur.body || '') + '</div>';
+    html += '<div class="mdai-edge-prompt-ro">' + esc(c.body || '') + '</div>';
   }
   html += '</div>';
+  return html;
+}
 
-  el.innerHTML = html;
-  _bindMdFileLinks(el);
+// The Diagram tab: the node's DAG as a vertical flow — source(s) -> synthesis
+// (model + instruction) -> output. Clicking a node jumps to the List tab to edit
+// it. A prompt-only node shows a self-fetch source instead of a file.
+function _mdaiDiagramHtml(cur) {
+  const c = _mdaiCur;
+  if (!c) return '';
+  let h = '<div class="mdai-diagram">';
+  if (c.sources.length) {
+    h += '<div class="mdai-dg-row">';
+    c.sources.forEach((s) => {
+      h += '<div class="mdai-dg-node mdai-dg-src" onclick="_mdaiSetBottomTab(\'list\')" title="Edit in List">'
+        + '<div class="mdai-dg-kind">source</div>'
+        + '<div class="mdai-dg-title">' + esc(s.path || '(unnamed)') + '</div>'
+        + (s.prompt ? '<div class="mdai-dg-sub">' + esc(s.prompt.slice(0, 90)) + '</div>' : '')
+        + '</div>';
+    });
+    h += '</div>';
+  } else {
+    h += '<div class="mdai-dg-node mdai-dg-src mdai-dg-selffetch" title="Prompt-only: fetches its own data at run time">'
+      + '<div class="mdai-dg-kind">prompt-only source</div>'
+      + '<div class="mdai-dg-sub">no source file — the instruction fetches its own data at run time</div>'
+      + '</div>';
+  }
+  h += '<div class="mdai-dg-arrow">&#8595;</div>';
+  const model = (cur && cur.model) || c.model || 'model';
+  h += '<div class="mdai-dg-node mdai-dg-synth" onclick="_mdaiSetBottomTab(\'list\')" title="Edit the instruction in List">'
+    + '<div class="mdai-dg-kind">synthesis &middot; ' + esc(model) + '</div>'
+    + '<div class="mdai-dg-sub">' + (esc((c.body || '').slice(0, 160)) || '(no instruction)') + '</div>'
+    + '</div>';
+  h += '<div class="mdai-dg-arrow">&#8595;</div>';
+  h += '<div class="mdai-dg-node mdai-dg-out">'
+    + '<div class="mdai-dg-kind">output' + (cur ? (cur.cached ? ' &middot; cached' : ' &middot; fresh') : '') + '</div>'
+    + '<div class="mdai-dg-sub">' + (cur && cur.output ? esc(cur.output.slice(0, 120)) + '&hellip;' : 'not run yet') + '</div>'
+    + '</div>';
+  h += '</div>';
+  return h;
 }
 
 // ── Connect picker: make a file/folder a source of a chosen .mdai node ──
