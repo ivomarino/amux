@@ -7775,7 +7775,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.676';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.677';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8354,6 +8354,7 @@ async function _psfViewFile(filePath) {
   // .mdai opens in the dedicated MDAI viewer (metadata + version scroll +
   // runs the chain on open), same as the main file browser (AMUX-3317).
   if (/\.mdai$/i.test(filePath || '')) { openMdaiNode(filePath); return; }
+  if (/\.(xlsx|xls|ods)$/i.test(filePath || '')) { _openXlsxPreview(filePath); return; }
   const body = document.getElementById('psf-body');
   const bc = document.getElementById('psf-breadcrumb');
   const dir = filePath.substring(0, filePath.lastIndexOf('/')) || '/';
@@ -14405,6 +14406,67 @@ function _mdSearchHighlightCurrent() {
   if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
+// Spreadsheet preview (AMUX-3343): fetch the server-parsed sheets and render
+// them as tables in the file overlay, with a tab per sheet, instead of forcing a
+// download. Server-side parsing (calamine) keeps the client light for mobile.
+async function _openXlsxPreview(path) {
+  _fileData = null;
+  _fileViewMode = 'preview';
+  const titleEl = document.getElementById('file-title');
+  if (titleEl) titleEl.textContent = path.split('/').pop();
+  const subEl = document.getElementById('file-subpath');
+  if (subEl) { const dir = path.slice(0, path.lastIndexOf('/')) || '/'; subEl.textContent = dir; subEl.title = path; }
+  const body = document.getElementById('file-body');
+  body.className = 'file-overlay-body';
+  body.textContent = 'Loading spreadsheet…';
+  const tabsEl = document.getElementById('file-view-tabs');
+  if (tabsEl) tabsEl.style.display = 'none';
+  document.getElementById('file-overlay').classList.add('active');
+  const dlBtn = document.getElementById('file-download-btn');
+  if (dlBtn) {
+    dlBtn.dataset.url = API + '/api/file/raw?path=' + encodeURIComponent(path) + '&download=1';
+    dlBtn.dataset.filename = path.split('/').pop();
+    dlBtn.style.display = '';
+  }
+  try {
+    const r = await fetch(API + '/api/file/xlsx?path=' + encodeURIComponent(path));
+    const d = await r.json();
+    if (d.error) { body.textContent = 'Error: ' + d.error; return; }
+    const sheets = d.sheets || [];
+    if (!sheets.length) { body.innerHTML = '<div class="xlsx-empty">No sheets in this workbook.</div>'; return; }
+    let html = '';
+    if (sheets.length > 1) {
+      html += '<div class="xlsx-tabs">' + sheets.map((s, i) =>
+        '<button class="xlsx-tab' + (i === 0 ? ' active' : '') + '" onclick="_xlsxShowSheet(' + i + ')">' + esc(s.name) + '</button>').join('') + '</div>';
+    }
+    sheets.forEach((s, i) => {
+      html += '<div class="xlsx-sheet" id="xlsx-sheet-' + i + '"' + (i > 0 ? ' style="display:none"' : '') + '>' + _xlsxTableHtml(s) + '</div>';
+    });
+    if (d.truncated) html += '<div class="xlsx-trunc">Large workbook — some rows, columns or sheets were truncated. Use Download for the full file.</div>';
+    body.innerHTML = html;
+  } catch (e) {
+    body.textContent = 'Failed to load spreadsheet: ' + e;
+  }
+}
+
+function _xlsxTableHtml(sheet) {
+  const rows = sheet.rows || [];
+  if (!rows.length) return '<div class="xlsx-empty">Empty sheet.</div>';
+  let h = '<div class="xlsx-scroll"><table class="xlsx-table">';
+  rows.forEach((row, ri) => {
+    h += '<tr>';
+    row.forEach(cell => { h += ri === 0 ? ('<th>' + esc(cell) + '</th>') : ('<td>' + esc(cell) + '</td>'); });
+    h += '</tr>';
+  });
+  h += '</table></div>';
+  return h;
+}
+
+function _xlsxShowSheet(i) {
+  document.querySelectorAll('.xlsx-sheet').forEach((el, idx) => { el.style.display = idx === i ? '' : 'none'; });
+  document.querySelectorAll('.xlsx-tab').forEach((el, idx) => { el.classList.toggle('active', idx === i); });
+}
+
 async function openFilePreview(path) {
   // .mdai files open in the dedicated MDAI viewer (Ethan, AMUX-3317): it shows
   // the node's metadata (model / date / cached), lets you scroll the run
@@ -14412,6 +14474,8 @@ async function openFilePreview(path) {
   // does. Route before touching the file-overlay DOM so a .mdai opened from the
   // file browser or a file link lands in the right viewer.
   if (/\.mdai$/i.test(path || '')) { openMdaiNode(path); return; }
+  // Spreadsheets render as tables, not a download (AMUX-3343).
+  if (/\.(xlsx|xls|ods)$/i.test(path || '')) { _openXlsxPreview(path); return; }
   _fileData = null;
   _fileViewMode = 'preview';
   document.getElementById('file-title').textContent = path.split('/').pop();

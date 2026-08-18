@@ -5493,3 +5493,16 @@
   .conn-save, .conn-connect, .conn-scope-btn { min-height: 44px; flex: 1 1 auto; }
   .conn-badge { margin-left: 0; }
 }
+
+/* ===== Spreadsheet (.xlsx) preview (AMUX-3343) ===== */
+.xlsx-tabs { display: flex; gap: 4px; flex-wrap: wrap; margin-bottom: 10px; }
+.xlsx-tab { background: var(--hover); border: 1px solid var(--border); border-radius: 6px; color: var(--dim); font-size: 0.76rem; padding: 6px 12px; cursor: pointer; min-height: 34px; }
+.xlsx-tab.active { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+.xlsx-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); border-radius: 8px; }
+.xlsx-table { border-collapse: collapse; font-size: 0.8rem; min-width: 100%; }
+.xlsx-table th, .xlsx-table td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; white-space: pre-wrap; word-break: break-word; max-width: 360px; vertical-align: top; }
+.xlsx-table th { background: var(--hover); font-weight: 600; position: sticky; top: 0; }
+.xlsx-table tr:nth-child(even) td { background: color-mix(in srgb, var(--hover) 40%, transparent); }
+.xlsx-empty { color: var(--dim); font-size: 0.85rem; padding: 16px 4px; }
+.xlsx-trunc { color: var(--yellow, #d4a017); font-size: 0.76rem; margin-top: 10px; }
+@media (max-width: 600px) { .xlsx-tab { min-height: 44px; } .xlsx-table th, .xlsx-table td { max-width: 220px; } }
