@@ -414,6 +414,18 @@ fn is_pure_read_command(cmd: &str) -> bool {
         "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
         "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
         "pwd", "echo", "printf",
+        // `cd` cannot modify anything, and its ABSENCE silently undid the
+        // git-read exemption directly below: `git show f` was correctly a read,
+        // while `cd /repo && git show f` was not, because the FIRST segment's
+        // verb decided the whole command. `cd` is the most common prefix in this
+        // repo's own workflow, so the exemption was defeated in the majority of
+        // real invocations — 117 of 191 inferred-edit records in 24h had
+        // verb=cd (AEAB-24). Safe because a real mutation still trips either the
+        // output-redirection check above or its own non-read verb in a later
+        // segment; `cd x && rm f`, `cd x && sed -i`, `cd x && git commit` and
+        // `cd x && cat > f <<EOF` all remain non-read, and the test below pins
+        // exactly that.
+        "cd",
     ];
     // `git <read-subcommand>` is how a careful VERIFIER reads a file — `git show`,
     // `git log --stat`, `git diff`, `git grep`, `git blame` to chase a specific
@@ -1807,5 +1819,56 @@ mod tests {
         // py:19187: max(600, env). A tiny window would make almost everything
         // `unclaimed` and nothing `foreign` — a guard that never blocks.
         assert!(window_secs() >= WINDOW_FLOOR);
+    }
+}
+
+#[cfg(test)]
+mod cd_is_not_a_mutation {
+    use super::*;
+
+    /// AEAB-24. `cd` was missing from READ_ONLY_VERBS, and its absence silently
+    /// undid the git-read exemption that AMUX-3128 added right above it.
+    ///
+    /// `is_pure_read_command` splits on `| ; & \n ( ) \``, takes the FIRST token of
+    /// each segment as that segment's verb, and returns false the moment one verb
+    /// is not read-only. So a leading `cd` — which cannot modify anything —
+    /// decided the whole command, and `cd /repo && git show f` minted an inferred
+    /// edit record naming the reader as co-author of a file they only inspected.
+    ///
+    /// That is the exact harm the git-read exemption exists to prevent, and its
+    /// own comment says so: "the harder a peer checks your output, the more it
+    /// blocks you, which trains toward GN=1 where the guard stops protecting
+    /// anything." The exemption worked for a bare `git show` and was defeated by
+    /// the most common prefix in this repo's workflow — 117 of 191 inferred-edit
+    /// records in one 24h window had verb=cd.
+    ///
+    /// The SAFETY half of this test is the load-bearing half. Adding a verb to
+    /// READ_ONLY_VERBS widens what the guard treats as harmless, and a widening
+    /// that goes too far stops the guard protecting anything while leaving every
+    /// other test green.
+    #[test]
+    fn cd_is_a_read_verb_but_never_launders_a_mutation() {
+        // Reads that a leading `cd` used to misclassify.
+        for cmd in [
+            "cd /tmp",
+            "cd /tmp && cat f.md",
+            "cd /repo && git show origin/main:frustrations.md",
+            "cd /repo && grep -n needle src/lib.rs",
+        ] {
+            assert!(is_pure_read_command(cmd), "should be a pure read: {cmd}");
+        }
+
+        // SAFETY — every one of these still mutates, and must still be attributed.
+        // `cd` must not launder the mutation that follows it.
+        for cmd in [
+            "cd /tmp && echo hi > f.md",              // output redirection
+            "cd /tmp && cat > f.md <<'EOF'\nx\nEOF",  // heredoc write
+            "cd /tmp && rm f.md",                     // non-read verb
+            "cd /tmp && sed -i '' s/a/b/ f.md",       // in-place edit
+            "cd /repo && git commit -am x",           // git WRITE subcommand
+            "cd /repo && git add -A",
+        ] {
+            assert!(!is_pure_read_command(cmd), "must NOT be a pure read: {cmd}");
+        }
     }
 }
