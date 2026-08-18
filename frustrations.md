@@ -2896,13 +2896,13 @@ NORMALISED 2026-08-17 by amux-errors-and-bugs, not rewritten — see AEAB-19. Th
 ## A pure status-question prompt is captured as code/doing, so it can never pass a gate and holds the WIP slot
 AREA: board
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-17
 SESSION: amux
 CARD: AMUX-3330
 SYMPTOM: Three prompts this session that only ASK for information ("status on MSG-29602?", "whats the status of MSG-29588?") were auto-captured as type=code, status=doing cards (AMUX-3325, AMUX-3323, AMUX-3328). A code card is gated on "implemented and merged"; a question can never truthfully satisfy that (ethos rule 3), and status=doing consumes the single WIP slot, so the `[amux]` "captured prompt, not a unit of work" nudge fires and the only resolution is a manual `curl PATCH ... status=discarded`.
 COST: ~1 tool-call + a manual discard per occurrence, 3x this session, and each one interrupts the answer flow with a WIP nudge. Small individually, but it recurs on every information-only prompt, which for a session Ethan is querying is a large fraction of turns.
-FIX: The capture classifier (crates/amux-server/src/api/session_verbs.rs) should detect an interrogative / status-query prompt and capture it non-gated (type=note or a new question type) and NOT set doing, so an answered question neither holds WIP nor trips the gate machinery. Distinct from the fixed reshape-rebrand class (2802107 / AMUX-3188): there the card WAS work and had been reshaped; here the card is genuinely not work and should never have been code/doing. Card AMUX-3330.
+FIX: Fixed in 145ee4b. amux_core::board::is_status_query detects the pure status-query shape and mint_capture_card returns None for it (mints NO board card), exactly like the steering/[no-board] prompts title_from_prompt already declines — so no WIP hold, no gate, no manual discard. The prompt still lands in cmd_history (the Messages ledger keeps every prompt). Deliberately tight (false positive = silent work): a match needs BOTH a status-query opener AND a trailing '?'. Chose mint-nothing over a non-gated type because AMUX-2613 forces captures to mint in `doing` (a `todo` capture is re-dispatched and double-runs), so a non-doing capture was not an option; and a status question is genuinely not work, like the steering prompts already skipped. Surface-in-logs: 'ledger: status-query not carded'. Distinct from the reshape-rebrand class (2802107 / AMUX-3188). Card AMUX-3330.
 ## The verify nudge names `needs:you` as its escape and does not honour it
 AREA: board
 SEVERITY: slows
