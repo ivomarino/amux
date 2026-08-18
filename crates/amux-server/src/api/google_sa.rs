@@ -48,17 +48,37 @@ pub fn sa_config() -> Option<(String, String)> {
     Some((get("GOOGLE_SA_KEY_FILE")?, get("GOOGLE_SA_SUBJECT")?))
 }
 
+/// A minted impersonated access token and the seconds until Google expires it.
+/// The token is a SECRET — never log it.
+pub struct MintedToken {
+    pub access_token: String,
+    pub expires_in: i64,
+}
+
 /// Mint an access token for `scope` (space-delimited Google OAuth scopes),
-/// impersonating the configured subject. Returns the bearer token (NEVER log it)
-/// or an error string that is safe to surface (carries no secret).
+/// impersonating the CONFIGURED subject (`GOOGLE_SA_SUBJECT`). Thin wrapper over
+/// [`mint_token_as`] returning just the bearer, so existing callers (the Test
+/// button) are unchanged. NEVER log the returned token.
 pub async fn mint_token(scope: &str) -> Result<String, String> {
-    let (path, subject) = sa_config().ok_or("GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT not set")?;
+    let (_, subject) = sa_config().ok_or("GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT not set")?;
+    Ok(mint_token_as(scope, &subject).await?.access_token)
+}
+
+/// Mint an access token for `scope`, impersonating an explicit `subject` — any
+/// Workspace user the SA is domain-wide-delegated for. The CALLER decides the
+/// subject, which is what binds a token to the requesting user rather than
+/// letting a caller impersonate the whole domain: in cloud the connector passes
+/// the gateway-authenticated user, locally it passes the configured subject.
+/// Returns the token plus its lifetime; the error string is safe to surface
+/// (carries no secret). NEVER log the returned token.
+pub async fn mint_token_as(scope: &str, subject: &str) -> Result<MintedToken, String> {
+    let (path, _) = sa_config().ok_or("GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT not set")?;
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("read SA key file: {e}"))?;
     let key: SaKey = serde_json::from_str(&raw).map_err(|e| format!("parse SA key JSON: {e}"))?;
     let now = chrono::Utc::now().timestamp();
     let claims = Claims {
         iss: &key.client_email,
-        sub: &subject,
+        sub: subject,
         scope,
         aud: &key.token_uri,
         iat: now,
@@ -99,8 +119,17 @@ pub async fn mint_token(scope: &str) -> Result<String, String> {
             .unwrap_or("");
         return Err(format!("{err}: {desc}"));
     }
-    body.get("access_token")
+    let access_token = body
+        .get("access_token")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
-        .ok_or_else(|| "token exchange returned no access_token".into())
+        .ok_or_else(|| "token exchange returned no access_token".to_string())?;
+    let expires_in = body
+        .get("expires_in")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(3600);
+    Ok(MintedToken {
+        access_token,
+        expires_in,
+    })
 }

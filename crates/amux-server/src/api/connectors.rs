@@ -31,7 +31,7 @@
 
 use super::AppState;
 use crate::config::{amux_home, canonical_port, parse_env_file};
-use axum::extract::Path;
+use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -122,9 +122,12 @@ const REGISTRY: &[Provider] = &[
             client_id_env: "GOOGLE_OAUTH_CLIENT_ID",
             client_secret_env: "GOOGLE_OAUTH_CLIENT_SECRET",
             callback_path: "/api/connectors/google/callback",
-            scopes: "https://www.googleapis.com/auth/drive",
+            // Drive + Docs: the DWD service account is granted both, and editing a
+            // Doc (the common follow-on to creating a Drive file) needs the Docs
+            // scope. A minted token from /token therefore works for both APIs.
+            scopes: "https://www.googleapis.com/auth/drive https://www.googleapis.com/auth/documents",
         },
-        setup_note: "Enable the Google Drive API on the GCP project (shares the one Google OAuth client).",
+        setup_note: "Enable the Google Drive + Docs APIs on the GCP project (shares the one Google OAuth client).",
         docs: "https://console.cloud.google.com/apis/library/drive.googleapis.com",
         test_url: "https://www.googleapis.com/drive/v3/about?fields=user",
     },
@@ -179,6 +182,31 @@ fn env_keys(p: &Provider) -> Vec<&'static str> {
 /// both the laptop (8824) and the container (8822) with no build flag.
 fn origin() -> String {
     format!("https://localhost:{}", canonical_port())
+}
+
+/// The Workspace user an SA-minted token should impersonate. In CLOUD the
+/// gateway authenticates the user and injects `X-Amux-User-Email` (and strips any
+/// client-supplied copy), so binding to it means a caller can only mint a token
+/// for THEMSELVES, never the whole domain — the primis/nissan caution. LOCALLY
+/// the header is absent, so we fall back to the single configured subject
+/// (`GOOGLE_SA_SUBJECT`), which is the box owner. Single codebase: no cloud
+/// branch, just presence/absence of the gateway-injected header.
+///
+/// SECURITY CONTRACT: this trusts `X-Amux-User-Email` as authenticated identity.
+/// That trust is only sound because the cloud gateway is the sole writer of
+/// `X-Amux-*` and drops inbound copies from clients. If that ever stops holding,
+/// this becomes domain-wide impersonation — keep the gateway's header-strip in
+/// step with this.
+fn impersonation_subject(headers: &HeaderMap) -> Option<String> {
+    if let Some(v) = headers
+        .get("x-amux-user-email")
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Some(v.to_string());
+    }
+    super::google_sa::sa_config().map(|(_, subject)| subject)
 }
 
 /// Does a provider have an OAuth token on disk? Tokens live under
@@ -304,6 +332,16 @@ async fn list() -> Response {
             } else {
                 "connected"
             };
+            // The actionable half of the status. "connected" meant only
+            // "credentials exist somewhere" and handed a session nothing — a
+            // caller had to know a key path existed (nissan, AMUX-3362). When a
+            // token CAN be minted right now, name the endpoint that returns one,
+            // so "connected" comes with the door, not just the label.
+            let token_endpoint = if sa_available {
+                json!(format!("/api/connectors/{}/token", p.id))
+            } else {
+                Value::Null
+            };
             json!({
                 "id": p.id,
                 "label": p.label,
@@ -313,6 +351,11 @@ async fn list() -> Response {
                 "env_keys": key_status,
                 "status": status,
                 "cred_source": cred_source,
+                // usable = a SESSION can obtain a working credential from amux
+                // right now (POST token_endpoint). Distinct from "connected",
+                // which for an OAuth-broker-pending connector is not yet usable.
+                "usable": !token_endpoint.is_null(),
+                "token_endpoint": token_endpoint,
                 "setup_note": p.setup_note,
                 "docs": p.docs,
             })
@@ -321,7 +364,7 @@ async fn list() -> Response {
     Json(json!({
         "connectors": items,
         "origin": origin(),
-        "note": "Paste credential VALUES here; they are written to ~/.amux/server.env and never returned. Set scope (global/group/worker) via the Scope tab or the per-connector scope control (PUT /api/scope, capability=connectors).",
+        "note": "Paste credential VALUES here; they are written to ~/.amux/server.env and never returned. When a connector reports a token_endpoint, POST it to mint a ready-to-use short-lived bearer (no key path to know). Set scope (global/group/worker) via the Scope tab or the per-connector scope control (PUT /api/scope, capability=connectors).",
     }))
     .into_response()
 }
@@ -591,12 +634,108 @@ async fn test_connection(Path(id): Path<String>) -> Response {
     }
 }
 
+/// POST /api/connectors/{id}/token — hand the caller a ready-to-use bearer for a
+/// Google connector, so a SESSION never has to know a key path exists (nissan,
+/// AMUX-3362). The token is minted through the service-account domain-wide
+/// delegation, impersonating the requesting Workspace user (see
+/// [`impersonation_subject`]). The raw SA key is NEVER returned or logged, and
+/// the minted token is NEVER logged. Optional `?scopes=` overrides the provider's
+/// declared scopes (space- or comma-delimited). On failure the endpoint surfaces
+/// Google's own error (e.g. `unauthorized_client`), which names the Admin-console
+/// fix — the same honest-error path `test_connection` uses.
+async fn mint_connector_token(
+    Path(id): Path<String>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let Some(p) = provider(&id) else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("unknown connector '{id}'")})),
+        )
+            .into_response();
+    };
+    let default_scopes = match p.auth {
+        Auth::OAuth2 { scopes, .. } => scopes,
+        Auth::ApiKey { .. } => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "status": "unsupported",
+                    "detail": format!("{id} is an API-key connector — there is no token to mint; the server uses its key directly (Test button)."),
+                })),
+            )
+                .into_response();
+        }
+    };
+    // Only SA-backed Google connectors can mint today. Anything else is honestly
+    // "not yet" (the OAuth broker, AMUX-3192), never a fake token.
+    if !(p.category == "Google" && super::google_sa::sa_config().is_some()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "ok": false,
+                "status": "needs_auth",
+                "detail": "minting needs a Google service account with domain-wide delegation (GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT); not configured for this connector. OAuth token exchange is pending (AMUX-3192).",
+            })),
+        )
+            .into_response();
+    }
+    let scope = q
+        .get("scopes")
+        .map(|s| s.replace(',', " "))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| default_scopes.to_string());
+    let Some(subject) = impersonation_subject(&headers) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"ok": false, "status": "error", "detail": "no impersonation subject (GOOGLE_SA_SUBJECT unset and no X-Amux-User-Email)"})),
+        )
+            .into_response();
+    };
+    match super::google_sa::mint_token_as(&scope, &subject).await {
+        Ok(tok) => {
+            // Log the FACT of a mint (id, subject, scope, lifetime) so a sweep can
+            // see who minted what — but NEVER the token itself (grep connector_token).
+            tracing::info!(
+                "connector_token: {id} minted for {subject} scope=[{scope}] expires_in={}",
+                tok.expires_in
+            );
+            Json(json!({
+                "ok": true,
+                "access_token": tok.access_token,
+                "token_type": "Bearer",
+                "expires_in": tok.expires_in,
+                "scope": scope,
+                "subject": subject,
+                "usage": "Authorization: Bearer <access_token> — e.g. GET https://www.googleapis.com/drive/v3/files",
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            tracing::warn!("connector_token: {id} mint failed for {subject}: {e}");
+            (
+                StatusCode::BAD_GATEWAY,
+                Json(json!({
+                    "ok": false,
+                    "status": "error",
+                    "detail": format!("service-account delegation failed: {e}. If this is 'unauthorized_client', a Workspace super-admin must authorize this connector's scopes for the SA in Admin console -> Security -> API controls -> Domain-wide delegation."),
+                })),
+            )
+                .into_response()
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/connectors", get(list))
         .route("/api/connectors/{id}/credentials", post(set_credentials))
         .route("/api/connectors/{id}/auth", post(begin_auth))
         .route("/api/connectors/{id}/test", post(test_connection))
+        .route("/api/connectors/{id}/token", post(mint_connector_token))
         .route("/api/connectors/{family}/callback", get(callback))
 }
 
@@ -624,6 +763,41 @@ mod tests {
                 assert!(uri.contains(&want), "{} redirect {} lost canonical port", p.id, uri);
                 assert!(!uri.contains(":8822") || want == ":8822", "{} pins retired 8822", p.id);
             }
+        }
+    }
+
+    #[test]
+    fn impersonation_subject_prefers_the_gateway_header_and_ignores_blank() {
+        // Cloud path: the gateway-injected user is impersonated verbatim, so a
+        // minted token is bound to the requester, not the whole domain.
+        let mut h = HeaderMap::new();
+        h.insert("x-amux-user-email", "alice@mixpeek.com".parse().unwrap());
+        assert_eq!(
+            impersonation_subject(&h).as_deref(),
+            Some("alice@mixpeek.com")
+        );
+        // A blank header must never become the subject — it falls through to the
+        // configured subject (or None), never impersonates "   ".
+        let mut blank = HeaderMap::new();
+        blank.insert("x-amux-user-email", "   ".parse().unwrap());
+        assert_ne!(impersonation_subject(&blank).as_deref(), Some("   "));
+    }
+
+    #[test]
+    fn drive_connector_grants_drive_and_docs_so_a_minted_token_can_edit_a_doc() {
+        // A Drive token that could not touch the Docs API would repeat the exact
+        // "connected but useless" gap this endpoint exists to close: creating a
+        // Doc is the common follow-on and needs the documents scope.
+        let drive = REGISTRY.iter().find(|p| p.id == "google-drive").unwrap();
+        match drive.auth {
+            Auth::OAuth2 { scopes, .. } => {
+                assert!(scopes.contains("auth/drive"), "drive scope missing");
+                assert!(
+                    scopes.contains("auth/documents"),
+                    "docs scope missing — a minted Drive token could not edit a Doc"
+                );
+            }
+            _ => panic!("google-drive should be OAuth2"),
         }
     }
 

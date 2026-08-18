@@ -1022,6 +1022,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- file viewer / files / fs
     RouteEntry { path: "/api/file", methods: ANY },
     RouteEntry { path: "/api/file/raw", methods: ANY },
+    RouteEntry { path: "/api/file/xlsx", methods: ANY },
     RouteEntry { path: "/api/file/vtt", methods: ANY },
     RouteEntry { path: "/api/file/prepare", methods: ANY },
     RouteEntry { path: "/api/file/transcode", methods: ANY },
@@ -1100,6 +1101,15 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/speedtest/upload", methods: &["POST"] },
     RouteEntry { path: "/api/stats/reset", methods: &["POST"] },
     RouteEntry { path: "/api/observability", methods: &["GET"] },
+    // Connectors (integrations): registry + status, credential paste, OAuth
+    // begin/callback, live Test, and the DWD token mint (AMUX-3362). `list` is
+    // GET; credentials/auth/test/token are POST; callback is the GET landing.
+    RouteEntry { path: "/api/connectors", methods: &["GET"] },
+    RouteEntry { path: "/api/connectors/{id}/credentials", methods: &["POST"] },
+    RouteEntry { path: "/api/connectors/{id}/auth", methods: &["POST"] },
+    RouteEntry { path: "/api/connectors/{id}/test", methods: &["POST"] },
+    RouteEntry { path: "/api/connectors/{id}/token", methods: &["POST"] },
+    RouteEntry { path: "/api/connectors/{family}/callback", methods: &["GET"] },
     RouteEntry { path: "/api/pull", methods: &["POST"] },
     RouteEntry { path: "/api/proxies", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/proxies/{id}", methods: &["PATCH", "DELETE"] },
