@@ -5461,7 +5461,14 @@
 .conn-redir code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
 .conn-copy { padding: 2px 8px; min-height: 0; font-size: 0.66rem; margin-left: 4px; }
 .conn-connect { background: var(--cyan, #2a9fd6); color: #000; border: none; font-weight: 600; }
+.conn-test { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 6px 0; }
+.conn-test-btn { background: var(--hover); color: var(--text); border: 1px solid var(--border); border-radius: 5px; font-size: 0.72rem; padding: 6px 12px; cursor: pointer; min-height: 32px; }
+.conn-test-btn:disabled { opacity: 0.6; cursor: default; }
+.conn-test-result { font-size: 0.74rem; }
+.conn-test-result.ok { color: var(--green); }
+.conn-test-result.bad { color: var(--red); }
 .conn-scope { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+@media (max-width: 600px) { .conn-test-btn { min-height: 44px; } }
 .conn-slabel { font-size: 0.72rem; color: var(--dim); }
 .conn-scope-off { opacity: 0.75; }
 @media (max-width: 600px) {

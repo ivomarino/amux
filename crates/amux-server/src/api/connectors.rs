@@ -68,6 +68,10 @@ struct Provider {
     setup_note: &'static str,
     /// A docs/console URL the tab links for setup; empty for none.
     docs: &'static str,
+    /// A cheap authenticated endpoint the Test button hits to verify the
+    /// credential actually WORKS, not merely that it is present (AMUX-3339).
+    /// GET with `Authorization: Bearer <cred>`; 2xx means the connection is live.
+    test_url: &'static str,
 }
 
 /// The registry. Add a connector by adding a row here (plus Ethan supplying its
@@ -80,6 +84,7 @@ const REGISTRY: &[Provider] = &[
         auth: Auth::ApiKey { key_env: "GRANOLA_API_KEY" },
         setup_note: "Business or Enterprise plan required to mint a key: Granola desktop -> Settings -> Connectors -> API keys (grn_...). Key-only, no OAuth.",
         docs: "https://public-api.granola.ai",
+        test_url: "https://public-api.granola.ai/v1/notes?limit=1",
     },
     Provider {
         id: "google-gmail",
@@ -93,6 +98,7 @@ const REGISTRY: &[Provider] = &[
         },
         setup_note: "Enable the Gmail API on the GCP project. All Google connectors share one OAuth client; register the redirect URI below on it.",
         docs: "https://console.cloud.google.com/apis/library/gmail.googleapis.com",
+        test_url: "https://gmail.googleapis.com/gmail/v1/users/me/profile",
     },
     Provider {
         id: "google-calendar",
@@ -106,6 +112,7 @@ const REGISTRY: &[Provider] = &[
         },
         setup_note: "Enable the Google Calendar API on the GCP project (shares the one Google OAuth client).",
         docs: "https://console.cloud.google.com/apis/library/calendar-json.googleapis.com",
+        test_url: "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1",
     },
     Provider {
         id: "google-drive",
@@ -119,6 +126,7 @@ const REGISTRY: &[Provider] = &[
         },
         setup_note: "Enable the Google Drive API on the GCP project (shares the one Google OAuth client).",
         docs: "https://console.cloud.google.com/apis/library/drive.googleapis.com",
+        test_url: "https://www.googleapis.com/drive/v3/about?fields=user",
     },
     Provider {
         id: "google-admin",
@@ -132,6 +140,7 @@ const REGISTRY: &[Provider] = &[
         },
         setup_note: "Needs a Workspace super-admin. Enable the Admin SDK API and consent the admin.directory scopes as the super-admin, or use a service account with domain-wide delegation.",
         docs: "https://console.cloud.google.com/apis/library/admin.googleapis.com",
+        test_url: "https://admin.googleapis.com/admin/directory/v1/users?maxResults=1&customer=my_customer",
     },
     Provider {
         id: "slack",
@@ -145,6 +154,7 @@ const REGISTRY: &[Provider] = &[
         },
         setup_note: "Create a Slack app, add the redirect URI below, and paste its client id + secret.",
         docs: "https://api.slack.com/apps",
+        test_url: "https://slack.com/api/auth.test",
     },
 ];
 
@@ -435,11 +445,97 @@ async fn callback(Path(provider_family): Path<String>, _headers: HeaderMap) -> R
         .into_response()
 }
 
+/// POST /api/connectors/{id}/test — verify the connection actually WORKS, not
+/// merely that a credential is present (AMUX-3339). Makes one cheap authenticated
+/// call to the provider and reports the real outcome. For ApiKey connectors this
+/// runs today; for OAuth ones it reports "connect first" until the token exchange
+/// (broker) lands, since there is no stored access token to present yet. The
+/// bearer value is NEVER logged — only the provider id, HTTP status and latency
+/// (grep `connector_test`).
+async fn test_connection(Path(id): Path<String>) -> Response {
+    let Some(p) = provider(&id) else {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown connector '{id}'")}))).into_response();
+    };
+    let file_env = parse_env_file(&amux_home().join("server.env"));
+    let bearer = match p.auth {
+        Auth::ApiKey { key_env } => match env_val(&file_env, key_env) {
+            Some(k) => k,
+            None => {
+                return Json(json!({
+                    "ok": false,
+                    "status": "needs_credentials",
+                    "detail": format!("set {key_env} first — nothing to test yet"),
+                }))
+                .into_response()
+            }
+        },
+        Auth::OAuth2 { .. } => {
+            // No stored access token until the OAuth broker (AMUX-3192) writes one,
+            // so report honestly rather than pass off credential-presence as a
+            // live check.
+            return Json(json!({
+                "ok": false,
+                "status": "needs_auth",
+                "detail": "Connect first — the live test runs once the OAuth token exchange lands (AMUX-3192).",
+            }))
+            .into_response();
+        }
+    };
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            return Json(json!({"ok": false, "status": "error", "detail": format!("client build failed: {e}")}))
+                .into_response()
+        }
+    };
+    let started = std::time::Instant::now();
+    let resp = client
+        .get(p.test_url)
+        .header("Authorization", format!("Bearer {bearer}"))
+        .send()
+        .await;
+    let ms = started.elapsed().as_millis();
+    match resp {
+        Ok(r) => {
+            let code = r.status().as_u16();
+            let ok = r.status().is_success();
+            tracing::info!("connector_test: {id} -> {code} ({ok}) in {ms}ms");
+            Json(json!({
+                "ok": ok,
+                "status": if ok { "connected" } else { "error" },
+                "http_status": code,
+                "elapsed_ms": ms,
+                "detail": if ok {
+                    format!("live: HTTP {code} in {ms}ms")
+                } else {
+                    format!("provider returned HTTP {code} — the key may be invalid or lack scope")
+                },
+            }))
+            .into_response()
+        }
+        Err(e) => {
+            let msg = if e.is_timeout() {
+                "timed out after 10s".to_string()
+            } else if e.is_connect() {
+                "could not reach the provider".to_string()
+            } else {
+                format!("request failed: {e}")
+            };
+            tracing::warn!("connector_test: {id} failed ({msg}) in {ms}ms");
+            Json(json!({"ok": false, "status": "error", "detail": msg, "elapsed_ms": ms})).into_response()
+        }
+    }
+}
+
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/connectors", get(list))
         .route("/api/connectors/{id}/credentials", post(set_credentials))
         .route("/api/connectors/{id}/auth", post(begin_auth))
+        .route("/api/connectors/{id}/test", post(test_connection))
         .route("/api/connectors/{family}/callback", get(callback))
 }
 

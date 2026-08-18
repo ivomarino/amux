@@ -7775,7 +7775,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.674';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.675';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15607,6 +15607,8 @@ function _connectorsRender(d) {
       html += '<div class="conn-oauth"><div class="conn-redir">Redirect URI to register: <code>' + esc(c.oauth.redirect_uri) + '</code> <button class="conn-copy" onclick="_copyTextWithToast(\'' + esc(c.oauth.redirect_uri) + '\',\'Redirect URI copied\')">copy</button></div>';
       html += '<button class="conn-connect" onclick="_connectorAuth(\'' + esc(c.id) + '\')">Connect ' + esc(c.label) + ' ↗</button></div>';
     }
+    // test connection — verify it actually WORKS, not just that a key is present
+    html += '<div class="conn-test"><button class="conn-test-btn" onclick="_connectorTest(\'' + esc(c.id) + '\', this)">Test connection</button> <span class="conn-test-result" id="conn-test-' + esc(c.id) + '"></span></div>';
     // scope control (global / group / worker) — drives /api/scope
     html += '<div class="conn-scope"><span class="conn-slabel">Enable for:</span> '
       + '<button class="conn-scope-btn" onclick="_connectorScope(\'' + esc(c.id) + '\',\'global\',true)">Global</button>'
@@ -15663,6 +15665,28 @@ async function _connectorScope(id, level, enabled) {
     if (d && d.error) { showToast('Scope failed: ' + d.error); return; }
     showToast((enabled ? 'Enabled ' : 'Disabled ') + id + ' at ' + level + (name ? (' ' + name) : ''));
   } catch (e) { showToast('Scope failed: ' + e); }
+}
+
+// Verify a connector actually WORKS (AMUX-3339): hits POST /api/connectors/<id>/test,
+// which makes one cheap authenticated call to the provider. ApiKey connectors test
+// live now; OAuth ones report "connect first" until the token exchange lands.
+async function _connectorTest(id, btn) {
+  const out = document.getElementById('conn-test-' + id);
+  const orig = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Testing…';
+  if (out) { out.textContent = ''; out.className = 'conn-test-result'; }
+  try {
+    const r = await fetch('/api/connectors/' + encodeURIComponent(id) + '/test', { method: 'POST' });
+    const d = await r.json();
+    if (out) {
+      out.textContent = (d.ok ? '✓ ' : '✗ ') + (d.detail || (d.ok ? 'works' : (d.status || 'failed')));
+      out.className = 'conn-test-result ' + (d.ok ? 'ok' : 'bad');
+    }
+  } catch (e) {
+    if (out) { out.textContent = '✗ ' + e; out.className = 'conn-test-result bad'; }
+  } finally {
+    btn.disabled = false; btn.textContent = orig;
+  }
 }
 
 async function _mdaiTabLoad() {
