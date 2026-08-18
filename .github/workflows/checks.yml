@@ -104,3 +104,14 @@ jobs:
           set -uo pipefail
           ./scripts/test-board-add-flags.sh
           ./scripts/test-amux-url.sh
+      # AEAB-22. Lives here, not in rust.yml, for the same reason as the other
+      # CLI/asset gates: rust.yml is path-filtered to `crates/**` + `Cargo.*` +
+      # `e2e/**`, and while app.js IS under crates/, this test also guards
+      # scripts/ and needs no Rust toolchain. It loads the SHIPPED functions out
+      # of app.js and runs them, so it fails if the linkifier is removed OR if a
+      # render path stops calling it — the second being the actual defect it was
+      # written for (the previous linkifier was perfect and had zero callers).
+      - name: SPA path linkifier (AEAB-22)
+        run: |
+          set -uo pipefail
+          node scripts/test-linkify-paths.mjs

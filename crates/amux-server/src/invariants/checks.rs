@@ -12,7 +12,7 @@
 //! this repo has shipped a green `if True:` fixture, a grep that could not
 //! match, and a spin-catcher that ranked sleeping threads, all of which "passed".
 
-use super::InvariantResult;
+use super::{InvariantResult, Status};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -875,6 +875,62 @@ pub fn installed_script_matches_committed(
 }
 
 // ---------------------------------------------------------------------------
+// 6c. Are session reports ATTRIBUTED? (AF-67)
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AF-67, 2026-08-16): 77% of all mutating requests in 24h carried no
+/// `X-Amux-Session`, dominated by `POST /api/sessions/<n>/report` -- 7,708 of
+/// them, from lanes still running the pre-AMUX-2936 inline hook. The attributed
+/// share was 0.0% in EVERY one of the last 12 hours across 40 lanes.
+///
+/// Nothing automated could see it. `autofix` reads only `status >= 500` from the
+/// request log, and a report POST is a 200; none of the 13 live invariants
+/// expressed attribution. The signal was in the store the whole time and the
+/// only reason it surfaced is that a human-triggered sweep happened to be named
+/// `unattributed-http`. That is ethos rule 4 exactly: a tag in a store the
+/// reader never opens is the same as no tag.
+///
+/// WHY THIS SIGNAL AND NOT "unattributed writes" GENERALLY: a rate needs a
+/// threshold, and a threshold below the baseline is not a detector (the
+/// spin-catcher lesson). Unattributed writes are legitimately non-zero forever
+/// -- the dashboard and the iPhone PWA have no session to declare. A session
+/// REPORT is different: it is emitted by `hook-report.sh`, which always sends
+/// the header, so the healthy value is structurally ZERO and no parameter has to
+/// be guessed. It also doubles as the AMUX-2936 uptake meter: as lanes recycle
+/// onto the new hook this falls on its own, and the breach clearing IS the
+/// remediation landing.
+pub fn reports_are_attributed(total: i64, unattributed: i64) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.reports_are_attributed";
+    // No reports at all is not health: it is the control plane being down, which
+    // `session.self_reports_landing` owns. Unknown here rather than a false pass.
+    if total <= 0 {
+        return vec![InvariantResult::unknown(
+            ID,
+            "no session reports in the window — see session.self_reports_landing",
+        )];
+    }
+    if unattributed == 0 {
+        return vec![InvariantResult::pass(ID)
+            .evidence(json!({"reports": total, "unattributed": 0}))];
+    }
+    let pct = 100.0 * unattributed as f64 / total as f64;
+    vec![InvariantResult::fail(
+        ID,
+        "every session report carries X-Amux-Session (hook-report.sh always sends it)",
+        format!(
+            "{unattributed} of {total} reports ({pct:.1}%) are UNATTRIBUTED — those lanes are \
+             running the pre-AMUX-2936 inline hook, which posts no header and no model/tokens. \
+             Hook config loads at SESSION START, so they cannot be fixed in place; they clear \
+             only as lanes restart. This falling to 0 is what AMUX-2936 being in effect looks like."
+        ),
+    )
+    .evidence(json!({
+        "reports": total, "unattributed": unattributed, "pct_unattributed": pct,
+        "card": "AF-67", "remedy": "lane restart picks up ~/.amux/hook-report.sh",
+    }))]
+}
+
+// ---------------------------------------------------------------------------
 // 6b. Are the report hooks WIRED to that script at all? (AMUX-2936)
 // ---------------------------------------------------------------------------
 
@@ -1193,6 +1249,110 @@ pub fn launch_matches_adapter(rows: &[ProviderLaunch]) -> Vec<InvariantResult> {
 }
 
 // ---------------------------------------------------------------------------
+// Fire-alarm reachability: the owner-alert channel must have a live destination.
+// ---------------------------------------------------------------------------
+
+/// The delivery state the owner-alert sender reads to decide where a page goes.
+/// The monitor fills this from the SAME config keys and the SAME
+/// `push_subscriptions` table the sender uses (`api::alerts`), so this check
+/// cannot disagree with the path it describes.
+#[derive(Debug, Clone)]
+pub struct AlertChannelState {
+    pub push_enabled: bool,
+    pub push_sub_count: usize,
+    pub sms_enabled: bool,
+    pub phone_configured: bool,
+    /// Email is the destination that needs no manual setup (AMUX-3203): a
+    /// connected Gmail account's own inbox reaches the owner. `email_reachable`
+    /// is true when AMUX_OWNER_EMAIL is set OR any Gmail account is connected.
+    pub email_enabled: bool,
+    pub email_reachable: bool,
+    /// `owner_alerts` rows written in the lookback window, and how many reached
+    /// zero channels. Corroboration, not the verdict: reachability decides
+    /// Pass/Fail, but a nonzero drop count turns "config looks unfinished" into
+    /// "N real pages were already lost".
+    pub recent_alerts: usize,
+    pub recent_zero_delivery: usize,
+}
+
+/// INCIDENT (AMUX-3203, measured 2026-08-16): both channels were ENABLED yet the
+/// owner-alert channel had no destination, 0 `push_subscriptions` and an empty
+/// `AMUX_OWNER_PHONE`, so `amux alert` reached nobody. The five most recent pages
+/// were a prod-down, a fleet-burn and two security holes, every one dropped
+/// silently, while 171 board cards waited on a decision that never escalated.
+///
+/// The per-alert WARN ("reached ZERO channels", AMUX-3151) fires only WHEN an
+/// alert is sent and lands in a log nobody tails, so a disconnected alarm sat
+/// load-bearing for weeks. This is the proactive leg: an alarm with no wire to a
+/// human is a CONTINUOUS health failure, visible in `/api/health/invariants`
+/// without waiting for the next dropped escalation.
+///
+/// INVARIANT: at least one owner-alert channel is enabled AND has a reachable
+/// destination (a registered push subscription, or a configured phone).
+///
+/// Connecting the destination is the owner's action (the push subscription is
+/// created when he grants the PWA notification permission; the phone is his to
+/// set), so this REPORTS, it never repairs (ethos rule 8). Both channels
+/// deliberately OFF is the owner's own choice to silence the alarm, so that is
+/// `Skipped`-with-reason rather than a failure of his config.
+pub fn alert_channel_can_deliver(s: &AlertChannelState) -> Vec<InvariantResult> {
+    const ID: &str = "alert.channel_can_deliver";
+    let push_state = match (s.push_enabled, s.push_sub_count) {
+        (false, _) => "disabled (AMUX_URGENT_PUSH=0)".to_string(),
+        (true, 0) => "enabled but 0 push subscriptions".to_string(),
+        (true, n) => format!("enabled, {n} subscription(s)"),
+    };
+    let sms_state = match (s.sms_enabled, s.phone_configured) {
+        (false, _) => "disabled (AMUX_URGENT_SMS=0)".to_string(),
+        (true, false) => "enabled but AMUX_OWNER_PHONE is empty".to_string(),
+        (true, true) => "enabled, phone configured".to_string(),
+    };
+    let email_state = match (s.email_enabled, s.email_reachable) {
+        (false, _) => "disabled (AMUX_URGENT_EMAIL=0)".to_string(),
+        (true, false) => "enabled but no connected Gmail account with a fresh token (a stale refresh_token fails invalid_grant, amux-cloud 2026-08-16)".to_string(),
+        (true, true) => "enabled, a connected Gmail account with a fresh token".to_string(),
+    };
+    let evidence = json!({
+        "class": "fire-alarm-reachability",
+        "push": push_state,
+        "sms": sms_state,
+        "email": email_state,
+        "push_sub_count": s.push_sub_count,
+        "recent_alerts_24h": s.recent_alerts,
+        "recent_zero_delivery_24h": s.recent_zero_delivery,
+        "incident": "AMUX-3203: 0 subs + empty phone dropped 5 serious pages \
+                     (prod-down, security x2) while 171 cards waited on the owner",
+        "fix": "email now reaches the owner with no setup (a connected Gmail \
+                account's own inbox). Or subscribe to push from the PWA, or set \
+                AMUX_OWNER_PHONE / AMUX_OWNER_EMAIL in ~/.amux/server.env",
+    });
+
+    // All channels off is the owner deliberately silencing the alarm. Report it,
+    // do not fail his choice.
+    if !s.push_enabled && !s.sms_enabled && !s.email_enabled {
+        let mut r = InvariantResult::new(ID, Status::Skipped).entity("owner-alert").evidence(evidence);
+        r.observed = "owner-alert is OFF by config (AMUX_URGENT_PUSH, _SMS and _EMAIL are all 0)".into();
+        return vec![r];
+    }
+
+    let push_ok = s.push_enabled && s.push_sub_count > 0;
+    let sms_ok = s.sms_enabled && s.phone_configured;
+    let email_ok = s.email_enabled && s.email_reachable;
+    if push_ok || sms_ok || email_ok {
+        return vec![InvariantResult::pass(ID).entity("owner-alert").evidence(evidence)];
+    }
+    // Armed but disconnected: at least one channel is enabled and none can reach a
+    // human. This is the incident state, and it is unambiguously broken, not a choice.
+    vec![InvariantResult::fail(
+        ID,
+        "owner-alert reaches a human: >=1 enabled channel with a destination",
+        format!("no reachable destination. push: {push_state}; sms: {sms_state}; email: {email_state}"),
+    )
+    .entity("owner-alert")
+    .evidence(evidence)]
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -1200,6 +1360,81 @@ pub fn launch_matches_adapter(rows: &[ProviderLaunch]) -> Vec<InvariantResult> {
 mod negative_controls {
     use super::*;
     use crate::invariants::Status;
+
+    /// AMUX-3203, rebuilt from the incident artifact: both channels ENABLED with
+    /// no destination (0 subs, empty phone) is the disconnected fire alarm that
+    /// dropped five serious pages while reading healthy. The check must FAIL on
+    /// that exact state and clear the moment ANY single destination appears; both
+    /// channels OFF is the owner's deliberate silence and must be Skipped, not
+    /// Failed (ethos rule 8).
+    #[test]
+    fn detects_the_fire_alarm_with_no_destination() {
+        // The incident state: every channel armed, none with a destination.
+        let incident = AlertChannelState {
+            push_enabled: true,
+            push_sub_count: 0,
+            sms_enabled: true,
+            phone_configured: false,
+            email_enabled: true,
+            email_reachable: false,
+            recent_alerts: 5,
+            recent_zero_delivery: 5,
+        };
+        let r = alert_channel_can_deliver(&incident);
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].status, Status::Fail, "disconnected alarm must fail: {:?}", r[0]);
+        assert!(r[0].observed.contains("no reachable destination"), "{:?}", r[0]);
+
+        // A push subscription alone clears it.
+        let with_push = AlertChannelState { push_sub_count: 1, ..incident.clone() };
+        assert_eq!(alert_channel_can_deliver(&with_push)[0].status, Status::Pass);
+
+        // A phone alone clears it.
+        let with_phone = AlertChannelState { phone_configured: true, ..incident.clone() };
+        assert_eq!(alert_channel_can_deliver(&with_phone)[0].status, Status::Pass);
+
+        // Email alone clears it — the no-setup destination (AMUX-3203). This is
+        // the case that goes green on the real machine, where a Gmail account is
+        // connected but push has 0 subs and no phone is set.
+        let with_email = AlertChannelState { email_reachable: true, ..incident.clone() };
+        assert_eq!(
+            alert_channel_can_deliver(&with_email)[0].status,
+            Status::Pass,
+            "a connected Gmail account is a reachable destination"
+        );
+
+        // One channel enabled+reachable, the OTHERS disabled, still passes.
+        let push_only = AlertChannelState {
+            push_enabled: true,
+            push_sub_count: 2,
+            sms_enabled: false,
+            phone_configured: false,
+            email_enabled: false,
+            email_reachable: false,
+            recent_alerts: 0,
+            recent_zero_delivery: 0,
+        };
+        assert_eq!(alert_channel_can_deliver(&push_only)[0].status, Status::Pass);
+
+        // Reachable destinations behind DISABLED channels do not count: with ALL
+        // three channels off the alarm is silenced by choice -> Skipped, never a
+        // cheerful Pass.
+        let all_off = AlertChannelState {
+            push_enabled: false,
+            push_sub_count: 5,
+            sms_enabled: false,
+            phone_configured: true,
+            email_enabled: false,
+            email_reachable: true,
+            recent_alerts: 0,
+            recent_zero_delivery: 0,
+        };
+        assert_eq!(
+            alert_channel_can_deliver(&all_off)[0].status,
+            Status::Skipped,
+            "all channels off is the owner's choice, reported not failed"
+        );
+    }
 
     /// AMUX-3153, rebuilt from the incident artifact: ollama's adapter builds
     /// `codex` (and advertises hooks), but the server launch arm still emits
@@ -1761,6 +1996,30 @@ mod negative_controls {
             "report-hook drift must name ITS OWN source, not the guard's: {}",
             rep_drift[0].observed
         );
+    }
+
+    /// AF-67. The healthy value is structurally ZERO, so this needs no tuned
+    /// threshold — which is the point of picking reports over "unattributed
+    /// writes" generally (those are legitimately non-zero forever: the dashboard
+    /// and the PWA have no session).
+    #[test]
+    fn an_unattributed_session_report_is_a_failure_and_zero_is_a_pass() {
+        // The live specimen: 0 of 1,652 attributed across 12h (AF-67).
+        let bad = reports_are_attributed(1652, 1652);
+        assert_eq!(bad[0].status, Status::Fail, "100% unattributed must fail: {bad:?}");
+        assert!(bad[0].observed.contains("100.0%"), "{}", bad[0].observed);
+        assert!(bad[0].observed.contains("SESSION START"), "must name why it cannot be fixed live");
+
+        // A partially-recycled fleet still fails, so the breach tracks uptake
+        // rather than flipping only at the very end.
+        assert_eq!(reports_are_attributed(100, 3)[0].status, Status::Fail);
+
+        // Full uptake passes — this clearing IS AMUX-2936 landing.
+        let good = reports_are_attributed(100, 0);
+        assert_eq!(good[0].status, Status::Pass, "zero unattributed must pass: {good:?}");
+
+        // No reports at all is the control plane being DOWN, not health.
+        assert_eq!(reports_are_attributed(0, 0)[0].status, Status::Unknown);
     }
 
     fn ent(event: &str, command: &str, matcher: Option<&str>) -> ReportHookEntry {

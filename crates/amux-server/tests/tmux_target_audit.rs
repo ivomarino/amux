@@ -62,6 +62,25 @@ fn offenders() -> Vec<String> {
         while let Some(rel) = src[from..].find("\"-t\"") {
             let at = from + rel;
             from = at + 4;
+            // Skip a `-t` that belongs to a NON-tmux external command in the
+            // SAME statement — e.g. `Command::new("touch").args(["-t", stamp,…])`
+            // setting a file mtime in a #[cfg(test)] module (email.rs:1330).
+            // Only tmux's -t names a session/pane; `touch -t` is a timestamp.
+            // Real tmux -t calls go through the tmux()/self.run() helpers and
+            // carry no Command::new in the statement, so they are unaffected;
+            // a literal `Command::new("tmux")` is still audited (name == tmux).
+            let before = &src[..at];
+            let stmt_start = before
+                .rfind([';', '{', '}'])
+                .map(|i| i + 1)
+                .unwrap_or(0);
+            if let Some(cn) = before[stmt_start..].rfind("Command::new(") {
+                let after = &before[stmt_start + cn + "Command::new(".len()..];
+                let name = after.trim_start().strip_prefix('"').and_then(|s| s.split('"').next());
+                if matches!(name, Some(n) if n != "tmux") {
+                    continue;
+                }
+            }
             // Skip the separator after the literal, then take the argument up
             // to the next `,` / `]` / `)` at this nesting level.
             let rest = &src[from..];

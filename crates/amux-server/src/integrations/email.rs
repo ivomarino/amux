@@ -527,6 +527,45 @@ pub fn connected_accounts_in(home: &Path) -> Vec<String> {
     out
 }
 
+/// Connected accounts ordered NEWEST-TOKEN-FIRST (AMUX-3203 / amux-cloud incident
+/// 2026-08-16). The alert email channel used `connected_accounts_in` (alphabetical)
+/// and blindly picked the FIRST account, whose refresh_token was dead
+/// (`invalid_grant`), while a healthy account existed. A refreshed token rewrites
+/// its file, so ordering by token-file mtime puts the account most likely to have a
+/// LIVE token first, and the fire alarm tries a working sender before a stale one.
+/// Accounts whose mtime is unreadable sort last (treated as oldest).
+pub fn connected_accounts_by_freshness_in(home: &Path) -> Vec<String> {
+    let dir = home.join("gmail-tokens");
+    let Ok(rd) = std::fs::read_dir(&dir) else { return Vec::new() };
+    let mut out: Vec<(std::time::SystemTime, String)> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("json") {
+                return None;
+            }
+            let stem = p.file_stem()?.to_str()?.to_string();
+            let mtime = p.metadata().ok().and_then(|m| m.modified().ok());
+            Some((mtime.unwrap_or(std::time::UNIX_EPOCH), stem))
+        })
+        .collect();
+    // Newest first; ties broken by name so the order is deterministic in tests.
+    out.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    out.into_iter().map(|(_, s)| s).collect()
+}
+
+/// Age in seconds of the FRESHEST connected-account token file (None if there are
+/// no accounts). The alert invariant uses this: a fleet whose newest Gmail token
+/// has not refreshed in a long time is one whose alert email is at real risk of
+/// `invalid_grant` (the amux-cloud incident), so "a connected account exists" is
+/// not enough to call email deliverable. `now` is passed for testability.
+pub fn newest_token_age_secs_in(home: &Path, now: std::time::SystemTime) -> Option<u64> {
+    let acct = connected_accounts_by_freshness_in(home).into_iter().next()?;
+    let p = home.join("gmail-tokens").join(format!("{acct}.json"));
+    let mtime = p.metadata().ok()?.modified().ok()?;
+    now.duration_since(mtime).ok().map(|d| d.as_secs())
+}
+
 #[derive(Debug, Clone, Default)]
 struct TokenFile {
     token: Option<String>,
@@ -1271,6 +1310,44 @@ pub fn read_email_log(home: &Path, days: i64, limit: usize, session_filter: &str
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-3203 / amux-cloud 2026-08-16: the alert email picked the FIRST-
+    /// ALPHABETICAL account, whose refresh_token was dead, while a fresh account
+    /// existed, so a live cloud outage paged nobody. Freshness ordering must put
+    /// the newest-token account first and, crucially, must NOT pick the first-
+    /// alphabetical account when that is the stale one.
+    #[test]
+    fn accounts_by_freshness_prefers_the_newest_token_over_first_alphabetical() {
+        let dir = tempfile::tempdir().unwrap();
+        let tok = dir.path().join("gmail-tokens");
+        std::fs::create_dir_all(&tok).unwrap();
+        for a in ["esteininger21@gmail.com", "ethan@mixpeek.com", "info@mixpeek.com"] {
+            std::fs::write(tok.join(format!("{a}.json")), "{}").unwrap();
+        }
+        // touch -t [[CC]YY]MMDDhhmm: esteininger21 stale (Jul), ethan newest (Aug 16).
+        let set = |name: &str, stamp: &str| {
+            std::process::Command::new("touch")
+                .args(["-t", stamp, tok.join(format!("{name}.json")).to_str().unwrap()])
+                .status()
+                .unwrap();
+        };
+        set("esteininger21@gmail.com", "202607160000");
+        set("info@mixpeek.com", "202608150000");
+        set("ethan@mixpeek.com", "202608161200");
+
+        let order = connected_accounts_by_freshness_in(dir.path());
+        assert_eq!(order.first().map(String::as_str), Some("ethan@mixpeek.com"), "newest first: {order:?}");
+        assert_eq!(order.last().map(String::as_str), Some("esteininger21@gmail.com"), "stale last: {order:?}");
+        // The incident, made explicit: first-alphabetical IS the dead account, and
+        // freshness ordering must not pick it.
+        let mut alpha = order.clone();
+        alpha.sort();
+        assert_eq!(alpha.first().map(String::as_str), Some("esteininger21@gmail.com"));
+        assert_ne!(order.first(), alpha.first(), "freshness must not pick the dead first-alphabetical account");
+
+        // Age helper: None with no accounts, small for a just-written token.
+        assert_eq!(newest_token_age_secs_in(&dir.path().join("nope"), std::time::SystemTime::now()), None);
+    }
 
     #[test]
     fn base64_vectors() {

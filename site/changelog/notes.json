@@ -1,5 +1,80 @@
 [
   {
+    "sha": "9f41809",
+    "short": "9f41809",
+    "date": "2026-08-17",
+    "type": "feat",
+    "title": "Computed files (.mdai) — define a knowledge DAG where agents produce outputs other agents consume automatically",
+    "tags": ["files", "agents", "knowledge-graph"],
+    "description": "A new .mdai file type introduces computed-file nodes with a DAG resolver, cache, and history. Define dependencies between files so that when one agent produces output, downstream agents automatically see the fresh result. The client UI adds a dedicated tab, node overlay, and connect controls. Combine with coding agents to build multi-step knowledge pipelines that run unattended."
+  },
+  {
+    "sha": "8b802e1",
+    "short": "8b802e1",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "Files tab now works like an OS file manager — browse, preview, and edit any project file from your browser or phone",
+    "tags": ["files", "dashboard", "mobile"],
+    "description": "The Files tab gained a full OS file-manager UX: directory tree, inline preview, and edit-in-place for text and code files. You can now browse your project, read agent-produced artifacts, and make quick edits without leaving the dashboard. Works at phone width so you can review and tweak files from your iOS app on the go."
+  },
+  {
+    "sha": "98402af",
+    "short": "98402af",
+    "date": "2026-08-17",
+    "type": "feat",
+    "title": "Codex and Ollama agent transcripts now render with the same Claude-style layout in the peek panel",
+    "tags": ["peek", "codex", "ollama"],
+    "description": "The peek panel now renders Codex and Ollama (qwen) session transcripts using the same structured message layout as Claude Code sessions. Tool calls, thinking blocks, and assistant turns are highlighted and collapsible. Easier to see what a local Codex or Ollama worker did overnight without parsing raw terminal output."
+  },
+  {
+    "sha": "6a2d0bc",
+    "short": "6a2d0bc",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "OPEN worker peek stays live — the expanded session view refreshes in place without collapsing back",
+    "tags": ["peek", "dashboard", "ux"],
+    "description": "When you open a worker's peek panel to watch it run, the view now stays live and updates in place. Previously, new activity would collapse the open view back to the summary row. Now you can keep a worker expanded and watch its transcript update in real time — useful for monitoring a long-running overnight task."
+  },
+  {
+    "sha": "cb5724e",
+    "short": "cb5724e",
+    "date": "2026-08-16",
+    "type": "fix",
+    "title": "Disk gauge now reports the actual data volume — was measuring the sealed read-only system volume on macOS",
+    "tags": ["metrics", "macos", "fix"],
+    "description": "The disk usage gauge in the dashboard was measuring the sealed APFS system volume on macOS, which is always nearly full, instead of the Macintosh HD data volume where your project files and model weights live. The gauge now shows accurate free space on the data volume — relevant when running large local models or accumulating agent output."
+  },
+  {
+    "sha": "1678a5b",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "Owner alerts fire via email and iMessage — critical agent events reach you without any manual setup"
+  },
+  {
+    "sha": "ec08a71",
+    "date": "2026-08-16",
+    "type": "fix",
+    "title": "Browser automation reconnects to an existing Chrome session before launching a new one"
+  },
+  {
+    "sha": "c6bd42b",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "Health invariant alert.channel_can_deliver — a disconnected owner-alert channel now shows red in the dashboard"
+  },
+  {
+    "sha": "6ebef13",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "Codex, Ollama, and Gemini CLI agents now load your amux rules automatically via AGENTS.md and GEMINI.md symlinks"
+  },
+  {
+    "sha": "2b00af8",
+    "date": "2026-08-16",
+    "type": "feat",
+    "title": "New CLI command: amux board show <ID> — inspect any board card from the terminal without opening the browser"
+  },
+  {
     "sha": "ec031ce",
     "date": "2026-08-15",
     "type": "feat",

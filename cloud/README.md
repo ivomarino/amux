@@ -228,6 +228,14 @@ and every endpoint they call is routed on the rust server (checked against
 * **`tests/godmode_walkthrough.py`** — signs in as an admin and collects evidence
   per customer org. It prints and does not conclude, on purpose: the `verified`
   gate is a human reading the evidence.
+* **`tests/e2e_personas.py`** — the assertive twin of `godmode_walkthrough`: signs
+  in as a user and turns every observation into PASS/FAIL, per environment and per
+  persona (a persona = a preconfigured worker role). Data-driven from `plans/*.json`.
+  The first assertion (environment reachable) is the outage detector this suite was
+  written for after the 2026-08-16 disk-full incident — a scheduled run goes red the
+  moment cloud.amux.io 502s. Read-only on real-customer orgs; the active reply probe
+  (`--send-probe`) is opt-in and refused for anything that is not a demo. Exits
+  non-zero on any failure so a scheduler can gate on it; `--json` for a summary.
 
 `gateway.py` stays python for the same reason: it is a host process that never
 runs customer code, and rewriting it was not part of the server cutover.

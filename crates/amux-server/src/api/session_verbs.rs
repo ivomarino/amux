@@ -930,6 +930,28 @@ pub(crate) fn is_rate_limit_menu(raw: &str) -> bool {
         && clean.contains("switch to usage credits")
 }
 
+/// Claude's "you have hit your usage limit, continuing on usage credits" BANNER.
+/// This is the state Ethan sees ("workers with a rate limit") that the menu misses:
+/// a lane past the menu, still working but ON CREDITS (2026-08-16, general-canvas-
+/// apps / backend / sherpa showed it while amux's menu-only detection reported 0).
+///
+/// Reliability rests on two things, and the caller MUST honour the first. First,
+/// the caller passes ONLY THE FOOTER (the last ~8 lines of the live frame, the
+/// Claude status region above the input box), never the whole pane: the earlier
+/// whole-pane scrape flagged `amux` for CODING the banner strings, because that
+/// code sits in scrollback (ethos rule 7, content-vs-state), and Claude renders
+/// this banner one line above the spinner, so footer-scoping excludes scrollback.
+/// Second, it matches Claude's FULL user-facing SENTENCE, not the bare words, and
+/// a lane discussing usage credits does not emit that exact sentence as a footer
+/// line. Validated live across all 47 running lanes: flags exactly the 3 on-credits
+/// lanes and leaves amux (mid-edit on this very code) clean.
+pub(crate) fn is_rate_limited_credit_banner(footer: &str) -> bool {
+    // Claude uses a curly apostrophe in "you're"; normalise before matching.
+    let clean = strip_ansi(footer).to_lowercase().replace('\u{2019}', "'");
+    clean.contains("usage-credits to finish what you're working on")
+        || clean.contains("reached your usage limit and")
+}
+
 /// The policy for what amux does with a rate-limit menu (ethos D2).
 ///
 /// `wait` (default) presses 1. `off` leaves the menu for a human and reports it.
@@ -1496,6 +1518,124 @@ pub(crate) fn session_jsonl_path(name: &str) -> Option<PathBuf> {
     } else {
         None
     }
+}
+
+/// All `rollout-*.jsonl` files under `~/.codex/sessions`, newest first.
+/// Codex nests them `YYYY/MM/DD/`; the walk is depth-bounded (3) so it cannot
+/// wander, and `session_jsonl_path`'s "newest mtime wins" discipline is applied
+/// the same way here.
+fn codex_rollout_files() -> Vec<(std::time::SystemTime, PathBuf)> {
+    // Codex writes to the OS home (`~/.codex`), NOT amux's `home()` (`~/.amux`);
+    // the two differ and the first cut pointed at `~/.amux/.codex`, so every
+    // resolution missed, which the debug trace in `codex_transcript_events`
+    // surfaced immediately (ethos rule 4). Same `$HOME`-based path shape as
+    // `claude_home()`.
+    let root = PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".codex/sessions");
+    let mut out: Vec<(std::time::SystemTime, PathBuf)> = Vec::new();
+    fn walk(dir: &Path, depth: usize, out: &mut Vec<(std::time::SystemTime, PathBuf)>) {
+        if depth > 3 {
+            return;
+        }
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, depth + 1, out);
+            } else if p
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.starts_with("rollout-") && s.ends_with(".jsonl"))
+                .unwrap_or(false)
+            {
+                if let Some(t) = p.metadata().ok().and_then(|m| m.modified().ok()) {
+                    out.push((t, p));
+                }
+            }
+        }
+    }
+    walk(&root, 0, &mut out);
+    out.sort_by_key(|e| std::cmp::Reverse(e.0));
+    out
+}
+
+/// The `cwd` a rollout was recorded in, read from its first line
+/// (`session_meta`), so this stats one small read per candidate, not the whole
+/// file.
+fn rollout_cwd(path: &Path) -> Option<String> {
+    let Ok(f) = std::fs::File::open(path) else { return None };
+    let mut reader = std::io::BufReader::new(f);
+    let mut line = String::new();
+    use std::io::BufRead;
+    reader.read_line(&mut line).ok()?;
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("session_meta") {
+        return None;
+    }
+    v.pointer("/payload/cwd")
+        .and_then(|c| c.as_str())
+        .map(str::to_string)
+}
+
+/// Map a codex/ollama worker to its live Codex rollout file. Mirrors
+/// `session_jsonl_path`'s resolution order: a recorded session-id claim first
+/// (deterministic: the id is the filename UUID), then the worker's `CC_DIR`
+/// cwd with newest mtime winning. `None` when nothing matches, which makes the
+/// caller fall back to the raw terminal (never a wrong transcript).
+pub(crate) fn codex_rollout_path(name: &str) -> Option<PathBuf> {
+    let cfg = parse_env(name);
+    let wd = cfg.get_or("CC_DIR", "").trim().to_string();
+    let sid = meta_str(&load_meta(name), "codex_session_id");
+    let files = codex_rollout_files();
+    if files.is_empty() {
+        return None;
+    }
+    // 1. session-id claim: the id is embedded in the filename, so this is a
+    //    string match, no file read.
+    if !sid.is_empty() {
+        if let Some((_, p)) = files.iter().find(|(_, p)| {
+            p.file_name().and_then(|s| s.to_str()).map(|s| s.contains(&sid)).unwrap_or(false)
+        }) {
+            return Some(p.clone());
+        }
+    }
+    // 2. cwd match, newest first. Bounded to the most recent candidates so a
+    //    years-deep history never turns one tab-open into thousands of reads.
+    if !wd.is_empty() {
+        for (_, p) in files.iter().take(80) {
+            if rollout_cwd(p).as_deref() == Some(wd.as_str()) {
+                return Some(p.clone());
+            }
+        }
+    }
+    None
+}
+
+/// A codex/ollama worker's transcript as the uniform [`TranscriptEvent`] model
+/// (AMUX-3201 slice 1). Reads a bounded tail of the rollout so a long session
+/// stays cheap, parses it via the shared `opencode::events` projection, and
+/// keeps the last `max_events` so the client renders the live end of the
+/// conversation, not megabytes of history.
+fn codex_transcript_events(
+    name: &str,
+    max_events: usize,
+) -> Option<Vec<crate::opencode::events::TranscriptEvent>> {
+    let Some(path) = codex_rollout_path(name) else {
+        // Self-announcing (ethos rule 4): a codex/ollama worker whose rollout
+        // can't be resolved returns an EMPTY transcript that looks identical to
+        // "the worker hasn't spoken yet". Trace it so "why is my codex
+        // transcript blank" is answerable from ~/.amux/logs, not a guess.
+        tracing::debug!(
+            session = %name,
+            "codex/ollama transcript: no rollout file resolved (cwd/session-id miss); peek falls back to raw terminal"
+        );
+        return None;
+    };
+    let lines = iter_jsonl_tail(&path, 4_000_000);
+    let mut evs = crate::opencode::events::codex_rollout_transcript(&lines);
+    if evs.len() > max_events {
+        evs = evs.split_off(evs.len() - max_events);
+    }
+    Some(evs)
 }
 
 // ---------------------------------------------------------------------------
@@ -2721,7 +2861,11 @@ pub(crate) async fn cmd_hist_record_full(
     // consequence (CLAUDE.md: hang the consequence off the write that happened).
     // Gated on ctype=="user": inter-session ("session") and scheduler ("schedule")
     // messages are not the recipient's task and must not spam the board.
-    if is_user && !skip_board {
+    // ISOLATED (AMUX-3232): a raw agent leaves no board trace; its prompts are
+    // not auto-captured as ledger cards. It has no session/URL to run `amux
+    // board`, so a card minted here would name work nobody can drive, and the
+    // accountability sweep is likewise told to skip it.
+    if is_user && !skip_board && !session_is_isolated(&cap_session) {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -4255,11 +4399,11 @@ async fn send_text_inner(
             )
             .await;
             if ok {
-                // The menu is gone; this send is no longer facing a selector.
-                // Clear the stamp in the SAME breath — a `credit_limited` that
-                // is set and never cleared is the mirror of one that is never
-                // set, and it would leave the fleet view permanently red.
-                update_meta(name, &[("rate_limited_since", json!(0))]);
+                // The menu is gone, but the lane is blocked until the limit resets.
+                // Do NOT clear the stamp here: the rate_limit_sweep clears it when
+                // the lane RESUMES generating (its own activity), so the status
+                // persists for the blocked window without any banner-word scrape.
+                // Only unblock this send.
                 waiting = false;
             }
         }
@@ -4680,16 +4824,21 @@ fn build_claude_cmd(cfg: &EnvFile, flags: &str, default_flags: &str, session_fla
     if !extra_flags.is_empty() {
         cmd = format!("{cmd} {}", shell_quote_flags(extra_flags));
     }
-    let mcp_val = cfg.get_or("CC_MCP", "").trim().to_lowercase();
-    if !matches!(mcp_val.as_str(), "off" | "none" | "0") {
-        if let Some(reg) = mcp_registry_path() {
-            cmd = format!("{cmd} --mcp-config {}", sh_quote(&reg.to_string_lossy()));
+    // ISOLATED (AMUX-3232): a raw agent gets no MCP servers injected. The
+    // whole harness is stripped, and `--mcp-config` is part of it. Guarded on
+    // the worker's own env, the same map CC_MCP itself lives in.
+    if !env_flag_on(cfg.get("CC_ISOLATED")) {
+        let mcp_val = cfg.get_or("CC_MCP", "").trim().to_lowercase();
+        if !matches!(mcp_val.as_str(), "off" | "none" | "0") {
+            if let Some(reg) = mcp_registry_path() {
+                cmd = format!("{cmd} --mcp-config {}", sh_quote(&reg.to_string_lossy()));
+            }
         }
-    }
-    if mcp_val == "chrome" {
-        let chrome = home().join("mcp-chrome.json");
-        if chrome.exists() {
-            cmd = format!("{cmd} --mcp-config {}", sh_quote(&chrome.to_string_lossy()));
+        if mcp_val == "chrome" {
+            let chrome = home().join("mcp-chrome.json");
+            if chrome.exists() {
+                cmd = format!("{cmd} --mcp-config {}", sh_quote(&chrome.to_string_lossy()));
+            }
         }
     }
     if !cmd.contains("--model") {
@@ -4878,6 +5027,11 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         return (false, format!("session '{name}' not found"));
     }
     let cfg = parse_env(name);
+    // ISOLATED (AMUX-3232): computed once here from the worker's own env so the
+    // spawn path can strip the harness (env injection below, --mcp-config in
+    // build_claude_cmd). Read from cfg, the same map every other CC_* flag on
+    // this launch uses.
+    let isolated = env_flag_on(cfg.get("CC_ISOLATED"));
     if !iterm2_id(&cfg).is_empty() {
         return (false, "iTerm2-backed sessions are not supported by the rust origin yet".into());
     }
@@ -5252,16 +5406,36 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
             "new-session".into(), "-d".into(), "-s".into(), tmux_sess.clone(),
             "-n".into(), name.into(), "-c".into(), work_dir.clone(),
             "-x".into(), cols, "-y".into(), rows,
-            "-e".into(), format!("TMUX_SESSION_NAME={name}"),
-            "-e".into(), format!("AMUX_WORKER={name}"),
-            "-e".into(), format!("AMUX_SESSION={name}"),
-            // The port THIS server answers on, never a literal: a new lane must
-            // reach the server that started it. The old hardcoded 8822 outlived
-            // its own deployment — it kept minting the retired address into
-            // every new session locally, and it forced the cloud image to bind
-            // 8822 to match (cloud/docker/Dockerfile named this line).
-            "-e".into(), format!("AMUX_URL={scheme}://localhost:{}", crate::config::canonical_port()),
         ];
+        // ISOLATED (AMUX-3232): a raw agent is "just tmux plus Claude Code". The
+        // amux harness reaches a lane through these four env vars. AMUX_SESSION
+        // and AMUX_URL are what the global Claude Code hooks
+        // (Stop/UserPromptSubmit/PostToolUse self-report) and every `amux`
+        // command key on, so NOT injecting them is the root-cause suppression:
+        // the hooks no-op, board attribution has no session to name, and the
+        // session cannot discover the fleet. The OWNER still peeks/sends because
+        // amux drives the pane with send-keys + capture from OUTSIDE, which needs
+        // nothing set inside the session. Suppressing at the injection point (not
+        // downstream) is why a better model does not route around it.
+        if isolated {
+            tracing::info!(
+                session = %name,
+                "spawn: ISOLATED worker, amux harness suppressed (no AMUX_SESSION/AMUX_URL/AMUX_WORKER env, no --mcp-config); owner peek/send still work, peers cannot discover or target it"
+            );
+        } else {
+            args.extend([
+                "-e".into(), format!("TMUX_SESSION_NAME={name}"),
+                "-e".into(), format!("AMUX_WORKER={name}"),
+                "-e".into(), format!("AMUX_SESSION={name}"),
+                // The port THIS server answers on, never a literal: a new lane
+                // must reach the server that started it. The old hardcoded 8822
+                // outlived its own deployment: it kept minting the retired
+                // address into every new session locally, and it forced the
+                // cloud image to bind 8822 to match (cloud/docker/Dockerfile
+                // named this line).
+                "-e".into(), format!("AMUX_URL={scheme}://localhost:{}", crate::config::canonical_port()),
+            ]);
+        }
         args.extend(env_args.iter().cloned());
         args.push(user_shell());
         let args_ref: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -6637,6 +6811,12 @@ fn fleet_roster() -> String {
             if env.get("CC_ARCHIVED").map(|v| v == "1").unwrap_or(false) {
                 continue;
             }
+            // ISOLATED (AMUX-3232): a raw agent is undiscoverable to peers, so it
+            // never appears in the fleet roster written into every OTHER worker's
+            // shared memory table. Same skip as archived.
+            if env_flag_on(env.get("CC_ISOLATED").map(String::as_str)) {
+                continue;
+            }
             let groups = env
                 .get("CC_TAGS")
                 .map(|t| {
@@ -7997,6 +8177,12 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         if cfg.get("CC_ARCHIVED") == Some("1") {
             continue;
         }
+        // ISOLATED (AMUX-3232): a raw agent gets no status scrape and no
+        // rate-limit auto-answer. amux does not press keys into a lane whose
+        // whole point is to run untouched. Same skip as archived.
+        if env_flag_on(cfg.get("CC_ISOLATED")) {
+            continue;
+        }
         if !is_running(name).await {
             continue;
         }
@@ -8097,9 +8283,32 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             }
         }
 
-        if !is_rate_limit_menu(&pane) {
-            // Recovered on its own (or was never limited): clear a stale stamp
-            // so the fleet view does not stay red after the fact.
+        // ONLY the interactive rate-limit MENU is a reliable state signal. A
+        // banner-word scrape ("your usage limit", "/usage-credits") cannot tell
+        // Claude's OWN banner from a lane merely DISCUSSING or CODING a rate limit
+        // in its work, and it false-flagged working lanes including `amux` itself
+        // (Ethan, 2026-08-16). The menu is a selector amux renders and answers, so
+        // it cannot be conversation. Persisting the status past the menu needs a
+        // reliable signal amux does not have by scraping (a reset time, or a Claude
+        // Code hook reporting rate-limit state, the D2 exit) — not a fuzzy banner.
+        // LIMITED = the interactive menu OR Claude's on-credits BANNER in the
+        // FOOTER (the status region above the input box). The menu is transient
+        // (amux answers it); the credit banner is the persistent state Ethan sees
+        // as "workers with a rate limit" — a lane past the menu, still working ON
+        // CREDITS. Footer-scoped + full-sentence so a lane CODING the banner (amux
+        // itself) is not flagged; the earlier whole-pane scrape was the false
+        // positive. pane = tmux_capture(name, 30) ends at the current footer, so
+        // its last 8 lines ARE the footer.
+        let menu = is_rate_limit_menu(&pane);
+        let footer = {
+            let ls: Vec<&str> = pane.lines().collect();
+            ls[ls.len().saturating_sub(8)..].join("\n")
+        };
+        let limited = menu || is_rate_limited_credit_banner(&footer);
+        if !limited {
+            // Neither the menu nor the credit banner is on screen: clear the stamp.
+            // Presence-based, and both signals are footer/menu-scoped, so scrollback
+            // ABOUT limits never flags and a lane clears as soon as its banner goes.
             if meta_i64(&load_meta(name), "rate_limited_since") > 0 {
                 update_meta(name, &[("rate_limited_since", json!(0))]);
             }
@@ -8118,18 +8327,18 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 state,
                 name,
                 "session.rate_limited",
-                Some(json!({"detected_by": "sweep"})),
+                Some(json!({"detected_by": if menu { "menu" } else { "credit-banner" }})),
                 Some(format!("rl:{name}:{}", now_i64() / 3600)),
                 "rate-limit",
             )
             .await;
         }
-        if rate_limit_action() != "off" {
+        // Answer ONLY the interactive menu (a banner has no selector, and a stray
+        // Enter into a working lane injects a newline). The presence-based clear
+        // above handles everything else.
+        if menu && rate_limit_action() != "off" {
             let (ok, msg) = send_keys_op(name, "Enter").await;
             tracing::warn!(session = %name, ok, detail = %msg, "swept a rate-limit menu — answered 'stop and wait'");
-            if ok {
-                update_meta(name, &[("rate_limited_since", json!(0))]);
-            }
         }
     }
     found
@@ -8572,12 +8781,31 @@ async fn get_dispatch(
             j200(peek_response(name, lines, live_only, no_trim).await)
         }
         "transcript" => {
+            // Codex/Ollama run a native TUI whose raw mirror is what Ethan saw
+            // looked nothing like Claude (AMUX-3201). They also write a
+            // structured rollout to disk, so return that as the uniform
+            // TranscriptEvent model and let the client render it Claude-like;
+            // Claude keeps its ANSI `output`. A worker whose rollout can't be
+            // resolved falls through to ANSI (empty for non-Claude), so the tab
+            // degrades to a message rather than a wrong transcript.
+            let provider = provider_of(&parse_env(name));
+            if matches!(provider.as_str(), "codex" | "ollama") {
+                let evs = codex_transcript_events(name, 400).unwrap_or_default();
+                let empty = evs.is_empty();
+                return j200(json!({
+                    "name": name,
+                    "provider": provider,
+                    "events": evs,
+                    "empty": empty,
+                    "source": "codex-rollout",
+                }));
+            }
             let mx: usize = qs_first(qs, "max", "40000").parse().unwrap_or(40000);
             let txt = render_session_transcript(name, mx);
             if txt.is_empty() {
-                j200(json!({"name": name, "output": "", "empty": true}))
+                j200(json!({"name": name, "provider": provider, "output": "", "empty": true}))
             } else {
-                j200(json!({"name": name, "output": txt, "source": "transcript"}))
+                j200(json!({"name": name, "provider": provider, "output": txt, "source": "transcript"}))
             }
         }
         // The worker's most recent full assistant message, clean — what the
@@ -9858,6 +10086,29 @@ pub(crate) fn templates_dir() -> Option<PathBuf> {
 // Group scoping for worker-to-worker sends (Ethan, 2026-08-11)
 // ---------------------------------------------------------------------------
 
+/// Whether a per-worker env value is switched ON (`1`/`true`/`yes`, quotes and
+/// case ignored). The one spelling every boolean CC_* flag is read through here.
+pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
+    matches!(
+        v.map(|s| s.trim().trim_matches('"').to_lowercase()).as_deref(),
+        Some("1") | Some("true") | Some("yes")
+    )
+}
+
+/// Whether a worker runs "isolated" (AMUX-3232): a RAW agent (tmux + the
+/// underlying CLI) with the amux harness stripped, and undiscoverable to peers.
+///
+/// The flag is the per-worker env key `CC_ISOLATED`, the SAME environment
+/// primitive that already holds `CC_MCP` / `CC_TAGS` / `CC_ARCHIVED`, so it
+/// persists across reload and applies at the next spawn with no new store to
+/// keep in step (deliberately not a second spelling in a SQLite column). This
+/// function is the single source of truth every isolation decision consults:
+/// spawn-env suppression, `--mcp-config`, board auto-capture, the peer fleet
+/// list, the fleet roster, the peer-send guard, and the status/rate-limit sweep.
+pub(crate) fn session_is_isolated(name: &str) -> bool {
+    env_flag_on(parse_env(name).get("CC_ISOLATED"))
+}
+
 /// A lane's groups, from `CC_TAGS` in its env file.
 pub(crate) fn lane_groups(lane: &str) -> std::collections::BTreeSet<String> {
     parse_env(lane)
@@ -9923,6 +10174,19 @@ fn dirs_home() -> Option<std::path::PathBuf> {
 fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, String> {
     if origin.is_empty() || origin == target {
         return Ok("self-or-human");
+    }
+    // ISOLATED TARGET (AMUX-3232): a raw agent is not a peer/relay target. The
+    // OWNER (empty origin) already returned above, so this refuses ONLY a PEER
+    // send; owner peek/send from the dashboard is untouched. The refusal names
+    // "isolated" so a sweep of the request log / send.cross_group_refused events
+    // can find it (the two-fixes rule: the exclusion is greppable, not silent).
+    if session_is_isolated(target) {
+        return Err(format!(
+            "send refused: '{target}' is an isolated (raw-agent) worker with the amux harness \
+             stripped. It is not a peer or relay target and is reachable only by the owner from \
+             the dashboard. This applies only to sends carrying a worker origin; a human send is \
+             never restricted."
+        ));
     }
     let (og, tg) = (lane_groups(origin), lane_groups(target));
     if !og.is_disjoint(&tg) {
@@ -10615,6 +10879,9 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
             // ABSENT != EMPTY above): the model does not change per tool call.
             let prev_model = reports[&name_s]["model"].clone();
             let prev_tokens = reports[&name_s]["tokens"].clone();
+            // Did the STATUS actually change? Only then is an SSE push worth it.
+            let status_changed = prev_state != st2;
+            let new_state = st2.clone();
             reports[&name_s] = json!({
                 "model": model_opt.clone().map(Value::from).unwrap_or(prev_model),
                 "tokens": tokens_opt.clone().unwrap_or(prev_tokens),
@@ -10626,7 +10893,26 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                  ON CONFLICT(key) DO UPDATE SET value=?1",
                 [reports.to_string()],
             )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            // SNAPPY STATUS (Ethan, 2026-08-16). A self-report is the fast, exact
+            // signal for active/idle/needs-input (the D1 exit), but this write used
+            // events:vec![], so a hook state change pushed NO SSE and the dashboard
+            // only caught it on the next 15s scan or a poll. Emit a Session event on
+            // a real status change so the SSE sessions push fires immediately; the
+            // scan stays the fallback for hookless lanes.
+            let events = if status_changed {
+                vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Session,
+                    entity_id: name_s.clone(),
+                    mutation: amux_core::revision::MutationKind::StatusChanged {
+                        from: prev_state,
+                        to: new_state,
+                    },
+                    payload: None,
+                }]
+            } else {
+                vec![]
+            };
+            Ok(crate::db::WriteOutcome { applied: true, events })
         })
         .await;
     match reply {
@@ -11867,6 +12153,38 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         return j200(json!({"ok": true, "message": "pin toggled"}));
     }
 
+    // Isolated (raw agent, no amux harness), AMUX-3232. Persisted as the env
+    // key CC_ISOLATED (the environment primitive, not a new store), so it
+    // survives reload and is read on the NEXT spawn: the harness (AMUX_SESSION /
+    // AMUX_URL env, the self-report hooks that key on them, --mcp-config) is not
+    // injected, and the worker becomes undiscoverable to peers (fleet list,
+    // roster, peer-send guard). The owner still controls it from the dashboard.
+    // Explicit boolean rather than a toggle, so the UI switch is idempotent.
+    if let Some(iv) = body.get("isolated") {
+        let on = py_truthy(iv);
+        cfg.set("CC_ISOLATED", if on { "1" } else { "" });
+        if cfg.write(&f).is_err() {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        }
+        // The roster peers read is fleet-wide data; toggling isolation adds or
+        // removes this worker from it, so refresh like desc/tags do.
+        let refreshed = refresh_fleet_rosters();
+        tracing::info!(
+            session = %name, isolated = on,
+            "config: isolated toggled; harness suppression + peer-undiscoverable apply at next spawn"
+        );
+        return j200(json!({
+            "ok": true,
+            "isolated": on,
+            "rosters_refreshed": refreshed,
+            "message": if on {
+                "isolated on (raw agent, no amux harness); restart the worker to apply"
+            } else {
+                "isolated off; restart the worker to apply"
+            },
+        }));
+    }
+
     // Branch (py:76679).
     if let Some(bv) = body.get("branch") {
         cfg.set("CC_BRANCH", bv.as_str().unwrap_or("").trim());
@@ -12226,6 +12544,43 @@ mod tests {
         // An untagged lane shares no group with anyone — including other
         // untagged lanes. Consistent with "untagged sees itself".
         assert!(cross_group_send_ok("lonely", "gtm-engine").is_err());
+    }
+
+    /// ISOLATED (AMUX-3232): a raw-agent worker is undiscoverable to peers and
+    /// cannot be targeted by a peer send, while a normal worker in the SAME group
+    /// stays reachable (the negative control that lets this test fail). The owner
+    /// (empty origin) is never blocked.
+    #[test]
+    fn isolated_worker_is_not_a_peer_send_target() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let write = |n: &str, body: &str| {
+            std::fs::write(sessions.join(format!("{n}.env")), body).expect("write");
+        };
+        // Two same-group peers plus a same-group ISOLATED worker.
+        write("caller", "CC_TAGS=\"amux\"\n");
+        write("normal", "CC_TAGS=\"amux\"\n");
+        write("secret", "CC_TAGS=\"amux\"\nCC_ISOLATED=\"1\"\n");
+
+        // The flag itself: on for the isolated worker, off for the normal one
+        // (the negative control: if session_is_isolated matched everything, the
+        // guard below would be vacuous).
+        assert!(session_is_isolated("secret"), "CC_ISOLATED=1 must read as isolated");
+        assert!(!session_is_isolated("normal"), "a normal worker must NOT read as isolated");
+
+        // A PEER send to the isolated worker is refused, and the reason names it.
+        let err = cross_group_send_ok("caller", "secret").expect_err("peer send to isolated must refuse");
+        assert!(err.contains("isolated"), "refusal must name the reason: {err}");
+
+        // NEGATIVE CONTROL: the same peer, same group, reaching a NON-isolated
+        // worker is allowed, proving the refusal is the isolation, not the group.
+        assert_eq!(cross_group_send_ok("caller", "normal").unwrap(), "same-group");
+
+        // The OWNER (empty origin, e.g. the dashboard) is never blocked, so
+        // owner peek/send to an isolated worker still works.
+        assert_eq!(cross_group_send_ok("", "secret").unwrap(), "self-or-human");
     }
     use axum::body::Body;
     use axum::http::Request;
@@ -14908,6 +15263,32 @@ mod steer_max_age_tests {
         let ansi = "\x1b[1m   What do you want to do?\x1b[0m\n ❯ 1. STOP AND WAIT FOR LIMIT TO RESET\n 2. Switch to Usage Credits";
         assert!(is_rate_limit_menu(ansi));
     }
+
+    /// The on-credits BANNER (Ethan, 2026-08-16: "workers with a rate limit" the
+    /// menu misses). Reliable because the caller passes only the FOOTER and this
+    /// matches Claude's FULL sentence. The false positive it replaces: a lane
+    /// CODING the banner strings (amux) had them in scrollback, so a whole-pane
+    /// scrape flagged it. Curly apostrophe (Claude's actual glyph) must match.
+    #[test]
+    fn credit_banner_flags_the_real_footer_banner_not_code_that_mentions_it() {
+        // The real footer, curly apostrophe, one line above the spinner.
+        let footer = "     /usage-credits to finish what you\u{2019}re working on.\n \u{273B} Saut\u{e9}ed for 5m 33s\n \u{2500}\u{2500}\u{2500}\n \u{276f}";
+        assert!(is_rate_limited_credit_banner(footer), "the live specimen must match");
+        // Straight apostrophe too.
+        assert!(is_rate_limited_credit_banner("/usage-credits to finish what you're working on."));
+
+        // amux CODING the banner: the phrase appears as a code string / comment,
+        // NOT as Claude's full footer sentence. Must NOT flag.
+        assert!(!is_rate_limited_credit_banner(
+            "clean.contains(\"usage-credits to finish\") || clean.contains(\"your usage limit\")"
+        ));
+        assert!(!is_rate_limited_credit_banner("// the /usage-credits offer banner (AMUX-3203)"));
+        // A lane DISCUSSING a third party's limit is not itself limited.
+        assert!(!is_rate_limited_credit_banner("the ops key hit its usage limit until 2026-09-01"));
+        // A normal working footer is clean.
+        assert!(!is_rate_limited_credit_banner(" \u{273B} Crunched for 2m\n \u{276f} type a message"));
+    }
+
 
     /// The policy is the human's, set once (D2). Default is `wait` — press 1 —
     /// because a human pressing 1 on sixty lanes is not a workflow and the

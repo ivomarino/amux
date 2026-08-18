@@ -102,6 +102,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/prefs", "key/value prefs"),
     ("/api/criteria", "gate criteria"),
     ("/api/metrics", "metrics"),
+    ("/api/reclaim", "disk scan, reclaim findings, treemap, quarantine"),
     ("/api/usage", "token usage"),
     ("/api/alert", "owner alerts"),
     ("/api/stats", "daily stats"),

@@ -133,6 +133,12 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // pointed elsewhere. This is the leg that fails on the actual incident.
     out.extend(report_hooks_check());
 
+    // -- 6c. are session reports ATTRIBUTED? (AF-67). The largest signal in the
+    // request log had no automated consumer: autofix reads only status>=500 and
+    // a report is a 200, so 7,708 unattributed reports/day were visible to
+    // nobody until a human-named trigger happened to say "unattributed-http".
+    out.extend(reports_attributed_check(state));
+
     // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
     // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
     // rate" as its detector but nothing read it; this closes that loop.
@@ -147,7 +153,94 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // self-announces instead of a lying capability report.
     out.extend(provider_launch_check());
 
+    // -- 9. fire-alarm reachability: can the owner-alert channel reach a human?
+    // (AMUX-3203). Both channels read healthy-enabled while neither had a
+    // destination (0 push subs, empty phone), so five serious pages (a prod-down
+    // and two security holes) dropped silently while 171 cards waited on the
+    // owner. The per-send WARN only fires on a dropped page; this makes a
+    // disconnected alarm a CONTINUOUS health failure instead.
+    out.extend(alert_channel_check(state));
+
     out
+}
+
+/// AMUX-3203. Reads the SAME config keys and `push_subscriptions` table
+/// `api::alerts` reads when it sends, so the check cannot disagree with the
+/// sender. The verdict is reachability (config + subscription count); the recent
+/// drop tally is corroborating evidence, computed from the `owner_alerts` ledger
+/// whose `ts` is in SECONDS (unlike cmd_history's ms — the ethos rule 7 landmine).
+fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "alert.channel_can_deliver";
+    let home = crate::config::amux_home();
+    let ev = |k: &str| crate::api::settings::effective_env(&home, k);
+    let push_enabled = ev("AMUX_URGENT_PUSH").unwrap_or_else(|| "1".into()) != "0";
+    let sms_enabled = ev("AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0";
+    let phone_configured = !ev("AMUX_OWNER_PHONE").unwrap_or_default().trim().is_empty();
+    let email_enabled = ev("AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
+    // Reachable only if a connected Gmail account has a plausibly-LIVE token. "An
+    // account exists" is NOT enough: the alarm reached nobody during a cloud outage
+    // because the selected account's refresh_token was dead (invalid_grant) while
+    // it still had a token FILE (amux-cloud, 2026-08-16). Proxy for liveness: the
+    // freshest token file was rewritten within EMAIL_TOKEN_STALE_S. An active
+    // account refreshes its token ~hourly; the incident's dead account was a month
+    // stale. It is a proxy, not a live refresh, but the sender now tries EVERY
+    // account newest-first, so actual delivery is more robust than this check.
+    const EMAIL_TOKEN_STALE_S: u64 = 14 * 24 * 3600;
+    let email_reachable = crate::integrations::email::newest_token_age_secs_in(
+        &home,
+        std::time::SystemTime::now(),
+    )
+    .map(|age| age < EMAIL_TOKEN_STALE_S)
+    .unwrap_or(false);
+
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let push_sub_count: usize = conn
+        .query_row("SELECT COUNT(*) FROM push_subscriptions", [], |r| r.get::<_, i64>(0))
+        .map(|n| n.max(0) as usize)
+        .unwrap_or(0);
+    // owner_alerts written in the last 24h, and how many reached zero channels. A
+    // deduped/muted row is a suppression, not a delivery attempt (channels "{}"),
+    // so exclude it; a delivered row carries a success token in its channels JSON
+    // ("imessage"/"twilio"/"sent").
+    let (recent_alerts, recent_zero_delivery) = {
+        let mut total = 0usize;
+        let mut dropped = 0usize;
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT channels, deduped FROM owner_alerts WHERE ts > (strftime('%s','now') - 86400)",
+        ) {
+            if let Ok(rows) = stmt.query_map([], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+            }) {
+                for (channels, deduped) in rows.flatten() {
+                    if deduped != 0 {
+                        continue;
+                    }
+                    total += 1;
+                    let delivered = channels.contains("imessage")
+                        || channels.contains("twilio")
+                        || channels.contains("\"sent\"");
+                    if !delivered {
+                        dropped += 1;
+                    }
+                }
+            }
+        }
+        (total, dropped)
+    };
+    drop(conn);
+
+    checks::alert_channel_can_deliver(&checks::AlertChannelState {
+        push_enabled,
+        push_sub_count,
+        sms_enabled,
+        phone_configured,
+        email_enabled,
+        email_reachable,
+        recent_alerts,
+        recent_zero_delivery,
+    })
 }
 
 /// AMUX-3153 / RR-0043: for each provider, compare the binary the SERVER launch
@@ -486,6 +579,31 @@ mod report_hook_wiring_tests {
             "settings.json HAS report hooks but the monitor reached no verdict — the \
              extractor and the live file disagree: {rs:?}"
         );
+    }
+}
+
+/// Count this window's session reports, split on whether the write was stamped.
+///
+/// Reads `_amux_request_log` directly because that is where the ANSWER is: the
+/// `amux_session` column is the header stamp, and it is the same column the
+/// attribution audit and the send-ledger read. Deriving it from anywhere else
+/// would let the check disagree with the thing it describes.
+fn reports_attributed_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "hooks.reports_are_attributed";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let since = crate::config::now_f64() - 3600.0;
+    let row = conn.query_row(
+        "SELECT COUNT(*), SUM(CASE WHEN COALESCE(amux_session,'')='' THEN 1 ELSE 0 END) \
+         FROM _amux_request_log \
+         WHERE method='POST' AND path LIKE '/api/sessions/%/report' AND ts >= ?1",
+        [since],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+    );
+    match row {
+        Ok((total, unattr)) => checks::reports_are_attributed(total, unattr),
+        Err(e) => vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
     }
 }
 

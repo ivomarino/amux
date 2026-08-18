@@ -209,10 +209,16 @@ pub const CATALOG: &[Doc] = &[
         id: ids::BOARD_DRIVE,
         name: "Board drive",
         purpose: "Assigns eligible todo cards to idle lanes and sends the advance nudge, through the steering queue.",
-        // `off` is None on purpose: board_drive::spawn does NOT check for 0
-        // (it clamps to 1s), so claiming 0 disables it would be a documented
-        // switch that does nothing.
-        env: &[EnvControl { var: "AMUX_BOARD_DRIVE_SECS", effect: "tick seconds", off: None }],
+        // AF-69 unified the `_SECS=0` opt-out across every periodic job at the
+        // single spawn site: 0 now DISABLES this loop (registered inert, never
+        // ticks) rather than clamping to a 1s interval. Any value >= 1 is still
+        // the tick period. This used to read `off: None` with a note that 0 did
+        // nothing; that stopped being true when the central knob landed.
+        env: &[EnvControl {
+            var: "AMUX_BOARD_DRIVE_SECS",
+            effect: "tick seconds; 0 disables the loop (fleet-isolation opt-out, AF-69)",
+            off: Some("0"),
+        }],
         pref: None,
         detail: Some("/api/debug/board-drive"),
     },
@@ -349,6 +355,14 @@ struct Job {
     /// true only after a panic or an explicit abort — i.e. it is exactly the
     /// "this job died" signal and nothing else.
     abort: Option<tokio::task::AbortHandle>,
+    /// Some(switch) when this job was REGISTERED but its tick loop was
+    /// deliberately NOT spawned because fleet isolation is on (AF-69: a
+    /// second/test amux-server must not drive the production tmux fleet). It
+    /// carries the exact switch that turned it off so [`system_jobs`] can render
+    /// it `disabled` WITH a reason, instead of a loop that reads `stalled`
+    /// because it never ticks. Registered-but-inert is the honest state: the
+    /// fleet hazard is visible, not a silent skip (ethos rule 4).
+    disabled: Option<String>,
 }
 
 fn reg() -> &'static Mutex<BTreeMap<String, Job>> {
@@ -366,6 +380,36 @@ pub fn register(
     interval: Option<Duration>,
     abort: Option<tokio::task::AbortHandle>,
 ) {
+    register_inner(id, kind, interval, abort, None);
+}
+
+/// Register a job whose tick loop was deliberately NOT spawned because fleet
+/// isolation is on (AF-69). Called by [`super::spawn_periodic_every`] when a
+/// global switch (`AMUX_ISOLATED`/`AMUX_NO_FLEET`) or the per-job
+/// `AMUX_<NAME>_SECS=0` opt-out is set, so a second/test amux-server cannot press
+/// Enter or resize panes in the production tmux lanes.
+///
+/// `reason` is the switch that fired. The job appears on `/api/system-jobs` as
+/// `disabled` with that reason rather than vanishing — a suppressed fleet-driving
+/// job must be inert-but-visible, or a live hazard reads as a silent skip (the
+/// exact failure ethos rule 4 and this module's own docs cite). No abort handle:
+/// there is no loop to stop.
+pub fn register_disabled(
+    id: &str,
+    kind: &'static str,
+    interval: Option<Duration>,
+    reason: String,
+) {
+    register_inner(id, kind, interval, None, Some(reason));
+}
+
+fn register_inner(
+    id: &str,
+    kind: &'static str,
+    interval: Option<Duration>,
+    abort: Option<tokio::task::AbortHandle>,
+    disabled: Option<String>,
+) {
     if let Ok(mut m) = reg().lock() {
         m.insert(
             id.to_string(),
@@ -378,6 +422,7 @@ pub fn register(
                 last_end: None,
                 last_ms: None,
                 abort,
+                disabled,
             },
         );
     }
@@ -432,6 +477,10 @@ pub struct Snapshot {
     pub last_tick_ms: Option<f64>,
     pub in_flight_since: Option<f64>,
     pub dead: bool,
+    /// Some(switch) when the job is registered-but-inert under fleet isolation
+    /// (AF-69). Drives the `disabled` verdict and is surfaced verbatim so the UI
+    /// can name WHY the job is off.
+    pub disabled_reason: Option<String>,
 }
 
 /// Every job that has actually been spawned in this process.
@@ -453,6 +502,7 @@ pub fn snapshot() -> Vec<Snapshot> {
                 _ => None,
             },
             dead: j.abort.as_ref().map(|a| a.is_finished()).unwrap_or(false),
+            disabled_reason: j.disabled.clone(),
         })
         .collect()
 }
@@ -614,6 +664,15 @@ pub fn outcome_for(id: &str) -> Option<String> {
                 human_bytes(r.bytes_freed + r.rotated_bytes)
             )
         }),
+        ids::SCAN => crate::orchestrator::scan::last_scan_state().map(|s| {
+            format!(
+                "{} scanned, {} demoted (structured), {} demoted (native), {} capture failure(s)",
+                s.report.scanned.len(),
+                s.report.demoted_structured.len(),
+                s.report.demoted_native.len(),
+                s.report.capture_failures.len(),
+            )
+        }),
         _ => None,
     }
 }
@@ -729,10 +788,16 @@ pub async fn system_jobs(
         };
         let pref_ctl = d.and_then(|d| pref_json(&state, d));
         let l = live.get(&id);
+        // Fleet isolation (AF-69) is decided at the spawn site, not re-derived
+        // from the catalog: a job registered inert under `AMUX_ISOLATED` carries
+        // its switch here. OR it with the catalog env readout so BOTH the global
+        // isolation knob and a job's own `_SECS=0` render as `disabled`. This is
+        // the mechanism's own verdict, so the view cannot drift from it.
+        let iso_reason = l.and_then(|x| x.disabled_reason.clone());
         let f = Facts {
             spawned: l.is_some(),
             dead: l.map(|x| x.dead).unwrap_or(false),
-            disabled: disabled_by_control,
+            disabled: disabled_by_control || iso_reason.is_some(),
             interval_s: l.and_then(|x| x.interval_s),
             spawned_at: l.map(|x| x.spawned_at),
             last_tick_at: l.and_then(|x| x.last_tick_at),
@@ -766,6 +831,11 @@ pub async fn system_jobs(
             "in_flight": f.in_flight_since.is_some(),
             "instrumented": f.instrumented,
             "status": status,
+            // The switch that suppressed this job under fleet isolation (AF-69),
+            // or null. Present so a `disabled` row names WHY — which switch —
+            // rather than leaving a reader to guess whether a human or the code
+            // turned it off.
+            "disabled_reason": iso_reason,
             // Readouts and the (at most one) live switch, kept apart on
             // purpose: the client renders them differently because they ARE
             // different — one is a fact you can act on elsewhere, one is a
@@ -782,7 +852,9 @@ pub async fn system_jobs(
                  There is no run-now, edit or delete here on purpose: these are not \
                  owned data, they are the machinery. `not_spawned` means the catalog \
                  documents a job that nothing started (the failure that cost hours); \
-                 `disabled` means a human turned it off.",
+                 `disabled` means a human turned it off (its `_SECS=0` opt-out or the \
+                 process-wide fleet-isolation switch AMUX_ISOLATED/AMUX_NO_FLEET — see \
+                 `disabled_reason`).",
         "now": now,
         "jobs": jobs,
         "count": jobs.len(),

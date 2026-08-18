@@ -39,6 +39,7 @@ pub mod journal;
 pub mod layout_presets;
 pub mod log_search;
 pub mod map;
+pub mod mdai;
 pub mod memories;
 pub mod metrics;
 pub mod observability;
@@ -48,6 +49,7 @@ pub mod org;
 pub mod prefs;
 pub mod proxies;
 pub mod py_proxy;
+pub mod reclaim;
 pub mod request_log;
 pub mod review;
 pub mod saved_messages;
@@ -132,6 +134,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/prefs", prefs::routes())
         .nest("/api/criteria", criteria::routes())
         .nest("/api/metrics", metrics::routes())
+        .nest("/api/reclaim", reclaim::routes())
         .nest("/api/usage", usage::routes())
         .nest("/api/review", review::routes())
         .nest("/api/channels", channels::routes())
@@ -185,6 +188,11 @@ pub fn router(state: AppState) -> Router {
         // path in python, so top-level here.
         .route("/api/library", axum::routing::any(file_viewer::library))
         .nest("/api/files", files::routes())
+        // The .mdai computed-file engine (AMUX-3240): run a node's upstream DAG,
+        // list nodes, browse run history, connect an edge. Nested one level
+        // deeper than /api/files above; files::routes() has no /mdai or wildcard,
+        // so the two prefixes do not conflict.
+        .nest("/api/files/mdai", mdai::routes())
         // /api/fs/* is the SPA's Files contract (multipart upload + dir
         // field, open/mkdir/rename/read/list/search/delete on ABSOLUTE
         // paths) — a different contract from /api/files above. NATIVE port
@@ -325,6 +333,12 @@ pub fn router(state: AppState) -> Router {
         // Public: the PWA shell + health must load before auth happens.
         .route("/health", axum::routing::get(health::health))
         .route("/api/debug/tmux", axum::routing::get(health::debug_tmux))
+        // The terminal-scan loop's last pass (AF-80): which lanes were demoted
+        // off pane-scraping and on what basis, so a skip leaves a trace instead
+        // of reading as a scan that found nothing (ethos rule 4, the D1 "scan"
+        // deviation). Advertised in ethos.md and the job registry but unrouted
+        // until now. Public like its debug siblings (lane names and timings).
+        .route("/api/debug/scan", axum::routing::get(health::debug_scan))
         // Per-session logging health + a computed stale verdict (AMUX-2628).
         // Public like its debug siblings: session names and byte counts only.
         .route("/api/debug/logs", axum::routing::get(session_verbs::debug_logs))

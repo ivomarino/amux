@@ -50,6 +50,11 @@ pub trait AlertChannels: Send + Sync {
     /// SMS/iMessage. Returns Python's `_send_sms` tuple: (ok, detail) where
     /// detail is "twilio"/"imessage" on success or the failure text.
     async fn sms(&self, phone: &str, text: &str) -> (bool, String);
+    /// Email, via the connected Gmail account (AMUX-3203). This is the channel
+    /// that reaches the owner with NO manual setup: push needs him to subscribe
+    /// and sms needs his phone, but a connected Gmail account already exists and
+    /// its own inbox is a destination. `(ok, detail)`, detail names the account.
+    async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String);
 }
 
 /// Production channels: web push via crate::push, SMS via Twilio-or-osascript.
@@ -75,6 +80,29 @@ impl AlertChannels for RealChannels {
 
     async fn sms(&self, phone: &str, text: &str) -> (bool, String) {
         send_sms(phone, text).await
+    }
+
+    async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
+        let gc = crate::integrations::email::GmailClient::new_default();
+        // Try connected accounts NEWEST-TOKEN-FIRST until one actually sends. A
+        // stale account whose refresh_token is dead (invalid_grant) must not
+        // silently win: during a live cloud outage the fire alarm reached NOBODY
+        // because it picked the first-ALPHABETICAL account (esteininger21@gmail.com,
+        // token dead) while ethan@mixpeek.com was fresh and sending fine moments
+        // later (amux-cloud, 2026-08-16). Trying each in turn means the alarm
+        // delivers if ANY connected account can, not just if the first one can.
+        let accounts = crate::integrations::email::connected_accounts_by_freshness_in(gc.home());
+        if accounts.is_empty() {
+            return (false, "no connected Gmail account to send from".into());
+        }
+        let mut last_err = String::new();
+        for from in &accounts {
+            match gc.compose_send(from, to, subject, body, "", "", "", "", true).await {
+                Ok(_) => return (true, format!("email via {from}")),
+                Err(e) => last_err = format!("email error via {from}: {}", truncate(&e, 80)),
+            }
+        }
+        (false, if last_err.is_empty() { "email send failed".into() } else { last_err })
     }
 }
 
@@ -572,6 +600,7 @@ async fn post_owner(
     // this makes it EXPLICIT in the response so no caller has to guess.
     let mut push_delivered = false;
     let mut sms_delivered = false;
+    let mut email_delivered = false;
     if effective_env(&home, "AMUX_URGENT_PUSH").unwrap_or_else(|| "1".into()) != "0" {
         match channels.push(&state, &session, &msg).await {
             Ok(()) => {
@@ -618,8 +647,33 @@ async fn post_owner(
         sms_delivered = ok;
         out_channels.insert("sms".into(), json!(if ok { detail } else { format!("failed: {detail}") }));
     }
+    // EMAIL (AMUX-3203): the channel that reaches the owner with no manual setup.
+    // Destination = AMUX_OWNER_EMAIL if set, else the connected account's own
+    // inbox (self-send). This is why the fire alarm no longer depends on a push
+    // subscription he never made or a phone he cleared after the 38-SMS night.
+    let email_enabled = effective_env(&home, "AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
+    let owner_email = effective_env(&home, "AMUX_OWNER_EMAIL")
+        .filter(|e| !e.trim().is_empty())
+        .or_else(|| crate::integrations::email::connected_accounts_by_freshness_in(&home).into_iter().next());
+    if !email_enabled {
+        out_channels.insert("email".into(), json!("disabled (AMUX_URGENT_EMAIL=0)"));
+    } else if owner_email.is_none() {
+        out_channels.insert("email".into(), json!("no AMUX_OWNER_EMAIL and no connected Gmail account"));
+    }
+    if email_enabled {
+        if let Some(to) = owner_email.as_deref() {
+            let subject = if session.is_empty() {
+                "amux URGENT".to_string()
+            } else {
+                format!("amux URGENT [{session}]")
+            };
+            let (ok, detail) = channels.email(to, &subject, &msg).await;
+            email_delivered = ok;
+            out_channels.insert("email".into(), json!(if ok { detail } else { format!("failed: {detail}") }));
+        }
+    }
     record_owner_alert(&state, &origin, &session, &msg, &reason, &out_channels, false).await;
-    let delivered = (push_delivered as u8 + sms_delivered as u8) as i64;
+    let delivered = (push_delivered as u8 + sms_delivered as u8 + email_delivered as u8) as i64;
     let delivered_any = delivered > 0;
     if delivered_any {
         tracing::info!(
@@ -807,8 +861,10 @@ mod tests {
     struct MockChannels {
         pushes: Mutex<Vec<(String, String)>>,
         smses: Mutex<Vec<(String, String)>>,
+        emails: Mutex<Vec<(String, String, String)>>,
         push_result: Result<(), String>,
         sms_result: (bool, String),
+        email_result: (bool, String),
     }
 
     impl MockChannels {
@@ -816,8 +872,10 @@ mod tests {
             Arc::new(Self {
                 pushes: Mutex::new(vec![]),
                 smses: Mutex::new(vec![]),
+                emails: Mutex::new(vec![]),
                 push_result: Ok(()),
                 sms_result: (true, "imessage".into()),
+                email_result: (true, "email via ethan@example.com".into()),
             })
         }
     }
@@ -831,6 +889,10 @@ mod tests {
         async fn sms(&self, phone: &str, text: &str) -> (bool, String) {
             self.smses.lock().unwrap().push((phone.to_string(), text.to_string()));
             self.sms_result.clone()
+        }
+        async fn email(&self, to: &str, subject: &str, body: &str) -> (bool, String) {
+            self.emails.lock().unwrap().push((to.to_string(), subject.to_string(), body.to_string()));
+            self.email_result.clone()
         }
     }
 
@@ -937,7 +999,17 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         // The CLAUDE.md contract shape.
         assert_eq!(v["ok"], json!(true));
-        assert_eq!(v["channels"], json!({ "push": "sent", "sms": "imessage" }));
+        // Email is a channel now (AMUX-3203), but the temp home has no connected
+        // Gmail account and AMUX_OWNER_EMAIL is unset, so it reports why rather
+        // than sending — push + sms are unchanged.
+        assert_eq!(
+            v["channels"],
+            json!({
+                "push": "sent",
+                "sms": "imessage",
+                "email": "no AMUX_OWNER_EMAIL and no connected Gmail account",
+            })
+        );
         assert_eq!(v["message"], json!("prod is down\n(deploy failed)"));
         assert_eq!(v["origin"], json!("sender-a"));
         assert_eq!(v["claimed"], json!("sender-a"));
@@ -1036,7 +1108,9 @@ mod tests {
     }
 
     fn v_len(mock: &MockChannels) -> usize {
-        mock.pushes.lock().unwrap().len() + mock.smses.lock().unwrap().len()
+        mock.pushes.lock().unwrap().len()
+            + mock.smses.lock().unwrap().len()
+            + mock.emails.lock().unwrap().len()
     }
 
     #[tokio::test]
@@ -1060,9 +1134,42 @@ mod tests {
             json!({
                 "push": "disabled (AMUX_URGENT_PUSH=0)",
                 "sms": "no phone configured (AMUX_OWNER_PHONE is empty)",
+                "email": "no AMUX_OWNER_EMAIL and no connected Gmail account",
             })
         );
         assert_eq!(v_len(&mock), 0);
+    }
+
+    /// AMUX-3203: the email channel is what makes the alarm reach the owner with
+    /// NO manual setup. In the incident's exact config (no push subscription, no
+    /// phone) the alert still DELIVERS via email and counts toward delivered_any,
+    /// as long as a connected Gmail account exists — its own inbox is the default
+    /// destination. This is the gap that dropped five real pages.
+    #[tokio::test]
+    async fn owner_alert_delivers_via_email_when_only_a_gmail_account_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        // No push subs, no phone — the incident. But a connected Gmail account:
+        std::fs::create_dir_all(dir.path().join("gmail-tokens")).unwrap();
+        std::fs::write(dir.path().join("gmail-tokens/ethan@example.com.json"), "{}").unwrap();
+        set_server_env_key(dir.path(), "AMUX_URGENT_PUSH", "0").unwrap();
+        let mock = MockChannels::ok();
+        let app = app(mock.clone());
+        let (_, v) = send(
+            &app,
+            "POST",
+            "/api/alert/owner",
+            &[],
+            Some(json!({ "message": "prod down, only email left" })),
+        )
+        .await;
+        assert_eq!(v["delivered_any"], json!(true), "email must deliver the page: {v}");
+        assert_eq!(v["channels"]["email"], json!("email via ethan@example.com"));
+        assert!(v.get("fallback").is_none(), "a delivered page must not carry the miss fallback");
+        // The mock received the self-send to the connected account.
+        let emails = mock.emails.lock().unwrap().clone();
+        assert_eq!(emails.len(), 1, "exactly one email attempt");
+        assert_eq!(emails[0].0, "ethan@example.com", "owner email defaults to the connected account");
     }
 
     /// A FIRE ALARM MUST NOT REPORT SUCCESS HAVING REACHED NOBODY (AMUX-2938).
@@ -1110,8 +1217,10 @@ mod tests {
         let mock = Arc::new(MockChannels {
             pushes: Mutex::new(vec![]),
             smses: Mutex::new(vec![]),
+            emails: Mutex::new(vec![]),
             push_result: Err("vapid: unreadable key".into()),
             sms_result: (false, "imessage error: -1743".into()),
+            email_result: (false, "email error: not_connected".into()),
         });
         let app = app(mock);
         let (_, v) =
@@ -1139,13 +1248,17 @@ mod tests {
         let mock = Arc::new(MockChannels {
             pushes: Mutex::new(vec![]),
             smses: Mutex::new(vec![]),
+            emails: Mutex::new(vec![]),
             push_result: Ok(()),
             sms_result: (true, "imessage".into()),
+            email_result: (true, "email via a@b.com".into()),
         });
         let app = app(mock);
         let (_, v) =
             send(&app, "POST", "/api/alert/owner", &[], Some(json!({ "message": "a real page" }))).await;
         assert_eq!(v["delivered_any"], json!(true));
+        // push + sms landed; email is not attempted here (no connected account in
+        // the temp home and no AMUX_OWNER_EMAIL), so the tally is 2, not 3.
         assert_eq!(v["delivered"], json!(2), "push + sms both landed");
         assert!(v.get("fallback").is_none(), "a delivered page must NOT carry the failure fallback");
     }

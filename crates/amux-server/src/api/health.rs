@@ -156,3 +156,52 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
         Err(e) => serde_json::json!({ "spawn": "failed", "error": e.to_string() }),
     })
 }
+
+/// GET /api/debug/scan returns the terminal scan loop's last pass, so a
+/// demotion that leaves no trace is not mistaken for a scan that found nothing
+/// (ethos rule 4, the D1 "scan" deviation). Advertised in ethos.md and the
+/// system-jobs registry (`detail: Some("/api/debug/scan")`) but unrouted until
+/// AF-80: a claimed-but-not-implemented instrument (ethos rule 6). Reports which lanes
+/// were demoted off pane-scraping and on what basis (their own protocol voice
+/// vs the backend's native agent-status report), which were actually captured,
+/// which captures or native reads failed, and the per-worker dedupe hash that
+/// gates re-firing a still-on-screen banner. A `null` last_pass_at means the
+/// loop has not completed a pass yet; if that persists past AMUX_RS_SCAN_SECS,
+/// `/api/system-jobs` names the `terminal-scan` job as stalled.
+pub async fn debug_scan() -> axum::Json<serde_json::Value> {
+    let now = crate::runtime_jobs::registry::unix_now();
+    match crate::orchestrator::scan::last_scan_state() {
+        Some(s) => axum::Json(serde_json::json!({
+            "note": "the terminal scan loop's last pass, the FALLBACK voice for hookless \
+                     workers. A lane in demoted_structured spoke for itself (live protocol \
+                     session); one in demoted_native was reported by its backend (herdr \
+                     agent_status); one in scanned had its pane captured because neither \
+                     voice was available. A skip here leaves a trace on purpose (ethos rule 4).",
+            "now": now,
+            "last_pass_at": s.last_pass_at,
+            "last_pass_age_s": s.last_pass_at.map(|t| now - t),
+            "scan_secs": std::env::var("AMUX_RS_SCAN_SECS").ok(),
+            "scanned": s.report.scanned,
+            "demoted_structured": s.report.demoted_structured,
+            "demoted_native": s.report.demoted_native,
+            "native_status_failures": s.report.native_status_failures,
+            "capture_failures": s.report.capture_failures,
+            "events_applied": s.report.events_applied,
+            "deduped": s.deduped,
+        })),
+        None => axum::Json(serde_json::json!({
+            "note": "the terminal scan loop has not completed a pass yet, so no demotion \
+                     decisions to report. If this persists past AMUX_RS_SCAN_SECS, check \
+                     /api/system-jobs for the 'terminal-scan' job.",
+            "now": now,
+            "last_pass_at": serde_json::Value::Null,
+            "scanned": Vec::<String>::new(),
+            "demoted_structured": Vec::<String>::new(),
+            "demoted_native": Vec::<String>::new(),
+            "native_status_failures": Vec::<String>::new(),
+            "capture_failures": Vec::<String>::new(),
+            "events_applied": 0,
+            "deduped": serde_json::Map::new(),
+        })),
+    }
+}

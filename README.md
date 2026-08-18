@@ -74,6 +74,75 @@ tmux is the default and fully supported backend. Sessions can instead run on [he
 
 Longer term, terminal scraping is the fallback, not the plan: the `opencode` module (`crates/amux-server/src/opencode/`) defines the structured AgentProtocol through which prompts, messages, cancellation, and state queries flow directly, shrinking the scraper to a liveness check as coverage grows.
 
+## Computed files: `.mdai`
+
+A `.mdai` file is a **computed markdown file**: a node in a directed acyclic graph (DAG) whose value is produced by a model. It composes two existing primitives, the **filesystem** and the **model over linked files**, and adds no new subsystem. A node connects to source files, folders, or other `.mdai` files through per-connection prompts (the edges), and its markdown body is the instruction that synthesizes those sources into the node's output. Opening a node runs its whole upstream chain and populates the output.
+
+The extension is `.mdai` (a single extension), not `.md.ai`: macOS reads a trailing `.ai` as an Adobe Illustrator file, so `foo.md.ai` would be misclassified as binary artwork by Finder and editors. `.mdai` stays plain text everywhere.
+
+### File format
+
+YAML frontmatter declares the connections and an optional model; the markdown body is the node's synthesis prompt.
+
+```yaml
+---
+sources:
+  - path: notes/meeting.md
+    prompt: Extract the decisions and open questions from this note.
+  - path: research.mdai
+    prompt: Use this synthesized research as background.
+model: claude-haiku-4-5   # optional per-file override
+---
+# Weekly brief
+Write a five-line brief that states each decision and the single most
+important open question, using only the connected sources.
+```
+
+- `sources` is a list of connections, each `{path, prompt}`. `path` is a file, a folder (expanded to its files, size-capped), or another `.mdai` file, resolved relative to the containing `.mdai` file's directory. `prompt` is the configurable edge prompt; a sensible default is filled in when a connection is created without one. A bare string entry (just the path) is also accepted and gets the default prompt.
+- `model` is an optional per-file override.
+- The markdown body is the node synthesis instruction. A plain markdown file with no frontmatter is a valid node with no sources.
+
+### How opening runs the chain
+
+Opening a node resolves its sources **upstream-first, depth-first**: every `.mdai` source runs to completion before this node synthesizes, so upstream output is available as context. The resolved sources are assembled with their edge prompts and handed to the model along with the body prompt to produce the output. Because sources can be other `.mdai` files, the graph is an arbitrary DAG.
+
+- **Cycle detection.** A node that transitively depends on itself is detected during resolution and errors honestly, naming the loop (for example `a.mdai -> b.mdai -> a.mdai`) rather than looping forever.
+- **Run-on-open with an input-hash cache.** Every open runs the chain, but a node whose resolved sources, body prompt, and model are unchanged since its last run reuses that output instead of spending a model call to reproduce an identical result. The input hash is recorded per run, and history distinguishes a cached reuse from a fresh computation.
+- **History.** Each open records a run (path, timestamp, input hash, output, model, and whether it was cached). History is browsable newest-first.
+
+### Model
+
+The default is the **fastest Claude model** (Haiku 4.5 today), resolved from the `AMUX_HELPER_MODEL` config path the rest of the server's helper calls read: a per-file `model:` wins, else `AMUX_HELPER_MODEL`, else the fastest-Claude default. The value is resolved from config rather than pinned in code, so the default improves as the fast tier does. A `.mdai` node inherits the same helper CLI (`AMUX_HELPER_CLI`, default `claude`).
+
+### Endpoints
+
+Rooted at the same files root as the Files browser (`AMUX_FILES_ROOT`, else `$HOME`):
+
+| Method + path | What |
+|---|---|
+| `POST /api/files/mdai/run {path}` | Resolve and run the DAG, record a history entry, return the entry node's latest output plus the upstream-first node order |
+| `GET /api/files/mdai` | List every `.mdai` file under the files root with metadata (source count, model, title, mtime, last run time) |
+| `GET /api/files/mdai/history?path=<rel>` | The node's run history, newest first |
+| `POST /api/files/mdai/connect {source, target, prompt?}` | Append a source connection to the target's frontmatter, writing a sensible default edge prompt when none is given |
+
+Run a node (path is relative to the files root):
+
+```bash
+curl -sk -X POST https://localhost:8824/api/files/mdai/run \
+  -H 'Content-Type: application/json' \
+  -d '{"path":"weekly.mdai"}'
+```
+
+Connect a source into a target (writes the edge into `weekly.mdai`'s frontmatter):
+
+```bash
+curl -sk -X POST https://localhost:8824/api/files/mdai/connect \
+  -H 'Content-Type: application/json' \
+  -d '{"source":"notes/meeting.md","target":"weekly.mdai","prompt":"Extract the decisions."}'
+```
+
+The dashboard's directory-view UI for creating and connecting `.mdai` files is tracked separately (AMUX-3245) and will be documented when it ships.
+
 ## Logs and the daily sweep
 
 Every `/api` request is recorded in a structured request log (`_amux_request_log`, served at `GET /api/logs` and the dashboard's Logs tab; raw server tracing at `~/.amux/logs/server-rs.log`; retention `AMUX_REQLOG_RETAIN_DAYS`, default 14 days).

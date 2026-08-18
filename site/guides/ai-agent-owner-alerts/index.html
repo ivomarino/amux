@@ -1,0 +1,302 @@
+<!DOCTYPE html>
+<html lang="en" data-theme="dark">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#1e2330">
+  <title>AI Agent Owner Alerts: Push, Email &amp; iMessage Notifications — amux</title>
+  <link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <meta name="description" content="Send push notifications and email to yourself when an AI coding agent needs attention. amux alert delivers to phone and email simultaneously. Setup guide, CLAUDE.md examples, and health verification for overnight AI agent runs.">
+  <meta name="keywords" content="ai agent notifications, ai coding agent alerts, how to get notified when ai agent needs attention, ai agent email notification, push notification ai agent, monitor ai agents remotely, ai agent owner alert, ai coding agent monitoring, claude code agent notification">
+  <link rel="canonical" href="https://amux.io/guides/ai-agent-owner-alerts/">
+  <meta property="og:title" content="AI Agent Owner Alerts: Push, Email &amp; iMessage Notifications — amux">
+  <meta property="og:description" content="Send push notifications and email to yourself when an AI coding agent needs attention. amux alert delivers to phone and email simultaneously.">
+  <meta property="og:url" content="https://amux.io/guides/ai-agent-owner-alerts/">
+  <meta property="og:image" content="https://amux.io/og-image.png">
+  <meta property="og:type" content="article">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="alternate" type="application/rss+xml" title="amux Blog" href="https://amux.io/blog/rss.xml">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="/style.css">
+  <script src="/site.js"></script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"BreadcrumbList","itemListElement":[{"@type":"ListItem","position":1,"name":"amux","item":"https://amux.io/"},{"@type":"ListItem","position":2,"name":"Guides","item":"https://amux.io/guides/"},{"@type":"ListItem","position":3,"name":"AI Agent Owner Alerts","item":"https://amux.io/guides/ai-agent-owner-alerts/"}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"Article","headline":"AI Agent Owner Alerts: Push, Email and iMessage Notifications","description":"Configure amux so your AI agents can page you when they need attention — push notifications, email, and iMessage delivered simultaneously, with a health invariant to verify the channel works before every overnight run.","url":"https://amux.io/guides/ai-agent-owner-alerts/","datePublished":"2026-08-16","dateModified":"2026-08-16","author":{"@type":"Organization","name":"amux","url":"https://amux.io/"},"publisher":{"@type":"Organization","name":"amux","url":"https://amux.io/","logo":{"@type":"ImageObject","url":"https://amux.io/icon.png"}}}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"HowTo","name":"How to Set Up Owner Alerts for AI Coding Agents","description":"Configure push notifications and email alerts so your AI agents can page you when they need attention, and verify the channel works before every overnight run.","step":[{"@type":"HowToStep","name":"Configure server.env","text":"Add AMUX_OWNER_EMAIL=you@example.com to ~/.amux/server.env. Optionally add AMUX_ALERT_EMAIL_FROM=alerts@yourdomain.com for a custom sender. Restart the server to pick up the changes."},{"@type":"HowToStep","name":"Install the amux PWA for push notifications","text":"Open https://localhost:8824 in your phone browser. Tap Share and choose Add to Home Screen. Open the installed app and accept the push notification permission prompt."},{"@type":"HowToStep","name":"Write alert triggers in CLAUDE.md","text":"Tell each agent when to call amux alert. For example: if you hit a blocker for more than 30 minutes, call amux alert with the message and a short reason. Repeat for queue-empty and unexpected-error cases."},{"@type":"HowToStep","name":"Verify the health invariant","text":"Call GET /api/health/invariants and confirm alert.channel_can_deliver is passing. If it fails, the response names the misconfigured channel and what to fix."},{"@type":"HowToStep","name":"Send a test alert","text":"Run: amux alert \"Test alert\" \"pre-run check\". Confirm a push notification arrives on your phone and an email lands in your inbox within 30 seconds."}]}</script>
+  <script type="application/ld+json">{"@context":"https://schema.org","@type":"FAQPage","mainEntity":[{"@type":"Question","name":"What is an AI agent owner alert?","acceptedAnswer":{"@type":"Answer","text":"An owner alert is a push notification and email sent to the owner of an AI agent fleet when an agent needs human attention. In amux, the agent calls 'amux alert' with a message and a reason. The server delivers the alert via push notification to the owner's phone and via email simultaneously. On Apple devices, the push notification also triggers iMessage."}},{"@type":"Question","name":"What notification channels does amux support for agent alerts?","acceptedAnswer":{"@type":"Answer","text":"amux delivers owner alerts to three channels simultaneously: push notifications via the installed PWA on your phone, email via Gmail API or configured SMTP, and iMessage on Apple devices when push is enabled. A single amux alert call reaches all three."}},{"@type":"Question","name":"How do I set up email alerts for AI coding agents?","acceptedAnswer":{"@type":"Answer","text":"Add AMUX_OWNER_EMAIL=you@example.com and AMUX_ALERT_EMAIL_FROM=alerts@yourdomain.com to ~/.amux/server.env, then restart the amux server. Verify with GET /api/health/invariants: the alert.channel_can_deliver invariant confirms the email channel is working. Send a test alert with: amux alert \"Test\" \"setup check\""}},{"@type":"Question","name":"What situations should trigger an AI agent owner alert?","acceptedAnswer":{"@type":"Answer","text":"Three situations reliably warrant an alert: a blocker that will stall progress for more than 30 minutes, an unexpected error in a protected area such as auth or payments, and a completed queue where the agent wants new tasks. Routine progress does not warrant an alert; the amux board and dashboard cover that. Write the trigger conditions in CLAUDE.md so every agent on your fleet follows the same rules."}},{"@type":"Question","name":"How do I verify that agent alerts are working before an overnight run?","acceptedAnswer":{"@type":"Answer","text":"Check GET /api/health/invariants and confirm alert.channel_can_deliver is passing. Then send a test alert: amux alert \"Test\" \"pre-run check\". Confirm the push notification arrives on your phone and email lands in your inbox. The invariant runs continuously; if it fails later, the dashboard marks it red."}},{"@type":"Question","name":"Can I use polling instead of alerts to monitor AI agents?","acceptedAnswer":{"@type":"Answer","text":"Polling via the amux dashboard works for checking agent status when you are already looking. Owner alerts handle the case where you are not looking: sleeping, in a meeting, or away from your machine. The two complement each other. Polling tells you the state when you check; alerts tell you when something needs you without you checking."}}]}</script>
+</head>
+<body>
+  <header class="site-header">
+    <a class="logo" href="/">amux</a>
+    <nav>
+      <a href="/docs/" class="hide-mobile">docs</a>
+      <a href="/guides/" class="hide-mobile">guides</a>
+      <a href="/compare/" class="hide-mobile">compare</a>
+      <a href="/demos/" class="hide-mobile">demos</a>
+      <a href="/blog/" class="hide-mobile">blog</a>
+      <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener" class="nav-cta-primary nav-cta">iOS app</a>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" class="nav-cta">GitHub <span class="gh-stars" id="gh-stars"></span></a>
+    </nav>
+  </header>
+  <main>
+    <div class="breadcrumb"><a href="/">amux</a> <span class="sep">&rsaquo;</span> <a href="/guides/">Guides</a> <span class="sep">&rsaquo;</span> <span>AI Agent Owner Alerts</span></div>
+    <!-- EXP-044: top-of-page CTA on new owner-alerts guide -->
+    <div style="background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.25);border-radius:8px;padding:1rem 1.2rem;margin-bottom:1.5rem;display:flex;align-items:center;justify-content:space-between;gap:1rem;flex-wrap:wrap">
+      <span style="font-size:.9rem;color:var(--text)">amux sends push, email, and iMessage when agents need you — open source, self-hosted, MIT licensed</span>
+      <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener" onclick="typeof posthog!=='undefined'&&posthog.capture('exp044_owner_alerts_topofpage_cta_click')" style="background:#10b981;color:#fff;padding:0.45rem 1rem;border-radius:6px;font-size:.875rem;font-weight:600;text-decoration:none;white-space:nowrap;flex-shrink:0">View amux on GitHub ★</a>
+    </div>
+    <h1>AI Agent Owner Alerts: Push, Email, and iMessage</h1>
+    <p class="subtitle">Updated August 2026. Configure amux so your agents page you the moment they need attention, via push notification, email, and iMessage, all from a single command your agents can call themselves.</p>
+
+    <nav class="toc" style="background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:1.2rem 1.6rem;margin:2rem 0;">
+      <strong style="font-size:0.82rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--muted);">Contents</strong>
+      <ol style="margin:0.6rem 0 0;padding-left:1.2rem;font-size:0.88rem;line-height:2;">
+        <li><a href="#answer" style="color:var(--dim);text-decoration:none;">How amux owner alerts work</a></li>
+        <li><a href="#setup" style="color:var(--dim);text-decoration:none;">Setup: server.env and push</a></li>
+        <li><a href="#claude-md" style="color:var(--dim);text-decoration:none;">Writing alert triggers in CLAUDE.md</a></li>
+        <li><a href="#channels" style="color:var(--dim);text-decoration:none;">Channel comparison: push vs email vs polling</a></li>
+        <li><a href="#health" style="color:var(--dim);text-decoration:none;">Health invariant: verify before every overnight run</a></li>
+        <li><a href="#overnight" style="color:var(--dim);text-decoration:none;">Overnight runs: alerts in practice</a></li>
+        <li><a href="#faq" style="color:var(--dim);text-decoration:none;">FAQ</a></li>
+      </ol>
+    </nav>
+
+    <h2 id="answer">How amux owner alerts work</h2>
+    <p>amux ships a built-in fire-alarm channel for agent-to-owner communication. When an agent calls <code>amux alert "message" "reason"</code>, the server delivers the alert to every configured channel simultaneously: push notification to your phone, email to your inbox, and iMessage on Apple devices. The whole delivery takes under 5 seconds.</p>
+    <p>This is different from checking the dashboard. The dashboard shows you status when you look; owner alerts reach you when you are not looking. A sleeping developer, a developer in a meeting, a developer who forgot to check in at 2am: owner alerts handle all three cases without any polling.</p>
+    <p>The alert command takes two arguments: a human-readable message and a short reason. The server logs both, timestamps the delivery, and sends them together to all channels. From a terminal or from inside an agent's CLAUDE.md instructions:</p>
+    <pre><code>amux alert "Blocked on auth migration -- need your call" "30+ min blocker"
+amux alert "All tasks done -- queue empty, ready for more" "queue empty"
+amux alert "Found unexpected changes in payments/ -- stopping" "scope violation"</code></pre>
+
+    <h2 id="setup">Setup: server.env and push notifications</h2>
+
+    <h3>Email configuration</h3>
+    <p>Add the following to <code>~/.amux/server.env</code>:</p>
+    <pre><code>AMUX_OWNER_EMAIL=you@example.com
+AMUX_ALERT_EMAIL_FROM=alerts@yourdomain.com   # optional, defaults to a system sender</code></pre>
+    <p>Restart the server to pick up the changes:</p>
+    <pre><code>launchctl kickstart -k gui/$(id -u)/com.amux.server-rs</code></pre>
+    <p>If you have a Gmail account connected via the amux Gmail API, alerts use that account for reliable delivery, threading, and signature. Otherwise, the server uses SMTP. Either way, one line in <code>server.env</code> is all that is needed.</p>
+
+    <h3>Push notifications</h3>
+    <p>Push notifications arrive on your phone even when the amux PWA is not open. To set them up:</p>
+    <ol>
+      <li>Open <code>https://localhost:8824</code> (or your Tailscale address) in your phone's browser.</li>
+      <li>Tap <strong>Share</strong> and choose <strong>Add to Home Screen</strong>.</li>
+      <li>Open the installed app from your home screen.</li>
+      <li>When the notification permission prompt appears, tap <strong>Allow</strong>.</li>
+    </ol>
+    <p>On iOS, the permission prompt appears on first open of the installed PWA. On Android, it may appear before installation. Once enabled, push notifications fire through the service worker even when the screen is locked, delivering the same behavior as a native app.</p>
+    <p>For remote access (agent running on a cloud VM or a machine at the office), connect via <a href="/guides/remote-access-tailscale/">Tailscale</a> and install the PWA pointed at your Tailscale address instead of localhost.</p>
+
+    <h3>iMessage</h3>
+    <p>On Apple devices, push notifications can trigger iMessage delivery as well. When the amux PWA sends a push, iOS surfaces it as both a banner notification and, for configured accounts, an iMessage. No additional setup is required beyond the push permission above. A push that arrives while your phone is asleep will wake the display and sound, matching the urgency of a true fire alarm.</p>
+
+    <h3>Verify setup immediately</h3>
+    <p>After configuring, verify before you trust the channel with an overnight run:</p>
+    <pre><code>amux alert "Test alert" "verifying setup"</code></pre>
+    <p>Confirm the push notification arrives on your phone and an email lands in your inbox. If either fails, check the health invariant (next section) for a diagnosis.</p>
+
+    <h2 id="claude-md">Writing alert triggers in CLAUDE.md</h2>
+    <p>The agent does not decide on its own when to alert you. You decide, once, in CLAUDE.md, and every agent on the fleet follows the same rules. This is deliberate: a well-calibrated alert policy means you get paged for real blockers, not for progress updates you would have seen in the morning review.</p>
+    <p>A good alert policy covers three cases:</p>
+
+    <h3>1. Blockers that stall progress</h3>
+    <pre><code># In CLAUDE.md
+If you hit a problem you cannot resolve after 3 attempts, and the task cannot
+proceed without a decision only the owner can make, run:
+  amux alert "Blocked on [description] -- need your call" "30+ min blocker"
+Then commit what you have, document the blocker in a comment, and stop.</code></pre>
+
+    <h3>2. Scope violations</h3>
+    <pre><code># In CLAUDE.md
+If completing the task requires modifying files in src/auth/, src/payments/,
+or infrastructure/, do NOT modify those files. Instead run:
+  amux alert "Task needs changes in [area] -- outside scope" "scope violation"
+Then commit a note explaining what you found and stop.</code></pre>
+
+    <h3>3. Queue empty</h3>
+    <pre><code># In CLAUDE.md
+If you finish all tasks and the board has no more work queued for you, run:
+  amux alert "All tasks done -- queue empty, ready for more" "queue empty"
+Then wait without doing anything else.</code></pre>
+
+    <h3>What NOT to alert on</h3>
+    <p>Agents that alert on routine progress quickly teach their owner to ignore the channel. Routine progress belongs on the board, not in an alert:</p>
+    <ul>
+      <li>Completing a task: mark the board card <code>done</code>, not an alert</li>
+      <li>Starting a new task: no notification needed</li>
+      <li>Failing a test and retrying: routine, not a blocker</li>
+      <li>Asking a clarifying question that can wait: write a TODO comment and continue</li>
+    </ul>
+    <p>The owner-alert channel should feel like a phone call at 3am: reserved for things that actually cannot wait.</p>
+
+    <h2 id="channels">Channel comparison: push vs email vs polling</h2>
+    <table style="width:100%;border-collapse:collapse;font-size:0.88rem;margin:1rem 0;">
+      <thead>
+        <tr style="border-bottom:2px solid var(--border);">
+          <th style="text-align:left;padding:0.6rem;">Channel</th>
+          <th style="text-align:left;padding:0.6rem;">Delivery</th>
+          <th style="text-align:left;padding:0.6rem;">Works when</th>
+          <th style="text-align:left;padding:0.6rem;">Setup</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr style="border-bottom:1px solid var(--border);">
+          <td style="padding:0.6rem;"><strong>Push notification</strong></td>
+          <td style="padding:0.6rem;">Under 5 seconds</td>
+          <td style="padding:0.6rem;">Phone is on and connected (even locked)</td>
+          <td style="padding:0.6rem;">Install PWA, grant permission</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border);">
+          <td style="padding:0.6rem;"><strong>iMessage (iOS)</strong></td>
+          <td style="padding:0.6rem;">Under 10 seconds</td>
+          <td style="padding:0.6rem;">iPhone connected to internet; sounds even on silent</td>
+          <td style="padding:0.6rem;">Automatic with push on iOS</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border);">
+          <td style="padding:0.6rem;"><strong>Email</strong></td>
+          <td style="padding:0.6rem;">Under 30 seconds</td>
+          <td style="padding:0.6rem;">Any email client; no app needed</td>
+          <td style="padding:0.6rem;"><code>AMUX_OWNER_EMAIL</code> in server.env</td>
+        </tr>
+        <tr style="border-bottom:1px solid var(--border);">
+          <td style="padding:0.6rem;"><strong>Dashboard polling</strong></td>
+          <td style="padding:0.6rem;">When you check</td>
+          <td style="padding:0.6rem;">You are already looking</td>
+          <td style="padding:0.6rem;">None, always on</td>
+        </tr>
+        <tr>
+          <td style="padding:0.6rem;"><strong>amux board</strong></td>
+          <td style="padding:0.6rem;">Immediate on write</td>
+          <td style="padding:0.6rem;">Morning review; board visible in dashboard</td>
+          <td style="padding:0.6rem;">None, used by agents automatically</td>
+        </tr>
+      </tbody>
+    </table>
+    <p>amux alert fires push, iMessage, and email simultaneously. You do not choose one: you get all three on a single call, with a 60-second server-side dedup to prevent spam from a misconfigured agent.</p>
+
+    <h2 id="health">Health invariant: verify before every overnight run</h2>
+    <p>The most dangerous failure mode for owner alerts is a misconfigured channel that looks correct in <code>server.env</code> but silently drops alerts at runtime. amux has a continuous health check that prevents this.</p>
+    <p>Check it before every overnight run:</p>
+    <pre><code>curl -sk $(amux url)/api/health/invariants | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+for f in d.get('failures', []):
+    print('FAIL:', f)
+for p in d.get('passing', []):
+    if 'alert' in p:
+        print('PASS:', p)
+"</code></pre>
+    <p>Look for <code>alert.channel_can_deliver</code> in the passing list. If it appears in failures, the response includes a <code>detail</code> field explaining what is wrong and how to fix it. Common failure reasons:</p>
+    <ul>
+      <li><strong>AMUX_OWNER_EMAIL not set:</strong> add it to <code>~/.amux/server.env</code> and restart</li>
+      <li><strong>Email auth error:</strong> reconnect your Gmail account with <code>GET /api/gmail/auth?account=you@example.com</code></li>
+      <li><strong>Push subscription expired:</strong> re-open the PWA and refresh the notification permission</li>
+    </ul>
+    <p>The invariant runs every 5 minutes automatically. If it starts failing between runs, the dashboard health indicator turns red and the failing invariant appears in the invariants tab. You do not have to check manually before every run; the dashboard shows you the state on your morning review.</p>
+
+    <h2 id="overnight">Overnight runs: alerts in practice</h2>
+    <p>Owner alerts become most valuable in <a href="/guides/ai-coding-agents-overnight/">overnight agent runs</a>. When you queue tasks before bed and start 5-20 agents, you want to sleep through routine progress and wake up only if something genuinely needs you. Here is the combined setup:</p>
+
+    <h3>Before starting an overnight run</h3>
+    <ol>
+      <li>Verify the health invariant: <code>alert.channel_can_deliver</code> must be passing.</li>
+      <li>Send a test alert and confirm delivery on push and email.</li>
+      <li>Confirm each agent's CLAUDE.md has the three alert triggers: blocker, scope violation, queue empty.</li>
+    </ol>
+
+    <h3>During the overnight run</h3>
+    <p>Your phone receives a push notification if any agent hits a blocker or a scope issue. For a well-decomposed task queue with good CLAUDE.md guardrails, you should see zero alerts on a typical overnight run: agents complete, queue empties, and you review in the morning.</p>
+    <p>A queue-empty alert means all tasks completed before your review time. This is a good signal: you can queue more before bed, or let the agents rest until morning.</p>
+    <p>A blocker alert at 2am means something genuinely needs you. Check the alert message, peek at the agent's output with <code>amux peek SESSION-NAME</code> from your phone, and either reply with a direction or leave it for the morning. The agent will wait.</p>
+
+    <h3>Morning review</h3>
+    <p>If you received no alerts overnight, open the amux dashboard and triage by board status. If you received alerts, start with those sessions before the routine review. See <a href="/guides/ai-coding-agents-overnight/">Running AI Coding Agents Overnight</a> for the full morning review workflow.</p>
+
+    <h2 id="faq">FAQ</h2>
+
+    <h3>What is an AI agent owner alert?</h3>
+    <p>An owner alert is a push notification and email delivered to the owner of an AI agent fleet when an agent needs human attention. In amux, the agent calls <code>amux alert</code> from inside its task. The server delivers the alert via push notification to the owner's phone and via email simultaneously, with iMessage on Apple devices.</p>
+
+    <h3>What notification channels does amux support for agent alerts?</h3>
+    <p>amux delivers owner alerts to three channels on a single <code>amux alert</code> call: push notifications via the PWA installed on your phone, email via Gmail API or configured SMTP, and iMessage on Apple devices when push notifications are enabled.</p>
+
+    <h3>How do I set up email alerts for AI coding agents?</h3>
+    <p>Add <code>AMUX_OWNER_EMAIL=you@example.com</code> to <code>~/.amux/server.env</code> and restart the server. Optionally add <code>AMUX_ALERT_EMAIL_FROM=alerts@yourdomain.com</code> for a custom sender. Verify with <code>GET /api/health/invariants</code>: <code>alert.channel_can_deliver</code> must be in the passing list.</p>
+
+    <h3>What should trigger an AI agent owner alert?</h3>
+    <p>Three situations reliably warrant an alert: a blocker that will stall progress for more than 30 minutes, an unexpected error in a protected area (auth, payments, migrations), and a completed queue where the agent wants new work. Routine progress belongs on the board. Write the trigger conditions in CLAUDE.md so every agent on the fleet follows the same rules.</p>
+
+    <h3>How do I verify that agent alerts are working?</h3>
+    <p>Check <code>GET /api/health/invariants</code> and confirm <code>alert.channel_can_deliver</code> is passing. Then send a test: <code>amux alert "Test" "pre-run check"</code>. Confirm push arrives on your phone and email lands in your inbox within 30 seconds. The invariant runs continuously; if it fails later, the dashboard marks it red.</p>
+
+    <h3>Can I use polling instead of alerts to monitor AI agents?</h3>
+    <p>Polling via the amux dashboard is good for checking status when you are already looking. Owner alerts handle the case where you are not looking. The two complement each other: polling gives you the state on demand; alerts reach you when something needs you without you asking.</p>
+
+    <h3>How do I prevent agents from sending too many alerts?</h3>
+    <p>Two mechanisms prevent alert spam. First, the server applies a 60-second dedup window: a second identical alert within 60 seconds of the first is dropped silently. Second, write tight trigger conditions in CLAUDE.md so agents only alert on genuine blockers. An agent that alerts on every progress step is a sign the CLAUDE.md triggers need narrowing.</p>
+
+    <div class="cta-box">
+      <h3>Set up owner alerts in 5 minutes</h3>
+      <p>amux ships push notifications, email, and iMessage alerts out of the box. Install amux, add one line to server.env, install the PWA on your phone, and your agents can page you from anywhere.</p>
+      <pre><code>git clone https://github.com/mixpeek/amux &amp;&amp; cd amux &amp;&amp; ./install.sh
+
+# In ~/.amux/server.env:
+# AMUX_OWNER_EMAIL=you@example.com
+
+# Test the channel:
+amux alert "Setup complete" "first alert"</code></pre>
+      <a class="btn btn-primary" href="https://github.com/mixpeek/amux">View amux on GitHub</a>
+    </div>
+  </main>
+  <footer class="sub-footer">
+    <div class="footer-inner">
+      <div class="footer-top">
+        <div class="footer-brand-col">
+          <a href="/" class="footer-logo">amux</a>
+          <p>Open-source control plane for AI agents.</p>
+        </div>
+        <div class="footer-col">
+          <div class="footer-col-label">Resources</div>
+          <ul>
+            <li><a href="/guides/">Guides</a></li>
+            <li><a href="/blog/">Blog</a></li>
+            <li><a href="/demos/">Demos</a></li>
+            <li><a href="/glossary/">Glossary</a></li>
+            <li><a href="/faq/">FAQ</a></li>
+          </ul>
+        </div>
+        <div class="footer-col">
+          <div class="footer-col-label">Related guides</div>
+          <ul>
+            <li><a href="/guides/ai-coding-agents-overnight/">Overnight agent runs</a></li>
+            <li><a href="/guides/getting-started/">Getting started</a></li>
+            <li><a href="/guides/remote-access-tailscale/">Remote access</a></li>
+            <li><a href="/guides/">All guides</a></li>
+          </ul>
+        </div>
+        <div class="footer-col">
+          <div class="footer-col-label">More</div>
+          <ul>
+            <li><a href="/use-cases/">Use Cases</a></li>
+            <li><a href="/compare/">Compare</a></li>
+            <li><a href="/changelog/">Changelog</a></li>
+          </ul>
+        </div>
+      </div>
+      <div class="footer-bottom">
+        <span>MIT License. Built by <a href="https://mixpeek.com">Mixpeek</a></span>
+        <div class="footer-bottom-links">
+          <a href="https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435" target="_blank" rel="noopener">iOS App</a>
+          <a href="https://github.com/mixpeek/amux" target="_blank" rel="noopener">GitHub</a>
+        </div>
+      </div>
+    </div>
+  </footer>
+
+<script>fetch('https://api.github.com/repos/mixpeek/amux').then(function(r){return r.json()}).then(function(d){var el=document.getElementById('gh-stars');if(el&&d.stargazers_count) el.textContent='★ '+d.stargazers_count}).catch(function(){})</script>
+</body>
+</html>

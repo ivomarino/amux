@@ -382,7 +382,7 @@ async fn view(req: Request) -> Response {
 /// ("foo.env") — a FILE named ".env" has no suffix and passes the
 /// extensionless branch, exactly as in python.
 const WRITABLE_EXTS: &[&str] = &[
-    ".md", ".markdown", ".mdx", ".txt", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".sh",
+    ".md", ".markdown", ".mdx", ".mdai", ".txt", ".json", ".yml", ".yaml", ".toml", ".ini", ".cfg", ".sh",
     ".bash", ".zsh", ".py", ".js", ".ts", ".jsx", ".tsx", ".mjs", ".cjs", ".css", ".scss",
     ".less", ".html", ".htm", ".xml", ".svg", ".csv", ".sql", ".graphql", ".proto", ".go", ".rs",
     ".java", ".rb", ".php", ".swift", ".kt", ".c", ".cpp", ".h", ".cs", ".r", ".lua", ".pl",
@@ -2015,6 +2015,23 @@ pub(crate) mod tests {
         assert_eq!(status, StatusCode::OK, "{v}");
         assert_eq!(v["ok"], true);
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
+
+        // A .mdai computed-node file is writable via the normal save path
+        // (AMUX-3256), so the MDAI UI does not need the upload bridge.
+        let mdai = dir.path().join("graph/node.mdai");
+        let (status, _, body) = send(
+            &app,
+            HttpRequest::builder().method("PUT").uri("/api/file")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"path": mdai.to_str().unwrap(), "content": "---\nsources: []\n---\nbody"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status, StatusCode::OK, "mdai must be writable: {v}");
+        assert_eq!(std::fs::read_to_string(&mdai).unwrap(), "---\nsources: []\n---\nbody");
 
         // Unlisted extension → 400 with python's message.
         let exe = dir.path().join("x.exe");

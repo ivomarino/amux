@@ -879,7 +879,10 @@
     display: flex; justify-content: space-between; align-items: center;
     margin-bottom: 8px; flex-shrink: 0;
   }
-  .file-overlay-header h2 { font-size: 1rem; flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-right: 8px; }
+  /* Title bar: file name on top, its folder path underneath, like a file manager. */
+  .file-title-wrap { flex: 1; min-width: 0; margin-right: 8px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }
+  .file-overlay-header h2 { font-size: 1rem; margin: 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.25; }
+  .file-subpath { font-size: 0.68rem; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: 'SF Mono','Fira Code',monospace; }
   /* Desktop: actions lay out inline in the header; the ⋮ menu button is mobile-only. */
   .file-actions { display: contents; }
   .file-menu-btn { display: none; background: none; border: none; color: var(--text); cursor: pointer; font-size: 1.25rem; line-height: 1; padding: 4px 8px; flex-shrink: 0; }
@@ -1025,7 +1028,8 @@
     #peek-session-status, #peek-model-badge { flex-shrink: 0; }
     .file-overlay-header { flex-wrap: nowrap; gap: 6px; align-items: center; position: relative; }
     /* Full title (no more 32vw cutoff) — actions move into the ⋮ menu. */
-    .file-overlay-header h2 { font-size: 0.9rem; flex: 1 1 auto; min-width: 0; max-width: none; margin-right: 4px; }
+    .file-overlay-header .file-title-wrap { flex: 1 1 auto; min-width: 0; max-width: none; margin-right: 4px; }
+    .file-overlay-header h2 { font-size: 0.9rem; min-width: 0; max-width: none; }
     .file-overlay-header .btn { min-width: 40px; min-height: 40px; font-size: 0.95rem; padding: 6px 10px; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; }
     .file-menu-btn { display: inline-flex; align-items: center; justify-content: center; min-width: 40px; min-height: 40px; font-size: 1.35rem; }
     /* Actions become a dropdown anchored under the ⋮ button. */
@@ -1124,19 +1128,20 @@
   #files-body.files-drop-active { outline: 2px dashed var(--accent); outline-offset: -4px; background: color-mix(in srgb, var(--accent) 6%, var(--bg)); }
   /* File explorer redesign */
   .fe-toolbar {
-    display: flex; align-items: center; gap: 4px; padding: 6px 10px;
+    display: flex; align-items: center; gap: 4px; padding: 6px 10px; flex-wrap: wrap;
     border-bottom: 1px solid var(--border); flex-shrink: 0; background: var(--card);
   }
   .fe-tb-btn {
     background: none; border: 1px solid var(--border); border-radius: 5px;
-    color: var(--dim); cursor: pointer; padding: 4px 7px; font-size: 0.75rem;
+    color: var(--dim); cursor: pointer; padding: 4px 8px; font-size: 0.75rem;
     line-height: 1; flex-shrink: 0; transition: background 0.12s, color 0.12s;
-    display: flex; align-items: center; gap: 3px;
+    display: flex; align-items: center; gap: 5px; white-space: nowrap;
   }
   .fe-tb-btn:hover { background: var(--hover); color: var(--text); }
   .fe-tb-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
   .fe-tb-actions { display: contents; }
-  .fe-tb-overflow { position: relative; flex-shrink: 0; display: none; }
+  /* The More (ellipsis) menu is always available, on desktop and mobile. */
+  .fe-tb-overflow { position: relative; flex-shrink: 0; display: flex; }
   .fe-tb-overflow-menu {
     display: none; position: absolute; right: 0; top: calc(100% + 4px); z-index: 200;
     background: var(--card); border: 1px solid var(--border); border-radius: 8px;
@@ -1154,11 +1159,13 @@
   .fe-tb-oitem-session { color: var(--accent); font-weight: 600; }
   .fe-tb-odivider { height: 1px; background: var(--border); margin: 3px 0; }
   @media (max-width: 600px) {
+    /* Primary labeled actions collapse into the More menu; the path bar and the
+       More button are all that stay in the toolbar, so it fits a 375px screen. */
     .fe-tb-actions { display: none; }
-    .fe-tb-overflow { display: flex; }
+    .fe-more-lbl { display: none; }
   }
   .fe-breadcrumb {
-    flex: 1; font-size: 0.8rem; font-family: 'SF Mono','Fira Code',monospace;
+    flex: 1 1 180px; font-size: 0.8rem; font-family: 'SF Mono','Fira Code',monospace;
     overflow-x: auto; white-space: nowrap; padding: 3px 6px;
     background: var(--bg); border: 1px solid var(--border); border-radius: 5px;
     min-width: 0; scrollbar-width: none;
@@ -1194,6 +1201,9 @@
   }
   .fe-row:hover { background: var(--hover, rgba(139,148,158,0.07)); }
   .fe-row:active { background: rgba(88,166,255,0.08); }
+  /* Desktop single-click selection (double-click then opens the file). */
+  .fe-row.fe-selected { background: color-mix(in srgb, var(--accent) 18%, transparent); }
+  .fe-row.fe-selected:hover { background: color-mix(in srgb, var(--accent) 22%, transparent); }
   .fe-row.fe-dir .fe-cell-name { font-weight: 500; }
   .fe-cell-name {
     display: flex; align-items: center; gap: 4px; padding: 4px 6px;
@@ -4769,6 +4779,36 @@
   .metrics-gauge-fill.mid { background: #f0a742; }
   .metrics-gauge-fill.high { background: #f85149; }
   .metrics-section-title { font-size: 0.7rem; font-weight: 600; color: var(--dim); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: 10px; }
+  /* Metrics sub-tabs (System / Disk Cleanup) */
+  .metrics-modebar { display: flex; gap: 6px; margin-bottom: 14px; flex-wrap: wrap; }
+  .metrics-modebtn { background: var(--card); border: 1px solid var(--border); color: var(--dim); border-radius: 7px; padding: 6px 14px; font-size: 0.8rem; font-weight: 600; cursor: pointer; min-height: 34px; }
+  .metrics-modebtn.active { color: var(--text); border-color: var(--accent, #58a6ff); background: rgba(88,166,255,0.10); }
+
+  /* Disk Cleanup (reclaim) */
+  .reclaim-empty { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 22px; }
+  .reclaim-progress { display: flex; gap: 12px; align-items: flex-start; background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; margin-bottom: 14px; }
+  .reclaim-spinner { width: 16px; height: 16px; border: 2px solid var(--border); border-top-color: var(--accent, #58a6ff); border-radius: 50%; animation: reclaim-spin 0.8s linear infinite; flex-shrink: 0; margin-top: 2px; }
+  @keyframes reclaim-spin { to { transform: rotate(360deg); } }
+  .reclaim-curpath { font-family: var(--mono, monospace); font-size: 0.68rem; color: var(--dim); margin-top: 4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .reclaim-warn { border: 1px solid var(--yellow, #e3b341); background: rgba(227,179,65,0.08); border-radius: 8px; padding: 12px 14px; margin-bottom: 16px; font-size: 0.82rem; }
+  .reclaim-code { display: block; margin-top: 6px; font-family: var(--mono, monospace); font-size: 0.74rem; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px; user-select: all; overflow-x: auto; }
+  .reclaim-catcard { cursor: pointer; transition: border-color 0.12s ease; }
+  .reclaim-catcard:hover { border-color: var(--accent, #58a6ff); }
+  .reclaim-catcard.active { border-color: var(--accent, #58a6ff); background: rgba(88,166,255,0.08); }
+  .reclaim-mapbar { display: flex; align-items: center; gap: 10px; margin-bottom: 8px; flex-wrap: wrap; }
+  .reclaim-mappath { font-family: var(--mono, monospace); font-size: 0.74rem; color: var(--text); word-break: break-all; flex: 1; min-width: 0; }
+  .reclaim-map { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; background: var(--card); }
+  .reclaim-map .tm-cell { cursor: pointer; }
+  .reclaim-map .tm-cell:hover rect { fill-opacity: 1; }
+  .reclaim-legend { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0 4px; font-size: 0.68rem; color: var(--dim); }
+  .reclaim-legend-item { display: inline-flex; align-items: center; gap: 4px; }
+  .reclaim-legend-item i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
+  .reclaim-actionbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; background: var(--card); border: 1px solid var(--accent, #58a6ff); border-radius: 8px; padding: 9px 12px; margin-bottom: 10px; font-size: 0.82rem; flex-wrap: wrap; }
+  .reclaim-danger { border-color: var(--red, #f85149) !important; color: var(--red, #f85149) !important; }
+  .reclaim-minibtn { font-size: 0.7rem !important; padding: 3px 9px !important; margin-left: 8px; text-transform: none; letter-spacing: 0; font-weight: 500; min-height: 28px; }
+  .reclaim-upbtn { font-size: 0.74rem; padding: 4px 10px; min-height: 32px; }
+  .metrics-table td input[type=checkbox] { width: 16px; height: 16px; cursor: pointer; }
+
   .metrics-load-row { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }
   .metrics-load-block { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 8px 16px; text-align: center; min-width: 72px; }
   .metrics-load-val { font-size: 1.05rem; font-weight: 700; line-height: 1; }
@@ -4801,6 +4841,21 @@
     .metrics-speedtest-cards { grid-template-columns: repeat(3, 1fr); gap: 8px; }
     .metrics-speedtest-value { font-size: 1.2rem; }
     .metrics-expand-btn { display: flex; }
+    /* Disk Cleanup at phone width: the treemap needs real height to stay
+       readable, and the action bar must not trap its buttons off-screen. */
+    .metrics-modebtn { flex: 1; min-width: 0; min-height: 44px; }
+    /* No fixed svg height here: the map is laid out at its real pixel size in
+       _reclaimRender, so a CSS height that disagreed with the viewBox is what
+       produced the letterboxed band at 390px. */
+    .reclaim-actionbar { flex-direction: column; align-items: stretch; gap: 8px; }
+    .reclaim-actionbar button { width: 100%; min-height: 44px; }
+    .reclaim-legend { gap: 7px; }
+    /* 44px on EVERY control in this tab, not just the ones in the action bar.
+       Measured at 390px: Rescan came out 40px and the treemap "up" button 32px,
+       both under the touch-target floor in .claude/rules/css-mobile.md. The
+       inline padding these carry wins over a class rule, so the floor is set
+       here on the container rather than per-button. */
+    #reclaim-content button, .reclaim-minibtn, .reclaim-upbtn { min-height: 44px; }
   }
 
   /* ── Graph / Mind Map ── */
@@ -5205,4 +5260,175 @@
   .amux-dp-pop.sheet .amux-dp-done,
   .amux-dp-pop.sheet .amux-dp-foot button { min-height: 44px; }
   .amux-dp-trigger { min-height: 40px; }
+}
+
+/* ═══════ MDAI: computed markdown DAG nodes (.mdai) ═══════
+   The global MDAI tab list, the node overlay (output + history + edit), and the
+   Connect picker. Mobile-first: everything is width-fluid and wraps at 375px. */
+#mdai-list { -webkit-overflow-scrolling: touch; }
+.mdai-row {
+  display: flex; align-items: center; gap: 10px; padding: 11px 14px;
+  border-bottom: 1px solid var(--border); cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+.mdai-row:hover { background: var(--card); }
+.mdai-row-icon { flex: 0 0 auto; display: flex; align-items: center; }
+.mdai-row-main { flex: 1; min-width: 0; }
+.mdai-row-title {
+  font-size: 0.86rem; font-weight: 600; color: var(--text);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.mdai-row-path {
+  font-size: 0.68rem; color: var(--dim); font-family: 'SF Mono','Fira Code',monospace;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 1px;
+}
+.mdai-row-meta { font-size: 0.7rem; color: var(--dim); margin-top: 3px; }
+.mdai-row-go { flex: 0 0 auto; color: var(--dim); font-size: 1.1rem; line-height: 1; }
+
+/* Node overlay body (reuses .file-overlay chrome, but normal prose, not mono). */
+.mdai-node-body {
+  flex: 1; overflow: auto; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px;
+  -webkit-overflow-scrolling: touch;
+}
+.mdai-section { margin-bottom: 16px; }
+.mdai-meta { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 8px; }
+.mdai-badge {
+  font-size: 0.66rem; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+  border: 1px solid var(--border); white-space: nowrap;
+}
+.mdai-badge-fresh { color: var(--green); border-color: var(--green); }
+.mdai-badge-cached { color: var(--dim); }
+.mdai-badge-model { color: var(--purple, #a371f7); border-color: var(--purple, #a371f7); font-family: 'SF Mono','Fira Code',monospace; }
+.mdai-meta-time { font-size: 0.7rem; color: var(--dim); }
+.mdai-histnav { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.mdai-hbtn {
+  background: none; border: 1px solid var(--border); border-radius: 6px;
+  color: var(--text); font-size: 0.74rem; padding: 5px 10px; cursor: pointer;
+  min-height: 32px;
+}
+.mdai-hbtn:disabled { opacity: 0.4; cursor: default; }
+.mdai-hpos { font-size: 0.72rem; color: var(--dim); }
+.mdai-output {
+  background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 14px; overflow-wrap: anywhere;
+}
+.mdai-output > *:first-child { margin-top: 0; }
+.mdai-output > *:last-child { margin-bottom: 0; }
+.mdai-err {
+  background: rgba(248,81,73,0.12); border: 1px solid var(--red); border-radius: 8px;
+  color: var(--red); padding: 10px 12px; font-size: 0.82rem; margin-bottom: 14px;
+  overflow-wrap: anywhere;
+}
+.mdai-err-cycle { margin-top: 6px; font-family: 'SF Mono','Fira Code',monospace; font-size: 0.72rem; }
+.mdai-edit { border-top: 1px solid var(--border); padding-top: 12px; }
+.mdai-edit-h { font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.04em; color: var(--dim); margin-bottom: 8px; }
+.mdai-note { font-size: 0.78rem; color: var(--dim); line-height: 1.5; margin-bottom: 8px; }
+.mdai-note a { color: var(--accent); }
+.mdai-edge { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 8px; }
+.mdai-edge-path { font-size: 0.74rem; font-family: 'SF Mono','Fira Code',monospace; color: var(--purple, #a371f7); word-break: break-all; margin-bottom: 6px; }
+.mdai-prompt, .mdai-body-ta {
+  width: 100%; box-sizing: border-box; background: var(--bg); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px;
+  font-size: 0.82rem; line-height: 1.45; resize: vertical; font-family: inherit;
+  outline: none;
+}
+.mdai-prompt:focus, .mdai-body-ta:focus { border-color: var(--accent); }
+.mdai-edge-prompt-ro { font-size: 0.8rem; color: var(--text); white-space: pre-wrap; overflow-wrap: anywhere; }
+.mdai-edge-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }
+.mdai-sbtn {
+  background: var(--accent); color: #fff; border: none; border-radius: 6px;
+  font-size: 0.74rem; font-weight: 600; padding: 6px 12px; cursor: pointer; min-height: 32px;
+}
+.mdai-sbtn-danger { background: none; color: var(--red); border: 1px solid var(--border); }
+
+/* Connect picker (a modal list of .mdai targets). */
+.mdai-picker-overlay {
+  position: fixed; inset: 0; background: rgba(1,4,9,0.6); z-index: 400;
+  display: flex; align-items: center; justify-content: center; padding: 16px;
+  padding-top: max(16px, env(safe-area-inset-top)); padding-bottom: max(16px, env(safe-area-inset-bottom));
+}
+.mdai-picker {
+  background: var(--bg); border: 1px solid var(--border); border-radius: 12px;
+  width: 100%; max-width: 460px; max-height: 80vh; display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.mdai-picker-h {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 12px 14px; border-bottom: 1px solid var(--border); font-size: 0.86rem;
+}
+.mdai-picker-h b { color: var(--purple, #a371f7); }
+.mdai-picker-x { background: none; border: none; color: var(--dim); font-size: 1rem; cursor: pointer; padding: 4px 8px; min-height: 36px; min-width: 36px; }
+.mdai-picker-list { overflow-y: auto; flex: 1; -webkit-overflow-scrolling: touch; }
+.mdai-picker-item {
+  display: flex; align-items: center; gap: 10px; width: 100%; text-align: left;
+  background: none; border: none; border-bottom: 1px solid var(--border);
+  padding: 11px 14px; cursor: pointer; color: var(--text);
+}
+.mdai-picker-item:hover { background: var(--card); }
+.mdai-picker-item-main { flex: 1; min-width: 0; }
+.mdai-picker-item-title { display: block; font-size: 0.84rem; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdai-picker-item-path { display: block; font-size: 0.68rem; color: var(--dim); font-family: 'SF Mono','Fira Code',monospace; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mdai-picker-foot { padding: 10px 14px; border-top: 1px solid var(--border); }
+@media (max-width: 600px) {
+  .mdai-picker { max-height: 88vh; }
+  .mdai-row { padding: 12px 12px; }
+  /* Touch targets >= 44px on mobile (css-mobile rule). */
+  .mdai-hbtn, .mdai-sbtn, .mdai-picker-x { min-height: 44px; }
+  .mdai-edge-actions { gap: 8px; }
+}
+
+/* Uniform provider transcript (AMUX-3201): codex/ollama rendered Claude-like.
+   Fluid width + word-break so it reads at 375px (css-mobile rule). */
+.ut-wrap { font-size: 0.82rem; line-height: 1.5; color: var(--text); padding-bottom: 8px; }
+.ut-user {
+  background: var(--card); border-left: 3px solid var(--accent);
+  border-radius: 4px; padding: 8px 10px; margin: 10px 0;
+  white-space: normal; overflow-wrap: anywhere; word-break: break-word;
+}
+.ut-msg { display: flex; gap: 8px; margin: 8px 0; align-items: flex-start; }
+.ut-tool-msg { flex-direction: column; gap: 4px; }
+.ut-dot { flex: 0 0 auto; line-height: 1.5; font-size: 0.7rem; }
+.ut-dot-a { color: var(--text); }
+.ut-dot-t { color: #3fb950; }
+.ut-body { flex: 1; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
+.ut-reason {
+  color: var(--dim); font-style: italic; margin: 6px 0 6px 4px;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.ut-reason-lbl {
+  font-style: normal; font-size: 0.62rem; text-transform: uppercase;
+  letter-spacing: 0.06em; opacity: 0.7; margin-right: 4px;
+}
+.ut-toolhead { display: flex; flex-wrap: wrap; gap: 6px; align-items: baseline; }
+.ut-tool { font-weight: 700; color: #3fb950; }
+.ut-tool-arg {
+  color: var(--dim); font-family: 'SF Mono','Fira Code',monospace; font-size: 0.74rem;
+  overflow-wrap: anywhere; word-break: break-word;
+}
+.ut-out {
+  margin: 2px 0 4px 16px; padding: 6px 8px; background: var(--bg);
+  border: 1px solid var(--border); border-radius: 4px;
+  font-family: 'SF Mono','Fira Code',monospace; font-size: 0.72rem;
+  color: var(--dim); white-space: pre-wrap; overflow-wrap: anywhere; word-break: break-word;
+  max-height: 220px; overflow-y: auto;
+}
+.ut-code { font-family: 'SF Mono','Fira Code',monospace; font-size: 0.76rem;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 3px; padding: 0 3px; }
+.ut-plan {
+  border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; margin: 10px 0;
+  background: var(--card);
+}
+.ut-plan-title {
+  font-weight: 700; font-size: 0.7rem; text-transform: uppercase;
+  letter-spacing: 0.06em; color: var(--dim); margin-bottom: 6px;
+}
+.ut-plan-row { display: flex; gap: 8px; align-items: flex-start; margin: 3px 0;
+  overflow-wrap: anywhere; word-break: break-word; }
+.ut-plan-mark { flex: 0 0 auto; }
+.ut-plan-done { color: var(--dim); text-decoration: line-through; }
+.ut-plan-active { color: var(--text); font-weight: 600; }
+@media (max-width: 600px) {
+  .ut-wrap { font-size: 0.8rem; }
+  .ut-out { margin-left: 8px; }
 }

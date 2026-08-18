@@ -726,6 +726,13 @@ pub(crate) async fn accountability_tick(state: &AppState) {
 
     let mut sent = 0usize;
     for (worker, msgs, snippet) in gaps {
+        // ISOLATED (AMUX-3232): a raw agent leaves no board trace on purpose and
+        // has no session/URL to open a card, so the accountability nudge would be
+        // both impossible to satisfy and harness noise inside a lane meant to run
+        // untouched. Skip it, reading the same source of truth the spawn path reads.
+        if crate::api::session_verbs::session_is_isolated(&worker) {
+            continue;
+        }
         let last = nudged.get(&worker).copied().unwrap_or(0);
         if now - last < cooldown_s {
             continue; // within cooldown — one nudge/day, not one/tick

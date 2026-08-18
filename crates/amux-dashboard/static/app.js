@@ -429,6 +429,7 @@ let filterStatuses = new Set();    // 'working' | 'waiting' | 'idle' | 'stopped'
 // Stable status key for filtering: card WORKING = 'active' internally.
 function _sessStatusKey(s) {
   if (!s.running) return 'stopped';
+  if (s.status === 'rate_limited') return 'rate_limited';
   if (s.status === 'active') return 'working';
   if (s.status === 'waiting') return 'waiting';
   return 'idle';
@@ -493,13 +494,44 @@ function _peekKickFast() {
   if (peekSession && !document.hidden) _schedulePeekPoll();
 }
 let _peekPollGen = 0;
+// Raw timer clear, used on every reschedule, so it must stay beacon-free.
 function _stopPeekPoll() { _peekPollGen++; if (peekTimer) { clearTimeout(peekTimer); peekTimer = null; } }
+// Open-view poller lifecycle beacon (AMUX-3242, two-fixes rule): a leaked or
+// wedged open-view poller must be visible in /api/client-debug rather than
+// silent. We beacon only the real transitions (start / stop with target
+// session), NOT the per-tick reschedule, so a stuck poller shows a 'start' with
+// no matching 'stop'. _peekPollActive tracks the transition; _peekPollSession
+// remembers the target so a 'stop' after peekSession was cleared still names it.
+let _peekPollActive = false;
+let _peekPollSession = null;
+function _peekPollBeacon(action, session, extra) {
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify(Object.assign({ kind: 'peek-poll', action, session: session || null,
+        ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?'), hidden: document.hidden ? 1 : 0 }, extra || {}))
+    }).catch(() => {});
+  } catch (e) {}
+}
+// Lifecycle STOP: the poller truly winds down (view closed, switched, or the tab
+// backgrounded). Distinct from the per-tick _stopPeekPoll() above; this is the
+// one that beacons, so start/stop pair up.
+function _peekPollStop(reason) {
+  _stopPeekPoll();
+  if (_peekPollActive) { _peekPollBeacon('stop', _peekPollSession, { reason: reason || 'stop' }); _peekPollActive = false; _peekPollSession = null; }
+}
 let _peekLastFullMs = 0;    // when the FULL payload (history) was last fetched
 let _peekPrevStatus = '';   // peeked session's status on the previous poll tick
 const _PEEK_HISTORY_REFRESH_MS = 30000;  // fallback full-refresh cadence while open
 function _schedulePeekPoll() {
   _stopPeekPoll();
-  if (!peekSession || document.hidden) return;
+  if (!peekSession || document.hidden) {
+    // Winding down (no open peek, or tab backgrounded): close out the lifecycle
+    // so the start/stop beacons pair up.
+    if (_peekPollActive) { _peekPollBeacon('stop', _peekPollSession, { reason: document.hidden ? 'hidden' : 'no-session' }); _peekPollActive = false; _peekPollSession = null; }
+    return;
+  }
+  if (!_peekPollActive) { _peekPollActive = true; _peekPollSession = peekSession; _peekPollBeacon('start', peekSession, { interval_ms: _peekPollInterval() }); }
   const gen = _peekPollGen;
   peekTimer = setTimeout(async () => {
     peekTimer = null;
@@ -512,6 +544,11 @@ function _schedulePeekPoll() {
       const needFull = turnEnded || (performance.now() - _peekLastFullMs > _PEEK_HISTORY_REFRESH_MS);
       await refreshPeek(!needFull);
       _peekUpdateBranch();
+      // Keep the open view's STATUS indicator live too, not just the log. The
+      // session status arrives via the sessions array (SSE or the polling
+      // fallback); refreshPeek repaints the log, this repaints the badge, so a
+      // flip to "needs input" shows without closing and reopening the view.
+      if (typeof updatePeekStatus === 'function') updatePeekStatus();
     } catch(e) {}
     if (gen !== _peekPollGen) return;
     _schedulePeekPoll();
@@ -2577,6 +2614,7 @@ function updatePeekStatus() {
   // trade off, the phone wins.
   if (s.status === 'active')  badge = '<span class="status-badge active">working</span>' + _agentsChip(s);
   else if (s.status === 'waiting') badge = '<span class="status-badge waiting"' + _waitingTitle(s) + '>' + _waitingLabel(s) + '</span>';
+  else if (s.status === 'rate_limited') badge = '<span class="status-badge rate-limited">rate limited</span>';
   else if (s.status === 'idle')    badge = '<span class="status-badge idle">idle</span>';
   else if (!s.running)             badge = '<span class="status-badge" style="background:rgba(255,255,255,0.06);color:var(--dim);border:1px solid var(--border);">stopped</span>';
   if (s.rate_limited_until) {
@@ -2955,6 +2993,7 @@ function render() {
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','model','${escJs(model||"")}','${escJs(provider)}')"><span class="mi">&#x2699;</span> Model${model ? ': '+esc(model) : ''}</div>
           ${provider === 'claude' ? `<div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','effort','${escJs(effort||"")}','${escJs(provider)}')"><span class="mi">&#x1F9E0;</span> Effort${effort ? ': '+esc(effort) : ' (default)'}</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();toggleYolo('${s.name}')"><span class="mi">${isYolo?'&#x2611;':'&#x2610;'}</span> YOLO mode</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleIsolated('${s.name}')" title="Run as a raw agent: just tmux plus the CLI, no amux harness, hidden from peers. The owner can still peek and send."><span class="mi">${s.isolated?'&#x2611;':'&#x2610;'}</span> Isolated (raw agent, no amux harness)</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','desc','${escJs(s.desc||"")}')"><span class="mi">&#x1F4DD;</span> Description</div>
           ${/* field is 'tags', the INTERNAL name — b009f6e's vocab pass renamed
                this argument to 'groups' as if it were a display string, and
@@ -2982,7 +3021,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
               that hits the banner never fires Stop and the active latch keeps
               claiming work). The payload now only reports FUTURE limits, so when
               rate_limited_until is set it is the true state and it supersedes
-              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
+              the status badge outright (AMUX-2566). */ ''}          ${s.rate_limited_until ? '' : `${s.status === 'rate_limited' ? '<span class="status-badge rate-limited" title="Hit a usage limit (on credits or waiting for reset)">rate limited</span>' : ''}${s.status === 'active' ? '<span class="status-badge active">working</span>' + _agentsChip(s) : ''}
           ${s.status === 'waiting' ? `<span class="status-badge waiting"${_waitingTitle(s)}>${_waitingLabel(s)}</span>${_stalledFor(s)}` : ''}
           ${s.status === 'idle' ? '<span class="status-badge idle">idle</span>' : ''}`}
           ${s.rate_limited_until ? `<span class="status-badge rate-limited" title="${s.rate_limit_weekly ? 'Weekly limit' : 'Rate-limited'} — auto-resume at ${_fmtResetTime(s.rate_limited_until)}">${s.rate_limit_weekly ? 'Weekly limit until' : 'Rate-limited until'} ${_fmtResetTime(s.rate_limited_until)}</span>` : ''}
@@ -3673,6 +3712,7 @@ const ALL_TABS = [
   { id: 'calendar',      label: 'Calendar' },
   { id: 'scheduler',     label: 'Scheduler' },
   { id: 'files',         label: 'Files' },
+  { id: 'mdai',          label: 'MDAI' },
   { id: 'proxies',       label: 'Proxies' },
   { id: 'logs',          label: 'Logs' },
   { id: 'browser',       label: 'Browser' },
@@ -4338,24 +4378,21 @@ function updateRateLimitPill() {
   if (!pill || !txt) return;
   const blocked = sessions.filter(s => s.rate_limited_until);
   const credit = sessions.filter(s => s.credit_limited);
-  if (!blocked.length && !credit.length) {
+  const n = blocked.length + credit.length;
+  if (!n) {
     pill.classList.remove('show');
     return;
   }
-  if (blocked.length) {
-    // All sessions on one account share a reset time; show the earliest if
-    // they drift, and indicate "N of M" so the user sees the fleet picture.
-    const earliest = Math.min(...blocked.map(s => s.rate_limited_until));
-    const total = sessions.filter(s => !s.archived).length || blocked.length;
-    txt.textContent = blocked.length + ' of ' + total +
-      ' rate-limited, reset ' + _fmtClockTime(earliest) +
-      (credit.length ? ' · ' + credit.length + ' model-limited' : '');
-  } else {
-    // Credit/model limits only — no reset time; the fix is a model switch.
-    txt.textContent = credit.length + ' worker' + (credit.length>1?'s':'') +
-      ' hit a model limit — switch model (Bulk actions)';
-  }
-  pill.title = blocked.concat(credit).map(s => s.name).join(', ');
+  // COMPACT CHIP (Ethan, 2026-08-16). The old verbose "N workers hit a model
+  // limit, switch model" text stretched this chip into a fleet-wide red
+  // banner. Now it is just a count: "N limited" (plus the shared reset time when
+  // one is known), and tapping it jumps to the first limited worker. The full
+  // breakdown and the model-switch fix stay on the per-worker badge and its title,
+  // so the header no longer shouts.
+  txt.textContent = blocked.length
+    ? n + ' limited · reset ' + _fmtClockTime(Math.min(...blocked.map(s => s.rate_limited_until)))
+    : n + ' limited';
+  pill.title = blocked.concat(credit).map(s => s.name).join(', ') + ' (tap to jump)';
   pill.classList.add('show');
 }
 function _scrollToFirstRateLimited() {
@@ -4411,6 +4448,9 @@ function _orchReset() {
   _orchShowStep('record');
   _orchStatus('Tap the mic and speak a command for the fleet');
   document.getElementById('orch-mic')?.classList.remove('recording');
+  // Clear the text path's field too (AMUX-3234), so a fresh open / start-over
+  // does not carry the previous command's pasted text.
+  const typed = document.getElementById('orch-typed'); if (typed) typed.value = '';
 }
 function _orchStatus(t) { const s = document.getElementById('orch-status'); if (s) s.textContent = t; }
 function _orchToggleRec() { if (_orchRecording) _orchStopRec(false); else _orchStartRec(); }
@@ -4490,6 +4530,18 @@ async function _orchTranscribe() {
     _orchShowStep('transcript');
     if ((d.text || '').trim()) _orchPlan();   // auto-route; the transcript stays editable for a re-route
   } catch (e) { _orchStatus('Transcription failed: ' + (e.message || 'error') + ' — tap the mic to retry'); }
+}
+// Text path (AMUX-3234): route typed / pasted text through the SAME flow the
+// dictation transcript takes. It writes the text into #orch-transcript (the one
+// field _orchPlan reads) and calls _orchPlan, so amux infers the intent, finds
+// the workers, drafts the per-worker commands, and the user APPROVES before
+// anything sends. Nothing downstream changes; this is only another way in.
+function _orchTextRoute() {
+  const typed = (document.getElementById('orch-typed')?.value || '').trim();
+  if (!typed) { showToast('Type or paste a command first'); return; }
+  const el = document.getElementById('orch-transcript');
+  if (el) el.value = typed;   // the transcript stays editable for a re-route
+  _orchPlan();                // identical infer-find-draft-approve path
 }
 async function _orchPlan() {
   const transcript = (document.getElementById('orch-transcript')?.value || '').trim();
@@ -4991,6 +5043,26 @@ async function togglePin(session) {
   await fetchSessions();
 }
 
+// Isolated (raw agent, no amux harness), AMUX-3232. Persists CC_ISOLATED via
+// the same config PATCH every other worker flag uses; the server strips the
+// harness (AMUX_SESSION/URL env, self-report hooks, --mcp-config) and hides the
+// worker from peers at the NEXT spawn, so the toast says restart to apply. Paint
+// the flip immediately like togglePin, then let fetchSessions be the truth.
+async function toggleIsolated(session) {
+  closeAllMenus();
+  const s = sessions.find(x => x.name === session);
+  const was = s ? !!s.isolated : null;
+  const next = !(was || false);
+  if (s) { s.isolated = next; lastSessionsJSON = ''; render(); }
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ isolated: next })
+  });
+  if (!r && s && was !== null) { s.isolated = was; lastSessionsJSON = ''; render(); }
+  else if (r) { showToast(next ? 'Isolated on (raw agent). Restart the worker to apply.' : 'Isolated off. Restart the worker to apply.'); }
+  await fetchSessions();
+}
+
 async function clearScrollback(session) {
   closeAllMenus();
   await apiCall(API + '/api/sessions/' + session + '/keys', {
@@ -5236,6 +5308,19 @@ function hidePeekLoading() {
 
 async function doSend(name, text) {
   showSendingIndicator();
+  // OPTIMISTIC STATUS (Ethan, 2026-08-16: "very snappy"). Flip to working the
+  // instant a command is sent, before the UserPromptSubmit hook + SSE round-trip
+  // confirms it. The server now pushes a Session SSE event on the hook report, so
+  // this optimism is corrected/confirmed within a beat; if the send is refused
+  // (409 not running) the next fetch resets it.
+  try {
+    const s = (typeof sessions !== 'undefined' && sessions.find) ? sessions.find(x => x.name === name) : null;
+    if (s && s.status !== 'active' && s.status !== 'rate_limited') {
+      s.status = 'active'; s.running = true;
+      if (typeof render === 'function') render();
+      if (typeof updatePeekStatus === 'function' && typeof peekSession !== 'undefined' && peekSession === name) updatePeekStatus();
+    }
+  } catch (e) {}
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
   const isSlashCmd = /^\/[a-z]/.test(text.trim());
   amuxTrack('message_sent', { session: name, is_slash: isSlashCmd, cmd: isSlashCmd ? text.trim().split(/\s+/)[0] : null, length: text.length });
@@ -5492,6 +5577,57 @@ let _peekTab = 'terminal';
 let _peekGitData = null;
 let _transcriptTimer = null;
 
+// ── Uniform provider transcript (AMUX-3201) ──────────────────────────────
+// Codex/Ollama run a native TUI whose raw mirror looks nothing like Claude
+// (Ethan's screenshot: "Updated Plan", "qwen3.8:27b low"). The server projects
+// each worker's on-disk rollout into a provider-agnostic TranscriptEvent stream
+// (opencode/events.rs), and this draws it the way Claude's transcript reads:
+// user turns, assistant prose, reasoning, tool calls with output, and the
+// update_plan checklist. One renderer, so a future provider that emits the same
+// events renders identically with no new client code.
+function _utInline(s) {
+  // Safe minimal markdown: escape FIRST, then bold + inline code, then newlines.
+  let h = esc(String(s));
+  h = h.replace(/`([^`\n]+)`/g, '<code class="ut-code">$1</code>');
+  h = h.replace(/\*\*([^*\n]+?)\*\*/g, '<strong>$1</strong>');
+  return h.replace(/\n/g, '<br>');
+}
+function _utPlanMark(status) {
+  if (status === 'completed') return '☑';      // ☑
+  if (status === 'in_progress') return '◐';    // ◐
+  return '☐';                                   // ☐
+}
+function renderUniformTranscript(events) {
+  if (!events || !events.length) return '';
+  const out = [];
+  for (const ev of events) {
+    if (ev.kind === 'user') {
+      out.push('<div class="ut-user">' + _utInline(ev.text) + '</div>');
+    } else if (ev.kind === 'assistant') {
+      out.push('<div class="ut-msg"><span class="ut-dot ut-dot-a">⏺</span>'
+        + '<div class="ut-body">' + _utInline(ev.text) + '</div></div>');
+    } else if (ev.kind === 'reasoning') {
+      out.push('<div class="ut-reason"><span class="ut-reason-lbl">thinking</span> '
+        + _utInline(ev.text) + '</div>');
+    } else if (ev.kind === 'tool') {
+      let head = '<span class="ut-dot ut-dot-t">⏺</span><span class="ut-tool">' + esc(ev.tool) + '</span>';
+      if (ev.detail) head += '<span class="ut-tool-arg">' + esc(ev.detail) + '</span>';
+      let block = '<div class="ut-toolhead">' + head + '</div>';
+      if (ev.output) block += '<pre class="ut-out">' + esc(ev.output) + '</pre>';
+      out.push('<div class="ut-msg ut-tool-msg">' + block + '</div>');
+    } else if (ev.kind === 'plan') {
+      const rows = (ev.steps || []).map(function(s) {
+        const cls = s.status === 'completed' ? 'ut-plan-done'
+          : (s.status === 'in_progress' ? 'ut-plan-active' : '');
+        return '<div class="ut-plan-row ' + cls + '"><span class="ut-plan-mark">'
+          + _utPlanMark(s.status) + '</span><span>' + esc(s.step) + '</span></div>';
+      }).join('');
+      out.push('<div class="ut-plan"><div class="ut-plan-title">Updated Plan</div>' + rows + '</div>');
+    }
+  }
+  return out.join('');
+}
+
 // ── Transcript tab: clean JSONL conversation history ──
 async function loadPeekTranscript(showLoading) {
   const body = document.getElementById('peek-transcript-body');
@@ -5503,6 +5639,25 @@ async function loadPeekTranscript(showLoading) {
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/transcript');
     const d = await r.json();
     if (_peekTab !== 'transcript' || peekSession !== name) return;
+    // Codex/Ollama: the server sends the uniform structured event stream, which
+    // we render Claude-like. Claude keeps its server-rendered ANSI `output`.
+    if (d.events) {
+      if (!d.events.length) {
+        body.innerHTML = '<div style="color:var(--dim);padding:20px;">No structured transcript yet for this '
+          + esc(d.provider || 'worker') + ' worker. The <a href="#" onclick="event.preventDefault();setPeekTab(\'terminal\')" style="color:var(--accent);">Terminal</a> tab shows the live view.</div>';
+        if (status) status.textContent = '';
+        return;
+      }
+      const atBottom = _isScrolledToBottom(body);
+      const html = '<div class="ut-wrap">' + renderUniformTranscript(d.events) + '</div>';
+      if (html !== body._lastHTML) {
+        body._lastHTML = html;
+        body.innerHTML = html;
+        if (atBottom) body.scrollTop = body.scrollHeight;
+      }
+      if (status) status.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · ' + esc(d.provider || 'codex') + ' rollout';
+      return;
+    }
     if (d.empty || !d.output) {
       body.innerHTML = '<div style="color:var(--dim);padding:20px;">No JSONL transcript found for this worker.</div>';
       if (status) status.textContent = '';
@@ -7619,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.650';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.668';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7805,8 +7960,8 @@ function _offlineCacheInfo() {
 function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
   _peekHistoryRaw = cached.history || '';
-  _peekHistoryHTML = cached.histHTML || (cached.history ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.history)))) : '');
-  _lastLiveHTML = cached.liveHTML || (cached.output ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output)))) : '');
+  _peekHistoryHTML = cached.histHTML || (cached.history ? _peekHtml(cached.history) : '');
+  _lastLiveHTML = cached.liveHTML || (cached.output ? _peekHtml(cached.output) : '');
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
@@ -7816,7 +7971,7 @@ function _paintCachedPeek(cached) {
 }
 function openPeek(name, opts) {
   try { _applyPeekTabVisibility(); } catch(e) {}
-  _stopPeekPoll();
+  _peekPollStop('switch');   // wind down any prior open-view poller (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   const _tb = document.getElementById('peek-transcript-body');
   if (_tb) { _tb.innerHTML = ''; _tb._lastHTML = null; }
@@ -7907,6 +8062,16 @@ function openPeek(name, opts) {
     if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
   });
   _peekUpdateTabCounts();
+  // AMUX-3201: a codex/ollama peek opens straight to the Claude-like structured
+  // transcript rather than the raw native TUI (Ethan's complaint). The Terminal
+  // tab stays one tap away as the raw-terminal toggle. Guarded: a hidden
+  // Transcript tab, a non-codex provider, or a missing helper is a no-op that
+  // leaves openPeek's default terminal view untouched.
+  try {
+    const _pv = _peekSess ? sessionProvider(_peekSess) : 'claude';
+    const _hidden = (typeof peekHiddenTabs !== 'undefined' && peekHiddenTabs.has) ? peekHiddenTabs.has('transcript') : false;
+    if ((_pv === 'codex' || _pv === 'ollama') && !_hidden) setPeekTab('transcript');
+  } catch (e) {}
   loadPeekCommitGuard(name);
   updateConnectionStatus();
   const peekOv = document.getElementById('peek-overlay');
@@ -8087,7 +8252,7 @@ function closePeek() {
     document.body.style.width = '';
     window.scrollTo(0, _peekScrollLockY || 0);
   }
-  _stopPeekPoll();
+  _peekPollStop('close');   // open-view poller stops when the view closes (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   sessionStorage.removeItem('peekState');
 }
@@ -8779,58 +8944,92 @@ function _osc8Resolve(html, urls) {
     .replace(/\uE000\d+\uE001|\uE002/g, '');
 }
 
-function linkifyOutput(text) {
-  // Split text into segments: URLs, file paths, and plain text
-  // URL regex: match http/https URLs
-  const urlRe = /https?:\/\/[^\s<>\]\)'"`,;]+/g;
-  // File path regex: absolute paths or relative paths with extensions
-  const fileRe = /(?:^|[\s(])((\/[\w./-]+(?:\.\w+)(?::[\d]+)?)|(\.\/[\w./-]+(?:\.\w+)(?::[\d]+)?))/gm;
+// Resolve a path as it appeared in a session's OUTPUT into something the file
+// APIs can use. Output is written from the worker's cwd, so `customers/rothco/
+// data/x.csv` is only meaningful relative to that session's dir — which is what
+// `peekSessionDir` holds. An absolute path is returned untouched.
+function _resolveOutputPath(p) {
+  const raw = String(p || '').replace(/:\d+$/, '');   // strip a trailing :linenum
+  if (raw.startsWith('/')) return raw;
+  const base = (typeof peekSessionDir === 'string' && peekSessionDir) ? peekSessionDir.replace(/\/+$/, '') : '';
+  const rel = raw.replace(/^\.\//, '');
+  return base ? base + '/' + rel : rel;
+}
 
-  const parts = [];
-  let last = 0;
+// Click target for a path in session output: open the FILE BROWSER at it.
+//
+// The browser is a directory view, so a file path opens its containing folder —
+// you land looking at the file, in context, with the session's shortcuts loaded
+// and the "back to <session>" affordance wired up. A path with no extension in
+// its last segment is treated as a directory and opened directly.
+//
+// Deliberately the browser rather than the file-preview overlay: peek output is
+// most often naming a file so you can go LOOK at it and what is around it, and
+// the browser is reachable from a preview while the reverse costs a round trip.
+function _openPathFromOutput(p) {
+  if (window.getSelection && String(window.getSelection()) !== '') return;  // a drag-select is not a click
+  const full = _resolveOutputPath(p);
+  const lastSeg = full.slice(full.lastIndexOf('/') + 1);
+  const looksLikeFile = /\.[A-Za-z0-9]{1,8}$/.test(lastSeg);
+  const dir = looksLikeFile ? (full.slice(0, full.lastIndexOf('/')) || '/') : full;
+  openExplore(dir, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
+}
 
-  // First pass: find all URLs
-  const matches = [];
-  let m;
-  while ((m = urlRe.exec(text)) !== null) {
-    // Strip trailing punctuation that's likely not part of URL
-    let url = m[0].replace(/[.,;:!?)]+$/, '');
-    matches.push({ start: m.index, end: m.index + url.length, type: 'url', value: url });
-  }
+// Turn file paths in ALREADY-ESCAPED peek HTML into links to the file browser.
+//
+// Replaces a `linkifyOutput` that had ZERO callers — it was written for this
+// surface (its `.file-link`/`.md-link` classes are styled under `.overlay-body`,
+// which is exactly `#peek-body`'s class) and was never wired into the pipeline,
+// so every path in every session's output has always rendered as dead text.
+// Capability that reaches nobody does not improve when anything else does.
+//
+// It also could not have matched the reported case. Its regex required a leading
+// `/` or `./`, and real output says `Contacts are in customers/rothco/data/
+// jewishlink-prospects.csv.` — a BARE relative path, which is how a worker
+// naturally writes a path inside its own cwd.
+//
+// Runs on escaped HTML so it composes AFTER the URL/OSC-8 linkification that
+// ansiToHtml already did, using the same `(?![^<]*>)` tail-guard as _linkifyUrls
+// to skip anything sitting inside a tag's attributes.
+function _linkifyPaths(safeHtml) {
+  try {
+    // Leading boundary is CAPTURED and re-emitted rather than matched by a
+    // lookbehind: iOS Safari is the primary client here and this keeps the
+    // pattern portable. The class deliberately excludes `/`, `:`, `.`, `@` and
+    // word characters, which is what stops a URL's own path (`https://h/a/b.js`)
+    // being re-linkified inside the anchor ansiToHtml just built for it.
+    // `(?:\.?\/)?` covers all three shapes seen in real output: `/abs/x.py`,
+    // `./rel/x.py` and the bare `customers/rothco/data/x.csv` that started this.
+    // The segment class excludes quotes on purpose — a path containing `'` would
+    // break out of the inline onclick below, so such a path is simply not linked
+    // rather than linked unsafely.
+    const RE = /(^|[\s(\[>"'`,;=])((?:\.?\/)?(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})(:\d+)?(?![^<]*>)/gm;
+    return String(safeHtml).replace(RE, (m, pre, path, line) => {
+      // Trailing sentence punctuation is prose, not filename: "…prospects.csv."
+      let p = path, tail = line || '';
+      const dot = p.match(/\.$/);
+      if (dot) { p = p.slice(0, -1); tail = '.' + tail; }
+      if (!/\.[A-Za-z0-9]{1,8}$/.test(p)) return m;
+      // A RELATIVE path is only meaningful against the session's cwd. With no
+      // cwd we cannot resolve it, and linking it anyway would render text that
+      // looks clickable and does nothing — the precise failure this file already
+      // records for the OSC-8 hyperlinks above. Leave it as plain text instead.
+      if (!p.startsWith('/') && !(typeof peekSessionDir === 'string' && peekSessionDir)) return m;
+      const cls = /\.md$/i.test(p) ? 'md-link' : 'file-link';
+      const shown = p + (line || '');
+      return pre + '<span class="' + cls + '" title="Open in the file browser: '
+        + esc(_resolveOutputPath(p)) + '" onclick="event.preventDefault();event.stopPropagation();'
+        + "_openPathFromOutput('" + escJs(p) + "')" + '">' + esc(shown) + '</span>'
+        + (dot ? '.' : '');
+    });
+  } catch (e) { return safeHtml; }
+}
 
-  // Second pass: find file paths (skip if overlapping with URL)
-  while ((m = fileRe.exec(text)) !== null) {
-    const path = m[1];
-    const pathStart = m.index + m[0].indexOf(path);
-    const pathEnd = pathStart + path.length;
-    const overlaps = matches.some(x => pathStart < x.end && pathEnd > x.start);
-    if (!overlaps) {
-      matches.push({ start: pathStart, end: pathEnd, type: 'file', value: path });
-    }
-  }
-
-  matches.sort((a, b) => a.start - b.start);
-
-  // Build HTML
-  let html = '';
-  for (const match of matches) {
-    if (match.start > last) {
-      html += esc(text.slice(last, match.start));
-    }
-    if (match.type === 'url') {
-      html += `<a href="${esc(match.value)}" target="_blank" rel="noopener noreferrer">${esc(match.value)}</a>`;
-    } else if (match.type === 'file') {
-      const rawPath = match.value.replace(/:[\d]+$/, '');  // strip :linenum
-      const isMd = /\.md$/i.test(rawPath);
-      const cls = isMd ? 'md-link' : 'file-link';
-      html += `<span class="${cls}" onclick="if(window.getSelection().toString())return;event.preventDefault();event.stopPropagation();openFilePreview('${esc(rawPath)}')">${esc(match.value)}</span>`;
-    }
-    last = match.end;
-  }
-  if (last < text.length) {
-    html += esc(text.slice(last));
-  }
-  return rewriteLocalhostUrls(html);
+// ONE peek render pipeline. The four call sites each spelled the chain out, so
+// adding a stage meant finding all of them — which is how the path linkifier
+// would have been half-wired.
+function _peekHtml(raw) {
+  return wrapBoxBlocks(_fitRules(highlightPrompts(_linkifyPaths(ansiToHtml(raw)))));
 }
 
 // The MARKERS amux stamps on everything it injects into a pane. Structural, not
@@ -8982,6 +9181,11 @@ async function _peekLoadPlan() {
   try {
     const r = await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/tasks');
     if (peekSession !== name) return;
+    // AF-83, same hole as the peek poller above: no r.ok check, so a 404 on a
+    // deleted session parsed the error body and rendered it as a plan. 1,737 of
+    // the 7,137 404s in the measured window came from HERE, so guarding only the
+    // peek fetch would have fixed 75% of a bug and left it looking fixed.
+    if (!r.ok) return;
     _peekRenderPlan(await r.json());
   } catch(e) {}
 }
@@ -9162,6 +9366,23 @@ async function refreshPeek(liveOnly, bypassTrim) {
     if (peekSession !== name) return;
     hidePeekLoading();   // a response arrived (200 painted below, or 304 = already latest) → drop the "Loading latest…" cue
     if (!liveOnly) _peekLastFullMs = performance.now();   // history is fresh (200 or 304)
+    // AF-83: a peek on a session that NO LONGER EXISTS 404s, and this poller had
+    // no r.ok check. It fell straight through to r.json(), parsed the error body
+    // {"error":"session 'X' not found"}, found no .live/.output, and painted
+    // "(no output)" — then polled again, forever. Measured 2026-08-17: one
+    // browser tab left open on a deleted session produced 5,382 peek + 1,737
+    // tasks 404s in 15h (~8/min), 95% of every error in the window, and the UI
+    // said "(no output)" rather than "this session is gone".
+    // Same r.json()-without-r.ok shape as _tunnelStatus (AF-63). Stop the poll
+    // and SAY what happened; a poller that cannot fail is how a dead tab bills
+    // the server forever.
+    if (r.status === 404) {
+      _stopPeekPoll();
+      _peekPollActive = false;
+      try { _peekPollBeacon('stop-404', name); } catch (e) {}
+      statusEl.textContent = 'Session ' + name + ' no longer exists — stopped polling.';
+      return;
+    }
     if (r.status === 304) {   // unchanged — nothing transferred, skip parse + render entirely
       if (performance.now() > _peekGeoHold) statusEl.textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · v' + APP_VER;
       return;
@@ -9187,12 +9408,12 @@ async function refreshPeek(liveOnly, bypassTrim) {
     let histChanged = false;
     if (histRaw !== null && histRaw !== _peekHistoryRaw) {   // full fetch → (re)render history once
       _peekHistoryRaw = histRaw;
-      _peekHistoryHTML = histRaw ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(histRaw)))) : '';
+      _peekHistoryHTML = histRaw ? _peekHtml(histRaw) : '';
       histChanged = true;
     }
     const atBottom = _isScrolledToBottom(body);
     if (atBottom) _peekScrollLocked = false;
-    const newHTML = wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(output))));
+    const newHTML = _peekHtml(output);
     if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
     if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
     // Claude runs on the terminal's ALT SCREEN: tmux holds only the viewport,
@@ -13204,13 +13425,13 @@ function closeFiltersModal() {
 const _PROVIDER_LABELS = { claude: 'Claude', codex: 'Codex', gemini: 'Gemini', iterm2: 'iTerm2' };
 const _MODEL_LABELS = { opus: 'Opus', sonnet: 'Sonnet', haiku: 'Haiku', fable: 'Fable', gpt: 'GPT', gemini: 'Gemini', 'o-series': 'o-series' };
 function _mLabel(x){ return _MODEL_LABELS[x] || (x.charAt(0).toUpperCase()+x.slice(1)); }
-const _STATUS_LABELS = { working: 'Working', waiting: 'Needs input', idle: 'Idle', stopped: 'Stopped' };
+const _STATUS_LABELS = { working: 'Working', waiting: 'Needs input', rate_limited: 'Rate limited', idle: 'Idle', stopped: 'Stopped' };
 function renderFilterOptions() {
   const live = sessions.filter(s => !s.archived);
   // Status chips — fixed order, only states that exist (or are selected)
   const sEl = document.getElementById('filter-statuses');
   if (sEl) {
-    const opts = ['working', 'waiting', 'idle', 'stopped']
+    const opts = ['working', 'waiting', 'rate_limited', 'idle', 'stopped']
       .filter(k => filterStatuses.has(k) || live.some(x => _sessStatusKey(x) === k));
     sEl.innerHTML = opts.length ? opts.map(k => {
       const on = filterStatuses.has(k);
@@ -14150,6 +14371,9 @@ async function openFilePreview(path) {
   _fileData = null;
   _fileViewMode = 'preview';
   document.getElementById('file-title').textContent = path.split('/').pop();
+  // Title bar shows the file name plus the folder it lives in, like a file manager.
+  const _subEl = document.getElementById('file-subpath');
+  if (_subEl) { const _dir = path.slice(0, path.lastIndexOf('/')) || '/'; _subEl.textContent = _dir; _subEl.title = path; }
   document.getElementById('file-body').className = 'file-overlay-body';
   document.getElementById('file-body').textContent = 'Loading...';
   document.getElementById('file-view-tabs').style.display = 'none';
@@ -14355,6 +14579,10 @@ function _filesUpdateSortHeaders() {
   });
 }
 
+// Recognizable file-type icon chosen by extension (folder, code, data, image,
+// markdown, text, archive, document, generic). Each non-folder type keeps the
+// same page outline but carries a small category glyph so the kind is readable
+// at a glance the way it is in a desktop file manager.
 function _fileTypeIcon(name, type) {
   if (type === 'dir') {
     return `<svg width="15" height="15" viewBox="0 0 16 16" fill="none"><path d="M1 4.5A1.5 1.5 0 0 1 2.5 3h3.172a1 1 0 0 1 .707.293L7.5 4.5H13.5A1.5 1.5 0 0 1 15 6v6a1.5 1.5 0 0 1-1.5 1.5h-11A1.5 1.5 0 0 1 1 12V4.5Z" fill="#E8A020"/></svg>`;
@@ -14363,17 +14591,40 @@ function _fileTypeIcon(name, type) {
   const CODE = new Set(['js','ts','jsx','tsx','py','go','rs','java','c','cpp','h','cs','rb','php','swift','sh','bash','zsh','fish']);
   const DATA = new Set(['json','yaml','yml','toml','xml','csv','sql','graphql']);
   const IMG  = new Set(['png','jpg','jpeg','gif','svg','webp','ico','bmp','avif']);
-  const DOC  = new Set(['md','txt','rst','log','env']);
+  const MD   = new Set(['md','markdown','mdx','rst']);
+  const TEXT = new Set(['txt','log','env','ini','cfg','conf']);
   const ARCH = new Set(['zip','tar','gz','bz2','xz','7z','rar']);
-  const PDF  = new Set(['pdf','doc','docx','xls','xlsx','ppt','pptx']);
-  let color = '#8b949e', opacity = '0.5';
-  if (CODE.has(ext))  { color = '#58a6ff'; opacity = '0.85'; }
-  else if (DATA.has(ext)) { color = '#3fb950'; opacity = '0.85'; }
-  else if (IMG.has(ext))  { color = '#a78bfa'; opacity = '0.85'; }
-  else if (DOC.has(ext))  { color = '#ffa657'; opacity = '0.85'; }
-  else if (ARCH.has(ext)) { color = '#ff7b72'; opacity = '0.85'; }
-  else if (PDF.has(ext))  { color = '#f85149'; opacity = '0.85'; }
-  return `<svg width="13" height="15" viewBox="0 0 13 15" fill="none"><path d="M1 1h7.5L12 4.5V14H1V1Z" fill="${color}" opacity="0.18"/><path d="M1 1h7.5L12 4.5V14H1V1Z" stroke="${color}" stroke-width="1" opacity="${opacity}"/><path d="M8 1v4h4" stroke="${color}" stroke-width="1" fill="none" opacity="${opacity}"/></svg>`;
+  const DOC  = new Set(['pdf','doc','docx','xls','xlsx','ppt','pptx']);
+  let color = '#8b949e', opacity = '0.55', glyph = '';
+  if (ext === 'mdai') {
+    // Computed markdown DAG node (.mdai). A distinct four-point "spark" glyph in
+    // computed-node purple, set apart from a plain .md so a node reads as a node
+    // at a glance in the directory listing and everywhere _fileTypeIcon is reused.
+    color = '#c297ff'; opacity = '0.92';
+    glyph = `<path d="M6.5 6.1 7.28 7.92 9.1 8.7 7.28 9.48 6.5 11.3 5.72 9.48 3.9 8.7 5.72 7.92Z" fill="${color}"/>`;
+  } else if (CODE.has(ext)) {
+    color = '#58a6ff'; opacity = '0.85';
+    glyph = `<path d="M4.7 8 3.4 9.4l1.3 1.4M8.3 8l1.3 1.4-1.3 1.4M7 7.7 6.1 11.1" stroke="${color}" stroke-width="0.9" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+  } else if (DATA.has(ext)) {
+    color = '#3fb950'; opacity = '0.85';
+    glyph = `<path d="M3.7 8.3h2.1M3.7 9.8h2.1M3.7 11.3h1.3" stroke="${color}" stroke-width="0.9" stroke-linecap="round" fill="none"/><circle cx="8.4" cy="8.3" r="0.6" fill="${color}"/><circle cx="8.4" cy="9.8" r="0.6" fill="${color}"/>`;
+  } else if (IMG.has(ext)) {
+    color = '#a78bfa'; opacity = '0.85';
+    glyph = `<circle cx="4.8" cy="8" r="0.9" fill="${color}"/><path d="M3.3 11.6 5.5 9.2l1.3 1.2 1.5-1.8 1.4 2.2" stroke="${color}" stroke-width="1" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+  } else if (MD.has(ext)) {
+    color = '#ffa657'; opacity = '0.85';
+    glyph = `<path d="M3.7 11.2V8.2L5 9.8 6.3 8.2V11.2" stroke="${color}" stroke-width="0.95" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M8.2 8.2v2.2M7.5 9.6l.7.8.7-.8" stroke="${color}" stroke-width="0.95" stroke-linecap="round" stroke-linejoin="round" fill="none"/>`;
+  } else if (TEXT.has(ext)) {
+    color = '#c9d1d9'; opacity = '0.7';
+    glyph = `<path d="M3.6 8h5.2M3.6 9.6h5.2M3.6 11.2h3.4" stroke="${color}" stroke-width="0.9" stroke-linecap="round" fill="none"/>`;
+  } else if (ARCH.has(ext)) {
+    color = '#ff7b72'; opacity = '0.85';
+    glyph = `<path d="M6.5 5.5v6" stroke="${color}" stroke-width="0.9" stroke-dasharray="1.1 1"/><rect x="5.6" y="9.2" width="1.8" height="2.3" rx="0.3" stroke="${color}" stroke-width="0.9" fill="none"/>`;
+  } else if (DOC.has(ext)) {
+    color = '#f85149'; opacity = '0.85';
+    glyph = `<path d="M3.6 8.4h5M3.6 10h5M3.6 11.6h3" stroke="${color}" stroke-width="0.9" stroke-linecap="round" fill="none"/>`;
+  }
+  return `<svg width="13" height="15" viewBox="0 0 13 15" fill="none"><path d="M1 1h7.5L12 4.5V14H1V1Z" fill="${color}" opacity="0.16"/><path d="M1 1h7.5L12 4.5V14H1V1Z" stroke="${color}" stroke-width="1" opacity="${opacity}"/><path d="M8 1v4h4" stroke="${color}" stroke-width="1" fill="none" opacity="${opacity}"/>${glyph}</svg>`;
 }
 // ═══════ FILES TAB (inline directory browser) ═══════
 let _filesPath = '/';
@@ -14800,8 +15051,39 @@ function _feBuildRow(entry, parentPath, depth, q) {
     `<div class="fe-cell-size">${sizeStr}</div>` +
     `<div class="fe-cell-date">${dateStr}</div>` +
     `<div class="fe-cell-actions"><button class="fe-menu-btn" title="Options" onclick="event.stopPropagation();_showFilesMenu('${ep}',this,'${entry.type}')">⋯</button></div>`;
-  row.onclick = entry.type === 'dir' ? () => loadFiles(entryPath) : () => openFilePreview(entryPath);
+  if (entry.type === 'dir') {
+    // Folders open on a single click on every device (fast, and mobile-friendly).
+    row.onclick = () => loadFiles(entryPath);
+  } else if (_feTouchDevice()) {
+    // Touch: a single tap opens the file. Mobile-first, no hover or double-tap.
+    row.onclick = () => openFilePreview(entryPath);
+  } else {
+    // Desktop pointer: single click selects the row, double-click opens it in the
+    // existing viewer, matching a familiar OS file manager. openFilePreview is
+    // unchanged; this only changes what gesture triggers it.
+    row.title = 'Double-click to open';
+    row.onclick = () => _feSelectRow(row);
+    row.ondblclick = () => openFilePreview(entryPath);
+  }
   return row;
+}
+// True on touch devices (no fine pointer / no hover), where a single tap must
+// keep opening files. On desktop we use single-click-to-select, double-click-to-open.
+function _feTouchDevice() {
+  return !!(window.matchMedia && window.matchMedia('(hover: none), (pointer: coarse)').matches);
+}
+// Single-selection highlight for the file list (desktop). Clears any prior
+// selection so exactly one row is highlighted, like a desktop file manager.
+function _feSelectRow(row) {
+  const body = document.getElementById('files-body');
+  if (body) body.querySelectorAll('.fe-row.fe-selected').forEach(r => r.classList.remove('fe-selected'));
+  row.classList.add('fe-selected');
+}
+// Navigate to the parent of the current Files-tab folder (the "Up" action).
+function _filesUp() {
+  const p = (_filesPath || '/').replace(/\/+$/, '');
+  const i = p.lastIndexOf('/');
+  loadFiles(i > 0 ? p.slice(0, i) : '/');
 }
 // Toggle a folder's inline expansion (accordion). Inserts/removes the folder's
 // child rows right after it, without navigating into the folder.
@@ -15070,6 +15352,490 @@ function _filesNewFile() {
   wrap.style.display = 'flex';
   document.getElementById('file-overlay').classList.add('active');
   setTimeout(() => ta.focus(), 100);
+}
+
+// ═══════ MDAI: computed markdown DAG nodes (.mdai) ═══════
+// A .mdai file is a computed markdown node: YAML frontmatter `sources` is a list
+// of {path, prompt} edges, the body is the synthesis instruction, and opening it
+// runs the upstream chain (POST /run, cached when inputs are unchanged) to produce
+// an output. This UI is a GLOBAL-only top-bar tab (it lives in ALL_TABS + switchView,
+// never in the per-worker peek overlay), plus a node overlay for open/run/history/
+// edit, a Connect picker, and a New-.mdai scaffold. Client only; the engine is Rust.
+let _mdaiCur = null;      // { abs, rel, model, sources:[{path,prompt}], body, content, parseOk }
+let _mdaiHist = [];       // run history for the open node, newest-first
+let _mdaiHistIdx = 0;     // which history entry is shown (0 = newest)
+let _mdaiRunError = null; // last run error (string) or null
+let _mdaiRunCycle = null; // cycle chain array from a cycle error, or null
+let _mdaiLastRun = null;  // last successful RunResult (for the upstream-node chain note)
+
+// Resolve an mdai path to the absolute filesystem path the Files API expects. The
+// /api/files/mdai list returns root-relative paths (relative to AMUX_FILES_ROOT,
+// i.e. $HOME); the Files browser hands us absolute paths. Both are accepted by the
+// mdai run/history/connect endpoints, but /api/file needs the absolute form.
+function _mdaiAbs(p) {
+  if (!p) return p;
+  if (p.charAt(0) === '/') return p;
+  const h = (window._AMUX_HOME || '').replace(/\/+$/, '');
+  return (h || '') + '/' + p.replace(/^\/+/, '');
+}
+// Root-relative path (under the files root, $HOME) for the upload endpoint, which
+// is how a .mdai file is WRITTEN: PUT /api/file refuses the .mdai extension (its
+// WRITABLE_EXTS allowlist has no .mdai), while POST /api/files/upload takes any
+// type but requires a path relative to the root. Returns null for a path outside
+// the root. The engine only sees .mdai files under $HOME anyway, so that is the
+// honest "cannot write here" answer rather than a silent failure.
+function _mdaiRootRel(abs) {
+  const home = (window._AMUX_HOME || '').replace(/\/+$/, '');
+  if (!abs) return null;
+  if (home && abs === home) return null;                 // the root dir itself is not a file
+  if (home && abs.indexOf(home + '/') === 0) return abs.slice(home.length + 1);
+  if (!home && abs.charAt(0) === '/') return abs.slice(1);
+  return null;
+}
+// Path of absFile relative to baseDir (both absolute). Used to write a portable
+// edge into a target's frontmatter (the engine resolves a source relative to the
+// containing .mdai file's directory).
+function _mdaiRelPath(absFile, baseDir) {
+  const a = String(absFile || '').split('/').filter(Boolean);
+  const b = String(baseDir || '').split('/').filter(Boolean);
+  let i = 0;
+  while (i < a.length && i < b.length && a[i] === b[i]) i++;
+  const up = b.length - i;
+  const parts = [];
+  for (let k = 0; k < up; k++) parts.push('..');
+  for (let k = i; k < a.length; k++) parts.push(a[k]);
+  return parts.join('/') || '.';
+}
+// A YAML double-quoted scalar: always valid, so arbitrary prompt/path text
+// (colons, quotes, newlines) round-trips safely without a YAML library.
+function _mdaiYq(s) {
+  return '"' + String(s == null ? '' : s)
+    .replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+    .replace(/\r/g, '').replace(/\n/g, '\\n').replace(/\t/g, '\\t') + '"';
+}
+// Unquote a simple YAML scalar (plain, single- or double-quoted). Handles the
+// escapes _mdaiYq emits; a value it cannot confidently read is returned verbatim.
+function _mdaiUnq(v) {
+  v = String(v == null ? '' : v).trim();
+  if (!v) return '';
+  if (v.length >= 2 && v.charAt(0) === '"' && v.charAt(v.length - 1) === '"') {
+    return v.slice(1, -1).replace(/\\(["\\ntr])/g, (m, c) => c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '' : c);
+  }
+  if (v.length >= 2 && v.charAt(0) === "'" && v.charAt(v.length - 1) === "'") {
+    return v.slice(1, -1).replace(/''/g, "'");
+  }
+  return v;
+}
+// Split leading `---`-delimited frontmatter from the body, mirroring the Rust
+// parser: an opening `---` with no close is treated as no frontmatter.
+function _mdaiSplitFront(text) {
+  text = String(text == null ? '' : text).replace(/^\uFEFF/, '');
+  const lines = text.split('\n');
+  if ((lines[0] || '').trim() !== '---') return { front: null, body: text };
+  const fm = []; let i = 1, closed = false;
+  for (; i < lines.length; i++) {
+    const t = lines[i].replace(/\s+$/, '');
+    if (t === '---' || t === '...') { closed = true; i++; break; }
+    fm.push(lines[i]);
+  }
+  if (!closed) return { front: null, body: text };
+  return { front: fm, body: lines.slice(i).join('\n') };
+}
+// Parse a .mdai document into {ok, model, sources, body}. `ok` is false when the
+// frontmatter carries a shape this lightweight parser will not safely rewrite
+// (flow sequences, block scalars, unknown top-level keys). The node view then
+// shows edges read-only and routes edits to the raw file editor.
+function _mdaiParse(text) {
+  const { front, body } = _mdaiSplitFront(text);
+  if (front === null) return { ok: true, model: null, sources: [], body: body };
+  let model = null, ok = true;
+  const sources = [];
+  let i = 0;
+  while (i < front.length) {
+    const line = front[i];
+    const t = line.trim();
+    if (t === '' || t.charAt(0) === '#') { i++; continue; }
+    const mm = line.match(/^model\s*:\s*(.*)$/);
+    if (mm) { model = _mdaiUnq(mm[1]) || null; i++; continue; }
+    const sm = line.match(/^sources\s*:\s*(.*)$/);
+    if (sm) {
+      const rest = sm[1].trim();
+      if (rest === '[]') { i++; continue; }
+      if (rest !== '') { ok = false; i++; continue; }   // flow sequence, bail
+      i++;
+      while (i < front.length) {
+        const l = front[i];
+        if (l.trim() !== '' && /^\S/.test(l) && !/^\s*-/.test(l)) break; // next top-level key
+        const dash = l.match(/^(\s*)-\s?(.*)$/);
+        if (dash) {
+          const after = dash[2];
+          if (after === '') { sources.push({ path: '', prompt: '' }); }
+          else {
+            const kv = after.match(/^([A-Za-z0-9_]+)\s*:\s*(.*)$/);
+            if (kv) { const e = { path: '', prompt: '' }; e[kv[1]] = _mdaiUnq(kv[2]); sources.push(e); }
+            else { sources.push({ path: _mdaiUnq(after), prompt: '' }); }  // bare string
+          }
+        } else if (/^\s+\S/.test(l)) {
+          const kv = l.trim().match(/^([A-Za-z0-9_]+)\s*:\s*(.*)$/);
+          if (kv && sources.length) sources[sources.length - 1][kv[1]] = _mdaiUnq(kv[2]);
+          else ok = false;
+        } else if (l.trim() !== '') { ok = false; }
+        i++;
+      }
+      continue;
+    }
+    if (/^\S/.test(line)) ok = false;   // an unknown top-level key we would clobber
+    i++;
+  }
+  for (const s of sources) { if (s.path == null) s.path = ''; if (s.prompt == null) s.prompt = ''; }
+  return { ok, model, sources, body };
+}
+// Re-emit a full .mdai document from parsed state, canonical and always valid.
+function _mdaiSerialize(cur) {
+  let fm = '---\n';
+  if (cur.model && String(cur.model).trim()) fm += 'model: ' + _mdaiYq(cur.model) + '\n';
+  if (!cur.sources || !cur.sources.length) fm += 'sources: []\n';
+  else {
+    fm += 'sources:\n';
+    for (const s of cur.sources) fm += '- path: ' + _mdaiYq(s.path) + '\n  prompt: ' + _mdaiYq(s.prompt || '') + '\n';
+  }
+  fm += '---\n';
+  const body = cur.body || '';
+  return fm + body + (body.endsWith('\n') ? '' : '\n');
+}
+
+// ── The MDAI tab (global list of every .mdai node) ──
+async function _mdaiTabLoad() {
+  const list = document.getElementById('mdai-list');
+  const cnt = document.getElementById('mdai-count');
+  if (!list) return;
+  list.innerHTML = '<div style="padding:16px;color:var(--dim);font-size:0.85rem;">Loading computed nodes…</div>';
+  try {
+    const r = await fetch(API + '/api/files/mdai');
+    const d = await r.json();
+    const files = (d && d.files) || [];
+    if (cnt) cnt.textContent = files.length ? (files.length + (files.length === 1 ? ' node' : ' nodes')) : '';
+    if (!files.length) {
+      list.innerHTML = '<div style="padding:28px 16px;text-align:center;color:var(--dim);font-size:0.85rem;">'
+        + 'No .mdai computed nodes yet.<br><br>'
+        + '<button class="fe-tb-btn" onclick="_mdaiNewFile()" style="display:inline-flex;">Create your first .mdai</button>'
+        + '<div style="margin-top:14px;font-size:0.75rem;line-height:1.5;max-width:340px;margin-left:auto;margin-right:auto;">'
+        + 'A .mdai file is a computed markdown node: connect sources, write a synthesis instruction, and opening it runs the chain.</div></div>';
+      return;
+    }
+    list.innerHTML = files.map(f => {
+      const name = (f.path || '').split('/').pop();
+      const dir = (f.path || '').slice(0, (f.path || '').lastIndexOf('/'));
+      const icon = _fileTypeIcon(name, 'file');
+      const title = f.title && f.title.trim() ? f.title.trim() : name;
+      const meta = [];
+      meta.push((f.sources || 0) + (f.sources === 1 ? ' source' : ' sources'));
+      if (f.model) meta.push(esc(f.model));
+      meta.push(f.last_run ? ('ran ' + timeAgo(f.last_run)) : 'not run yet');
+      return '<div class="mdai-row" onclick="openMdaiNode(' + JSON.stringify(f.path).replace(/"/g, '&quot;') + ')">'
+        + '<span class="mdai-row-icon">' + icon + '</span>'
+        + '<div class="mdai-row-main">'
+        + '<div class="mdai-row-title">' + esc(title) + '</div>'
+        + '<div class="mdai-row-path">' + esc(dir ? dir + '/' : '') + esc(name) + '</div>'
+        + '<div class="mdai-row-meta">' + meta.join(' &middot; ') + '</div>'
+        + '</div><span class="mdai-row-go">&#8250;</span></div>';
+    }).join('');
+  } catch (e) {
+    list.innerHTML = '<div style="padding:16px;color:var(--dim);font-size:0.85rem;">Could not load computed nodes.</div>';
+  }
+}
+
+// ── The node overlay: open, run, history, edit ──
+async function openMdaiNode(path, opts) {
+  opts = opts || {};
+  const abs = _mdaiAbs(path);
+  _mdaiCur = { abs, rel: (path && path.charAt(0) !== '/') ? path : null, model: null, sources: [], body: '', content: '', parseOk: true };
+  _mdaiHist = []; _mdaiHistIdx = 0; _mdaiRunError = null; _mdaiRunCycle = null; _mdaiLastRun = null;
+  const nm = abs.split('/').pop();
+  document.getElementById('mdai-title').textContent = nm;
+  const sub = document.getElementById('mdai-subpath');
+  if (sub) { sub.textContent = abs.slice(0, abs.lastIndexOf('/')) || '/'; sub.title = abs; }
+  document.getElementById('mdai-body').innerHTML = '<div style="padding:18px;color:var(--dim);">Loading node…</div>';
+  document.getElementById('mdai-overlay').classList.add('active');
+  // Read the file so we can show + edit sources and the body.
+  try {
+    const r = await fetch(API + '/api/file?path=' + encodeURIComponent(abs));
+    const d = await r.json();
+    if (!d.error && typeof d.content === 'string') {
+      const p = _mdaiParse(d.content);
+      _mdaiCur.model = p.model; _mdaiCur.sources = p.sources; _mdaiCur.body = p.body;
+      _mdaiCur.parseOk = p.ok; _mdaiCur.content = d.content;
+    }
+  } catch (e) {}
+  await _mdaiLoadHistory();
+  if (opts.autorun === false) { _mdaiRender(); }
+  else { await _mdaiRun({ fromOpen: true }); }
+}
+function closeMdaiNode() {
+  document.getElementById('mdai-overlay').classList.remove('active');
+  _mdaiCur = null; _mdaiHist = []; _mdaiLastRun = null;
+}
+async function _mdaiLoadHistory() {
+  if (!_mdaiCur) return;
+  try {
+    const r = await fetch(API + '/api/files/mdai/history?path=' + encodeURIComponent(_mdaiCur.abs));
+    const d = await r.json();
+    _mdaiHist = (d && d.runs) || [];
+    if (d && d.path) _mdaiCur.rel = d.path;
+  } catch (e) { _mdaiHist = []; }
+  _mdaiHistIdx = 0;
+}
+// Run (or re-run) the node. The engine caches unchanged inputs, so this is cheap
+// on an open of an unchanged node. Every run records a history row (cached flagged),
+// so we reload history and show the newest.
+async function _mdaiRun(opts) {
+  opts = opts || {};
+  const btn = document.getElementById('mdai-run-btn');
+  if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = 'Running…'; }
+  const bodyEl = document.getElementById('mdai-body');
+  if (opts.fromOpen && bodyEl) bodyEl.innerHTML = '<div style="padding:18px;color:var(--dim);">Running the chain…</div>';
+  try {
+    const r = await fetch(API + '/api/files/mdai/run', {
+      method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ path: _mdaiCur.abs })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) {
+      _mdaiRunError = d.error || ('HTTP ' + r.status);
+      _mdaiRunCycle = d.cycle || null;
+    } else {
+      _mdaiRunError = null; _mdaiRunCycle = null; _mdaiLastRun = d;
+      await _mdaiLoadHistory();
+    }
+  } catch (e) {
+    _mdaiRunError = (e && e.message) || 'run failed'; _mdaiRunCycle = null;
+  }
+  if (btn) btn.disabled = false;
+  _mdaiRender();
+}
+function _mdaiHistNav(delta) {
+  if (!_mdaiHist.length) return;
+  const n = Math.max(0, Math.min(_mdaiHist.length - 1, _mdaiHistIdx + delta));
+  if (n === _mdaiHistIdx) return;
+  _mdaiHistIdx = n; _mdaiRender();
+}
+// Write the current parsed state back to disk (used by every structured edit).
+// Uses the upload endpoint (see _mdaiRootRel) because PUT /api/file rejects .mdai.
+async function _mdaiWriteFile() {
+  const content = _mdaiSerialize(_mdaiCur);
+  const rel = _mdaiRootRel(_mdaiCur.abs);
+  if (rel === null) { showToast('This node is outside your home folder and cannot be edited here'); return false; }
+  try {
+    const r = await fetch(API + '/api/files/upload?path=' + encodeURIComponent(rel), {
+      method: 'POST', headers: _authHeaders({ 'Content-Type': 'text/plain' }), body: content
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d && d.ok) { _mdaiCur.content = content; return true; }
+    showToast((d && d.error) || 'Could not save node');
+  } catch (e) { showToast('Could not save node'); }
+  return false;
+}
+// Edit one edge's prompt, save, then re-run so the change takes effect.
+async function _mdaiSavePrompt(idx) {
+  const ta = document.getElementById('mdai-prompt-' + idx);
+  if (!ta || !_mdaiCur || !_mdaiCur.sources[idx]) return;
+  _mdaiCur.sources[idx].prompt = ta.value;
+  if (await _mdaiWriteFile()) { showToast('Edge prompt saved'); await _mdaiRun(); }
+}
+async function _mdaiRemoveSource(idx) {
+  if (!_mdaiCur || !_mdaiCur.sources[idx]) return;
+  if (!confirm('Disconnect "' + (_mdaiCur.sources[idx].path || 'source') + '" from this node?')) return;
+  _mdaiCur.sources.splice(idx, 1);
+  if (await _mdaiWriteFile()) { showToast('Source disconnected'); await _mdaiRun(); }
+}
+// Edit the node body (synthesis instruction), save, then re-run.
+async function _mdaiSaveBody() {
+  const ta = document.getElementById('mdai-body-ta');
+  if (!ta || !_mdaiCur) return;
+  _mdaiCur.body = ta.value;
+  if (await _mdaiWriteFile()) { showToast('Instruction saved'); await _mdaiRun(); }
+}
+function _mdaiOpenRaw() {
+  if (!_mdaiCur) return;
+  const abs = _mdaiCur.abs;
+  closeMdaiNode();
+  openFilePreview(abs);
+}
+function _mdaiRender() {
+  const el = document.getElementById('mdai-body');
+  if (!el || !_mdaiCur) return;
+  el.className = 'mdai-node-body';
+  const runBtn = document.getElementById('mdai-run-btn');
+  if (runBtn) runBtn.textContent = _mdaiHist.length ? 'Re-run' : 'Run';
+  const cur = _mdaiHist[_mdaiHistIdx] || null;
+  let html = '';
+
+  // Error banner (still show the editor below so the user can fix it).
+  if (_mdaiRunError) {
+    html += '<div class="mdai-err">' + esc(_mdaiRunError);
+    if (_mdaiRunCycle && _mdaiRunCycle.length) html += '<div class="mdai-err-cycle">cycle: ' + esc(_mdaiRunCycle.join(' \u2192 ')) + '</div>';
+    html += '</div>';
+  }
+
+  // Output section (the star): meta row + history nav + rendered markdown.
+  html += '<div class="mdai-section">';
+  html += '<div class="mdai-meta">';
+  if (cur) {
+    html += '<span class="mdai-badge ' + (cur.cached ? 'mdai-badge-cached' : 'mdai-badge-fresh') + '">' + (cur.cached ? 'cached' : 'fresh') + '</span>';
+    if (cur.model) html += '<span class="mdai-badge mdai-badge-model">' + esc(cur.model) + '</span>';
+    html += '<span class="mdai-meta-time">' + (cur.ts ? timeAgo(cur.ts) : '') + '</span>';
+  } else {
+    html += '<span class="mdai-meta-time">Not run yet</span>';
+  }
+  html += '</div>';
+  if (_mdaiHist.length > 1) {
+    const pos = (_mdaiHist.length - _mdaiHistIdx);
+    html += '<div class="mdai-histnav">'
+      + '<button class="mdai-hbtn" onclick="_mdaiHistNav(1)"' + (_mdaiHistIdx >= _mdaiHist.length - 1 ? ' disabled' : '') + ' title="Older run">&#8249; Older</button>'
+      + '<span class="mdai-hpos">run ' + pos + ' of ' + _mdaiHist.length + '</span>'
+      + '<button class="mdai-hbtn" onclick="_mdaiHistNav(-1)"' + (_mdaiHistIdx <= 0 ? ' disabled' : '') + ' title="Newer run">Newer &#8250;</button>'
+      + '</div>';
+  }
+  html += '<div class="mdai-output md-content">';
+  if (cur && cur.output) html += renderMarkdown(cur.output, _mdaiCur.abs);
+  else if (!_mdaiRunError) html += '<div style="color:var(--dim);font-size:0.85rem;">This node has no output yet. Press Run to compute it.</div>';
+  html += '</div></div>';
+
+  // Sources & instruction editor.
+  html += '<div class="mdai-section mdai-edit">';
+  html += '<div class="mdai-edit-h">Sources</div>';
+  if (!_mdaiCur.parseOk) {
+    html += '<div class="mdai-note">This node\'s frontmatter uses a form the inline editor will not rewrite safely. '
+      + '<a href="#" onclick="event.preventDefault();_mdaiOpenRaw()">Open the raw file</a> to edit its sources.</div>';
+  }
+  if (!_mdaiCur.sources.length) {
+    html += '<div class="mdai-note">No sources connected. Use a file\'s &#8942; menu in the Files tab (Connect to .mdai) to add one.</div>';
+  } else {
+    _mdaiCur.sources.forEach((s, idx) => {
+      html += '<div class="mdai-edge">'
+        + '<div class="mdai-edge-path" title="' + esc(s.path) + '">' + esc(s.path || '(unnamed source)') + '</div>';
+      if (_mdaiCur.parseOk) {
+        html += '<textarea class="mdai-prompt" id="mdai-prompt-' + idx + '" rows="2" placeholder="Edge prompt">' + esc(s.prompt || '') + '</textarea>'
+          + '<div class="mdai-edge-actions">'
+          + '<button class="mdai-sbtn" onclick="_mdaiSavePrompt(' + idx + ')">Save &amp; re-run</button>'
+          + '<button class="mdai-sbtn mdai-sbtn-danger" onclick="_mdaiRemoveSource(' + idx + ')">Disconnect</button>'
+          + '</div>';
+      } else {
+        html += '<div class="mdai-edge-prompt-ro">' + esc(s.prompt || '') + '</div>';
+      }
+      html += '</div>';
+    });
+  }
+  html += '<div class="mdai-edit-h" style="margin-top:12px;">Instruction (node body)</div>';
+  if (_mdaiCur.parseOk) {
+    html += '<textarea class="mdai-body-ta" id="mdai-body-ta" rows="5" placeholder="What should this node synthesize from its sources?">' + esc(_mdaiCur.body || '') + '</textarea>'
+      + '<div class="mdai-edge-actions"><button class="mdai-sbtn" onclick="_mdaiSaveBody()">Save &amp; re-run</button></div>';
+  } else {
+    html += '<div class="mdai-edge-prompt-ro">' + esc(_mdaiCur.body || '') + '</div>';
+  }
+  html += '</div>';
+
+  el.innerHTML = html;
+  _bindMdFileLinks(el);
+}
+
+// ── Connect picker: make a file/folder a source of a chosen .mdai node ──
+async function _mdaiConnectPicker(sourceAbs) {
+  document.querySelectorAll('.mdai-picker-overlay').forEach(e => e.remove());
+  const ov = document.createElement('div');
+  ov.className = 'mdai-picker-overlay';
+  ov.onclick = (e) => { if (e.target === ov) ov.remove(); };
+  const srcName = (sourceAbs || '').split('/').pop();
+  ov.innerHTML = '<div class="mdai-picker">'
+    + '<div class="mdai-picker-h"><span>Connect <b>' + esc(srcName) + '</b> into a .mdai node</span>'
+    + '<button class="mdai-picker-x" onclick="this.closest(\'.mdai-picker-overlay\').remove()">&#10005;</button></div>'
+    + '<div class="mdai-picker-list" id="mdai-picker-list"><div style="padding:16px;color:var(--dim);font-size:0.85rem;">Loading nodes…</div></div>'
+    + '<div class="mdai-picker-foot"><button class="fe-tb-btn" id="mdai-picker-new">New .mdai to connect into</button></div>'
+    + '</div>';
+  document.body.appendChild(ov);
+  document.getElementById('mdai-picker-new').onclick = async () => {
+    ov.remove();
+    const t = await _mdaiNewFile({ silent: true, noOpen: true });
+    if (t) _mdaiDoConnect(sourceAbs, t);
+  };
+  try {
+    const r = await fetch(API + '/api/files/mdai');
+    const d = await r.json();
+    const files = (d && d.files) || [];
+    const listEl = document.getElementById('mdai-picker-list');
+    if (!files.length) {
+      listEl.innerHTML = '<div style="padding:16px;color:var(--dim);font-size:0.85rem;">No .mdai nodes yet. Create one below to connect into.</div>';
+      return;
+    }
+    listEl.innerHTML = files.map(f => {
+      const name = (f.path || '').split('/').pop();
+      const title = f.title && f.title.trim() ? f.title.trim() : name;
+      return '<button class="mdai-picker-item" onclick="_mdaiDoConnect(' + JSON.stringify(sourceAbs).replace(/"/g, '&quot;') + ',' + JSON.stringify(f.path).replace(/"/g, '&quot;') + ')">'
+        + '<span class="mdai-row-icon">' + _fileTypeIcon(name, 'file') + '</span>'
+        + '<span class="mdai-picker-item-main"><span class="mdai-picker-item-title">' + esc(title) + '</span>'
+        + '<span class="mdai-picker-item-path">' + esc(f.path) + '</span></span></button>';
+    }).join('');
+  } catch (e) {
+    const listEl = document.getElementById('mdai-picker-list');
+    if (listEl) listEl.innerHTML = '<div style="padding:16px;color:var(--dim);font-size:0.85rem;">Could not load .mdai nodes.</div>';
+  }
+}
+async function _mdaiDoConnect(sourceAbs, targetRel) {
+  document.querySelectorAll('.mdai-picker-overlay').forEach(e => e.remove());
+  const targetAbs = _mdaiAbs(targetRel);
+  const targetDir = targetAbs.slice(0, targetAbs.lastIndexOf('/')) || '/';
+  const sourceForEdge = _mdaiRelPath(sourceAbs, targetDir);   // portable, resolved from the node's dir
+  try {
+    const r = await fetch(API + '/api/files/mdai/connect', {
+      method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ source: sourceForEdge, target: targetRel })
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast('Connect failed: ' + ((d && d.error) || ('HTTP ' + r.status))); return; }
+    showToast('Connected ' + (sourceAbs.split('/').pop()) + ' \u2192 ' + (targetAbs.split('/').pop()));
+    // Open the node so the default edge prompt is right there to edit; do not
+    // auto-run (a fresh edge is likely one of several the user is about to add).
+    openMdaiNode(targetRel, { autorun: false });
+  } catch (e) { showToast('Connect failed'); }
+}
+
+// ── New .mdai scaffold (from the Files toolbar and the MDAI tab) ──
+// dirOrOpts: a directory string, or an options object {dir, silent, noOpen}.
+// Returns the created root-relative path (or null) so the connect picker can chain.
+async function _mdaiNewFile(dirOrOpts) {
+  let dir = null, silent = false, noOpen = false;
+  if (typeof dirOrOpts === 'string') dir = dirOrOpts;
+  else if (dirOrOpts) { dir = dirOrOpts.dir || null; silent = !!dirOrOpts.silent; noOpen = !!dirOrOpts.noOpen; }
+  if (!dir) dir = (activeView === 'files' && _filesPath && !_exploreSession) ? _filesPath : (window._AMUX_HOME || '/');
+  const home = (window._AMUX_HOME || '').replace(/\/+$/, '');
+  // Computed nodes only live under the files root ($HOME). That is the only tree
+  // the engine walks and the only one the writer can reach. If the current folder
+  // is elsewhere (the browser can roam the whole disk), fall back to the root.
+  if (home && dir !== home && dir.indexOf(home + '/') !== 0) dir = home;
+  const raw = prompt('New .mdai node name (e.g. weekly-brief.mdai):', 'node.mdai');
+  if (!raw || !raw.trim()) return null;
+  let fname = raw.trim();
+  if (!/\.mdai$/i.test(fname)) fname += '.mdai';
+  if (/[\/\0]/.test(fname) || fname === '.' || fname === '..') { showToast('Invalid file name'); return null; }
+  const fpath = dir.replace(/\/+$/, '') + '/' + fname;
+  const rel = _mdaiRootRel(fpath);
+  if (rel === null) { showToast('Could not place the node under your home folder'); return null; }
+  const base = fname.replace(/\.mdai$/i, '');
+  const template = '---\nsources: []\n---\n# ' + base + '\n\nDescribe what this node should synthesize from its connected sources.\n';
+  let d = null;
+  try {
+    const r = await fetch(API + '/api/files/upload?path=' + encodeURIComponent(rel), {
+      method: 'POST', headers: _authHeaders({ 'Content-Type': 'text/plain' }), body: template
+    });
+    d = await r.json().catch(() => ({}));
+    if (!r.ok) d = d || { error: 'HTTP ' + r.status };
+  } catch (e) { showToast(online ? 'Could not create node' : 'Offline: cannot create node'); return null; }
+  if (!d || !d.ok) { showToast((d && d.error) || 'Could not create node'); return null; }
+  if (!silent) showToast('Created ' + fname);
+  if (activeView === 'files') loadFiles(_filesPath);
+  if (activeView === 'mdai') _mdaiTabLoad();
+  if (!noOpen) openMdaiNode(fpath, { autorun: false });
+  return rel;
 }
 
 function triggerFilesUpload() {
@@ -15360,6 +16126,14 @@ function _showFilesMenu(path, btn, type) {
   bmItem.textContent = _exploreSession ? ('Add shortcut · ' + _exploreSession) : 'Add shortcut';
   bmItem.onclick = () => { popup.remove(); _filesAddBookmarkPath(path, type); };
   popup.appendChild(bmItem);
+  // Connect to a .mdai node: make THIS file/folder a source of a chosen computed
+  // node. Picks from the GLOBAL list of .mdai files (GET /api/files/mdai) and POSTs
+  // /connect; the target gets a default edge prompt, editable in the node view after.
+  const connItem = document.createElement('button');
+  connItem.className = 'explore-menu-item';
+  connItem.textContent = 'Connect to .mdai…';
+  connItem.onclick = () => { popup.remove(); _mdaiConnectPicker(path); };
+  popup.appendChild(connItem);
   // Rename
   const renItem = document.createElement('button');
   renItem.className = 'explore-menu-item';
@@ -17476,11 +18250,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph'];
-  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph'];
-  // MUST stay index-aligned with _svIds/_svNames above (18 entries). It once had
+  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph'];
+  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph'];
+  // MUST stay index-aligned with _svIds/_svNames above (19 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex'];
+  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -17508,6 +18282,7 @@ function switchView(view) {
   // "Message history" modal reached from inside a peek.
   if (view === 'messages') _messagesLoad(true, '');
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
+  if (view === 'mdai') _mdaiTabLoad();
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
     try { if (location.hash.startsWith('#path=')) history.replaceState({}, '', location.pathname); } catch(e) {}
@@ -24524,6 +25299,20 @@ function connectSSE() {
           try { localStorage.setItem('amux_sessions_cache', j); }
           catch (e2) { try { localStorage.removeItem('amux_sessions_cache'); } catch (e3) {} }
           render();
+          // Keep an OPEN peek/worker view live on a session event, not only the
+          // card/list. render() above refreshed the list; the open detail view
+          // has its own status badge and terminal log, so a status flip (e.g. to
+          // "needs input") must repaint here and the log must refetch now rather
+          // than wait for the next poll tick. The refetch is a cheap 304 when the
+          // peeked frame is unchanged; the while-open poll still carries the
+          // continuous mid-turn stream that SSE-on-change alone would miss.
+          try {
+            const _pov = document.getElementById('peek-overlay');
+            if (typeof peekSession !== 'undefined' && peekSession && _pov && _pov.classList.contains('active')) {
+              if (typeof updatePeekStatus === 'function') updatePeekStatus();
+              if (!document.hidden && typeof refreshPeek === 'function') refreshPeek();
+            }
+          } catch (ePk) {}
           // If workspace is open but no panes were restored yet (e.g. sessions
           // cache was empty on startup), retry restoration now that we have data.
           if (firstLoad && _grid && Object.keys(_gridPanes).length === 0) {
@@ -24659,9 +25448,11 @@ function _resyncEverything() {
   _runDeltaSync();
 }
 function _onClientResume(reason) {
-  if (document.hidden) { _stopPeekPoll(); return; }   // tab backgrounded → pause peek polling
-  // Resume adaptive peek polling if we're on a peek and it was paused while hidden.
-  if (peekSession && !peekTimer) { refreshPeek(); _schedulePeekPoll(); }
+  if (document.hidden) { _peekPollStop('hidden'); return; }   // tab backgrounded → pause the open-view poller (beaconed)
+  // Resume the open-view poller if we're on a peek and it was paused while
+  // hidden; also refetch the log and repaint the status badge so a tab that
+  // comes back to the foreground is instantly current (visibility/pageshow/focus/online).
+  if (peekSession && !peekTimer) { refreshPeek(); if (typeof updatePeekStatus === 'function') updatePeekStatus(); _schedulePeekPoll(); }
   if (window._peekEmbed) { refreshPeek(); return; }
   // Always pull fresh state — cheap and the user expects up-to-date data.
   if (_lastDataTime && Date.now() - _lastDataTime > _SSE_REFRESH_MS) {
@@ -25719,6 +26510,7 @@ function toggleSettings() {
     _renderInstanceSwitcher();
     _loadCloudPlan();
     loadDefaultModel();
+    loadHelperModel();
     const zd = document.getElementById('zoom-level-display');
     if (zd) zd.textContent = _zoomLevel + '%';
     // Apply cloud identity (email) or device name
@@ -25961,6 +26753,56 @@ async function saveDefaultModel(val) {
       if (defOpt) defOpt.textContent = 'Default (' + val + ')';
       showToast('Default model: ' + val);
     }
+  } catch(e) { showToast('Error: ' + e.message); }
+}
+
+// ── Meta-task model (Look Up / Orchestrate router / worker summaries) ────────────
+// The DEFAULT is the cheapest Claude model, chosen server-side in
+// lookup::helper_answer; this control writes the live `helper_model` pref that
+// overrides it (empty value = back to default). Local ollama models are listed
+// dynamically so any installed model is selectable.
+async function loadHelperModel() {
+  const sel = document.getElementById('settings-helper-model');
+  if (!sel) return;
+  try {
+    const r = await fetch(API + '/api/ollama/models', { headers: _authHeaders() });
+    if (r.ok) {
+      const d = await r.json();
+      const models = (d.models || []).filter(Boolean);
+      const og = document.getElementById('settings-helper-model-ollama');
+      if (og) {
+        og.innerHTML = '';
+        if (!models.length) { og.remove(); }
+        else models.forEach(name => {
+          const o = document.createElement('option');
+          o.value = name; o.textContent = name; og.appendChild(o);
+        });
+      }
+    }
+  } catch (e) {}
+  try {
+    const r = await fetch(API + '/api/prefs?key=helper_model', { headers: _authHeaders() });
+    if (r.ok) {
+      const d = await r.json();
+      const val = (d && d.value) || '';
+      // A saved id not in the list (e.g. a custom dated model) still shows.
+      if (val && !Array.from(sel.options).some(o => o.value === val)) {
+        const opt = document.createElement('option');
+        opt.value = val; opt.textContent = val; sel.appendChild(opt);
+      }
+      sel.value = val;
+    }
+  } catch (e) {}
+}
+async function saveHelperModel(val) {
+  try {
+    const r = await fetch(API + '/api/prefs', {
+      method: 'POST',
+      headers: Object.assign({'Content-Type':'application/json'}, _authHeaders()),
+      body: JSON.stringify({ key: 'helper_model', value: val })
+    });
+    if (r.ok) showToast(val ? ('Meta-task model: ' + val) : 'Meta-task model: default (haiku)');
+    else showToast('Could not save meta-task model');
   } catch(e) { showToast('Error: ' + e.message); }
 }
 
@@ -27661,11 +28503,14 @@ function _metricsRender() {
   }
   if (sys.disk_total_gb) {
     const cls = _metricsGaugeCls(sys.disk_percent || 0);
-    html += `<div class="metrics-card">
-      <div class="metrics-card-title">Disk (/)</div>
-      <div class="metrics-card-value">${sys.disk_used_gb}<span> GB</span></div>
-      <div class="metrics-card-sub">of ${sys.disk_total_gb} GB &mdash; ${(sys.disk_percent || 0).toFixed(0)}%</div>
+    // Free space is the number you act on, so it leads. Clicking through to
+    // Disk Cleanup is the point: a red gauge with no next step is just anxiety.
+    html += `<div class="metrics-card reclaim-catcard" onclick="_metricsSetMode('disk')" title="Open Disk Cleanup">
+      <div class="metrics-card-title">Disk</div>
+      <div class="metrics-card-value">${sys.disk_free_gb != null ? sys.disk_free_gb : (sys.disk_total_gb - sys.disk_used_gb).toFixed(1)}<span> GB free</span></div>
+      <div class="metrics-card-sub">${sys.disk_used_gb} of ${sys.disk_total_gb} GB used &mdash; ${(sys.disk_percent || 0).toFixed(0)}%</div>
       <div class="metrics-gauge"><div class="metrics-gauge-fill ${cls}" style="width:${Math.min(100, sys.disk_percent || 0)}%"></div></div>
+      <div style="font-size:0.66rem;color:var(--accent,#58a6ff);margin-top:6px;">Disk Cleanup &rsaquo;</div>
     </div>`;
   }
   html += '</div>';
@@ -27784,6 +28629,455 @@ function _metricsRender() {
 function _metricsSelectSession(name) {
   _metricsSelectedSession = _metricsSelectedSession === name ? null : name;
   _metricsRender();
+}
+
+// ── Metrics > Disk Cleanup (reclaim) ─────────────────────────────────────────
+// Scan / findings / treemap / quarantine over /api/reclaim.
+//
+// The one number this UI must never fake: "reclaimed". A move within a volume
+// frees nothing, and on APFS even a delete frees nothing while a local snapshot
+// still references the blocks — measured on 2026-08-16, deleting 22GB of ollama
+// models moved `df` by ~0. So every reclaim figure shown here is a real
+// free-space delta reported by the server, and estimates are labelled as such.
+let _metricsMode = 'system';
+let _reclaimScan = null;
+let _reclaimTimer = null;
+let _reclaimSel = new Set();
+let _reclaimTreePath = null;
+let _reclaimTree = null;
+let _reclaimQuarantine = null;
+let _reclaimCat = null;
+
+const _RECLAIM_CATS = {
+  build:     { label: 'Build artifacts', hint: 'Regenerable. Costs a rebuild, not data.', safe: true },
+  cache:     { label: 'Caches',          hint: 'Regenerable. Apps refill these on demand.', safe: true },
+  devtool:   { label: 'Dev tool stores', hint: 'Models, images, registries. Re-download can be slow.', safe: true },
+  large:     { label: 'Large files',     hint: 'Recently touched. Review individually.', safe: false },
+  stale:     { label: 'Stale files',     hint: 'Large and untouched for 90d+. Review individually.', safe: false },
+  duplicate: { label: 'Likely duplicates', hint: 'Same size + head/tail fingerprint, NOT a full hash. Verify before deleting.', safe: false },
+  snapshot:  { label: 'APFS snapshots',  hint: 'Holds deleted blocks. Not deletable from here.', safe: false },
+};
+
+const _KIND_COLORS = {
+  model: '#a371f7', media: '#f0883e', image: '#3fb950', archive: '#e3b341',
+  data: '#58a6ff', code: '#6e7681', build: '#f85149', doc: '#39c5cf', other: '#484f58',
+};
+
+// _fmtBytes is declared once, further down (the B/KB/MB/GB version by the
+// torrent renderer). A second copy lived here; in a classic script the LAST
+// declaration wins, so this one governed nothing at runtime and only tripped
+// eslint no-redeclare, which failed the SPA static gate and kept rust.yml red
+// for 3 runs on origin/main (reported by mixpeek-homepage-claude 2026-08-17,
+// which also blocked their MHC-377 CI step from ever running). Removed.
+
+function _metricsSetMode(mode) {
+  _metricsMode = mode;
+  document.getElementById('metricsmode-system')?.classList.toggle('active', mode === 'system');
+  document.getElementById('metricsmode-disk')?.classList.toggle('active', mode === 'disk');
+  const mc = document.getElementById('metrics-content');
+  const rc = document.getElementById('reclaim-content');
+  if (mc) mc.style.display = mode === 'system' ? '' : 'none';
+  if (rc) rc.style.display = mode === 'disk' ? '' : 'none';
+  const sb = document.getElementById('metrics-sidebar');
+  if (sb) sb.style.display = mode === 'disk' ? 'none' : '';
+  if (mode === 'disk') _reclaimLoad(); else _reclaimStopPolling();
+}
+
+function _reclaimStopPolling() {
+  if (_reclaimTimer) { clearInterval(_reclaimTimer); _reclaimTimer = null; }
+}
+
+async function _reclaimLoad() {
+  try {
+    const [scan, quar] = await Promise.all([
+      fetch(API + '/api/reclaim/scan/latest').then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch(API + '/api/reclaim/quarantine').then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    _reclaimScan = scan;
+    _reclaimQuarantine = quar;
+    _reclaimRender();
+    const st = scan?.scan?.status;
+    if (st === 'running' && !_reclaimTimer) _reclaimTimer = setInterval(_reclaimPoll, 1500);
+    if (st !== 'running') _reclaimStopPolling();
+    // Any terminal status, not just 'done'. A cancelled or interrupted scan
+    // still persists the tree it built before it stopped, and gating on 'done'
+    // meant the map silently never appeared for the two statuses that are most
+    // common here - the server restarts on every commit to this checkout.
+    if (st && st !== 'running' && !_reclaimTree) _reclaimLoadTree(null);
+  } catch (e) {
+    const el = document.getElementById('reclaim-content');
+    if (el) el.innerHTML = '<div style="color:var(--red);padding:20px;">Could not load reclaim data: ' + esc(String(e)) + '</div>';
+  }
+}
+
+async function _reclaimPoll() {
+  const r = await fetch(API + '/api/reclaim/scan/latest').then(r => r.ok ? r.json() : null).catch(() => null);
+  if (!r) return;
+  const wasRunning = _reclaimScan?.scan?.status === 'running';
+  _reclaimScan = r;
+  _reclaimRender();
+  if (r.scan?.status !== 'running') {
+    _reclaimStopPolling();
+    if (wasRunning) { _reclaimTree = null; _reclaimLoadTree(null); showToast('Disk scan complete'); }
+  }
+}
+
+async function _reclaimStartScan() {
+  const btn = document.getElementById('reclaim-scan-btn');
+  if (btn) { btn.disabled = true; btn.textContent = 'Starting…'; }
+  try {
+    const r = await fetch(API + '/api/reclaim/scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) { showToast(d.error || 'Scan could not start'); }
+    _reclaimSel = new Set();
+    await _reclaimLoad();
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Rescan'; }
+  }
+}
+
+async function _reclaimCancelScan() {
+  const id = _reclaimScan?.scan?.id;
+  if (!id) return;
+  await fetch(API + '/api/reclaim/scan/' + encodeURIComponent(id) + '/cancel', { method: 'POST' });
+  _reclaimLoad();
+}
+
+async function _reclaimLoadTree(path) {
+  const id = _reclaimScan?.scan?.id;
+  if (!id) return;
+  const qs = path ? '?path=' + encodeURIComponent(path) : '';
+  _reclaimTree = await fetch(API + '/api/reclaim/tree/' + encodeURIComponent(id) + qs)
+    .then(r => r.ok ? r.json() : null).catch(() => null);
+  _reclaimTreePath = path;
+  _reclaimRender();
+}
+
+function _reclaimToggle(path) {
+  if (_reclaimSel.has(path)) _reclaimSel.delete(path); else _reclaimSel.add(path);
+  _reclaimRender();
+}
+
+function _reclaimSetCat(cat) {
+  _reclaimCat = (_reclaimCat === cat || !cat) ? null : cat;
+  _reclaimRender();
+}
+
+function _reclaimSelectCategory(cat) {
+  // Only regenerable categories are bulk-selectable. Stale/duplicate/large are
+  // judgment calls and stay one-at-a-time on purpose (ethos rule 8).
+  const rows = (_reclaimScan?.findings || []).filter(f => f.category === cat && f.regenerable);
+  const allOn = rows.length && rows.every(f => _reclaimSel.has(f.path));
+  rows.forEach(f => allOn ? _reclaimSel.delete(f.path) : _reclaimSel.add(f.path));
+  _reclaimRender();
+}
+
+async function _reclaimQuarantineSelected() {
+  const paths = [..._reclaimSel];
+  if (!paths.length) return;
+  const est = (_reclaimScan?.findings || []).filter(f => _reclaimSel.has(f.path))
+    .reduce((a, f) => a + (f.bytes || 0), 0);
+  const msg = 'Move ' + paths.length + ' item(s) to quarantine?\n\n'
+    + 'Estimated size: ' + _fmtBytes(est) + '\n\n'
+    + 'Nothing is deleted. Files move to ~/.amux/quarantine and can be restored '
+    + 'with one click. Space is NOT returned until you purge the batch.\n\n'
+    + paths.slice(0, 12).join('\n') + (paths.length > 12 ? '\n…and ' + (paths.length - 12) + ' more' : '');
+  if (!confirm(msg)) return;
+  const r = await fetch(API + '/api/reclaim/quarantine', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ paths, scan_id: _reclaimScan?.scan?.id }),
+  });
+  const d = await r.json().catch(() => ({}));
+  if (d.refused && d.refused.length) {
+    alert('Staged ' + (d.moved || 0) + ' item(s).\n\nRefused ' + d.refused.length + ':\n'
+      + d.refused.map(x => x.path + ' — ' + x.reason).join('\n'));
+  } else {
+    showToast('Staged ' + (d.moved || 0) + ' item(s) — ' + _fmtBytes(d.bytes || 0));
+  }
+  _reclaimSel = new Set();
+  _reclaimLoad();
+}
+
+async function _reclaimRestore(batchId) {
+  if (!confirm('Restore every file in this batch to its original location?')) return;
+  const r = await fetch(API + '/api/reclaim/quarantine/' + encodeURIComponent(batchId) + '/restore', { method: 'POST' });
+  const d = await r.json().catch(() => ({}));
+  showToast('Restored ' + (d.restored || 0) + ' item(s)');
+  if (d.failed && d.failed.length) alert('Failed:\n' + d.failed.map(x => x.path + ' — ' + x.reason).join('\n'));
+  _reclaimLoad();
+}
+
+async function _reclaimPurge(batchId, bytes) {
+  const msg = 'PERMANENTLY DELETE this quarantine batch?\n\n'
+    + 'Size: ' + _fmtBytes(bytes) + '\n\n'
+    + 'This cannot be undone. Restore will no longer be possible.';
+  if (!confirm(msg)) return;
+  if (prompt('Type PURGE to confirm permanent deletion:') !== 'PURGE') { showToast('Cancelled'); return; }
+  const r = await fetch(API + '/api/reclaim/quarantine/' + encodeURIComponent(batchId)
+    + '?confirm=' + encodeURIComponent(batchId), { method: 'DELETE' });
+  const d = await r.json().catch(() => ({}));
+  // Report the REAL delta, and say so when it disappoints.
+  showToast('Purged · free space +' + _fmtBytes(d.actually_freed || 0));
+  if (d.note) alert(d.note);
+  _reclaimLoad();
+}
+
+// Squarified treemap. Colour encodes the dominant file-type bucket, area
+// encodes bytes, so a big red block is a big pile of build output.
+function _reclaimTreemapSvg(nodes, w, h) {
+  const total = nodes.reduce((a, n) => a + (n.bytes || 0), 0);
+  if (!total) return '<div style="color:var(--dim);padding:20px;font-size:0.82rem;">No size data for this folder.</div>';
+  const items = nodes.filter(n => n.bytes > 0).map(n => ({ ...n, area: n.bytes / total * w * h }));
+  const rects = [];
+  let x = 0, y = 0, cw = w, ch = h, i = 0;
+
+  while (i < items.length) {
+    const vertical = cw >= ch;
+    const side = vertical ? ch : cw;
+    let row = [], rowArea = 0, best = Infinity;
+    while (i + row.length < items.length) {
+      const cand = [...row, items[i + row.length]];
+      const ca = rowArea + items[i + row.length].area;
+      const len = ca / side;
+      const worst = Math.max(...cand.map(r => Math.max(len / (r.area / len || 1e-9), (r.area / len || 1e-9) / len)));
+      if (row.length && worst > best) break;
+      row = cand; rowArea = ca; best = worst;
+    }
+    if (!row.length || side <= 0) break;
+    const len = rowArea / side;
+    if (!(len > 0)) break;
+    let off = 0;
+    row.forEach(r => {
+      const seg = (r.area / rowArea) * side;
+      rects.push(vertical
+        ? { ...r, x, y: y + off, w: len, h: seg }
+        : { ...r, x: x + off, y, w: seg, h: len });
+      off += seg;
+    });
+    if (vertical) { x += len; cw -= len; } else { y += len; ch -= len; }
+    i += row.length;
+  }
+
+  const body = rects.map(r => {
+    const name = (r.path || '').split('/').pop() || r.path;
+    const color = _KIND_COLORS[r.kind || 'other'] || _KIND_COLORS.other;
+    const showLabel = r.w > 54 && r.h > 22;
+    const t = esc(name + ' — ' + _fmtBytes(r.bytes));
+    return `<g class="tm-cell" onclick="_reclaimLoadTree('${escJs(r.path)}')">
+      <title>${t}</title>
+      <rect x="${r.x.toFixed(1)}" y="${r.y.toFixed(1)}" width="${Math.max(0,r.w-1.5).toFixed(1)}" height="${Math.max(0,r.h-1.5).toFixed(1)}"
+            fill="${color}" fill-opacity="0.78" stroke="var(--bg)" stroke-width="1" rx="2"/>
+      ${showLabel ? `<text x="${(r.x+6).toFixed(1)}" y="${(r.y+15).toFixed(1)}" font-size="10.5" fill="#fff" font-weight="600" pointer-events="none">${esc(name.slice(0,22))}</text>
+      <text x="${(r.x+6).toFixed(1)}" y="${(r.y+27).toFixed(1)}" font-size="9.5" fill="#fff" fill-opacity="0.82" pointer-events="none">${_fmtBytes(r.bytes)}</text>` : ''}
+    </g>`;
+  }).join('');
+
+  // viewBox is sized to the ACTUAL box (see the caller), so the map fills its
+  // container without letterboxing and without preserveAspectRatio="none".
+  // That would fill the box but shear every text label, since non-uniform
+  // scaling distorts glyphs even though it preserves relative cell areas.
+  return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="${h}" style="display:block;border-radius:8px;overflow:hidden;">${body}</svg>`;
+}
+
+function _reclaimRender() {
+  const el = document.getElementById('reclaim-content');
+  if (!el) return;
+  const scan = _reclaimScan?.scan;
+  const findings = _reclaimScan?.findings || [];
+  const totals = _reclaimScan?.totals || [];
+  let html = '';
+
+  // Header + volume state
+  const freePct = scan?.df_total ? (scan.df_free / scan.df_total * 100) : null;
+  const critical = freePct !== null && freePct < 10;
+  html += `<div class="metrics-hdr">
+    <div class="metrics-hdr-left">
+      <span class="metrics-hdr-title">Disk Cleanup</span>
+      ${scan?.df_total ? `<span class="metrics-hostname">${_fmtBytes(scan.df_free)} free of ${_fmtBytes(scan.df_total)}</span>` : ''}
+      ${critical ? `<span style="color:var(--red);font-size:0.72rem;font-weight:600;">${freePct.toFixed(1)}% free</span>` : ''}
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;">
+      ${scan?.status === 'running'
+        ? `<button class="btn" onclick="_reclaimCancelScan()" style="font-size:0.8rem;padding:5px 12px;">Stop scan</button>`
+        : `<button class="btn" id="reclaim-scan-btn" onclick="_reclaimStartScan()" style="font-size:0.8rem;padding:5px 12px;">${scan ? 'Rescan' : 'Run scan'}</button>`}
+    </div>
+  </div>`;
+
+  if (!scan) {
+    html += `<div class="reclaim-empty">
+      <div style="font-weight:600;margin-bottom:6px;">No scan yet</div>
+      <div style="font-size:0.82rem;color:var(--dim);line-height:1.6;max-width:620px;">
+        Walks your home directory plus the dev-tool stores that live outside it, and ranks what can be
+        reclaimed. The scan is read-only and runs at background I/O priority so it does not compete
+        with the amux server for disk. Nothing is deleted without you selecting it.
+      </div>
+    </div>`;
+    el.innerHTML = html;
+    return;
+  }
+
+  // Progress
+  if (scan.status === 'running') {
+    html += `<div class="reclaim-progress">
+      <div class="reclaim-spinner"></div>
+      <div style="flex:1;min-width:0;">
+        <div style="font-size:0.85rem;font-weight:600;margin-bottom:3px;">Scanning…</div>
+        <div style="font-size:0.75rem;color:var(--dim);">
+          ${(scan.dirs_walked||0).toLocaleString()} folders · ${(scan.files_walked||0).toLocaleString()} files · ${_fmtBytes(scan.bytes_seen)} seen
+        </div>
+        <div class="reclaim-curpath">${esc(scan.current_path || '')}</div>
+      </div>
+    </div>`;
+  }
+
+  // An interrupted scan must say so. The server restarts on every commit to
+  // the shared checkout, so a scan dying mid-walk is common, and a UI that
+  // kept spinning would read as "still working" forever.
+  if (scan.status === 'interrupted' || (scan.status === 'cancelled' && scan.error)) {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">Scan did not finish</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        ${esc(scan.error || 'The scan was cancelled.')}
+        Results below are partial: ${(scan.dirs_walked||0).toLocaleString()} folders were walked before it stopped.
+        Run it again to get a complete picture.
+      </div>
+    </div>`;
+  }
+
+  // Snapshot warning: the thing that makes cleanup look broken.
+  const snapFinding = findings.find(f => f.category === 'snapshot');
+  if (snapFinding) {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">⚠ ${scan.snapshot_count} APFS local snapshots are holding deleted space</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        Until these expire or are thinned, <b>deleting files will not increase your free space</b>.
+        The blocks stay referenced by the snapshot. This is why a cleanup can look like it did nothing.
+        <div style="margin-top:6px;">Release them from a terminal (needs sudo, so amux will not run it for you):</div>
+        <code class="reclaim-code">sudo tmutil thinlocalsnapshots / 21474836480 4</code>
+      </div>
+    </div>`;
+  }
+
+  // Category totals
+  const actionable = totals.filter(t => t.category !== 'snapshot');
+  if (actionable.length) {
+    html += '<div class="metrics-section-title">Reclaimable by category</div><div class="metrics-cards">';
+    actionable.forEach(t => {
+      const meta = _RECLAIM_CATS[t.category] || { label: t.category, hint: '' };
+      const on = _reclaimCat === t.category;
+      html += `<div class="metrics-card reclaim-catcard${on ? ' active' : ''}" onclick="_reclaimSetCat('${escJs(t.category)}')" title="${esc(meta.hint)}">
+        <div class="metrics-card-title">${esc(meta.label)}</div>
+        <div class="metrics-card-value" style="font-size:1.2rem;">${_fmtBytes(t.bytes)}</div>
+        <div class="metrics-card-sub">${t.count} item${t.count === 1 ? '' : 's'}${meta.safe ? ' · regenerable' : ''}</div>
+      </div>`;
+    });
+    html += '</div>';
+  }
+
+  // Treemap
+  if (_reclaimTree) {
+    const rootPath = _reclaimTree.root?.path || _reclaimTreePath || '~';
+    const parent = rootPath.includes('/') ? rootPath.slice(0, rootPath.lastIndexOf('/')) : null;
+    html += `<div class="metrics-section-title" style="margin-top:18px;">Disk map
+      <span style="text-transform:none;letter-spacing:0;font-weight:400;">(click a block to drill in)</span></div>`;
+    html += `<div class="reclaim-mapbar">
+      ${parent ? `<button class="btn reclaim-upbtn" onclick="_reclaimLoadTree('${escJs(parent)}')">↑ up</button>` : ''}
+      <span class="reclaim-mappath">${esc(rootPath)}</span>
+      ${_reclaimTree.root ? `<span style="color:var(--dim);font-size:0.75rem;">${_fmtBytes(_reclaimTree.root.bytes)}</span>` : ''}
+    </div>`;
+    // Lay the map out at the size it will actually occupy, so the viewBox and
+    // the box agree and nothing is letterboxed. Measured from the scroll pane
+    // (minus its 16px padding either side) rather than assumed.
+    const _mapW = Math.round(Math.max(300, Math.min(1200,
+      (document.getElementById('metrics-main')?.clientWidth || 900) - 32)));
+    const _mapH = window.innerWidth < 600 ? 300 : 340;
+    html += '<div class="reclaim-map">' + _reclaimTreemapSvg(_reclaimTree.children || [], _mapW, _mapH) + '</div>';
+    html += '<div class="reclaim-legend">' + Object.entries(_KIND_COLORS).map(([k, c]) =>
+      `<span class="reclaim-legend-item"><i style="background:${c}"></i>${k}</span>`).join('') + '</div>';
+  }
+
+  // Findings table
+  const shown = _reclaimCat ? findings.filter(f => f.category === _reclaimCat) : findings.filter(f => f.category !== 'snapshot');
+  const selBytes = findings.filter(f => _reclaimSel.has(f.path)).reduce((a, f) => a + (f.bytes || 0), 0);
+
+  html += `<div class="metrics-section-title" style="margin-top:18px;">
+    Findings${_reclaimCat ? ' — ' + esc(_RECLAIM_CATS[_reclaimCat]?.label || _reclaimCat) : ''}
+    <span style="text-transform:none;letter-spacing:0;font-weight:400;">(${shown.length})</span>
+    ${_reclaimCat ? `<button class="btn reclaim-minibtn" onclick="_reclaimSetCat(null)">clear filter</button>` : ''}
+    ${_reclaimCat && _RECLAIM_CATS[_reclaimCat]?.safe ? `<button class="btn reclaim-minibtn" onclick="_reclaimSelectCategory('${escJs(_reclaimCat)}')">select all regenerable</button>` : ''}
+  </div>`;
+
+  if (_reclaimSel.size) {
+    html += `<div class="reclaim-actionbar">
+      <span><b>${_reclaimSel.size}</b> selected · <b>${_fmtBytes(selBytes)}</b> <span style="color:var(--dim);">(estimated)</span></span>
+      <span style="display:flex;gap:8px;">
+        <button class="btn" onclick="_reclaimSel=new Set();_reclaimRender()">Clear</button>
+        <button class="btn reclaim-danger" onclick="_reclaimQuarantineSelected()">Move to quarantine…</button>
+      </span>
+    </div>`;
+  }
+
+  html += '<div class="metrics-table-wrap"><table class="metrics-table"><thead><tr>';
+  html += '<th style="width:28px;"></th><th>Path</th><th>Category</th><th>Size</th><th>Files</th><th>Detail</th>';
+  html += '</tr></thead><tbody>';
+  if (!shown.length) {
+    html += '<tr><td colspan="6" style="text-align:center;color:var(--dim);padding:20px;">'
+      + (scan.status === 'running' ? 'Scan in progress…' : 'Nothing found in this category.') + '</td></tr>';
+  } else {
+    shown.slice(0, 400).forEach(f => {
+      const meta = _RECLAIM_CATS[f.category] || { label: f.category };
+      const checked = _reclaimSel.has(f.path) ? ' checked' : '';
+      html += `<tr class="${_reclaimSel.has(f.path) ? 'row-selected' : ''}">
+        <td><input type="checkbox"${checked} onchange="_reclaimToggle('${escJs(f.path)}')"></td>
+        <td style="font-family:var(--mono,monospace);font-size:0.74rem;word-break:break-all;">${esc(f.path)}</td>
+        <td style="font-size:0.74rem;">${esc(meta.label)}${f.regenerable ? '' : ' <span style="color:var(--yellow,#e3b341);" title="Not regenerable. Review before removing.">⚠</span>'}</td>
+        <td style="font-weight:600;">${_fmtBytes(f.bytes)}</td>
+        <td style="font-size:0.74rem;color:var(--dim);">${(f.file_count||0).toLocaleString()}</td>
+        <td style="font-size:0.72rem;color:var(--dim);">${esc(f.detail || '')}</td>
+      </tr>`;
+    });
+  }
+  html += '</tbody></table></div>';
+  if (shown.length > 400) {
+    html += `<div style="font-size:0.72rem;color:var(--dim);margin-top:6px;">Showing the 400 largest of ${shown.length}. Narrow with a category filter to see the rest.</div>`;
+  }
+
+  // Quarantine ledger
+  const batches = (_reclaimQuarantine?.batches || []).filter(b => b.status !== 'purged' || b.item_count);
+  if (batches.length) {
+    html += '<div class="metrics-section-title" style="margin-top:20px;">Quarantine</div>';
+    html += '<div class="metrics-table-wrap"><table class="metrics-table"><thead><tr>';
+    html += '<th>Staged</th><th>Items</th><th>Size</th><th>Actually freed</th><th>Status</th><th></th>';
+    html += '</tr></thead><tbody>';
+    batches.forEach(b => {
+      const freed = (b.df_free_after != null && b.df_free_before != null)
+        ? b.df_free_after - b.df_free_before : null;
+      const staged = b.status === 'staged';
+      html += `<tr>
+        <td style="font-size:0.75rem;">${_metricsRelTime(new Date(b.created_at * 1000).toISOString())}</td>
+        <td>${b.item_count}</td>
+        <td style="font-weight:600;">${_fmtBytes(b.bytes)}</td>
+        <td style="font-size:0.75rem;color:${freed > 0 ? '#3fb950' : 'var(--dim)'};">${freed == null ? '—' : (freed > 0 ? '+' : '') + _fmtBytes(freed)}</td>
+        <td style="font-size:0.75rem;">${esc(b.status)}</td>
+        <td style="text-align:right;white-space:nowrap;">
+          ${staged ? `<button class="btn reclaim-minibtn" onclick="_reclaimRestore('${escJs(b.id)}')">Restore</button>
+          <button class="btn reclaim-minibtn reclaim-danger" onclick="_reclaimPurge('${escJs(b.id)}',${b.bytes})">Purge</button>` : ''}
+        </td>
+      </tr>`;
+    });
+    html += '</tbody></table></div>';
+    html += `<div style="font-size:0.72rem;color:var(--dim);margin-top:6px;line-height:1.5;">
+      Staged files live in <code>${esc(_reclaimQuarantine?.root || '~/.amux/quarantine')}</code>.
+      "Actually freed" is the real free-space change rather than the sum of file sizes. A move frees
+      nothing until purge, and snapshots can hold the blocks after that.</div>`;
+  }
+
+  el.innerHTML = html;
 }
 
 // ── Torrents tab ─────────────────────────────────────────────────────────────

@@ -50,6 +50,9 @@ struct Rig {
 }
 
 fn rig() -> Rig {
+    // These golden scenarios test the gate/lifecycle state machine, not the
+    // global done-link gate (which has its own coverage), so pin it OFF.
+    std::env::set_var("AMUX_DONE_LINK_REQUIRED", "0");
     let dir = tempfile::tempdir().unwrap();
     let store: SharedStore = Arc::new(Store::open(&dir.path().join("golden.db")).unwrap());
     let state = AppState {

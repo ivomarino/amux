@@ -42,7 +42,7 @@
     "description": "How amux runs AI business automations — intent-resolved on every run, not brittle coordinate replay. Browser AI agents that compose with coding agents, scheduled, phone-monitored, self-healing.",
     "url": "https://amux.io/guides/ai-agent-automations/",
     "datePublished": "2026-07-05",
-    "dateModified": "2026-07-22",
+    "dateModified": "2026-08-17",
     "author": {"@type": "Organization", "name": "amux", "url": "https://amux.io/"},
     "publisher": {"@type": "Organization", "name": "amux", "url": "https://amux.io/"},
     "image": "https://amux.io/og-image.png",
@@ -171,7 +171,7 @@
     <div class="breadcrumb"><a href="/">amux</a> <span class="sep">›</span> <a href="/guides/">Guides</a> <span class="sep">›</span> <span>AI Agent Business Automations</span></div>
 
     <h1>AI Agent Business Automations</h1>
-    <p class="subtitle">Intent-based, not brittle coordinate replay — automate SaaS tasks with AI that reads the page, not records the pixels. Updated July 2026.</p>
+    <p class="subtitle">Intent-based, not brittle coordinate replay — automate SaaS tasks with AI that reads the page, not records the pixels. Updated August 2026.</p>
 
     <p>amux runs business automations as AI-driven browser tasks: pull a daily Stripe payout report, reconcile two dashboards, check insurance eligibility statuses, monitor competitor pricing. The critical difference from traditional RPA (robotic process automation): amux automations describe <em>what to accomplish</em>, not <em>which pixels to click</em>. Each run, the agent reads the current page state and decides actions fresh — it survives UI redesigns, A/B tests, and dynamic content that would break a coordinate-replay script. And because automations run inside the same platform as your coding agents, results hand off directly: a scraper finds bugs, a Claude Code session files PRs.</p>
 
@@ -428,6 +428,33 @@ curl -sk $AMUX_URL/api/browser/agent/status</code></pre>
       <li><strong>Visible stop conditions:</strong> every automation declares a <code>## Success when</code> condition — the runner checks it and reports pass/fail clearly, not a silent "completed"</li>
       <li><strong>Dry run:</strong> resolve the action plan and preview what the automation would do without executing side-effectful steps</li>
     </ul>
+
+    <h2>Computed file flows with .mdai — automation outputs as a knowledge graph</h2>
+    <p>Browser automations extract data. Coding agents consume it. The bridge between them used to be manual — paste the output, write the prompt, hand it off. August 2026 ships a better model: <strong>.mdai computed files</strong>, which define a DAG where agent outputs are consumed automatically by downstream agents.</p>
+
+    <p>A <code>.mdai</code> file declares its dependencies and how to produce its output:</p>
+
+    <pre style="background:var(--surface-2);padding:1rem;border-radius:6px;overflow-x:auto"><code># competitor-pricing-analysis.mdai
+depends_on:
+  - competitor-pricing-raw.md      # produced by your browser automation
+  - internal-pricing.md            # your current pricing sheet
+
+produce: |
+  Compare competitor pricing against internal-pricing.md.
+  Identify our three most under-priced tiers.
+  Output a table: tier | our price | competitor price | gap.</code></pre>
+
+    <p>When <code>competitor-pricing-raw.md</code> is updated by a scheduled browser automation, the DAG resolver sees the dependency changed and queues the analysis agent automatically. No manual trigger, no copy-paste, no pipeline glue code to maintain.</p>
+
+    <p>Three patterns this unlocks:</p>
+
+    <ul>
+      <li><strong>Automation → analysis → action:</strong> a browser agent scrapes data → a .mdai node analyzes it → a coding agent files a board task or drafts a PR</li>
+      <li><strong>Shared knowledge base:</strong> multiple automations write to different raw files; a single .mdai synthesis node reads all of them and keeps a consolidated view current</li>
+      <li><strong>Cache-aware reruns:</strong> if neither dependency changed since the last run, the computed file is not recomputed — the analysis is always fresh but never redundant</li>
+    </ul>
+
+    <p>The result is a knowledge graph that grows as your automations run. The files tab shows the DAG topology; click any node to see when it last computed, what it consumed, and what the output was.</p>
 
     <h2>The road ahead: dedicated Automations tab</h2>
     <p>Today's amux automation stack — browser agent API + scheduler + saved profiles + board integration — enables all the patterns above. The next step, currently in design, is a dedicated <strong>Automations tab</strong> in the dashboard where you can:</p>

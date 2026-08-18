@@ -430,18 +430,44 @@ impl FleetSignals {
         // counts as shell-only only if EVERY pane is a shell.
         let mut shell_only = BTreeSet::new();
         if let Ok(o) = std::process::Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_current_command}"])
+            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"])
             .output()
         {
             const SHELLS: [&str; 8] = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
             let mut any_live: BTreeSet<String> = BTreeSet::new();
             let mut seen: BTreeSet<String> = BTreeSet::new();
+            // Panes whose FOREGROUND command is a shell but which might still host
+            // an agent as a CHILD: (session, pane_pid). Collected here and probed
+            // below only for sessions not already proven live by another pane.
+            let mut shell_panes: Vec<(String, String)> = Vec::new();
             for l in String::from_utf8_lossy(&o.stdout).lines() {
-                let Some((sess, cmd)) = l.rsplit_once(':') else { continue };
+                // format is session:pid:cmd, but a session NAME can contain ':',
+                // so split from the RIGHT twice: cmd, then pid.
+                let Some((rest, cmd)) = l.rsplit_once(':') else { continue };
+                let Some((sess, pid)) = rest.rsplit_once(':') else { continue };
                 seen.insert(sess.to_string());
                 let cmd = cmd.trim().trim_start_matches('-');
                 if !SHELLS.contains(&cmd) {
                     any_live.insert(sess.to_string());
+                } else {
+                    shell_panes.push((sess.to_string(), pid.trim().to_string()));
+                }
+            }
+            // AMUX-3: a foreground SHELL can still host a live agent as a child.
+            // ai-video-editor read as not-running while claude (working, 80k tokens)
+            // ran as a child of its pane's bash, so #{pane_current_command}="bash".
+            // The live is_running() already uses pgrep -P; do the same here so the
+            // fleet list agrees with it instead of hiding a running lane behind a
+            // shell it never actually returned to. Bounded: only shell-foreground
+            // panes whose session is not already proven live by another pane.
+            for (sess, pid) in shell_panes {
+                if any_live.contains(&sess) || pid.is_empty() {
+                    continue;
+                }
+                if let Ok(ch) = std::process::Command::new("pgrep").args(["-P", &pid]).output() {
+                    if !ch.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                        any_live.insert(sess.clone());
+                    }
                 }
             }
             for s in seen {
@@ -516,7 +542,36 @@ impl FleetSignals {
     /// Call this instead of touching `running` directly, or the two answers
     /// drift again.
     pub fn agent_running(&self, tmux_name: &str) -> bool {
-        self.running.contains(tmux_name) && !self.shell_only.contains(tmux_name)
+        // The tmux SESSION must exist either way — a self-report cannot resurrect a
+        // lane whose session is gone.
+        if !self.running.contains(tmux_name) {
+            return false;
+        }
+        // Primary: the pane scrape says an agent is the foreground command (or, via
+        // the pgrep rescue, a child of a foreground shell).
+        if !self.shell_only.contains(tmux_name) {
+            return true;
+        }
+        // AF-82 / D1: a lane that SELF-REPORTED an active agent recently is running,
+        // even when the pane scrape reads shell-only — an agent launched as a child
+        // of a wrapper shell, or nested a level deeper than the pgrep rescue reaches.
+        // The self-report is the harness reporting its own state (the D1 exit) and
+        // the scrape is the FALLBACK; `running` ignored it while `status` already
+        // honoured it, so ai-video-editor read running=False with an `active` report
+        // 57s old. Same freshness guards the status override uses (from_this_life +
+        // live), active/waiting only (an idle report does not assert a live agent).
+        if let Some(name) = tmux_name.strip_prefix("amux-") {
+            if let Some(rep) = self.reports.get(name) {
+                let st = rep["state"].as_str().unwrap_or("");
+                let ts = rep["ts"].as_f64().unwrap_or(0.0);
+                let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= ts;
+                let live = self.now - ts < env_secs("AMUX_HOOKS_LIVE_S", 1800.0);
+                if from_this_life && live && (st == "active" || st == "waiting") {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// How recent must physical evidence be to falsify a reported `idle`, and
@@ -1271,16 +1326,54 @@ pub fn legacy_sessions_array(store: &crate::db::SharedStore) -> anyhow::Result<S
     Ok(json)
 }
 
-pub async fn list_sessions_legacy(State(state): State<AppState>) -> Response {
+pub async fn list_sessions_legacy(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     match legacy_sessions_array(&state.store) {
         Ok(json) => (
             StatusCode::OK,
             [(axum::http::header::CONTENT_TYPE, "application/json")],
-            json,
+            filter_isolated_for_peer(&json, &headers),
         )
             .into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
+}
+
+/// Whether the caller is a PEER worker rather than the owner. A peer's request
+/// carries a server-verified worker/session header (the `amux` CLI stamps it);
+/// the owner's dashboard is a browser and sends neither. Same owner-vs-peer
+/// split the send guard uses (empty origin = owner).
+fn caller_is_peer(headers: &axum::http::HeaderMap) -> bool {
+    ["x-amux-worker", "x-amux-session"].iter().any(|k| {
+        headers
+            .get(*k)
+            .and_then(|v| v.to_str().ok())
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
+}
+
+/// ISOLATED (AMUX-3232): strip isolated (raw-agent) workers from the fleet list
+/// a PEER sees, so they are undiscoverable to other sessions. The OWNER
+/// dashboard sees the full fleet (it must still control them), so the shared
+/// cache stays owner-complete and the peer view is applied per request here.
+/// Greppable trace on a real strip so the exclusion is not silent.
+fn filter_isolated_for_peer(json: &str, headers: &axum::http::HeaderMap) -> String {
+    if !caller_is_peer(headers) {
+        return json.to_string();
+    }
+    let Ok(mut arr) = serde_json::from_str::<Vec<serde_json::Value>>(json) else {
+        return json.to_string();
+    };
+    let before = arr.len();
+    arr.retain(|s| !s.get("isolated").and_then(serde_json::Value::as_bool).unwrap_or(false));
+    let hidden = before - arr.len();
+    if hidden > 0 {
+        tracing::debug!(hidden, "sessions list: isolated worker(s) hidden from a peer caller");
+    }
+    serde_json::to_string(&arr).unwrap_or_else(|_| json.to_string())
 }
 
 // ---- POST /api/sessions — CREATE a fleet worker --------------------------
@@ -1737,7 +1830,17 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             "sched_on": 0,
             "sched_off": 0,
             "name": name,
-            "status": status,
+            // Rate-limit IS a status (Ethan, 2026-08-16: "capture workers rate
+            // limit as a status"). A lane blocked on a provider usage limit must be
+            // distinguishable in the fleet view, not hidden behind idle/waiting with
+            // only the side boolean `credit_limited` two lines down. Derives from the
+            // same meta stamp the rate_limit_sweep now keeps set for the whole
+            // blocked window (menu OR post-menu banner).
+            "status": if meta["rate_limited_since"].as_i64().unwrap_or(0) > 0 {
+                json!("rate_limited")
+            } else {
+                json!(status.clone())
+            },
             "running": is_running,
             "provider": env.get("CC_PROVIDER").cloned().unwrap_or_else(|| "claude".into()),
             "model": env.get("CC_MODEL").cloned().unwrap_or_default(),
@@ -1750,6 +1853,11 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // UI (Ethan's finding).
             "tags": env.get("CC_TAGS").map(|t| t.split(',').map(str::trim).filter(|s| !s.is_empty()).map(String::from).collect::<Vec<_>>()).unwrap_or_default(),
             "pinned": env.get("CC_PINNED").map(|v| v == "1").unwrap_or(false),
+            // ISOLATED (AMUX-3232): a raw agent (tmux + the CLI, no amux
+            // harness). The OWNER dashboard reads this to show the toggle state /
+            // badge; the peer-facing list strips these entries entirely in
+            // list_sessions_legacy (a peer must not even see it exists).
+            "isolated": env.get("CC_ISOLATED").map(|v| v == "1").unwrap_or(false),
             "steering_queue": [],
             "managed_by": "python",
         }));
@@ -2224,6 +2332,43 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 mod tests {
     use super::*;
 
+    /// ISOLATED (AMUX-3232): the peer-facing fleet list strips isolated
+    /// (raw-agent) workers so peers cannot discover them, while the OWNER
+    /// dashboard (no worker header) sees the full fleet. The normal worker is the
+    /// negative control that lets this test actually fail.
+    #[test]
+    fn peer_list_hides_isolated_workers_owner_sees_all() {
+        let arr = serde_json::to_string(&serde_json::json!([
+            {"name": "normal", "isolated": false},
+            {"name": "secret", "isolated": true},
+        ]))
+        .unwrap();
+
+        // A PEER carries a server-stamped worker header, so the isolated worker
+        // is gone and the normal one remains.
+        let mut peer = axum::http::HeaderMap::new();
+        peer.insert("x-amux-worker", "some-peer".parse().unwrap());
+        let peer_view: Vec<serde_json::Value> =
+            serde_json::from_str(&filter_isolated_for_peer(&arr, &peer)).unwrap();
+        let peer_names: Vec<&str> =
+            peer_view.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(peer_names, vec!["normal"], "peer must not see the isolated worker");
+
+        // The OWNER dashboard sends no worker/session header, so it sees BOTH.
+        let owner = axum::http::HeaderMap::new();
+        let owner_view: Vec<serde_json::Value> =
+            serde_json::from_str(&filter_isolated_for_peer(&arr, &owner)).unwrap();
+        let owner_names: Vec<&str> =
+            owner_view.iter().filter_map(|s| s["name"].as_str()).collect();
+        assert_eq!(owner_names, vec!["normal", "secret"], "owner sees the full fleet");
+
+        // An EMPTY worker header is the owner, not a peer (the send guard's same
+        // rule), so it must not trigger the strip.
+        let mut empty = axum::http::HeaderMap::new();
+        empty.insert("x-amux-worker", "".parse().unwrap());
+        assert!(!caller_is_peer(&empty), "an empty header is the owner, not a peer");
+    }
+
     /// AMUX-3182: the create modal could not honestly make an ollama worker.
     /// An ollama worker's model must land in CC_MODEL (the start arm reads it),
     /// never as `--model` in CC_FLAGS, and the CLAUDE default model must never
@@ -2399,6 +2544,49 @@ mod tests {
             panes: BTreeMap::new(),
             now: 1_000_000.0,
         }
+    }
+
+    /// AF-82 / D1: `running` must honour a fresh self-report, not only the pane
+    /// scrape. A lane launched as a child of a wrapper shell scrapes shell_only,
+    /// but an `active` report 57s old means an agent IS running (the exact
+    /// ai-video-editor case). The scrape is the fallback; ignoring the report is
+    /// what showed a working lane as stopped.
+    #[test]
+    fn agent_running_honours_a_fresh_active_self_report_over_a_shell_scrape() {
+        let mut s = signals();
+        let tmux = "amux-avetest";
+        s.running.insert(tmux.into()); // the tmux session exists
+        s.shell_only.insert(tmux.into()); // but the pane scrapes as a bare shell
+        assert!(!s.agent_running(tmux), "shell scrape + no report reads not-running");
+
+        // A fresh active report from THIS life -> running, despite the shell scrape.
+        s.started.insert("avetest".into(), s.now - 1000.0);
+        s.reports = serde_json::json!({ "avetest": { "state": "active", "ts": s.now - 57.0 } });
+        assert!(s.agent_running(tmux), "a 57s-old active self-report means an agent is running");
+
+        // A PREVIOUS-LIFE report (before the session (re)started) must NOT count.
+        s.started.insert("avetest".into(), s.now - 10.0);
+        assert!(!s.agent_running(tmux), "a report from before the last start is a dead life");
+
+        // An idle report does not assert a live agent.
+        s.started.insert("avetest".into(), s.now - 1000.0);
+        s.reports = serde_json::json!({ "avetest": { "state": "idle", "ts": s.now - 5.0 } });
+        assert!(!s.agent_running(tmux), "an idle report does not make it running");
+
+        // A STALE active report (older than the live window) must NOT count.
+        s.reports = serde_json::json!({ "avetest": { "state": "active", "ts": s.now - 4000.0 } });
+        assert!(!s.agent_running(tmux), "a stale active report (>30min) is not a live agent");
+
+        // The session GONE: no report resurrects it.
+        s.running.clear();
+        s.reports = serde_json::json!({ "avetest": { "state": "active", "ts": s.now - 5.0 } });
+        assert!(!s.agent_running(tmux), "a report cannot resurrect a lane whose session is gone");
+
+        // Normal case: a non-shell foreground pane is running with no report at all.
+        s.running.insert(tmux.into());
+        s.shell_only.clear();
+        s.reports = serde_json::Value::Null;
+        assert!(s.agent_running(tmux), "a non-shell foreground pane is running");
     }
 
     #[test]

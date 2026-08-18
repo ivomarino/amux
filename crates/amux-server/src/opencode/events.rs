@@ -38,6 +38,7 @@ use amux_core::protocol::{
     Failure, ProgressReport, RateLimit, RateLimitKind, ToolEvent, TurnResult, WorkerEvent,
 };
 use amux_core::provider::ProviderId;
+use serde::Serialize;
 use serde_json::Value;
 
 /// One-line, bounded summary for `ProgressReport`/`ToolEvent` detail fields:
@@ -56,7 +57,7 @@ fn summarize(text: &str) -> String {
 /// that carry the action (a Bash `command`, an Edit `file_path`), fall back
 /// to compact JSON. Never the full payload — that goes to logs.
 fn tool_detail(input: &Value) -> Option<String> {
-    for key in ["command", "description", "file_path", "pattern", "query", "url"] {
+    for key in ["command", "cmd", "description", "file_path", "path", "pattern", "query", "url"] {
         if let Some(s) = input.get(key).and_then(Value::as_str) {
             if !s.trim().is_empty() {
                 return Some(summarize(s));
@@ -442,6 +443,311 @@ pub fn translate_gemini(line: &str, turn: &TurnId) -> Vec<WorkerEvent> {
 }
 
 // ---------------------------------------------------------------------------
+// Uniform TRANSCRIPT model (RR-0030 render path, AMUX-3201 slice 1).
+//
+// [`WorkerEvent`] above is TELEMETRY: one-line summaries capped at 120 chars,
+// tool OUTPUT deliberately dropped, and no plan concept (Invariant 30:
+// "headlines, not transcripts"). Rendering a Codex/Ollama worker's
+// conversation the way Claude's is rendered needs CONTENT the telemetry model
+// forbids: the full assistant message, the tool's output, and the
+// `update_plan` checklist that shows up in the native TUI as "Updated Plan".
+// So the transcript path carries its OWN content-bearing model. It is
+// co-located with the telemetry translators because it reads the SAME provider
+// records; the two never merge (one feeds status detection, one feeds a
+// reader), which is why this is a projection of the rollout, not a second copy
+// of `translate_codex`; the latter parses `codex exec --json`, a DIFFERENT
+// schema from the on-disk rollout parsed here.
+//
+// Source of truth: Codex's rollout file
+// (`~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl`), one JSON object per line
+// shaped `{type, payload}`. Every line is read from `response_item`, the
+// canonical Responses-API record, and the `event_msg` mirror
+// (`agent_message`/`agent_reasoning`/`user_message`, which repeat the same
+// text) is skipped so nothing renders twice. Ollama runs through
+// `codex --oss`, so it emits this identical format and needs no separate path.
+
+/// One step of a Codex `update_plan` checklist (the native "Updated Plan").
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct PlanStep {
+    /// `pending` | `in_progress` | `completed` (Codex's own vocabulary; passed
+    /// through verbatim so the renderer, not this parser, owns presentation).
+    pub status: String,
+    pub step: String,
+}
+
+/// A content-bearing transcript entry, provider-agnostic so one client
+/// renderer draws Codex the way it draws Claude. `#[serde(tag = "kind")]`
+/// matches the `WorkerEvent` wire shape so the client's event handling reads
+/// the same way.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TranscriptEvent {
+    /// A prompt the human sent (environment/context wrappers stripped).
+    User { text: String },
+    /// Assistant prose.
+    Assistant { text: String },
+    /// The model's visible reasoning ("thinking"). Only emitted when the
+    /// rollout actually carries plaintext; newer Codex builds encrypt it, in
+    /// which case there is simply no reasoning block, the same as a Claude
+    /// turn with no thinking.
+    Reasoning { text: String },
+    /// A tool call paired with its output (Codex writes the two as separate
+    /// records; this reunites them by `call_id`, the way Claude pairs
+    /// `tool_use` with `tool_result`).
+    Tool {
+        tool: String,
+        detail: Option<String>,
+        output: Option<String>,
+    },
+    /// An `update_plan` call, rendered as a checklist.
+    Plan { steps: Vec<PlanStep> },
+}
+
+/// Flatten a `message` payload's `content` (array of `{type,text}` blocks, or a
+/// bare string) into one string.
+fn message_text(payload: &Value) -> String {
+    match payload.get("content") {
+        Some(Value::String(s)) => s.clone(),
+        Some(Value::Array(blocks)) => {
+            let mut parts = Vec::new();
+            for b in blocks {
+                if let Some(t) = b.get("text").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        parts.push(t);
+                    }
+                }
+            }
+            parts.join("\n")
+        }
+        _ => String::new(),
+    }
+}
+
+/// Remove a `<tag>...</tag>` block (inclusive) wherever it appears. Codex's
+/// first user message is a pure `<environment_context>` block, and real prompts
+/// can carry a `<user_instructions>` block (harness chrome, not conversation).
+fn remove_tag_block(s: &str, tag: &str) -> String {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut out = s.to_string();
+    while let Some(start) = out.find(&open) {
+        if let Some(rel_end) = out[start..].find(&close) {
+            let end = start + rel_end + close.len();
+            out.replace_range(start..end, "");
+        } else {
+            out.replace_range(start.., "");
+        }
+    }
+    out
+}
+
+/// Clean a user prompt: drop context/instruction wrappers and a leading
+/// `[HH:MM AM]` send-time tag Codex prepends. Returns "" when nothing but
+/// chrome remains (e.g. the opening environment_context message).
+fn strip_context_wrapper(text: &str) -> String {
+    let mut t = remove_tag_block(text, "environment_context");
+    t = remove_tag_block(&t, "user_instructions");
+    let t = t.trim();
+    // Strip a single leading "[..]" time stamp, e.g. "[05:41 PM] do X".
+    if let Some(rest) = t.strip_prefix('[') {
+        if let Some(idx) = rest.find(']') {
+            return rest[idx + 1..].trim().to_string();
+        }
+    }
+    t.to_string()
+}
+
+/// Join a `reasoning` payload's `summary` blocks. `None` when the build
+/// encrypted the reasoning (empty summary + `encrypted_content`).
+fn reasoning_text(payload: &Value) -> Option<String> {
+    let arr = payload.get("summary").and_then(Value::as_array)?;
+    let mut parts = Vec::new();
+    for b in arr {
+        if let Some(t) = b.get("text").and_then(Value::as_str) {
+            if !t.trim().is_empty() {
+                parts.push(t.trim());
+            }
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
+/// A short human label for a tool call: for `function_call` the `arguments`
+/// are a JSON STRING (parse, then prefer the action field via [`tool_detail`]);
+/// for `custom_tool_call` (e.g. `apply_patch`) the `input` is raw text.
+fn tool_call_detail(payload: &Value) -> Option<String> {
+    if let Some(args) = payload.get("arguments").and_then(Value::as_str) {
+        if let Ok(v) = serde_json::from_str::<Value>(args) {
+            return tool_detail(&v);
+        }
+        return Some(summarize(args));
+    }
+    if let Some(input) = payload.get("input").and_then(Value::as_str) {
+        return Some(summarize(input));
+    }
+    None
+}
+
+/// Codex wraps `exec_command` output with a metadata preamble
+/// (`Chunk ID: …\nWall time: …\nProcess exited with code 0\n…\nOutput:\n<real>`).
+/// Keep only the real output, and bound it so one noisy tool result cannot
+/// dominate the transcript.
+fn clean_tool_output(raw: &str) -> String {
+    const CAP: usize = 4000;
+    let body = if let Some(idx) = raw.find("\nOutput:\n") {
+        &raw[idx + "\nOutput:\n".len()..]
+    } else if let Some(rest) = raw.strip_prefix("Output:\n") {
+        rest
+    } else {
+        raw
+    };
+    let body = body.trim_end();
+    if body.chars().count() > CAP {
+        let mut s: String = body.chars().take(CAP).collect();
+        s.push('…');
+        s
+    } else {
+        body.to_string()
+    }
+}
+
+/// Pull the text out of a `*_output` payload's `output` field (a string in the
+/// versions captured; defensively handles an object carrying `output`).
+fn output_text(payload: &Value) -> String {
+    match payload.get("output") {
+        Some(Value::String(s)) => clean_tool_output(s),
+        Some(other) => other
+            .get("output")
+            .and_then(Value::as_str)
+            .map(clean_tool_output)
+            .unwrap_or_default(),
+        None => String::new(),
+    }
+}
+
+/// Parse an `update_plan` call's `arguments` (JSON string) into steps.
+fn parse_plan(payload: &Value) -> Option<Vec<PlanStep>> {
+    let args = payload.get("arguments").and_then(Value::as_str)?;
+    let v: Value = serde_json::from_str(args).ok()?;
+    let arr = v.get("plan").and_then(Value::as_array)?;
+    let steps: Vec<PlanStep> = arr
+        .iter()
+        .filter_map(|s| {
+            let step = s.get("step").and_then(Value::as_str)?.trim().to_string();
+            if step.is_empty() {
+                return None;
+            }
+            Some(PlanStep {
+                status: s
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending")
+                    .to_string(),
+                step,
+            })
+        })
+        .collect();
+    if steps.is_empty() {
+        None
+    } else {
+        Some(steps)
+    }
+}
+
+/// Project a Codex rollout (already parsed into per-line [`Value`]s, in file
+/// order) into a uniform [`TranscriptEvent`] stream. Pure: no I/O, no clock;
+/// the caller owns tailing the file. Unknown record/payload types are ignored
+/// (forward-compatibility, same discipline as the telemetry translators).
+pub fn codex_rollout_transcript(lines: &[Value]) -> Vec<TranscriptEvent> {
+    // Pass 1: correlate each tool OUTPUT back to its call by `call_id`. Codex
+    // writes the call and its result as separate records, and the reader wants
+    // one tool block, the way Claude pairs tool_use with tool_result.
+    let mut outputs: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for v in lines {
+        if v.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(p) = v.get("payload") else { continue };
+        if matches!(
+            p.get("type").and_then(Value::as_str),
+            Some("function_call_output") | Some("custom_tool_call_output")
+        ) {
+            if let Some(id) = p.get("call_id").and_then(Value::as_str) {
+                let out = output_text(p);
+                if !out.trim().is_empty() {
+                    outputs.insert(id.to_string(), out);
+                }
+            }
+        }
+    }
+    // Pass 2: emit in file order from `response_item` only (the `event_msg`
+    // mirror repeats the same text; skipping it is the whole dedup).
+    let mut out = Vec::new();
+    for v in lines {
+        if v.get("type").and_then(Value::as_str) != Some("response_item") {
+            continue;
+        }
+        let Some(p) = v.get("payload") else { continue };
+        match p.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                let role = p.get("role").and_then(Value::as_str).unwrap_or("");
+                let text = message_text(p);
+                let text = text.trim();
+                if text.is_empty() {
+                    continue;
+                }
+                match role {
+                    "user" => {
+                        let cleaned = strip_context_wrapper(text);
+                        if !cleaned.is_empty() {
+                            out.push(TranscriptEvent::User { text: cleaned });
+                        }
+                    }
+                    "assistant" => out.push(TranscriptEvent::Assistant {
+                        text: text.to_string(),
+                    }),
+                    // developer/system messages are harness chrome, not the
+                    // conversation the user is reading.
+                    _ => {}
+                }
+            }
+            Some("reasoning") => {
+                if let Some(t) = reasoning_text(p) {
+                    out.push(TranscriptEvent::Reasoning { text: t });
+                }
+            }
+            Some("function_call") | Some("custom_tool_call") => {
+                let name = p
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                if name == "update_plan" {
+                    if let Some(steps) = parse_plan(p) {
+                        out.push(TranscriptEvent::Plan { steps });
+                        continue;
+                    }
+                }
+                let call_id = p.get("call_id").and_then(Value::as_str).unwrap_or("");
+                let output = outputs.get(call_id).cloned();
+                out.push(TranscriptEvent::Tool {
+                    tool: name,
+                    detail: tool_call_detail(p),
+                    output,
+                });
+            }
+            // `*_output` records were consumed in pass 1; unknown ignored.
+            _ => {}
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
 // Tests. Fixtures are REAL captured lines (2026-08-09, this machine) unless
 // marked SYNTHETIC.
 // ---------------------------------------------------------------------------
@@ -768,5 +1074,114 @@ pub(crate) mod tests {
             assert!(translate_codex(line, &t).is_empty(), "codex: {line}");
             assert!(translate_gemini(line, &t).is_empty(), "gemini: {line}");
         }
+    }
+
+    // -- Codex ROLLOUT -> uniform transcript (REAL captures) ----------------
+    //
+    // Lines lifted verbatim from real rollout files under
+    // ~/.codex/sessions on this machine (2026-05-02 and 2025-11-02 sessions),
+    // except the session_meta and function_call_output, whose huge git_info /
+    // output blobs are shortened for readability; the parser reads only the
+    // fields exercised below.
+
+    // REAL shape, shortened: only `cwd` is read from session_meta.
+    const RO_META: &str = r#"{"timestamp":"2026-05-02T21:41:12.719Z","type":"session_meta","payload":{"id":"019deaa2-8e13-7843-9f9c-dbb54b8cd961","cwd":"/Users/ethan/Dev/mixpeek/server/mvs","cli_version":"0.58.0","model_provider":"openai"}}"#;
+    // REAL, verbatim: real user prompt with a leading "[05:41 PM]" time tag.
+    const RO_USER: &str = r#"{"timestamp":"2026-05-02T21:41:12.719Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"[05:41 PM] take a look at the progress of mvs, where we're at and whats remaining for pre-production, then come up with a plan to get us there"}]}}"#;
+    // SYNTHETIC (shape is REAL): the opening environment_context user message,
+    // pure harness chrome, must render to nothing.
+    const RO_ENV: &str = r#"{"timestamp":"2026-05-02T21:41:12.700Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/Users/ethan/Dev/mixpeek/server/mvs</cwd>\n  <shell>bash</shell>\n</environment_context>"}]}}"#;
+    // REAL, verbatim: reasoning WITH plaintext summary (older build).
+    const RO_REASONING: &str = r#"{"timestamp":"2025-11-02T19:15:22.395Z","type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"**Checking RESOURCES.md file**"}],"content":null,"encrypted_content":"gAAAAABpB63I"}}"#;
+    // REAL, verbatim: reasoning with NO plaintext (newer, encrypted build):
+    // must produce no event, not an empty one.
+    const RO_REASONING_ENC: &str = r#"{"timestamp":"2026-05-02T21:41:18.194Z","type":"response_item","payload":{"type":"reasoning","summary":[],"content":null,"encrypted_content":"gAAAAABp9m9-bKAY"}}"#;
+    // REAL, verbatim: an exec tool call...
+    const RO_EXEC: &str = r#"{"timestamp":"2026-05-02T21:41:21.666Z","type":"response_item","payload":{"type":"function_call","name":"exec_command","arguments":"{\"cmd\":\"git status --short --branch\",\"workdir\":\"/Users/ethan/Dev/mixpeek/server/mvs\",\"yield_time_ms\":1000,\"max_output_tokens\":4000}","call_id":"call_oOWSsoiERNccts8M61EX61l6"}}"#;
+    // REAL shape, shortened: ...and its output, carrying Codex's metadata
+    // preamble that clean_tool_output must strip.
+    const RO_EXEC_OUT: &str = r#"{"timestamp":"2026-05-02T21:41:22.036Z","type":"response_item","payload":{"type":"function_call_output","call_id":"call_oOWSsoiERNccts8M61EX61l6","output":"Chunk ID: c15eb7\nWall time: 0.2054 seconds\nProcess exited with code 0\nOriginal token count: 2358\nOutput:\n## main...origin/main\n D scenes.json"}}"#;
+    // REAL, verbatim: the update_plan call ("Updated Plan").
+    const RO_PLAN: &str = r#"{"timestamp":"2025-11-02T19:15:54.780Z","type":"response_item","payload":{"type":"function_call","name":"update_plan","arguments":"{\"plan\":[{\"status\":\"in_progress\",\"step\":\"Adjust retriever sections in RESOURCES.md\"},{\"status\":\"pending\",\"step\":\"Document Ray submission ID metadata\"}]}","call_id":"call_ieMDLIsT8CykfDSDQwtCGTZ2"}}"#;
+    // REAL, verbatim: an assistant message.
+    const RO_ASSISTANT: &str = r#"{"timestamp":"2026-05-02T21:41:21.661Z","type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"I’ll first map the repo structure, current git state, docs, and test surface."}],"phase":"commentary"}}"#;
+    // REAL, verbatim: the event_msg mirror of the assistant text; MUST be
+    // skipped (dedup), or every message renders twice.
+    const RO_AGENT_MSG_MIRROR: &str = r#"{"timestamp":"2026-05-02T21:41:21.660Z","type":"event_msg","payload":{"type":"agent_message","message":"I’ll first map the repo structure, current git state, docs, and test surface.","phase":"commentary"}}"#;
+
+    fn rollout(lines: &[&str]) -> Vec<Value> {
+        lines.iter().map(|l| serde_json::from_str(l).unwrap()).collect()
+    }
+
+    #[test]
+    fn codex_rollout_renders_claude_like_turns() {
+        let lines = rollout(&[
+            RO_META,
+            RO_ENV,
+            RO_USER,
+            RO_REASONING,
+            RO_ASSISTANT,
+            RO_AGENT_MSG_MIRROR,
+            RO_EXEC,
+            RO_EXEC_OUT,
+            RO_PLAN,
+        ]);
+        let evs = codex_rollout_transcript(&lines);
+
+        // Structure, in order: the env-context message and the agent_message
+        // mirror both vanish, so the reader sees exactly one of each real turn.
+        assert_eq!(evs.len(), 5, "unexpected shape: {evs:#?}");
+
+        match &evs[0] {
+            TranscriptEvent::User { text } => {
+                // leading "[05:41 PM]" time tag stripped.
+                assert!(text.starts_with("take a look at the progress"), "{text}");
+            }
+            other => panic!("expected User first, got {other:?}"),
+        }
+        assert!(matches!(&evs[1], TranscriptEvent::Reasoning { text } if text.contains("Checking RESOURCES")));
+        assert!(matches!(&evs[2], TranscriptEvent::Assistant { text } if text.starts_with("I’ll first map")));
+        match &evs[3] {
+            TranscriptEvent::Tool { tool, detail, output } => {
+                assert_eq!(tool, "exec_command");
+                assert_eq!(detail.as_deref(), Some("git status --short --branch"));
+                // metadata preamble stripped; output correlated by call_id.
+                let o = output.as_deref().unwrap();
+                assert!(o.starts_with("## main...origin/main"), "{o}");
+                assert!(!o.contains("Wall time"), "preamble leaked: {o}");
+            }
+            other => panic!("expected Tool, got {other:?}"),
+        }
+        match &evs[4] {
+            TranscriptEvent::Plan { steps } => {
+                assert_eq!(steps.len(), 2);
+                assert_eq!(steps[0].status, "in_progress");
+                assert!(steps[0].step.starts_with("Adjust retriever"));
+                assert_eq!(steps[1].status, "pending");
+            }
+            other => panic!("expected Plan, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_rollout_encrypted_reasoning_is_absent_not_empty() {
+        let evs = codex_rollout_transcript(&rollout(&[RO_REASONING_ENC, RO_ASSISTANT]));
+        // No reasoning block at all when the build encrypted it.
+        assert_eq!(evs.len(), 1);
+        assert!(matches!(&evs[0], TranscriptEvent::Assistant { .. }));
+    }
+
+    #[test]
+    fn codex_rollout_malformed_and_empty_are_safe() {
+        assert!(codex_rollout_transcript(&[]).is_empty());
+        // A lone tool OUTPUT with no matching call yields nothing (it is
+        // consumed in pass 1 and never re-emitted).
+        assert!(codex_rollout_transcript(&rollout(&[RO_EXEC_OUT])).is_empty());
+        // Unknown record/payload types are ignored, not fatal.
+        let unknown = rollout(&[
+            r#"{"type":"turn_context","payload":{}}"#,
+            r#"{"type":"response_item","payload":{"type":"world_state_from_a_future_cli"}}"#,
+        ]);
+        assert!(codex_rollout_transcript(&unknown).is_empty());
     }
 }

@@ -96,8 +96,12 @@ someone re-litigates.
 
 - **`connectors` scope capability** (`scope.rs` `SCOPE_CAPS`): `kind: json`,
   `levels: global/group/worker`, `merge: merge-by-key`, mirroring `skin`. Value shape per
-  scope: `{ "<connector>": { "enabled": true, "account": "<id>", "mcp": "<server-name>" } }`.
-  This says "this worker/group/global uses Gmail as `info@mixpeek.com`."
+  scope: `{ "<connector>": { "enabled": true, "account": "<id>", "mcp": "<server-name>",
+  "write": "read_only" | "allow", "deny_channels": ["#cust-*"], "deny_recipients": ["*@customer.com"] } }`.
+  This says "this worker/group/global uses Gmail as `info@mixpeek.com`, and it may read but
+  never send to a customer address." The `write`/`deny_*` fields are the write-safety policy
+  (see below); absent, a connector defaults to `read_only` so a mis-scoped connector fails
+  closed rather than sending.
 - **Provider registry** (static, in-tree): per provider, the OAuth2 endpoints, scopes,
   and the MCP server template. Small enough to be a Rust const table, like `GMAIL_SCOPES`.
 - **Token store**: `~/.amux/connectors/<provider>/<account>.json`, chmod 600, outside the
@@ -164,6 +168,43 @@ not silently no-op:
 - The e2e scenario (block 3, AMUX-3093/3094) exercises each of these against the real UI
   and API.
 
+## Write safety: read broadly, write narrowly (AMUX-3271, Ethan's verify state)
+
+Ethan's governing constraint for connectors, stated as the acceptance criteria: a
+connector may **read** widely, but its **writes** must never reach a customer. Concretely:
+
+- Slack: read and write our own channels, but **never post in a customer channel**.
+- Email: read an inbox, but **never send an outbound message to a customer or user**.
+
+This is not covered by the entitlement checks in "Unhappy paths" above (those answer "is
+this worker allowed to use Gmail at all"). It is a second, finer gate on the write verbs
+of an entitled connector, and it is the highest-consequence property of the whole feature:
+an over-broad connector that auto-emails a customer is the failure that matters.
+
+Design, in primitives (this is scope + a guarded verb, not a new subsystem):
+
+- **Policy lives in the `connectors` scope value**, the `write` / `deny_channels` /
+  `deny_recipients` fields above. It resolves global -> group -> worker like every other
+  scope layer, so "read-only for this whole group, one worker may send from `info@`" is
+  expressible without special-casing.
+- **Fail closed.** A connector with no explicit `write` is `read_only`. A write verb whose
+  target matches a `deny_*` rule, or that cannot be evaluated against the policy, is
+  refused before the provider call, never after.
+- **The refusal is a first-class, logged event, not a silent no-op** (two-fixes rule): a
+  blocked write returns a structured error naming the connector, the worker, and the
+  matched rule, and increments a counter surfaced by `GET /api/logs/analyze`, so the next
+  time a connector is one deny-rule away from mailing a customer, a log sweep sees it
+  without a human noticing first. The e2e (AMUX-3093/3094) asserts a customer-targeted
+  write is refused AND that the refusal appears in the request log.
+- **This composes with the harness boundary already in force**: sending a message on the
+  user's behalf is a permissioned action. The write guard is amux enforcing that same
+  boundary at the connector layer, so an agent cannot route around it by calling a tool.
+
+Customer identity (which addresses and channels are "customer") is itself data amux
+already holds: the CRM contacts and the customer-tagged worker groups. The deny lists seed
+from those rather than a hand-maintained blocklist, so a new customer added to the CRM
+tightens the guard automatically.
+
 ## Build order
 
 1. **AMUX-3101**: this doc.
@@ -173,14 +214,25 @@ not silently no-op:
 3. **`connectors` scope capability** + provider registry + token store.
 4. **OAuth broker** generalizing `gmail_auth.rs`; redirect_uri from `canonical_port()`
    (folds in AMUX-3026 / AMUX-2943).
-5. **Gmail on the new broker**: multi-account, per-worker scope, unhappy-path eval
-   (AMUX-3103).
-6. **Connectors tab**; remove the MCP tab (AMUX-3105, AMUX-3102).
-7. **Slack connector** (AMUX-3104).
-8. **Nango re-evaluation gate**: only if provider count crosses ~5.
+5. **Write-safety guard** (AMUX-3271): the resolved `write`/`deny_*` gate on every
+   connector write verb, fail-closed, with the logged-refusal signal. Lands with the first
+   writing connector and is asserted by the e2e; it is Ethan's verify state, so no writing
+   connector ships without it.
+6. **Gmail on the new broker**: multi-account, per-worker scope, unhappy-path eval
+   (AMUX-3103), read + guarded send.
+7. **Connectors tab**; remove the MCP tab (AMUX-3105, AMUX-3102).
+8. **Slack connector** (AMUX-3104), read + guarded post (never a customer channel).
+9. **Nango re-evaluation gate**: only if provider count crosses ~5.
 
 ## Open questions for Ethan
 
+- **Write-safety (AMUX-3271) is now folded in as a first-class gate above.** Confirm the
+  fail-closed default (a connector with no explicit policy is read-only) and that seeding
+  the customer deny-lists from the CRM + customer-tagged groups is the right source of
+  truth, rather than a hand-kept blocklist.
+- **Slack vs Gmail first.** The verify state names both. Build order does Gmail first
+  because it is a worked native OAuth precedent to generalize; Slack reuses that broker.
+  Say if you want Slack led instead.
 - The staged native-first / Nango-deferred call: confirm, or say "stand up Nango now."
 - Scope-resolution-at-launch (step 2) is a meaningful new card the vision did not name
   explicitly. It is the true foundation; flag if you want it split out or folded into
