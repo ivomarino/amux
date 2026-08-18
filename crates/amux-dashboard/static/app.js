@@ -7775,7 +7775,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.678';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.679';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14429,24 +14429,53 @@ async function _openXlsxPreview(path) {
     dlBtn.style.display = '';
   }
   try {
-    const r = await fetch(API + '/api/file/xlsx?path=' + encodeURIComponent(path));
-    const d = await r.json();
-    if (d.error) { body.textContent = 'Error: ' + d.error; return; }
-    const sheets = d.sheets || [];
-    if (!sheets.length) { body.innerHTML = '<div class="xlsx-empty">No sheets in this workbook.</div>'; return; }
-    let html = '';
-    if (sheets.length > 1) {
-      html += '<div class="xlsx-tabs">' + sheets.map((s, i) =>
-        '<button class="xlsx-tab' + (i === 0 ? ' active' : '') + '" onclick="_xlsxShowSheet(' + i + ')">' + esc(s.name) + '</button>').join('') + '</div>';
+    // Primary: SheetJS (the standard xlsx library) parses the raw bytes in the
+    // browser and preserves merged cells, number formats and multi-sheet
+    // structure via sheet_to_html (AMUX-3343, Ethan). Falls back to the
+    // server-side (calamine) parse if the CDN library is unavailable (offline).
+    if (window.XLSX) {
+      const buf = await (await fetch(API + '/api/file/raw?path=' + encodeURIComponent(path))).arrayBuffer();
+      const wb = XLSX.read(new Uint8Array(buf), { type: 'array' });
+      const names = wb.SheetNames || [];
+      if (!names.length) { body.innerHTML = '<div class="xlsx-empty">No sheets in this workbook.</div>'; return; }
+      let html = '';
+      if (names.length > 1) {
+        html += '<div class="xlsx-tabs">' + names.map((n, i) =>
+          '<button class="xlsx-tab' + (i === 0 ? ' active' : '') + '" onclick="_xlsxShowSheet(' + i + ')">' + esc(n) + '</button>').join('') + '</div>';
+      }
+      names.forEach((n, i) => {
+        const table = XLSX.utils.sheet_to_html(wb.Sheets[n], { id: 'xlsx-tbl-' + i });
+        html += '<div class="xlsx-sheet" id="xlsx-sheet-' + i + '"' + (i > 0 ? ' style="display:none"' : '') + '><div class="xlsx-scroll">' + table + '</div></div>';
+      });
+      body.innerHTML = html;
+      return;
     }
-    sheets.forEach((s, i) => {
-      html += '<div class="xlsx-sheet" id="xlsx-sheet-' + i + '"' + (i > 0 ? ' style="display:none"' : '') + '>' + _xlsxTableHtml(s) + '</div>';
-    });
-    if (d.truncated) html += '<div class="xlsx-trunc">Large workbook — some rows, columns or sheets were truncated. Use Download for the full file.</div>';
-    body.innerHTML = html;
+    await _openXlsxServerFallback(path, body);
   } catch (e) {
-    body.textContent = 'Failed to load spreadsheet: ' + e;
+    // A SheetJS parse error still gets the server fallback a shot before giving up.
+    try { await _openXlsxServerFallback(path, body); }
+    catch (e2) { body.textContent = 'Failed to load spreadsheet: ' + e; }
   }
+}
+
+// Server-parsed fallback (calamine): used when SheetJS did not load (offline) or
+// failed to parse. Renders the same tabbed table view.
+async function _openXlsxServerFallback(path, body) {
+  const r = await fetch(API + '/api/file/xlsx?path=' + encodeURIComponent(path));
+  const d = await r.json();
+  if (d.error) { body.textContent = 'Error: ' + d.error; return; }
+  const sheets = d.sheets || [];
+  if (!sheets.length) { body.innerHTML = '<div class="xlsx-empty">No sheets in this workbook.</div>'; return; }
+  let html = '';
+  if (sheets.length > 1) {
+    html += '<div class="xlsx-tabs">' + sheets.map((s, i) =>
+      '<button class="xlsx-tab' + (i === 0 ? ' active' : '') + '" onclick="_xlsxShowSheet(' + i + ')">' + esc(s.name) + '</button>').join('') + '</div>';
+  }
+  sheets.forEach((s, i) => {
+    html += '<div class="xlsx-sheet" id="xlsx-sheet-' + i + '"' + (i > 0 ? ' style="display:none"' : '') + '>' + _xlsxTableHtml(s) + '</div>';
+  });
+  if (d.truncated) html += '<div class="xlsx-trunc">Large workbook — some rows, columns or sheets were truncated. Use Download for the full file.</div>';
+  body.innerHTML = html;
 }
 
 function _xlsxTableHtml(sheet) {

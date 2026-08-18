@@ -5512,6 +5512,10 @@
 .xlsx-tab { background: var(--hover); border: 1px solid var(--border); border-radius: 6px; color: var(--dim); font-size: 0.76rem; padding: 6px 12px; cursor: pointer; min-height: 34px; }
 .xlsx-tab.active { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
 .xlsx-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--border); border-radius: 8px; }
+/* SheetJS sheet_to_html output (all <td>, no header row markup) */
+.xlsx-scroll table { border-collapse: collapse; font-size: 0.8rem; min-width: 100%; }
+.xlsx-scroll table td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; white-space: pre-wrap; word-break: break-word; max-width: 360px; vertical-align: top; }
+.xlsx-scroll table tr:nth-child(even) td { background: color-mix(in srgb, var(--hover) 40%, transparent); }
 .xlsx-table { border-collapse: collapse; font-size: 0.8rem; min-width: 100%; }
 .xlsx-table th, .xlsx-table td { border: 1px solid var(--border); padding: 5px 9px; text-align: left; white-space: pre-wrap; word-break: break-word; max-width: 360px; vertical-align: top; }
 .xlsx-table th { background: var(--hover); font-weight: 600; position: sticky; top: 0; }
