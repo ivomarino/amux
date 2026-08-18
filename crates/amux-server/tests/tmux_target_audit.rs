@@ -49,6 +49,87 @@ fn normalise(expr: &str) -> String {
     e.trim().to_string()
 }
 
+/// Positive evidence that this `-t` belongs to a program that is NOT tmux.
+///
+/// AEAB-20. The scanner searched every `.rs` under `src/` for the literal
+/// `"-t"` and treated whatever followed as a tmux target, with no notion of
+/// which program was being invoked. `integrations/email.rs` runs
+/// `Command::new("touch").args(["-t", stamp, ...])` to backdate a fixture —
+/// `touch -t` is a TIMESTAMP, not a pane — and the audit failed `main` over it,
+/// which in turn made every open PR inherit a red `check` job and look broken.
+///
+/// Deliberately requires POSITIVE evidence and fails SAFE: only a literal
+/// `Command::new("x")` with x != "tmux" exempts a site. Anything the scanner
+/// cannot attribute stays audited, so this narrows the false positives without
+/// opening a hole — `api/metrics.rs` reaches tmux through a
+/// `cmd_output("tmux", ...)` helper with no `Command::new` at all, and must and
+/// does remain covered.
+///
+/// The alternative shape — "skip anything whose statement does not mention
+/// tmux" — was rejected for being the wrong polarity: it would exempt a real
+/// `let args = ["-t", target]; tmux(&args)` split across two statements, which
+/// is precisely the offender this file exists to catch.
+fn non_tmux_program(src: &str, at: usize) -> Option<String> {
+    // The enclosing statement, back to the nearest `;` / `{` / `}`.
+    let start = src[..at].rfind([';', '{', '}']).map_or(0, |i| i + 1);
+    let span = &src[start..at];
+    const KEY: &str = "Command::new(\"";
+    let i = span.rfind(KEY)?;
+    let rest = &span[i + KEY.len()..];
+    let end = rest.find('"')?;
+    let prog = &rest[..end];
+    (prog != "tmux").then(|| prog.to_string())
+}
+
+/// Walk one source text and return every non-exact `-t` target expression.
+///
+/// Extracted so `offenders()` and `the_audit_detects_a_planted_non_exact_target`
+/// run the SAME code. They used to be two copies of this loop — the test
+/// re-implemented ~30 lines of it inline — which meant the test could not
+/// observe a change in the real scanner. Simulating what you believe a function
+/// does cannot catch that function doing something else (ethos rule 7), and the
+/// exemption added above would have been entirely untested under that shape.
+fn scan(src: &str) -> Vec<(usize, String)> {
+    let mut found = Vec::new();
+    let mut from = 0usize;
+    while let Some(rel) = src[from..].find("\"-t\"") {
+        let at = from + rel;
+        from = at + 4;
+        if non_tmux_program(src, at).is_some() {
+            continue;
+        }
+        // Skip the separator after the literal, then take the argument up
+        // to the next `,` / `]` / `)` at this nesting level.
+        let rest = &src[from..];
+        let Some(comma) = rest.find(',') else { continue };
+        let tail = &rest[comma + 1..];
+        let mut depth = 0i32;
+        let mut end = tail.len();
+        for (i, c) in tail.char_indices() {
+            match c {
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    if depth == 0 {
+                        end = i;
+                        break;
+                    }
+                    depth -= 1;
+                }
+                ',' if depth == 0 => {
+                    end = i;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let expr = normalise(&tail[..end]);
+        if !ALLOWED.contains(&expr.as_str()) {
+            found.push((at, expr));
+        }
+    }
+    found
+}
+
 fn offenders() -> Vec<String> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut files = Vec::new();
@@ -58,38 +139,7 @@ fn offenders() -> Vec<String> {
     let mut bad = Vec::new();
     for f in files {
         let src = std::fs::read_to_string(&f).unwrap_or_default();
-        let mut from = 0usize;
-        while let Some(rel) = src[from..].find("\"-t\"") {
-            let at = from + rel;
-            from = at + 4;
-            // Skip the separator after the literal, then take the argument up
-            // to the next `,` / `]` / `)` at this nesting level.
-            let rest = &src[from..];
-            let Some(comma) = rest.find(',') else { continue };
-            let tail = &rest[comma + 1..];
-            let mut depth = 0i32;
-            let mut end = tail.len();
-            for (i, c) in tail.char_indices() {
-                match c {
-                    '(' | '[' | '{' => depth += 1,
-                    ')' | ']' | '}' => {
-                        if depth == 0 {
-                            end = i;
-                            break;
-                        }
-                        depth -= 1;
-                    }
-                    ',' if depth == 0 => {
-                        end = i;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-            let expr = normalise(&tail[..end]);
-            if ALLOWED.contains(&expr.as_str()) {
-                continue;
-            }
+        for (at, expr) in scan(&src) {
             let line = src[..at].matches('\n').count() + 1;
             bad.push(format!(
                 "{}:{line}: tmux -t target `{expr}` is not one of {ALLOWED:?} \
@@ -119,44 +169,15 @@ fn every_tmux_target_uses_the_exact_match_helpers() {
 #[test]
 fn the_audit_detects_a_planted_non_exact_target() {
     // Same text shape the scanner walks in a real source file, including the
-    // prefix-matching target that motivated the rule.
+    // prefix-matching target that motivated the rule. Runs the SHIPPED `scan`
+    // rather than a copy of it — this test used to re-implement the loop inline,
+    // so it could not have observed the AEAB-20 exemption at all.
     let planted = r#"
         let _ = tmux(&["pipe-pane", "-t", &format!("amux-{name}"), &cmd]).await;
         let _ = tmux(&["send-keys", "-t", "amux-amux", "Enter"]).await;
         let _ = tmux(&["kill-session", "-t", &stq]).await;
     "#;
-    let mut found = Vec::new();
-    let mut from = 0usize;
-    while let Some(rel) = planted[from..].find("\"-t\"") {
-        let at = from + rel;
-        from = at + 4;
-        let rest = &planted[from..];
-        let Some(comma) = rest.find(',') else { continue };
-        let tail = &rest[comma + 1..];
-        let mut depth = 0i32;
-        let mut end = tail.len();
-        for (i, c) in tail.char_indices() {
-            match c {
-                '(' | '[' | '{' => depth += 1,
-                ')' | ']' | '}' => {
-                    if depth == 0 {
-                        end = i;
-                        break;
-                    }
-                    depth -= 1;
-                }
-                ',' if depth == 0 => {
-                    end = i;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        let expr = normalise(&tail[..end]);
-        if !ALLOWED.contains(&expr.as_str()) {
-            found.push(expr);
-        }
-    }
+    let found: Vec<String> = scan(planted).into_iter().map(|(_, e)| e).collect();
     assert_eq!(
         found.len(),
         2,
@@ -164,4 +185,56 @@ fn the_audit_detects_a_planted_non_exact_target() {
     );
     assert!(found.iter().any(|f| f.contains("format!")), "missed the format! target: {found:?}");
     assert!(found.iter().any(|f| f.contains("\"amux-amux\"")), "missed the literal prefix target: {found:?}");
+}
+
+/// AEAB-20, both directions. The exemption must silence `touch -t` and MUST NOT
+/// silence a tmux target — a fix that just stopped flagging things would satisfy
+/// "main is green" while deleting the guard, which is the whole failure mode this
+/// file was written to avoid.
+#[test]
+fn a_non_tmux_program_is_exempt_but_tmux_is_never_exempt() {
+    // The real specimen, reduced from integrations/email.rs:1330. `touch -t` is a
+    // timestamp; flagging it failed main and made every open PR look broken.
+    let touch = r#"
+        let set = |name: &str, stamp: &str| {
+            std::process::Command::new("touch")
+                .args(["-t", stamp, tok.join(format!("{name}.json")).to_str().unwrap()])
+                .status()
+                .unwrap();
+        };
+    "#;
+    assert!(scan(touch).is_empty(), "touch -t is a timestamp, not a pane: {:?}", scan(touch));
+
+    // THE CONTROL. Identical shape, program `tmux`: must still be caught.
+    let tmux_cmd = r#"
+        std::process::Command::new("tmux")
+            .args(["send-keys", "-t", "amux-amux", "Enter"])
+            .status()
+            .unwrap();
+    "#;
+    let f: Vec<String> = scan(tmux_cmd).into_iter().map(|(_, e)| e).collect();
+    assert_eq!(f.len(), 1, "a hand-spelled tmux target must still be flagged: {f:?}");
+    assert!(f[0].contains("amux-amux"), "wrong expression captured: {f:?}");
+
+    // And a helper that names tmux WITHOUT Command::new stays covered — this is
+    // api/metrics.rs's shape (`cmd_output("tmux", &[...])`), where there is no
+    // literal program to attribute, so the fail-safe keeps it audited.
+    let helper = r#"
+        let _ = cmd_output("tmux", &["list-panes", "-t", "amux-amux", "-F", "x"]);
+    "#;
+    assert_eq!(scan(helper).len(), 1, "a helper-invoked tmux target must stay audited");
+
+    // A non-tmux program reached the same way is NOT exempt either, for the same
+    // reason: no literal program means no positive evidence, so it stays flagged.
+    // Recorded rather than "fixed" — erring toward a reviewable false positive is
+    // the correct direction for this guard, and pretending otherwise would need a
+    // real parser.
+    let other_helper = r#"
+        let _ = cmd_output("touch", &["-t", "202608161200", "f.json"]);
+    "#;
+    assert_eq!(
+        scan(other_helper).len(),
+        1,
+        "documented limitation: without Command::new there is nothing to attribute"
+    );
 }

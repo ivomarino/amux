@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.665';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.666';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28578,14 +28578,23 @@ const _KIND_COLORS = {
   data: '#58a6ff', code: '#6e7681', build: '#f85149', doc: '#39c5cf', other: '#484f58',
 };
 
-function _fmtBytes(n) {
-  n = +n || 0;
-  if (n >= 1099511627776) return (n / 1099511627776).toFixed(2) + ' TB';
-  if (n >= 1073741824) return (n / 1073741824).toFixed(1) + ' GB';
-  if (n >= 1048576) return (n / 1048576).toFixed(0) + ' MB';
-  if (n >= 1024) return (n / 1024).toFixed(0) + ' KB';
-  return n + ' B';
-}
+// _fmtBytes is NOT redefined here. A second `function _fmtBytes` lived at this
+// spot and was DEAD CODE: both declarations are top-level in this file, so the
+// later one (the B/KB/MB/GB version, further down) is hoisted over this one and
+// wins for every caller. Verified in node rather than reasoned about. Deleting
+// it is therefore a no-op at runtime, and it is what the two pointer comments
+// above (near the request-log and storage sections) already describe as the
+// single shared implementation.
+//
+// It also broke the build: `no-redeclare` is an ERROR in the SPA static gate, so
+// this one duplicate failed `rust.yml` on main and every open PR inherited a red
+// `check`/`e2e` and looked broken (AEAB-20).
+//
+// The deleted copy carried one thing the survivor does not: a TB tier (and a
+// `+n || 0` coercion). That was not restored here, deliberately — adding a tier
+// CHANGES rendered output above 1 TB, and this deletion is meant to change
+// nothing. If the storage view wants TB, add it to the single shared function as
+// its own reviewable change.
 
 function _metricsSetMode(mode) {
   _metricsMode = mode;
