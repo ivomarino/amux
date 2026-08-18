@@ -7779,7 +7779,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.680';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.681';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -21989,7 +21989,93 @@ function _bqEnsureFullText(items) {
     .finally(() => { _bqFullPending = false; });
 }
 
+// ── BM25 relevance ranking (Ethan 2026-08-18) ───────────────────────────────
+// Board free-text search MATCHES across every field (see _bqMatch's _hay); this
+// RANKS the matches by BM25F so the most relevant card is first rather than
+// whatever pos it happened to carry. Fields are boosted — a term in the title or
+// id is a stronger signal than one buried in the History/log — and df/idf are
+// taken over the whole loaded board (the corpus), so a rare term lifts the few
+// cards that carry it while tf saturation (k1) + length normalization (b) order
+// the matches among themselves. Standard BM25F: legitimately ranking, not a
+// popularity heuristic, so it compounds with more/better fields rather than
+// capping on a hand-tuned weight.
+const _BM25_K1 = 1.2, _BM25_B = 0.75;
+// The SAME fields _bqMatch searches, each with a boost. Keep this list in step
+// with _bqMatch's _hay: a field searched but not ranked here still filters a
+// card IN, it just contributes 0 to its score.
+const _BM25_FIELDS = [
+  ['title', 6], ['id', 8], ['tags', 3], ['desc', 2], ['session', 1.5],
+  ['creator', 1], ['reviewer', 1], ['shepherd', 1], ['type', 1], ['status', 1],
+  ['source_ref', 1], ['due', 1], ['gate_note', 1], ['log', 1],
+  ['depends_on', 1], ['gate', 1],
+];
+let _bqRankActive = false;
+
+function _bqFieldStr(item, f) {
+  const v = item[f];
+  if (v == null) return '';
+  return Array.isArray(v) ? v.join(' ') : String(v);
+}
+// Lowercased tokens of a card's whole searchable text, memoized on the item and
+// invalidated by the concatenated length (which changes when _bqEnsureFullText
+// fills desc/log). Used for df + document length; the per-field pass below reads
+// fields directly so a boost applies to the field the term actually hit.
+function _bqTokens(item) {
+  let all = '';
+  for (const [f] of _BM25_FIELDS) { const s = _bqFieldStr(item, f); if (s) all += ' ' + s; }
+  all = all.toLowerCase();
+  if (item._bqTokStamp === all.length && item._bqTok) return item._bqTok;
+  const toks = all.split(/[^a-z0-9]+/).filter(Boolean);
+  item._bqTok = toks; item._bqTokStamp = all.length;
+  return toks;
+}
+// Substring-aware term frequency: counts tokens CONTAINING the term, preserving
+// the substring semantics _bqMatch uses ("auth" finds "authentication"), and the
+// field's token count for length normalization.
+function _bqFieldTf(item, field, term) {
+  const toks = _bqFieldStr(item, field).toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  let tf = 0;
+  for (const tk of toks) if (tk.includes(term)) tf++;
+  return tf;
+}
+// Rank `cands` (the matches) by BM25F over `terms`, df/idf from `corpus` (the
+// whole loaded set). Writes item._bm25, read by _boardCardSort.
+function _bqRankBm25(cands, corpus, terms) {
+  const N = corpus.length || 1;
+  let totalLen = 0;
+  const df = {};
+  for (const t of terms) df[t] = 0;
+  for (const d of corpus) {
+    const toks = _bqTokens(d);
+    totalLen += toks.length;
+    for (const t of terms) if (toks.some(tk => tk.includes(t))) df[t]++;
+  }
+  const avgdl = totalLen / N || 1;
+  const idf = {};
+  for (const t of terms) idf[t] = Math.log(1 + (N - df[t] + 0.5) / (df[t] + 0.5));
+  for (const c of cands) {
+    const dl = _bqTokens(c).length || 1;
+    let score = 0;
+    for (const t of terms) {
+      let wtf = 0;
+      for (const [field, boost] of _BM25_FIELDS) {
+        const tf = _bqFieldTf(c, field, t);
+        if (tf) wtf += boost * tf;
+      }
+      if (wtf) {
+        const denom = wtf + _BM25_K1 * (1 - _BM25_B + _BM25_B * dl / avgdl);
+        score += idf[t] * (wtf * (_BM25_K1 + 1)) / denom;
+      }
+      // An exact id term is "take me to THAT card" — a large constant keeps it
+      // first, folding the old id-first behaviour into the ranking.
+      if ((c.id || '').toLowerCase() === t) score += 1000;
+    }
+    c._bm25 = score;
+  }
+}
+
 function _bqFilter(items, q) {
+  _bqRankActive = false;
   const s = (q || '').trim();
   if (!s) return items;
   const ast = _bqParse(s);
@@ -21997,9 +22083,19 @@ function _bqFilter(items, q) {
   if (ast.text.length) _bqEnsureFullText(items);
   const ix = _bqSessionIndex();
   const out = items.filter(i => _bqMatch(i, ast, ix));
-  // If the query names a card exactly, that card goes first. Searching an id
-  // also matches every card that REFERENCES it (desc, History), which is
-  // usually wanted — but not at the cost of burying the card you typed.
+  // Free text present: rank the matches by BM25F. The corpus is the whole loaded
+  // set (`items`) so idf is meaningful; column sort then reads _bm25 (below), and
+  // this pre-sort orders the List view + any flat consumer.
+  const posTerms = ast.text.filter(x => !x.neg).map(x => x.t);
+  if (posTerms.length) {
+    _bqRankBm25(out, items, posTerms);
+    _bqRankActive = true;
+    out.sort((a, b) => (b._bm25 || 0) - (a._bm25 || 0));
+    return out;
+  }
+  // Pure structured/id query (no free text): keep the exact-id-first behaviour.
+  // Searching an id also matches every card that REFERENCES it, usually wanted,
+  // but not at the cost of burying the card you typed.
   const _idm = s.match(_BQ_ID_RE);
   if (_idm) {
     const want = _idm[0].toLowerCase();
@@ -22384,17 +22480,17 @@ function _issueRowHTML(item, opts) {
     : '';
   const badge = '<span class="status-badge" style="background:' + sty.bg + ';color:' + sty.color + ';border:1px solid ' + sty.border + ';font-size:0.7rem;padding:1px 6px;border-radius:10px;">' + esc(item.status || 'todo') + '</span>';
   const dot = '<span class="board-status-dot" style="background:' + sty.dot + ';flex:0 0 auto;"></span>';
+  const _rq = (typeof _peekIssuesQuery !== 'undefined' && _peekIssuesQuery)
+    ? _peekIssuesQuery
+    : (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '');
   return '<div class="peek-issue-item" style="min-height:44px;" onclick="openBoardDetail(\'' + esc(item.id) + '\')">' +
     dot +
-    '<span class="peek-issue-key">' + esc(item.id) + '</span>' +
+    '<span class="peek-issue-key">' + _hlSearch(esc(item.id), _rq) + '</span>' +
     // The PEEK query, not the global board query. This read boardSearchQuery,
     // so typing in a session's Board tab highlighted nothing — the search
     // filtered correctly and looked broken, which is the failure Ethan
     // reported for messages, sitting one tab over.
-    '<span class="peek-issue-title">' + owner + _hlSearch(esc(item.title),
-        (typeof _peekIssuesQuery !== 'undefined' && _peekIssuesQuery)
-          ? _peekIssuesQuery
-          : (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '')) + '</span>' +
+    '<span class="peek-issue-title">' + owner + _hlSearch(esc(item.title), _rq) + '</span>' +
     '<span class="peek-issue-meta">' + badge + due + '</span>' +
     '</div>';
 }
@@ -22420,7 +22516,8 @@ function _renderBoardCard(item) {
   let h = '<div class="board-card' + (pinned ? ' board-card-pinned' : '') + (_liveNow ? ' board-card-live' : '') + '" data-id="' + item.id + '"' + (_liveNow ? ' title="' + esc(item.session) + ' is working on this right now"' : '') + ' onclick="openBoardDetail(\'' + item.id + '\')">';
   h += '<div class="board-drag-handle" onclick="event.stopPropagation()" title="Drag to move"><svg width="12" height="12" viewBox="0 0 12 12" fill="currentColor"><circle cx="3.5" cy="2.5" r="1.25"/><circle cx="8.5" cy="2.5" r="1.25"/><circle cx="3.5" cy="6" r="1.25"/><circle cx="8.5" cy="6" r="1.25"/><circle cx="3.5" cy="9.5" r="1.25"/><circle cx="8.5" cy="9.5" r="1.25"/></svg></div>';
   h += '<button class="board-pin-btn' + (pinned ? ' active' : '') + '" onclick="event.stopPropagation();_togglePin(\'' + item.id + '\')" title="' + (pinned ? 'Unpin' : 'Pin to top') + '">&#x1F4CC;</button>';
-  h += '<div class="board-card-key">' + esc(item.id) + '</div>';
+  const _bq = typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '';
+  h += '<div class="board-card-key">' + _hlSearch(esc(item.id), _bq) + '</div>';
   if (item.doing_rot) h += '<div class="board-card-rot" title="Rotting: ' + item.doing_rot_days + 'd in doing with no board update and no commit/PR evidence. Evidence it forward or demote it.">&#x26A0; ' + Math.round(item.doing_rot_days) + 'd no evidence</div>';
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
   h += '<div class="board-card-title">';
@@ -22432,12 +22529,12 @@ function _renderBoardCard(item) {
   // right and the feedback was missing.
   if (firstLine) h += '<div class="board-card-desc">' + _hlSearch(esc(firstLine), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + (((item.desc !== undefined ? item.desc.length : (item.desc_len || 0)) > 80) ? '\u2026' : '') + '</div>';
   h += '<div class="board-card-footer">';
-  if (boardViewMode !== 'worker' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + esc(item.session) + '</span>';
-  if (item.shepherd) h += '<span class="board-card-shepherd" data-session="' + esc(item.shepherd) + '" title="Shepherd: watching this for the owner. NOT accountable for executing it.">&#x1F441; watched by ' + esc(item.shepherd) + '</span>';
-  groups.forEach(function(t) { h += '<span class="board-card-tag" data-tag="' + esc(t) + '">' + esc(t) + '</span>'; });
+  if (boardViewMode !== 'worker' && item.session) h += '<span class="board-card-session" data-session="' + esc(item.session) + '">' + (_liveNow ? '<span class="board-live-dot"></span>' : '') + _hlSearch(esc(item.session), _bq) + '</span>';
+  if (item.shepherd) h += '<span class="board-card-shepherd" data-session="' + esc(item.shepherd) + '" title="Shepherd: watching this for the owner. NOT accountable for executing it.">&#x1F441; watched by ' + _hlSearch(esc(item.shepherd), _bq) + '</span>';
+  groups.forEach(function(t) { h += '<span class="board-card-tag" data-tag="' + esc(t) + '">' + _hlSearch(esc(t), _bq) + '</span>'; });
   if (item.due) { const today = new Date().toISOString().slice(0,10); const overdue = item.due < today && item.status !== 'done'; h += '<span class="board-card-time" style="' + (overdue ? 'color:var(--red)' : 'color:var(--accent)') + '">&#x1F4C5; ' + item.due + '</span>'; }
   h += '<span class="board-card-time">' + timeAgo(item.updated || item.created) + '</span>';
-  if (item.creator) h += '<span class="board-card-time">' + esc(item.creator) + '</span>';
+  if (item.creator) h += '<span class="board-card-time">' + _hlSearch(esc(item.creator), _bq) + '</span>';
   h += '</div></div>';
   return h;
 }
@@ -22472,6 +22569,13 @@ async function _togglePin(id) {
 function _boardCardSort(a, b) {
   const pp = (b.pinned || 0) - (a.pinned || 0);
   if (pp !== 0) return pp;
+  // A free-text search orders each column by RELEVANCE (BM25); pos/recency only
+  // break ties. Pinned still wins so a pinned card stays put. _bqRankActive is
+  // set by the _bqFilter call that produced this render's `visible` set.
+  if (_bqRankActive) {
+    const sc = (b._bm25 || 0) - (a._bm25 || 0);
+    if (sc !== 0) return sc;
+  }
   const ap = a.pos || 0, bp = b.pos || 0;
   // Items without a pos (=0) sort to the bottom, ordered by recency
   if (ap === 0 && bp === 0) return (b.updated || 0) - (a.updated || 0);
