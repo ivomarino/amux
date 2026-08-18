@@ -572,6 +572,23 @@ RELATED LOSS, found 2026-08-11 while validating AC-252: this entry's recorded fi
   The entry was already correctly `open`; this records WHY it cannot be closed by pointing at
   the python fix.
 
+FRESH SPECIMEN 2026-08-18, amux-frustrations — STILL OPEN, and the same class one layer over.
+  The idle guard reported: "You went idle with 2 uncommitted change(s) under your working
+  directory" naming app.js and sw.js. `git status --porcelain` was EMPTY for both and for
+  the whole tree — I had committed them in cd2e017. The two files differed from
+  origin/main only because that commit was unpushed.
+  So the notice compared against origin/main and called the result "uncommitted", which is
+  a different predicate from the one the word means. Same shape as the 2026-08-08 case: a
+  git assertion the reader cannot distinguish from the real thing. Here it is not staleness
+  but a WRONG COMPARISON BASE — and the notice's own body warns at length about exactly
+  this confusion ("a difference from origin/main is not a direction"), then makes it.
+  Cost this time was bounded because the notice also prescribes the ancestry test, which I
+  ran: `git log HEAD..origin/main -- <path>` printed nothing for both, so the safe action
+  was commit-not-restore. Had I taken "uncommitted" at face value and run the remedy it
+  names for the stale case (`git checkout origin/main -- <path>`), I would have reverted 18
+  commits of dashboard work including that day's fix and a peer's feature work.
+  That is the entry's own COST paragraph coming true at a larger blast radius: the sentence
+  cannot distinguish itself from the real case, and its remedy is destructive.
 
 ## SessionStart freshness hook named files upstream never touched
 AREA: instruments
