@@ -15,6 +15,7 @@ pub mod board;
 pub mod criteria;
 pub mod browser;
 pub mod calendar;
+pub mod connectors;
 pub mod dictation;
 pub mod tts;
 pub mod email;
@@ -223,6 +224,7 @@ pub fn router(state: AppState) -> Router {
         .nest("/api/saved-messages", saved_messages::routes())
         .merge(habits::routes())
         .merge(observability::routes())
+        .merge(connectors::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
