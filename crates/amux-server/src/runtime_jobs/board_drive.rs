@@ -4678,7 +4678,13 @@ mod tests {
         match select_advance(&conn, "lane", &[], now_f64()) {
             Advance::Nudge { kind, text, .. } => {
                 assert_eq!(kind, "decompose-asked");
-                assert!(text.contains("Split it"), "{text}");
+                // The nudge now distinguishes not-work (discard) from
+                // real-unfinished-work (promote to epic) — AMUX-3323, e8e648f.
+                assert!(text.contains("not a unit of work"), "{text}");
+                assert!(
+                    text.contains("PROMOTE it to an epic") && text.contains("discard it"),
+                    "the decompose ask must offer both the epic-promotion and the discard exits: {text}"
+                );
             }
             Advance::None { reason, detail } => panic!("expected a split ask, got {reason}: {detail}"),
         }
