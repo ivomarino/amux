@@ -270,7 +270,14 @@ def main():
     results = []
     for plan in plans:
         org_id = resolve_org_id(plan, orgs)
-        r = check_env(cookie, plan, org_id, send_probe)
+        try:
+            r = check_env(cookie, plan, org_id, send_probe)
+        except Exception as e:
+            # A single env erroring (a sluggish cloud, a timeout) must not sink the
+            # whole run — record it as a FAIL and keep going so the JSON always emits.
+            r = {"env": plan["name"], "stem": plan["stem"], "org_id": org_id,
+                 "is_demo": plan["is_demo"], "personas": [], "board": None,
+                 "status": "FAIL", "reachable": False, "reasons": ["check errored: %s" % str(e)[:120]]}
         results.append(r)
         icon = {"PASS": "✓", "WARN": "!", "FAIL": "✗", "NOT_PROVISIONED": "·"}.get(r["status"], "?")
         log(f"{icon} {r['status']:16s} {r['env']}  ({plan['stem']}, {'demo' if plan['is_demo'] else 'REAL customer'})")
