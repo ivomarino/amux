@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.672';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.673';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11063,6 +11063,7 @@ if (_abAudio) {
 let _ttsVoices = null;
 let _ttsSelectedVoice = '';
 let _ttsSpeakAudio = null;   // currently-playing one-click clip, so a second press stops the first
+let _ttsAbort = null;        // AbortController for the in-flight /api/tts generation, so Cancel aborts the 3-11s request (AMUX-3333)
 
 // Claim the tap's user-activation for the SHARED player element, synchronously.
 //
@@ -11116,20 +11117,41 @@ function _mdToSpeech(md) {
 // loading signal — not just the ones with a button to spin (Ethan 2026-08-13).
 // The button (if any) also spins; this covers the ellipsis-menu actions that
 // pass no button.
-function _ttsLoading(on) {
+// Legacy boolean callers map onto the mode-based indicator: true -> generating.
+function _ttsLoading(on) { _ttsIndicator(on ? 'generating' : 'off'); }
+
+// The floating TTS indicator, now carrying a Cancel/Stop control so a read-aloud
+// can be aborted mid-generation or stopped mid-playback from a single affordance,
+// whatever entry point triggered it (AMUX-3333). Modes: 'generating' | 'playing'
+// | 'off'.
+function _ttsIndicator(mode) {
   let el = document.getElementById('tts-loading');
-  if (on) {
-    if (!el) {
-      el = document.createElement('div');
-      el.id = 'tts-loading';
-      el.className = 'tts-loading';
-      el.innerHTML = '<span class="tts-loading-spin">◌</span> Generating audio…';
-      document.body.appendChild(el);
-    }
-    el.style.display = 'flex';
-  } else if (el) {
-    el.style.display = 'none';
+  if (mode === 'off') { if (el) el.style.display = 'none'; return; }
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'tts-loading';
+    el.className = 'tts-loading';
+    document.body.appendChild(el);
   }
+  const label = mode === 'playing'
+    ? '<span class="tts-loading-spin" style="animation:none">&#9654;</span> Playing…'
+    : '<span class="tts-loading-spin">&#9676;</span> Generating audio…';
+  const btn = mode === 'playing' ? 'Stop' : 'Cancel';
+  el.innerHTML = label + ' <button class="tts-cancel-btn" onclick="_ttsCancel()">' + btn + '</button>';
+  el.style.display = 'flex';
+}
+
+// Cancel the whole read-aloud lifecycle: abort the in-flight /api/tts request if
+// generation is still running, stop playback if it started, and reset state so
+// the next Read-aloud works cleanly. Safe to call in any phase (each step is
+// guarded and idempotent).
+function _ttsCancel() {
+  try { if (_ttsAbort) _ttsAbort.abort(); } catch (_) {}
+  _ttsAbort = null;
+  try { if (_ttsSpeakAudio) _ttsSpeakAudio.pause(); } catch (_) {}
+  try { if (_abAudio) _abAudio.pause(); } catch (_) {}
+  _ttsSpeakAudio = null;
+  _ttsIndicator('off');
 }
 
 async function _ttsSpeak(text, btn) {
@@ -11156,11 +11178,14 @@ async function _ttsSpeak(text, btn) {
   // allowed the play either way).
   // Unlock the SHARED player element, not a private one — see _ttsClaimGesture.
   _ttsClaimGesture();
+  _ttsAbort = new AbortController();
+  let _ttsPlaying = false;
   try {
     const r = await fetch(API + '/api/tts', {
       method: 'POST',
       headers: _authHeaders({'Content-Type': 'application/json'}),
       body: JSON.stringify({ text }),
+      signal: _ttsAbort.signal,
     });
     const d = await r.json();
     if (d.error) { showToast(d.error, 'error'); return; }
@@ -11172,11 +11197,19 @@ async function _ttsSpeak(text, btn) {
     // the feature people actually listen to for minutes at a time, did not.
     _abPlay(d.url, 'Read aloud' + (peekSession ? ' — ' + peekSession : ''));
     _ttsSpeakAudio = _abAudio;   // so a second press still stops the first
-    _ttsLoading(false);   // audio is playing — done generating
+    // Generation is done and audio is playing: keep the floating control alive
+    // as a Stop affordance for the playback phase, and clear it when the clip
+    // ends on its own (AMUX-3333).
+    _ttsPlaying = true;
+    _ttsIndicator('playing');
+    if (_abAudio) { try { _abAudio.addEventListener('ended', () => _ttsIndicator('off'), { once: true }); } catch (_) {} }
     // Record for replay (Ethan: a tab of past read-alouds). Fire-and-forget so a
     // storage hiccup never blocks playback.
     _raRecord(text, d.url, (typeof peekSession !== 'undefined' && peekSession) || '');
   } catch(e) {
+    // A user-initiated Cancel aborts the fetch; that is the feature working, not
+    // an error — stay quiet (state was already reset by _ttsCancel) (AMUX-3333).
+    if (e && e.name === 'AbortError') return;
     // NotAllowedError is not a permission the user can grant — it means the tap's
     // user-activation expired. Say something actionable instead of WebKit's
     // "possibly because the user denied permission", which sends people hunting
@@ -11194,7 +11227,8 @@ async function _ttsSpeak(text, btn) {
                  { type: 'application/json' }));
     } catch (_) {}
   } finally {
-    _ttsLoading(false);
+    _ttsAbort = null;
+    if (!_ttsPlaying) _ttsIndicator('off');   // hide only if playback did NOT start
     if (btn) { btn.disabled = false; btn.innerHTML = orig; }
   }
 }

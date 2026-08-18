@@ -572,7 +572,12 @@
     font-size: 0.82rem; font-weight: 600; box-shadow: 0 4px 16px rgba(0,0,0,0.4);
     display: flex; align-items: center; gap: 8px; }
   .tts-loading-spin { display: inline-block; animation: tts-spin 0.9s linear infinite; }
+  /* Cancel/Stop control on the floating indicator (AMUX-3333). Touch-friendly. */
+  .tts-cancel-btn { background: rgba(255,255,255,0.22); color: #fff; border: 1px solid rgba(255,255,255,0.5);
+    border-radius: 14px; padding: 3px 12px; font-size: 0.78rem; font-weight: 600; cursor: pointer; margin-left: 2px; }
+  .tts-cancel-btn:hover { background: rgba(255,255,255,0.34); }
   @keyframes tts-spin { to { transform: rotate(360deg); } }
+  @media (max-width: 600px) { .tts-cancel-btn { min-height: 32px; padding: 6px 14px; } }
   /* Past read-alouds list (replay tab). */
   .ra-list { display: flex; flex-direction: column; }
   .ra-item { display: flex; align-items: center; gap: 10px; padding: 10px 14px;
