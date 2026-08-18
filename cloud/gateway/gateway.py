@@ -1864,7 +1864,20 @@ def proxy(handler, port, path, qs, user_email="", user_id=None):
     # on a proxied error body. Same fix and same reason as the Anthropic proxy
     # path (~line 1250); the container path simply never got it.
     skip = {"host", "content-length", "authorization", "cookie", "accept-encoding"}
-    fwd = {k: v for k, v in handler.headers.items() if k.lower() not in skip}
+    # SECURITY (sole-writer of X-Amux-*): the container trusts X-Amux-User-Email as the
+    # authenticated identity — the connectors DWD token mint binds impersonation to it —
+    # so a client must NEVER be able to supply it. Overwriting X-Amux-User-Email only when
+    # user_email is truthy was not enough: any inbound X-Amux-* not in `skip` was copied
+    # verbatim, so an unauthenticated path (user_email="") passed a forged X-Amux-User-Email
+    # straight through, and X-Amux-Session/Worker/etc. always did. STRIP every inbound
+    # X-Amux-* here; the gateway is the only writer. A stripped header is a forgery attempt,
+    # so log it (WARN) — the next attempt then shows up in server.log without a repro.
+    inbound_amux = [k for k in handler.headers.keys() if k.lower().startswith("x-amux-")]
+    if inbound_amux:
+        print(f"[proxy] WARN stripped inbound X-Amux-* (forgery guard): {inbound_amux} "
+              f"path={path} identity={user_email or '<unauth>'}", flush=True)
+    fwd = {k: v for k, v in handler.headers.items()
+           if k.lower() not in skip and not k.lower().startswith("x-amux-")}
     fwd["accept-encoding"] = "identity"
     if user_email:
         fwd["X-Amux-User-Email"] = user_email
