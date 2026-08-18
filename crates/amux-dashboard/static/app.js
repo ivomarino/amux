@@ -3705,27 +3705,26 @@ document.addEventListener('click', e => {
   }
 });
 
-const ALL_TABS = [
-  { id: 'sessions',      label: 'Sessions',   required: true },
-  { id: 'board',         label: 'Board' },
-  { id: 'groups',        label: 'Groups' },
-  { id: 'calendar',      label: 'Calendar' },
-  { id: 'scheduler',     label: 'Scheduler' },
-  { id: 'files',         label: 'Files' },
-  { id: 'mdai',          label: 'MDAI' },
-  { id: 'proxies',       label: 'Proxies' },
-  { id: 'logs',          label: 'Logs' },
-  { id: 'browser',       label: 'Browser' },
-  { id: 'grid',          label: 'Workspace' },
-  { id: 'messages',      label: 'Messages' },
-  { id: 'skills',        label: 'Skills' },
-  { id: 'sql',           label: 'Database' },
-  { id: 'map',           label: 'Map' },
-  { id: 'metrics',       label: 'Metrics' },
-  { id: 'cost',          label: 'Cost' },
-  { id: 'torrents',      label: 'Torrents' },
-  { id: 'terminal',      label: 'Terminal' },
-];
+// Derived from the actual nav buttons (.tab-bar > button#tab-<id>) so EVERY tab,
+// including any added later (Connectors, and whatever comes next), is
+// hideable/draggable/reorderable WITHOUT being hand-registered here (Ethan
+// 2026-08-18: a new tab must be customizable "just like all other tabs"). A
+// hardcoded universe silently excluded any tab missing from it — Connectors, and
+// Groups before it, shipped un-customizable for exactly this reason. The
+// customizer button lives OUTSIDE .tab-bar, so it is never picked up; 'sessions'
+// is the one required (always-visible) tab. The .tab-bar markup precedes this
+// script, so the DOM is ready here; the fallback covers the impossible-empty case.
+const ALL_TABS = (function _discoverNavTabs() {
+  const REQUIRED = new Set(['sessions']);
+  const out = [];
+  document.querySelectorAll('.tab-bar button[id^="tab-"]').forEach(b => {
+    const id = b.id.slice(4);   // strip 'tab-'
+    if (!id) return;
+    const lbl = b.querySelector('.tab-lbl');
+    out.push({ id, label: lbl ? lbl.textContent.trim() : id, required: REQUIRED.has(id) });
+  });
+  return out.length ? out : [{ id: 'sessions', label: 'Workers', required: true }];
+})();
 
 let hiddenTabs = (function() {
   try {
@@ -3885,22 +3884,24 @@ function _peekTabsWheel(e) {
   e.preventDefault(); // keep the page from scrolling instead of the tabs
 }
 
-const PEEK_TABS = [
-  { id: 'simple',     label: 'Simple' },
-  { id: 'steering',   label: 'Steering' },
-  { id: 'schedules',  label: 'Schedules' },
-  { id: 'scope',      label: 'Scope' },
-  { id: 'messages',   label: 'Messages' },
-  { id: 'dictation',  label: 'Dictation' },
-  { id: 'readalouds', label: 'Read alouds' },
-  { id: 'issues',     label: 'Board' },
-  { id: 'cost',       label: 'Cost' },
-  { id: 'transcript', label: 'Transcript' },
-  { id: 'commits',    label: 'Commits' },
-  { id: 'memory',     label: 'Memory' },
-  { id: 'git',        label: 'Worktree' },
-  { id: 'logs',       label: 'Logs' },
-];
+// Derived from the actual peek-tab buttons (.peek-tabs > button.peek-tab#peek-tab-<id>)
+// so every WORKER-VIEW tab, including any added later, is hideable/draggable
+// without being hand-registered — the same rule as the global bar (Ethan
+// 2026-08-18). `terminal` is deliberately excluded: it is pinned first by
+// _applyPeekTabVisibility and is not reorderable. The customize button carries a
+// different class (tab-customize-btn, not peek-tab), so it is not picked up. DOM
+// order is the default order, matching what a fresh browser shows.
+const PEEK_TABS = (function _discoverPeekTabs() {
+  const PINNED = new Set(['terminal']);
+  const out = [];
+  document.querySelectorAll('.peek-tabs button.peek-tab[id^="peek-tab-"]').forEach(b => {
+    const id = b.id.slice('peek-tab-'.length);
+    if (!id || PINNED.has(id)) return;
+    const lbl = b.querySelector('.tab-lbl');
+    out.push({ id, label: lbl ? lbl.textContent.trim() : id });
+  });
+  return out.length ? out : [{ id: 'simple', label: 'Simple' }];
+})();
 let peekHiddenTabs = (function() {
   try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return new Set(JSON.parse(v)); } catch(e) {}
   return new Set(['dictation', 'commits', 'git']);   // sensible default
@@ -7774,7 +7775,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.673';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.674';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
