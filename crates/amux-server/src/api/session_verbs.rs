@@ -5062,6 +5062,47 @@ fn codex_dir_already_known(config_text: &str, dir: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// The CHEAP, synchronous reasons a session cannot start — the ones knowable
+/// without the op-lock or a tmux query. Returns the human reason, or None if
+/// nothing cheap blocks the launch.
+///
+/// This exists because `POST /api/sessions/<n>/start` answers an optimistic 202
+/// `{ok:true,"starting"}` BEFORE `start_session` runs (AMUX-2557), so a start
+/// that was always going to be refused — an archived scaffold, a blocked lane —
+/// reported success to the caller and its refusal reached only the event stream,
+/// never `server-rs.log`: indistinguishable from a real start (AMUX-3364, found
+/// on cloud POC containers). The `/start` handler now calls this SYNCHRONOUSLY
+/// and answers `{ok:false,error}` for these cases, so the caller learns the truth
+/// and the refusal is logged.
+///
+/// SEAM NOTE (ethos D6): these predicates are ALSO checked inside `start_session`,
+/// which stays authoritative — it additionally holds the op-lock and does the
+/// async `is_running` check (a running session is "already running", a success,
+/// which is why is_running is deliberately NOT here). This is a small, stable
+/// mirror of five invariant preconditions, not a second control plane; keep the
+/// two in step if a precondition is added.
+pub(crate) fn start_block_reason(name: &str, cfg: &EnvFile) -> Option<String> {
+    if !valid_session_name(name) {
+        return Some("invalid session name".into());
+    }
+    if !env_path(name).exists() {
+        return Some(format!("session '{name}' not found"));
+    }
+    if is_session_blocked(name) {
+        return Some("session is blocked; remove it from blocked-sessions.txt first".into());
+    }
+    if !iterm2_id(cfg).is_empty() {
+        return Some("iTerm2-backed sessions are not supported by the rust origin yet".into());
+    }
+    if backend_of_cfg(cfg) == "herdr" {
+        return Some("herdr-backed session start is not ported to the rust origin yet".into());
+    }
+    if cfg.get("CC_ARCHIVED") == Some("1") {
+        return Some("session is archived; wake it first".into());
+    }
+    None
+}
+
 async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_conv_id: bool) -> (bool, String) {
     if !valid_session_name(name) {
         return (false, "invalid session name".into());
@@ -9911,6 +9952,16 @@ async fn post_dispatch(
                     json!({"ok": false, "message": format!("work dir missing: {wd0}")}),
                 );
             }
+            // A start that CANNOT succeed must say so NOW, not answer an
+            // optimistic 202 and no-op in the background (AMUX-3364). The cheap
+            // preconditions are knowable synchronously, so answer ok:false and
+            // WARN — the refusal is now both told to the caller and greppable in
+            // server-rs.log (`session_start_refused`), where before it was
+            // invisible on both channels.
+            if let Some(reason) = start_block_reason(name, &cfg) {
+                tracing::warn!(session = %name, reason = %reason, "session_start_refused: /start cannot launch this session");
+                return jresp(StatusCode::CONFLICT, json!({"ok": false, "error": reason}));
+            }
             let prompt = body_str(body, "prompt").trim().to_string();
             let st2 = state.clone();
             let n = name.to_string();
@@ -9928,6 +9979,12 @@ async fn post_dispatch(
                     }
                 } else {
                     // A background failure must still be SEEN (ethos rule 4).
+                    // The event stream alone was not enough (AMUX-3364): a
+                    // `server-rs.log` sweep found nothing, so a start that
+                    // spawned nothing read as success. WARN to the log too, so
+                    // the class is greppable (`session_start_failed`) without
+                    // opening the event store.
+                    tracing::warn!(session = %n, reason = %chars_truncate(&msg, 200), "session_start_failed: /start spawned nothing");
                     emit_event(
                         &st2,
                         &n,
@@ -12595,6 +12652,45 @@ mod tests {
         // Unparseable config -> treated as known -> we do NOT append into a file we
         // cannot understand (fail-safe).
         assert!(codex_dir_already_known("[unclosed table", "/b"), "unparseable -> refuse to append");
+    }
+
+    /// AMUX-3364: `POST /api/sessions/<n>/start` used to answer an optimistic 202
+    /// ok:true and then no-op in the background for a session that could never
+    /// launch (the archived cloud scaffold), with NO server-rs.log trace —
+    /// indistinguishable from a real start. start_block_reason is the cheap
+    /// synchronous predicate the handler now answers ok:false from; every arm
+    /// here is a case that reported false success before the fix.
+    #[test]
+    fn start_block_reason_refuses_the_unlaunchable_synchronously() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).expect("mkdir");
+        let write =
+            |n: &str, body: &str| std::fs::write(sessions.join(format!("{n}.env")), body).expect("write");
+
+        // A normal, launchable session: nothing cheap blocks it.
+        write("worker", "CC_DIR=\"/tmp\"\n");
+        assert_eq!(start_block_reason("worker", &parse_env("worker")), None);
+
+        // THE REPORTED CASE: an archived scaffold. Refused synchronously, never
+        // an optimistic ok:true that vanishes in the background.
+        write("hello-world", "CC_ARCHIVED=\"1\"\n");
+        let r = start_block_reason("hello-world", &parse_env("hello-world"))
+            .expect("an archived session must block");
+        assert!(r.contains("archived"), "{r}");
+
+        // herdr start is not ported to the rust origin — refuse now, do not 202
+        // and then fail invisibly.
+        write("herd", "CC_BACKEND=\"herdr\"\n");
+        assert!(start_block_reason("herd", &parse_env("herd")).unwrap().contains("herdr"));
+
+        // No env file at all: not found. (Also caught upstream; asserted here so
+        // the handler's synchronous contract is locked in.)
+        assert!(start_block_reason("ghost-xyz", &parse_env("ghost-xyz")).unwrap().contains("not found"));
+
+        // An invalid name never resolves to a launch.
+        assert!(start_block_reason("bad/name", &parse_env("bad/name")).unwrap().contains("invalid"));
     }
 
     /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
