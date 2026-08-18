@@ -151,7 +151,8 @@ jobs:
       # unconditionally would pass the incident case while being pure noise, and
       # the hook's own header names silence-when-current as the reason it gets
       # read at all.
-      - name: SessionStart freshness hook (AEAB-18)
+      - name: SessionStart freshness hook (AEAB-18) + build provenance (AEAB-12)
         run: |
           set -uo pipefail
           ./scripts/test-session-freshness.sh
+          ./scripts/test-build-provenance.sh

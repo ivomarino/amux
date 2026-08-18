@@ -93,6 +93,36 @@ if git remote get-url origin >/dev/null 2>&1; then
   fi
 fi
 
+# ── Axis 1c: was the RUNNING SERVER built from an unmerged revision? ─────────
+#
+# AEAB-12. The rust auto-builder rebuilds whenever the BUILD SOURCE's local HEAD
+# moves, on any branch, and the server self-adopts within 5s. That permissiveness
+# is deliberate — this machine has survived weeks pinned to an unmerged fix
+# branch — but it means a commit made on a feature branch inside the build source
+# is serving the whole fleet about a minute later, with no CI and no review.
+#
+# On 2026-08-17 that ran for 9h42m unnoticed, while the same condition also
+# stopped the machine tracking upstream, so the daily update schedule silently did
+# nothing. Nothing looked wrong anywhere.
+#
+# The builder records what it installed; this reads it. Deliberately a REPORT, not
+# a refusal, and not a re-derivation: only the builder knows which tree it built,
+# and a second implementation guessing at it would be the drift this file keeps
+# finding. Fails open like everything else here — no file, unreadable, or garbage
+# means silence.
+PROV="${AMUX_RS_BUILD_PROVENANCE:-$HOME/.amux/rust-build-provenance.json}"
+if [ -r "$PROV" ]; then
+  prov_on_main=$(sed -n 's/.*"on_main":"\([^"]*\)".*/\1/p' "$PROV" 2>/dev/null)
+  prov_ref=$(sed -n 's/.*"ref":"\([^"]*\)".*/\1/p' "$PROV" 2>/dev/null)
+  prov_sha=$(sed -n 's/.*"sha":"\([^"]*\)".*/\1/p' "$PROV" 2>/dev/null)
+  if [ "${prov_on_main:-yes}" = "no" ]; then
+    out+="  - the RUNNING SERVER was built from an unmerged revision: ${prov_sha:0:9} on '${prov_ref:-?}'"$'\n'
+    out+=$'    it is the live build for the whole fleet, with no CI and no review behind it\n'
+    out+=$'    intentional pin? fine. accident? put the build source back on main —\n'
+    out+=$'    develop in a git worktree, never in the checkout the builder watches\n'
+  fi
+fi
+
 # ── Axis 2: does what is INSTALLED match this checkout? ──────────────────────
 # The repo copy is the source; install.sh copies it. Editing the repo alone
 # changes nothing that a session or the dashboard actually executes.
