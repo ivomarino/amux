@@ -139,3 +139,19 @@ jobs:
         run: |
           set -uo pipefail
           node scripts/test-linkify-paths.mjs
+
+      # AEAB-18. The freshness hook is a SHELL script outside crates/, so
+      # rust.yml's path filter never sees it. It also guards a silent,
+      # write-shaped failure — appending to a shared append-only file from a
+      # diverged checkout succeeds and reaches nobody — which means the only way
+      # to know the warning still fires is to fire it. The test builds real git
+      # repos and runs the shipped hook against them.
+      #
+      # Its control cases matter as much as its positive one: a hook that warned
+      # unconditionally would pass the incident case while being pure noise, and
+      # the hook's own header names silence-when-current as the reason it gets
+      # read at all.
+      - name: SessionStart freshness hook (AEAB-18)
+        run: |
+          set -uo pipefail
+          ./scripts/test-session-freshness.sh
