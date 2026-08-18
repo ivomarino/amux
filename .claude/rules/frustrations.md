@@ -5,6 +5,27 @@ notice that misattributes, a gate you cannot satisfy honestly, a probe that cann
 express the answer, a nudge that fires forever — **append an entry to
 `frustrations.md` at the repo root.**
 
+**"The repo root" means the checkout that can actually PUSH.** On a machine with
+more than one clone this is not a pedantic distinction, it is the whole value of
+the file: on 2026-08-17 four entries were appended to a checkout that was ~1000
+commits behind with unpushed local commits and an hourly sync job that had failed
+80+ runs. That copy held 25 entries; the real one held 124. The appends
+SUCCEEDED — no error, nothing to notice — and reached nobody. The argument this
+file exists to make is that one frustration is a complaint and a cluster is an
+argument; a cluster only forms in the file everyone reads.
+
+So before appending, confirm the checkout is not stranded:
+
+```bash
+git rev-list --count origin/main..HEAD   # unpushed commits here
+git rev-list --count HEAD..origin/main   # how far behind
+```
+
+If BOTH are non-zero the checkout has diverged, cannot fast-forward, and nothing
+will carry your entry upstream — append to a clone that is current instead. The
+SessionStart freshness hook now says this out loud when it applies, because a
+rule that only asks you to remember is the kind ethos rule 6 warns about.
+
 This is not a diary. It is the input to deciding what to fix next, so it has to be
 greppable and it has to be honest about cost.
 

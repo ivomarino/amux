@@ -41,6 +41,7 @@ if git remote get-url origin >/dev/null 2>&1; then
   base="$(git rev-parse --abbrev-ref --symbolic-full-name '@{u}' 2>/dev/null || echo origin/main)"
   if git rev-parse --verify -q "$base" >/dev/null 2>&1; then
     behind="$(git rev-list --count "HEAD..$base" 2>/dev/null || echo 0)"
+    ahead="$(git rev-list --count "$base..HEAD" 2>/dev/null || echo 0)"
     if [ "${behind:-0}" -gt 0 ]; then
       # Name the files that actually matter here, not just a number: "110
       # commits behind" reads as bookkeeping, "crates/ changed upstream"
@@ -64,6 +65,30 @@ if git remote get-url origin >/dev/null 2>&1; then
       [ -n "$hot" ] && out+=" — including: ${hot}"
       out+=$'\n'
       out+=$'    git pull --rebase origin main   (review first: this checkout is SHARED)\n'
+    fi
+
+    # ── Axis 1b: DIVERGED, so append-only shared files written here strand ───
+    #
+    # Behind alone is recoverable: pull, and your work still reaches origin.
+    # Behind AND ahead is not — the checkout cannot fast-forward, so the hourly
+    # sync job refuses (correctly, it must never rewrite a shared tree) and
+    # nothing carries anything here upstream until a human reconciles it.
+    #
+    # The reason this is worth its own line rather than folding into the count
+    # above: the failure is SILENT AND WRITE-SHAPED. A stale checkout announces
+    # itself the moment you pull. Appending to `frustrations.md` here succeeds,
+    # prints nothing, and reaches nobody. On 2026-08-17 four entries went in
+    # this way — that copy held 25 entries while origin held 124 — and it was
+    # noticed only by chance, days later (AEAB-18).
+    #
+    # Names frustrations.md specifically because it is the append-only shared
+    # file a session is INSTRUCTED to write on its own initiative, so it is the
+    # one that gets stranded without anybody choosing to risk it.
+    if [ "${behind:-0}" -gt 0 ] && [ "${ahead:-0}" -gt 0 ]; then
+      out+="  - this checkout has DIVERGED (${ahead} unpushed, ${behind} behind ${base})"$'\n'
+      out+=$'    it cannot fast-forward, so nothing here reaches origin until a human reconciles it\n'
+      out+=$'    do NOT append to frustrations.md here — the write succeeds and reaches nobody\n'
+      out+=$'    log friction in a clone that is current instead (.claude/rules/frustrations.md)\n'
     fi
   fi
 fi
