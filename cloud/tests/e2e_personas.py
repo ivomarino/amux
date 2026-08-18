@@ -186,9 +186,14 @@ def check_env(cookie, plan, org_id, send_probe):
         res["board"] = {"issues": len(issues), "raw_capture_titles": len(shells)}
 
     missing = [p["name"] for p in res["personas"] if not p["present"]]
+    # A persona shows evidence of work if it has a transcript, tool calls, OR files.
+    # tool_calls alone is proof the worker ran (peek may omit history_lines yet still
+    # show the ⏺ tool markers), so a worker with tool_calls is NOT "no evidence".
     no_evidence = [p["name"] for p in res["personas"]
                    if p["present"] and p["evidence"]
-                   and p["evidence"]["history_lines"] == 0 and p["evidence"]["files"] == 0]
+                   and p["evidence"]["history_lines"] == 0
+                   and p["evidence"]["files"] == 0
+                   and p["evidence"]["tool_calls"] == 0]
     probe_fail = [p["name"] for p in res["personas"]
                   if p.get("probe") and not p["probe"].get("replied")]
     if missing:
