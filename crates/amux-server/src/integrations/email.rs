@@ -920,6 +920,24 @@ impl GmailClient {
         }))
     }
 
+    /// Download one attachment's raw bytes by its Gmail `attachmentId` (from
+    /// `get_message_full`'s attachments list) — AMUX-3354/autodesk.
+    pub async fn get_attachment(
+        &self,
+        account: &str,
+        gmail_id: &str,
+        attachment_id: &str,
+    ) -> Result<Vec<u8>, String> {
+        let url = format!(
+            "{GMAIL_BASE}/messages/{}/attachments/{}",
+            urlencode(gmail_id),
+            urlencode(attachment_id)
+        );
+        let resp = self.api(account, "GET", &url, None).await?;
+        let data = resp.get("data").and_then(Value::as_str).ok_or("attachment has no data")?;
+        base64url_decode(data)
+    }
+
     /// Python `_gmail_list_messages` (AMUX-2883): header-level summaries for
     /// the Mail view. `q` overrides `label` (python's exact precedence). The
     /// N metadata fetches after the id list are python's own shape — one
@@ -1337,14 +1355,38 @@ fn decode_body(payload: &Value) -> (String, String) {
 /// `/messages/{id}/attachments/{attachmentId}`). Used by the read-one endpoint
 /// (AMUX-3354/autodesk): a snippet-only read hid attachments entirely.
 pub fn collect_attachments(payload: &Value) -> Vec<Value> {
+    fn header(node: &Value, name: &str) -> String {
+        node.get("headers")
+            .and_then(Value::as_array)
+            .and_then(|hs| {
+                hs.iter()
+                    .find(|h| {
+                        h.get("name")
+                            .and_then(Value::as_str)
+                            .is_some_and(|n| n.eq_ignore_ascii_case(name))
+                    })
+                    .and_then(|h| h.get("value").and_then(Value::as_str))
+            })
+            .unwrap_or("")
+            .to_string()
+    }
     fn walk(node: &Value, out: &mut Vec<Value>) {
         let filename = node.get("filename").and_then(Value::as_str).unwrap_or("");
         if !filename.is_empty() {
+            // `filename` is set on INLINE images too (signature logos, cid: images
+            // in the HTML), so "has a filename" is not "is a real attachment"
+            // (autodesk, AMUX-3354: 9 of 13 parts were one repeated inline logo).
+            // Inline iff Content-Disposition says so, or it is absent but the part
+            // carries a Content-ID the HTML body references.
+            let disp = header(node, "Content-Disposition").to_lowercase();
+            let inline = disp.contains("inline")
+                || (!disp.contains("attachment") && !header(node, "Content-ID").is_empty());
             out.push(json!({
                 "filename": filename,
                 "mime_type": node.get("mimeType").and_then(Value::as_str).unwrap_or(""),
                 "size": node.pointer("/body/size").and_then(Value::as_i64).unwrap_or(0),
                 "attachment_id": node.pointer("/body/attachmentId").and_then(Value::as_str).unwrap_or(""),
+                "inline": inline,
             }));
         }
         if let Some(parts) = node.get("parts").and_then(Value::as_array) {
@@ -1563,14 +1605,22 @@ mod tests {
                     { "mimeType": "text/html", "body": {"data": "PHA+"} }
                 ]},
                 { "mimeType": "application/pdf", "filename": "report.pdf",
-                  "body": {"size": 1234, "attachmentId": "att-1"} }
+                  "headers": [{"name":"Content-Disposition","value":"attachment; filename=report.pdf"}],
+                  "body": {"size": 1234, "attachmentId": "att-1"} },
+                // A cid: signature logo — has a filename but is INLINE, not a file.
+                { "mimeType": "image/png", "filename": "logo.png",
+                  "headers": [{"name":"Content-ID","value":"<logo@sig>"},{"name":"Content-Disposition","value":"inline"}],
+                  "body": {"size": 50, "attachmentId": "att-2"} }
             ]
         });
         let atts = collect_attachments(&payload);
-        assert_eq!(atts.len(), 1);
-        assert_eq!(atts[0]["filename"], json!("report.pdf"));
-        assert_eq!(atts[0]["attachment_id"], json!("att-1"));
-        assert_eq!(atts[0]["size"], json!(1234));
+        assert_eq!(atts.len(), 2);
+        let pdf = atts.iter().find(|a| a["filename"] == json!("report.pdf")).unwrap();
+        assert_eq!(pdf["attachment_id"], json!("att-1"));
+        assert_eq!(pdf["size"], json!(1234));
+        assert_eq!(pdf["inline"], json!(false), "a real file is not inline");
+        let logo = atts.iter().find(|a| a["filename"] == json!("logo.png")).unwrap();
+        assert_eq!(logo["inline"], json!(true), "a cid: signature logo is inline");
         // A plain body-only message has no attachments.
         assert!(collect_attachments(&json!({"mimeType":"text/plain","body":{"data":"aGk"}})).is_empty());
     }

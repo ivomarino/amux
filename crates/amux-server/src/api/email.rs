@@ -53,6 +53,7 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/reply", post(reply))
         .route("/inbox", get(inbox))
         .route("/message/{id}", get(message))
+        .route("/message/{id}/attachments/{attachment_id}", get(message_attachment))
         .route("/search", get(search))
         .route("/log", get(send_log))
         .layer(Extension(ctx))
@@ -698,6 +699,50 @@ pub async fn message(
             "hint": "the id is the RFC822 Message-ID from /inbox or /search (e.g. <...@host>), not the gmail short id; pass ?account=<email> to target one mailbox",
         }),
     )
+}
+
+/// GET /api/email/message/{id}/attachments/{attachment_id} — download one
+/// attachment's raw bytes (AMUX-3354/autodesk). `{id}` is the RFC822 Message-ID,
+/// `{attachment_id}` the Gmail attachmentId from the message's attachments list.
+/// `?filename=` and `?content_type=` set the download headers.
+pub async fn message_attachment(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    Path((id, attachment_id)): Path<(String, String)>,
+    Query(qs): Query<HashMap<String, String>>,
+) -> Response {
+    let id = id.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string();
+    let account = qs.get("account").map(|s| s.trim().to_string()).unwrap_or_default();
+    let connected = ctx.client.connected_accounts();
+    let accounts: Vec<String> = if !account.is_empty() {
+        if !connected.contains(&account) {
+            return err(StatusCode::BAD_REQUEST, json!({ "error": format!("account {account} is not connected") }));
+        }
+        vec![account]
+    } else {
+        connected.clone()
+    };
+    for acct in &accounts {
+        if let Some(meta) = ctx.client.find_message_by_rfc822(acct, &id).await {
+            if let Some(gid) = meta.get("id").and_then(Value::as_str) {
+                return match ctx.client.get_attachment(acct, gid, &attachment_id).await {
+                    Ok(bytes) => {
+                        let fname = qs.get("filename").map(String::as_str).unwrap_or("attachment").replace(['"', '\r', '\n'], "");
+                        let ct = qs.get("content_type").map(String::as_str).unwrap_or("application/octet-stream").to_string();
+                        (
+                            [
+                                (axum::http::header::CONTENT_TYPE, ct),
+                                (axum::http::header::CONTENT_DISPOSITION, format!("attachment; filename=\"{fname}\"")),
+                            ],
+                            bytes,
+                        )
+                            .into_response()
+                    }
+                    Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e })),
+                };
+            }
+        }
+    }
+    err(StatusCode::NOT_FOUND, json!({ "error": "message not found", "id": id }))
 }
 
 pub async fn search(
