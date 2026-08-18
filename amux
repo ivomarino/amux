@@ -1397,6 +1397,64 @@ print(json.dumps(b))' ${checked[@]+"${checked[@]}"})
     "${AMUX_API:-https://localhost:8824}/api/board/$id"
 }
 
+# The board's valid item types, ASKED FOR rather than carried.
+#
+# Extracted from the `type` verb, which learned this the hard way: it used to
+# hold a hardcoded list that drifted — advertising `task` and `decision`, both
+# rejected, and omitting `tripwire` — so following the tool's own usage line
+# produced "unknown type 'decision'" and sent you looking at your card instead
+# of at the CLI (AMUX-2479). `add --type` needs the same list, and a SECOND copy
+# is how that drift happens again, so there is one implementation and no literal
+# list anywhere in this file. On an unreachable server it returns a POINTER, not
+# a guess: confidently wrong help is worse than none.
+_board_valid_types() {
+  local _t
+  _t=$(curl -sk --max-time 3 "$AMUX_API/api/board/contract" 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(" ".join(json.load(sys.stdin)["fields"]["valid_types"]))
+except Exception: pass' 2>/dev/null)
+  [[ -n "$_t" ]] && echo "$_t" || echo "(server unreachable — see GET /api/board/contract)"
+}
+
+# Refuse an argument that LOOKS like a flag but is not one this verb knows.
+#
+# AEAB-17: every board verb taking positional text used `*) text="$1"` as its
+# catch-all, so an unsupported or mistyped flag became part of the TEXT with
+# exit 0 and no warning. The failure is invisible at the call site — the command
+# prints the card id it created and looks like it worked.
+#
+# Only `--`-prefixed arguments are refused. A positional title is legitimate and
+# must keep working; something starting with `--` is a mistake often enough that
+# refusing it is right, and the escape (--stdin/--file) is named in the message
+# so a title that genuinely begins with dashes is still expressible.
+_board_bad_flag() {
+  local verb="$1" arg="$2"; shift 2
+  die "amux board $verb: unknown option '$arg'
+accepted here: $*
+If '$arg' was meant as literal text, pass it via --stdin or --file so it is
+never parsed as a flag. Unknown flags used to be folded silently into the
+title/text (AEAB-17), which produced cards with a scratch path in the title
+and an empty body."
+}
+
+_board_add_usage() {
+  cat <<EOF
+Usage: amux board add <title>
+       amux board add --stdin | --file <path>          (title, unevaluated by your shell)
+
+Optional:
+  --desc <text> | --desc-stdin | --desc-file <path>    card body
+  --type <type>                                        the GATE is derived from this
+  --help                                               this text
+
+types: $(_board_valid_types)
+
+Prefer --stdin/--file for a title and --desc-stdin/--desc-file for a body: inline
+text is evaluated by YOUR shell first, so backticks and \$(...) in it are EXECUTED
+before amux ever sees them (AMUX-1888).
+EOF
+}
+
 # Outcome-based exit for board mutations (AMUX-2140): the CLI used to report
 # the TRANSPORT (curl ok = exit 0) while the server refused the write — every
 # `$?` caller and every `&& echo moved` printed success on blocked mutations,
@@ -1641,14 +1699,10 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
         # "unknown type 'decision'", which is the worst kind of help: confidently
         # wrong, and it sends you looking at your card instead of at the CLI.
         # (Hit live on AMUX-2479, 2026-08-07.)
-        local _types
-        _types=$(curl -sk --max-time 3 "$AMUX_API/api/board/contract" 2>/dev/null \
-          | python3 -c 'import json,sys
-try: print(" ".join(json.load(sys.stdin)["fields"]["valid_types"]))
-except Exception: pass' 2>/dev/null)
-        [[ -n "$_types" ]] || _types="(server unreachable — see GET /api/board/contract)"
+        # One implementation, in _board_valid_types — `add --type` needs the
+        # same list and a second copy is how the drift below happens again.
         die "Usage: amux board type <ISSUE-ID> <type>
-types: $_types"
+types: $(_board_valid_types)"
       fi
       local result
       result=$(T="$new_type" python3 -c 'import json,os;print(json.dumps({"type":os.environ["T"]}))' \
@@ -1783,6 +1837,15 @@ conversation it was captured from."
           --desc-file)    [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board retitle <ID> --desc-file <path>"
                           new_desc=$(cat "$2"); _mode=1; shift 2 ;;
           --desc)         new_desc="${2:-}"; _mode=1; shift 2 ;;
+          --help|-h)      die "Usage: amux board retitle <ISSUE-ID> <title> | --stdin | --file <path>
+       amux board retitle <ISSUE-ID> --desc-stdin | --desc-file <path> | --desc <text>" ;;
+          # Same AEAB-17 defect as `add` below, twenty lines away: this catch-all
+          # absorbed unknown flags into the TITLE. Fixed here too rather than
+          # left as a known hole — searching for the SHAPE and not one spelling
+          # is the lesson of the sweep that missed a second site by grepping a
+          # single pattern.
+          --*)            _board_bad_flag retitle "$1" \
+                            "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --help" ;;
           *)              new_title="$1"; _mode=1; shift ;;
         esac
       done
@@ -1811,16 +1874,56 @@ print(json.dumps(b))' \
       # (AMUX-1888); the JSON body is built with json.dumps, not string
       # interpolation, so a quote/newline/backslash in the title can't produce
       # malformed JSON (the old `-d "{\"title\":\"$title\"}"` form did).
-      local title
-      if [[ "${1:-}" == "--stdin" || "${1:-}" == "-" ]]; then title=$(cat)
-      elif [[ "${1:-}" == "--file" ]]; then
-        [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board add --file <path>"
-        title=$(cat "$2")
-      else title="$*"; fi
-      [[ -n "$title" ]] || die "Usage: amux board add <title> | --stdin | --file <path>"
+      #
+      # AEAB-17. This used to be `else title="$*"`, which meant EVERY argument
+      # became part of the title — so an unsupported or mistyped flag was
+      # silently folded in, exit 0, no warning. One log-review run filed five
+      # cards that way: titles up to 259 chars carrying raw
+      # `--type blocker --desc-file /private/tmp/.../c26.md` (a scratch path
+      # that would not exist the next day), empty descs, and the DEFAULT type —
+      # so two cards about a production outage were typed `code` and therefore
+      # gated on "Implemented and merged" + "Tests / lint pass", which cannot be
+      # acked truthfully for "your prod host disk is full" (ethos rule 3,
+      # reached by accident). And `amux board add --help` filed a card TITLED
+      # "--help", so the one action taken to discover the interface was the
+      # action that polluted the board — the AMUX-2140 shape, where following
+      # the instruction is what produces the failure.
+      #
+      # Two fixes, and the second is why the first was needed: reject unknown
+      # flags instead of absorbing them, AND accept --type/--desc-* so the
+      # honest path is the easy path. Without the latter, a card with a body
+      # still needs add-then-retitle, which is exactly the two-step that made
+      # the mistake natural. `retitle` already had these flags; `add`, the verb
+      # you reach first, had none and said so nowhere reachable.
+      local title="" desc="" itype="" _src=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --stdin|-)     title=$(cat); _src=1; shift ;;
+          --file)        [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board add --file <path>"
+                         title=$(cat "$2"); _src=1; shift 2 ;;
+          --desc-stdin)  desc=$(cat); shift ;;
+          --desc-file)   [[ -n "${2:-}" && -r "${2:-}" ]] || die "usage: amux board add --desc-file <path>"
+                         desc=$(cat "$2"); shift 2 ;;
+          --desc)        [[ -n "${2:-}" ]] || die "usage: amux board add --desc <text>"
+                         desc="$2"; shift 2 ;;
+          --type)        [[ -n "${2:-}" ]] || die "usage: amux board add --type <type>
+types: $(_board_valid_types)"
+                         itype="$2"; shift 2 ;;
+          --help|-h)     _board_add_usage; return 0 ;;
+          --*)           _board_bad_flag add "$1" \
+                           "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --type <t> --help" ;;
+          *)             title="${title:+$title }$1"; _src=1; shift ;;
+        esac
+      done
+      [[ -n "$title" ]] || die "$(_board_add_usage)"
       local body result
-      body=$(T="$title" S="${AMUX_SESSION:-}" python3 -c \
-        "import json,os; print(json.dumps({'title': os.environ['T'].strip(), 'status':'todo', 'session': os.environ['S']}))")
+      body=$(T="$title" S="${AMUX_SESSION:-}" D="$desc" TY="$itype" python3 -c 'import json,os
+b = {"title": os.environ["T"].strip(), "status": "todo", "session": os.environ["S"]}
+d = os.environ.get("D", "")
+if d.strip(): b["desc"] = d
+t = os.environ.get("TY", "").strip()
+if t: b["type"] = t
+print(json.dumps(b))')
       result=$(curl -sk -X POST \
         -H 'Content-Type: application/json' \
         -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
@@ -2222,6 +2325,10 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux whoami                      Live worker identity vs inherited env (mismatch warns)
   amux board ls [--all]            List open issues (--all includes archived)
   amux board add <title>           Create a new todo issue
+    --type T                       set the type at create time (the GATE is derived from it)
+    --desc/--desc-stdin/--desc-file  give the card a body in the same write
+                                   (--stdin/--file for the TITLE. Unknown flags are
+                                    REFUSED, not folded into the title — AEAB-17.)
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
   amux board needsyou <ID> [ask]   Mark a card as blocked on the human (surfaces in Needs-you).
                                    A sign-in/login ask auto-gets a clickable resume link into
@@ -2592,7 +2699,7 @@ ${BOLD}CRM:${RESET}
 
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues
-  amux board add <title>         Create a new issue
+  amux board add <title>         Create a new issue (--type/--desc*; see `amux board`)
   amux board done <ID>           Mark issue as done
   amux board doing <ID>          Mark issue as in progress
   amux board todo <ID>           Mark issue as todo
