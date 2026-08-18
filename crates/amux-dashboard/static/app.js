@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.667';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.668';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -7960,8 +7960,8 @@ function _offlineCacheInfo() {
 function _paintCachedPeek(cached) {
   if (!cached || (!cached.output && !cached.history)) return false;
   _peekHistoryRaw = cached.history || '';
-  _peekHistoryHTML = cached.histHTML || (cached.history ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.history)))) : '');
-  _lastLiveHTML = cached.liveHTML || (cached.output ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(cached.output)))) : '');
+  _peekHistoryHTML = cached.histHTML || (cached.history ? _peekHtml(cached.history) : '');
+  _lastLiveHTML = cached.liveHTML || (cached.output ? _peekHtml(cached.output) : '');
   lastPeekHTML = _peekEarlierHTML() + _peekHistoryHTML + _lastLiveHTML;
   applyPeekSearch();
   const ago = Math.floor((Date.now() - (cached.time || Date.now())) / 60000);
@@ -8944,58 +8944,92 @@ function _osc8Resolve(html, urls) {
     .replace(/\uE000\d+\uE001|\uE002/g, '');
 }
 
-function linkifyOutput(text) {
-  // Split text into segments: URLs, file paths, and plain text
-  // URL regex: match http/https URLs
-  const urlRe = /https?:\/\/[^\s<>\]\)'"`,;]+/g;
-  // File path regex: absolute paths or relative paths with extensions
-  const fileRe = /(?:^|[\s(])((\/[\w./-]+(?:\.\w+)(?::[\d]+)?)|(\.\/[\w./-]+(?:\.\w+)(?::[\d]+)?))/gm;
+// Resolve a path as it appeared in a session's OUTPUT into something the file
+// APIs can use. Output is written from the worker's cwd, so `customers/rothco/
+// data/x.csv` is only meaningful relative to that session's dir — which is what
+// `peekSessionDir` holds. An absolute path is returned untouched.
+function _resolveOutputPath(p) {
+  const raw = String(p || '').replace(/:\d+$/, '');   // strip a trailing :linenum
+  if (raw.startsWith('/')) return raw;
+  const base = (typeof peekSessionDir === 'string' && peekSessionDir) ? peekSessionDir.replace(/\/+$/, '') : '';
+  const rel = raw.replace(/^\.\//, '');
+  return base ? base + '/' + rel : rel;
+}
 
-  const parts = [];
-  let last = 0;
+// Click target for a path in session output: open the FILE BROWSER at it.
+//
+// The browser is a directory view, so a file path opens its containing folder —
+// you land looking at the file, in context, with the session's shortcuts loaded
+// and the "back to <session>" affordance wired up. A path with no extension in
+// its last segment is treated as a directory and opened directly.
+//
+// Deliberately the browser rather than the file-preview overlay: peek output is
+// most often naming a file so you can go LOOK at it and what is around it, and
+// the browser is reachable from a preview while the reverse costs a round trip.
+function _openPathFromOutput(p) {
+  if (window.getSelection && String(window.getSelection()) !== '') return;  // a drag-select is not a click
+  const full = _resolveOutputPath(p);
+  const lastSeg = full.slice(full.lastIndexOf('/') + 1);
+  const looksLikeFile = /\.[A-Za-z0-9]{1,8}$/.test(lastSeg);
+  const dir = looksLikeFile ? (full.slice(0, full.lastIndexOf('/')) || '/') : full;
+  openExplore(dir, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
+}
 
-  // First pass: find all URLs
-  const matches = [];
-  let m;
-  while ((m = urlRe.exec(text)) !== null) {
-    // Strip trailing punctuation that's likely not part of URL
-    let url = m[0].replace(/[.,;:!?)]+$/, '');
-    matches.push({ start: m.index, end: m.index + url.length, type: 'url', value: url });
-  }
+// Turn file paths in ALREADY-ESCAPED peek HTML into links to the file browser.
+//
+// Replaces a `linkifyOutput` that had ZERO callers — it was written for this
+// surface (its `.file-link`/`.md-link` classes are styled under `.overlay-body`,
+// which is exactly `#peek-body`'s class) and was never wired into the pipeline,
+// so every path in every session's output has always rendered as dead text.
+// Capability that reaches nobody does not improve when anything else does.
+//
+// It also could not have matched the reported case. Its regex required a leading
+// `/` or `./`, and real output says `Contacts are in customers/rothco/data/
+// jewishlink-prospects.csv.` — a BARE relative path, which is how a worker
+// naturally writes a path inside its own cwd.
+//
+// Runs on escaped HTML so it composes AFTER the URL/OSC-8 linkification that
+// ansiToHtml already did, using the same `(?![^<]*>)` tail-guard as _linkifyUrls
+// to skip anything sitting inside a tag's attributes.
+function _linkifyPaths(safeHtml) {
+  try {
+    // Leading boundary is CAPTURED and re-emitted rather than matched by a
+    // lookbehind: iOS Safari is the primary client here and this keeps the
+    // pattern portable. The class deliberately excludes `/`, `:`, `.`, `@` and
+    // word characters, which is what stops a URL's own path (`https://h/a/b.js`)
+    // being re-linkified inside the anchor ansiToHtml just built for it.
+    // `(?:\.?\/)?` covers all three shapes seen in real output: `/abs/x.py`,
+    // `./rel/x.py` and the bare `customers/rothco/data/x.csv` that started this.
+    // The segment class excludes quotes on purpose — a path containing `'` would
+    // break out of the inline onclick below, so such a path is simply not linked
+    // rather than linked unsafely.
+    const RE = /(^|[\s(\[>"'`,;=])((?:\.?\/)?(?:[\w.@-]+\/)+[\w.@-]+\.[A-Za-z0-9]{1,8})(:\d+)?(?![^<]*>)/gm;
+    return String(safeHtml).replace(RE, (m, pre, path, line) => {
+      // Trailing sentence punctuation is prose, not filename: "…prospects.csv."
+      let p = path, tail = line || '';
+      const dot = p.match(/\.$/);
+      if (dot) { p = p.slice(0, -1); tail = '.' + tail; }
+      if (!/\.[A-Za-z0-9]{1,8}$/.test(p)) return m;
+      // A RELATIVE path is only meaningful against the session's cwd. With no
+      // cwd we cannot resolve it, and linking it anyway would render text that
+      // looks clickable and does nothing — the precise failure this file already
+      // records for the OSC-8 hyperlinks above. Leave it as plain text instead.
+      if (!p.startsWith('/') && !(typeof peekSessionDir === 'string' && peekSessionDir)) return m;
+      const cls = /\.md$/i.test(p) ? 'md-link' : 'file-link';
+      const shown = p + (line || '');
+      return pre + '<span class="' + cls + '" title="Open in the file browser: '
+        + esc(_resolveOutputPath(p)) + '" onclick="event.preventDefault();event.stopPropagation();'
+        + "_openPathFromOutput('" + escJs(p) + "')" + '">' + esc(shown) + '</span>'
+        + (dot ? '.' : '');
+    });
+  } catch (e) { return safeHtml; }
+}
 
-  // Second pass: find file paths (skip if overlapping with URL)
-  while ((m = fileRe.exec(text)) !== null) {
-    const path = m[1];
-    const pathStart = m.index + m[0].indexOf(path);
-    const pathEnd = pathStart + path.length;
-    const overlaps = matches.some(x => pathStart < x.end && pathEnd > x.start);
-    if (!overlaps) {
-      matches.push({ start: pathStart, end: pathEnd, type: 'file', value: path });
-    }
-  }
-
-  matches.sort((a, b) => a.start - b.start);
-
-  // Build HTML
-  let html = '';
-  for (const match of matches) {
-    if (match.start > last) {
-      html += esc(text.slice(last, match.start));
-    }
-    if (match.type === 'url') {
-      html += `<a href="${esc(match.value)}" target="_blank" rel="noopener noreferrer">${esc(match.value)}</a>`;
-    } else if (match.type === 'file') {
-      const rawPath = match.value.replace(/:[\d]+$/, '');  // strip :linenum
-      const isMd = /\.md$/i.test(rawPath);
-      const cls = isMd ? 'md-link' : 'file-link';
-      html += `<span class="${cls}" onclick="if(window.getSelection().toString())return;event.preventDefault();event.stopPropagation();openFilePreview('${esc(rawPath)}')">${esc(match.value)}</span>`;
-    }
-    last = match.end;
-  }
-  if (last < text.length) {
-    html += esc(text.slice(last));
-  }
-  return rewriteLocalhostUrls(html);
+// ONE peek render pipeline. The four call sites each spelled the chain out, so
+// adding a stage meant finding all of them — which is how the path linkifier
+// would have been half-wired.
+function _peekHtml(raw) {
+  return wrapBoxBlocks(_fitRules(highlightPrompts(_linkifyPaths(ansiToHtml(raw)))));
 }
 
 // The MARKERS amux stamps on everything it injects into a pane. Structural, not
@@ -9374,12 +9408,12 @@ async function refreshPeek(liveOnly, bypassTrim) {
     let histChanged = false;
     if (histRaw !== null && histRaw !== _peekHistoryRaw) {   // full fetch → (re)render history once
       _peekHistoryRaw = histRaw;
-      _peekHistoryHTML = histRaw ? wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(histRaw)))) : '';
+      _peekHistoryHTML = histRaw ? _peekHtml(histRaw) : '';
       histChanged = true;
     }
     const atBottom = _isScrolledToBottom(body);
     if (atBottom) _peekScrollLocked = false;
-    const newHTML = wrapBoxBlocks(_fitRules(highlightPrompts(ansiToHtml(output))));
+    const newHTML = _peekHtml(output);
     if (peekSelecting || (window.getSelection()?.toString().length > 0)) return;
     if (_sendingSnapshot && newHTML !== _sendingSnapshot) clearSendingIndicator();
     // Claude runs on the terminal's ALT SCREEN: tmux holds only the viewport,
