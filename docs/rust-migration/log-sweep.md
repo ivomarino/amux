@@ -191,6 +191,14 @@ fallback when a finding needs row-level inspection.
      not the creator's, so the creator looks idle on both fields. Check the
      request log for `POST /api/board` before calling anyone silent.
 
+   - **`POST /api/git/staged-guard` is not work.** It is the pre-commit guard
+     probing whether a commit is safe, so it is a mutating METHOD against a
+     read-shaped endpoint, and a lane that only ran `git commit` shows up with
+     nothing else. It has manufactured a false silent-worker flag in three
+     consecutive sweeps (2026-08-16 creative-dna + radio-canada, 08-17
+     cold-outbound, 08-18 amux-cloud + random — the last two did *nothing else*
+     all day). Exclude it before flagging, the same way GETs are excluded.
+
    The sample is also capped: `limit=2000` is the max, and on a busy day that is
    ~2.7 hours of a 24h window, taken from one end. Say the real span in the
    summary, or read the store directly for the full window.
