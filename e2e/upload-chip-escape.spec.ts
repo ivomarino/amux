@@ -68,7 +68,25 @@ async function attachStalledFile(page: import('@playwright/test').Page) {
 
 test.beforeEach(async ({ page }) => {
   await page.goto('/');
+  // Skip the first-run walkthrough via its own Skip button, as golden.spec.ts
+  // does. Its backdrop covers the page and swallows the chip click this suite
+  // is here to prove works — which failed as "x does not remove the chip", i.e.
+  // as the product bug, on all three targets.
+  const wt = page.locator('#wt-overlay.open');
+  await wt.waitFor({ state: 'visible', timeout: 8_000 }).catch(() => {});
+  if (await wt.isVisible()) {
+    await page.locator('#wt-tooltip .wt-skip').click();
+    await expect(wt).toBeHidden();
+  }
   await page.waitForFunction(() => typeof (window as any).uploadAndAttach === 'function', { timeout: 20000 });
+  // Open a peek so the composer is REALLY interactive. Without it the attach bar
+  // still renders and Playwright still calls the chip visible, but the closed
+  // overlay takes no pointer events, so the click lands on <body> — which
+  // reports as "x does not remove the chip", i.e. as this very bug. Calling
+  // openPeek directly is the house idiom (tab-customizer.spec.ts): the harness
+  // has no sessions to click on.
+  await page.evaluate(() => (window as Win).openPeek('e2e-probe'));
+  await page.waitForSelector('#peek-overlay', { state: 'visible', timeout: 15000 });
   await stubStalledUpload(page);
 });
 
@@ -88,15 +106,16 @@ test('an in-flight attachment can still be removed', async ({ page }) => {
 test('closing the peek mid-upload does not strand the attachment', async ({ page }) => {
   await attachStalledFile(page);
 
-  // Exactly what closePeek() -> openPeek() do around the composer draft.
-  await page.evaluate(() => (window as Win)._peekFilesStash('worker-a'));
+  // Switch to another worker and back — the real path, which is openPeek's own
+  // _peekFilesStash/_peekFilesRestore pair, not a hand-rolled imitation of it.
+  await page.evaluate(() => (window as Win).openPeek('e2e-other'));
   await expect(page.locator('#peek-attach-bar .peek-attach-chip')).toHaveCount(0);
 
   // The transfer must still be alive: let the stalled chunk through while the
   // peek is CLOSED, which is the precise moment the old code gave up.
   await page.evaluate(() => (window as Win).__release());
 
-  await page.evaluate(() => (window as Win)._peekFilesRestore('worker-a'));
+  await page.evaluate(() => (window as Win).openPeek('e2e-probe'));
   const chip = page.locator('#peek-attach-bar .peek-attach-chip');
   await expect(chip).toHaveCount(1);
 
