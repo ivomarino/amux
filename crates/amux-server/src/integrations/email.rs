@@ -891,6 +891,35 @@ impl GmailClient {
         self.api(account, "GET", &url, None).await.ok()
     }
 
+    /// Fetch ONE message with `format=full` and return its FULL parsed body (not
+    /// the snippet) plus the attachment list. The read-one endpoint reused the
+    /// LIST path (metadata + `snippet`), so bodies were truncated and attachments
+    /// invisible (AMUX-3354, autodesk).
+    pub async fn get_message_full(&self, account: &str, gmail_id: &str) -> Result<Value, String> {
+        let url = format!("{GMAIL_BASE}/messages/{}?format=full", urlencode(gmail_id));
+        let full = self.api(account, "GET", &url, None).await?;
+        let payload = full.get("payload").cloned().unwrap_or(json!({}));
+        let h = header_map_of(&payload);
+        let hget = |k: &str| h.get(k).cloned().unwrap_or_default();
+        let (html_body, text_body) = decode_body(&payload);
+        let body = if !text_body.is_empty() { text_body.clone() } else { html_body.clone() };
+        Ok(json!({
+            "account": account,
+            "gmail_id": gmail_id,
+            "thread_id": full.get("threadId").cloned().unwrap_or(Value::Null),
+            "message_id": hget("message-id"),
+            "from": hget("from"),
+            "to": hget("to"),
+            "cc": hget("cc"),
+            "subject": hget("subject"),
+            "date": hget("date"),
+            "body": body,
+            "body_html": html_body,
+            "snippet": full.get("snippet").cloned().unwrap_or(json!("")),
+            "attachments": collect_attachments(&payload),
+        }))
+    }
+
     /// Python `_gmail_list_messages` (AMUX-2883): header-level summaries for
     /// the Mail view. `q` overrides `label` (python's exact precedence). The
     /// N metadata fetches after the id list are python's own shape — one
@@ -1302,6 +1331,33 @@ fn decode_body(payload: &Value) -> (String, String) {
     (html, text)
 }
 
+/// Walk a full-format message payload and list its attachments (parts that carry
+/// a non-empty `filename`). Each entry names the filename, mime type, size and
+/// the Gmail `attachmentId` (fetchable at
+/// `/messages/{id}/attachments/{attachmentId}`). Used by the read-one endpoint
+/// (AMUX-3354/autodesk): a snippet-only read hid attachments entirely.
+pub fn collect_attachments(payload: &Value) -> Vec<Value> {
+    fn walk(node: &Value, out: &mut Vec<Value>) {
+        let filename = node.get("filename").and_then(Value::as_str).unwrap_or("");
+        if !filename.is_empty() {
+            out.push(json!({
+                "filename": filename,
+                "mime_type": node.get("mimeType").and_then(Value::as_str).unwrap_or(""),
+                "size": node.pointer("/body/size").and_then(Value::as_i64).unwrap_or(0),
+                "attachment_id": node.pointer("/body/attachmentId").and_then(Value::as_str).unwrap_or(""),
+            }));
+        }
+        if let Some(parts) = node.get("parts").and_then(Value::as_array) {
+            for p in parts {
+                walk(p, out);
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(payload, &mut out);
+    out
+}
+
 // ---------------------------------------------------------------------------
 // Send-audit ledger (Python `_email_log` / GET /api/email/log, AMUX-1897)
 // ---------------------------------------------------------------------------
@@ -1494,6 +1550,29 @@ mod tests {
         let msg2 = build_rfc822(&spec2);
         assert!(msg2.contains("filename=\"passwd\""), "filename must be a basename: {msg2}");
         assert!(msg2.contains("Content-Type: application/octet-stream"), "empty ct -> octet-stream");
+    }
+
+    #[test]
+    fn collect_attachments_walks_nested_parts() {
+        // AMUX-3354: a full payload's attachments are enumerated from any depth.
+        let payload = json!({
+            "mimeType": "multipart/mixed",
+            "parts": [
+                { "mimeType": "multipart/alternative", "parts": [
+                    { "mimeType": "text/plain", "body": {"data": "aGk"} },
+                    { "mimeType": "text/html", "body": {"data": "PHA+"} }
+                ]},
+                { "mimeType": "application/pdf", "filename": "report.pdf",
+                  "body": {"size": 1234, "attachmentId": "att-1"} }
+            ]
+        });
+        let atts = collect_attachments(&payload);
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0]["filename"], json!("report.pdf"));
+        assert_eq!(atts[0]["attachment_id"], json!("att-1"));
+        assert_eq!(atts[0]["size"], json!(1234));
+        // A plain body-only message has no attachments.
+        assert!(collect_attachments(&json!({"mimeType":"text/plain","body":{"data":"aGk"}})).is_empty());
     }
 
     #[test]

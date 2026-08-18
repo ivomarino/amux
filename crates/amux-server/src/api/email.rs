@@ -660,7 +660,6 @@ pub async fn message(
     if id.is_empty() {
         return err(StatusCode::BAD_REQUEST, json!({ "error": "message id required" }));
     }
-    let query = format!("rfc822msgid:{id}");
     let account = qs.get("account").map(|s| s.trim().to_string()).unwrap_or_default();
     let connected = ctx.client.connected_accounts();
     let accounts: Vec<String> = if !account.is_empty() {
@@ -677,10 +676,16 @@ pub async fn message(
     if accounts.is_empty() {
         return err(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "no connected Gmail accounts" }));
     }
+    // Resolve the RFC822 id to a gmail message id, then fetch format=full so the
+    // FULL body + attachments come back — not the list-path snippet (AMUX-3354,
+    // autodesk: the snippet path truncated bodies and hid attachments).
     for acct in &accounts {
-        if let Ok(v) = ctx.client.inbox_messages(acct, 1, &query, 0.0).await {
-            if let Some(m) = v.get("messages").and_then(Value::as_array).and_then(|a| a.first()) {
-                return Json(m.clone()).into_response();
+        if let Some(meta) = ctx.client.find_message_by_rfc822(acct, &id).await {
+            if let Some(gmail_id) = meta.get("id").and_then(Value::as_str) {
+                return match ctx.client.get_message_full(acct, gmail_id).await {
+                    Ok(full) => Json(full).into_response(),
+                    Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e })),
+                };
             }
         }
     }
