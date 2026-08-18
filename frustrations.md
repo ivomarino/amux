@@ -3119,3 +3119,27 @@ FIX: (1) /start should refuse a commandless/agentless session with an explicit
   `{"ok":false,"error":"no command configured"}` instead of an optimistic ok:true. (2) a start
   that spawns no tmux session must WARN (session=<n> reason=no-command) so the next occurrence
   self-announces. Routed to amux (owns session lifecycle) as AMUX-3364.
+
+---
+## cloud host has no sqlite3 CLI, so a `sqlite3 …` probe returns empty for every id and flags EVERYTHING
+AREA: cloud
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-18
+SESSION: amux-cloud
+CARD: AC-375
+SYMPTOM: Wrote an orphan-container check (running amux-user containers with no gateway.db
+  row) using `sqlite3 /var/amux/gateway.db "SELECT 1 …"`. It flagged all 9 containers as
+  orphans — including the 4 live POC orgs that plainly have rows. Root: the cloud host has
+  NO sqlite3 binary (`sqlite3: command not found`), so every query returned empty and
+  every id read as "no row". The same broken probe had earlier told me 6 orgs had "NO DB
+  ROW" (they were confirmed deletable only because they were in the deletion manifest, a
+  real grep — not because the DB check worked).
+COST: ~15 min, and nearly acted on a wrong answer: the check would have marked the 4 real
+  customer POCs as orphans for cleanup. The tell was the count being implausible (9/9), not
+  any error — the probe exits 0 with empty output. Ethos rule 7: an instrument that returns
+  a confident wrong answer is worse than one that errors.
+FIX (84fbbc8): both the deploy DB-check (deploy-cloud.yml) and cloud_autofix.check_orphans
+  now use the python3 sqlite3 MODULE, which is present. General rule for cloud-host probes:
+  the host has python3 but not sqlite3/jq/etc — verify a CLI exists before trusting its
+  empty output, or use python. Live-tested: POC/team ids resolve, deleted ids do not.
