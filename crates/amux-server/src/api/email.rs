@@ -23,7 +23,7 @@ use crate::integrations::email::{
     email_log, read_email_log, GmailClient, OUR_DOMAINS,
 };
 use crate::integrations::{self, IntegrationRegistry, IntegrationState};
-use axum::extract::Query;
+use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -51,6 +51,7 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/send", post(send))
         .route("/reply", post(reply))
         .route("/inbox", get(inbox))
+        .route("/message/{id}", get(message))
         .route("/search", get(search))
         .route("/log", get(send_log))
         .layer(Extension(ctx))
@@ -569,6 +570,56 @@ fn recv_ts(m: &Value) -> f64 {
 }
 
 // ---- GET /api/email/search ------------------------------------------------
+
+/// GET /api/email/message/{id} — read ONE message by its RFC822 Message-ID (the
+/// `message_id` returned by /inbox and /search). The global CLAUDE.md documented
+/// this endpoint, but the cutover never ported it, so a worker following the docs
+/// got a bare `{"error":"not found"}` (autodesk, 2026-08-18). Resolves the id via
+/// a Gmail `rfc822msgid:` search across the connected accounts (or `?account=` to
+/// target one) and returns the full message in the same shape /inbox yields.
+pub async fn message(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    Path(id): Path<String>,
+    Query(qs): Query<HashMap<String, String>>,
+) -> Response {
+    let id = id.trim().trim_start_matches('<').trim_end_matches('>').trim().to_string();
+    if id.is_empty() {
+        return err(StatusCode::BAD_REQUEST, json!({ "error": "message id required" }));
+    }
+    let query = format!("rfc822msgid:{id}");
+    let account = qs.get("account").map(|s| s.trim().to_string()).unwrap_or_default();
+    let connected = ctx.client.connected_accounts();
+    let accounts: Vec<String> = if !account.is_empty() {
+        if !connected.contains(&account) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                json!({ "error": format!("account {account} is not connected"), "connected": connected }),
+            );
+        }
+        vec![account]
+    } else {
+        connected.clone()
+    };
+    if accounts.is_empty() {
+        return err(StatusCode::SERVICE_UNAVAILABLE, json!({ "error": "no connected Gmail accounts" }));
+    }
+    for acct in &accounts {
+        if let Ok(v) = ctx.client.inbox_messages(acct, 1, &query, 0.0).await {
+            if let Some(m) = v.get("messages").and_then(Value::as_array).and_then(|a| a.first()) {
+                return Json(m.clone()).into_response();
+            }
+        }
+    }
+    err(
+        StatusCode::NOT_FOUND,
+        json!({
+            "error": "message not found",
+            "id": id,
+            "searched_accounts": accounts,
+            "hint": "the id is the RFC822 Message-ID from /inbox or /search (e.g. <...@host>), not the gmail short id; pass ?account=<email> to target one mailbox",
+        }),
+    )
+}
 
 pub async fn search(
     Extension(ctx): Extension<Arc<EmailCtx>>,
