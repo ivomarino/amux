@@ -2667,6 +2667,23 @@ fn mint_capture_card(
     if session_name.trim().is_empty() {
         return Ok(None);
     }
+    // A pure status / info query ("status on MSG-29602?", "any update on X?") is
+    // answered inline and produces no deliverable, so it is NOT a board work card:
+    // the old capture minted it type=code/doing, which a question can never take
+    // through the `code` gate (ethos rule 3) and which held the WIP slot until a
+    // manual discard (three times in one session — AMUX-3330). It stays in
+    // cmd_history (the Messages ledger keeps every prompt); it just does not become
+    // a work card, exactly like the steering/control prompts title_from_prompt
+    // already declines. Surface it (two-fixes rule): grep
+    // "ledger: status-query not carded" to audit the detector, so a wrong
+    // suppression of a REAL task is findable in the logs rather than silent.
+    if amux_core::board::is_status_query(body) {
+        tracing::info!(
+            session = %session_name,
+            "ledger: status-query not carded (recorded in cmd_history only) — AMUX-3330"
+        );
+        return Ok(None);
+    }
     // AMUX-3147: the old dedup skipped capturing ANY new task whenever the session
     // held ANY open agent card — so only the FIRST task of a work-session reached
     // the board and every later prompt was silent ("none of these have board
@@ -13060,6 +13077,47 @@ mod tests {
                 .is_none(),
             "inter-session messages must not spam the board"
         );
+    }
+
+    // AMUX-3330: a pure status query is answered inline and produces no
+    // deliverable, so it must NOT mint a board work card (the old capture minted
+    // type=code/doing, which a question can never take through the gate and which
+    // held the WIP slot until a manual discard). It STAYS in cmd_history — the
+    // Messages ledger keeps every prompt. This tests the shipped path, not just
+    // the detector (ethos rule 7).
+    #[tokio::test]
+    async fn a_status_query_records_in_history_but_mints_no_card() {
+        let (st, _dir) = state();
+        cmd_hist_record_full(
+            &st, "lane-sq", "status on MSG-29602?",
+            "user", "", false, DeliveryMeta::direct(),
+        )
+        .await;
+        let card_id: Option<String> = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT card_id FROM cmd_history WHERE session=?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params!["lane-sq"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(card_id.is_none(), "a status query must not mint a work card (AMUX-3330)");
+        let cards: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM issues WHERE session='lane-sq'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cards, 0, "no board card for a status query");
+        let msgs: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM cmd_history WHERE session='lane-sq'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(msgs, 1, "the prompt is still recorded in cmd_history (Messages ledger)");
     }
 
     // The stale-pickup guard (AMUX-3052) keys on the EXACT template board_drive.rs
