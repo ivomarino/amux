@@ -3143,3 +3143,29 @@ FIX (84fbbc8): both the deploy DB-check (deploy-cloud.yml) and cloud_autofix.che
   now use the python3 sqlite3 MODULE, which is present. General rule for cloud-host probes:
   the host has python3 but not sqlite3/jq/etc — verify a CLI exists before trusting its
   empty output, or use python. Live-tested: POC/team ids resolve, deleted ids do not.
+
+---
+## GET /api/board truncates terminal cards to a global top-100, so a session undercounts its OWN done queue
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-18
+SESSION: amux-cloud
+CARD: AC-301
+SYMPTOM: Triaging my done column, `GET /api/board` (the recipe in CLAUDE.md) filtered to
+  session=amux-cloud,status=done returned 2 cards — I reported "2 done, all resolved". The
+  real count was 68. The list caps TERMINAL cards (done/verified/discarded) at a GLOBAL 100
+  (x-amux-done-limit:100, x-amux-truncated:1, x-amux-terminal-total:5905), so a session
+  whose done cards are older than the fleet-wide 100 most-recent sees almost none of its own.
+  The truncation IS announced in response headers, but neither the CLAUDE.md `curl
+  $AMUX_URL/api/board` recipe nor `amux board ls` reads them, so the drop is silent to the
+  caller. `GET /api/board/<id>` returns each missing card fine — two views disagreeing.
+COST: ~20 min, and I nearly shipped a wrong close-out ("5 done cards, all handled") that
+  hid a 66-card backlog. The undercount is the dangerous kind: it returns a confident small
+  number with no error.
+FIX: use the SCOPED query the contract documents —
+  `GET /api/board?session=<worker>&status=done&archived=0` — which is NOT subject to the
+  global terminal cap and returned all 68. Groomed the backlog with it (archived 61
+  historical agent-owned cards, kept 6). The durable fix (AC-301, amux's) is to make the
+  CLAUDE.md board-ledger recipe scope by session, or have `amux board ls` surface the
+  truncation header so the caller knows the count is partial.
