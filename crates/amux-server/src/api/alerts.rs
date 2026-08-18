@@ -97,7 +97,7 @@ impl AlertChannels for RealChannels {
         }
         let mut last_err = String::new();
         for from in &accounts {
-            match gc.compose_send(from, to, subject, body, "", "", "", "", true).await {
+            match gc.compose_send(from, to, subject, body, "", "", "", "", true, &[]).await {
                 Ok(_) => return (true, format!("email via {from}")),
                 Err(e) => last_err = format!("email error via {from}: {}", truncate(&e, 80)),
             }

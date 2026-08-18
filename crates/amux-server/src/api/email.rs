@@ -20,8 +20,9 @@
 
 use super::AppState;
 use crate::integrations::email::{
-    email_log, read_email_log, GmailClient, OUR_DOMAINS,
+    email_log, read_email_log, Attachment, GmailClient, OUR_DOMAINS,
 };
+use base64::Engine as _;
 use crate::integrations::{self, IntegrationRegistry, IntegrationState};
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
@@ -135,6 +136,71 @@ fn gmail_scope_check(home: &std::path::Path, lane: &str, from: &str) -> Result<O
 
 fn body_str(body: &Value, k: &str) -> String {
     body.get(k).and_then(Value::as_str).unwrap_or("").trim().to_string()
+}
+
+/// A MIME content type from a filename extension; octet-stream when unknown.
+fn guess_content_type(name: &str) -> &'static str {
+    match name.rsplit('.').next().unwrap_or("").to_lowercase().as_str() {
+        "pdf" => "application/pdf",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "csv" => "text/csv",
+        "txt" | "log" | "md" => "text/plain",
+        "json" => "application/json",
+        "html" | "htm" => "text/html",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "xls" => "application/vnd.ms-excel",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// Parse the request body's optional `attachments` array (AMUX-3357). Each entry
+/// is either `{"path": "..."}` (read from disk; filename is the basename,
+/// content_type inferred from the extension unless given) or
+/// `{"filename": "...", "content_base64": "...", "content_type": "..."}`. Caps
+/// the total at Gmail's 25MB. Returns a 400-worthy message on any bad entry.
+fn parse_attachments(body: &Value) -> Result<Vec<Attachment>, String> {
+    let Some(v) = body.get("attachments") else { return Ok(vec![]) };
+    if v.is_null() {
+        return Ok(vec![]);
+    }
+    let arr = v.as_array().ok_or("attachments must be an array")?;
+    const MAX_TOTAL: usize = 25 * 1024 * 1024;
+    let mut out = Vec::new();
+    let mut total = 0usize;
+    for (i, a) in arr.iter().enumerate() {
+        let (filename, ct_opt, data) = if let Some(path) = a.get("path").and_then(Value::as_str) {
+            let p = std::path::Path::new(path);
+            let data = std::fs::read(p).map_err(|e| format!("attachment {i}: read {path}: {e}"))?;
+            let fname = p
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_else(|| "attachment".into());
+            (fname, a.get("content_type").and_then(Value::as_str).map(String::from), data)
+        } else if let Some(b64) = a.get("content_base64").and_then(Value::as_str) {
+            let data = base64::engine::general_purpose::STANDARD
+                .decode(b64.trim())
+                .map_err(|e| format!("attachment {i}: invalid base64: {e}"))?;
+            let fname =
+                a.get("filename").and_then(Value::as_str).unwrap_or("attachment").to_string();
+            (fname, a.get("content_type").and_then(Value::as_str).map(String::from), data)
+        } else {
+            return Err(format!("attachment {i}: needs a 'path' or 'content_base64'"));
+        };
+        total += data.len();
+        if total > MAX_TOTAL {
+            return Err(format!("attachments exceed {}MB (Gmail cap)", MAX_TOTAL / 1024 / 1024));
+        }
+        let content_type =
+            ct_opt.unwrap_or_else(|| guess_content_type(&filename).to_string());
+        out.push(Attachment { filename, content_type, data });
+    }
+    Ok(out)
 }
 
 /// Feed a real Gmail outcome into the registry (RR-0073). Auth-shaped
@@ -338,10 +404,14 @@ pub async fn send(
     // Python: `body.get("signature", True) is not False` — only a literal
     // false disables the signature.
     let include_sig = body.get("signature") != Some(&Value::Bool(false));
+    let attachments = match parse_attachments(&body) {
+        Ok(a) => a,
+        Err(e) => return err(StatusCode::BAD_REQUEST, json!({ "error": e })),
+    };
     if !from_acct.is_empty() && connected.contains(&from_acct) {
         let res = ctx
             .client
-            .compose_send(&from_acct, &to, &subject, &message, &cc, "", "", "", include_sig)
+            .compose_send(&from_acct, &to, &subject, &message, &cc, "", "", "", include_sig, &attachments)
             .await;
         report_outcome(&ctx.registry, &res.as_ref().map(|_| ()).map_err(Clone::clone));
         return match res {
@@ -443,11 +513,15 @@ pub async fn reply(
     let gmail_from =
         if from_acct.is_empty() { body_str(&body, "account") } else { from_acct.clone() };
     let include_sig = body.get("signature") != Some(&Value::Bool(false));
+    let attachments = match parse_attachments(&body) {
+        Ok(a) => a,
+        Err(e) => return err(StatusCode::BAD_REQUEST, json!({ "error": e })),
+    };
     if !gmail_from.is_empty() && connected.contains(&gmail_from) {
         let allow_self = body.get("allow_self").map(truthy).unwrap_or(false);
         let res = ctx
             .client
-            .reply_send(&gmail_from, &message_id, &reply_body, include_sig, reply_all, allow_self)
+            .reply_send(&gmail_from, &message_id, &reply_body, include_sig, reply_all, allow_self, &attachments)
             .await;
         report_outcome(&ctx.registry, &res.as_ref().map(|_| ()).map_err(Clone::clone));
         return match res {

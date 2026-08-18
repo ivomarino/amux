@@ -246,6 +246,15 @@ pub fn encode_header_value(s: &str) -> String {
 
 /// Everything needed to assemble one outgoing message. `boundary` is
 /// injected so tests pin the full RFC822 output.
+/// One file attachment (AMUX-3357). `data` is the raw bytes; `build_rfc822`
+/// base64-encodes it into a multipart/mixed part.
+#[derive(Clone, Debug)]
+pub struct Attachment {
+    pub filename: String,
+    pub content_type: String,
+    pub data: Vec<u8>,
+}
+
 pub struct MimeSpec<'a> {
     pub from: &'a str,
     pub to: &'a str,
@@ -256,19 +265,38 @@ pub struct MimeSpec<'a> {
     pub plain: &'a str,
     pub html: &'a str,
     pub boundary: &'a str,
+    /// File attachments (AMUX-3357). Empty = the classic multipart/alternative
+    /// message, byte-for-byte as before; non-empty wraps that body in a
+    /// multipart/mixed with one base64 part per file.
+    pub attachments: &'a [Attachment],
 }
 
-/// Build the multipart/alternative RFC822 message (CRLF line ends, base64
-/// body parts). Threading headers appear iff `in_reply_to` is non-empty,
-/// mirroring Python: References defaults to In-Reply-To when unset.
+/// A header-safe filename: no quotes or CR/LF that could break the
+/// Content-Disposition line.
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name.chars().filter(|c| *c != '"' && *c != '\r' && *c != '\n').collect();
+    let base = cleaned.rsplit(['/', '\\']).next().unwrap_or(&cleaned).trim();
+    if base.is_empty() { "attachment".to_string() } else { base.to_string() }
+}
+
+/// Build the RFC822 message (CRLF line ends, base64 parts). With no attachments
+/// this is a multipart/alternative (text+html), unchanged. With attachments the
+/// alternative body becomes the first sub-part of a multipart/mixed container,
+/// followed by one base64 attachment part each (AMUX-3357). Threading headers
+/// appear iff `in_reply_to` is non-empty; References defaults to In-Reply-To.
 pub fn build_rfc822(spec: &MimeSpec) -> String {
-    let mut lines: Vec<String> = vec![
-        "MIME-Version: 1.0".into(),
-        format!("Content-Type: multipart/alternative; boundary=\"{}\"", spec.boundary),
-        format!("To: {}", spec.to),
-        format!("From: {}", spec.from),
-        format!("Subject: {}", encode_header_value(spec.subject)),
-    ];
+    let has_att = !spec.attachments.is_empty();
+    let inner = spec.boundary;
+    let outer = format!("{}_mix", spec.boundary);
+    let mut lines: Vec<String> = vec!["MIME-Version: 1.0".into()];
+    if has_att {
+        lines.push(format!("Content-Type: multipart/mixed; boundary=\"{outer}\""));
+    } else {
+        lines.push(format!("Content-Type: multipart/alternative; boundary=\"{inner}\""));
+    }
+    lines.push(format!("To: {}", spec.to));
+    lines.push(format!("From: {}", spec.from));
+    lines.push(format!("Subject: {}", encode_header_value(spec.subject)));
     if !spec.cc.is_empty() {
         lines.push(format!("Cc: {}", spec.cc));
     }
@@ -278,17 +306,40 @@ pub fn build_rfc822(spec: &MimeSpec) -> String {
         lines.push(format!("References: {refs}"));
     }
     lines.push(String::new());
-    for (ctype, body) in
-        [("text/plain", spec.plain), ("text/html", spec.html)]
-    {
-        lines.push(format!("--{}", spec.boundary));
+    // The multipart/alternative body — a sub-part of the mixed container when
+    // there are attachments, otherwise the top-level body.
+    if has_att {
+        lines.push(format!("--{outer}"));
+        lines.push(format!("Content-Type: multipart/alternative; boundary=\"{inner}\""));
+        lines.push(String::new());
+    }
+    for (ctype, body) in [("text/plain", spec.plain), ("text/html", spec.html)] {
+        lines.push(format!("--{inner}"));
         lines.push(format!("Content-Type: {ctype}; charset=\"utf-8\""));
         lines.push("MIME-Version: 1.0".into());
         lines.push("Content-Transfer-Encoding: base64".into());
         lines.push(String::new());
         lines.push(wrap76(&base64_std(body.as_bytes())));
     }
-    lines.push(format!("--{}--", spec.boundary));
+    lines.push(format!("--{inner}--"));
+    if has_att {
+        lines.push(String::new());
+        for att in spec.attachments {
+            let fname = sanitize_filename(&att.filename);
+            let ct = if att.content_type.trim().is_empty() {
+                "application/octet-stream"
+            } else {
+                att.content_type.trim()
+            };
+            lines.push(format!("--{outer}"));
+            lines.push(format!("Content-Type: {ct}; name=\"{fname}\""));
+            lines.push("Content-Transfer-Encoding: base64".into());
+            lines.push(format!("Content-Disposition: attachment; filename=\"{fname}\""));
+            lines.push(String::new());
+            lines.push(wrap76(&base64_std(&att.data)));
+        }
+        lines.push(format!("--{outer}--"));
+    }
     lines.push(String::new());
     lines.join("\r\n")
 }
@@ -786,6 +837,7 @@ impl GmailClient {
         references: &str,
         thread_id: &str,
         include_signature: bool,
+        attachments: &[Attachment],
     ) -> Result<Value, String> {
         let sig_html =
             if include_signature { self.get_signature(account).await } else { String::new() };
@@ -809,6 +861,7 @@ impl GmailClient {
             plain: &plain,
             html: &html,
             boundary: &boundary,
+            attachments,
         });
         let mut send_body = Map::new();
         send_body.insert("raw".into(), json!(base64url(rfc822.as_bytes())));
@@ -988,6 +1041,7 @@ impl GmailClient {
     /// its RFC822 Message-ID. Cross-account: a thread living on another
     /// connected account threads via headers, not the account-local
     /// threadId.
+    #[allow(clippy::too_many_arguments)]
     pub async fn reply_send(
         &self,
         account: &str,
@@ -996,6 +1050,7 @@ impl GmailClient {
         include_signature: bool,
         reply_all: bool,
         allow_self: bool,
+        attachments: &[Attachment],
     ) -> Result<Value, String> {
         let mut orig = self.find_message_by_rfc822(account, rfc822_message_id).await;
         let mut thread_account = account.to_string();
@@ -1041,6 +1096,7 @@ impl GmailClient {
                 &plan.references,
                 &thread_id,
                 include_signature,
+                attachments,
             )
             .await?;
         // Threading proof for the caller (assertable evidence, ethos rule 4).
@@ -1406,6 +1462,41 @@ mod tests {
     }
 
     #[test]
+    fn rfc822_with_attachment_is_multipart_mixed() {
+        // AMUX-3357: attachments wrap the alternative body in a multipart/mixed.
+        let att = Attachment {
+            filename: "report.pdf".into(),
+            content_type: "application/pdf".into(),
+            data: b"PDF-BYTES".to_vec(),
+        };
+        let spec = MimeSpec {
+            from: "a@x.com",
+            to: "b@y.com",
+            cc: "",
+            subject: "hi",
+            in_reply_to: "",
+            references: "",
+            plain: "hello",
+            html: "<p>hello</p>",
+            boundary: "=_bnd",
+            attachments: std::slice::from_ref(&att),
+        };
+        let msg = build_rfc822(&spec);
+        assert!(msg.contains("Content-Type: multipart/mixed; boundary=\"=_bnd_mix\""), "{msg}");
+        assert!(msg.contains("Content-Type: multipart/alternative; boundary=\"=_bnd\""));
+        assert!(msg.contains("Content-Disposition: attachment; filename=\"report.pdf\""));
+        assert!(msg.contains("Content-Type: application/pdf; name=\"report.pdf\""));
+        assert!(msg.contains(&base64_std(b"PDF-BYTES")), "attachment bytes not base64-embedded");
+        assert!(msg.trim_end().ends_with("--=_bnd_mix--"), "mixed container must close last: {msg}");
+        // A path-traversing filename is reduced to its basename in the headers.
+        let att2 = Attachment { filename: "../../etc/passwd".into(), content_type: String::new(), data: vec![1] };
+        let spec2 = MimeSpec { attachments: std::slice::from_ref(&att2), ..spec };
+        let msg2 = build_rfc822(&spec2);
+        assert!(msg2.contains("filename=\"passwd\""), "filename must be a basename: {msg2}");
+        assert!(msg2.contains("Content-Type: application/octet-stream"), "empty ct -> octet-stream");
+    }
+
+    #[test]
     fn rfc822_fixture_with_threading_headers() {
         let spec = MimeSpec {
             from: "sender@example.com",
@@ -1417,6 +1508,7 @@ mod tests {
             plain: "plain body",
             html: "<div>plain body</div>",
             boundary: "=_amux_test",
+            attachments: &[],
         };
         let msg = build_rfc822(&spec);
         let want = concat!(
@@ -1458,6 +1550,7 @@ mod tests {
             plain: "p",
             html: "h",
             boundary: "=_b",
+            attachments: &[],
         };
         let msg = build_rfc822(&spec);
         assert!(!msg.contains("In-Reply-To"));
@@ -1477,6 +1570,7 @@ mod tests {
             plain: "p",
             html: "h",
             boundary: "=_b",
+            attachments: &[],
         };
         let msg = build_rfc822(&spec);
         assert!(msg.contains("References: <only@id>\r\n"), "{msg}");
@@ -1704,7 +1798,7 @@ mod tests {
         ]);
         let client = GmailClient::new(http.clone(), home.path().to_path_buf());
         let res = client
-            .compose_send("acct@example.com", "x@ext.com", "S", "B", "", "", "", "", false)
+            .compose_send("acct@example.com", "x@ext.com", "S", "B", "", "", "", "", false, &[])
             .await
             .unwrap();
         assert_eq!(res["ok"], json!(true));
@@ -1728,7 +1822,7 @@ mod tests {
         )]);
         let client = GmailClient::new(http, home.path().to_path_buf());
         let err = client
-            .compose_send("acct@example.com", "x@ext.com", "S", "B", "", "", "", "", false)
+            .compose_send("acct@example.com", "x@ext.com", "S", "B", "", "", "", "", false, &[])
             .await
             .unwrap_err();
         assert!(err.contains("invalid_grant"), "{err}");
@@ -1755,6 +1849,7 @@ mod tests {
                 "<root@id> <orig@id>",
                 "T9",
                 true,
+                &[],
             )
             .await
             .unwrap();
@@ -1796,7 +1891,7 @@ mod tests {
         ]);
         let client = GmailClient::new(http.clone(), home.path().to_path_buf());
         let res = client
-            .reply_send("acct@example.com", "<orig@ext>", "thanks!", false, false, false)
+            .reply_send("acct@example.com", "<orig@ext>", "thanks!", false, false, false, &[])
             .await
             .unwrap();
         assert_eq!(res["threaded"], json!(true));
@@ -1824,7 +1919,7 @@ mod tests {
         )]);
         let client = GmailClient::new(http, home.path().to_path_buf());
         let err = client
-            .reply_send("acct@example.com", "<gone@id>", "b", false, false, false)
+            .reply_send("acct@example.com", "<gone@id>", "b", false, false, false, &[])
             .await
             .unwrap_err();
         assert_eq!(err, "message not found in any connected account — check message_id");
