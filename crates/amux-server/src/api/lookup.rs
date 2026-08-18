@@ -217,7 +217,31 @@ async fn anthropic_api_answer(prompt: &str, model: &str, key: &str) -> Result<St
 /// `(via, text)` — `via` is `ollama:<model>` or the CLI name — or an HTTP
 /// status + message. The caller supplies the WHOLE prompt (this does not wrap
 /// it), so each caller keeps its own instruction.
+/// The 504/500 message when the helper chain is exhausted. It states the TOTAL
+/// time the caller waited and every attempt made, NOT a single call's per-call
+/// bound — the AF-86 fix. Factored out so the exact wording is unit-testable
+/// (the bug WAS the wording: a 90s hang that claimed "within 45s").
+fn helper_exhausted_message(total_s: u64, attempts: &[String]) -> String {
+    if attempts.is_empty() {
+        return format!("no helper answered within {total_s}s");
+    }
+    format!(
+        "no helper answered within {total_s}s across {} attempt(s): {}",
+        attempts.len(),
+        attempts.join("; ")
+    )
+}
+
 pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (StatusCode, String)> {
+    // AF-86: helper_answer makes UP TO TWO bounded attempts (a fast primary —
+    // ollama or the Anthropic API — then the CLI), each capped at
+    // LOOKUP_TIMEOUT_S. When both time out the CALLER waits ~2x that, but the old
+    // 504 reported only the CLI's per-call bound ("did not answer within 45s"),
+    // so a debugger seeing a 90s hang grepped for 90s, found 45, and went hunting
+    // a tokio bug instead of the second attempt. Track the total elapsed and every
+    // attempt so the number in the message is the number the client FELT.
+    let started = std::time::Instant::now();
+    let mut attempts: Vec<String> = Vec::new();
     let model = resolve_helper_model();
     if is_ollama_model(&model) {
         if let Some(answer) = try_local_model_named(prompt, &model).await {
@@ -225,6 +249,7 @@ pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (Sta
         }
         // The chosen local model is unavailable — fall through to the cheap
         // Claude default rather than the CLI's own (heavier) default.
+        attempts.push(format!("ollama:{model} unavailable at {}s", started.elapsed().as_secs()));
     }
     // Prefer the Anthropic Messages API when a key is present (AMUX-3301). The
     // `claude` CLI boots a full process and auths per call, so its latency is
@@ -239,9 +264,12 @@ pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (Sta
             if !key.is_empty() {
                 match anthropic_api_answer(prompt, &api_model_id(&model), &key).await {
                     Ok(text) => return Ok((format!("api:{model}"), text)),
-                    Err(e) => tracing::warn!(
-                        "helper_answer: anthropic api failed ({e}); falling back to the helper CLI"
-                    ),
+                    Err(e) => {
+                        attempts.push(format!("api:{model} failed at {}s ({e})", started.elapsed().as_secs()));
+                        tracing::warn!(
+                            "helper_answer: anthropic api failed ({e}); falling back to the helper CLI"
+                        );
+                    }
                 }
             }
         }
@@ -276,21 +304,25 @@ pub(crate) async fn helper_answer(prompt: &str) -> Result<(String, String), (Sta
     cmd.stdin(std::process::Stdio::null());
     match tokio::time::timeout(std::time::Duration::from_secs(LOOKUP_TIMEOUT_S), cmd.output()).await {
         Err(_) => {
-            // Surfaces so a sweep catches a slow helper without a human waiting
-            // on a 504 first (two-fixes rule): grep `helper_timeout` in
-            // server-rs.log; /api/logs/analyze already groups the 504.
-            tracing::warn!(
-                "helper_timeout: {cli}:{cli_model} did not answer within {LOOKUP_TIMEOUT_S}s (meta-task 504)"
-            );
+            attempts.push(format!("cli:{cli} timed out at {LOOKUP_TIMEOUT_S}s"));
+            let total = started.elapsed().as_secs();
+            let msg = helper_exhausted_message(total, &attempts);
+            // Surfaces so a sweep catches a slow helper without a human waiting on
+            // a 504 first (two-fixes rule): grep `helper_timeout` in
+            // server-rs.log; /api/logs/analyze groups the 504. The message now
+            // states the TOTAL the caller felt and every attempt (AF-86), so a 90s
+            // hang no longer reads as a dishonoured 45s timeout.
+            tracing::warn!("helper_timeout: {msg} (meta-task 504)");
+            Err((StatusCode::GATEWAY_TIMEOUT, msg))
+        }
+        Ok(Err(e)) => {
+            attempts.push(format!("cli:{cli} could not run ({e})"));
+            let total = started.elapsed().as_secs();
             Err((
-                StatusCode::GATEWAY_TIMEOUT,
-                format!("{cli} did not answer within {LOOKUP_TIMEOUT_S}s"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                helper_exhausted_message(total, &attempts),
             ))
         }
-        Ok(Err(e)) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("could not run {cli}: {e}"),
-        )),
         Ok(Ok(out)) => {
             // Non-empty stdout wins even on a non-zero exit (the CLI prints its
             // answer then sometimes exits non-zero); only an EMPTY answer is a
@@ -348,6 +380,27 @@ pub async fn lookup(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_message_reports_total_and_attempts_not_a_per_call_bound() {
+        // The AF-86 regression: two 45s attempts summed to a 90s wait, but the
+        // message reported a single 45s bound and sent debuggers at tokio.
+        let m = helper_exhausted_message(
+            90,
+            &[
+                "api:haiku failed at 45s (timeout)".to_string(),
+                "cli:claude timed out at 45s".to_string(),
+            ],
+        );
+        assert!(m.contains("within 90s"), "must state the total the caller felt: {m}");
+        assert!(m.contains("2 attempt"), "must state attempt count: {m}");
+        assert!(m.contains("api:haiku") && m.contains("cli:claude"), "must name the chain: {m}");
+        // The exact wording that misled must be gone.
+        assert!(!m.contains("did not answer within 45s"), "old misleading wording resurfaced: {m}");
+        // Single-attempt case still reads cleanly (the 45s rows in the sweep).
+        let one = helper_exhausted_message(45, &["cli:claude timed out at 45s".to_string()]);
+        assert!(one.contains("within 45s") && one.contains("1 attempt"), "{one}");
+    }
 
     #[test]
     fn api_model_id_resolves_aliases_and_passes_ids_through() {
