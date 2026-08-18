@@ -2061,15 +2061,21 @@ pub fn select_advance(
             };
         }
         let text = format!(
-            "[amux] {card_id} is a captured prompt, not a unit of work — {why}. It cannot move \
+            "[amux] {card_id} is a captured prompt, not a unit of work ({why}). It cannot move \
              through the gates as it stands, so it is holding your WIP slot and nothing is \
              driving it.\n\n\
-             Split it: create one card per unit of work that can honestly be finished \
-             (`amux board add \"...\"` for each), then discard {card_id} with a pointer to them, \
-             or retype it if it is really one unit. Then drive each new card through its gates \
-             to done.\n\n\
-             If the work is ALREADY finished, that is exactly the case to split and close \
-             honestly rather than leave open — the board is the record that it happened."
+             If it is genuinely NOT work (a status question, a slash command, an empty \
+             journal), discard it and nothing is lost.\n\n\
+             But if it decomposes into REAL work that is not yet finished, do NOT discard it. \
+             PROMOTE it to an epic that owns the pieces: retype it `epic`, rewrite the desc with \
+             the scope, the child cards, and acceptance criteria (that structure clears this \
+             capture brand), add one card per unit of work (`amux board add \"...\"`), and set \
+             each child's `epic` to {card_id}. Discarding an umbrella whose children are still \
+             open abandons the top-level request and orphans them, and the board then reads that \
+             request as thrown away (AMUX-3323).\n\n\
+             Only discard with a pointer when the pointed-to work is ALREADY done, or already \
+             tracked on another card, and this card adds nothing. Then drive each child through \
+             its gates to done."
         );
         return Advance::Nudge {
             target: session.to_string(),

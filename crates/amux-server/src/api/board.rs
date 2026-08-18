@@ -2600,6 +2600,58 @@ pub async fn patch_item(
                         }
                     }
 
+                    // DISCARD-ORPHAN DETECTOR (AMUX-3323). A real-work capture
+                    // (the connectors + MDAI epics) was discarded on the decompose
+                    // nudge's advice, which abandoned the top-level request and
+                    // orphaned its open children. WARN-only, never a block: most
+                    // discards are honest (status questions, journals, single-card
+                    // dedups). It fires only on the umbrella smell — discarding a
+                    // card that still OWNS open epic children, or whose desc points
+                    // at 2+ still-open cards — so the next wrongful discard
+                    // self-announces in /api/logs/analyze without a human noticing
+                    // (two-fixes rule). grep `discard_orphans` in server-rs.log.
+                    if target == TaskStatus::Discarded && !force {
+                        let is_open = |rid: &str| -> bool {
+                            conn.query_row(
+                                "SELECT 1 FROM issues WHERE id=?1 AND deleted IS NULL \
+                                 AND status NOT IN ('done','verified','discarded','quarantined')",
+                                [rid],
+                                |_| Ok(()),
+                            )
+                            .is_ok()
+                        };
+                        let mut orphans: Vec<String> = Vec::new();
+                        // (a) cards whose `epic` points at THIS card and are still open.
+                        if let Ok(mut st) = conn.prepare(
+                            "SELECT id FROM issues WHERE epic=?1 AND deleted IS NULL \
+                             AND status NOT IN ('done','verified','discarded','quarantined') LIMIT 8",
+                        ) {
+                            if let Ok(rows) = st.query_map([&next.id], |r| r.get::<_, String>(0)) {
+                                orphans.extend(rows.flatten());
+                            }
+                        }
+                        // (b) desc points at 2+ distinct still-open cards (the umbrella
+                        // pointer). A single open reference is a dedup and stays quiet.
+                        let refs: Vec<String> = card_refs(&next.desc)
+                            .into_iter()
+                            .filter(|r| *r != next.id && is_open(r))
+                            .collect();
+                        if refs.len() >= 2 {
+                            for r in refs {
+                                if !orphans.contains(&r) {
+                                    orphans.push(r);
+                                }
+                            }
+                        }
+                        if !orphans.is_empty() {
+                            tracing::warn!(
+                                "discard_orphans: {} discarded while it still owns or points at open work {:?} — if this is a real request decomposed into unfinished children, promote it to an epic instead of discarding (AMUX-3323)",
+                                next.id,
+                                orphans
+                            );
+                        }
+                    }
+
                     // Gate acknowledgement (AMUX-1719: gate_checked must
                     // MATCH the effective gate — every criterion present).
                     let mut evidence: Vec<Evidence> = Vec::new();
@@ -3421,6 +3473,50 @@ async fn status_update(
             .insert("x-amux-truncated", axum::http::HeaderValue::from_static("1"));
     }
     resp
+}
+
+/// Distinct card ids (`PREFIX-123`) referenced in free text, first-seen order.
+/// The discard-orphan detector (AMUX-3323) uses this to spot an umbrella capture
+/// whose desc points at several children right before it is discarded — the
+/// shape that abandoned the connectors + MDAI epics.
+fn card_refs(text: &str) -> Vec<String> {
+    use std::sync::OnceLock;
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"\b[A-Z][A-Z0-9]+-\d+\b").expect("card ref regex")
+    });
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for m in re.find_iter(text) {
+        let id = m.as_str().to_string();
+        if seen.insert(id.clone()) {
+            out.push(id);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod discard_orphan_tests {
+    use super::card_refs;
+
+    #[test]
+    fn card_refs_extracts_distinct_ids_in_order() {
+        let got = card_refs("decomposed into AMUX-3324, AMUX-3192 and AMUX-3324 again; GE-1 too");
+        assert_eq!(
+            got,
+            vec![
+                "AMUX-3324".to_string(),
+                "AMUX-3192".to_string(),
+                "GE-1".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn card_refs_empty_when_no_ids() {
+        assert!(card_refs("just prose, no ids, port 8822").is_empty());
+    }
 }
 
 /// Append one stamped line to a card's log. Both handlers above write only
