@@ -514,6 +514,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
   <button id="tab-files" onclick="switchView('files')"><span class="tab-ico">🗂</span><span class="tab-lbl">Files</span></button>
   <button id="tab-mdai" onclick="switchView('mdai')"><span class="tab-ico">&#x2726;</span><span class="tab-lbl">MDAI</span></button>
   <button id="tab-proxies" onclick="switchView('proxies')"><span class="tab-ico">⇄</span><span class="tab-lbl">Proxies</span></button>
+  <button id="tab-connectors" onclick="switchView('connectors')"><span class="tab-ico">🔌</span><span class="tab-lbl">Connectors</span></button>
   <button id="tab-logs" onclick="switchView('logs')"><span class="tab-ico">≡</span><span class="tab-lbl">Logs</span></button>
   <button id="tab-grid" onclick="enterGridMode()"><span class="tab-ico">▣</span><span class="tab-lbl">Workspace</span></button>
   <button id="tab-messages" onclick="switchView('messages')"><span class="tab-ico">✉</span><span class="tab-lbl">Messages</span></button>
@@ -863,6 +864,20 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         </div>
       </div>
     </div>
+  </div>
+</div>
+
+<div id="connectors-view" style="display:none;flex-direction:column;flex:1;min-height:0;overflow-y:auto;">
+  <div style="max-width:760px;width:100%;margin:0 auto;padding:16px 16px 40px;">
+    <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:6px;">
+      <div style="font-size:1.05rem;font-weight:700;">Connectors</div>
+      <button class="btn" onclick="_connectorsTabLoad()">Refresh</button>
+    </div>
+    <div style="font-size:0.78rem;color:var(--dim);line-height:1.5;margin-bottom:14px;">
+      Third-party integrations scoped across global, group, and worker. Paste each connector's key or OAuth client credentials below;
+      values are written to <code>~/.amux/server.env</code> and never shown again. Adding a new connector is one registry row.
+    </div>
+    <div id="connectors-list"></div>
   </div>
 </div>
 

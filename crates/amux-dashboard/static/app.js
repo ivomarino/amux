@@ -7774,7 +7774,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.671';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.672';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15515,6 +15515,121 @@ function _mdaiSerialize(cur) {
 
 // ── The MDAI tab (global list of every .mdai node) ──
 let _mdaiRootPath;   // cached mdai_root pref (the local.amux folder), '' if unset
+// ===== Connectors (integrations) tab =====
+// Renders GET /api/connectors: one card per provider with a status badge, the
+// env-key fields to paste (values POST to /credentials -> ~/.amux/server.env,
+// never echoed back), the OAuth redirect URI to register + a Connect button,
+// and a scope control (global / group / worker) that drives the EXISTING
+// /api/scope connectors capability. A connector is a scopable capability, not a
+// new subsystem — the tab composes primitives (scope + env), it does not add one.
+let _connectorsData = null;
+async function _connectorsTabLoad() {
+  const host = document.getElementById('connectors-list');
+  if (!host) return;
+  host.innerHTML = '<div class="conn-empty">Loading connectors…</div>';
+  try {
+    const r = await fetch('/api/connectors');
+    const d = await r.json();
+    _connectorsData = d;
+    _connectorsRender(d);
+  } catch (e) {
+    host.innerHTML = '<div class="conn-empty">Failed to load connectors: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function _connBadge(status) {
+  const map = {
+    connected: ['Connected', '#1f8f4e'],
+    needs_auth: ['Needs sign-in', '#b8860b'],
+    needs_credentials: ['Needs credentials', '#8a4b4b'],
+  };
+  const pair = map[status] || [status, '#666'];
+  return '<span class="conn-badge" style="background:' + pair[1] + '">' + esc(pair[0]) + '</span>';
+}
+
+function _connectorsRender(d) {
+  const host = document.getElementById('connectors-list');
+  if (!host) return;
+  const list = (d && d.connectors) || [];
+  if (!list.length) { host.innerHTML = '<div class="conn-empty">No connectors registered.</div>'; return; }
+  let html = '';
+  html += '<div class="conn-origin">This server: <code>' + esc(d.origin || '') + '</code>. Pasted keys are written to <code>~/.amux/server.env</code> and never shown again.</div>';
+  for (const c of list) {
+    html += '<div class="conn-card" data-id="' + esc(c.id) + '">';
+    html += '<div class="conn-head"><span class="conn-title">' + esc(c.label) + '</span>';
+    html += '<span class="conn-cat">' + esc(c.category) + '</span>' + _connBadge(c.status) + '</div>';
+    if (c.setup_note) html += '<div class="conn-note">' + esc(c.setup_note) + (c.docs ? ' <a href="' + esc(c.docs) + '" target="_blank" rel="noopener">docs ↗</a>' : '') + '</div>';
+    // credential fields
+    html += '<div class="conn-creds">';
+    for (const k of (c.env_keys || [])) {
+      html += '<label class="conn-field"><span class="conn-klabel">' + esc(k.name) + (k.set ? ' <em>(set: ' + esc(k.masked || '••••') + ')</em>' : '') + '</span>';
+      html += '<input type="password" class="conn-input" data-env="' + esc(k.name) + '" placeholder="' + (k.set ? 'replace…' : 'paste value…') + '" autocomplete="off"></label>';
+    }
+    html += '<button class="conn-save" onclick="_connectorSave(\'' + esc(c.id) + '\', this)">Save keys</button>';
+    html += '</div>';
+    // oauth
+    if (c.auth === 'oauth2' && c.oauth) {
+      html += '<div class="conn-oauth"><div class="conn-redir">Redirect URI to register: <code>' + esc(c.oauth.redirect_uri) + '</code> <button class="conn-copy" onclick="_copyTextWithToast(\'' + esc(c.oauth.redirect_uri) + '\',\'Redirect URI copied\')">copy</button></div>';
+      html += '<button class="conn-connect" onclick="_connectorAuth(\'' + esc(c.id) + '\')">Connect ' + esc(c.label) + ' ↗</button></div>';
+    }
+    // scope control (global / group / worker) — drives /api/scope
+    html += '<div class="conn-scope"><span class="conn-slabel">Enable for:</span> '
+      + '<button class="conn-scope-btn" onclick="_connectorScope(\'' + esc(c.id) + '\',\'global\',true)">Global</button>'
+      + '<button class="conn-scope-btn" onclick="_connectorScope(\'' + esc(c.id) + '\',\'group\',true)">Group…</button>'
+      + '<button class="conn-scope-btn" onclick="_connectorScope(\'' + esc(c.id) + '\',\'worker\',true)">Worker…</button>'
+      + '<button class="conn-scope-btn conn-scope-off" onclick="_connectorScope(\'' + esc(c.id) + '\',\'global\',false)">Disable global</button>'
+      + '</div>';
+    html += '</div>';
+  }
+  host.innerHTML = html;
+}
+
+async function _connectorSave(id, btn) {
+  const card = btn.closest('.conn-card');
+  if (!card) return;
+  const body = {};
+  card.querySelectorAll('.conn-input').forEach(inp => {
+    const v = (inp.value || '').trim();
+    if (v) body[inp.getAttribute('data-env')] = v;
+  });
+  if (!Object.keys(body).length) { showToast('Nothing to save — paste a value first'); return; }
+  btn.disabled = true; btn.textContent = 'Saving…';
+  try {
+    const r = await fetch('/api/connectors/' + encodeURIComponent(id) + '/credentials', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (d && d.ok) { showToast('Saved ' + (d.written || []).join(', ') + ' to server.env'); _connectorsTabLoad(); }
+    else { showToast('Save failed: ' + (d && (d.error || (d.rejected && ('rejected ' + d.rejected.join(',')))) || '?')); btn.disabled = false; btn.textContent = 'Save keys'; }
+  } catch (e) { showToast('Save failed: ' + e); btn.disabled = false; btn.textContent = 'Save keys'; }
+}
+
+async function _connectorAuth(id) {
+  try {
+    const r = await fetch('/api/connectors/' + encodeURIComponent(id) + '/auth', { method: 'POST' });
+    const d = await r.json();
+    if (d && d.authorize_url) { window.open(d.authorize_url, '_blank', 'noopener'); showToast('Opened the sign-in page'); }
+    else if (d && d.ok) { showToast(d.note || 'No sign-in needed'); }
+    else { showToast('Connect failed: ' + (d && (d.error || d.need_env) || '?')); }
+  } catch (e) { showToast('Connect failed: ' + e); }
+}
+
+async function _connectorScope(id, level, enabled) {
+  let name = '';
+  if (level !== 'global') {
+    name = (prompt('Enable "' + id + '" for which ' + level + '?') || '').trim();
+    if (!name) return;
+  }
+  const body = { level, name, capability: 'connectors', value: {} };
+  body.value[id] = { enabled: !!enabled };
+  try {
+    const r = await fetch('/api/scope', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+    const d = await r.json();
+    if (d && d.error) { showToast('Scope failed: ' + d.error); return; }
+    showToast((enabled ? 'Enabled ' : 'Disabled ') + id + ' at ' + level + (name ? (' ' + name) : ''));
+  } catch (e) { showToast('Scope failed: ' + e); }
+}
+
 async function _mdaiTabLoad() {
   const list = document.getElementById('mdai-list');
   const cnt = document.getElementById('mdai-count');
@@ -18338,11 +18453,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph'];
-  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph'];
-  // MUST stay index-aligned with _svIds/_svNames above (19 entries). It once had
+  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
+  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
+  // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex'];
+  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -18371,6 +18486,7 @@ function switchView(view) {
   if (view === 'messages') _messagesLoad(true, '');
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
   if (view === 'mdai') _mdaiTabLoad();
+  if (view === 'connectors') _connectorsTabLoad();
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
     try { if (location.hash.startsWith('#path=')) history.replaceState({}, '', location.pathname); } catch(e) {}

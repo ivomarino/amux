@@ -5432,3 +5432,35 @@
   .ut-wrap { font-size: 0.8rem; }
   .ut-out { margin-left: 8px; }
 }
+
+/* ===== Connectors (integrations) tab ===== */
+.conn-empty { color: var(--dim); padding: 20px 4px; font-size: 0.85rem; }
+.conn-origin { font-size: 0.75rem; color: var(--dim); line-height: 1.5; margin-bottom: 14px; }
+.conn-origin code { background: var(--hover); padding: 1px 5px; border-radius: 4px; }
+.conn-card { border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 12px; background: var(--card-bg); }
+.conn-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.conn-title { font-weight: 700; font-size: 0.98rem; }
+.conn-cat { font-size: 0.68rem; color: var(--dim); background: var(--hover); padding: 2px 7px; border-radius: 10px; }
+.conn-badge { color: #fff; font-size: 0.66rem; font-weight: 600; padding: 2px 8px; border-radius: 10px; margin-left: auto; }
+.conn-note { font-size: 0.75rem; color: var(--dim); line-height: 1.5; margin: 8px 0 10px; }
+.conn-creds { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: flex-end; margin-bottom: 8px; }
+.conn-field { display: flex; flex-direction: column; gap: 3px; flex: 1 1 220px; min-width: 0; }
+.conn-klabel { font-size: 0.68rem; color: var(--dim); font-family: var(--mono, monospace); }
+.conn-klabel em { color: var(--green); font-style: normal; }
+.conn-input { width: 100%; padding: 7px 9px; border: 1px solid var(--border); border-radius: 5px; background: var(--bg); color: var(--text); font-size: 0.8rem; box-sizing: border-box; }
+.conn-save, .conn-connect, .conn-scope-btn, .conn-copy { border: 1px solid var(--border); background: var(--hover); color: var(--text); border-radius: 5px; font-size: 0.72rem; padding: 7px 12px; cursor: pointer; white-space: nowrap; min-height: 34px; }
+.conn-save { background: var(--accent); color: #000; border: none; font-weight: 600; }
+.conn-save:disabled { opacity: 0.6; cursor: default; }
+.conn-oauth { margin: 6px 0 10px; padding: 8px 10px; background: var(--hover); border-radius: 6px; }
+.conn-redir { font-size: 0.72rem; color: var(--dim); line-height: 1.6; margin-bottom: 8px; word-break: break-all; }
+.conn-redir code { background: var(--bg); padding: 1px 5px; border-radius: 4px; }
+.conn-copy { padding: 2px 8px; min-height: 0; font-size: 0.66rem; margin-left: 4px; }
+.conn-connect { background: var(--cyan, #2a9fd6); color: #000; border: none; font-weight: 600; }
+.conn-scope { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 6px; }
+.conn-slabel { font-size: 0.72rem; color: var(--dim); }
+.conn-scope-off { opacity: 0.75; }
+@media (max-width: 600px) {
+  .conn-field { flex: 1 1 100%; }
+  .conn-save, .conn-connect, .conn-scope-btn { min-height: 44px; flex: 1 1 auto; }
+  .conn-badge { margin-left: 0; }
+}
