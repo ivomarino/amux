@@ -4518,15 +4518,33 @@ async fn send_text_inner(
         // — the exact question this bug turns on — could not be answered from
         // anything amux kept. A sweep can now count mid-turn deliveries, and
         // `mode="type"` here should be structurally impossible.
-        tracing::warn!(
-            session = %name,
-            mode = if use_paste { "paste" } else { "type" },
-            chars = text.chars().count(),
-            from_steering,
-            allow_mid_turn,
-            "delivering to a GENERATING lane — paste is the only mode measured as \
-             non-lossy mid-turn (AMUX-2909); mode=type here is a regression"
-        );
+        // AEAB-25. This was a single `warn!` whose TEXT asserted "mode=type here is
+        // a regression" while the structured field carried the mode that actually
+        // happened. 25 of 25 records, all-time, were mode="paste" — the mode the
+        // same sentence calls correct. It has never once fired on the condition it
+        // describes, so grepping it returns only healthy deliveries, and a REAL
+        // mode=type would be one line among them, indistinguishable.
+        //
+        // The comment above says the intent: make every mid-turn delivery
+        // self-announcing so a sweep can count them, and `mode="type"` "should be
+        // structurally impossible". That is instrumentation, not an alarm. So the
+        // record stays for every delivery — the sweep keeps working — and only the
+        // genuinely impossible case is a WARN.
+        if use_paste {
+            tracing::info!(
+                session = %name, mode = "paste", chars = text.chars().count(),
+                from_steering, allow_mid_turn,
+                "delivering to a GENERATING lane by paste — the mode measured as \
+                 non-lossy mid-turn (AMUX-2909)"
+            );
+        } else {
+            tracing::warn!(
+                session = %name, mode = "type", chars = text.chars().count(),
+                from_steering, allow_mid_turn,
+                "delivering to a GENERATING lane by TYPE — paste is the only mode \
+                 measured as non-lossy mid-turn (AMUX-2909); this is the regression"
+            );
+        }
     }
     send_key(name, "C-u").await;
     sleep_ms(40).await;
@@ -15597,6 +15615,34 @@ mod delivery_mode_tests {
         // Size and shape must not rescue it either.
         assert!(must_paste(true, 0, false), "even empty-ish text");
         assert!(must_paste(true, 5000, true));
+    }
+
+    /// AEAB-25. WHY the mode=type warning next to this predicate is currently
+    /// unreachable, stated as an assertion instead of left as a comment.
+    ///
+    /// `must_paste` is `generating || …`, so inside `if generating { … }` the
+    /// paste branch is taken for EVERY input. The old single warning there said
+    /// "mode=type here is a regression" while the structured field carried the
+    /// mode that actually happened — and it could never be `type`, by
+    /// construction. 25 of 25 records all-time were mode="paste", i.e. it fired
+    /// only on the healthy path and a real regression would have been one line
+    /// among them, indistinguishable.
+    ///
+    /// The warning is now split so only the genuinely impossible case warns. That
+    /// leaves a branch that cannot currently fire, which is fine ONLY while this
+    /// invariant holds — so if someone widens `must_paste` such that a generating
+    /// lane can be typed into, this fails loudly AND the warning becomes live and
+    /// correct at the same moment.
+    #[test]
+    fn a_generating_lane_always_pastes_so_the_type_warning_stays_unreachable() {
+        for chars in [0usize, 1, 12, 400, 401, 5000, 100_000] {
+            for picker in [false, true] {
+                assert!(
+                    must_paste(true, chars, picker),
+                    "generating must force paste (chars={chars}, picker={picker}) —                      if this ever fails, the mode=type warning is now reachable and                      must be treated as a live regression signal"
+                );
+            }
+        }
     }
 
     /// The control, without which the test above passes for a `must_paste` that
