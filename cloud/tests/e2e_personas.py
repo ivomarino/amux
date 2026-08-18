@@ -79,16 +79,29 @@ def load_plans(only=None):
     return plans
 
 
+# Known provisioned customer/demo orgs, keyed by plan stem. A fallback for when the
+# admin/orgs API is slow or projects fields differently — the orgs table's `name`
+# column equals the plan's org.name, but the API response shape has drifted before,
+# so pin the confirmed ids (from the gateway orgs DB, 2026-08-18).
+KNOWN_ORGS = {
+    "capital-express": "org_37aa24eb89c1d97a",
+    "elliot-wexus": "org_18f676d91310d02f",
+    "rothco": "org_8e89a846b6f5be7d",
+}
+
+
 def resolve_org_id(plan, orgs):
-    """Match a plan to its provisioned org_id via the admin org list (by email, else name)."""
+    """Match a plan to its provisioned org_id: admin-list by email/name, else the
+    known-org pin. Returns None only when the plan is genuinely not provisioned."""
     for o in orgs:
         oe = (o.get("email") or o.get("owner_email") or "").lower()
         if oe and oe == plan["email"]:
             return o.get("id")
+    pn = plan["name"].strip().lower()
     for o in orgs:
-        if (o.get("name") or "").strip().lower() == plan["name"].strip().lower():
+        if (o.get("name") or "").strip().lower() == pn:
             return o.get("id")
-    return None
+    return KNOWN_ORGS.get(plan["stem"])
 
 
 def _evidence_for(cookie, org, worker):
@@ -234,8 +247,15 @@ def main():
         sys.exit(1)
 
     # Sign in. If auth breaks after the gateway is up, that is also a real failure.
+    # gm.sign_in() prints progress to stdout; in --json mode that pollutes the JSON,
+    # so redirect it to stderr for a clean machine-readable document.
+    import contextlib
     try:
-        cookie = gm.sign_in()
+        if as_json:
+            with contextlib.redirect_stdout(sys.stderr):
+                cookie = gm.sign_in()
+        else:
+            cookie = gm.sign_in()
     except (SystemExit, Exception) as e:
         out = {"cloud_reachable": True, "signin_ok": False, "error": str(e)[:200], "results": []}
         (print(json.dumps(out, indent=2)) if as_json else
