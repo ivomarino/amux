@@ -3074,3 +3074,26 @@ FIX: Migrated today's four entries here and verified against
   (c) have the rule REFUSE to append to a checkout that is behind origin, or at minimum
   warn. (c) is the one that survives the next time two checkouts drift, because this
   failure is silent by construction.
+
+## A fix to a CI gate's config could not re-run that gate — eslint.config.mjs was outside rust.yml's paths
+AREA: ci
+SEVERITY: blocks
+STATUS: fixed (ba8ec83)
+DATE: 2026-08-18
+SESSION: amux
+CARD: AMUX-3363
+SYMPTOM: The e2e job's SPA static gate (scripts/spa-lint.sh) reads eslint.config.mjs for its
+  vendor-global allowlist, but rust.yml's push/pull_request paths filter listed crates/**,
+  scripts/**, e2e/**, amux, Cargo.* and the workflow file — NOT eslint.config.mjs (repo root).
+  So the fix that greened spa-lint (32c416b, whitelisting the XLSX CDN global) touched ONLY
+  eslint.config.mjs, triggered NO rust run, and main stayed red on the prior run. A green fix
+  was sitting on main while the required check still reported red, with nothing queued to
+  re-evaluate it.
+COST: The green-main-only cloud deploy stayed blocked after the fix had already landed. It took
+  a second commit (ba8ec83) plus ~15 min of watching for a run that was never going to start
+  before "no run appeared" registered as a path-filter miss rather than a slow CI queue.
+FIX: Added eslint.config.mjs to both paths filters in rust.yml (ba8ec83); editing the workflow
+  file also re-triggered the run. The general shape worth keeping: every INPUT a CI gate reads
+  must be in the paths that trigger it, or a fix to that input cannot re-run the gate. The
+  gate's other inputs (spa-lint.sh, gen-spa-globals.mjs, static/*.js) were already covered by
+  scripts/** and crates/**; only the root-level config was orphaned.
