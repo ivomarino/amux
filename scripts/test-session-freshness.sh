@@ -103,6 +103,38 @@ out=$(mk ahead 2 0)
 lacks "$MARK" "$out"
 lacks "DIVERGED" "$out"
 
+# ---------------------------------------------------------------------------
+# (e) AEAB-12 — the running server's BUILD PROVENANCE. The builder records what
+#     it installed; the hook reports it. A session should not be able to be
+#     looking at a fleet-wide deploy of somebody's scratch branch without being
+#     told, which is what happened for 9h42m on 2026-08-17.
+#
+#     The on_main=yes and missing-file cases are the load-bearing ones: this line
+#     is only worth having if it stays absent in the normal case.
+# ---------------------------------------------------------------------------
+PROVMARK="was built from an unmerged revision"
+prov_run() { # $1 = file contents, or "" for no file
+  local d="$TMP/prov"; rm -rf "$d"; mkdir -p "$d/.claude"
+  cp "$HOOK" "$d/.claude/session-freshness.sh"
+  ( cd "$d"; git init -q -b main .; echo x > f; git add -A; git commit -qm x ) >/dev/null 2>&1
+  local pf="$d/prov.json"
+  if [ -n "$1" ]; then printf '%s\n' "$1" > "$pf"; else rm -f "$pf"; fi
+  ( cd "$d"; AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
+}
+
+out=$(prov_run '{"sha":"deadbeef1234","ref":"fix/my-thing","on_main":"no","built_at":"x"}')
+says "$PROVMARK" "$out"
+says "fix/my-thing" "$out"
+
+out=$(prov_run '{"sha":"deadbeef1234","ref":"main","on_main":"yes","built_at":"x"}')
+lacks "$PROVMARK" "$out"
+
+out=$(prov_run "")                       # no file at all — fail open, stay silent
+lacks "$PROVMARK" "$out"
+
+out=$(prov_run 'not json at all')        # garbage — must not warn on a bad parse
+lacks "$PROVMARK" "$out"
+
 echo
 echo "test-session-freshness: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

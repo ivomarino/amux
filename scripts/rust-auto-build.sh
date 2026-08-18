@@ -87,8 +87,63 @@ echo $$ > "$LOCK/pid"
 last=$(cat "$STAMP" 2>/dev/null || echo "")
 [ "$head" = "$last" ] && exit 0
 
+# PROVENANCE (AEAB-12). This builder rebuilds whenever $REPO's local HEAD moves
+# and does not care whether HEAD is on main or on somebody's feature branch. The
+# server then self-adopts within 5s. That permissiveness is CORRECT and must stay:
+# this machine survived weeks deliberately pinned to an unmerged fix branch, and
+# "only build main" would delete the rollback mechanism.
+#
+# The defect is that a deliberate pin and an ACCIDENTAL feature branch are
+# byte-identical to the builder, and the accidental one is announced nowhere. On
+# 2026-08-17 a commit made on a branch inside this checkout was serving the whole
+# fleet 76 seconds later and stayed there 9h42m — no CI had run on it, no review —
+# while the machine also could not track upstream, so the daily update schedule
+# silently did nothing. Everything looked healthy the entire time.
+#
+# So: say it. NOT a refusal, a fact, written where consumers can find it.
+#
+# The predicate is "HEAD is contained in main OR origin/main". Checking only
+# origin/main would false-positive right after a merge, because this script
+# deliberately does not fetch (it must not reach the network on a 60s timer) and
+# the local remote-tracking ref lags. Local `main` moves on the merge itself, so
+# the pair covers both orders.
+on_main=no
+if git -C "$REPO" merge-base --is-ancestor HEAD main 2>/dev/null \
+   || git -C "$REPO" merge-base --is-ancestor HEAD origin/main 2>/dev/null; then
+  on_main=yes
+fi
+head_ref=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
+# The sha reported is the one actually BUILT — the worktree below is created from
+# `rev-parse HEAD`. `$head` is a different thing: the last commit that touched the
+# build inputs, used as the rebuild stamp key. Reporting the stamp key here would
+# name a commit that is not what is running.
+built_sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "$head")
+# A file rather than only a log line, because ~/.amux/logs/rust-auto-build.log is
+# not somewhere anyone looks — a tag in a store the reader never opens is the same
+# failure as no tag. The SessionStart freshness hook reads this and says it at the
+# one moment a session is about to build on it.
+printf '{"sha":"%s","ref":"%s","on_main":"%s","built_at":"%s"}\n' \
+  "$built_sha" "$head_ref" "$on_main" "$(date '+%F %T')" \
+  > "${AMUX_RS_BUILD_PROVENANCE:-$HOME/.amux/rust-build-provenance.json}" 2>/dev/null || true
+
+# A seam so the predicate above is TESTABLE against real repos rather than
+# restated in a test that could not notice it changing. Everything before this
+# point is cheap and touches no network; a cargo build is neither, which is why
+# scripts/test-build-provenance.sh stops here instead of asserting on a copy of
+# the logic.
+if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" = "1" ]; then
+  [ "$on_main" = "yes" ] || echo "OFF-MAIN $head_ref $built_sha"
+  exit 0
+fi
+
 {
   echo "== $(date '+%F %T') building $head (was: ${last:-none})"
+  if [ "$on_main" != "yes" ]; then
+    echo "== !! OFF-MAIN: $built_sha is on '$head_ref', which is not contained in main."
+    echo "==    Installing it makes it the live build for the WHOLE FLEET within ~5s,"
+    echo "==    with no CI and no review. Intentional pin? fine. Accident? put"
+    echo "==    $REPO back on main — develop in a git worktree, not the build source."
+  fi
   # Build from a clean, committed snapshot: a worktree of HEAD, so nobody's
   # uncommitted edits (or a mid-edit broken tree) can poison the deploy.
   WORK=$(mktemp -d /tmp/amux-rs-build.XXXXXX)
