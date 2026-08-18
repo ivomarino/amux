@@ -209,6 +209,41 @@ def check_envs():
         return {"error": str(e)[:100]}
 
 
+def check_orphans():
+    """Running amux-user containers with NO gateway.db org/user row. The deploy is
+    DIRECTORY-driven (deploy-cloud.yml loops /var/amux/users/*/), so a workspace dir
+    left behind by an incomplete deletion gets its container RESURRECTED even after
+    the org is gone from the DB — 6 came back on 2026-08-18 (AC-373). Report-only:
+    a DB-less container can also be a brief mid-provision race, so surfacing it in
+    the trace ledger (which a sweep reads) is the fix, not an unattended delete."""
+    # The host has NO sqlite3 CLI — query the gateway DB via the python sqlite3
+    # module. A `sqlite3 …` CLI version of this returned '' for every id (command
+    # not found), which flags EVERY container as an orphan — the exact ethos-rule-7
+    # instrument that reports a confident wrong answer (caught 2026-08-18).
+    out = ssh(r'''
+import json, subprocess, sqlite3
+def run(*a):
+    try: return subprocess.run(a, capture_output=True, text=True, timeout=30).stdout.strip()
+    except Exception: return ""
+names = [n for n in run("docker","ps","--format","{{.Names}}").splitlines() if n.startswith("amux-user-")]
+orphans = []
+try:
+    c = sqlite3.connect("/var/amux/gateway.db")
+    for n in names:
+        oid = n[len("amux-user-"):]
+        row = c.execute("SELECT 1 FROM orgs WHERE id=? UNION SELECT 1 FROM users WHERE id=? LIMIT 1", (oid, oid)).fetchone()
+        if not row:
+            orphans.append(oid)
+    print(json.dumps({"running": len(names), "orphans": orphans}))
+except Exception as e:
+    print(json.dumps({"running": len(names), "error": str(e)[:80]}))
+''', timeout=45)
+    try:
+        return json.loads(out)
+    except Exception:
+        return {"error": (out or "")[:100]}
+
+
 def main():
     no_fix = "--no-fix" in sys.argv
     as_json = "--json" in sys.argv
@@ -224,6 +259,12 @@ def main():
         result["envs"] = check_envs()
         trace("check_envs", "reachable=%s failed=%s" % (result["envs"].get("cloud_reachable"),
                                                         result["envs"].get("failed")), None)
+        # Orphaned (DB-less) running containers — a deploy resurrection self-announces here.
+        result["orphans"] = check_orphans()
+        _orph = result["orphans"].get("orphans") or []
+        trace("orphans", "running=%s orphaned=%s%s" % (
+            result["orphans"].get("running"), len(_orph),
+            (" -> " + ",".join(_orph)) if _orph else ""), not _orph)
     else:
         # Cloud is DOWN. Diagnose and apply deterministic repairs.
         d = diagnose()

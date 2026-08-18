@@ -437,6 +437,33 @@ jobs:
             for user_dir in /var/amux/users/*/; do
               user_id=$(basename "$user_dir")
               compose_file="$user_dir/docker-compose.yml"
+              # This loop is DIRECTORY-driven, not DB-driven: a workspace dir left
+              # behind by an incomplete deletion (delete removed the gateway.db row
+              # and the docker volume but not /var/amux/users/<id>) gets its
+              # container RESURRECTED here, silently, even though the org no longer
+              # exists to any user. That happened on 2026-08-18: a recreate=yes run
+              # brought back 6 orgs the mass-delete had removed (AC-373), because it
+              # never removed their dirs. Make the resurrection self-announce so a
+              # deploy-log sweep catches the next one instead of a human noticing a
+              # container count that does not match the org count. NOTE: the host has
+              # NO sqlite3 CLI (only python3), so query via the sqlite3 module — an
+              # earlier `sqlite3 …` version of this check was silently inert.
+              if [ -f /var/amux/gateway.db ]; then
+                _hasrow=$(python3 -c "import sqlite3; print('1' if sqlite3.connect('/var/amux/gateway.db').execute(\"SELECT 1 FROM orgs WHERE id=? UNION SELECT 1 FROM users WHERE id=? UNION SELECT 1 FROM orgs WHERE owner_id=? UNION SELECT 1 FROM org_memberships WHERE user_id=? LIMIT 1\", ('${user_id}','${user_id}','${user_id}','${user_id}')).fetchone() else '')" 2>/dev/null)
+                if [ -z "$_hasrow" ]; then
+                  # SKIP, not just warn. The gateway resolves every workspace from
+                  # the DB, so a dir with NO row is unreachable by any user — a
+                  # leftover from an incomplete deletion, not a real workspace. A
+                  # legit new signup always has its org/user row committed BEFORE
+                  # its dir is provisioned, so it is never skipped here. Not
+                  # skipping is exactly how a recreate=yes run resurrected 6 deleted
+                  # orgs on 2026-08-18 (AC-373). We do NOT rm the dir from CI (that
+                  # is an owner-authorised delete, ethos rule 8); we refuse to bring
+                  # it back and make the refusal loud.
+                  echo "::warning::orphaned workspace ${user_id}: /var/amux/users/${user_id} has NO gateway.db row — SKIPPING (refusing to resurrect a deleted env). Remove the dir to silence: rm -rf /var/amux/users/${user_id}"
+                  continue
+                fi
+              fi
               # Search the WHOLE file for the host port bound to :8822. A
               # `grep -A1 ports:` parse broke silently once when a comment moved
               # in above the mapping, and skipped all 19 workspaces while the
