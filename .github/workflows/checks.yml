@@ -104,6 +104,30 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-frustrations-audit.sh
+      # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
+      # and they belong HERE rather than in rust.yml because rust.yml is
+      # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to
+      # `./amux`, which is where both of these bugs lived, triggers NOTHING there.
+      # A test that never runs on the file it covers is decoration (ethos rule 1),
+      # and `scripts/test-amux-url.sh` had already been sitting unwired since it
+      # was written, which is why it is added here too rather than left for later.
+      #
+      # Both scripts run the SHIPPED dispatch path as a subprocess with HOME and
+      # AMUX_API controlled — not a paraphrase of it — and both point AMUX_API at
+      # a port nothing listens on, so a case that reaches the network fails loudly
+      # instead of mutating a real board. (That isolation is not hypothetical: the
+      # first cut of the add-flags test exported AMUX_URL instead of AMUX_API and
+      # filed three junk cards on a live board while still reporting green.)
+      #
+      # These scripts exit non-zero on failure and that is intended to fail the
+      # step. Each runs under its own shebang and its own `set -uo pipefail`, so
+      # the workflow's `bash -e {0}` wrapper does not leak into them — unlike the
+      # frustrations step above, no `|| rc=$?` dance is needed.
+      - name: CLI dispatch tests (board add flags, amux url resolver)
+        run: |
+          set -uo pipefail
+          ./scripts/test-board-add-flags.sh
+          ./scripts/test-amux-url.sh
       # AEAB-22. Lives here, not in rust.yml, for the same reason as the other
       # CLI/asset gates: rust.yml is path-filtered to `crates/**` + `Cargo.*` +
       # `e2e/**`, and while app.js IS under crates/, this test also guards
