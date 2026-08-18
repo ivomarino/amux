@@ -255,6 +255,34 @@ pub struct AuthParams {
     account: Option<String>,
 }
 
+/// The manual Google Cloud console step OAuth cannot automate: the redirect URI
+/// must be registered on the client, or Google rejects the sign-in BEFORE it
+/// reaches amux. Copy-paste-ready guidance, returned at auth time and on a
+/// redirect_uri_mismatch so a reauth is self-service (AMUX-3352, refresh-house:
+/// an undiscoverable console step blocked a reauth for ~3 days).
+fn oauth_prerequisite(client_id: &str, redirect_uri: &str) -> Value {
+    json!({
+        "requirement": "The redirect URI below must be registered on this OAuth client in the Google Cloud console (APIs & Services -> Credentials -> the OAuth 2.0 Client ID -> Authorized redirect URIs), or Google rejects the sign-in before it reaches amux.",
+        "console_url": "https://console.cloud.google.com/apis/credentials",
+        "client_id": client_id,
+        "add_redirect_uri": redirect_uri,
+    })
+}
+
+/// The same guidance as an HTML block for the callback error page.
+fn prerequisite_html(client_id: &str, redirect_uri: &str) -> String {
+    format!(
+        "<p>Google rejected the sign-in because the redirect URI is not registered on the OAuth client.</p>\
+         <p><b>One-time fix:</b></p><ol>\
+         <li>Open <a href=\"https://console.cloud.google.com/apis/credentials\">console.cloud.google.com/apis/credentials</a></li>\
+         <li>Open the OAuth 2.0 Client ID <code>{}</code></li>\
+         <li>Add <code>{}</code> under <b>Authorized redirect URIs</b> and Save</li>\
+         <li>Re-run the reauth (GET /api/gmail/auth) and open the URL again</li></ol>",
+        html_escape(client_id),
+        html_escape(redirect_uri)
+    )
+}
+
 pub async fn auth_url(
     Extension(ctx): Extension<Arc<GmailAuthCtx>>,
     Query(p): Query<AuthParams>,
@@ -343,9 +371,20 @@ pub async fn auth_url(
             redirect_port.unwrap_or(0),
             canonical
         );
-        return Json(json!({ "url": url, "account": account, "warning": warning })).into_response();
+        return Json(json!({
+            "url": url,
+            "account": account,
+            "warning": warning,
+            "prerequisite": oauth_prerequisite(&cfg.client_id, &redirect_uri),
+        }))
+        .into_response();
     }
-    Json(json!({ "url": url, "account": account })).into_response()
+    Json(json!({
+        "url": url,
+        "account": account,
+        "prerequisite": oauth_prerequisite(&cfg.client_id, &redirect_uri),
+    }))
+    .into_response()
 }
 
 // ---- GET /api/gmail/callback -----------------------------------------------
@@ -368,6 +407,18 @@ pub async fn callback(
     let state = p.state.unwrap_or_default().trim().to_string();
     let error = p.error.unwrap_or_default().trim().to_string();
     if !error.is_empty() {
+        // A redirect_uri_mismatch is the reauth-blocking case (AMUX-3352):
+        // render the one-time console fix instead of a dead-end "Auth failed".
+        if error.contains("redirect_uri_mismatch") {
+            let cid = client_config(&ctx.home).map(|c| c.client_id).unwrap_or_default();
+            return html(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "<html><body><h2>Sign-in blocked: redirect URI not registered</h2>{}</body></html>",
+                    prerequisite_html(&cid, &gmail_redirect_uri())
+                ),
+            );
+        }
         // Python's page (values escaped here — same content, no reflected
         // markup).
         return html(
@@ -435,6 +486,17 @@ pub async fn callback(
     };
     let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
     if status >= 400 || access.is_empty() {
+        // If the exchange itself reports a redirect_uri_mismatch, surface the
+        // one-time console fix rather than a raw HTTP dump (AMUX-3352).
+        if body.to_string().contains("redirect_uri_mismatch") {
+            return html(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "<html><body><h2>Sign-in blocked: redirect URI not registered</h2>{}</body></html>",
+                    prerequisite_html(&cfg.client_id, &gmail_redirect_uri())
+                ),
+            );
+        }
         return html(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
@@ -641,6 +703,19 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    #[test]
+    fn prerequisite_names_the_console_client_and_redirect_uri() {
+        // AMUX-3352: the reauth-blocking console step must be spelled out.
+        let v = oauth_prerequisite("492989726165-abc.apps.googleusercontent.com", "https://localhost:8824/api/gmail/callback");
+        assert_eq!(v["console_url"], "https://console.cloud.google.com/apis/credentials");
+        assert_eq!(v["client_id"], "492989726165-abc.apps.googleusercontent.com");
+        assert_eq!(v["add_redirect_uri"], "https://localhost:8824/api/gmail/callback");
+        let h = prerequisite_html("492989726165-abc.apps.googleusercontent.com", "https://localhost:8824/api/gmail/callback");
+        assert!(h.contains("492989726165-abc.apps.googleusercontent.com"));
+        assert!(h.contains("https://localhost:8824/api/gmail/callback"));
+        assert!(h.contains("Authorized redirect URIs"));
+    }
 
     /// (method, url, bearer, body) as seen on the mocked wire.
     type RecordedCall = (String, String, Option<String>, Option<Value>);
