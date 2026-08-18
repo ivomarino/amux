@@ -3097,3 +3097,25 @@ FIX: Added eslint.config.mjs to both paths filters in rust.yml (ba8ec83); editin
   must be in the paths that trigger it, or a fix to that input cannot re-run the gate. The
   gate's other inputs (spa-lint.sh, gen-spa-globals.mjs, static/*.js) were already covered by
   scripts/** and crates/**; only the root-level config was orphaned.
+
+---
+## session /start reports ok:true for a commandless session but starts nothing and logs nothing
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-18
+SESSION: amux-cloud
+CARD: AMUX-3364
+SYMPTOM: After a recreate=yes cloud deploy (AC-374) I restarted each POC's tmux sessions via
+  POST /api/sessions/<name>/start. The 12 real workers came up. The seeded `hello-world`
+  scaffold (command/cmd/agent all null) returned `{"ok":true,"message":"starting","resumed":false}`
+  in all 3 orgs, yet no tmux session materialized and ~/.amux/logs/server-rs.log had ZERO lines
+  mentioning it — grep for the name returned nothing. A start that spawned nothing was
+  byte-indistinguishable from a start that worked.
+COST: ~10 min chasing a phantom "1 of 4 sessions failed to restart" before confirming the missing
+  one was a no-command scaffold, not a real worker. A log sweep or autofix loop could never catch
+  this class: the no-op leaves no trace at all.
+FIX: (1) /start should refuse a commandless/agentless session with an explicit
+  `{"ok":false,"error":"no command configured"}` instead of an optimistic ok:true. (2) a start
+  that spawns no tmux session must WARN (session=<n> reason=no-command) so the next occurrence
+  self-announces. Routed to amux (owns session lifecycle) as AMUX-3364.
