@@ -7836,7 +7836,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.687';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.688';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16132,10 +16132,21 @@ async function _mdaiRun(opts) {
   const bodyEl = document.getElementById('mdai-body');
   if (opts.fromOpen && bodyEl) bodyEl.innerHTML = '<div style="padding:18px;color:var(--dim);">Running the chain…</div>';
   try {
-    const r = await fetch(API + '/api/files/mdai/run', {
-      method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
-      body: JSON.stringify({ path: _mdaiCur.abs })
-    });
+    // Bound the run so it cannot hang the UI forever (AMUX-3371: Priorities.mdai
+    // sat on "Running the chain…" with no error and no way out). A real chain —
+    // even a self-fetch + a synthesis model call over weeks of messages —
+    // finishes well inside 3 min; past that it is a stuck source or a wedged
+    // model call, and a timeout that surfaces an error beats an infinite spinner.
+    const _ctrl = new AbortController();
+    const _to = setTimeout(() => _ctrl.abort(), 180000);
+    let r;
+    try {
+      r = await fetch(API + '/api/files/mdai/run', {
+        method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+        body: JSON.stringify({ path: _mdaiCur.abs }),
+        signal: _ctrl.signal
+      });
+    } finally { clearTimeout(_to); }
     const d = await r.json().catch(() => ({}));
     if (!r.ok || d.error) {
       _mdaiRunError = d.error || ('HTTP ' + r.status);
@@ -16145,7 +16156,10 @@ async function _mdaiRun(opts) {
       await _mdaiLoadHistory();
     }
   } catch (e) {
-    _mdaiRunError = (e && e.message) || 'run failed'; _mdaiRunCycle = null;
+    _mdaiRunError = (e && e.name === 'AbortError')
+      ? 'The run took too long (over 3 min) and was stopped — likely a stuck source or a wedged model call. Try again, or simplify the instruction/sources.'
+      : ((e && e.message) || 'run failed');
+    _mdaiRunCycle = null;
   }
   if (btn) btn.disabled = false;
   _mdaiRender();
