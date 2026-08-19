@@ -3143,3 +3143,55 @@ FIX: Owner's call, and genuinely a trade — `LimitLoadToSessionType = Backgroun
   on a Tailscale-reachable machine. Filed rather than chosen (ethos rule 8). What is NOT
   the owner's call and should ship regardless: `install.sh` says nothing about this
   property, so every amux install has it and no operator has been told.
+
+---
+## The disk detector times out on exactly the directories that would answer the question
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed (half — the false cause; the bias is carded)
+DATE: 2026-08-19
+SESSION: amux-errors-and-bugs
+CARD: AEAB-33
+SYMPTOM: `disk: size ranking is INCOMPLETE — these paths exceeded the du budget
+  skipped=3 paths=~/Library/Caches, ~/.Trash, ~/.npm` — 1178 times in 24h, unchanging.
+  Measured by hand with `du` unbounded, those paths hold 9.9G + 6.4G, against 3.7G free.
+  `du` time scales with size, so the budget skips the LARGEST directories by
+  construction: the ranking that survives lists the also-rans as the top consumers. And
+  `~/.Trash` never times out at all — `du` returns "Operation not permitted" (macOS TCC)
+  — but a failure and a timeout both returned `None` and were reported under the same
+  "exceeded the du budget" message, which is false for that path and always will be.
+COST: The auto-filed card AMUX-30 ("disk: 4.2 GB free, below the 50 GB floor") says of
+  itself "It is a REPORT, not a diagnosis: the evidence below is computed, the cause is
+  not." The cause was missing because this ranker skipped it — so the one card raised
+  about a disk that has since fallen to 3.7G could not name a single consumer. Anyone
+  acting on the log message would also have raised the timeout, which cannot ever help
+  `.Trash` and re-opens AMUX-35 (an unbounded `du` here parked every tokio worker and
+  hung the entire server).
+FIX: `du_one` now returns a typed `DuOutcome` — `Sized` / `TimedOut` /
+  `Unreadable(exit code)` — and `du_top` reports the two skip reasons as separate
+  warnings, one naming the budget and one saying plainly that no timeout increase will
+  help. The timeout message now also states the bias out loud rather than leaving it to
+  be inferred: the paths missing are likelier to be the largest than the ones ranked
+  below it. Exit code rather than stderr text is deliberate — piping stderr means `du`
+  over a tree of unreadable subdirectories can fill the pipe buffer and block while we
+  poll, converting a path that would have finished into a timeout, i.e. the detector
+  manufacturing the fault it reports.
+  Tested against the incident's own specimen (`~/.Trash`, the path named 914 times),
+  with a `du` probe deciding whether the case is live so it can never pass by mistaking
+  an absent directory for a permissions error, and mutation-checked: collapsing the two
+  outcomes back into one fails it.
+  The BIAS itself is fixed in the follow-up commit on the same card: each path's last
+  successful size is persisted to `~/.amux/du-sizes.json` and carried forward, LABELLED
+  with its age, so a path that blows the budget still appears in the ranking instead of
+  vanishing. A day-old 9.9G answers "what is eating my disk"; absence does not, and
+  absence is what it reported. On disk rather than in memory because this process
+  re-execs to adopt builds — in-memory state would be empty on exactly the first run
+  after every restart. A path never successfully sized still does NOT appear: a
+  fabricated 0 would sort the biggest consumer last, which is the failure `du_one`'s own
+  doc comment warns about, and there is a test asserting each direction.
+  That work also surfaced a LATENT TEST BUG worth naming on its own: the du budget lives
+  in process-global env vars and cargo runs these cases on parallel threads, so three
+  pre-existing cases were already racing (two writing the vars, one reading). It had
+  never been visible because the budgets in play were large enough not to break a
+  neighbour. A new case using a 1ms budget broke one, and the failure appeared in a test
+  with nothing wrong in it. All seven now take a shared lock.
