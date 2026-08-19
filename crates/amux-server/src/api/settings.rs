@@ -86,26 +86,30 @@ pub(crate) fn effective_env(home: &Path, key: &str) -> Option<String> {
 /// else append. Non-atomic plain write, matching Python (`_env_set`).
 /// `pub(crate)`: shared with the alert-config PATCH (api/alerts.rs), which
 /// is Python's `_env_set` on the same file.
-/// Does this config VALUE point into ephemeral storage (`~/.amux/uploads/`)? Such
-/// a value is a time bomb: uploads are cleaned up long after the config stops
-/// being looked at, so a working config silently breaks later — exactly the
-/// GOOGLE_SA_KEY_FILE 502 (AMUX-3383). nissan's shape (AMUX-3386): reject it at
-/// the persist site. Broader than `uploads/` in principle (any ephemeral dir),
-/// but uploads/ is the instance we tripped over and the one amux owns; a single
-/// helper here is the seam to widen if another ephemeral dir shows up.
+/// Does this config VALUE point into storage the box REAPS BY AGE? Such a value
+/// is a time bomb: the file is cleaned up long after the config stops being
+/// looked at, so a working config silently breaks later — exactly the
+/// GOOGLE_SA_KEY_FILE 502 (AMUX-3383). "Ephemeral" is DEFINED by the storage
+/// reaper (`storage::AGE_PRUNED_DIRS`), not duplicated here (nissan, AMUX-3386):
+/// whatever it age-prunes is by definition unsafe to persist durable config into,
+/// so adding a scratch dir there extends this guard automatically instead of
+/// leaving a second copy of the knowledge to drift. Today that is media-cache,
+/// uploads and spin-dumps — the original guard knew only uploads and silently
+/// passed the other two.
 pub(crate) fn is_ephemeral_path(home: &Path, val: &str) -> bool {
     let v = val.trim().trim_matches('"');
     if v.is_empty() {
         return false;
     }
-    let uploads = home.join("uploads");
     let expanded = match v.strip_prefix("~/") {
         Some(rest) => std::env::var("HOME")
             .map(|h| Path::new(&h).join(rest))
             .unwrap_or_else(|_| Path::new(v).to_path_buf()),
         None => Path::new(v).to_path_buf(),
     };
-    expanded.starts_with(&uploads)
+    crate::runtime_jobs::storage::AGE_PRUNED_DIRS
+        .iter()
+        .any(|(name, _, _)| expanded.starts_with(home.join(name)))
 }
 
 pub(crate) fn set_server_env_key(home: &Path, key: &str, val: &str) -> std::io::Result<()> {
@@ -1021,7 +1025,14 @@ mod tests {
         let uploads = home.join("uploads").join("db76-key.json");
         let stable = home.join("gcp").join("dpa-sa.json");
 
+        // EVERY age-reaped dir is ephemeral, not just uploads — the guard reads
+        // storage::AGE_PRUNED_DIRS, so media-cache and spin-dumps (which the
+        // original guard silently passed) are caught too.
         assert!(is_ephemeral_path(home, uploads.to_str().unwrap()), "uploads path is ephemeral");
+        assert!(is_ephemeral_path(home, home.join("media-cache").join("x").to_str().unwrap()), "media-cache");
+        assert!(is_ephemeral_path(home, home.join("spin-dumps").join("x").to_str().unwrap()), "spin-dumps");
+        // Negative control — a path-prefix check must not widen into refusing
+        // everything: a stable dir and an opaque non-path value are NOT flagged.
         assert!(!is_ephemeral_path(home, stable.to_str().unwrap()), "gcp path is stable");
         assert!(!is_ephemeral_path(home, "some-opaque-token-value"), "a non-path value is not ephemeral");
 
