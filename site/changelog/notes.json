@@ -1,5 +1,61 @@
 [
   {
+    "hash": "168f311c",
+    "short": "168f311",
+    "title": "BM25 board search \u2014 full-text relevance ranking with match highlighting",
+    "date": "2026-08-19",
+    "type": "feat",
+    "tags": [
+      "board",
+      "search",
+      "bm25",
+      "dashboard"
+    ],
+    "description": "The board search bar now uses BM25 relevance ranking across every card field \u2014 title, description, notes, session tags, and status \u2014 with match highlighting on results. Previously the board used substring filtering with no ranking, so a query matching dozens of cards returned them in arbitrary order. BM25 brings TF-IDF style scoring so the most relevant cards surface first. Particularly useful when running large fleets where a session might have hundreds of past cards."
+  },
+  {
+    "hash": "438e528",
+    "short": "438e528",
+    "title": "Email file attachments \u2014 attach PDFs, CSVs, and files to /send and /reply",
+    "date": "2026-08-18",
+    "type": "feat",
+    "tags": [
+      "email",
+      "attachments",
+      "gmail",
+      "agents"
+    ],
+    "description": "Both /api/email/send and /api/email/reply now accept an attachments array. Each entry takes a filename, base64-encoded content, and MIME type. The email is sent as multipart/mixed so the body and attachment arrive together in Gmail. Agents can generate a report, export a CSV, or produce a PDF and email it to a recipient without any manual step. Works with all connected Gmail accounts."
+  },
+  {
+    "hash": "61f71f3",
+    "short": "61f71f3",
+    "title": "Email attachment inline flag and download endpoint",
+    "date": "2026-08-18",
+    "type": "feat",
+    "tags": [
+      "email",
+      "attachments",
+      "gmail",
+      "api"
+    ],
+    "description": "Attachments sent via /api/email/send or /api/email/reply are now flagged as inline or attachment in the MIME structure. A new GET /api/email/attachment/<id> download endpoint returns the raw attachment bytes, useful for agents or operators who need to retrieve a previously sent file. This closes the loop on the attachment workflow: send, confirm arrival, and retrieve if needed."
+  },
+  {
+    "hash": "f3aac99",
+    "short": "f3aac99",
+    "title": "Session status: API 5xx / Overloaded \u2014 distinct state when provider is rate-limited or down",
+    "date": "2026-08-18",
+    "type": "feat",
+    "tags": [
+      "sessions",
+      "status",
+      "api",
+      "observability"
+    ],
+    "description": "Sessions can now report an Overloaded status when the AI provider is returning 5xx errors or explicit rate-limit responses. Previously these events caused sessions to appear as crashed or stalled with no distinct visual signal. The new status surfaces in the dashboard session card, the iOS app status chip, and the API response, so operators can distinguish 'agent is broken' from 'provider is temporarily unavailable' without reading terminal output."
+  },
+  {
     "hash": "fe519a42682cbfc1770b93964176",
     "short": "fe519a4",
     "title": "Connectors tab \u2014 paste API credentials once, scope to global, group, or per-worker",
