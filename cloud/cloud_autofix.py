@@ -204,7 +204,17 @@ def check_envs():
     try:
         r = subprocess.run([sys.executable, os.path.join(REPO, "cloud/tests/e2e_personas.py"), "--json"],
                            capture_output=True, text=True, timeout=600, cwd=REPO)
-        return json.loads(r.stdout.strip().splitlines()[-1]) if r.stdout.strip() else {"error": "no output"}
+        out = (r.stdout or "").strip()
+        if not out:
+            return {"error": "no output"}
+        # e2e_personas.py --json emits a SINGLE pretty-printed JSON object across ~191
+        # lines (progress goes to stderr). Parse the WHOLE stdout — splitlines()[-1]
+        # grabbed the closing "}" and errored every run, so this env check was silently
+        # dead and the daily health rode the 302 probe alone (ethos rule 7, fixed here).
+        try:
+            return json.loads(out)
+        except json.JSONDecodeError:
+            return json.loads(out.splitlines()[-1])  # fallback: trailing-JSON-line format
     except Exception as e:
         return {"error": str(e)[:100]}
 
@@ -257,8 +267,16 @@ def main():
         # Cloud is serving. Verify the environments too.
         result["healthy"] = True
         result["envs"] = check_envs()
-        trace("check_envs", "reachable=%s failed=%s" % (result["envs"].get("cloud_reachable"),
-                                                        result["envs"].get("failed")), None)
+        # Surface a broken or failing env-check LOUDLY (ok=FAILED), not as a bland None:
+        # a None reads as "no data", which is how the parse bug above hid for so long.
+        _env = result["envs"]
+        if _env.get("error"):
+            trace("check_envs", "ERROR: %s" % _env["error"], False)
+        else:
+            _failed = _env.get("failed")
+            trace("check_envs", "reachable=%s provisioned=%s passed=%s warned=%s failed=%s" % (
+                _env.get("cloud_reachable"), _env.get("provisioned"), _env.get("passed"),
+                _env.get("warned"), _failed), (_failed == 0))
         # Orphaned (DB-less) running containers — a deploy resurrection self-announces here.
         result["orphans"] = check_orphans()
         _orph = result["orphans"].get("orphans") or []
