@@ -3169,3 +3169,25 @@ FIX: use the SCOPED query the contract documents —
   historical agent-owned cards, kept 6). The durable fix (AC-301, amux's) is to make the
   CLAUDE.md board-ledger recipe scope by session, or have `amux board ls` surface the
   truncation header so the caller knows the count is partial.
+
+---
+## cloud_autofix's daily env check parsed only the last stdout line, so it silently errored every run
+AREA: cloud
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-19
+SESSION: amux-cloud
+CARD: AC-367
+SYMPTOM: The DAILY CLOUD HEALTH tick reported HEALTHY, but its trace line read
+  `check_envs: reachable=None failed=None`. check_envs() did
+  `json.loads(stdout.strip().splitlines()[-1])`, expecting the persona result on a single
+  trailing line. e2e_personas.py --json actually emits ONE pretty-printed JSON object across
+  ~191 lines, so the last line is `}` and json.loads errored -> {"error": parse} every run.
+  The per-environment/persona half of the health check has been dead; overall "HEALTHY" was
+  driven by the cloud 302 probe alone. Running e2e_personas.py directly worked, which is why
+  the persona TICK looked fine and hid that the AUTOFIX tick was not checking envs at all.
+COST: A daily check that claimed to verify every customer env has not verified any since it
+  was written. A real persona FAIL would not have surfaced through the autofix path. ~10 min.
+FIX (this commit): parse the whole stdout (json.loads(out)) with a last-line fallback, and
+  make the trace show the env matrix or ERROR with ok=FAILED, so a bland None can never again
+  read as "no data". Re-ran: check_envs now reports reachable=True provisioned=3 passed=2.
