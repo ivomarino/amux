@@ -86,7 +86,45 @@ pub(crate) fn effective_env(home: &Path, key: &str) -> Option<String> {
 /// else append. Non-atomic plain write, matching Python (`_env_set`).
 /// `pub(crate)`: shared with the alert-config PATCH (api/alerts.rs), which
 /// is Python's `_env_set` on the same file.
+/// Does this config VALUE point into ephemeral storage (`~/.amux/uploads/`)? Such
+/// a value is a time bomb: uploads are cleaned up long after the config stops
+/// being looked at, so a working config silently breaks later — exactly the
+/// GOOGLE_SA_KEY_FILE 502 (AMUX-3383). nissan's shape (AMUX-3386): reject it at
+/// the persist site. Broader than `uploads/` in principle (any ephemeral dir),
+/// but uploads/ is the instance we tripped over and the one amux owns; a single
+/// helper here is the seam to widen if another ephemeral dir shows up.
+pub(crate) fn is_ephemeral_path(home: &Path, val: &str) -> bool {
+    let v = val.trim().trim_matches('"');
+    if v.is_empty() {
+        return false;
+    }
+    let uploads = home.join("uploads");
+    let expanded = match v.strip_prefix("~/") {
+        Some(rest) => std::env::var("HOME")
+            .map(|h| Path::new(&h).join(rest))
+            .unwrap_or_else(|_| Path::new(v).to_path_buf()),
+        None => Path::new(v).to_path_buf(),
+    };
+    expanded.starts_with(&uploads)
+}
+
 pub(crate) fn set_server_env_key(home: &Path, key: &str, val: &str) -> std::io::Result<()> {
+    // Never persist a config value that points into ephemeral uploads/ storage —
+    // the file gets cleaned up and the config silently breaks (AMUX-3386/3383).
+    if is_ephemeral_path(home, val) {
+        tracing::warn!(
+            key = %key,
+            "refusing to persist an ephemeral ~/.amux/uploads/ path into server.env (AMUX-3386) — copy the file to a stable location first"
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to write {key} = a path under ~/.amux/uploads/ into server.env: \
+                 files there are cleaned up and the config would silently break later \
+                 (AMUX-3383). Copy it to a stable location (e.g. ~/.amux/gcp/) and set {key} to that."
+            ),
+        ));
+    }
     let file = home.join("server.env");
     let mut lines: Vec<String> = std::fs::read_to_string(&file)
         .map(|s| s.lines().map(String::from).collect())
@@ -971,5 +1009,33 @@ mod tests {
         let (st, _) =
             send(&app, "PATCH", "/api/settings/env", Some(json!({ "OPENAI_API_KEY": 42 }))).await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
+    }
+
+    /// AMUX-3386: a config value pointing into ephemeral ~/.amux/uploads/ must be
+    /// refused at the persist site — that path is the AMUX-3383 time bomb (the
+    /// file is cleaned up and the config silently breaks later).
+    #[test]
+    fn set_server_env_refuses_an_ephemeral_uploads_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let uploads = home.join("uploads").join("db76-key.json");
+        let stable = home.join("gcp").join("dpa-sa.json");
+
+        assert!(is_ephemeral_path(home, uploads.to_str().unwrap()), "uploads path is ephemeral");
+        assert!(!is_ephemeral_path(home, stable.to_str().unwrap()), "gcp path is stable");
+        assert!(!is_ephemeral_path(home, "some-opaque-token-value"), "a non-path value is not ephemeral");
+
+        // The persist site refuses the ephemeral path and writes nothing.
+        assert!(
+            set_server_env_key(home, "GOOGLE_SA_KEY_FILE", uploads.to_str().unwrap()).is_err(),
+            "must refuse an uploads path"
+        );
+        let after = std::fs::read_to_string(home.join("server.env")).unwrap_or_default();
+        assert!(!after.contains("uploads"), "the ephemeral path must not reach server.env: {after}");
+
+        // A stable path persists normally.
+        set_server_env_key(home, "GOOGLE_SA_KEY_FILE", stable.to_str().unwrap()).unwrap();
+        let after = std::fs::read_to_string(home.join("server.env")).unwrap();
+        assert!(after.contains("gcp/dpa-sa.json"), "stable path persists: {after}");
     }
 }
