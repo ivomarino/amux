@@ -5468,11 +5468,30 @@ function _draftSave(session, text) {
     else localStorage.setItem(k, JSON.stringify({ t: text, ts: Date.now() }));
   } catch (e) {}   // quota/private-mode: a lost draft must never break sending
 }
+// The value the composer for `session` holds RIGHT NOW, or null if none is
+// mounted. The peek box wins when it is the one showing this session (it is the
+// active editor); otherwise the list card.
+function _liveComposerValue(session) {
+  if (typeof peekSession !== 'undefined' && peekSession === session) {
+    const pk = document.getElementById('peek-cmd-input');
+    if (pk) return pk.value;
+  }
+  const card = document.getElementById('input-' + session);
+  return card ? card.value : null;
+}
 function _draftSaveDebounced(session, text) {
   clearTimeout(_draftTimers[session || '_']);
   _draftTimers[session || '_'] = setTimeout(() => {
-    _draftSave(session, text);
-    _draftSyncInputs(session, text);   // keep the other view in step as you type
+    // Read the LIVE composer at fire time, not the value captured 250ms ago at
+    // the keystroke. If a send cleared the box in that window, we save the
+    // CLEARED state (dropping the draft) instead of resurrecting the pre-send
+    // text — that stale-capture race is how an already-sent message came back and
+    // sat in the composer (a prefix of it, from the mid-typing snapshot). Falls
+    // back to the captured text only if the input is gone.
+    const live = _liveComposerValue(session);
+    const val = live != null ? live : text;
+    _draftSave(session, val);
+    _draftSyncInputs(session, val);   // keep the other view in step as you type
   }, 250);
 }
 function _draftGet(session) {
@@ -7836,7 +7855,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.688';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.689';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
