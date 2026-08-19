@@ -7797,7 +7797,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.682';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.683';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -20626,6 +20626,20 @@ function toggleSchedExpand(id) {
   if (btn) btn.textContent = showing ? 'View' : 'Hide';
 }
 
+// The last-run cell for a schedule row, shared by the enabled AND disabled
+// templates (and therefore by both the global scheduler and the worker-details
+// peek, which render through the same renderScheduler). `last_run` arrives either
+// as an epoch int/string or an ISO wall-clock string, so normalise both; the
+// title carries the absolute local time, the label the relative one. Extracted so
+// the two row templates cannot drift on "when did this last run" (Ethan 2026-08-19).
+function _schedLastRunHTML(s) {
+  if (!s || !s.last_run) return '<span style="color:var(--dim);">never</span>';
+  const abs = /^\d+$/.test(String(s.last_run))
+    ? new Date((+s.last_run > 2e9 ? +s.last_run : +s.last_run * 1000)).toLocaleString()
+    : new Date(s.last_run).toLocaleString();
+  return `<span style="color:var(--dim);" title="last run: ${esc(abs)}">&#x2713; ${relTime(s.last_run)}</span>`;
+}
+
 function renderScheduler(opts) {
   opts = opts || {};
   const listEl = document.getElementById(opts.listId || 'scheduler-list');
@@ -20713,8 +20727,7 @@ function renderScheduler(opts) {
       const fireBadge = fpd
         ? `<span class="sched-fires${share >= 20 ? ' hot' : ''}" title="${fpd} fires in 24h = ${share}% of fleet">${fpd}/day${share >= 5 ? ` \u00B7 ${share}%` : ''}</span>`
         : '';
-      const _lrTitle = s.last_run ? (/^\d+$/.test(String(s.last_run)) ? new Date((+s.last_run > 2e9 ? +s.last_run : +s.last_run * 1000)).toLocaleString() : new Date(s.last_run).toLocaleString()) : '';
-      const lastRel = s.last_run ? `<span style="color:var(--dim);" title="${esc(_lrTitle)}">&#x2713; ${relTime(s.last_run)}</span>` : `<span style="color:var(--dim);">never</span>`;
+      const lastRel = _schedLastRunHTML(s);
       // The ⚡trigger / 👁watch / "stop:" badges lived here. They advertised
       // behaviour this server does not have — the pane-polling watcher and the
       // event-trigger loop were never ported from Python — so a badge could
@@ -20776,9 +20789,10 @@ function renderScheduler(opts) {
               <span style="font-weight:600;font-size:0.82rem;">${esc(s.title)}</span>
               <code class="sched-cadence-pill">${esc(recLabel)}</code>
             </div>
-            <div style="font-size:0.7rem;color:var(--dim);display:flex;align-items:center;gap:6px;">
+            <div style="font-size:0.7rem;color:var(--dim);display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
               ${s.session ? `<span style="color:var(--accent);">${esc(s.session)}</span>` : ''}
-              <span>&#xD7;${s.run_count || 0}</span>
+              ${_schedLastRunHTML(s)}
+              <span title="Total runs">&#xD7;${s.run_count || 0}</span>
               ${dots ? `<span style="display:flex;align-items:center;gap:2px;">${dots}</span>` : ''}
             </div>
             <div class="sched-actions">
