@@ -29,6 +29,7 @@ use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use rusqlite::OptionalExtension;
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use std::sync::{Arc, Mutex};
@@ -682,6 +683,96 @@ fn finish<T>(
 ) -> rusqlite::Result<WriteOutcome> {
     *slot.lock().expect("outcome slot poisoned") = Some(outcome);
     Ok(write)
+}
+
+/// AMUX-3391: fold the silent auto-capture card into a worker's own card.
+///
+/// Every prompt is auto-captured as a `doing` card (creator=amux, desc
+/// `**Prompt:**`, minted `notified=1` so the worker is never TOLD it exists).
+/// The worker then follows the ledger rule and cards its OWN work — two cards
+/// for one prompt. Measured live: 68% of capture cards were being discarded by
+/// hand as duplicates of the worker's own card (the PRIMI-152/153 shape, 72
+/// such pairs in 14 days). This reconciles at the write that already happens
+/// (CLAUDE.md's recorded event decision — not a sweep, not a model call): when a
+/// worker cards its work and a FRESH capture card is still open for its lane,
+/// discard the capture in place as an audit tombstone linked to the new card, so
+/// there is exactly one card and nothing to clean up.
+///
+/// Returns `(folded_capture_id, its SSE event)`, or `None` when nothing folds.
+/// Pure over `conn` so the create handler stays readable and this is unit-tested
+/// against an in-memory DB (see the tests below).
+fn fold_capture_for_worker_card(
+    conn: &rusqlite::Connection,
+    new: &IssueRow,
+    window_s: i64,
+    now: i64,
+) -> rusqlite::Result<Option<(String, PendingEvent)>> {
+    // A capture card is minted by amux, owned by an agent, and its desc begins
+    // with the `**Prompt:**` marker. Only a genuine WORKER card (not amux, not a
+    // capture) triggers a fold — and it must not itself be a capture.
+    let is_worker_card = !new.creator.is_empty()
+        && new.creator != "amux"
+        && !new.creator.starts_with("amux ") // "amux (claimed …)" is the capture actor
+        && new.owner_type == "agent"
+        && !new.desc.starts_with("**Prompt:**");
+    if !is_worker_card {
+        return Ok(None);
+    }
+    let Some(sess) = new.session.as_deref().filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let cutoff = now - window_s;
+    // The most-recent open capture card for this lane that NO earlier worker card
+    // has already claimed. A worker card (other than the one just inserted)
+    // created at/after the capture means this new card is a 2nd/unrelated one for
+    // the lane — leave the capture alone rather than mis-fold an unrelated task.
+    let cap: Option<(String, i64)> = conn
+        .query_row(
+            "SELECT c.id, c.rev FROM issues c \
+             WHERE c.session = ?1 AND c.creator = 'amux' \
+               AND c.owner_type = 'agent' AND c.status = 'doing' \
+               AND substr(c.\"desc\", 1, 11) = '**Prompt:**' \
+               AND c.deleted IS NULL AND c.created > ?2 \
+               AND NOT EXISTS ( \
+                 SELECT 1 FROM issues w WHERE w.session = c.session \
+                   AND w.owner_type = 'agent' AND w.creator <> 'amux' \
+                   AND w.deleted IS NULL AND w.id <> ?3 \
+                   AND w.created >= c.created ) \
+             ORDER BY c.created DESC LIMIT 1",
+            rusqlite::params![sess, cutoff, new.id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+        )
+        .optional()?;
+    let Some((cap_id, cap_rev)) = cap else {
+        return Ok(None);
+    };
+    let Some(mut c) = bs::get_issue(conn, &cap_id)? else {
+        return Ok(None);
+    };
+    c.status = "discarded".into();
+    c.desc = format!(
+        "{}\n\n_Folded into {} — the worker carded this work directly (AMUX-3391)._",
+        c.desc, new.id
+    );
+    c.log = Some(bs::append_log(
+        c.log.as_deref(),
+        &hhmm(),
+        &format!("capture folded into {}", new.id),
+    ));
+    c.rev = cap_rev + 1;
+    c.version += 1;
+    c.updated = now;
+    bs::save_patched(conn, &c)?;
+    // Two-fixes rule: the fold leaves a trace, so a sweep can confirm it fires —
+    // and can compare fold-count against capture cards STILL discarded by hand (a
+    // fold that should have fired but did not). grep "ledger: capture folded".
+    tracing::info!(
+        session = %sess,
+        capture = %cap_id,
+        folded_into = %new.id,
+        "ledger: capture folded into worker card (AMUX-3391)"
+    );
+    Ok(Some((cap_id, ev_snap(&c, MutationKind::Updated))))
 }
 
 fn now_secs() -> i64 {
@@ -1451,6 +1542,10 @@ pub async fn create_item(
     }
     let slot: Arc<Mutex<Option<Out>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
+    // AMUX-3391: carries the id of a capture card this create folded, so the
+    // response can name it and it can be reported without re-querying.
+    let folded: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let folded_w = folded.clone();
     let write = state
         .store
         .write_async(move |conn| {
@@ -1464,13 +1559,25 @@ pub async fn create_item(
                 }
             }
             let row = bs::create_issue(conn, &new, now_secs())?;
-            let event = ev_snap(&row, MutationKind::Created);
+            let mut events = vec![ev_snap(&row, MutationKind::Created)];
+            // AMUX-3391: fold the silent auto-capture card into this worker card
+            // (see fold_capture_for_worker_card). The window is env-tunable.
+            let fold_window: i64 = std::env::var("AMUX_CAPTURE_FOLD_WINDOW_S")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(600);
+            if let Some((cap_id, ev)) =
+                fold_capture_for_worker_card(conn, &row, fold_window, now_secs())?
+            {
+                events.push(ev);
+                *folded_w.lock().unwrap() = Some(cap_id);
+            }
             finish(
                 &slot_w,
                 Out::Created(Box::new(row)),
                 WriteOutcome {
                     applied: true,
-                    events: vec![event],
+                    events,
                 },
             )
         })
@@ -1489,6 +1596,11 @@ pub async fn create_item(
             v["global_rev"] = json!(reply.rev.0);
             if !ignored.is_empty() {
                 v["ignored_fields"] = json!(ignored);
+            }
+            // AMUX-3391: tell the caller the auto-capture card it just displaced,
+            // so a worker sees the reconcile happened and never hand-discards it.
+            if let Some(cap_id) = folded.lock().expect("folded slot poisoned").take() {
+                v["folded_capture"] = json!(cap_id);
             }
             (StatusCode::CREATED, Json(v)).into_response()
         }
@@ -3743,5 +3855,144 @@ mod slim_tests {
         // CONTENT, not the first line.
         let padded = IssueRow { desc: "\n\n  \nreal content here".into(), ..Default::default() };
         assert_eq!(list_body(&padded, true, false)["desc_head"], "real content here");
+    }
+
+    // ---- AMUX-3391: auto-fold the silent capture card into the worker's own ----
+
+    fn fold_db() -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
+                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
+                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
+                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
+                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
+                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
+                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
+                epic TEXT, deleted INTEGER);
+             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
+                PRIMARY KEY (issue_id, tag));
+             CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn fold_card(creator: &str, status: &str, desc: &str, session: &str) -> bs::NewIssue {
+        bs::NewIssue {
+            title: "t".into(),
+            desc: desc.into(),
+            status: status.into(),
+            session: Some(session.into()),
+            item_type: "code".into(),
+            creator: creator.into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
+        }
+    }
+
+    /// The core reconcile: a worker carding its own work folds its lane's fresh
+    /// auto-capture card, discarding it in place with a tombstone that links to
+    /// the worker card — so there is one card, not the two that 68% of the time
+    /// ended in a hand discard.
+    #[test]
+    fn a_worker_card_folds_the_fresh_capture_for_its_lane() {
+        let conn = fold_db();
+        let cap =
+            bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** do the thing", "lane"), 1000)
+                .unwrap();
+        let worker =
+            bs::create_issue(&conn, &fold_card("lane", "todo", "Fix the thing", "lane"), 1010).unwrap();
+
+        let folded = fold_capture_for_worker_card(&conn, &worker, 600, 1010).unwrap();
+        assert_eq!(
+            folded.as_ref().map(|(id, _)| id.as_str()),
+            Some(cap.id.as_str()),
+            "the worker card must fold its lane's fresh capture"
+        );
+        let got = bs::get_issue(&conn, &cap.id).unwrap().unwrap();
+        assert_eq!(got.status, "discarded", "the folded capture is discarded in place");
+        assert!(
+            got.desc.contains(&format!("Folded into {}", worker.id)),
+            "the tombstone links to the worker card"
+        );
+    }
+
+    /// The negative controls — each is a case where a fold would be WRONG, and a
+    /// filter that folded everything would look identical to a correct one from
+    /// the happy-path test alone (ethos rule 7). The capture must stay `doing`.
+    #[test]
+    fn fold_leaves_a_capture_alone_when_it_should_not_fire() {
+        // (a) an amux-created card is the capture actor, never a folder.
+        {
+            let conn = fold_db();
+            let cap = bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** x", "lane"), 1000)
+                .unwrap();
+            let other =
+                bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** y", "lane"), 1010)
+                    .unwrap();
+            assert!(
+                fold_capture_for_worker_card(&conn, &other, 600, 1010).unwrap().is_none(),
+                "a capture card must not fold another capture"
+            );
+            assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
+        }
+        // (b) a capture in a DIFFERENT lane is not this worker's to fold.
+        {
+            let conn = fold_db();
+            let cap = bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** x", "laneA"), 1000)
+                .unwrap();
+            let worker =
+                bs::create_issue(&conn, &fold_card("laneB", "todo", "Fix", "laneB"), 1010).unwrap();
+            assert!(fold_capture_for_worker_card(&conn, &worker, 600, 1010).unwrap().is_none());
+            assert_eq!(
+                bs::get_issue(&conn, &cap.id).unwrap().unwrap().status,
+                "doing",
+                "another lane's capture is untouched"
+            );
+        }
+        // (c) a capture older than the fold window is not the worker's current
+        // prompt — it stays for its lane rather than being swallowed.
+        {
+            let conn = fold_db();
+            let cap = bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** x", "lane"), 100)
+                .unwrap();
+            let worker =
+                bs::create_issue(&conn, &fold_card("lane", "todo", "Fix", "lane"), 2000).unwrap();
+            assert!(
+                fold_capture_for_worker_card(&conn, &worker, 600, 2000).unwrap().is_none(),
+                "a capture older than the window is not this prompt"
+            );
+            assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
+        }
+    }
+
+    /// The mis-fold guard (the NOT EXISTS clause): if a worker has ALREADY carded
+    /// work after a capture, a SECOND, distinct worker card must not swallow that
+    /// capture — otherwise an unrelated task would absorb the prompt's card. This
+    /// exercises the guard directly with the capture still `doing`.
+    #[test]
+    fn a_second_worker_card_does_not_fold_an_already_owned_capture() {
+        let conn = fold_db();
+        let cap = bs::create_issue(&conn, &fold_card("amux", "doing", "**Prompt:** x", "lane"), 1000)
+            .unwrap();
+        // A prior worker card for the lane already exists after the capture.
+        let _prior =
+            bs::create_issue(&conn, &fold_card("lane", "doing", "Fix A", "lane"), 1010).unwrap();
+        let newer =
+            bs::create_issue(&conn, &fold_card("lane", "todo", "Fix B", "lane"), 1020).unwrap();
+        assert!(
+            fold_capture_for_worker_card(&conn, &newer, 600, 1020).unwrap().is_none(),
+            "a capture a prior worker card already owns must not be re-folded"
+        );
+        assert_eq!(bs::get_issue(&conn, &cap.id).unwrap().unwrap().status, "doing");
     }
 }
