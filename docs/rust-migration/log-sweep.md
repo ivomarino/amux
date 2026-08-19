@@ -199,6 +199,14 @@ fallback when a finding needs row-level inspection.
      cold-outbound, 08-18 amux-cloud + random — the last two did *nothing else*
      all day). Exclude it before flagging, the same way GETs are excluded.
 
+   - **`POST /api/sessions/<n>/send` and `/api/workers/<n>/send` are not work
+     either.** Messaging a peer is a mutating METHOD with no board consequence,
+     so a lane whose only write that day was a relay reads as silent. Fourth
+     instance of this false flag (2026-08-19, `amux-gtm`, one `send` to
+     amux-cloud and nothing else). Same exclusion as staged-guard above — the
+     rule generalises: **a mutating method is not the same as WORK. Before
+     flagging, look at what the writes actually were.**
+
    The sample is also capped: `limit=2000` is the max, and on a busy day that is
    ~2.7 hours of a 24h window, taken from one end. Say the real span in the
    summary, or read the store directly for the full window.
