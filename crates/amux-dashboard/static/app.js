@@ -275,6 +275,46 @@ async function toggleAutofix(checked) {
   } catch(e) {}
 })();
 
+// ── YOLO by default for new workers (Ethan 2026-08-19) ──
+// A global pref like the toggles above. The create flow reads _yoloDefault and,
+// when on, enables YOLO on the freshly-created worker via the SAME toggle_yolo
+// the manual switch uses — which ADDS the provider yolo flag to CC_FLAGS without
+// dropping the server-resolved --model (passing `flags` at create would replace
+// it). Default OFF: skipping permission prompts is opt-in, per worker or globally.
+let _yoloDefault = false;
+async function toggleYoloDefault(checked) {
+  _yoloDefault = !!checked;
+  await fetch('/api/prefs', {
+    method: 'POST', headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({ key: 'yolo_default', value: checked ? '1' : '0' })
+  });
+  if (typeof showToast === 'function') {
+    showToast(checked ? 'New workers will start in YOLO mode'
+                      : 'New workers will not default to YOLO');
+  }
+}
+(async function initYoloDefault() {
+  try {
+    const r = await fetch('/api/prefs?key=yolo_default');
+    const d = await r.json();
+    _yoloDefault = String((d && d.value) ?? '0') === '1';   // default OFF
+    const cb = document.getElementById('yolo-default-checkbox');
+    if (cb) cb.checked = _yoloDefault;
+  } catch (e) {}
+})();
+// Enable YOLO on a just-created worker when the pref is on. toggle_yolo is a
+// toggle, but a fresh worker is never already YOLO, so it deterministically
+// turns it ON while preserving the resolved model in CC_FLAGS.
+async function _applyYoloDefault(name) {
+  if (!_yoloDefault || !name) return;
+  try {
+    await fetch(API + '/api/sessions/' + encodeURIComponent(name) + '/config', {
+      method: 'PATCH', headers: _authHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify({ toggle_yolo: true })
+    });
+  } catch (e) {}
+}
+
 // ═══════ STATE & GLOBALS ═══════
 const API = '';
 
@@ -1786,6 +1826,7 @@ async function runSyncBanner() {
       if (!createResp.ok && createResp.status !== 409) {
         item.status = 'failed'; draft.syncing = false; saveDrafts(); renderBanner(); continue;
       }
+      await _applyYoloDefault(draft.name);   // YOLO-by-default applies to synced drafts too
       const startResp = await _origFetch(API + '/api/sessions/' + encodeURIComponent(draft.name) + '/start', { method: 'POST', headers: _authHeaders() });
       if (draft.prompt && startResp.ok) {
         await new Promise(r => setTimeout(r, 5000));
@@ -7795,7 +7836,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.686';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.687';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -17527,6 +17568,9 @@ async function submitCreate() {
         body: JSON.stringify({branch: 'none'}),
       }).catch(() => {});
     }
+    // If YOLO-by-default is on, enable it BEFORE start so the worker launches in
+    // YOLO mode (adds the flag to CC_FLAGS; keeps the resolved --model).
+    await _applyYoloDefault(name);
     // Start session — pass prompt to server so it waits for Claude to be ready
     const startBody = prompt ? { prompt } : {};
     await apiCall(API + '/api/sessions/' + encodeURIComponent(name) + '/start', {

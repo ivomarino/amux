@@ -279,6 +279,14 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
           </div>
           <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Send /compact when context &lt; 50%</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
+            <span style="font-size:0.85rem;">YOLO by default for new workers</span>
+            <label class="theme-toggle">
+              <input type="checkbox" id="yolo-default-checkbox" onchange="toggleYoloDefault(this.checked)">
+              <span class="theme-track"><span class="theme-thumb"></span></span>
+            </label>
+          </div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Every new worker starts in YOLO mode (skips permission prompts). Default OFF. You can still toggle YOLO per worker from its &#x22EF; menu.</div>
+          <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">Auto-answer resume dialog</span>
             <label class="theme-toggle">
               <input type="checkbox" id="auto-resume-checkbox" onchange="toggleAutoResume(this.checked)" checked>
