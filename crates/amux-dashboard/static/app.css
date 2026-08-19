@@ -5363,6 +5363,12 @@
 .mdai-note a { color: var(--accent); }
 .mdai-edge { background: var(--card); border: 1px solid var(--border); border-radius: 8px; padding: 10px; margin-bottom: 8px; }
 .mdai-edge-path { font-size: 0.74rem; font-family: 'SF Mono','Fira Code',monospace; color: var(--purple, #a371f7); word-break: break-all; margin-bottom: 6px; }
+/* The editable source path: same purple monospace token look as the read-only
+   div, but a real input so it can be changed and saved with the edge. */
+input.mdai-edge-path-input { display: block; width: 100%; box-sizing: border-box;
+  background: var(--bg); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; min-height: 34px; outline: none; }
+input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(88,166,255,0.12); }
 .mdai-prompt, .mdai-body-ta {
   width: 100%; box-sizing: border-box; background: var(--bg); color: var(--text);
   border: 1px solid var(--border); border-radius: 6px; padding: 7px 9px;

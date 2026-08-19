@@ -7797,7 +7797,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.683';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.684';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16197,8 +16197,15 @@ async function _mdaiWriteFile() {
 async function _mdaiSavePrompt(idx) {
   const ta = document.getElementById('mdai-prompt-' + idx);
   if (!ta || !_mdaiCur || !_mdaiCur.sources[idx]) return;
+  // The source PATH is editable too now (Ethan 2026-08-19: "make it so i can edit
+  // this" pointing at `amux:messages?days=14`). The same "Save & re-run" persists
+  // a changed path — e.g. days=14 -> days=28, or swapping a file for an amux: ref —
+  // alongside the edge prompt, then re-runs so the new source takes effect. Round-
+  // trips through the same _mdaiYq quoting the prompt save has always used.
+  const pathInp = document.getElementById('mdai-path-' + idx);
+  if (pathInp) _mdaiCur.sources[idx].path = pathInp.value.trim();
   _mdaiCur.sources[idx].prompt = ta.value;
-  if (await _mdaiWriteFile()) { showToast('Edge prompt saved'); await _mdaiRun(); }
+  if (await _mdaiWriteFile()) { showToast('Source saved'); await _mdaiRun(); }
 }
 async function _mdaiRemoveSource(idx) {
   if (!_mdaiCur || !_mdaiCur.sources[idx]) return;
@@ -16293,7 +16300,9 @@ function _mdaiListHtml() {
   } else {
     c.sources.forEach((s, idx) => {
       html += '<div class="mdai-edge">'
-        + '<div class="mdai-edge-path" title="' + esc(s.path) + '">' + esc(s.path || '(unnamed source)') + '</div>';
+        + (c.parseOk
+            ? '<input class="mdai-edge-path mdai-edge-path-input" id="mdai-path-' + idx + '" value="' + esc(s.path || '') + '" placeholder="source — a file path or an amux: ref (e.g. amux:messages?days=14)" spellcheck="false" autocapitalize="off" autocomplete="off" autocorrect="off">'
+            : '<div class="mdai-edge-path" title="' + esc(s.path) + '">' + esc(s.path || '(unnamed source)') + '</div>');
       if (c.parseOk) {
         html += '<textarea class="mdai-prompt" id="mdai-prompt-' + idx + '" rows="2" placeholder="Edge prompt">' + esc(s.prompt || '') + '</textarea>'
           + '<div class="mdai-edge-actions">'
