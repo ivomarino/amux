@@ -601,18 +601,11 @@
   }
   .send-input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(88,166,255,0.12); }
 
-  /* Card-composer attachments (upload files in the card list, like the peek).
-     The bar reuses .peek-attach-bar (hidden until .has-files) and the chips reuse
-     .peek-attach-chip. Only the paperclip button and the drop-target cue are new. */
+  /* Card-composer attachments: no paperclip button on the worker list (Ethan
+     2026-08-19 — too bulky there); you attach by DRAGGING files onto the
+     composer, and the chips bar reuses .peek-attach-bar / .peek-attach-chip.
+     Paste still works too. The peek keeps its own paperclip. */
   .card-attach-bar { margin-top: 4px; }
-  .card-attach-btn {
-    flex: 0 0 auto; align-self: flex-end; min-width: 44px; min-height: 44px;
-    display: inline-flex; align-items: center; justify-content: center;
-    border: 1px solid var(--border); background: var(--bg); color: var(--dim);
-    border-radius: 8px; cursor: pointer; font-size: 1.05rem; line-height: 1; padding: 0;
-    -webkit-tap-highlight-color: transparent;
-  }
-  .card-attach-btn:hover { color: var(--accent); border-color: var(--accent); }
   .send-row.card-drop-over { outline: 2px dashed var(--accent); outline-offset: 2px; border-radius: 8px; }
 
   /* Peek overlay */

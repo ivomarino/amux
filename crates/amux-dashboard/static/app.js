@@ -3090,10 +3090,8 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
         ${s.running ? `
         <div class="chips" id="card-chips-${s.name}"></div>
         <div class="peek-attach-bar card-attach-bar${(_cardFiles[s.name]||[]).length ? ' has-files' : ''}" id="card-attach-${s.name}">${_renderCardFileChips(s.name)}</div>
-        <div class="send-row" style="position:relative;" ondragover="cardDragOver(event)" ondragleave="cardDragLeave(event)" ondrop="cardDrop('${s.name}',event)">
+        <div class="send-row" style="position:relative;" ondragover="cardDragOver(event)" ondragleave="cardDragLeave(event)" ondrop="cardDrop('${s.name}',event)" title="Drag files here to attach">
           <div id="card-ac-${s.name}" class="ac-list slash-ac"></div>
-          <input type="file" id="cfile-${s.name}" multiple style="display:none" onchange="handleCardFileInput('${s.name}',event)">
-          <button class="card-attach-btn" title="Attach files (or drop / paste them here)" onclick="event.stopPropagation();document.getElementById('cfile-${s.name}').click()">&#x1F4CE;</button>
           <textarea class="send-input" id="input-${s.name}" rows="1"
             placeholder="Send to ${esc(s.name)}..." autocomplete="off" autocorrect="on"
             autocapitalize="sentences" spellcheck="true" enterkeyhint="enter"
@@ -7797,7 +7795,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.685';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.686';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9962,10 +9960,6 @@ function _renderCardFileChips(name) {
     const rm = `<span class="chip-remove" onclick="event.stopPropagation();removeCardFile('${name}',${i})" title="Remove">×</span>`;
     return `<div class="peek-attach-chip${f.path ? '' : (f.error ? ' failed' : ' uploading')}">${thumb}<span class="chip-name">${esc(f.name)}</span>${status}${rm}</div>`;
   }).join('');
-}
-function handleCardFileInput(name, e) {
-  for (const f of e.target.files) _enqueueUpload(f, _cardSink(name));
-  e.target.value = '';   // let the same file be re-picked after a remove
 }
 function removeCardFile(name, idx) {
   const a = _cardFiles[name] || [];
