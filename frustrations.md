@@ -3160,3 +3160,25 @@ COST: A daily check that claimed to verify every customer env has not verified a
 FIX (this commit): parse the whole stdout (json.loads(out)) with a last-line fallback, and
   make the trace show the env matrix or ERROR with ok=FAILED, so a bland None can never again
   read as "no data". Re-ran: check_envs now reports reachable=True provisioned=3 passed=2.
+
+---
+## Prompt auto-capture writes a credential the user typed verbatim into a fleet-readable board card
+AREA: board
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-19
+SESSION: amux-cloud
+CARD: AMUX-3384
+SYMPTOM: Ethan typed a NetSuite login password in chat and said to keep it in the PRIVATE
+  amux-GTM repo only. amux auto-captured the prompt into a board card (AC-381) with the
+  password value verbatim in the TITLE. The board is fleet-readable (every session can GET
+  /api/board/<id>), so a credential meant for a private repo was sitting in shared state.
+COST: A credential leak into fleet-shared state that directly contradicted the user's stated
+  scoping. Had to hand-scrub the card (overwrite title+desc) and confirm the value was gone;
+  a discarded card is still retrievable, so the value transited the board regardless. ~5 min
+  plus the exposure window.
+FIX: the capture path should redact obvious secret shapes (long base64/hex, values after
+  pw|password|secret|key=) before writing the card, OR skip capturing a prompt flagged as
+  carrying a credential, OR keep the capture body out of the shared board store. Filed as AMUX-3384
+  to amux (capture/board is their domain). Same family as AC-214: a secret reaching a store the
+  owner did not intend.
