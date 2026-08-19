@@ -5505,6 +5505,17 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 @media (max-width: 600px) { .conn-test-btn { min-height: 44px; } }
 .conn-slabel { font-size: 0.72rem; color: var(--dim); }
 .conn-scope-off { opacity: 0.75; }
+/* Gmail accounts in the connector card (AMUX-3389): health + Reconnect/Add. */
+.conn-gmail { margin: 6px 0 10px; padding: 8px 10px; background: var(--hover); border-radius: 6px; }
+.conn-gmail-h { font-size: 0.72rem; font-weight: 600; color: var(--dim); margin-bottom: 6px; }
+.conn-gmail-empty, .conn-gmail-loading { font-size: 0.74rem; color: var(--dim); padding: 2px 0; }
+.conn-gmail-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 4px 0; }
+.conn-gmail-addr { font-family: 'SF Mono','Fira Code',monospace; font-size: 0.76rem; color: var(--text); word-break: break-all; }
+.conn-gmail-badge { color: #fff; font-size: 0.62rem; font-weight: 600; padding: 2px 7px; border-radius: 9px; white-space: nowrap; }
+.conn-gmail-btn { margin-left: auto; border: 1px solid var(--border); background: var(--card-bg, var(--card)); color: var(--text); border-radius: 5px; font-size: 0.7rem; padding: 5px 10px; cursor: pointer; min-height: 32px; white-space: nowrap; }
+.conn-gmail-btn.conn-gmail-del { margin-left: 0; color: var(--red, #c0392b); }
+.conn-gmail-add { margin-top: 8px; border: 1px dashed var(--border); background: none; color: var(--accent); border-radius: 5px; font-size: 0.72rem; padding: 6px 12px; cursor: pointer; min-height: 34px; }
+@media (max-width: 600px) { .conn-gmail-btn { min-height: 44px; } .conn-gmail-btn { margin-left: 0; flex: 1 1 auto; } }
 /* Scope picker: searchable dropdown over real workers/groups (AMUX-3350) */
 .conn-picker-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 10050; display: flex; align-items: flex-start; justify-content: center; padding-top: 12vh; }
 .conn-picker { background: var(--card-bg); border: 1px solid var(--border); border-radius: 12px; width: min(92vw, 420px); max-height: 70vh; display: flex; flex-direction: column; box-shadow: 0 8px 40px rgba(0,0,0,0.5); overflow: hidden; }

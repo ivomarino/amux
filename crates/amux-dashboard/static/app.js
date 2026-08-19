@@ -7855,7 +7855,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.689';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.690';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15887,6 +15887,12 @@ function _connectorsRender(d) {
       html += '<div class="conn-oauth"><div class="conn-redir">Redirect URI to register: <code>' + esc(c.oauth.redirect_uri) + '</code> <button class="conn-copy" onclick="_copyTextWithToast(\'' + esc(c.oauth.redirect_uri) + '\',\'Redirect URI copied\')">copy</button></div>';
       html += '<button class="conn-connect" onclick="_connectorAuth(\'' + esc(c.id) + '\')">Connect ' + esc(c.label) + ' ↗</button></div>';
     }
+    // Gmail: connected accounts with token health + one-click Reconnect/Add, so a
+    // dead token (invalid_grant) is VISIBLE and FIXABLE here instead of needing
+    // the raw /api/gmail/auth?account= URL (Ethan via amux-cloud, AMUX-3389).
+    if (c.id === 'google-gmail') {
+      html += '<div class="conn-gmail" id="conn-gmail-accounts"><div class="conn-gmail-loading">Loading Gmail accounts…</div></div>';
+    }
     // test connection — verify it actually WORKS, not just that a key is present
     html += '<div class="conn-test"><button class="conn-test-btn" onclick="_connectorTest(\'' + esc(c.id) + '\', this)">Test connection</button> <span class="conn-test-result" id="conn-test-' + esc(c.id) + '"></span></div>';
     // scope control (global / group / worker) — drives /api/scope
@@ -15899,6 +15905,75 @@ function _connectorsRender(d) {
     html += '</div>';
   }
   host.innerHTML = html;
+  if (list.some(c => c.id === 'google-gmail')) _gmailAccountsLoad();
+}
+
+// ── Gmail accounts in the Connectors panel (AMUX-3389) ──
+// The backend already reports per-account health from a real getProfile round
+// trip (GET /api/gmail/accounts) and mints the OAuth URL (GET /api/gmail/auth
+// ?account=). This surfaces both: a token that died (needs_reauth) shows red with
+// a one-click Reconnect, and you can add a new account, without knowing a URL.
+async function _gmailAccountsLoad() {
+  const el = document.getElementById('conn-gmail-accounts');
+  if (!el) return;
+  try {
+    const r = await fetch('/api/gmail/accounts');
+    const d = await r.json();
+    const accts = d.accounts || [];
+    const health = d.health || {};
+    let h = '<div class="conn-gmail-h">Connected Gmail accounts</div>';
+    if (!accts.length) {
+      h += '<div class="conn-gmail-empty">No accounts connected yet.</div>';
+    } else {
+      for (const a of accts) {
+        const st = health[a] || 'unknown';
+        const meta = st === 'ok' ? ['valid', '#1f8f4e']
+          : st === 'needs_reauth' ? ['token dead — reconnect', '#c0392b']
+          : st === 'not_connected' ? ['not connected', '#8a6d3b']
+          : [st, '#666'];
+        h += '<div class="conn-gmail-row">'
+          + '<span class="conn-gmail-addr">' + esc(a) + '</span>'
+          + '<span class="conn-gmail-badge" style="background:' + meta[1] + '">' + esc(meta[0]) + '</span>'
+          + '<button class="conn-gmail-btn" onclick="_gmailReconnect(\'' + escJs(a) + '\')">Reconnect ↗</button>'
+          + '<button class="conn-gmail-btn conn-gmail-del" onclick="_gmailRemove(\'' + escJs(a) + '\')">Remove</button>'
+          + '</div>';
+      }
+    }
+    h += '<button class="conn-gmail-add" onclick="_gmailAddAccount()">+ Add Gmail account</button>';
+    el.innerHTML = h;
+  } catch (e) {
+    el.innerHTML = '<div class="conn-gmail-empty">Failed to load Gmail accounts.</div>';
+  }
+}
+// Start (or repair) OAuth for one account: fetch the URL and open it. Google
+// redirects back to /api/gmail/callback which writes the token; then Refresh.
+async function _gmailReconnect(email) {
+  if (!email) return;
+  try {
+    const r = await fetch('/api/gmail/auth?account=' + encodeURIComponent(email));
+    const d = await r.json();
+    if (d && d.url) {
+      window.open(d.url, '_blank', 'noopener');
+      showToast('Approve access for ' + email + ' in the opened tab, then Refresh');
+      if (d.warning) showToast(d.warning);
+    } else if (d && d.error) {
+      showToast('Could not start reconnect: ' + d.error);
+    } else {
+      showToast('Could not start reconnect');
+    }
+  } catch (e) { showToast('Reconnect failed'); }
+}
+async function _gmailAddAccount() {
+  const email = (prompt('Gmail address to connect:') || '').trim();
+  if (email) _gmailReconnect(email);
+}
+async function _gmailRemove(email) {
+  if (!(await showConfirm('Remove ' + email + '?\n\nThe local token file is deleted; you can reconnect any time.', 'Remove', true))) return;
+  try {
+    await fetch('/api/gmail/account?account=' + encodeURIComponent(email), { method: 'DELETE' });
+    showToast('Removed ' + email);
+    _gmailAccountsLoad();
+  } catch (e) { showToast('Remove failed'); }
 }
 
 async function _connectorSave(id, btn) {
