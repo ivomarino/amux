@@ -3267,3 +3267,38 @@ FIX: `df -Pk` and `du -sk` with the GB conversion in awk — POSIX, and already 
   the branch with a huge floor, so an unparsed figure still reaches the loop and the
   regression is caught only by luck. Mutation-checked: restoring a bad df flag fails case
   (f) specifically, not just the ordering cases.
+
+---
+## I wrote a keep-warm branch that could never execute, hours after writing about that exact failure mode
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-19
+SESSION: amux-errors-and-bugs
+CARD: AEAB-35
+SYMPTOM: AEAB-34's fix added an early exit to the builder's disk guard — reclaim the idle
+  cache, and if free space is back above the floor, keep the shared cache so the build
+  stays warm. The branch fired ZERO times and could not: it tested against
+  `AMUX_BUILD_MIN_FREE_GB` (25GB) on a volume with 4GB free, so after reclaiming the idle
+  cache the condition was still false and the shared cache was destroyed anyway.
+  `grep -c "reclaimed to" rust-auto-build.log` -> 0.
+COST: Half a fix presented as a whole one. The card AEAB-34 is titled "so every build is
+  cold" and every build stayed cold; only prod verification caught it, and only because I
+  looked for the branch's OUTPUT rather than re-reading the code. Had I not, the card would
+  have closed claiming a result it did not deliver.
+FIX: Two thresholds, because there are two questions —
+  `AMUX_BUILD_MIN_FREE_GB` (25) asks "is the FLEET at ENOSPC risk", which is what decides
+  whether to reclaim at all; `AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB` (8) asks "can THIS BUILD
+  proceed while keeping its cache". Between them, reclaim the idle caches and stay warm.
+  Two test cases that EXECUTE the branch, driving the shipped script with a fake `df`
+  placed in `$HOME/.cargo/bin` — the script exports its own minimal PATH whose first entry
+  is exactly that, so no test-only branch is added to production code. Mutation-checked:
+  restoring the single threshold fails the keep-warm case specifically.
+WHY IT IS WORTH AN ENTRY EVEN THOUGH I FIXED IT: the ethos file records "a threshold below
+  the baseline is not a detector", and this is its mirror — a stop condition ABOVE the
+  achievable maximum is not a stop condition. I had cited that rule in a commit message the
+  same morning. Authoring a rule does not install the habit; that is the third instance of
+  that sentence being true in this session, and the pattern is only visible because the
+  earlier two were also written down. The generalisable check: when adding an early exit,
+  state the RANGE OF INPUTS under which it fires, and confirm the live system produces
+  values in that range.

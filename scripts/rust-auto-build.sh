@@ -180,25 +180,54 @@ fi
   # Caught by scripts/test-build-disk-clear.sh on its first CI run; the Rust side
   # already had it right (storage::disk_free_bytes uses `df -Pk`), so this was
   # one convention drifting from another inside the same codebase.
+  # TWO THRESHOLDS, BECAUSE THERE ARE TWO QUESTIONS (AEAB-35). The first cut of
+  # this used one number for both and the keep-warm exit below became DEAD CODE:
+  # it fired only once free space reached AMUX_BUILD_MIN_FREE_GB (25GB), on a
+  # volume sitting at 4GB, so after reclaiming the idle cache the condition was
+  # still false and the shared cache was destroyed anyway. Measured: zero
+  # "reclaimed to" lines, ever. A stop condition above the achievable maximum is
+  # not a stop condition — the mirror of "a threshold below the baseline is not a
+  # detector", and it reads perfectly sensibly in review.
+  #
+  #   AMUX_BUILD_MIN_FREE_GB (25)             — is the FLEET at ENOSPC risk?
+  #                                             Right number for that; AMUX-2754
+  #                                             is 741MB free with lanes failing
+  #                                             to write. It decides whether to
+  #                                             reclaim AT ALL.
+  #   AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB (8) — can THIS BUILD proceed while
+  #                                             keeping its cache? A cargo build
+  #                                             plus a ~5GB target dir needs
+  #                                             single-digit GB, not 25.
+  #
+  # Between the two, reclaim the idle caches and let the build stay warm. Below
+  # the lower one, the shared cache genuinely is worth a cold build.
   FREE_GB=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')
   if [ "${FREE_GB:-999}" -lt "${AMUX_BUILD_MIN_FREE_GB:-25}" ]; then
     for cand in "$HOME/.amux/rust-build-target-e2e-head" "$HOME/.amux/rust-build-target"; do
       [ -d "$cand" ] || continue
+      if [ "$cand" = "$HOME/.amux/rust-build-target" ]; then
+        # LAST RESORT. Only sacrifice the cache this build needs when free space
+        # is below the level at which the build could keep it.
+        if [ "${FREE_GB:-0}" -ge "${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}" ]; then
+          echo "== reclaimed to ${FREE_GB}GB free (>= ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB) — keeping the shared target dir, so this build stays warm."
+          break
+        fi
+      fi
       CAND_GB=$(du -sk "$cand" 2>/dev/null | awk '{print int($1/1048576)}')
       if [ "$cand" = "$HOME/.amux/rust-build-target" ]; then
-        echo "== DISK LOW: ${FREE_GB}GB free. Clearing the ${CAND_GB:-?}GB SHARED target dir — this build goes cold."
+        echo "== DISK LOW: ${FREE_GB}GB free (< ${AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB:-8}GB). Clearing the ${CAND_GB:-?}GB SHARED target dir — this build goes cold."
       else
         echo "== DISK LOW: ${FREE_GB}GB free. Clearing the ${CAND_GB:-?}GB idle e2e target dir first (this build does not need it)."
       fi
       # A seam so the ORDERING is testable without a 4GB fixture or a real build.
       [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" = "1" ] || rm -rf "$cand"
-      # Re-measure: if the idle cache was enough, never touch the one this build
-      # is about to use. Under dry-run there is nothing to re-measure, so keep
-      # listing candidates to show the full order.
+      # Re-measure between candidates: what the idle cache freed is what decides
+      # whether the shared one survives. Under dry-run there is nothing to
+      # re-measure, so keep listing candidates to show the full order.
       if [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" != "1" ]; then
         FREE_GB=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')
         if [ "${FREE_GB:-999}" -ge "${AMUX_BUILD_MIN_FREE_GB:-25}" ]; then
-          echo "== reclaimed to ${FREE_GB}GB free — the shared target dir is untouched, so this build stays warm."
+          echo "== reclaimed to ${FREE_GB}GB free — above the fleet floor, nothing further to clear."
           break
         fi
       fi
