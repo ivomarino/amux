@@ -3089,13 +3089,17 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
         <div class="card-stats" id="stats-${s.name}"></div>
         ${s.running ? `
         <div class="chips" id="card-chips-${s.name}"></div>
-        <div class="send-row" style="position:relative;">
+        <div class="peek-attach-bar card-attach-bar${(_cardFiles[s.name]||[]).length ? ' has-files' : ''}" id="card-attach-${s.name}">${_renderCardFileChips(s.name)}</div>
+        <div class="send-row" style="position:relative;" ondragover="cardDragOver(event)" ondragleave="cardDragLeave(event)" ondrop="cardDrop('${s.name}',event)">
           <div id="card-ac-${s.name}" class="ac-list slash-ac"></div>
+          <input type="file" id="cfile-${s.name}" multiple style="display:none" onchange="handleCardFileInput('${s.name}',event)">
+          <button class="card-attach-btn" title="Attach files (or drop / paste them here)" onclick="event.stopPropagation();document.getElementById('cfile-${s.name}').click()">&#x1F4CE;</button>
           <textarea class="send-input" id="input-${s.name}" rows="1"
             placeholder="Send to ${esc(s.name)}..." autocomplete="off" autocorrect="on"
             autocapitalize="sentences" spellcheck="true" enterkeyhint="enter"
             oninput="autoGrow(this);cardSlashAcUpdate('${s.name}');cmdHistoryReset();_draftSaveDebounced('${s.name}',this.value)"
             onkeydown="cardSlashAcKeydown('${s.name}',event)"
+            onpaste="handleCardPaste('${s.name}',event)"
             onbeforeinput="cardSlashAcBeforeInput('${s.name}',event)"></textarea>
           <div class="send-split${_sendMode === 'queue' ? ' mode-queue' : ''}"><button class="btn primary send-split-main" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => sendFromInput('${s.name}'))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => sendFromInput('${s.name}'))" onclick="_btnFire(event, () => sendFromInput('${s.name}'))">${_sendMode === 'queue' ? 'Queue' : 'Send'}</button><button class="btn primary send-split-arrow" onpointerdown="event.preventDefault()" onpointerup="_btnFire(event, () => _toggleSendMode(event))" ontouchstart="_btnTouchStart(event)" ontouchend="_btnTouchEnd(event, () => _toggleSendMode(event))" onclick="_btnFire(event, () => _toggleSendMode(event))" title="Switch send mode">&#x25BC;</button></div>
         </div>` : ''}
@@ -5493,18 +5497,29 @@ async function sendFromInput(name) {
   const inp = document.getElementById('input-' + name);
   if (!inp) return;
   const text = inp.value.trim();
-  if (!text) {
+  // Card attachments ride the message as inline @path refs, exactly like the
+  // peek composer (sendPeekCmd). Block while any is still uploading; a
+  // files-only send (no text) is allowed.
+  const _cf = _cardFiles[name] || [];
+  if (_cf.some(f => f.path == null)) { if (typeof showToast === 'function') showToast('Wait for upload to finish'); return; }
+  const _files = _cf.filter(f => f.path);
+  if (!text && _files.length === 0) {
     // Empty send = extract + submit the suggested prompt from the session
     inp.value = '';
     _submitSuggestion(name, false);
     return;
   }
-  const routed = _atRoute(text);
+  // No newlines: tmux treats \n as Enter, which would split the message and
+  // submit the path as its own line.
+  const _refs = _files.map(f => '@' + f.path).join(' ');
+  const msg = text ? (_refs ? text + ' ' + _refs : text) : _refs;
+  const routed = _atRoute(msg);
   if (routed) {
     // @mention opens a persistent channel drawer instead of fire-and-forget routing.
     // The message is pre-filled so the user can review/edit before sending.
     inp.value = '';
     inp.style.height = 'auto';
+    _clearCardFiles(name);
     channelOpen(name, routed.target, routed.message);
     return;
   }
@@ -5515,25 +5530,28 @@ async function sendFromInput(name) {
   // a waiting session needs the keystroke to land now, not at a turn boundary.
   const _atSel = (sessions.find(s => s.name === name) || {}).status === 'waiting';
   if (_sendMode === 'queue' && !_atSel) {
-    cmdHistoryAdd(text, { type: 'steering' });
+    cmdHistoryAdd(text || msg, { type: 'steering' });
     inp.value = '';
     _draftClear(name);
     inp.style.height = 'auto';
+    const _nf = _files.length;
+    _clearCardFiles(name);
     const splitMain = inp.closest('.panel, .card')?.querySelector('.send-split-main');
     if (splitMain) { splitMain.dataset.prevText = splitMain.textContent; splitMain.textContent = 'Queuing…'; splitMain.disabled = true; splitMain.style.opacity = '0.6'; }
-    await steerSession(name, _expandAtMentions(text));
+    await steerSession(name, _expandAtMentions(msg));
     if (splitMain) { splitMain.textContent = splitMain.dataset.prevText || 'Queue'; splitMain.disabled = false; splitMain.style.opacity = ''; }
     inp.style.borderColor = '#a371f7';
     setTimeout(() => { inp.style.borderColor = ''; }, 600);
     const sess = sessions.find(s => s.name === name);
     const cnt = _steerHumanCount(sess);
-    if (typeof showToast === 'function') showToast('Queued for ' + name + (cnt > 1 ? ' (' + cnt + ' in queue)' : ''));
+    if (typeof showToast === 'function') showToast('Queued for ' + name + (cnt > 1 ? ' (' + cnt + ' in queue)' : '') + (_nf ? ' · ' + _nf + ' file' + (_nf === 1 ? '' : 's') : ''));
     return;
   }
-  cmdHistoryAdd(text);
+  cmdHistoryAdd(text || msg);
   inp.value = '';
   _draftClear(name);          // it left the composer — a restored copy would be a ghost
   inp.style.height = 'auto';
+  _clearCardFiles(name);
   // OUTCOME FROM doSend, NOT FROM A FLAG SAMPLED BEFORE THE ATTEMPT (amux-cloud,
   // reviewing this card). `online` and "what the send actually did" are two different
   // facts and they diverge in reachable ways: an online fetch that THROWS gets queued
@@ -5545,7 +5563,7 @@ async function sendFromInput(name) {
   // Same defect as AMUX-2363 six commits earlier, inverted onto the client: there the
   // endpoint reported that it was REACHED rather than what it DID. doSend knows the
   // outcome; it was throwing it away and the caller was guessing.
-  const _outcome = await doSend(name, _expandAtMentions(text));
+  const _outcome = await doSend(name, _expandAtMentions(msg));
   // Same queue/send semantics as the peek composer. doSend() has always queued
   // correctly when offline; the worker list just never SAID which happened — a
   // 400ms green border reads identically for "delivered" and "sitting in a local
@@ -7779,7 +7797,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.681';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.682';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9902,6 +9920,82 @@ function _peekFilesRestore(session) {
   renderPeekFiles();
 }
 
+// ── Card-composer attachments (Ethan 2026-08-19: "upload files in card list view
+// just like the worker-details page"). The home list shows many worker cards at
+// once, each with its own composer, so attachments are keyed BY WORKER —
+// `_cardFiles[name]` — not a single global like the peek's `peekFiles`. Same
+// placeholder shape ({name, path, previewUrl, chunk, totalChunks, error}) and the
+// SAME chunked-upload core (via the upload sink), so a file attaches the same way
+// on both surfaces and rides the message as `@path` on send.
+let _cardFiles = {};   // worker name -> [{name, path, previewUrl, chunk, totalChunks, error}]
+
+// Repaint one card's attachment strip, throttled to a frame — a bulk drop calls
+// this after every chunk. Keyed by name so two cards uploading at once do not
+// stomp each other's rAF.
+let _cardFilesRAF = {};
+function _scheduleRenderCardFiles(name) {
+  if (_cardFilesRAF[name]) return;
+  _cardFilesRAF[name] = requestAnimationFrame(() => {
+    delete _cardFilesRAF[name];
+    renderCardFiles(name);
+  });
+}
+function renderCardFiles(name) {
+  const bar = document.getElementById('card-attach-' + name);
+  if (!bar) return;   // card not expanded / not running — state persists in _cardFiles
+  bar.innerHTML = _renderCardFileChips(name);
+  bar.classList.toggle('has-files', (_cardFiles[name] || []).length > 0);
+}
+function _renderCardFileChips(name) {
+  const files = _cardFiles[name] || [];
+  return files.map((f, i) => {
+    let thumb;
+    if (f.isImage && f.previewUrl) thumb = `<img src="${f.previewUrl}" alt="">`;
+    else thumb = `<span class="chip-icon">${_fileIcon(f.name)}</span>`;
+    let status;
+    if (f.path) status = `<span style="color:var(--green);font-size:0.75rem;">✓</span>`;
+    else if (f.error) status = `<span class="chip-err" title="${esc(f.error)}">!</span>`;
+    else { const pct = f.totalChunks ? Math.round(f.chunk / f.totalChunks * 100) : 0;
+           status = `<span style="color:var(--dim);font-size:0.6rem;">${pct}%</span>`; }
+    // The × is on EVERY chip in EVERY state — an escape hatch that only exists
+    // once an upload finishes is not one (the peek's own AMUX-85 lesson).
+    const rm = `<span class="chip-remove" onclick="event.stopPropagation();removeCardFile('${name}',${i})" title="Remove">×</span>`;
+    return `<div class="peek-attach-chip${f.path ? '' : (f.error ? ' failed' : ' uploading')}">${thumb}<span class="chip-name">${esc(f.name)}</span>${status}${rm}</div>`;
+  }).join('');
+}
+function handleCardFileInput(name, e) {
+  for (const f of e.target.files) _enqueueUpload(f, _cardSink(name));
+  e.target.value = '';   // let the same file be re-picked after a remove
+}
+function removeCardFile(name, idx) {
+  const a = _cardFiles[name] || [];
+  const f = a[idx];
+  if (!f) return;
+  if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+  a.splice(idx, 1);
+  renderCardFiles(name);
+}
+function _clearCardFiles(name) {
+  (_cardFiles[name] || []).forEach(f => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+  delete _cardFiles[name];
+  renderCardFiles(name);
+}
+// Drop files onto a card's composer. Scoped to the send-row, not the whole card,
+// so it never fights the card's drag-to-reorder. Files only — a text/URL drag
+// falls through untouched.
+function cardDragOver(e) {
+  if (![...(e.dataTransfer && e.dataTransfer.types || [])].includes('Files')) return;
+  e.preventDefault(); e.stopPropagation();
+  e.currentTarget.classList.add('card-drop-over');
+}
+function cardDragLeave(e) { e.currentTarget.classList.remove('card-drop-over'); }
+function cardDrop(name, e) {
+  if (![...(e.dataTransfer && e.dataTransfer.types || [])].includes('Files')) return;
+  e.preventDefault(); e.stopPropagation();
+  e.currentTarget.classList.remove('card-drop-over');
+  for (const f of (e.dataTransfer.files || [])) _enqueueUpload(f, _cardSink(name));
+}
+
 const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk
 
 // Concurrency-limited upload queue: max 4 simultaneous uploads so bulk drops
@@ -9909,15 +10003,35 @@ const CHUNK_SIZE = 5 * 1024 * 1024; // 5 MB per chunk
 const _UPLOAD_CONCURRENCY = 4;
 let _uploadQueue = [];
 let _uploadActive = 0;
-function _enqueueUpload(file) {
-  _uploadQueue.push(file);
+// An upload SINK: where a placeholder lives while it uploads and how to repaint
+// it. The peek composer and each home card are separate sinks, so a file lands in
+// the surface it was dropped/pasted/picked on. This is the one seam that lets the
+// card list reuse the chunked-upload core instead of copying it.
+function _peekSink() {
+  return {
+    push: (p) => peekFiles.push(p),
+    has: (p) => peekFiles.indexOf(p) >= 0,
+    drop: (p) => { const i = peekFiles.indexOf(p); if (i >= 0) peekFiles.splice(i, 1); },
+    render: _scheduleRenderPeekFiles,
+  };
+}
+function _cardSink(name) {
+  return {
+    push: (p) => (_cardFiles[name] = _cardFiles[name] || []).push(p),
+    has: (p) => (_cardFiles[name] || []).indexOf(p) >= 0,
+    drop: (p) => { const a = _cardFiles[name] || []; const i = a.indexOf(p); if (i >= 0) a.splice(i, 1); },
+    render: () => _scheduleRenderCardFiles(name),
+  };
+}
+function _enqueueUpload(file, sink) {
+  _uploadQueue.push({ file, sink: sink || _peekSink() });
   _drainUploadQueue();
 }
 function _drainUploadQueue() {
   while (_uploadQueue.length && _uploadActive < _UPLOAD_CONCURRENCY) {
     _uploadActive++;
-    const f = _uploadQueue.shift();
-    uploadAndAttach(f).finally(() => { _uploadActive--; _drainUploadQueue(); });
+    const { file, sink } = _uploadQueue.shift();
+    uploadAndAttach(file, sink).finally(() => { _uploadActive--; _drainUploadQueue(); });
   }
 }
 
@@ -9933,7 +10047,8 @@ function _scheduleRenderPeekFiles() {
   }
 }
 
-async function uploadAndAttach(file) {
+async function uploadAndAttach(file, sink) {
+  sink = sink || _peekSink();
   const isImage = file.type.startsWith('image/');
   let previewUrl = null;
   if (isImage && file.size < 10 * 1024 * 1024) previewUrl = URL.createObjectURL(file);
@@ -9946,9 +10061,9 @@ async function uploadAndAttach(file) {
   // numeric index goes stale and the finished file writes to the wrong slot or a
   // placeholder never gets its .path (send then stalls on "wait for upload").
   const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB, chunk: 0, totalChunks };
-  peekFiles.push(placeholder);
-  _scheduleRenderPeekFiles();
-  const _present = () => peekFiles.indexOf(placeholder) >= 0;
+  sink.push(placeholder);
+  sink.render();
+  const _present = () => sink.has(placeholder);
 
   try {
     const startR = await fetch(API + '/api/upload/start', {
@@ -9975,7 +10090,7 @@ async function uploadAndAttach(file) {
         throw new Error(d.error || 'chunk ' + i + ' failed');
       }
       placeholder.chunk = i + 1;
-      _scheduleRenderPeekFiles();
+      sink.render();
     }
 
     const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST' });
@@ -9987,10 +10102,9 @@ async function uploadAndAttach(file) {
   } catch(e) {
     console.error('Upload error:', e);
     showToast('Upload failed: ' + e.message);
-    const i = peekFiles.indexOf(placeholder);
-    if (i >= 0) peekFiles.splice(i, 1);
+    sink.drop(placeholder);
   }
-  _scheduleRenderPeekFiles();
+  sink.render();
 }
 
 function handlePeekFileInput(e) {
@@ -10008,6 +10122,21 @@ function handlePeekPaste(e) {
     if (item.kind === 'file') {
       e.preventDefault();
       _enqueueUpload(item.getAsFile());
+      return;
+    }
+  }
+}
+
+// Paste a file into a card's composer — the card analog of handlePeekPaste. The
+// document-level paste handler bails when a textarea is focused, so a pasted
+// screenshot needs this per-card hook to reach the upload sink.
+function handleCardPaste(name, e) {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.kind === 'file') {
+      e.preventDefault();
+      _enqueueUpload(item.getAsFile(), _cardSink(name));
       return;
     }
   }
