@@ -1305,6 +1305,11 @@ impl Runtime {
         body: &str,
         now: DateTime<Utc>,
     ) -> anyhow::Result<()> {
+        // Redact secret shapes before the prompt reaches the fleet-readable board
+        // — title AND desc both derive from `body` (AMUX-3384). Same helper the
+        // send-path capture uses, so the two sites cannot drift on what leaks.
+        let redacted = crate::api::session_verbs::redact_prompt_secrets(body);
+        let body = redacted.as_str();
         let Some(title) = amux_core::board::title_from_prompt(body) else {
             return Ok(()); // steering, not a task
         };

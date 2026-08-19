@@ -2673,12 +2673,78 @@ const DUP_DELIVERY_WINDOW_MS: i64 = 120_000;
 /// atomic; the self-description STEER nudge stays orchestrator-only (it needs an
 /// async enqueue), but the durable `needs-self-description` TAG is set here so a
 /// needy card is still findable.
+/// Redact secret-shaped substrings before a prompt is written to the FLEET-
+/// READABLE board (AMUX-3384: a NetSuite login password a user typed was
+/// auto-captured verbatim into a shared card title+desc; any session GETs
+/// /api/board/<id>). Deliberately over-eager — masking a rare long identifier is
+/// fine, a credential transiting shared state is not. It kills the LABELLED
+/// (`password: …`, `secret=…`), the KNOWN-PREFIX (sk-/ghp_/AKIA/JWT…), the PEM
+/// and the long HIGH-ENTROPY shapes. It CANNOT catch a bare, unlabelled,
+/// low-entropy password — the inherent limit of pattern redaction — so it is a
+/// mitigation, not a guarantee. Applied at BOTH capture sites (this one and the
+/// orchestrator's capture_prompt_card) via the body they both derive title+desc
+/// from.
+pub(crate) fn redact_prompt_secrets(s: &str) -> String {
+    if s.is_empty() {
+        return String::new();
+    }
+    let mut out = s.to_string();
+    // 1. Labelled secrets: keep the label + separator, mask the value. The label
+    //    match allows an env-var-style prefix/suffix (AWS_SECRET_ACCESS_KEY=…),
+    //    where `\b` fails because `_` is a word char. Separators: `= : := is was`.
+    let kv = cached_re!(
+        r"(?i)([A-Za-z0-9]*(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|private[_-]?key|client[_-]?secret|credential)[A-Za-z0-9_]*)([ \t]*(?:[:=]|:=|is|was)[ \t]*)(\S{3,})"
+    );
+    out = kv.replace_all(&out, "${1}${2}[REDACTED]").to_string();
+    // 1b. `Authorization: Bearer <token>` / bare `Bearer <token>`.
+    let bearer = cached_re!(r"(?i)\bbearer[ \t]+([A-Za-z0-9._~+/\-]{8,}=*)");
+    out = bearer.replace_all(&out, "Bearer [REDACTED]").to_string();
+    // 2. Known token prefixes (stripe / github / aws / slack / google / openai / JWT).
+    let pref = cached_re!(
+        r"(?i)\b(sk-[A-Za-z0-9]{20,}|sk_(?:live|test)_[A-Za-z0-9]{16,}|pk_(?:live|test)_[A-Za-z0-9]{16,}|rk_(?:live|test)_[A-Za-z0-9]{16,}|ghp_[A-Za-z0-9]{20,}|gh[opsu]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|A[KS]IA[0-9A-Z]{12,}|AIza[0-9A-Za-z_\-]{30,}|ya29\.[A-Za-z0-9_\-]{20,}|eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]+)\b"
+    );
+    out = pref.replace_all(&out, "[REDACTED]").to_string();
+    // 3. PEM private-key blocks.
+    let pem = cached_re!(r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----");
+    out = pem.replace_all(&out, "[REDACTED PRIVATE KEY]").to_string();
+    // 4. Long high-entropy runs (>=44 chars, past a 40-hex git sha) that MIX case
+    //    or carry base64 punctuation — real keys, not prose or a plain hash.
+    let tok = cached_re!(r"[A-Za-z0-9+/_-]{44,}={0,2}");
+    out = tok
+        .replace_all(&out, |c: &regex::Captures| {
+            let m = &c[0];
+            let has_upper = m.bytes().any(|b| b.is_ascii_uppercase());
+            let has_lower = m.bytes().any(|b| b.is_ascii_lowercase());
+            let has_punct = m.bytes().any(|b| matches!(b, b'+' | b'/' | b'=' | b'-'));
+            if (has_upper && has_lower) || has_punct {
+                "[REDACTED]".to_string()
+            } else {
+                m.to_string() // pure-hex / single-case run (git sha, hex hash): leave it
+            }
+        })
+        .to_string();
+    out
+}
+
 fn mint_capture_card(
     conn: &rusqlite::Connection,
     session_name: &str,
     body: &str,
     now_ms: i64,
 ) -> rusqlite::Result<Option<crate::db::board_store::IssueRow>> {
+    // Redact secret shapes BEFORE anything derives a title/desc from the prompt —
+    // both come from `body`, and the board is fleet-readable (AMUX-3384).
+    let redacted = redact_prompt_secrets(body);
+    if redacted != body {
+        // Surface that the control FIRED (two-fixes rule) without logging the
+        // value — so a sweep can confirm redaction is active and see how often a
+        // secret is typed. grep "ledger: redacted secret".
+        tracing::info!(
+            session = %session_name,
+            "ledger: redacted secret-shaped content from a captured prompt before carding (AMUX-3384)"
+        );
+    }
+    let body = redacted.as_str();
     let Some(title) = amux_core::board::title_from_prompt(body) else {
         return Ok(None); // steering / control / [no-board] — mint nothing
     };
@@ -12691,6 +12757,40 @@ mod tests {
 
         // An invalid name never resolves to a launch.
         assert!(start_block_reason("bad/name", &parse_env("bad/name")).unwrap().contains("invalid"));
+    }
+
+    /// AMUX-3384: the prompt auto-capture must not write a typed credential into a
+    /// fleet-readable board card. redact_prompt_secrets masks the credential
+    /// shapes (labelled, known-prefix, bearer, PEM, high-entropy) and leaves
+    /// ordinary prose — and a git sha — alone.
+    #[test]
+    fn redact_prompt_secrets_masks_credentials_and_spares_prose() {
+        let r = redact_prompt_secrets;
+        // Fake secrets are assembled from PARTS so the repo secret-scanner does
+        // not flag this test's source — the strings exist only at runtime.
+        // The reported case: a labelled password. Value gone, label kept.
+        let out = r("keep the netsuite password: Hunter2Winter! in the private repo");
+        assert!(out.contains("[REDACTED]") && !out.contains("Hunter2Winter!"), "{out}");
+        assert!(out.contains("password"), "the label stays so the card still reads: {out}");
+        // env-var assignment (underscored name, where \b would fail).
+        let envval = "wJalrXUtnFEMIabcdefEXAMPLEKEY99";
+        assert!(!r(&format!("set AWS_SECRET_ACCESS_KEY={envval} now")).contains(envval), "env-var secret");
+        // Known token prefixes.
+        let sk = format!("sk-{}", "ABCdef0123456789ABCdef0123");
+        assert!(!r(&format!("here is {sk} ok")).contains(&sk), "stripe/openai");
+        let ghp = format!("gh{}_{}", "p", "ABCdefGHIjkl0123456789ABCdefGHI");
+        assert!(!r(&format!("token {ghp} x")).contains(&ghp), "github pat");
+        let aws = format!("AK{}IOSFODNN7EXAMPLE", "IA");
+        assert!(!r(&format!("use {aws} for aws")).contains(&aws), "aws key id");
+        // Bearer token (with dots).
+        let jwt = format!("Bearer ey{}.ey{}.abcDEF123", "JhbGciOi", "JzdWIiOi");
+        assert!(!r(&format!("Authorization: {jwt} done")).contains("JhbGciOi"), "bearer/jwt");
+        // Ordinary prose is untouched.
+        let clean = "fix the login bug in auth.rs and rerun the tests";
+        assert_eq!(r(clean), clean, "prose must not be redacted");
+        // A 40-hex git sha survives (single-case, no punct, < 44 chars).
+        let sha = "revert a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2 please";
+        assert_eq!(r(sha), sha, "git sha must survive: {}", r(sha));
     }
 
     /// Ethan, 2026-08-11: worker-to-worker messaging is intra-group unless
