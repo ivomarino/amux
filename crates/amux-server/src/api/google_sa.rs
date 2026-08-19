@@ -48,6 +48,19 @@ pub fn sa_config() -> Option<(String, String)> {
     Some((get("GOOGLE_SA_KEY_FILE")?, get("GOOGLE_SA_SUBJECT")?))
 }
 
+/// True only when the SA is configured AND its key file actually EXISTS — i.e. a
+/// mint can be attempted. `sa_config().is_some()` means the config is SET; the
+/// file behind it can go missing (it did — GOOGLE_SA_KEY_FILE pointed at an
+/// ephemeral `~/.amux/uploads/…` copy that got cleaned up, so the connector read
+/// "connected" while every mint 502'd, AMUX-3383). Status/usable checks that gate
+/// on "can we mint" must use THIS, not `sa_config().is_some()`, or they report a
+/// key that no longer exists as connected (ethos rule 4).
+pub fn sa_usable() -> bool {
+    sa_config()
+        .map(|(path, _)| std::path::Path::new(&path).exists())
+        .unwrap_or(false)
+}
+
 /// A minted impersonated access token and the seconds until Google expires it.
 /// The token is a SECRET — never log it.
 pub struct MintedToken {
@@ -132,4 +145,38 @@ pub async fn mint_token_as(scope: &str, subject: &str) -> Result<MintedToken, St
         access_token,
         expires_in,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// AMUX-3383: a configured-but-missing SA key file must read as NOT usable.
+    /// `sa_config().is_some()` only means the config is set; the file behind
+    /// GOOGLE_SA_KEY_FILE can be gone (it pointed at an ephemeral uploads copy
+    /// that got cleaned up), and the connector reading "connected" off it while
+    /// every mint 502'd is the dishonest status this guards against.
+    #[test]
+    fn sa_usable_requires_the_key_file_to_exist_not_just_be_configured() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let key = dir.path().join("dpa-sa.json");
+        let env = dir.path().join("server.env");
+
+        // Configured, but the key file is MISSING -> Some config, NOT usable.
+        std::fs::write(
+            &env,
+            format!(
+                "GOOGLE_SA_KEY_FILE={}\nGOOGLE_SA_SUBJECT=ethan@mixpeek.com\n",
+                key.display()
+            ),
+        )
+        .unwrap();
+        assert!(sa_config().is_some(), "config is set");
+        assert!(!sa_usable(), "a missing key file is NOT usable");
+
+        // Key file present -> usable.
+        std::fs::write(&key, "{}").unwrap();
+        assert!(sa_usable(), "an existing key file is usable");
+    }
 }

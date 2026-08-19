@@ -320,8 +320,13 @@ async fn list() -> Response {
                 ),
             };
             // A Google connector backed by the service-account domain-wide
-            // delegation is usable with no per-user grant (AMUX-3347).
-            let sa_available = p.category == "Google" && super::google_sa::sa_config().is_some();
+            // delegation is usable with no per-user grant (AMUX-3347) — but ONLY
+            // if the key file still exists. sa_usable() checks that; reading
+            // "connected" off a configured-but-missing key is the dishonest
+            // status that turned a moved key into a silent 502 (AMUX-3383).
+            let sa_configured = p.category == "Google" && super::google_sa::sa_config().is_some();
+            let sa_available = p.category == "Google" && super::google_sa::sa_usable();
+            let sa_key_gone = sa_configured && !sa_available;
             // Status ladder, most-blocked first.
             let status = if sa_available {
                 "connected"
@@ -356,6 +361,14 @@ async fn list() -> Response {
                 // which for an OAuth-broker-pending connector is not yet usable.
                 "usable": !token_endpoint.is_null(),
                 "token_endpoint": token_endpoint,
+                // Name the exact failure when the SA is configured but its key
+                // file is gone, so the connectors UI (and a session) sees a
+                // config problem instead of concluding the whole provider is down.
+                "detail": if sa_key_gone {
+                    json!("Service-account key file is configured but missing on disk — re-paste the key or fix GOOGLE_SA_KEY_FILE in server.env")
+                } else {
+                    Value::Null
+                },
                 "setup_note": p.setup_note,
                 "docs": p.docs,
             })
