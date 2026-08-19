@@ -26,6 +26,16 @@ will carry your entry upstream — append to a clone that is current instead. Th
 SessionStart freshness hook now says this out loud when it applies, because a
 rule that only asks you to remember is the kind ethos rule 6 warns about.
 
+And if this file itself has already diverged both ways — your local appends AND
+origin-only entries a peer landed (AMUX-3367, seen live on the Mixpeek
+FRUSTRATIONS.md) — do NOT reach for either single-arm git remedy: `git add` +
+commit REVERTS the peer's entries, `git checkout origin/main -- <file>` DELETES
+yours, and the direction test cannot separate them because BOTH are true at once.
+UNION-MERGE: `git checkout origin/main -- <file>` to take origin's version, then
+RE-APPEND your entries on top and commit. The idle commit-nudge now prints this
+directive by name when a dirty append-only file is in the set, but the operation
+is yours to run.
+
 This is not a diary. It is the input to deciding what to fix next, so it has to be
 greppable and it has to be honest about cost.
 

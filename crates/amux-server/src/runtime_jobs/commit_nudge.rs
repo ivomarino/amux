@@ -240,6 +240,47 @@ pub fn build(
 /// rendered under the ownership axis (mine / unknown / foreign / shared). Returns
 /// the message WITHOUT the trailing provenance so [`build`] can stamp it exactly
 /// once across a STALE section and this body.
+/// An append-only, multi-writer shared file — `frustrations.md` is the canonical
+/// one (matched case-insensitively; macOS resolves FRUSTRATIONS.md to the same
+/// file). Its whole failure mode is that the two direction remedies this nudge
+/// prescribes BOTH lose data on it, so it needs its own directive.
+fn is_append_only_shared(path: &str) -> bool {
+    std::path::Path::new(path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(path)
+        .eq_ignore_ascii_case("frustrations.md")
+}
+
+/// The union-merge directive for any append-only shared file in the dirty set,
+/// or None if there is none. Appended to whichever nudge fires (AMUX-3367): an
+/// append-only file can be NOVEL AND STALE at once — you appended locally while a
+/// peer landed different entries on origin — so committing the path REVERTS the
+/// peer's entries and restoring DELETES yours. The direction test cannot separate
+/// these because both are true, so name the file and prescribe the only safe
+/// operation, which neither generic remedy performs.
+fn append_only_note(dirty: &[String]) -> Option<String> {
+    let mut ao: Vec<&str> = dirty
+        .iter()
+        .map(String::as_str)
+        .filter(|p| is_append_only_shared(p))
+        .collect();
+    ao.sort();
+    ao.dedup();
+    if ao.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "\n\nAPPEND-ONLY SHARED FILE — {} can be NOVEL AND STALE at once (you and a peer \
+         appended to different bases), so BOTH remedies above lose data on it: committing the \
+         path REVERTS the peer's origin-only entries, `git checkout origin/main -- <path>` \
+         DELETES yours. UNION-MERGE instead — `git checkout origin/main -- <path>` to take their \
+         version, then RE-APPEND your entries and commit. Never a plain add/commit or a bare \
+         restore (AMUX-3367).",
+        ao.join(", ")
+    ))
+}
+
 fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
     if dirty.is_empty() {
         return None;
@@ -307,6 +348,9 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
         );
         if let Some(why) = &own.partial {
             m.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
+        }
+        if let Some(note) = append_only_note(dirty) {
+            m.push_str(&note);
         }
         return Some(m);
     }
@@ -392,6 +436,9 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
             who.into_iter().collect::<Vec<_>>().join("/"),
             it
         ));
+    }
+    if let Some(note) = append_only_note(dirty) {
+        msg.push_str(&note);
     }
     Some(msg)
 }
@@ -1595,6 +1642,31 @@ mod tests {
         let msg = build("/repo", &dirty, &Ownership::default(), &fresh, "test-provenance").unwrap();
         assert!(msg.contains("2 uncommitted change(s)"), "both NEW and EDITED are commit-worthy: {msg}");
         assert!(msg.contains("added.rs") && msg.contains("changed.rs"), "{msg}");
+    }
+
+    /// AMUX-3367: an append-only multi-writer file (frustrations.md) can diverge
+    /// BOTH ways at once, so the nudge's "commit the path" / "restore" advice both
+    /// lose data on it. A dirty frustrations.md must therefore get an explicit
+    /// UNION-MERGE directive, and a dirty set without one must not.
+    #[test]
+    fn an_append_only_shared_file_gets_a_union_merge_directive() {
+        // Case-insensitive basename, any directory, ONLY frustrations.md.
+        assert!(is_append_only_shared("frustrations.md"));
+        assert!(is_append_only_shared("FRUSTRATIONS.md")); // macOS resolves to the same file
+        assert!(is_append_only_shared("deep/path/frustrations.md"));
+        assert!(!is_append_only_shared("frustrations.md.bak"));
+        assert!(!is_append_only_shared("src/app.js"));
+
+        let dirty = s(&["frustrations.md", "app.js"]);
+        let msg = commit_worthy_body("/repo", &dirty, &Ownership::default()).unwrap();
+        assert!(msg.contains("APPEND-ONLY SHARED FILE"), "{msg}");
+        assert!(msg.contains("UNION-MERGE"), "{msg}");
+        assert!(msg.contains("frustrations.md"), "{msg}");
+
+        // No append-only file in the set -> no such block.
+        let plain = s(&["app.js", "main.rs"]);
+        let msg2 = commit_worthy_body("/repo", &plain, &Ownership::default()).unwrap();
+        assert!(!msg2.contains("APPEND-ONLY SHARED FILE"), "{msg2}");
     }
 
     /// THE EXIT-CODE DISCRIMINATOR, against a real repo (MG-1467). The classifier
