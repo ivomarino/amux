@@ -1158,7 +1158,12 @@
   }
   .fe-tb-btn:hover { background: var(--hover); color: var(--text); }
   .fe-tb-btn.active { background: var(--accent); color: #fff; border-color: var(--accent); }
-  .fe-tb-actions { display: contents; }
+  /* The labeled action row (Home / New Folder / New File / New .mdai / Upload /
+     Refresh / Set dir) is collapsed into the ⋯ More menu on EVERY width (Ethan
+     2026-08-19: "these take up too much space make it an ellipse dropdown"). The
+     More menu already carries every one of these actions, so nothing is lost —
+     the toolbar is just Back / Up / breadcrumb / ⋯ now. */
+  .fe-tb-actions { display: none; }
   /* The More (ellipsis) menu is always available, on desktop and mobile. */
   .fe-tb-overflow { position: relative; flex-shrink: 0; display: flex; }
   .fe-tb-overflow-menu {
@@ -1178,9 +1183,8 @@
   .fe-tb-oitem-session { color: var(--accent); font-weight: 600; }
   .fe-tb-odivider { height: 1px; background: var(--border); margin: 3px 0; }
   @media (max-width: 600px) {
-    /* Primary labeled actions collapse into the More menu; the path bar and the
-       More button are all that stay in the toolbar, so it fits a 375px screen. */
-    .fe-tb-actions { display: none; }
+    /* .fe-tb-actions is already display:none at every width (above); on a phone
+       we also drop the "More" text so only the ⋯ icon remains, to fit 375px. */
     .fe-more-lbl { display: none; }
   }
   .fe-breadcrumb {
