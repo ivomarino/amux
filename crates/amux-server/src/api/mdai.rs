@@ -590,14 +590,16 @@ struct RunRow {
     model: String,
     cached: bool,
     session: Option<String>,
+    /// Model-call wall time; None on cached rows (no call happened).
+    dur_ms: Option<i64>,
 }
 
 fn record_run(store: &Store, row: RunRow) -> Result<(), MdaiError> {
     store
         .write(move |conn| {
             conn.execute(
-                "INSERT INTO mdai_runs (path, ts, inputs_hash, output, model, cached, session)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO mdai_runs (path, ts, inputs_hash, output, model, cached, session, dur_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 rusqlite::params![
                     row.path,
                     row.ts,
@@ -605,7 +607,8 @@ fn record_run(store: &Store, row: RunRow) -> Result<(), MdaiError> {
                     row.output,
                     row.model,
                     row.cached as i64,
-                    row.session
+                    row.session,
+                    row.dur_ms
                 ],
             )?;
             Ok(WriteOutcome { applied: true, events: vec![] })
@@ -752,16 +755,31 @@ fn run_node(ctx: &mut RunCtx, abs_path: &Path) -> Result<String, MdaiError> {
 
     // Cache short-circuit: an unchanged node reuses its last output rather than
     // spending a model call to reproduce an identical result.
-    let (output, cached) = match latest_run(ctx.store, &rel) {
-        Some((prev_hash, prev_out)) if prev_hash == inputs_hash => (prev_out, true),
+    let (output, cached, dur_ms) = match latest_run(ctx.store, &rel) {
+        Some((prev_hash, prev_out)) if prev_hash == inputs_hash => (prev_out, true, None),
         _ => {
             let prompt = build_prompt(&doc.body, &assembled);
             ctx.calls += 1;
+            // The chain's latency used to be INVISIBLE (AMUX-3410): zero log
+            // lines and nothing in mdai_runs said where the time went, so a
+            // "why is this slow" was answered by reconstructing timings from
+            // adjacent rows' timestamps. Measured while fixing it: a bare CLI
+            // boot is ~10.6s and a 256KB-prompt haiku synthesis ~80s, so the
+            // prompt (source size), not the CLI spawn, is the cost to watch —
+            // which is exactly what prompt_bytes in this line lets a reader
+            // see without re-measuring.
+            let t0 = std::time::Instant::now();
             let out = ctx
                 .model
                 .complete(&model_name, &prompt)
                 .map_err(MdaiError::Model)?;
-            (out, false)
+            let dur = t0.elapsed().as_millis() as i64;
+            tracing::info!(
+                path = %rel, model = %model_name,
+                prompt_bytes = prompt.len(), output_bytes = out.len(), dur_ms = dur,
+                "mdai node model call completed"
+            );
+            (out, false, Some(dur))
         }
     };
 
@@ -776,6 +794,7 @@ fn run_node(ctx: &mut RunCtx, abs_path: &Path) -> Result<String, MdaiError> {
             model: model_name.clone(),
             cached,
             session: ctx.session.clone(),
+            dur_ms,
         },
     )?;
 
@@ -995,7 +1014,7 @@ async fn history(State(state): State<AppState>, Query(q): Query<HashMap<String, 
         let conn = store.read().map_err(|e| e.to_string())?;
         let mut stmt = conn
             .prepare(
-                "SELECT id, path, ts, inputs_hash, output, model, cached, session
+                "SELECT id, path, ts, inputs_hash, output, model, cached, session, dur_ms
                  FROM mdai_runs WHERE path=?1 ORDER BY id DESC",
             )
             .map_err(|e| e.to_string())?;
@@ -1009,6 +1028,7 @@ async fn history(State(state): State<AppState>, Query(q): Query<HashMap<String, 
                     "output": r.get::<_, String>(4)?,
                     "model": r.get::<_, String>(5)?,
                     "cached": r.get::<_, i64>(6)? != 0,
+                    "dur_ms": r.get::<_, Option<i64>>(8)?,
                     "session": r.get::<_, Option<String>>(7)?,
                 }))
             })
