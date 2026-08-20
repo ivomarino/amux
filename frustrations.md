@@ -2169,7 +2169,7 @@ FIX: The CLI cannot know what landed when the server sends no JSON, so it must s
 ## POST /api/browser/start accepts unknown fields and silently ignores them
 AREA: browser
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-20
 SESSION: amux
 CARD: AMUX-3403
@@ -2189,3 +2189,8 @@ FIX: start (and action) should reject or at least echo unknown top-level fields 
   for exactly this (cold-outbound's PATCH entry). Alternatively accept viewport/device at
   start and apply it after launch, which is what both of my guesses assumed the contract
   was.
+  FIXED 2e78f49 — both halves: device/width+height are real start fields now, applied to
+  the just-opened tab via the same CDP call the viewport action uses (validated before
+  launch; apply failure degrades to viewport_error, never fails the start), and every
+  other unknown field is captured by a serde flatten and echoed as ignored_fields with a
+  note. Live-verified with the exact wrong call that motivated the entry.
