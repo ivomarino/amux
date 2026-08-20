@@ -235,6 +235,13 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
         }
     };
     let mut rows: Vec<serde_json::Value> = Vec::new();
+    // A query that FAILS must not render as "there were never any outages".
+    // Caught live on AF-99: with migrations 0022/0023 written but not registered,
+    // `requests_during` did not exist, prepare() failed, and this endpoint served
+    // `"outages": []` — which is exactly what a healthy server with no history
+    // looks like. I read that as the false row having been corrected. An empty
+    // list and a broken query must be distinguishable (ethos rule 4).
+    let mut query_error: Option<String> = None;
     if let Ok(mut stmt) = conn.prepare(
         "SELECT down_from, up_at, seconds, port, requests_during FROM server_downtime \
          ORDER BY up_at DESC LIMIT 100",
@@ -262,7 +269,15 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
             }))
         }) {
             rows.extend(it.filter_map(|r| r.ok()));
+        } else {
+            query_error = Some("server_downtime rows could not be read".into());
         }
+    } else {
+        query_error = Some(
+            "server_downtime could not be queried — the schema is older than this \
+             binary expects (is a migration unregistered or unapplied?)"
+                .into(),
+        );
     }
     let last_beat: Option<f64> = conn
         .query_row("SELECT beat_at FROM server_heartbeat WHERE id = 1", [], |r| r.get(0))
@@ -284,5 +299,8 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
         "last_beat_at": last_beat.map(crate::api::request_log::local_when),
         "this_boot_followed_downtime_s": crate::runtime_jobs::heartbeat::boot_gap().map(|g| g.seconds),
         "outages": rows,
+        // Present ONLY when the read failed, so a consumer can tell an empty
+        // history from an unreadable one.
+        "error": query_error,
     }))
 }
