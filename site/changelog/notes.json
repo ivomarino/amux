@@ -1,5 +1,32 @@
 [
   {
+    "hash": "e58c085",
+    "short": "e58c085",
+    "title": "Email read-back shows your sent copy, not Gmail's rewritten version",
+    "date": "2026-08-20",
+    "type": "fix",
+    "tags": ["email", "gmail", "api"],
+    "description": "When you read back a message you just sent via /api/email/message/<id>, you now see the exact content you sent \u2014 not the Gmail-rewritten delivered copy, which could strip formatting or alter structure. Affects outbound read-back for all Gmail-connected accounts. Useful for confirming exactly what your agent sent before acting on the reply."
+  },
+  {
+    "hash": "2e78f49",
+    "short": "2e78f49",
+    "title": "Browser automation start echoes ignored fields and accepts a viewport parameter",
+    "date": "2026-08-19",
+    "type": "fix",
+    "tags": ["browser", "automation", "api"],
+    "description": "POST /api/browser/start now returns an ignored_fields list when you pass unrecognized parameters, so a wrong guess reads as a debugging hint rather than a silent no-op. Also adds a viewport parameter ({width, height}) so you can set screen dimensions at launch \u2014 useful for responsive layout testing and screenshots at specific breakpoints."
+  },
+  {
+    "hash": "a1c5be1",
+    "short": "a1c5be1",
+    "title": "Email reply audit rows now carry to/subject fields like send rows",
+    "date": "2026-08-19",
+    "type": "fix",
+    "tags": ["email", "audit", "api"],
+    "description": "The email send audit log (GET /api/email/log) previously showed blank to and subject fields for replies \u2014 only direct sends were fully attributed. Reply rows now carry the recipient and subject thread, so the audit trail is consistent whether your agent sent a fresh email or replied in a thread."
+  },
+  {
     "hash": "168f311c",
     "short": "168f311",
     "title": "BM25 board search \u2014 full-text relevance ranking with match highlighting",
