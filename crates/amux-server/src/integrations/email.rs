@@ -1152,6 +1152,17 @@ impl GmailClient {
         res["orig_thread_id"] =
             json!(if thread_id.is_empty() { orig_thread_id } else { thread_id });
         res["threaded"] = json!(threaded);
+        // Resolved envelope back to the caller (GT-58): the send-audit ledger
+        // must record WHO a reply went to and under WHAT subject — reply rows
+        // logged both as null while send rows carried them, so AMUX-1897
+        // forensics could not attribute any reply to a recipient. Both are
+        // computed right here for the RFC822 headers; returning them costs
+        // nothing and spares every caller a re-resolve of the anchor message.
+        res["to"] = json!(plan.to);
+        res["subject"] = json!(plan.subject);
+        if !plan.cc.is_empty() {
+            res["cc"] = json!(plan.cc);
+        }
         Ok(res)
     }
 
@@ -2025,6 +2036,10 @@ mod tests {
             .unwrap();
         assert_eq!(res["threaded"], json!(true));
         assert_eq!(res["orig_thread_id"], json!("T1"));
+        // GT-58: the resolved envelope comes back so the audit ledger can
+        // record recipient + subject for a reply, not just for a send.
+        assert_eq!(res["to"], json!("p@customer.com"));
+        assert_eq!(res["subject"], json!("Re: Deal"));
         let calls = http.calls.lock().unwrap();
         let (_, _, body) = calls.iter().find(|(m, u, _)| m == "POST" && u.contains("/messages/send")).unwrap();
         let body = body.as_ref().unwrap();

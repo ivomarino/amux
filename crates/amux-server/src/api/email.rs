@@ -532,6 +532,13 @@ pub async fn reply(
                     ctx.client.home(),
                     json!({
                         "endpoint": "reply", "via": "gmail", "from": gmail_from,
+                        // Resolved by reply_send from the anchor message (GT-58):
+                        // without these, no ledger consumer could attribute a
+                        // reply to a recipient (AMUX-1897), and gtm's corrective
+                        // sender had to confirm sends via Sent-mailbox search.
+                        "to": res.get("to").cloned().unwrap_or(Value::Null),
+                        "cc": res.get("cc").cloned().unwrap_or(Value::Null),
+                        "subject": res.get("subject").cloned().unwrap_or(Value::Null),
                         "in_reply_to": message_id, "reply_all": reply_all,
                         "body_chars": reply_body.chars().count(),
                         "body_preview": reply_body.chars().take(240).collect::<String>(),
@@ -542,6 +549,8 @@ pub async fn reply(
                 );
                 Json(json!({
                     "ok": true, "message_id": message_id, "reply_all": reply_all,
+                    "to": res.get("to").cloned().unwrap_or(Value::Null),
+                    "subject": res.get("subject").cloned().unwrap_or(Value::Null),
                     "from": gmail_from, "via": "gmail",
                     "id": res.get("id").cloned().unwrap_or(Value::Null),
                     "thread_id": res.get("thread_id").cloned().unwrap_or(Value::Null),
@@ -1269,6 +1278,15 @@ mod tests {
         assert_eq!(log["log"][0]["endpoint"], json!("reply"));
         assert_eq!(log["log"][0]["session"], json!("w1"));
         assert_eq!(log["log"][0]["in_reply_to"], json!("<orig@ext>"));
+        // GT-58: reply rows logged to/subject as NULL while send rows carried
+        // both, so AMUX-1897 forensics could not attribute any reply to a
+        // recipient and ledger consumers got structural false-negatives
+        // (gtm's corrective sender fell back to Sent-mailbox search). The
+        // resolved envelope must land in the ledger row and the response.
+        assert_eq!(log["log"][0]["to"], json!("p@customer.com"));
+        assert_eq!(log["log"][0]["subject"], json!("Re: Deal"));
+        assert_eq!(res["to"], json!("p@customer.com"));
+        assert_eq!(res["subject"], json!("Re: Deal"));
     }
 
     #[tokio::test]
