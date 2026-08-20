@@ -6447,6 +6447,8 @@ async function _simpleRender(gen) {
 
 function setPeekTab(tab) {
   _peekTab = tab;
+  // Persist so an app-switch away and back lands on this tab, not the default.
+  try { _savePeekState(); } catch(e) {}
   // The notes tab is gone; this flushed its pending save and called
   // _peekNotesSave(), which went with it. The branch never fired only because
   // _peekNotesSaveTimer is now never assigned non-null — so a single line
@@ -7861,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.691';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.692';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8342,6 +8344,10 @@ function closePeek() {
   _peekPollStop('close');   // open-view poller stops when the view closes (beaconed)
   if (_transcriptTimer) { clearInterval(_transcriptTimer); _transcriptTimer = null; }
   sessionStorage.removeItem('peekState');
+  // An explicitly-closed peek must not resurrect after an iOS eviction: the
+  // localStorage copy exists only for eviction restore, and leaving it here
+  // meant close -> background -> relaunch reopened what the user dismissed.
+  try { localStorage.removeItem('amux_peek_state'); } catch(e) {}
 }
 
 // ── Peek split pane (file browser) ──
@@ -8350,6 +8356,9 @@ let _peekSplitPath = null;
 function _savePeekState() {
   if (peekSession) {
     const state = { session: peekSession };
+    // "Back to that location" includes WHICH tab (Ethan 2026-08-20): a
+    // restore that lands on the default tab is the right worker, wrong place.
+    if (typeof _peekTab === 'string' && _peekTab) state.tab = _peekTab;
     const wrap = document.getElementById('peek-split-wrap');
     if (wrap && wrap.classList.contains('split-active')) {
       state.split = true;
@@ -28245,6 +28254,16 @@ function _restoreScreen() {
   if (_ps && _ps.session) {
     setTimeout(() => {
       openPeek(_ps.session);
+      // Restore the tab WITHIN the peek — guarded on the button still
+      // existing, because localStorage outlives removed tabs (the notes-view
+      // lesson above applies one level down).
+      if (_ps.tab && _ps.tab !== 'terminal') {
+        setTimeout(() => {
+          if (peekSession === _ps.session && document.getElementById('peek-tab-' + _ps.tab)) {
+            try { setPeekTab(_ps.tab); } catch(e) {}
+          }
+        }, 350);
+      }
       if (_ps.split && window.innerWidth > 600) {
         setTimeout(() => {
           const wrap = document.getElementById('peek-split-wrap');
