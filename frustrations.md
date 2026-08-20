@@ -2120,6 +2120,160 @@ FIX: The CLI cannot know what landed when the server sends no JSON, so it must s
   hand-rolled curl, so a silent no-op here pushes people back to curl, which is how
   attribution gets lost.
 ---
+## I wrote a keep-warm branch that could never execute, hours after writing about that exact failure mode
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-19
+SESSION: amux-errors-and-bugs
+CARD: AEAB-35
+SYMPTOM: AEAB-34's fix added an early exit to the builder's disk guard — reclaim the idle
+  cache, and if free space is back above the floor, keep the shared cache so the build
+  stays warm. The branch fired ZERO times and could not: it tested against
+  `AMUX_BUILD_MIN_FREE_GB` (25GB) on a volume with 4GB free, so after reclaiming the idle
+  cache the condition was still false and the shared cache was destroyed anyway.
+  `grep -c "reclaimed to" rust-auto-build.log` -> 0.
+COST: Half a fix presented as a whole one. The card AEAB-34 is titled "so every build is
+  cold" and every build stayed cold; only prod verification caught it, and only because I
+  looked for the branch's OUTPUT rather than re-reading the code. Had I not, the card would
+  have closed claiming a result it did not deliver.
+FIX: Two thresholds, because there are two questions —
+  `AMUX_BUILD_MIN_FREE_GB` (25) asks "is the FLEET at ENOSPC risk", which is what decides
+  whether to reclaim at all; `AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB` (8) asks "can THIS BUILD
+  proceed while keeping its cache". Between them, reclaim the idle caches and stay warm.
+  Two test cases that EXECUTE the branch, driving the shipped script with a fake `df`
+  placed in `$HOME/.cargo/bin` — the script exports its own minimal PATH whose first entry
+  is exactly that, so no test-only branch is added to production code. Mutation-checked:
+  restoring the single threshold fails the keep-warm case specifically.
+WHY IT IS WORTH AN ENTRY EVEN THOUGH I FIXED IT: the ethos file records "a threshold below
+  the baseline is not a detector", and this is its mirror — a stop condition ABOVE the
+  achievable maximum is not a stop condition. I had cited that rule in a commit message the
+  same morning. Authoring a rule does not install the habit; that is the third instance of
+  that sentence being true in this session, and the pattern is only visible because the
+  earlier two were also written down. The generalisable check: when adding an early exit,
+  state the RANGE OF INPUTS under which it fires, and confirm the live system produces
+  values in that range.
+---
+## `set -euo pipefail` turned a deliberately non-fatal board write into a silent abort
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-19
+SESSION: amux-errors-and-bugs
+CARD: AEAB-36
+SYMPTOM: SUPERSEDES the earlier entry "board done --outcome-stdin printed a warning about
+  the outcome and silently applied NOTHING" — that entry recorded the symptom correctly and
+  called the cause unknown. It is now known and reproduced deterministically.
+  The outcome write is `curl ... | python3 -c ...`, and the python exits 0 on failure ON
+  PURPOSE so a lost outcome never blocks the transition that follows. `set -euo pipefail`
+  (amux line 19) defeats that entirely: on a TRANSPORT failure curl exits non-zero,
+  `pipefail` makes the pipeline return curl's status rather than python's, and `set -e`
+  aborts the script right there — AFTER the warning has printed. One warning, scoped to
+  the outcome, and the transition never ran and never said so.
+  The transition write was worse. Not piped at all, so `result=$(_board_transition ...)`
+  aborted the caller directly: `amux board done <ID>` against an unreachable server printed
+  ABSOLUTELY NOTHING and exited 7.
+  Reproduced with `AMUX_API=http://127.0.0.1:9`: one warning + exit 7 with an outcome,
+  total silence + exit 7 without one — byte-identical to the live incident.
+COST: A card reported closed that was still in `review`, caught only by re-reading the
+  operand. The live trigger was the server restarting to adopt a build I had just merged —
+  so the failure fires exactly when amux is deploying itself, which is when a session is
+  most likely to be closing cards. And the warning's wording actively misleads: naming only
+  the outcome makes "status moved, prose lost" the natural reading, which is inverted.
+FIX: Capture curl's OWN exit status at both sites instead of piping it, and on a transport
+  failure say plainly that NOTHING was applied — naming both writes — then stop. A dropped
+  connection and a refused gate now read completely differently, which matters because one
+  should be retried and the other must not be.
+  `scripts/test-board-transport-failure.sh` (11 cases, wired into checks.yml). Its (c)/(d)
+  controls are the load-bearing half: a CLI that shouted "cannot reach the board" at every
+  error would pass both failure cases while destroying that distinction, and
+  mutation-checking confirms it fails (c) and (d) specifically.
+  THE GENERAL LESSON, worth more than the fix: `set -e` + `pipefail` silently overrides
+  every `sys.exit(0)` written to make a step non-fatal. Any `cmd | python3 -c '...exit(0)'`
+  in this file has the same defect latent. Grep for the pattern before trusting that a step
+  is really optional.
+---
+## The "oldest undeployed commit" age was the NEWEST one, so an overnight lag read as 3 minutes
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux-errors-and-bugs
+CARD: AEAB-39
+SYMPTOM: The SessionStart hook printed "the RUNNING SERVER is 4 commit(s) behind
+  origin/main / built 9f92a631f; oldest undeployed commit landed 3 minutes ago". The oldest
+  undeployed commit was 23 HOURS old (7ac99632). The line computed
+  `git log -1 --format=%cr <range> | tail -1`, and `-1` limits git to one commit — the
+  newest — so `tail -1` never sees a second line.
+COST: The count was right; the number that makes it ACTIONABLE was always small. This line
+  exists to separate "just merged, the builder is about to pick it up" from "a fix has sat
+  undeployed overnight", and only the second is worth acting on — so the alarming case is
+  precisely the one it could never display. It would have read as reassuring every time,
+  forever. I shipped it yesterday in the same commit whose message argued that a bare count
+  "reads as bookkeeping" and the age is what makes it actionable.
+FIX: `git log --reverse --format=%cr <range> | head -1`. New case (i2) in
+  test-session-freshness.sh builds a repo with one commit dated 2020 and one dated now, so
+  taking the newest says "seconds ago" and taking the oldest says "years ago". The 25-case
+  suite passed with the bug present because every other case asserts the COUNT — a whole
+  suite around a line, none of it testing the field that carries the meaning.
+  Fourth instance this session of a check I wrote reporting something plausible but wrong
+  (LR-37 filter, LR-42 vantage, LR-43 proximity grep, this). The common shape is not
+  carelessness: each probe RAN and returned something usable, so nothing prompted a
+  recheck. What catches them is comparing the output against an independently-known value —
+  here, `git log` over the same range without `-1`.
+
+---
+## A ghost-rescue log quoted a pane scrape as the user's message, and it reads as corruption
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux-errors-and-bugs
+CARD: AEAB-38
+SYMPTOM: At 00:50 EDT the owner sent a real message from their phone; the send path failed
+  to submit it and ghost-rescue recovered it. The WARN line quoted it as
+  "Canyoufightthisforme?Don'tsendbutdodraftandaddresstotherightperson" — every space gone.
+  That reads unmistakably as the prompt being corrupted somewhere in delivery.
+COST: Nearly a filed user-facing data-corruption bug, on the owner's own overnight message,
+  which is about the worst thing to be wrong about. Cost ~10 minutes to disprove.
+FIX: The preview is a PANE SCRAPE. `composer_state` builds it with
+  `plain.extend(p.split_whitespace())` — words concatenated, whitespace discarded — which
+  is CORRECT for its actual job (comparing two captures of a WRAPPED terminal line, where
+  whitespace is an artifact of the wrap) and wrong for anything a human reads. The
+  discriminator: the board card auto-captured from the same send (PP-7) has the text intact,
+  and the rescue presses Enter on what is already in the composer rather than retyping, so
+  delivery cannot alter it. Storage unchanged — altering it would change the equality check
+  and `is_amux_ghost` to fix a display problem — and the LINE now says what the preview is.
+  This is the D1 terminal-scraping deviation showing through: a value computed for MACHINE
+  COMPARISON was reused for HUMAN DISPLAY, where its lossy normalisation reads as
+  corruption. Before quoting a scraped value in a log, ask what was normalised out of it.
+
+---
+## Every PR conflicts with every other, because the friction log is append-only and mandatory
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-20
+SESSION: amux-errors-and-bugs
+CARD: AEAB-40
+SYMPTOM: `.claude/rules/frustrations.md` mandates an entry for any amux friction and says
+  "Append at the bottom", so every branch doing real work ends by appending to the same last
+  line of the same file. Two branches in flight is a guaranteed textual conflict. Hit three
+  times today on PRs #132, #133 and #136.
+COST: ~20 minutes of CI per occurrence, three times, because GitHub does not run PR
+  workflows on a head it cannot merge — so the PR shows NO CHECKS AT ALL rather than a
+  failure. "no checks reported" and "all checks passed" are one glance apart in
+  `gh pr checks`; I nearly read the absence as green. All three branches were mine, so no
+  peer was blocked this time, but a peer would have been.
+FIX: Open, and it is a design call rather than a patch — carded as AEAB-40 and parked
+  needs:you. NOT `merge=union` in .gitattributes: this repo's own history records union-
+  merging this file splicing fragments of different entries together, leaving one entry
+  carrying another's `FIX:` line, which silently corrupts the `grep '^STATUS: open'` counts
+  the file exists for. A conflict that stops you beats a merge that lies. The candidate I
+  would pick is one file per entry (`frustrations/YYYY-MM-DD-slug.md`), which makes the
+  conflict structurally impossible, with the work being the greps in the rules, CLAUDE.md
+  and `scripts/frustrations_audit.py`. Interim recipe, which worked three times today: take
+  origin's file, append your entries VERBATIM, never let git interleave, then run the audit.
 ## The shared-checkout amend guard pins HEAD, not the staged set, so a correctly-pinned amend still absorbed a peer's work
 AREA: git
 SEVERITY: slows
