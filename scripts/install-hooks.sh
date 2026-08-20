@@ -110,6 +110,26 @@ install_guard_only() {
     echo "  FAIL $target/.git/hooks/prepare-commit-msg differs after install" >&2
     fail=1
   fi
+  # append-only-push-guard (MG-1483): the stale-republish data-loss guard —
+  # a stale shared checkout committing FRUSTRATIONS.md silently reverted 10
+  # pushed entry-lines with no conflict. The FILE is safe to drop anywhere
+  # (self-contained, fail-open); the CALL belongs to the repo owner's
+  # pre-push, so check it and hand over the line, never edit theirs.
+  install -m 0755 "$SRC/scripts/git-hooks/append-only-push-guard" "$target/.git/hooks/append-only-push-guard"
+  local hooksdir="$target/.git/hooks"
+  local hp
+  hp=$(git -C "$target" config core.hooksPath 2>/dev/null || true)
+  if [ -n "$hp" ]; then
+    case "$hp" in /*) hooksdir="$hp" ;; *) hooksdir="$target/$hp" ;; esac
+  fi
+  if [ -f "$hooksdir/pre-push" ] && grep -q 'append-only-push-guard' "$hooksdir/pre-push"; then
+    echo "  ok   $target pre-push calls append-only-push-guard"
+  else
+    echo "  WARN $target pre-push does NOT call append-only-push-guard — stale-republish" >&2
+    echo "       protection is OFF there (hooks dir: $hooksdir). Add near the top:" >&2
+    echo '         aog="$(git rev-parse --git-path hooks)/append-only-push-guard"' >&2
+    echo '         if [ -x "$aog" ]; then "$aog" "$@" <&0 || exit 1; fi' >&2
+  fi
   # The shim is the whole chain: an installed guard nothing calls is a file, not
   # a guard. We do not write their pre-commit, so all we can do is check it and
   # hand over the exact lines — which is the honest move, not a silent no-op.
@@ -158,6 +178,7 @@ install -m 0755 "$ROOT/scripts/git-hooks/pre-commit" "$ROOT/.git/hooks/pre-commi
 install -m 0755 "$ROOT/scripts/git-hooks/amux-staged-guard" "$ROOT/.git/hooks/amux-staged-guard"
 install -m 0755 "$ROOT/scripts/git-hooks/prepare-commit-msg" "$ROOT/.git/hooks/prepare-commit-msg"
 install -m 0755 "$ROOT/scripts/git-hooks/pre-push" "$ROOT/.git/hooks/pre-push"
+install -m 0755 "$ROOT/scripts/git-hooks/append-only-push-guard" "$ROOT/.git/hooks/append-only-push-guard"
 install -m 0755 "$ROOT/scripts/git-hooks/post-commit" "$ROOT/.git/hooks/post-commit"
 
 # Verify rather than announce (ethos #7): compare what landed against its source,
@@ -167,7 +188,7 @@ install -m 0755 "$ROOT/scripts/git-hooks/post-commit" "$ROOT/.git/hooks/post-com
 # commits printed "Security scan passed" from a scanner that could match none of
 # them.
 fail=0
-for h in pre-commit amux-staged-guard prepare-commit-msg pre-push post-commit; do
+for h in pre-commit amux-staged-guard prepare-commit-msg pre-push post-commit append-only-push-guard; do
   if cmp -s "$ROOT/scripts/git-hooks/$h" "$ROOT/.git/hooks/$h"; then
     echo "  ok   .git/hooks/$h matches scripts/git-hooks/$h"
   else

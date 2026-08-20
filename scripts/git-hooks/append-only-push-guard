@@ -1,0 +1,233 @@
+#!/usr/bin/env bash
+# append-only-push-guard — refuse to publish a commit whose copy of a guarded
+# shared file DROPS lines the remote already has (MG-1483, 2026-08-19).
+#
+# THE INCIDENT. A lane on a stale shared checkout (18 behind) committed
+# FRUSTRATIONS.md and published it: six entries reverted to older versions and
+# four lines vanished, inside a commit whose diff read as an ordinary edit
+# (mixpeek e1c2597850, restored by 397ebd0d99). No conflict fired because the
+# content never went through merge machinery — the documented survival pattern
+# for a contended shared index is a commit-tree graft, which fast-forwards
+# HISTORY while carrying whatever stale CONTENT the worktree holds. History
+# checks cannot see this; only comparing CONTENT against the remote's current
+# copy can, which is what this guard does.
+#
+# THE TEST. For each guarded file: every line in the REMOTE's current copy must
+# still be present in the copy being pushed (multiset, blank lines ignored).
+# Append-only files pass by construction; a stale republish fails and the
+# refusal prints exactly which published lines would be lost. A deliberate
+# rewrite is the author's to make — but out loud:
+#     AMUX_ALLOW_SHARED_REWRITE=1 git push ...      # logged
+#
+# No fetch needed: git hands pre-push the remote's ACTUAL current sha per ref
+# ("<local ref> <local sha> <remote ref> <remote sha>" on stdin), so the guard
+# compares against what origin really holds at push time, not a stale tracking
+# ref.
+#
+# Guarded files: repo-root `.append-only-files` (one repo-relative path per
+# line, '#' comments) if present, else the defaults below; a name absent from
+# the remote tree silently no-ops, so listing a file that only some repos have
+# is safe.
+#
+# Modes:
+#   as a pre-push hook        — stdin ref lines, $1 = remote name
+#   --check <base> <head> [file...]  — standalone/test: compare two commit-ish
+#
+# Fail-open: internal errors never block a push (same contract as the amux
+# push-guard). The ONLY exit 1 is a confirmed line loss without the override.
+# Refusals and overrides are logged to ~/.amux/logs/append-only-guard.log so a
+# log sweep sees the pattern, not just the one lane that hit it.
+
+LC_ALL=C
+export LC_ALL
+
+DEFAULT_FILES=("FRUSTRATIONS.md" "frustrations.md")
+LOG="${HOME}/.amux/logs/append-only-guard.log"
+MAX_SHOWN=15
+
+log_line() {
+  # Best-effort; never let logging break the guard.
+  mkdir -p "$(dirname "$LOG")" 2>/dev/null || return 0
+  printf '%s %s repo=%s session=%s %s\n' \
+    "$(date '+%Y-%m-%dT%H:%M:%S')" "$1" \
+    "$(git rev-parse --show-toplevel 2>/dev/null || echo '?')" \
+    "${AMUX_SESSION:-'(human)'}" "$2" >> "$LOG" 2>/dev/null || true
+}
+
+guarded_files() {
+  local root cfg
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
+  cfg="$root/.append-only-files"
+  if [ -f "$cfg" ]; then
+    grep -v '^[[:space:]]*#' "$cfg" | grep -v '^[[:space:]]*$'
+  else
+    printf '%s\n' "${DEFAULT_FILES[@]}"
+  fi
+}
+
+# check_pair <base-ish> <head-ish> [file...] — 0 clean, 1 loss (prints), 2 error
+check_pair() {
+  local base="$1" head="$2"
+  shift 2
+  local files=("$@")
+  [ ${#files[@]} -eq 0 ] && while IFS= read -r f; do files+=("$f"); done < <(guarded_files)
+  # The pushed copies of ALL guarded files, concatenated: content that MOVED
+  # between them is not lost. This is what lets FRUSTRATIONS.md itself be
+  # guarded — mixpeek's numstat shrink-leg had to leave it off its list
+  # because the archive campaign removes one line per archived entry, and a
+  # deletion-count test cannot tell that move from a clobber. A content test
+  # can: the archived line still exists, in FRUSTRATIONS_ARCHIVE.md's pushed
+  # copy, and a clobbered line exists nowhere.
+  local union_tmp
+  union_tmp=$(mktemp 2>/dev/null) || return 2
+  local f hb
+  for f in "${files[@]}"; do
+    hb=$(git rev-parse --verify --quiet "$head:$f" 2>/dev/null) || continue
+    git cat-file blob "$hb" >> "$union_tmp" 2>/dev/null || true
+    printf '\n' >> "$union_tmp"
+  done
+  local loss=0 base_blob head_blob missing n
+  for f in "${files[@]}"; do
+    base_blob=$(git rev-parse --verify --quiet "$base:$f" 2>/dev/null) || continue
+    head_blob=$(git rev-parse --verify --quiet "$head:$f" 2>/dev/null) || head_blob=""
+    [ "$base_blob" = "$head_blob" ] && continue
+    if [ -z "$head_blob" ]; then
+      loss=1
+      echo ""
+      echo "append-only guard: this push DELETES $f, which the remote currently has." >&2
+      log_line "REFUSED" "file=$f deleted"
+      continue
+    fi
+    missing=$(comm -23 \
+      <(git cat-file blob "$base_blob" 2>/dev/null | grep -v '^[[:space:]]*$' | sort) \
+      <(git cat-file blob "$head_blob" 2>/dev/null | grep -v '^[[:space:]]*$' | sort)) || return 2
+    [ -z "$missing" ] && continue
+    # Exact-line mismatch is not yet loss: the NORMAL edit on these files
+    # extends an entry's single line in place (verification appendices), so
+    # the old line survives as a SUBSTRING of the new longer one. Only a line
+    # whose text appears NOWHERE in the pushed copy has actually been lost —
+    # measured on the incident's own artifacts, this is what separates the
+    # restore commit (extends, passes) from the stale republish (reverts,
+    # refused). Without it, every legitimate entry extension demands the
+    # override, which trains setting it blind.
+    # Checkbox flips (`- [ ]` -> `- [x]`) are the other routine edit — daily
+    # verification passes flip AND extend an entry's line. Normalize the
+    # marker on both sides so a flip alone never reads as loss; the entry's
+    # CONTENT is what must not vanish, and that the substring test still
+    # covers. Measured on the restore commit (397ebd0d99): with both rules,
+    # the only line still flagged is its one deliberate rewrite of published
+    # text (a PENDING_SHA placeholder filled in) — which is exactly the case
+    # the override exists to acknowledge.
+    # Two classes remain after the exact-line diff, and only one is refusable
+    # without making overrides routine (measured over the last 60 commits
+    # touching FRUSTRATIONS.md — a strict test refused 5 of 6 real deletion
+    # commits, four of them ordinary corrections like recording a shipped
+    # sha into an entry line, and a guard that fires daily teaches setting
+    # the escape blind):
+    #   EDITED — the line changed but its entry-identity prefix (the first
+    #   64 normalized chars: checkbox + date + area + title) still exists in
+    #   the pushed union. Routine: sha fill-ins, corrections, extensions
+    #   with rewording. WARN, log, allow.
+    #   LOST — no trace of the line or its entry anywhere in the pushed
+    #   union. A stale republish virtually always produces these (the
+    #   staleness window misses whole appended entries); the incident had 4.
+    #   REFUSE.
+    # Residual risk, named: a republish stale by so little that it reverts
+    # only entry BODIES (zero whole lines lost) passes with warnings. The
+    # WARN log line is what keeps that case visible.
+    _classified=$(python3 -c '
+import sys
+norm = lambda s: s.replace("- [x]", "- [ ]").replace("- [X]", "- [ ]")
+head = norm(open(sys.argv[2]).read())
+cand = open(sys.argv[1]).read().splitlines()
+lost, edited = [], []
+for l in cand:
+    if not l:
+        continue
+    nl = norm(l)
+    if nl in head:
+        continue
+    (edited if nl.strip()[:64] and nl.strip()[:64] in head else lost).append(l)
+sys.stdout.write("\n".join("L\t" + l for l in lost))
+if edited:
+    sys.stdout.write("\n" if lost else "")
+    sys.stdout.write("\n".join("E\t" + l for l in edited))
+' /dev/fd/3 "$union_tmp" 3<<< "$missing") || _classified=""
+    edited=$(printf '%s\n' "$_classified" | grep '^E	' | cut -f2-)
+    missing=$(printf '%s\n' "$_classified" | grep '^L	' | cut -f2-)
+    if [ -n "$edited" ]; then
+      n=$(printf '%s\n' "$edited" | wc -l | tr -d ' ')
+      {
+        echo ""
+        echo "append-only guard: NOTE — $n published line(s) of $f are EDITED in place by"
+        echo "this push (entry still present, content changed). Fine for corrections; if"
+        echo "you did not knowingly edit these, your copy may be STALE — check before"
+        echo "pushing:  git diff origin/main -- $f"
+        printf '%s\n' "$edited" | head -3 | cut -c1-100 | sed 's/^/    ~ /'
+      } >&2
+      log_line "WARNED" "file=$f edited_published_lines=$n"
+    fi
+    [ -z "$missing" ] && continue
+    loss=1
+    n=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+    {
+      echo ""
+      echo "append-only guard: PUSH BLOCKED — $f as pushed is MISSING $n line(s) the"
+      echo "remote's current copy has. On this shared checkout that almost always means a"
+      echo "stale worktree copy is being republished, silently reverting other lanes'"
+      echo "pushed work (this exact mechanism lost 10 entry-lines on 2026-08-19, MG-1483)."
+      echo ""
+      echo "Lines that would vanish (first $MAX_SHOWN):"
+      printf '%s\n' "$missing" | head -"$MAX_SHOWN" | sed 's/^/    | /'
+      [ "$n" -gt "$MAX_SHOWN" ] && echo "    ... and $((n - MAX_SHOWN)) more"
+      echo ""
+      echo "Fix: bring $f current before pushing — union-merge per"
+      echo ".claude/rules/frustrations.md (take origin's copy, re-append yours):"
+      echo "    git checkout origin/main -- $f    # then re-apply YOUR additions on top"
+      echo "If this rewrite is genuinely intentional, say so out loud (logged):"
+      echo "    AMUX_ALLOW_SHARED_REWRITE=1 git push ..."
+    } >&2
+    log_line "REFUSED" "file=$f missing_lines=$n"
+  done
+  rm -f "$union_tmp" 2>/dev/null
+  return $loss
+}
+
+main() {
+  if [ "${1:-}" = "--check" ]; then
+    [ $# -ge 3 ] || { echo "usage: $0 --check <base> <head> [file...]" >&2; return 2; }
+    shift
+    check_pair "$@"
+    return $?
+  fi
+
+  if [ -n "${AMUX_ALLOW_SHARED_REWRITE:-}" ]; then
+    log_line "OVERRIDE" "AMUX_ALLOW_SHARED_REWRITE=1 push allowed without the superset check"
+    return 0
+  fi
+
+  local remote="${1:-origin}" rc=0
+  local lref lsha rref rsha base
+  # git closes stdin after the ref lines; -t 5 keeps a manual invocation with an
+  # open terminal from hanging every lane (same defence as mixpeek's pre-push).
+  while read -r -t 5 lref lsha rref rsha; do
+    [ -z "${lsha:-}" ] && continue
+    case "$lsha" in *[!0]*) ;; *) continue ;; esac      # all-zeros = deletion
+    if [ -n "${rsha:-}" ] && case "$rsha" in *[!0]*) true ;; *) false ;; esac; then
+      base="$rsha"
+    else
+      # New branch: nothing on the remote ref yet — compare against the
+      # remote's main so a graft onto a fresh branch can't dodge the guard.
+      base=$(git rev-parse --verify --quiet "refs/remotes/$remote/main" 2>/dev/null) || continue
+    fi
+    check_pair "$base" "$lsha"
+    case $? in
+      1) rc=1 ;;
+      2) : ;;     # instrument error: fail open, never block on our own bug
+    esac
+  done
+  return $rc
+}
+
+main "$@"
+exit $?

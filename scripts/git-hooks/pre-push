@@ -22,6 +22,22 @@ ZERO = "0" * 40
 
 
 def main():
+    # DATA-LOSS GUARD FIRST, and BEFORE the session early-returns: a stale
+    # shared-file republish (MG-1483 — 10 pushed entry-lines silently reverted,
+    # no conflict) destroys published work no matter who pushes, so the
+    # append-only guard runs for humans and AMUX_ALLOW_FOREIGN pushes too.
+    # Stdin is consumed once here and shared with the attribution walk below.
+    stdin_text = sys.stdin.read()
+    try:
+        guard = os.path.join(os.path.dirname(os.path.realpath(__file__)),
+                             "append-only-push-guard")
+        if os.path.exists(guard):
+            r = subprocess.run([guard] + sys.argv[1:], input=stdin_text,
+                               text=True, timeout=60)
+            if r.returncode != 0:
+                return r.returncode
+    except Exception:
+        pass  # fail open — the guard must never brick a push on its own bug
     sess = os.environ.get("AMUX_SESSION", "")
     if not sess or os.environ.get("AMUX_ALLOW_FOREIGN"):
         return 0
@@ -30,7 +46,7 @@ def main():
     foreign = {}
     ordered = []
     try:
-        for line in sys.stdin.read().splitlines():
+        for line in stdin_text.splitlines():
             parts = line.split()
             if len(parts) < 4:
                 continue
