@@ -2247,6 +2247,45 @@ pub fn connector_findings_from_rollup(rollup: &serde_json::Value, now: f64) -> V
             last_ts: now,
         });
     }
+    // Canary legs (AMUX-3430): the grant refreshes but a granted API answers
+    // failure — a rot the reauth finding cannot see. Only `api_error` files:
+    // `unreachable` is network trouble (a dead network is not connector rot
+    // and must never fan out one card per account), `not_granted` is neutral,
+    // and needs_reauth legs are already the reauth finding above.
+    for a in rollup.get("accounts").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let account = a.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let Some(canary) = a.get("canary").and_then(|v| v.as_object()) else { continue };
+        for (svc, leg) in canary {
+            if leg.get("status").and_then(|v| v.as_str()) != Some("api_error") {
+                continue;
+            }
+            let http_st = leg.get("http").and_then(|v| v.as_u64()).unwrap_or(0);
+            out.push(Finding {
+                kind: DetectorKind::ConnectorAuth,
+                signature: format!("connector-canary|{account}|{svc}"),
+                title: format!(
+                    "Connector canary failing: {svc} API for {account} (HTTP {http_st})"
+                ),
+                evidence: vec![
+                    ("account".into(), account.clone()),
+                    ("service".into(), svc.clone()),
+                    ("http".into(), http_st.to_string()),
+                    (
+                        "detail".into(),
+                        leg.get("detail").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    ),
+                    (
+                        "effect".into(),
+                        "the token mints but this API rejects it — workers using this service fail while the account still reads connected".into(),
+                    ),
+                ],
+                recheck: "curl -sk $(amux url)/api/connectors/accounts".into(),
+                owner: None,
+                count: 1,
+                last_ts: now,
+            });
+        }
+    }
     out
 }
 
@@ -3324,6 +3363,32 @@ mod tests {
         // Healthy rollup → nothing to file (the check CAN pass).
         let quiet = connector_findings_from_rollup(&serde_json::json!({"needs_reauth": []}), 0.0);
         assert!(quiet.is_empty());
+    }
+
+    #[test]
+    fn canary_api_errors_file_per_service_but_unreachable_and_not_granted_never_do() {
+        use super::connector_findings_from_rollup;
+        // One account, four canary legs: only the leg where the provider
+        // ANSWERED with a failure becomes a card. `unreachable` is network
+        // trouble (a dead network must never fan out one card per account),
+        // `not_granted` is neutral, `ok` is ok.
+        let rollup = serde_json::json!({
+            "accounts": [
+                {"account": "acct@x.io", "canary": {
+                    "gmail": {"status": "ok", "http": 200},
+                    "calendar": {"status": "api_error", "http": 403, "detail": "insufficientPermissions"},
+                    "drive": {"status": "not_granted"},
+                    "slack": {"status": "unreachable", "detail": "dns"},
+                }},
+            ],
+            "needs_reauth": [],
+        });
+        let f = connector_findings_from_rollup(&rollup, 1000.0);
+        assert_eq!(f.len(), 1, "{:?}", f.iter().map(|x| &x.signature).collect::<Vec<_>>());
+        assert_eq!(f[0].signature, "connector-canary|acct@x.io|calendar");
+        assert!(f[0].title.contains("HTTP 403"), "{}", f[0].title);
+        let detail = f[0].evidence.iter().find(|(k, _)| k == "detail").unwrap();
+        assert!(detail.1.contains("insufficientPermissions"));
     }
 
     // ── du_one: a timeout and an unreadable path are DIFFERENT (AEAB-33) ────

@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.695';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.696';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15945,6 +15945,18 @@ async function _connAccountsLoad() {
         const st = fams[f];
         const color = st === 'ok' ? '#1f8f4e' : st === 'needs_reauth' ? '#c0392b' : '#8a6d3b';
         h += '<span class="conn-gmail-badge" style="background:' + color + '">' + esc(f) + ': ' + esc(st) + '</span>';
+      }
+      // Canary legs (AMUX-3430): one real API call per granted service every
+      // ~5min. A dot per service — green serves, red answered a failure,
+      // amber unreachable, gray not granted — with last-checked in the title.
+      const can = a.canary || {};
+      for (const svc of Object.keys(can)) {
+        const leg = can[svc] || {};
+        if (leg.status === 'not_granted') continue;
+        const c = leg.status === 'ok' ? '#1f8f4e' : leg.status === 'unreachable' ? '#8a6d3b' : '#c0392b';
+        const age = leg.checked_at ? Math.max(0, Math.round(Date.now() / 1000 - leg.checked_at)) + 's ago' : 'never';
+        const tip = svc + ' canary: ' + (leg.status || '?') + (leg.http ? ' (HTTP ' + leg.http + ')' : '') + ', checked ' + age;
+        h += '<span title="' + esc(tip) + '" style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + c + ';margin-left:4px;vertical-align:middle"></span>';
       }
       if (a.needs_reauth) {
         const fam = (a.reconnect || '').indexOf('/slack/') >= 0 ? 'slack' : 'google';

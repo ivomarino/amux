@@ -1570,6 +1570,20 @@ static ROLLUP_CACHE: Mutex<std::collections::BTreeMap<PathBuf, (Instant, Value)>
     Mutex::new(std::collections::BTreeMap::new());
 const ROLLUP_TTL_S: u64 = 300;
 
+/// Canary targets: the cheapest real call per Google service, gated on the
+/// grant actually covering it (a gmail-only grant must read `not_granted` for
+/// calendar, never red — the inverse of the "connected but useless" lie).
+/// A refreshable token proves only the TOKEN leg; these prove the API serves.
+const CANARY_TARGETS: &[(&str, &str, &str)] = &[
+    ("gmail", "https://gmail.googleapis.com/gmail/v1/users/me/profile", "auth/gmail."),
+    (
+        "calendar",
+        "https://www.googleapis.com/calendar/v3/users/me/calendarList?maxResults=1",
+        "auth/calendar",
+    ),
+    ("drive", "https://www.googleapis.com/drive/v3/about?fields=user", "auth/drive"),
+];
+
 /// Build the per-account rollup: every account amux holds any credential for,
 /// which families cover it, each one's LIVE health, and — when broken — the
 /// ONE reconnect action. This is the view Ethan's "do it once per account"
@@ -1583,10 +1597,21 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
         }
     }
     let mut rows: std::collections::BTreeMap<String, Map<String, Value>> = Default::default();
+    // Per-account canary legs (AMUX-3430): the CONTINUES-working proof, one
+    // cheap real API call per granted service on every cache refresh.
+    let mut canaries: std::collections::BTreeMap<String, Map<String, Value>> = Default::default();
+    let legacy_gmail: std::collections::BTreeSet<String> =
+        connected_accounts_in(home).into_iter().collect();
     // Gmail (legacy store) — health via the SAME probe /api/gmail/accounts uses.
-    for a in connected_accounts_in(home) {
-        let health = super::gmail_auth::health_for(http.clone(), home, &a).await;
+    // That probe is a real getProfile round trip, so it doubles as the gmail
+    // canary leg for these accounts (mirrored below, never pinged twice).
+    for a in &legacy_gmail {
+        let health = super::gmail_auth::health_for(http.clone(), home, a).await;
         rows.entry(a.clone()).or_default().insert("gmail".into(), json!(health));
+        canaries.entry(a.clone()).or_default().insert(
+            "gmail".into(),
+            json!({"status": health, "via": "gmail_probe", "checked_at": now_ts()}),
+        );
     }
     // Family stores. Google health: fresh expires_at is ok on its face; stale
     // exercises the refresh token — the needs_reauth discriminator.
@@ -1598,8 +1623,9 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
                 .and_then(|r| serde_json::from_str(&r).ok())
                 .unwrap_or(json!({}));
             let health = if family != "google" {
-                // Slack bot tokens do not expire; presence is connected (the
-                // Test button does the live check on demand).
+                // Slack bot tokens do not expire; presence says nothing about
+                // whether the workspace still honors it — the canary below is
+                // the live check.
                 "ok".to_string()
             } else if tf.get("expires_at").and_then(Value::as_f64).is_some_and(|e| e - now_ts() > 60.0) {
                 "ok".to_string()
@@ -1607,6 +1633,13 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
                 probe_google_refresh(http, &path, &tf).await
             };
             rows.entry(a.clone()).or_default().insert(family.into(), json!(health));
+            let legs = canaries.entry(a.clone()).or_default();
+            if family == "google" {
+                canary_google_legs(http, &path, &health, legacy_gmail.contains(&a), legs).await;
+            } else if health == "ok" {
+                let token = tf.get("token").and_then(Value::as_str).unwrap_or("");
+                legs.insert("slack".into(), canary_slack_leg(http, token).await);
+            }
         }
     }
     let mut accounts: Vec<Value> = Vec::new();
@@ -1633,14 +1666,28 @@ pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::p
         accounts.push(json!({
             "account": account,
             "families": families,
+            "canary": canaries.get(&account).cloned().map(Value::Object),
             "needs_reauth": reconnect.is_some(),
             "reconnect": reconnect,
         }));
     }
+    // Persist the canary map with a timestamp: last-checked must survive the
+    // frequent self-adopt restarts, or silence after a restart reads as
+    // health (in-memory state is fiction — ethos D1).
+    let canary_file = json!({
+        "checked_at": now_ts(),
+        "accounts": canaries.iter().map(|(k, v)| (k.clone(), Value::Object(v.clone()))).collect::<Map<_, _>>(),
+    });
+    let _ = std::fs::create_dir_all(home.join("connectors")).and_then(|_| {
+        std::fs::write(
+            home.join("connectors").join("canary.json"),
+            serde_json::to_string_pretty(&canary_file).unwrap_or_default(),
+        )
+    });
     let out = json!({
         "accounts": accounts,
         "needs_reauth": needs_reauth,
-        "note": "One row per account; one approval repairs every family listed as needs_reauth (a Google grant covers gmail + calendar + drive/docs at once and every worker shares it).",
+        "note": "One row per account; one approval repairs every family listed as needs_reauth (a Google grant covers gmail + calendar + drive/docs at once and every worker shares it). canary = one real API call per granted service on every refresh (~5min): ok / api_error / not_granted / unreachable, with checked_at.",
     });
     ROLLUP_CACHE
         .lock()
@@ -1684,6 +1731,72 @@ async fn probe_google_refresh(http: &Arc<dyn HttpTransport>, path: &std::path::P
         }
         Ok((_, body)) if body.to_string().contains("invalid_grant") => "needs_reauth".into(),
         _ => "not_connected".into(),
+    }
+}
+
+/// Ping every service the Google grant covers with one cheap real call
+/// (AMUX-3430). Distinctions that matter downstream: `api_error` (the provider
+/// ANSWERED with a failure — the canary finding) vs `unreachable` (transport
+/// error — network trouble is not connector rot, never a card) vs
+/// `not_granted` (scope-gated, neutral). When the account also has a legacy
+/// gmail token, the gmail leg was already proven by health_for's real
+/// getProfile round trip and is mirrored, not pinged twice.
+async fn canary_google_legs(
+    http: &Arc<dyn HttpTransport>,
+    store: &std::path::Path,
+    health: &str,
+    gmail_already_probed: bool,
+    legs: &mut Map<String, Value>,
+) {
+    if health != "ok" {
+        // No usable token: every covered leg inherits the grant's state so
+        // the canary never claims silence where the grant itself is broken.
+        legs.insert("grant".into(), json!({"status": health, "checked_at": now_ts()}));
+        return;
+    }
+    // Re-read: probe_google_refresh may have just rotated the token in place.
+    let tf: Value = std::fs::read_to_string(store)
+        .ok()
+        .and_then(|r| serde_json::from_str(&r).ok())
+        .unwrap_or(json!({}));
+    let token = tf.get("token").and_then(Value::as_str).unwrap_or("");
+    let scopes = tf.get("scopes").and_then(Value::as_str).unwrap_or("");
+    for (svc, url, marker) in CANARY_TARGETS {
+        if !scopes.contains(marker) {
+            legs.insert((*svc).into(), json!({"status": "not_granted"}));
+            continue;
+        }
+        if *svc == "gmail" && gmail_already_probed {
+            continue;
+        }
+        let leg = match http.get(url, Some(token)).await {
+            Ok((st, _)) if st < 400 => json!({"status": "ok", "http": st, "checked_at": now_ts()}),
+            Ok((st, body)) => json!({
+                "status": "api_error",
+                "http": st,
+                "detail": body.to_string().chars().take(200).collect::<String>(),
+                "checked_at": now_ts(),
+            }),
+            Err(e) => json!({"status": "unreachable", "detail": e, "checked_at": now_ts()}),
+        };
+        legs.insert((*svc).into(), leg);
+    }
+}
+
+/// Slack canary: auth.test is the cheapest authenticated call and answers
+/// `{"ok":false}` with HTTP 200 on a dead token, so the body is the verdict.
+async fn canary_slack_leg(http: &Arc<dyn HttpTransport>, token: &str) -> Value {
+    match http.get("https://slack.com/api/auth.test", Some(token)).await {
+        Ok((st, body)) if st < 400 && body.get("ok").is_some_and(|v| v == true) => {
+            json!({"status": "ok", "checked_at": now_ts()})
+        }
+        Ok((st, body)) => json!({
+            "status": "api_error",
+            "http": st,
+            "detail": body.get("error").and_then(Value::as_str).unwrap_or("").to_string(),
+            "checked_at": now_ts(),
+        }),
+        Err(e) => json!({"status": "unreachable", "detail": e, "checked_at": now_ts()}),
     }
 }
 
@@ -2337,5 +2450,53 @@ mod tests {
         assert_eq!(healthy["families"]["google"], json!("ok"));
         assert_eq!(healthy["needs_reauth"], json!(false));
         assert_eq!(v["needs_reauth"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn canary_pings_granted_services_and_discriminates_the_failure_kinds() {
+        // The continues-working proof (AMUX-3430): a refreshable token proves
+        // only the TOKEN leg. Here the token is fresh, gmail SERVES, calendar
+        // ANSWERS 500 — and drive is simply not granted, which must read
+        // neutral, never red.
+        let home = tempfile::tempdir().unwrap();
+        let fam = home.path().join("connectors").join("google");
+        std::fs::create_dir_all(&fam).unwrap();
+        std::fs::write(
+            fam.join(format!("{ACCT}.json")),
+            json!({ "token": "PLACEHOLDER_OK", "refresh_token": "PLACEHOLDER_RT",
+                     "token_uri": "https://oauth2.googleapis.com/token",
+                     "client_id": "CID", "client_secret": "CSEC",
+                     "scopes": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/calendar",
+                     "expires_at": now_ts() + 3000.0 })
+            .to_string(),
+        )
+        .unwrap();
+        let http: Arc<dyn HttpTransport> = MockHttp::new(vec![
+            ("GET", "gmail/v1/users/me/profile", 200, json!({ "emailAddress": ACCT })),
+            ("GET", "calendar/v3/users/me/calendarList", 500, json!({ "error": "backendError" })),
+        ]);
+        let v = accounts_rollup(&http, home.path(), true).await;
+        let row = v["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["account"] == json!(ACCT))
+            .expect("account row")
+            .clone();
+        assert_eq!(row["canary"]["gmail"]["status"], json!("ok"), "{v}");
+        assert_eq!(row["canary"]["calendar"]["status"], json!("api_error"), "{v}");
+        assert_eq!(row["canary"]["calendar"]["http"], json!(500), "{v}");
+        assert_eq!(row["canary"]["drive"]["status"], json!("not_granted"), "{v}");
+        assert!(row["canary"]["gmail"]["checked_at"].as_f64().unwrap() > 0.0);
+        // The grant itself stays green — an API-side failure is a DIFFERENT
+        // state from token rot and must not trigger the reconnect flow.
+        assert_eq!(row["needs_reauth"], json!(false), "{v}");
+        // Last-checked survives restarts: the canary map is persisted.
+        let persisted: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("connectors").join("canary.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["accounts"][ACCT]["calendar"]["status"], json!("api_error"));
+        assert!(persisted["checked_at"].as_f64().unwrap() > 0.0);
     }
 }
