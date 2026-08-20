@@ -1679,43 +1679,6 @@ FIX: The staged-guard is the designed prevention and it was DOWN for both events
   so cross-session sweep protection was off exactly when four lanes were committing into one tree.
   Being loud about it is right; being down is the hazard it exists for. See AMUX-2807.
 
-## The server went silent 15s after install: no panic, no log, listening socket held
-AREA: instruments
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-11
-SESSION: amux
-CARD: AMUX-35
-SYMPTOM: Fresh `./install.sh` on this machine came up healthy, answered `/health` twice,
-  then stopped answering ANYTHING — `/health`, `/api/board`, the dashboard, even the
-  plain-HTTP redirect that is handled before TLS. The process stayed alive, kept its
-  listening socket, sat at 0% CPU with every thread parked, and wrote NOTHING further to
-  server-rs.log. `curl` hung mid-TLS-handshake because the kernel completes the TCP
-  handshake from the listen backlog while nothing ever calls accept(). Root cause: the
-  disk-pressure autofix detector shells out to `du` with blocking
-  `std::process::Command::output()` and no timeout, on a tokio worker; on a 96%-full disk
-  `du -skx ~/Library/Caches` runs for minutes, so each tick parked another worker until
-  none were left to poll the accept loop.
-COST: ~90 minutes, almost entirely spent on the instrument rather than the bug. Four
-  hypotheses died first: a leaked semaphore permit, a head-of-line block in
-  RedirectingAcceptor's peek, self-adoption exiting, and `server.env` (which "confirmed"
-  itself, then un-confirmed when the no-file control ALSO failed — the earlier survival
-  was timing luck, not configuration). A fault that emits no panic, no log and no CPU is
-  indistinguishable from a network problem, and every cheap probe returns silence, which
-  reads as "nothing wrong here". The discriminator was free and I reached it late:
-  `ps -eo pid,ppid` on the wedged process showed one child, `/usr/bin/du -skx
-  ~/Library/Caches`, 1m40s old. Compounding it, the release binary is unsymbolicated, so
-  `sample` printed `???` for every amux frame until I rebuilt with debug info.
-FIX: bound every `du` with per-path and total wall-clock budgets, kill AND reap on
-  timeout (an unreaped `du` holds the FDs the neighbouring FdPressure detector counts),
-  and OMIT a timed-out path instead of sizing it 0 — a silent zero sorts the largest
-  consumer last and aims the report at an innocent directory. The incomplete ranking now
-  says so in the log (rule 4). The deeper fix this entry is really arguing for: a
-  detector that only runs when the resource is already scarce must be bounded BY
-  CONSTRUCTION, and the whole sync detector sweep still runs on the async runtime holding
-  a store connection — `tmutil` and the build detector's git calls are the same shape,
-  bounded only by luck. Moving that sweep to `spawn_blocking` is the real exit.
-
 ## A probe read a hook file that git never executes, and a correct measurement certified the wrong conclusion
 AREA: instruments
 SEVERITY: slows
