@@ -965,6 +965,59 @@ pub(crate) fn rate_limit_action() -> String {
         .unwrap_or_else(|| "wait".into())
 }
 
+/// Is this pane sitting on Claude Code's RESUME-MODE selector?
+///
+/// ```text
+/// This session is 2d old and 725.5k tokens.
+/// Resuming the full session will consume a substantial portion of your
+/// usage limits. We recommend resuming from a summary.
+/// ❯ 1. Resume from summary (recommended)
+///   2. Resume full session as-is
+///   3. Don't ask me again
+/// ```
+///
+/// Shown by `claude --resume` on old/large sessions — which is every lane after
+/// a machine reboot (the 2026-08-19 panic restart parked a third of the fleet
+/// on this exact selector). Like the rate-limit menu it is INFRASTRUCTURE, not
+/// a question anyone needs to weigh per-occurrence: Ethan set the policy once
+/// (2026-08-19, "resume from summary; it should work across different models").
+///
+/// Matched on the two numbered option LINES (line-anchored, optional highlight
+/// pointer) plus the third option's text, never on the header sentence — the
+/// header carries the session's age and token count, which vary per lane and
+/// per model, and matching prose is how the credit-banner scrape false-flagged
+/// lanes that were merely CODING the strings (2026-08-16). Line-anchored
+/// `1.`/`2.` shapes do not appear when this source file itself is on screen
+/// (quoted strings carry a leading `"`).
+pub(crate) fn is_resume_mode_prompt(raw: &str) -> bool {
+    let clean = strip_ansi(raw).to_lowercase().replace('\u{2019}', "'");
+    let opt1 = cached_re!(r"(?m)^\s*(?:[\u{276f}>]\s*)?1\.\s+resume from summary");
+    let opt2 = cached_re!(r"(?m)^\s*(?:[\u{276f}>]\s*)?2\.\s+resume full session");
+    opt1.is_match(&clean) && opt2.is_match(&clean) && clean.contains("don't ask me again")
+}
+
+/// The policy for the resume-mode selector (ethos D2, same shape as
+/// `rate_limit_action`).
+///
+/// `summary` (default) presses the digit 1 — "Resume from summary". `off`
+/// leaves the selector for a human, and the sweep then stamps it
+/// input-required like any other picker. The digit, NOT Enter: Enter selects
+/// whatever happens to be highlighted, and a stray Down before the answer
+/// lands would silently pick "Resume full session" (burns the usage limits
+/// this prompt exists to protect) or "Don't ask me again" (a persistent
+/// config change amux must never make by accident — ethos rule 8).
+///
+/// SCOPE (Ethan, 2026-08-19): this menu and the rate-limit menu are the ONLY
+/// prompts amux auto-answers (yolo's own permission flags aside). Do not
+/// generalize this mechanism to other selectors.
+pub(crate) fn resume_mode_action() -> String {
+    std::env::var("AMUX_RESUME_MODE_ACTION")
+        .ok()
+        .map(|v| v.trim().to_lowercase())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "summary".into())
+}
+
 /// A transient 5xx / Overloaded API-error banner sitting at the TAIL of the pane
 /// — the lane is currently STUCK on it (a retry would help), not merely that a
 /// 529 happened earlier and the lane moved on. Anchored on the marker line
@@ -4467,9 +4520,32 @@ async fn send_text_inner(
     // selector, nothing else dismisses a menu, and every later send queues
     // behind the same one. Live specimen: mvs-infra held two messages for 400s+
     // and pressing Enter in the dashboard only added a third.
-    if waiting && rate_limit_action() != "off" {
+    if waiting {
         let pane = tmux_capture(name, 30).await;
-        if is_rate_limit_menu(&pane) {
+        // The resume-mode selector is amux's to answer, same as the rate-limit
+        // menu below (D2; policy set once by Ethan 2026-08-19). Answering here
+        // unblocks THIS send instead of parking it behind a selector the sweep
+        // would only clear on its next pass.
+        if resume_mode_action() != "off" && is_resume_mode_prompt(&pane) {
+            let (ok, msg) = send_keys_op(name, "1").await;
+            tracing::warn!(
+                session = %name, ok, detail = %msg,
+                "answered the resume-mode selector with '1. Resume from summary' — amux owns this prompt (D2)"
+            );
+            emit_event(
+                state,
+                name,
+                "session.resume_mode_answered",
+                Some(json!({"choice": "resume-from-summary", "ok": ok, "detail": msg})),
+                None,
+                "status",
+            )
+            .await;
+            if ok {
+                waiting = false;
+            }
+        }
+        if rate_limit_action() != "off" && is_rate_limit_menu(&pane) {
             // STAMP IT BEFORE ANSWERING, so the condition is visible even if the
             // keypress fails — and so a lane whose policy is `off` still shows
             // up as limited rather than merely stuck. /api/sessions reads these
@@ -4716,7 +4792,9 @@ const ALLOWED_TMUX_KEYS: [&str; 47] = [
     "C-u", "C-r", "C-p", "C-n", "C-b", "C-f", "C-w", "C-o", "C-x", "M-b", "M-f", "M-d", "F1",
     "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
 ];
-const ALLOWED_TMUX_CHAR_KEYS: [&str; 4] = ["y", "n", "q", "x"];
+// "1": the resume-mode auto-answer selects BY DIGIT (see resume_mode_action —
+// Enter would take whatever is highlighted, including "Don't ask me again").
+const ALLOWED_TMUX_CHAR_KEYS: [&str; 5] = ["y", "n", "q", "x", "1"];
 
 async fn send_keys_op(name: &str, keys: &str) -> (bool, String) {
     if !is_running(name).await {
@@ -8388,6 +8466,33 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             continue;
         }
         let pane = tmux_capture(name, 30).await;
+
+        // RESUME-MODE SELECTOR: amux's to answer (D2; policy set once by Ethan
+        // 2026-08-19 — "resume from summary", fleet-wide, model-agnostic). The
+        // send path also answers it, but only when somebody happens to be
+        // sending; after a machine reboot a third of the fleet parks here with
+        // nothing queued, which is exactly the sweep's reason to exist. Digit 1,
+        // not Enter — see resume_mode_action. Answered means the pane is mid-
+        // transition, so skip this lane's remaining state derivation this tick.
+        // With the policy `off` we fall through and the selector is stamped
+        // input-required below, like any other picker.
+        if resume_mode_action() != "off" && is_resume_mode_prompt(&pane) {
+            let (ok, msg) = send_keys_op(name, "1").await;
+            tracing::warn!(session = %name, ok, detail = %msg,
+                "swept a resume-mode selector — answered '1. Resume from summary'");
+            emit_event(
+                state,
+                name,
+                "session.resume_mode_answered",
+                Some(json!({"choice": "resume-from-summary", "ok": ok, "detail": msg, "detected_by": "sweep"})),
+                Some(format!("resumemode:{name}:{}", now_i64() / 3600)),
+                "status",
+            )
+            .await;
+            if ok {
+                continue;
+            }
+        }
 
         // INPUT-REQUIRED IS A DISTINCT STATE, and the dashboard has always been
         // able to show it (app.js:2405 renders `needs input`, and there is a
@@ -15667,6 +15772,49 @@ mod steer_max_age_tests {
         assert_eq!(rate_limit_action(), "wait");
         // `off` is the honest opt-out: detect it, report it, touch nothing.
         assert_ne!("off", rate_limit_action(), "default must not be off");
+    }
+
+    /// The resume-mode selector (Ethan, 2026-08-19: "resume from summary,
+    /// across models, the only prompt I auto answer outside of the yolo").
+    /// The specimen is the incident's own artifact — the selector Ethan
+    /// pasted, which a third of the fleet parked on after the panic restart.
+    #[test]
+    fn resume_mode_prompt_matches_the_selector_not_prose_or_its_own_source() {
+        let specimen = "  This session is 2d old and 725.5k tokens.\n\n  Resuming the full session will consume a substantial portion of your usage limits. We recommend resuming from a summary.\n\n  \u{276f} 1. Resume from summary (recommended)\n    2. Resume full session as-is\n    3. Don't ask me again";
+        assert!(is_resume_mode_prompt(specimen), "the live specimen must match");
+
+        // Model-agnostic: the header (age, token count) varies per lane and per
+        // model, and the highlight may sit on any option or render as '>'.
+        // Detection must rest only on the option lines.
+        let other = "This session is 5h old and 91.2k tokens.\n > 2. Resume full session as-is\n   1. Resume from summary (recommended)\n   3. Don\u{2019}t ask me again";
+        assert!(is_resume_mode_prompt(other), "must not depend on header text or highlight position");
+
+        // The rate-limit menu is a DIFFERENT selector with a different answer.
+        let rl = "What do you want to do?\n \u{276f} 1. Stop and wait for limit to reset\n   2. Switch to usage credits";
+        assert!(!is_resume_mode_prompt(rl));
+
+        // The resume PICKER (conversation list) is a question for a human.
+        let picker = "Resume a conversation\n \u{276f} 1. 2h ago fix the auth bug\n   2. 1d ago gallery review";
+        assert!(!is_resume_mode_prompt(picker));
+
+        // This source file on screen: the strings live inside quotes, so the
+        // line-anchored option shapes must not fire (the credit-banner lesson,
+        // 2026-08-16 — a lane CODING the strings is not sitting on them).
+        let code = "    let s = \"1. Resume from summary (recommended)\";\n    // \"2. Resume full session as-is\" and don't ask me again";
+        assert!(!is_resume_mode_prompt(code));
+
+        // Prose recounting the choice must not press a key into a working lane.
+        let prose = "I chose Resume from summary; Resume full session as-is was too costly. Don't ask me again about it.";
+        assert!(!is_resume_mode_prompt(prose));
+    }
+
+    /// The policy is the human's, set once (D2). Default is `summary` — Ethan
+    /// 2026-08-19 — and `off` is the honest opt-out (detect, stamp
+    /// input-required, touch nothing).
+    #[test]
+    fn the_resume_mode_policy_defaults_to_summary() {
+        assert_eq!(resume_mode_action(), "summary");
+        assert_ne!("off", resume_mode_action(), "default must not be off");
     }
 
     #[test]

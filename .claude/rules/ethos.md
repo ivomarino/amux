@@ -443,6 +443,11 @@ scraper pretending to be a user.
 `rate_limit_action` = `wait` (default, today's behavior) or `off` (detect but
 leave the menu for a human). The scrape stays only because Claude Code exposes
 this state nowhere else.
+2026-08-19: a SECOND selector joined it by Ethan's explicit instruction — the
+resume-mode prompt ("Resume from summary / full session / don't ask again"),
+answered with the digit 1 (`resume_mode_action`, default `summary`, `off` to
+leave it). He also set the boundary: these two are the ONLY prompts amux
+auto-answers (yolo's own flags aside) — do not generalize the mechanism.
 **Exit:** Claude Code exposes rate-limit state via hook/JSON; delete the
 pattern table.
 
