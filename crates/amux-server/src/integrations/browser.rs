@@ -479,6 +479,32 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
     // Does CDP still answer? That is the only proof that matters — a live pid
     // whose Chrome has wedged is not an adoptable browser.
     if cdp_list(port).await.is_err() {
+        // RECORD THE CORPSE, do not just sweep it (AMUX-3414). The exit
+        // monitor dies WITH the server, so a Chrome killed during a server
+        // restart — the builder adopts a new binary several times an hour on
+        // this machine, and the deaths correlate — leaves no in-process
+        // record. The restarted server finding a running-file whose browser
+        // is dead IS the observation; clearing it silently was why two lanes
+        // spent a morning on hypotheses for a death nothing logged.
+        let started_by =
+            v.get("started_by").and_then(serde_json::Value::as_str).unwrap_or("");
+        let profile =
+            v.get("profile").and_then(serde_json::Value::as_str).unwrap_or("default");
+        tracing::warn!(
+            pid, port, profile, started_by,
+            "browser: running-file names a browser that is GONE (CDP dead) — it died while \
+             no server was watching, most likely killed alongside a server restart; \
+             recording last_exit and clearing the file"
+        );
+        *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
+            "ts": chrono::Utc::now().timestamp(),
+            "reason": "found dead on adopt (died while the server was down or restarting)",
+            "profile": profile,
+            "pid": pid,
+            "started_by": started_by,
+            "code": serde_json::Value::Null,
+            "signal": serde_json::Value::Null,
+        }));
         clear_running(home);
         return false;
     }
