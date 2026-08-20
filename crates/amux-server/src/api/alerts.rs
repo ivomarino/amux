@@ -340,12 +340,35 @@ pub(crate) fn hdr_worker(headers: &HeaderMap) -> String {
 
 // ---- /api/alert/config -----------------------------------------------------
 
+/// The send path's own SMS gate, shared with `/api/alert/config` so the view
+/// and the send cannot disagree. Found by amux-frustrations verifying AC-362:
+/// config reported `"sms": true` in exactly the state where a real send
+/// reports "no phone configured (AMUX_OWNER_PHONE is empty)" — the flag is a
+/// real fact (the toggle), but a reader checking it believed a send would
+/// text. Returns (deliverable, blocked_reason); the reason strings are the
+/// send path's own, verbatim, so the two surfaces stay in string parity.
+fn sms_gate(home: &std::path::Path) -> (bool, Option<&'static str>) {
+    if effective_env(home, "AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) == "0" {
+        return (false, Some("disabled (AMUX_URGENT_SMS=0)"));
+    }
+    if effective_env(home, "AMUX_OWNER_PHONE").unwrap_or_default().is_empty() {
+        return (false, Some("no phone configured (AMUX_OWNER_PHONE is empty)"));
+    }
+    (true, None)
+}
+
 async fn get_config() -> Response {
     let home = amux_home();
+    let (sms_deliverable, sms_blocked) = sms_gate(&home);
     Json(json!({
         "phone": effective_env(&home, "AMUX_OWNER_PHONE").unwrap_or_default(),
         "push": effective_env(&home, "AMUX_URGENT_PUSH").unwrap_or_else(|| "1".into()) != "0",
+        // `sms` stays the raw TOGGLE (existing consumers render it as the
+        // setting); deliverability is its own field because they genuinely
+        // differ — a toggle can be on with no phone to text.
         "sms": effective_env(&home, "AMUX_URGENT_SMS").unwrap_or_else(|| "1".into()) != "0",
+        "sms_deliverable": sms_deliverable,
+        "sms_blocked_reason": sms_blocked,
         "sms_provider": if effective_env(&home, "TWILIO_ACCOUNT_SID").is_some() { "twilio" } else { "imessage" },
     }))
     .into_response()
@@ -630,10 +653,10 @@ async fn post_owner(
     // AMUX_OWNER_PHONE present but empty), which is very likely a deliberate
     // response to the 38-SMS night of 2026-08-03 — see cmd_alert in the CLI.
     // Deliberate or not, the alarm must say so out loud.
-    if !sms_enabled {
-        out_channels.insert("sms".into(), json!("disabled (AMUX_URGENT_SMS=0)"));
-    } else if phone.is_empty() {
-        out_channels.insert("sms".into(), json!("no phone configured (AMUX_OWNER_PHONE is empty)"));
+    // The reason comes from the SAME gate /api/alert/config now reports, so
+    // the config view and a real send can never name different truths.
+    if let (false, Some(reason)) = sms_gate(&home) {
+        out_channels.insert("sms".into(), json!(reason));
     }
     if sms_enabled && !phone.is_empty() {
         // Stamp the originating session so the owner sees WHICH session
@@ -775,6 +798,33 @@ async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<Ledger
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The config view and the send path share one SMS gate (found verifying
+    /// AC-362: config said "sms": true in exactly the state where a real send
+    /// reports "no phone configured"). Every case writes BOTH keys into the
+    /// file because effective_env is file-first and this machine's process env
+    /// carries its own values — an absent key would make the test read the
+    /// host, not the fixture.
+    #[test]
+    fn sms_gate_matches_the_send_paths_own_predicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let env = |sms: &str, phone: &str| {
+            std::fs::write(
+                dir.path().join("server.env"),
+                format!("AMUX_URGENT_SMS={sms}\nAMUX_OWNER_PHONE={phone}\n"),
+            )
+            .unwrap();
+        };
+        env("0", "+15551234567");
+        assert_eq!(sms_gate(dir.path()), (false, Some("disabled (AMUX_URGENT_SMS=0)")));
+        env("1", "");
+        assert_eq!(
+            sms_gate(dir.path()),
+            (false, Some("no phone configured (AMUX_OWNER_PHONE is empty)"))
+        );
+        env("1", "+15551234567");
+        assert_eq!(sms_gate(dir.path()), (true, None));
+    }
 
     /// The fire-alarm honesty rule (AC-347 / mixpeek-finances). "sent" is
     /// legitimate ONLY when an endpoint accepted the push (2xx). The whole
@@ -943,12 +993,20 @@ mod tests {
         let _guard = test_env::set_home(dir.path());
         let app = app(MockChannels::ok());
 
-        // Python defaults: no phone, both channels on, imessage provider.
+        // Python defaults: no phone, both channels on, imessage provider —
+        // and the toggle-on/no-phone state must SAY sms is not deliverable
+        // (the AC-362 residual: "sms": true beside phone "" read as "a send
+        // will text" when a real send reports "no phone configured").
         let (st, v) = send(&app, "GET", "/api/alert/config", &[], None).await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(
             v,
-            json!({ "phone": "", "push": true, "sms": true, "sms_provider": "imessage" })
+            json!({
+                "phone": "", "push": true, "sms": true,
+                "sms_deliverable": false,
+                "sms_blocked_reason": "no phone configured (AMUX_OWNER_PHONE is empty)",
+                "sms_provider": "imessage"
+            })
         );
 
         // PATCH applies only the keys present in the body.
