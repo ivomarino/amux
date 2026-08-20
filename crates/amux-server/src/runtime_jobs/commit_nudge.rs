@@ -69,6 +69,15 @@ pub struct Freshness {
     /// origin has commits on the path that local HEAD lacks: the worktree copy
     /// is OLDER. Committing it SILENTLY REVERTS origin. Restore, do not commit.
     pub stale: Vec<String>,
+    /// BOTH directions have commits on the path — novel and stale at once.
+    /// Neither single-arm remedy is safe: commit reverts origin's side,
+    /// restore reverts the local side, and every restore-safety test passes
+    /// while doing it (locally-committed content is "reachable from a commit"
+    /// too). Live specimen 2026-08-20: mixpeek .githooks/pre-push, origin
+    /// carrying 96ea161803 and local HEAD carrying the MG-1483 guard — the
+    /// two-bucket classifier filed it STALE and the prescribed restore
+    /// silently disarmed a data-loss push guard. Merge, or hand to the owner.
+    pub diverged: Vec<String>,
     /// Absent from origin/main. Genuinely new work; LOST if never committed.
     pub new: Vec<String>,
     /// Differs from origin, which has not moved past HEAD on this path. A
@@ -136,6 +145,7 @@ pub fn build(
     // also the honest state when local HEAD is not behind origin.
     let same: BTreeSet<&str> = fresh.same.iter().map(String::as_str).collect();
     let stale_set: BTreeSet<&str> = fresh.stale.iter().map(String::as_str).collect();
+    let diverged_set: BTreeSet<&str> = fresh.diverged.iter().map(String::as_str).collect();
 
     // Drop SAME first. If that empties the set there is nothing honest to say:
     // identical-to-origin is the same non-event as a clean tree.
@@ -147,14 +157,46 @@ pub fn build(
 
     let stale_paths: Vec<&str> =
         dirty.iter().copied().filter(|p| stale_set.contains(*p)).collect();
+    let diverged_paths: Vec<&str> =
+        dirty.iter().copied().filter(|p| diverged_set.contains(*p)).collect();
     let commit_worthy: Vec<String> = dirty
         .iter()
         .copied()
-        .filter(|p| !stale_set.contains(*p))
+        .filter(|p| !stale_set.contains(*p) && !diverged_set.contains(*p))
         .map(str::to_string)
         .collect();
 
     let mut sections: Vec<String> = Vec::new();
+
+    // DIVERGED before everything: both remedies the rest of this message
+    // teaches are wrong for these paths, and the reader must hit that before
+    // either recipe. The missing cell that disarmed the mixpeek MG-1483 guard
+    // (2026-08-20): both directions carry commits, so commit reverts origin's
+    // side, restore reverts the local side, and the restore-safety check
+    // passes throughout because locally-committed content is
+    // reachable-from-a-commit too.
+    if !diverged_paths.is_empty() {
+        let n = diverged_paths.len();
+        let list: String = diverged_paths
+            .iter()
+            .take(10)
+            .map(|p| format!("  {p}\n"))
+            .collect::<String>()
+            + if n > 10 { "  …\n" } else { "" };
+        sections.push(format!(
+            "DIVERGED: {n} of your dirty file(s) under {dir} have commits in BOTH directions — \
+             origin/main carries commits on them that your HEAD lacks, AND your HEAD carries \
+             commits origin lacks. They are novel and stale AT ONCE, so NEITHER standard remedy \
+             is safe:\n{list}\
+             Committing carries your side forward and SILENTLY REVERTS origin's commits; \
+             `git checkout origin/main -- <path>` reverts YOUR landed commits — and the \
+             find-object restore-safety check PASSES while it does, because locally-committed \
+             content is reachable-from-a-commit too (that is how the mixpeek MG-1483 push guard \
+             was silently disarmed, 2026-08-20). MERGE the two versions (for append-only files, \
+             union-merge per .claude/rules/frustrations.md), or hand the path to its owner. Do \
+             not clear these with any single-arm command."
+        ));
+    }
 
     // STALE FIRST and most prominently. The opposite instruction to the rest of
     // the nudge: do NOT commit these, restore them.
@@ -336,7 +378,11 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              you lack = STALE, so do not commit; restore with `git checkout origin/main -- <path>` \
              ONLY after `git log --all --find-object=$(git hash-object <path>) -- <path>` prints a \
              commit (empty or errored means the stale copy carries novel mid-edit a restore would \
-             DELETE, so commit the path instead); \
+             DELETE, so commit the path instead) AND the reverse test \
+             `git log --oneline origin/main..HEAD -- <path>` prints NOTHING — if BOTH directions \
+             print commits the path has DIVERGED (novel and stale at once) and either single-arm \
+             remedy destroys one side's landed work: MERGE the versions or hand the path to its \
+             owner; \
              prints NOTHING = origin has nothing you lack, so it is current content, and if it \
              is not yours it is a peer's mid-edit: hands off either way. Do NOT use \
              `git cat-file -e $(git hash-object <path>)` for this: blob existence cannot separate \
@@ -380,9 +426,17 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          \u{2022} `git log --oneline HEAD..origin/main -- <path>`: if it prints ANY commit, \
          origin has work on this path that your HEAD lacks, so the worktree copy is genuinely \
          older (STALE); do not commit. Restore with `git checkout origin/main -- <path>` ONLY \
-         after `git log --all --find-object=$(git hash-object <path>) -- <path>` prints a commit; \
-         an empty or errored result means the stale copy carries novel mid-edit a restore would \
-         DELETE, so commit the path instead.\n\
+         after BOTH: `git log --all --find-object=$(git hash-object <path>) -- <path>` prints a \
+         commit (empty or errored means the stale copy carries novel mid-edit a restore would \
+         DELETE, so commit the path instead), AND the REVERSE test \
+         `git log --oneline origin/main..HEAD -- <path>` prints NOTHING.\n\
+         \u{2022} if BOTH directions print commits, the path has DIVERGED — novel AND stale at \
+         once — and commit and restore each destroy one side's landed work while every test \
+         above passes as prescribed. MERGE the two versions (or hand the path to its owner); \
+         neither single-arm remedy is safe. Live specimen 2026-08-20: mixpeek \
+         .githooks/pre-push, origin carrying 96ea161803 and HEAD carrying the MG-1483 guard \
+         chain — the one-direction protocol read it STALE and the prescribed restore silently \
+         disarmed a data-loss push guard.\n\
          \u{2022} if it prints NOTHING, origin has nothing you lack: the content is yours to \
          keep, `checkout` would DESTROY it, and the safe action is COMMIT, not restore.\n\
          This is the same predicate the guard itself classifies with, so its verdict and your \
@@ -847,7 +901,25 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
             .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
             .unwrap_or(false);
         if stale {
-            fresh.stale.push(p.clone());
+            // 3b. DIVERGED: local HEAD ALSO has commits origin lacks on this
+            //     path. Filing it STALE prescribes a restore that reverts the
+            //     local side's landed work — and the restore-safety check
+            //     passes while it happens, because locally-committed content
+            //     is reachable-from-a-commit too (the mixpeek .githooks
+            //     disarm, 2026-08-20). The missing cell, not a tighter test.
+            let local_ahead = tokio::process::Command::new("git")
+                .args(["-C", dir, "log", "--oneline", "origin/main..HEAD", "--", p])
+                .output()
+                .await
+                .map(|o| {
+                    o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
+                })
+                .unwrap_or(false);
+            if local_ahead {
+                fresh.diverged.push(p.clone());
+            } else {
+                fresh.stale.push(p.clone());
+            }
             continue;
         }
 
@@ -1075,6 +1147,29 @@ mod tests {
                  every committed-but-unpushed file and its remedy reverts them: {m}"
             );
         }
+    }
+
+    /// The DIVERGED cell must render as its own section that forbids BOTH
+    /// single-arm remedies (the mixpeek MG-1483 disarm, 2026-08-20): a path in
+    /// `diverged` must never be listed as commit-worthy or STALE, and the text
+    /// must name the merge as the only exit.
+    #[test]
+    fn diverged_paths_get_their_own_section_and_leave_both_recipes() {
+        let dirty = vec!["hooks/pre-push".to_string()];
+        let fresh =
+            Freshness { diverged: vec!["hooks/pre-push".to_string()], ..Default::default() };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("diverged section must render");
+        assert!(m.contains("DIVERGED:"), "the cell must have its own section: {m}");
+        assert!(
+            m.contains("reachable-from-a-commit too"),
+            "must say WHY the restore-safety check cannot catch this: {m}"
+        );
+        assert!(m.contains("MERGE the two versions"), "the only safe exit must be named: {m}");
+        assert!(
+            !m.contains("STALE:"),
+            "a diverged path must not also render the STALE restore recipe: {m}"
+        );
     }
 
     /// The STALE section's RESTORE-SAFETY check must be the reachable-from-a-commit
