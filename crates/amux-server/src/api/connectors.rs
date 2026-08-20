@@ -80,9 +80,11 @@ enum Auth {
     OAuth2 {
         client_id_env: &'static str,
         client_secret_env: &'static str,
-        /// Path the OAuth client must have registered as a redirect URI, joined
-        /// to this server's canonical origin at request time. All Google
-        /// connectors share ONE client, so they share one callback path.
+        /// Path this family's callback route is mounted at. Slack joins it to
+        /// the canonical origin as its redirect URI. Google connectors do NOT:
+        /// they hand Google the gmail redirect URI instead (the one already
+        /// registered on the shared client — see [`google_redirect_uri`]), and
+        /// the gmail callback delegates their states back to this module.
         callback_path: &'static str,
         scopes: &'static str,
     },
@@ -213,6 +215,19 @@ fn env_keys(p: &Provider) -> Vec<&'static str> {
 /// both the laptop (8824) and the container (8822) with no build flag.
 fn origin() -> String {
     format!("https://localhost:{}", canonical_port())
+}
+
+/// The redirect URI every google-family grant uses: the GMAIL one, on purpose
+/// (AMUX-3427). It is the only URI proven registered on the shared OAuth
+/// client — every working Gmail token was minted through it — so reusing it
+/// deletes the "register a second URI in the console" step. The first live
+/// Reconnect dead-ended on exactly that step: Google answered
+/// `Error 400: redirect_uri_mismatch` BEFORE redirecting, a wall amux can
+/// never observe from its own callback. The gmail callback recognises
+/// connectors-minted states and delegates back to [`delegate_gmail_callback`].
+/// `GMAIL_REDIRECT_URI` in server.env overrides both flows with one knob.
+fn google_redirect_uri() -> String {
+    super::gmail_auth::gmail_redirect_uri()
 }
 
 /// The Workspace user an SA-minted token should impersonate. In CLOUD the
@@ -731,7 +746,27 @@ async fn begin_auth(
                 )
                     .into_response();
             };
-            let redirect_uri = format!("{}{}", origin(), callback_path);
+            // Google reuses the ALREADY-REGISTERED gmail redirect URI (see
+            // google_redirect_uri); only Slack gets the connectors path.
+            let redirect_uri = if p.category == "Google" {
+                google_redirect_uri()
+            } else {
+                format!("{}{}", origin(), callback_path)
+            };
+            // Registration evidence: a working gmail token proves the URI is
+            // registered on this client. With none, the grant may dead-end at
+            // Google's own error wall (which never redirects, so amux would
+            // see nothing) — say so NOW, in the log and the response.
+            let registration_proven =
+                p.category == "Google" && !connected_accounts_in(&ctx.home).is_empty();
+            if p.category == "Google" && !registration_proven {
+                tracing::warn!(
+                    "connector_auth: no working gmail token proves {} is registered on the OAuth \
+                     client — if Google answers redirect_uri_mismatch, register it once at \
+                     https://console.cloud.google.com/apis/credentials",
+                    redirect_uri
+                );
+            }
             let state = token_urlsafe(24);
             let (url, verifier) = if p.category == "Google" {
                 // One grant covers the whole Google family: union scopes, so
@@ -784,6 +819,11 @@ async fn begin_auth(
                 "auth": "oauth2",
                 "authorize_url": url,
                 "redirect_uri": redirect_uri,
+                "redirect_uri_registered": if p.category == "Google" {
+                    json!(registration_proven)
+                } else {
+                    Value::Null
+                },
                 "account": account,
                 "family": family,
                 "prerequisite": if p.category == "Google" {
@@ -854,7 +894,7 @@ async fn callback(
         if error.contains("redirect_uri_mismatch") && url_family == "google" {
             let cid = resolve_cred_in(&ctx.home, &file_env, "Google", "GOOGLE_OAUTH_CLIENT_ID")
                 .unwrap_or_default();
-            let uri = format!("{}/api/connectors/google/callback", origin());
+            let uri = google_redirect_uri();
             let pre = super::gmail_auth::oauth_prerequisite(&cid, &uri);
             return cb_page(
                 StatusCode::BAD_REQUEST,
@@ -891,6 +931,50 @@ async fn callback(
             ),
         );
     }
+    complete_exchange(&ctx, family, code, hint_account, verifier).await
+}
+
+/// Called by the gmail callback when a state it does not own arrives: if the
+/// state is a connectors-minted grant (the google family hands Google the
+/// gmail redirect URI precisely because it is the registered one — see
+/// [`google_redirect_uri`]), complete it here. Returns None when the state is
+/// unknown to the connectors store too, so the gmail callback renders its own
+/// invalid/expired page. Single-use order matters: the caller must miss in
+/// ITS pending store before this take.
+pub(crate) async fn delegate_gmail_callback(
+    http: Arc<dyn HttpTransport>,
+    home: &std::path::Path,
+    state: &str,
+    code: &str,
+) -> Option<Response> {
+    let (family, hint_account, verifier) = pending_take(home, state)?;
+    if family != "google" {
+        // A slack state can only land here via a mis-registered redirect —
+        // name it rather than exchanging against the wrong token endpoint.
+        return Some(cb_page(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "<h2>Family mismatch</h2><p>This grant was started for <b>{}</b> but the \
+                 redirect landed on the gmail callback. Check the registered redirect URI.</p>",
+                html_escape(&family)
+            ),
+        ));
+    }
+    let ctx = ConnectorsCtx { http, home: home.to_path_buf() };
+    Some(complete_exchange(&ctx, family, code.to_string(), hint_account, verifier).await)
+}
+
+/// The code→token exchange + store write shared by BOTH entry points: the
+/// connectors callback above, and the gmail callback delegating a
+/// connectors-minted state that arrived on the gmail redirect URI.
+async fn complete_exchange(
+    ctx: &ConnectorsCtx,
+    family: String,
+    code: String,
+    hint_account: String,
+    verifier: Option<String>,
+) -> Response {
+    let file_env = parse_env_file(&ctx.home.join("server.env"));
     let category = if family == "google" { "Google" } else { "Chat" };
     let (id_key, secret_key) = if family == "google" {
         ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
@@ -906,7 +990,13 @@ async fn callback(
             format!("<h2>Token exchange failed</h2><pre>client credentials for {family} are no longer set</pre>"),
         );
     };
-    let redirect_uri = format!("{}/api/connectors/{}/callback", origin(), family);
+    // Must match the auth request byte-for-byte: google grants were issued
+    // with the gmail redirect URI (the registered one), slack with its own.
+    let redirect_uri = if family == "google" {
+        google_redirect_uri()
+    } else {
+        format!("{}/api/connectors/{}/callback", origin(), family)
+    };
     let token_uri = if family == "google" {
         DEFAULT_TOKEN_URI.to_string()
     } else {
@@ -1828,6 +1918,19 @@ mod tests {
         assert_eq!(qparam(url, "access_type"), Some("offline"));
         assert_eq!(qparam(url, "code_challenge_method"), Some("S256"));
         assert_eq!(qparam(url, "login_hint"), Some(urlencode(ACCT).as_str()));
+        // The redirect URI is the GMAIL one — the only URI already registered
+        // on the shared client. Issuing /api/connectors/google/callback here
+        // is the regression that dead-ended the first live Reconnect at
+        // Google's own `Error 400: redirect_uri_mismatch` wall (AMUX-3427).
+        assert!(
+            v["redirect_uri"].as_str().unwrap().ends_with("/api/gmail/callback"),
+            "google grant must reuse the registered gmail redirect URI: {}",
+            v["redirect_uri"]
+        );
+        // No gmail token exists in this temp home, so nothing proves the URI
+        // is registered — the response must say so instead of letting the
+        // grant dead-end silently.
+        assert_eq!(v["redirect_uri_registered"], json!(false));
 
         // Pending state persisted (family + verifier), challenge derived S256.
         let state = qparam(url, "state").unwrap();
@@ -1879,10 +1982,11 @@ mod tests {
         assert!(page.contains("connected"), "{page}");
         assert!(page.contains("email API included"), "{page}");
 
-        // The exchange carried the PKCE verifier and OUR redirect URI.
+        // The exchange carried the PKCE verifier and the SAME redirect URI the
+        // auth request was issued with — the registered gmail one (AMUX-3427).
         let form = http.calls()[0].3.clone().unwrap();
         assert_eq!(form["grant_type"], json!("authorization_code"));
-        assert!(form["redirect_uri"].as_str().unwrap().ends_with("/api/connectors/google/callback"));
+        assert!(form["redirect_uri"].as_str().unwrap().ends_with("/api/gmail/callback"));
         assert!(form["code_verifier"].as_str().is_some());
 
         // Family store: one file per ACCOUNT (named by userinfo, not the hint).
@@ -1925,6 +2029,60 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::BAD_REQUEST);
         assert!(page.contains("Invalid or expired"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn gmail_callback_completes_a_connectors_state_it_does_not_own() {
+        // The SHIPPED flow (AMUX-3427): a google-family grant hands Google the
+        // gmail redirect URI (the registered one), so the code+state land on
+        // /api/gmail/callback — which must recognise the connectors state and
+        // complete the family exchange, not render "Invalid or expired".
+        let home = home_with_google_client();
+        let http = MockHttp::new(vec![
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                200,
+                json!({ "access_token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT",
+                         "expires_in": 3599,
+                         "scope": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/drive" }),
+            ),
+            ("GET", "oauth2/v2/userinfo", 200, json!({ "email": ACCT })),
+        ]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        let (_, v) =
+            send_json(&app, "POST", "/api/connectors/google/auth?account=hint%40other.io").await;
+        let state = qparam(v["authorize_url"].as_str().unwrap(), "state").unwrap().to_string();
+
+        // Google redirects to the GMAIL callback, not the connectors one.
+        let gctx = Arc::new(crate::api::gmail_auth::GmailAuthCtx::new(
+            http.clone(),
+            home.path().to_path_buf(),
+        ));
+        let dir2 = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir2.path().join("c.db")).unwrap();
+        let gstate = AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let gapp = Router::new()
+            .merge(crate::api::gmail_auth::callback_routes_with(gctx))
+            .with_state(gstate);
+        let (st, page) =
+            send(&gapp, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        assert_eq!(st, StatusCode::OK, "{page}");
+        assert!(page.contains("connected"), "{page}");
+
+        // The delegated exchange wrote the family store AND the gmail mirror.
+        assert!(home
+            .path()
+            .join("connectors")
+            .join("google")
+            .join(format!("{ACCT}.json"))
+            .exists());
+        assert!(home.path().join("gmail-tokens").join(format!("{ACCT}.json")).exists());
     }
 
     #[tokio::test]

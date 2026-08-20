@@ -432,6 +432,22 @@ pub async fn callback(
     }
     let entry = if state.is_empty() { None } else { pending_take(&ctx.home, &state) };
     let Some((account, verifier)) = entry.filter(|_| !code.is_empty()) else {
+        // Not ours? The connectors broker's google-family grants hand Google
+        // THIS redirect URI on purpose — it is the one already registered on
+        // the shared client — so their states land here (AMUX-3427). Single-use
+        // order: our own pending store missed above, now try theirs.
+        if !state.is_empty() && !code.is_empty() {
+            if let Some(resp) = super::connectors::delegate_gmail_callback(
+                ctx.http.clone(),
+                &ctx.home,
+                &state,
+                &code,
+            )
+            .await
+            {
+                return resp;
+            }
+        }
         return html(
             StatusCode::BAD_REQUEST,
             "<html><body><h2>Invalid or expired auth request.</h2>\

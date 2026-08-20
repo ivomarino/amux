@@ -2407,3 +2407,29 @@ FIX: Derive both from ONE table. A view must share the predicate of the mechanis
   which is precisely the weaker practice the gate exists to prevent. A stale doc that
   under-states a constraint teaches the wrong habit to everyone who never trips the gate.
   Not fixed here: which of the two is authoritative is amux's call, not a guess of mine.
+
+---
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux
+AREA: instruments
+CARD: AMUX-3427
+SYMPTOM: The first live Reconnect through the connectors OAuth broker dead-ended at
+  Google's own wall: `Error 400: redirect_uri_mismatch`, because the flow issued
+  `https://localhost:8824/api/connectors/google/callback`, a URI registered on no
+  OAuth client. Google blocks BEFORE redirecting, so amux never receives anything:
+  no callback hit, no log line, no autofix signal. The only witness was Ethan's
+  screenshot. Meanwhile the same client already had a working registered URI
+  (`/api/gmail/callback`, proven by every working Gmail token), and the broker
+  ignored it in favor of a new one that needed a manual console step.
+COST: Ethan's Reconnect click wasted, a screenshot round-trip, and the whole
+  "one click repairs the account" promise broken on its first real use. The
+  failure mode is invisible to amux by construction.
+FIX: Reuse what is proven instead of demanding new registration: google-family
+  grants now hand Google the gmail redirect URI (`google_redirect_uri()` =
+  `gmail_redirect_uri()`, one `GMAIL_REDIRECT_URI` override knob for both), and
+  the gmail callback recognises connectors-minted states and delegates the
+  exchange back to the broker. The unobservable-wall class is surfaced at the
+  only moment amux CAN see it: begin_auth now WARNs and returns
+  `redirect_uri_registered:false` when no working gmail token proves the URI is
+  registered. Regression tests pin the URI and the delegation.
