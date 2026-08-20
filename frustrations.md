@@ -2235,3 +2235,61 @@ FIX: The guard verifies that the COMMIT BEING REWRITTEN is yours and says nothin
   Cheap interim, entirely on the caller: `git commit --amend -- <your paths>`. A
   pathspec makes amend behave like the scoped commit the guard already pushes people
   toward everywhere else, and nothing in the guard's message mentions it.
+
+---
+## SIX answer-shaped wrong results in one night, and in every one the tell was a MISSING ACCOMPANIMENT rather than the answer
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-107
+SYMPTOM: Six probes in one sweep returned something that LOOKED like an answer and was
+  wrong. Recorded together because the count is the argument — any one of these reads as
+  carelessness, and six in a night is a property of the surfaces, not of the day.
+
+  1. `until [ "$(curl .../health | py 'print(d["build"])')" != "$OLD" ]` — the health call
+     failed mid-restart, python raised, the expression was EMPTY, empty != old, and the
+     loop exited printing "ADOPTED". I then measured a WARN storm against the old binary.
+     Missing accompaniment: it never printed the hash it had supposedly adopted.
+  2. `git diff --numstat origin/main...main -- <file>` labelled "what origin added that I
+     lack". Three dots diff merge-base -> main, so those were MY changes with the label
+     reversed. I nearly told amux their AMUX-3110 gate was still live. Missing
+     accompaniment: `behind=0`, already on screen, said origin had nothing.
+  3. Filtered `/api/logs` rows on `ts` inside an outage window and got zero — from a page
+     that is newest-first and capped at 2000, every row of which post-dated the window.
+     Missing accompaniment: no count of how many rows the page could even span.
+  4. Read a schedule's `last_run_at`; the field is `last_run`. Three schedules reported
+     `None` and I briefly believed a 12.6h outage had eaten the day's fires. Missing
+     accompaniment: no key listing next to the value.
+  5. Grepped `/api/debug/boundary` for a `families` key that does not exist; printed
+     "families tracked: 0" against a live, correct response.
+  6. Imported `git-shared-guard.py` to A/B its behaviour. It carried a module-level
+     `sys.exit(main())`, so the import exits the importer with code 0. I wrapped it in
+     `except SystemExit: pass` and moved on. amux hit the same line and their test suite
+     printed NOTHING and exited 0 with every assertion unreached — the purest cannot-fail
+     check either of us saw. Missing accompaniment: no PASS line, from a suite that
+     "passed".
+COST: no wrong conclusion shipped, because each was caught by a second look — but 4 of the
+  6 had already produced a stated conclusion I was about to act on, and #2 was seconds from
+  being sent to another session as fact. The real cost is that the catch was luck of
+  habit, not of instrumentation: nothing in any of these surfaces made the wrongness
+  visible.
+FIX: The generalisation, sharpened by amux and worth more than the six specimens: every
+  one produced an ANSWER-SHAPED result — an empty string, a reversed label, `ok:true`,
+  `exit 0`, a plausible zero — and in NO case was the result itself the tell. The tell was
+  always something ABSENT beside it: no PASS line, no adopted hash, no `ignored_fields`, no
+  key listing, a diff that should have shrunk and did not.
+  So the precondition that actually works is not "be careful" and not "check the result".
+  It is: BEFORE believing a probe, name what should appear ALONGSIDE the answer if the
+  probe really ran, and check for THAT. A count next to a zero. A hash next to "adopted".
+  A PASS line next to a green suite. A key listing next to a None.
+  ethos rule 7 already carries this family (the silent probe, the loud-wrong probe, the
+  empty grep). What it does not yet carry is the accompaniment test, which is the cheap
+  mechanical version, and this entry exists so the SIXFOLD count is somewhere countable
+  rather than spread across six cards nobody joins up.
+  Two of the six are amux defects with their own fixes: the module-level `sys.exit`
+  (now __name__-gated) and `/api/browser/start` silently accepting unknown fields
+  (AMUX-3403). The other four are surfaces that make the mistake easy — a capped
+  newest-first page with no upper bound, and field names that differ by a suffix — and
+  none of them can currently tell a caller they were misread.
