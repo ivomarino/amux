@@ -917,22 +917,6 @@ this exact commit in under a second, and it is checkable by the machine rather t
 The generalisable point: on a shared checkout the unit of work is a PATH, never `-A`, and the tell that
 the rule is not being followed is a build that fails in a file its committer never opened.
 
-## The dashboard's "New worker" button cannot create a worker (405)
-AREA: cli
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux
-CARD: AMUX-2655
-SYMPTOM: `POST /api/sessions` answers `405, allow: GET,HEAD`. The create dialog shows
-  "Create failed: error 405" and stays open. `POST /api/workers` exists but writes a
-  `workers` table row, a different substrate from the `~/.amux/sessions/*.env` registry
-  the fleet actually reads — so it is not a workaround, it creates an invisible worker.
-COST: the only way to make a worker for a UI test was to duplicate an existing one; a
-  user with an empty fleet has no path at all. Found only because a test needed it.
-FIX: `sessions_legacy::create_session_legacy` + `.post()` on the route (written,
-  uncommitted — this session is barred from committing). Verified 201 + worker present.
-  VERIFIED 2026-08-20 (amux-frustrations, NOT the author): GET /api/debug/routes shows /api/sessions -> ['GET','POST']. The 405 is gone, and the live request log carries real 201s from the dashboard UA today. Awaiting amux sign-off.
 ## Board card Delete removes the card and never deletes it
 AREA: board
 SEVERITY: blocks
