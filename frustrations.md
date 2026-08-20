@@ -342,50 +342,6 @@ FIX: A review that produces an out-of-scope finding needs somewhere to put it th
 NOTE: related to the `watch`-type blindness in ethos.md (a card surfaced by nothing is a note,
   not a monitor) — same root, different container: here the invisible thing is a paragraph
   inside a terminal-status card rather than a card outside every query.
-## SUPERSEDES the restart-framed-its-subject entry above: BOTH causes were real, and the instrument already existed
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-08
-SESSION: amux-frustrations
-CARD: AF-11
-SUPERSEDES: "A peer's save restarts the server mid-measurement, and the timings blame your
-  subject" (same session, same day). That entry is wrong in its diagnosis and wrong in its
-  FIX. Leaving it in place per this file's convention; read this one instead.
-SYMPTOM: I reported `GET /api/board?slim=1` timing out at 60s while the unfiltered 6.6MB
-  fetch returned in 16.9s, found that a peer had written amux-server.py at 12:39:48 and
-  the server had restarted at 12:40:24, and concluded the numbers were "entirely
-  fabricated". Then I re-measured, got slim 0.10s / full 0.11s, and declared the
-  hypothesis dead. Timeline says otherwise: my FIRST measurement predates the write, so no
-  restart was involved — it was measuring a live defect (AMUX-2562, filtered board GETs
-  running an uncapped full-table scan per request, which is precisely why the PROJECTING
-  path hung while the unfiltered one returned). d4dfbc7 landed the fix at 12:40:49. My
-  "control" ran after that. I compared before-fix to after-fix and labelled it
-  before-restart to after-restart.
-COST: A wrong conclusion published in two places (this file and AF-11) and a real defect
-  dismissed as measurement noise by the only other session that had independently
-  observed it. amux filed AMUX-2562 from their own diagnosis an hour later; had I read my
-  own data correctly they would have had a second data point at 12:36 instead of none.
-FIX: Nothing to build — GET /health ALREADY returns `build` (a content hash of the running
-  amux-server.py), plus `pid` and `uptime_s`. Any of the three would have caught this;
-  `build` catches it exactly, because the invalidating fact was that the served CODE
-  changed, not merely that the process bounced. Fixed by routing callers to it: CLAUDE.md
-  now carries the bracket recipe (read `build` before and after, a move means the
-  measurement is INVALID, not that the subject is slow), next to the existing "verify with
-  a string your edit INTRODUCED" rule. AF-11 closed as already-implemented and retyped
-  code -> doc; adding the field it already has would have been a second spelling of an
-  existing primitive, shipped in the belief it fixed something.
-NOTE: two lessons, and the second is the transferable one. (1) A confound that explains
-  PART of a mess will be accepted as explaining ALL of it — the restart was real and did
-  explain my second run's HTTP 000s, which is exactly what made it convincing enough to
-  stop the search. Ask what the confound does NOT explain: the first run had no restart in
-  it and I never checked. (2) The ethos rule about confirming results fired precisely as
-  written — I was most careless at the moment the answer matched what I expected, and the
-  re-measurement that "proved" me right was run against different code than the
-  measurement it was meant to control. A control that does not hold the build constant is
-  not a control. This is the same shape as `_build_id`'s own docstring, which was written
-  for two other sessions hitting it on two other fixes in one hour; I hit it a third time
-  with the instrument already sitting one curl away.
 ## The untracked-work nudge is blind to review work, so a reviewer is told to record what they just recorded
 AREA: notices
 SEVERITY: annoys
@@ -421,47 +377,6 @@ NOTE: what makes this instructive rather than just a bug is that the function ha
   ethos rule-1 note that a view must share the predicate of the mechanism it describes;
   here the guard describes "did this lane work?" with a predicate that means "does this
   lane own cards?".
-## No rig can render amux at phone width, so the mobile half of `verified` is undecidable
-AREA: browser
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-08
-SESSION: amux-frustrations
-CARD: AF-18
-FIX-NOTE: e29069b — the driver's viewport was a LITERAL (1280x900); it is now a
-  parameter (argv, AMUX_BU_VIEWPORT, and a `viewport` action taking width+height or
-  device=iphone|ipad|...). innerWidth 1280->390, mq(max-width:600px) false->true.
-  Also explains why window.resizeTo() looked broken: Playwright owns the viewport, so
-  the call was inert rather than blocked. Unblocked AMUX-2369 (now verified) and
-  resolved AMUX-2367's 40-vs-44px flag (renders 67px, clean).
-SYMPTOM: amux is mobile-first by policy and `verified` is meant to include the real UI at
-  phone width. Three rigs, none can do it. (1) The shipped driver: POST /api/browser/start
-  takes url/profile/session/fresh/backend — no viewport parameter — and in-page
-  window.resizeTo(390,844) is ignored (innerWidth stayed 1280, matchMedia('(max-width:600px)')
-  false). (2) Chrome CDP, the one rig with real device emulation: localhost:9222 returns 404,
-  and cdp.mjs has no emulate verb anyway. (3) iOS Simulator, which my own notes call ground
-  truth: HTML renders but the app sits on "Connecting to server…" and /health stays blank
-  through a long settle, so the API never answers inside the sim; adding the root cert per the
-  documented recipe changed nothing, and simctl has no tap primitive to dismiss the first-run
-  tour that covers the page.
-COST: Two verifications in one afternoon. AMUX-2369 is literally titled "mobile optimized" and
-  could not be verified on that axis — left `done` with the check handed back to a human with
-  a phone. AMUX-2367 shipped an unresolvable question: `.send-row button` declares
-  min-height:40px with no override in any of the 48 mobile media blocks, under the 44px rule,
-  but min-height is a floor and I could not measure a rendered button, so it went on the card
-  as a flag rather than a finding.
-FIX: Cheapest and highest-value is a window size (or an `emulate` action) on the driver amux
-  already ships and already launches — it is the default path and it is one launch argument
-  from working. Then CDP (enable 9222 + an emulate verb). The simulator is the
-  highest-fidelity rig and worth repairing, but it has two independent blockers.
-NOTE: this is ethos rule 3 with a tooling shape. The verified gate asks for a check no shipped
-  tool can perform, so it resolves the same way every time: the reviewer writes "could not
-  check at phone width" and the mobile half of `verified` quietly becomes decorative. It will
-  do that on every mobile card until a rig exists — which is exactly the "constraint that
-  cannot be satisfied honestly" pattern, except the dishonest exit here is silent omission
-  rather than a false ack.
-
----
 ## `git commit` on the shared checkout consumes PEERS' staged files silently
 AREA: attribution
 SEVERITY: slows
@@ -558,51 +473,6 @@ FRESH SPECIMEN 2026-08-18, amux-frustrations — STILL OPEN, and the same class 
   commits of dashboard work including that day's fix and a peer's feature work.
   That is the entry's own COST paragraph coming true at a larger blast radius: the sentence
   cannot distinguish itself from the real case, and its remedy is destructive.
-
-## SessionStart freshness hook named files upstream never touched
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-22
-SYMPTOM: Hook printed `checkout is 1 commit(s) behind origin/main - including: CLAUDE.md
-  amux amux-server.py`. The single incoming commit (eaa1e91) touches ONLY amux-server.py.
-  Cause: the hot-file list used `git diff --name-only HEAD..$base` - TWO dots, which in
-  `git diff` compares the two ENDPOINTS instead of diffing from the merge-base, so on a
-  shared checkout with 120 unpushed commits it reports OUR OWN files as upstream changes.
-  The same sentence disagreed with itself: `behind` uses rev-list, where two-dot IS correct,
-  so the count said 1 while the file list implied a broad conflict.
-COST: ~10 min reconciling two files that had zero incoming changes. The compounding cost is
-  worse than the minutes: the error grows with the number of unpushed local commits, so the
-  warning is least trustworthy exactly when the checkout is busiest - which is the situation
-  it exists for. An instrument that cries wolf in proportion to the real risk gets ignored.
-FIX: 13c7014 - three dots. Positive control in a scratch clone with upstream touching only
-  amux-server.py: two-dot -> [CLAUDE.md amux amux-server.py] (reproduces the symptom),
-  three-dot -> [amux-server.py]. Line 43's rev-list two-dot deliberately left alone.
-## `HEAD~1` is not "before my change" here — the pre-fix specimen check tested the wrong commit
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-25
-SYMPTOM: Verifying AF-23's regression test against a pre-fix specimen via
-  `git show HEAD~1:amux-server.py`. amux-cloud committed 939064d between my commit
-  (523df63) and the check, so HEAD~1 WAS MY OWN FIX. The probe reported the disclosure
-  string already present pre-fix and concluded "the test would PASS - VACUOUS - bad test!".
-  Re-run against `523df63^` - the parent of MY commit - it correctly reports FAIL.
-COST: ~5 min, and it was one step from costing much more: the false verdict was that a
-  correctly-discriminating test was vacuous, whose natural remedy is to rewrite a good test
-  into a worse one. This is the LOUD WRONG probe, not the silent one - it answers, and the
-  answer looks exactly like the failure ethos rule 7 warns about, so it is self-corroborating.
-FIX: documented in CLAUDE.md, in the same commit as this entry (no sha cited here: writing
-  one before the commit exists is the fabrication ethos rule 7 records, and I did it in the
-  first draft of this very entry). Use `git show <your-sha>^:<file>`, never HEAD~1, on
-  a checkout where other lanes commit. The trap is invisible on a single-session repo, which
-  is precisely why it needs writing down here: every fix in this repo is supposed to be
-  checked against a pre-fix specimen, so the wrong recipe is reached for constantly.
-
 
 ## Dashboard's usage-limit discriminator says 'worker'; the live endpoint says 'session'
 AREA: instruments
@@ -717,34 +587,6 @@ FIX: Pass BOTH on resume — `--resume <uuid> --name <worker>` — so the displa
   Cheap detector while it is open: `amux whoami` already contrasts live worker
   identity against inherited env — extend it to compare against the pane title, so
   the disagreement is reported instead of discovered.
-
-## Idle nudge told me to commit 11 files I never touched, while the staged-guard said I owned none
-AREA: notices
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux-frustrations
-CARD: AF-38
-SYMPTOM: The idle dirty-tree nudge listed 11 files as mine to "commit completed work now",
-  excluding only 2 as not-mine. I had touched none of the 11 - they are amux-rust's in-flight
-  rust migration (crates/amux-server/src/api/*.rs, tests, install.sh, scripts/rust-auto-build.sh).
-  The staged-guard, queried on the same dirty list at the same moment, disagreed completely:
-  `POST /api/git/staged-guard` returned foreign=4 (owner=amux), unclaimed=18, shared/mine=0.
-  My own work was already committed; git status showed nothing of mine.
-COST: none, because I checked before committing - but only because I had spent the day on this
-  exact defect class from the other side. Following the instruction literally sweeps a peer's
-  whole in-flight rust migration into a commit under my name, which is the AMUX-2554 incident
-  the fleet has already paid for twice. The instruction IS the hazard.
-FIX: have the nudge resolve ownership through the same call the staged-guard uses instead of
-  deriving "yours" from dirty-tree membership. Two components answering the same question
-  differently is the duplicated-precedence bug AMUX-2330 already fixed once for gates: one
-  answer, one owner. Note the nudge is not blind - it correctly excluded 2 files - so it has
-  SOME signal and is wrong in one direction only, which is the more dangerous shape.
-
-RESOLVED 2026-08-09 by the python retirement, NOT by a fix — recorded because 'fixed' and 'the code is gone' are different things. The nudge, including its NOT-YOURS exclusion, lived only in amux-server.py (792ce1f^:amux-server.py, exclusion at line 20190); that file is deleted from HEAD and nothing in crates/ implements it. AF-38 discarded.
-  The finding survives as AMUX-2638: when the nudge is ported it must resolve ownership through the staged-guard path, not from dirty-tree membership — that substitution IS the bug and a fresh port reintroduces it by default, because `git status` is the obvious source.
-  Also note the capability is simply GONE meanwhile: nothing tells any session about uncommitted work, on a shared checkout with ~7 lanes and 82 dirty files.
-
 
 ## The rust request log recorded a ~15-second restart choreography as a 76ms request
 AREA: instruments
@@ -1945,20 +1787,6 @@ FIX: `POST /api/sessions/<name>/send` is the correct way to send tasks to codex/
 
 ---
 
-## Three copies of "report state to amux" exist and global settings.json pointed at the poorest one — model + tokens silently regressed to zero
-AREA: hooks
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-15
-SESSION: amux-frustrations
-CARD: AMUX-2936
-SYMPTOM: `~/.claude/settings.json` Stop/UserPromptSubmit/PostToolUse all ran an inline one-liner posting exactly `{"state":"idle","source":"stop-hook"}` — no model, no tokens, no conversation id — while `~/.amux/hook-report.sh` sat on disk extracting all three. The server-side consequence was already recorded in code: "292 report POSTs, 0 carrying tokens".
-  Fixing the blind-cotenant window I went to add one field to the state-report hook and found THREE implementations on this machine: an inline one-liner baked into ~/.claude/settings.json (posts {state, source} only), ~/.amux/hooks/amux-report.sh (a delegate), and ~/.amux/hook-report.sh (the real one — parses the payload, extracts model and real token count). settings.json pointed at the INLINE one, so every session started since that regression reported no model and no tokens, and auto-compact (AMUX-2829) lost its only input for the second time. amux-report.sh's own header documents this exact fork happening in 2026-08-11 and says "two implementations of one thing is what produced this bug; do not re-fork it" — and I still nearly shipped a FOURTH copy, because that warning lives in an unversioned runtime file nobody reads before editing. The reason it keeps recurring is structural: hook-report.sh was untracked, so there was no reviewable, diffable, rollback-able canonical copy, and no check could compare what is running against what was intended.
-COST: ~25 min to discover the existing script and unwind my duplicate, plus an unknown number of days of model/tokens reporting zero fleet-wide, which silently disables auto-compact. The near-miss is the real cost: a fourth copy would have regressed model+tokens AGAIN while looking like a fix.
-FIX: SHIPPED (ce87481). hook-report.sh now lives in the repo at scripts/hooks/hook-report.sh and is installed from there with a recorded sha256, mirroring the git-shared-guard treatment at install.sh:134 that exists for exactly this reason. settings.json repointed at it (restores model+tokens AND adds the conversation id). Remaining gap, not closed: there is no invariant comparing the RUNNING ~/.amux/hook-report.sh against the committed copy the way `hooks.shared_guard_matches_committed` does for the git guard — so drift is now detectable by hand but still not self-announcing. Worth adding; it is a near-copy of an invariant that already exists.
-
----
-
 ## A shared CARGO_TARGET_DIR is mandated, and concurrent builds in it evict each other's artifacts
 AREA: build
 SEVERITY: slows
@@ -1971,28 +1799,6 @@ SYMPTOM: `error: extern location for serde_core does not exist: ~/.amux/rust-bui
 COST: ~12 min of pure rebuild, and worse, it masqueraded as a code error twice — the first failure looked like my own change had broken the build, which is exactly the wrong instrument reading (a red result on code you just verified by hand means the instrument is a candidate before the code is).
 FIX: Not fixed; needs a decision, not a workaround. Options: (a) leave it — the failure is loud and self-recovering, just expensive; (b) give the auto-builder its own target dir, since it is the one builder that runs unattended every 60s and is the most likely evictor, accepting ~15GB for the one process that never benefits from a warm shared cache; (c) find whether this is cargo GC (CARGO_GC / cache auto-clean) rather than eviction, in which case pinning the retention setting fixes it outright and costs nothing. (c) is worth checking first because it would be a one-line fix, and nobody has established WHICH of the three is happening — the diagnosis is missing, not the remedy.
 
-## /api/health/invariants cannot tell you a check is running, only that nothing failed
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-15
-SESSION: amux-frustrations
-CARD: AF-55
-SYMPTOM: after adding two invariants and deploying them, `GET /api/health/invariants` returned `checks: {pass: 409, fail: 17, unknown: 0, total: 426}` and named neither new check. `failures` lists only failing rows and `unknowns` only Unknown ones, so a PASSING invariant appears nowhere. A check that is green and a check that was never wired into `evaluate_all` produce a byte-identical response. Polled the endpoint eight times across a builder swap looking for a string that could never have been there.
-COST: ~8 minutes and a wrong path, on a fix whose whole point was making a silent failure self-announce. Worse in the general case: the natural next move is to conclude the wiring did not take and go re-edit working code. `/api/debug/invariants` -> `latest_per_invariant` had the answer the entire time (`status=pass`, `age_s=2.4`) and the observability table in CLAUDE.md does not mention it.
-FIX: both halves shipped. 2eceea7 documents `/api/debug/invariants` in the CLAUDE.md observability table and states plainly that a PASS is invisible on the health endpoint. feb7ea7 adds `GET /api/health/invariants?id=<invariant_id>`, which returns an explicit `ran` flag plus, on a miss, `known_ids` -- because a typo and a genuinely-unwired check are both empty results and only one of them is a bug. `ran` is about evaluation and not verdict: a failing check ran, and that is asserted, since collapsing the two is the obvious way to reintroduce the ambiguity. Mutation-verified (`ran := true` turns the test red). Same shape as the rule this file exists for: an empty result read as evidence, where a positive was never expressible.
-
-## `include_str!` reaching outside crates/ compiles locally and breaks builds that COPY a subset — third instance
-AREA: cloud
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-15
-SESSION: amux-frustrations
-CARD: AF-56
-SYMPTOM: I added `include_str!(concat!(CARGO_MANIFEST_DIR, "/../../scripts/hooks/hook-report.sh"))` in 06683ee. `cargo check --workspace --all-targets`, `clippy -D warnings` and 1010 lib tests all passed, and the change deployed locally and ran green. The cloud image build then failed, because `cloud/docker/Dockerfile` COPYs `Cargo.toml`, `crates` and `amux` but not `scripts/`. Every gate I ran compiles from the FULL checkout, where the path exists, so not one of them could have caught it. rust CI's `check` job has the same blindness, which is why it stayed green.
-COST: ~40 minutes of amux-cloud's evening, on the first green-main deploy in days. My commit was the second instance, not the first — ea2a573 (2026-08-14) added the same pattern for `scripts/git-hooks/git-shared-guard.py` and the image had been unbuildable for a day, invisible because deploy-cloud skipped on red main every time. Greening main is what exposed both at once. This is the THIRD `include_str!`-resolution incident in a week: 2026-08-10 (an uncommitted .sql swept into a peer's commit, AMUX-2647, still `STATUS: open` above), 2026-08-12 (the amux-CLI build), and this one. Same root each time — a compile-time include whose path is present in the author's tree and absent in some other build's inputs — reached by three different mechanisms, which is exactly why no single entry made the argument.
-FIX: 910e668 (amux-cloud) adds `COPY scripts scripts` to the build stage AND `tests/dockerfile_build_inputs.rs`, which scans amux-server for `include_str!` reaching outside `crates/` and asserts the Dockerfile COPYs each root. It runs in `check`, so a NEW external include fails on a green checkout before any deploy build sees it. I ran it here and read its negative control rather than trusting the pass: it drops "scripts" from the copied set and asserts the check then reports it missing, with "the check cannot detect a missing COPY — it is theatre". Scanning for the pattern rather than hardcoding one path is what makes it a class kill. Remaining gap, latent not live: the check is scoped to amux-server, and the 2026-08-12 instance was the CLI. I grepped before claiming it — today NO crate outside amux-server uses `include_str!` at all, so nothing is currently unguarded; the gap is that the first one added to amux-cli would be.
-
 ## amux-launched browser does not survive a server self-adopt
 AREA: browser
 SEVERITY: slows
@@ -2004,39 +1810,6 @@ SYMPTOM: Driving the dashboard for the ollama UI E2E, the amux-launched Chrome (
   CORRECTION (verified after filing, and it is the more useful lesson): my first report also claimed the failure was SILENT, that /api/browser/screenshot returned {"path": null} with no error. That was MY probe, not the endpoint. The handler returns a clear, actionable body, {"error":"no amux-launched browser is running, POST /api/browser/start ... first", "hint": ...}, and it already WARNs on wedged captures. My extraction was `python3 -c "print(json.load(sys.stdin).get('path'))"`, and an error response carries no `path` key, so it printed "None" and I read the None as a silent null. Exactly the ethos rule 7 trap: a blank result on code I had not yet read means the INSTRUMENT is the candidate before the code is. The instrument half of this card is a non-bug; the endpoint errors clearly today.
 COST: ~8 minutes. ~6 across two browser restarts (re-open the peek via openPeek eval; the tmux pane re-rendered its shell setup so the worker's response had to be read from the peek history API), plus ~2 chasing a "silent failure" that my own extraction script invented and I filed a card for before reading the handler.
 FIX: The real residual is lifecycle, not instrumentation. Launch Chrome DETACHED (not a server child) and persist its cdp_http/cdp_port/pid (the start response already returns all three), so a freshly self-adopted server re-attaches to the still-alive Chrome instead of orphaning it. Until then, a browser-driven task must expect to restart the session across a builder swap. The instrument half needs nothing.
-
-## Compressed error bodies were logged as mojibake, so half the 5xx in a sweep were undiagnosable
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-15
-SESSION: amux-frustrations
-CARD: AF-57
-SYMPTOM: running the daily log sweep, `GET /api/logs/analyze?since_h=24` returned `error_body` values like `\x1f\xef\xbf\xbd\x08...` for the 502/503 groups (browser, tts) while other groups on the same page showed clean JSON. One row read `\x1f...{"error":"CDP Page.captureScreenshot timed out after 30s"}\x53\x40` — readable text embedded in binary, which is what gave it away. The bytes are gzip: the request-log middleware is the OUTERMOST layer so it runs after `CompressionLayer`, and `String::from_utf8_lossy` was applied to an already-compressed body.
-COST: the field exists precisely so a 5xx is diagnosable without a repro, and it silently failed for the subset of clients that negotiate gzip. `/api/why` and autofix both read `error_body`, so all three consumers got noise. ~2KB of destroyed bytes were written per affected row to hold it. Measured on the live log: 27 of 264 error bodies in a 24h window, ~10%. The corruption is IRREVERSIBLE, not merely ugly — 875 of ~3.8KB became U+FFFD, so `1f 8b` is now `1f ef bf bd` and no reader will ever recover those bodies; the 502s and 503s already in the window are permanently undiagnosable. Worst property: it only sometimes fires, so the same endpoint reads fine from curl and as mojibake from the dashboard, which makes it look like a weird payload rather than a logging bug.
-FIX: f683a40 honours `Content-Encoding` before storing — decode gzip, and on an undecodable encoding or a corrupt stream store an explicit marker instead of bytes that read like content, so every branch is honest. Output capped at 1MB because a compressed body is an amplification vector and this runs on every 4xx/5xx. 993f5e4 adds a WARN on both marker branches so the next instance reaches a log sweep without anyone thinking to inspect `error_body`. Live-verified on the deployed build: 27 mojibake in the 24h before, 0 after, with `content-encoding: gzip` confirmed on the wire for the probe rows and the stored bodies read back read-only from `_amux_request_log`.
-
-## A full `cargo test` in the shared checkout reports phantom failures when a peer is mid-edit
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-15
-SESSION: amux-frustrations
-CARD: AF-60
-SYMPTOM: `cargo test -p amux-server --lib` returned `1009 passed; 4 failed` — `api::branding::tests::manifest_follows_branding_prefs`, `api::sse::ping_tests::ping_carries_the_embedded_app_ver`, `api::static_files::tests::unknown_api_path_is_a_json_404_not_the_spa_shell`, `invariants::monitor::extractor_wiring_tests::extract_caller_paths_includes_the_cli`. My only edit was `crates/amux-server/src/api/request_log.rs`, which none of those four touch. Re-running the same four minutes later: all pass. Full suite re-run: 1013 passed, 0 failed. The cause was a peer (amux) writing dashboard static files and the `amux` CLI while my run was reading them — these tests read repo files at RUNTIME, so they see whatever the shared working tree contains at that instant.
-COST: ~6 minutes and a worktree round-trip to disambiguate, on a run whose whole purpose was deciding whether MY change broke something. The failure points at four subsystems the author never touched, so the honest first hypothesis is "I broke something in a way I do not understand" — the expensive direction. It also produces the inverse risk: a session that sees 4 unrelated failures, shrugs, and commits anyway is right this time and wrong the time it matters. `ethos.md` names the tell ("a red test on code you just verified by hand ... means the instrument is a candidate before the code is") but nothing in the test output says the shared tree moved underneath it.
-FIX: bf01bdd — enabled rust-embed's `debug-embed` feature, taking option (b)'s spirit (remove the race) rather than (a) (report it). ROOT, and it is ONE root not four: all four tests go through `DashboardAssets::get()`, and rust-embed falls back to reading `static/` from disk at runtime in DEBUG builds only. Reproduced deterministically instead of by timing — truncate `app.js` WITHOUT rebuilding and two of them fail; with the feature they pass, and still pass when `app.js` is DELETED, because the binary carries its own copy. The cost is debug hot-reload of dashboard assets, which nothing here uses: the auto-builder ships `cargo build --release`, so what DEPLOYS always embedded at compile time, and CLAUDE.md already states the rule this restores ("editing the working tree changes nothing that is live; COMMITTED source is what ships") — which the debug fallback was quietly contradicting. Options considered and not taken: (a) have the file-reading tests record the mtime/sha of the repo files they read and print "the working tree changed during this run" on failure, so the phantom announces itself instead of being re-diagnosed each time; (b) have them read from `git show HEAD:<path>` rather than the working tree, so they test the COMMITTED artifact, which is what actually ships (the deploy is committed-source-only, so this is arguably more correct anyway); (c) document the disambiguation recipe — re-run the failures alone, and if they pass, run the full suite in `git worktree add --detach HEAD` before believing them. (b) looks right to me and is a small change, but these are not my tests and the choice belongs to whoever owns them.
-
-## An unknown /api path answers a bare empty 405 on non-GET, so a guessing caller learns nothing
-AREA: instruments
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-15
-SESSION: amux-frustrations
-CARD: AF-61
-SYMPTOM: `POST /api/board/AF-49/backlog` returned `405` with an EMPTY body and no content-type, while `GET` on the same nonexistent path returns `{"error": "not found"}` as JSON. `/{*path}` was mounted GET-only, so axum's method router answered before the JSON-404 branch could run. Found via `/api/logs/analyze`, whose verdict already said "no route exists at this path — the 405 is the GET-only SPA catch-all answering a non-GET".
-COST: small per occurrence, but it lands on a caller who is ALREADY wrong and gives them nothing to correct with. 9 rows over two days from two lanes (8 from `backend` in one batch). The route was invented — nothing advertises it — most likely generalised from `POST /api/board/{id}/claim`, which does exist. Worth contrasting with the gate-409 body, which names the exact CLI command to run and is why those callers recover; this one names nothing. The capability was never missing: `amux board backlog <ID>` exists and works.
-FIX: 362fc4d — mount `any(serve_path)` and take `Method`, so an unknown `/api/*` path JSON-404s on every method. Non-API non-GET still 405s, because handing the SPA shell back for a POST would be worse than the bare 405 it replaces. The guard that existed could not fail on this: `unknown_api_path_is_a_json_404_not_the_spa_shell` exercised GET only, the method that already worked. Proved rather than argued — reverting to `get()` turns the new test red while the old one stays green.
 
 ## Cloud freshness tick's served-APP_VER probe returns empty because app.js 302s to /sign-in
 AREA: cloud
@@ -2059,17 +1832,6 @@ CARD: AC-362
 SYMPTOM: cloud.amux.io was fully down (502 on every endpoint, AC-361). I fired `amux alert "<prod down + what I need>" "<why now>"` and it paged NOBODY, exit 3: "email: failed: token refresh failed (400): invalid_grant, push: no push subscriptions, sms: no phone configured (AMUX_OWNER_PHONE is empty)". All three fire-alarm channels dead at once, so the one path meant to reach the owner in an emergency failed at the exact moment it was needed. The top-of-repo CLAUDE.md still advertises SMS/iMessage as "wired and confirmed working" returning channels push:sent sms:imessage — now false.
 COST: The owner was NOT paged during a live customer-facing outage. I only reached Ethan because /api/email/send (Gmail API, a DIFFERENT credential than the alert email path) still worked and delivered a direct email (msg 1a00b525ec2baa84), plus a board escalation (AC-361). Without noticing the alert had failed and falling back by hand, prod would have stayed down and silent. A fire-alarm that fails only when pulled is worse than none, because every runbook (including CLAUDE.md's) tells you to trust it.
 FIX: (AC-362) three channel repairs — re-auth the alert email OAuth token [Ethan's Google], register a push subscription for the owner, set AMUX_OWNER_PHONE in ~/.amux/server.env [Ethan]. DURABLE (the real fix): `amux alert` must SELF-TEST its channels on a schedule and surface "0/3 channels healthy" as its own signal BEFORE an incident needs it — a dead fire-alarm currently leaves no trace until someone pulls it. And reconcile the CLAUDE.md claim that SMS is confirmed-working with reality.
-
-## Diagnosing deployed behaviour against source that had not shipped yet
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-16
-SESSION: amux-frustrations
-CARD: AF-82
-SYMPTOM: `ai-video-editor` read `running=False` in `/api/sessions` while the agent was demonstrably alive (claude pid 8605, 321k tokens, 2 subagents, `self_report {age_s: 57, state: active}`). I traced it to `shell_only` classification, then found `sessions_legacy.rs:467` ALREADY contained a `pgrep -P <pane_pid>` rescue for exactly this — with an RCA comment naming `ai-video-editor` by name. I ran the rescue's own command by hand (`/usr/bin/pgrep -P 8600` -> `8605`), confirmed it should fire, and filed a card saying the misclassification "survives the child-check". It did not survive anything: the rescue was committed at 14:12:27 and the running server had started at 13:08:59, so the live binary predated it by an hour.
-COST: a card filed on a false premise, and a stretch of investigation spent on a mystery that did not exist. The deeper cost is the shape: I was reading source, confirming its logic was correct, and treating deployed behaviour that disagreed as an unexplained defect — when the two were simply different builds. This repo's own rule ("editing the working tree changes nothing that is live; COMMITTED source is what ships") is stated for UNCOMMITTED edits, and I have quoted it at other sessions; the same gap opens for a commit that exists but has not been BUILT yet, which is a window of up to a builder cycle plus a 4.5-minute release compile.
-FIX: the check is one call and belongs before any "why does deployed behaviour disagree with the code" investigation: compare `/health`'s `build` against the commit time of the code you are reading (`git log -1 --format=%ad <sha>`), and if the fix postdates the running binary, stop — there is nothing to diagnose. CLAUDE.md already tells you to bracket TIMING measurements with `build`; this is the same instrument for a different question, and it is not written down for this one. Worth adding to the Deploy section: a fix you can see in `git log` is not a fix the server is running.
 
 ## Metrics disk gauge read 0.6% used while the volume was 90% full and failing writes
 AREA: instruments
@@ -2404,56 +2166,6 @@ FIX: The CLI cannot know what landed when the server sends no JSON, so it must s
   hand-rolled curl, so a silent no-op here pushes people back to curl, which is how
   attribution gets lost.
 ---
-## The freshness hook's DIVERGED advice recommends the destructive remedy and calls the safe one impossible
-AREA: git
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-19
-SESSION: amux-frustrations
-CARD: AF-95
-SYMPTOM: This checkout (the canonical ~/Dev/amux, the one ~50 lanes share) was 28 unpushed /
-  8 behind. `.claude/session-freshness.sh` said three things to every lane that started, and
-  two of them were wrong:
-    (a) line 67 recommends `git pull --rebase origin main`. On THIS checkout that rewrites the
-        SHAs of 28 commits belonging to ~15 other lanes, and the hook's OWN header comment
-        (lines 18-21) is the record of a peer's `git pull --rebase` replaying another session's
-        unpushed commit onto origin, citing ethos rule 8. The hook warns about rebase in its
-        comments and recommends it in its output.
-    (b) line 89: "nothing here reaches origin until a human reconciles it". False. `git merge
-        origin/main` reconciled it with no human, no history rewrite, and exactly one conflicted
-        file — the working tree was clean across the whole repo, so nothing was at risk.
-    (c) lines 90-91: "do NOT append to frustrations.md here — log friction in a clone that is
-        current instead". There is no other clone; this IS the canonical one. Followed
-        literally, the instruction means never log anything, which is ethos rule 3 (a constraint
-        that cannot be satisfied honestly) arriving through the hook that exists to prevent a
-        different version of the same loss.
-COST: The file silently split in two for at least a day: 129 entries here, 130 on origin, SIX
-  entries on each side invisible to the other. Five of the origin-only ones (AEAB-28/29/33/34/36)
-  come from `amux-errors-and-bugs`, a lane landing entries through GitHub PRs #123-#130 that I
-  had never encountered in four days of running this program. So every count I have reported to
-  Ethan — "129 entries, 9 deletions" — was computed on a partial file, and the AREA clustering
-  this file exists to make possible ("three entries sharing an AREA is an argument") was running
-  on two thirds of an argument. The rule warns about exactly this and scopes it to a STRANDED
-  SECOND CLONE; the canonical checkout diverging from itself is the same loss by a path the rule
-  does not cover.
-FIX: Reconciled by merge, not rebase: `git merge origin/main` (d09c274), conflict in
-  frustrations.md only, resolved as a true union — 135 entries, both sides whole, AC-235 staying
-  deleted because amux-cloud validated it against the live gateway. Worth keeping about the
-  resolution: git matched FOUR identical header lines (`AREA:/SEVERITY:/STATUS:/DATE:`) between
-  two DIFFERENT entries and reported them as common context, so accepting the auto-merge would
-  have spliced one entry's header onto another entry's body. On an append-only file of
-  fixed-field records, the fields themselves are the false-common-region hazard; reconstruct
-  each side in full rather than trusting the hunk boundaries.
-  Hook corrected by the commit carrying this entry: the behind-only path still recommends
-  `git pull --rebase` because there is nothing local to rewrite, and the DIVERGED path now
-  recommends `git merge origin/main`, names the count it would otherwise rewrite, drops the
-  human-only claim, and says that when this is the only checkout, reconciling IS the remedy.
-  Verified by RENDERING both branches against a purpose-built diverged fixture rather than by
-  reading the diff: ahead=0/behind=1 renders `pull --rebase` and no DIVERGED block,
-  ahead=1/behind=1 renders `merge` and the block. A backwards condition would have shown
-  `merge` in the first case; it does not. The lines this replaces were wrong at every lane
-  start for as long as they existed, precisely because nobody had ever rendered the branch.
-
 ## POST /api/browser/start accepts unknown fields and silently ignores them
 AREA: browser
 SEVERITY: slows
