@@ -2217,3 +2217,39 @@ FIX: The generalisation, sharpened by amux and worth more than the six specimens
   (AMUX-3403). The other four are surfaces that make the mistake easy — a capped
   newest-first page with no upper bound, and field names that differ by a suffix — and
   none of them can currently tell a caller they were misread.
+
+---
+## `GET /api/board/contract` advertises a `verified` gate the board does not enforce, and the refusal points you back at it
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-112
+SYMPTOM: Moving three re-verified investigation cards to `verified`, acking exactly what the
+  contract endpoint advertises, all three refused:
+    GET /api/board/contract -> investigation.verified == ["Outcome confirmed to still hold"]
+    409 body                -> gate == ["Functionality change is live and exercised, not just
+                                        merged", "Peer-reviewed by a DIFFERENT worker in group
+                                        `amux` (name them)", "That peer verified it themselves
+                                        rather than taking the author's word", "No regression in
+                                        what it touched"]
+  Control, so this is not a nesting difference: the string "Peer-reviewed by a DIFFERENT
+  worker" appears ZERO times anywhere in the contract response.
+  The same mismatch holds for doc / ops / chore / research / escalation, which the contract
+  all report as the single "Outcome confirmed to still hold".
+COST: three refused transitions and a round trip to learn the real gate. Small in minutes.
+  The part worth the entry is WHERE it sends you: the 409's own `how_to_ack.contract` field
+  names `GET /api/board/contract` as the place to learn the gate, so the sanctioned
+  instruction points at the source that is wrong. An agent following it correctly is
+  refused — AMUX-2325's shape, recoverable only because the refusal happens to print the
+  real gate.
+FIX: Derive both from ONE table. A view must share the predicate of the mechanism it
+  describes, and here the view is the mechanism's own documentation.
+  Note which direction the drift runs, because it is the dangerous one: the contract
+  advertises a LOWER bar than the gate enforces. The real gate requires peer verification
+  by a different worker who checked it themselves — Ethan's standing rule, encoded. An
+  agent reading only the contract would conclude a card can be self-verified on a re-check,
+  which is precisely the weaker practice the gate exists to prevent. A stale doc that
+  under-states a constraint teaches the wrong habit to everyone who never trips the gate.
+  Not fixed here: which of the two is authoritative is amux's call, not a guess of mine.
