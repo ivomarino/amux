@@ -753,20 +753,6 @@ async fn begin_auth(
             } else {
                 format!("{}{}", origin(), callback_path)
             };
-            // Registration evidence: a working gmail token proves the URI is
-            // registered on this client. With none, the grant may dead-end at
-            // Google's own error wall (which never redirects, so amux would
-            // see nothing) — say so NOW, in the log and the response.
-            let registration_proven =
-                p.category == "Google" && !connected_accounts_in(&ctx.home).is_empty();
-            if p.category == "Google" && !registration_proven {
-                tracing::warn!(
-                    "connector_auth: no working gmail token proves {} is registered on the OAuth \
-                     client — if Google answers redirect_uri_mismatch, register it once at \
-                     https://console.cloud.google.com/apis/credentials",
-                    redirect_uri
-                );
-            }
             let state = token_urlsafe(24);
             let (url, verifier) = if p.category == "Google" {
                 // One grant covers the whole Google family: union scopes, so
@@ -798,6 +784,38 @@ async fn begin_auth(
                     None,
                 )
             };
+            // PROBE the authorize URL before handing it out (AMUX-3427, second
+            // strike). Token presence was first used as registration evidence
+            // and it LIED: a stored token proves a grant worked with whatever
+            // URI was registered when it was MINTED, and this deployment's URI
+            // moved ports since (8822→8824) with the console never updated.
+            // Google's authorize endpoint renders the mismatch page instantly
+            // with no interaction, so probe the EXACT url the user will open.
+            // This is the only moment amux can see the failure at all: on a
+            // mismatch Google blocks BEFORE redirecting, so a dead grant never
+            // reaches our callback or logs.
+            let registered: Value = if p.category == "Google" {
+                match ctx.http.get(&url, None).await {
+                    Ok((_, body)) => {
+                        let text =
+                            body.as_str().map(str::to_string).unwrap_or_else(|| body.to_string());
+                        json!(!text.contains("redirect_uri_mismatch"))
+                    }
+                    // Probe unreachable: unknown beats a guess in either direction.
+                    Err(_) => Value::Null,
+                }
+            } else {
+                Value::Null
+            };
+            if registered == json!(false) {
+                tracing::warn!(
+                    "connector_auth: Google REJECTS redirect_uri={} for this client \
+                     (redirect_uri_mismatch) — the grant will dead-end at Google's error page. \
+                     Register the URI once: https://console.cloud.google.com/apis/credentials/oauthclient/{}",
+                    redirect_uri,
+                    client_id
+                );
+            }
             if let Err(e) = pending_save(&ctx.home, &state, family, &account, verifier.as_deref()) {
                 // Without the pending entry the callback CANNOT succeed —
                 // failing loudly beats handing out a URL that dead-ends.
@@ -819,8 +837,15 @@ async fn begin_auth(
                 "auth": "oauth2",
                 "authorize_url": url,
                 "redirect_uri": redirect_uri,
-                "redirect_uri_registered": if p.category == "Google" {
-                    json!(registration_proven)
+                // Live-probed against Google (see above): true = the consent
+                // page renders; false = Google rejects the URI and the ONE fix
+                // is registering it on the client; null = probe unreachable.
+                "redirect_uri_registered": registered,
+                "fix_if_unregistered": if registered == json!(false) {
+                    json!(format!(
+                        "add {} under Authorized redirect URIs at https://console.cloud.google.com/apis/credentials/oauthclient/{}",
+                        redirect_uri, client_id
+                    ))
                 } else {
                     Value::Null
                 },
@@ -1896,7 +1921,26 @@ mod tests {
     #[tokio::test]
     async fn google_auth_carries_union_scopes_pkce_and_pending_state() {
         let home = home_with_google_client();
-        let (app, _d) = app_with(MockHttp::new(vec![]), home.path());
+        // The registration probe hits the REAL authorize URL: first grant sees
+        // Google's mismatch page, second sees the consent page — the response
+        // must discriminate (AMUX-3427: token-presence as evidence lied).
+        let (app, _d) = app_with(
+            MockHttp::new(vec![
+                (
+                    "GET",
+                    "accounts.google.com/o/oauth2/auth",
+                    200,
+                    json!("<html>Error 400: redirect_uri_mismatch</html>"),
+                ),
+                (
+                    "GET",
+                    "accounts.google.com/o/oauth2/auth",
+                    200,
+                    json!("<html>Sign in with Google</html>"),
+                ),
+            ]),
+            home.path(),
+        );
 
         // Family alias, account required.
         let (st, v) = send_json(&app, "POST", "/api/connectors/google/auth").await;
@@ -1927,10 +1971,14 @@ mod tests {
             "google grant must reuse the registered gmail redirect URI: {}",
             v["redirect_uri"]
         );
-        // No gmail token exists in this temp home, so nothing proves the URI
-        // is registered — the response must say so instead of letting the
-        // grant dead-end silently.
+        // The probe saw Google's mismatch page: the response must say so AND
+        // name the one fix, instead of letting the grant dead-end silently at
+        // a wall amux cannot observe.
         assert_eq!(v["redirect_uri_registered"], json!(false));
+        assert!(
+            v["fix_if_unregistered"].as_str().unwrap().contains("console.cloud.google.com"),
+            "{v}"
+        );
 
         // Pending state persisted (family + verifier), challenge derived S256.
         let state = qparam(url, "state").unwrap();
@@ -1950,6 +1998,9 @@ mod tests {
                 .await;
         assert_eq!(st, StatusCode::OK);
         assert_eq!(v2["family"], json!("google"));
+        // Second probe rendered the consent page: registered, no fix needed.
+        assert_eq!(v2["redirect_uri_registered"], json!(true));
+        assert_eq!(v2["fix_if_unregistered"], Value::Null);
     }
 
     #[tokio::test]
@@ -1984,7 +2035,10 @@ mod tests {
 
         // The exchange carried the PKCE verifier and the SAME redirect URI the
         // auth request was issued with — the registered gmail one (AMUX-3427).
-        let form = http.calls()[0].3.clone().unwrap();
+        // (calls() also records the begin_auth registration probe, so select
+        // the token exchange by method rather than position.)
+        let form =
+            http.calls().into_iter().find(|c| c.0 == "FORM").expect("token exchange").3.unwrap();
         assert_eq!(form["grant_type"], json!("authorization_code"));
         assert!(form["redirect_uri"].as_str().unwrap().ends_with("/api/gmail/callback"));
         assert!(form["code_verifier"].as_str().is_some());

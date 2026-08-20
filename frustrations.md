@@ -2433,3 +2433,28 @@ FIX: Reuse what is proven instead of demanding new registration: google-family
   only moment amux CAN see it: begin_auth now WARNs and returns
   `redirect_uri_registered:false` when no working gmail token proves the URI is
   registered. Regression tests pin the URI and the delegation.
+
+---
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux
+AREA: instruments
+CARD: AMUX-3427
+SYMPTOM: The fix for the entry above shipped its own rule-7 violation, caught by
+  Ethan's SECOND redirect_uri_mismatch screenshot within the hour. The broker's new
+  `redirect_uri_registered` signal inferred registration from token PRESENCE:
+  "working gmail tokens exist, therefore the gmail redirect URI is registered." It
+  answered true while the live console held only `http://localhost:8822/...` (the
+  retired port): the tokens were minted before the port move and prove only what
+  was registered THEN. An instrument that could not fail: any deployment with old
+  tokens reads as registered forever, regardless of the console.
+COST: A second wasted Reconnect click and a second error screenshot from the owner,
+  plus a confident wrong "no console step needed, it will work this time" shipped in
+  a reply. The probe that settles it costs one curl and no interaction: Google's
+  authorize endpoint renders the mismatch page instantly, so the question was
+  answerable the whole time.
+FIX: Replaced the inference with the real instrument: begin_auth now GETs the exact
+  authorize URL it is about to hand out and greps the response for
+  redirect_uri_mismatch. false carries `fix_if_unregistered` naming the exact URI
+  and the client's console deep-link; probe-unreachable is null, never a guess.
+  Test scripts both pages so the discriminator is pinned in both directions.
