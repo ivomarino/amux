@@ -6334,6 +6334,71 @@ fn rotated_log_path(name: &str) -> PathBuf {
     logs_dir().join(format!("{name}.log.1"))
 }
 
+/// The signals `/api/debug/logs` correlates for ONE session.
+pub(crate) struct LogSignals {
+    pub running: bool,
+    pub piped: bool,
+    /// Seconds since the log file was last written. `None` = no log file.
+    pub log_age_s: Option<i64>,
+    /// Seconds since the pane last painted. `None` = never.
+    pub pane_activity_age_s: Option<i64>,
+    /// Seconds since the pipe-pane writer was armed. 0 = no writer known.
+    pub writer_age_s: i64,
+    pub stale_s: i64,
+}
+
+/// The verdict, as a pure function of the signals (AF-96).
+///
+/// This logic used to live inline in the handler, which meant the alarm it
+/// exists to raise could not be shown to FIRE. AMUX-2628's own entry claimed it
+/// had been "extracted as a pure function and unit-tested against this
+/// incident's own numbers so the alarm is demonstrably able to fire" — it had
+/// not, and that gap is the precise half ethos rule 7 protects: an instrument
+/// nobody can test is one nobody can trust to be more than decoration.
+///
+/// `stale` is the discriminating verdict: piping is on, and the pane painted
+/// MORE RECENTLY than the log was written. Everything else here exists to keep
+/// that cell honest — `recovering` and `idle` are the two states that otherwise
+/// masquerade as it.
+pub(crate) fn log_verdict(s: &LogSignals) -> (&'static str, String) {
+    if !s.running {
+        return ("not-running", "no tmux pane for this session".to_string());
+    }
+    if !s.piped {
+        return ("unpiped", "pane is running but pipe-pane is OFF — nothing is being logged".to_string());
+    }
+    match (s.log_age_s, s.pane_activity_age_s) {
+        (Some(la), Some(aa)) if la > s.stale_s && aa < la => {
+            // Was a writer even present when that output happened? If the writer
+            // is YOUNGER than the gap, the missing output predates it and the
+            // pipe is merely waiting for the pane to speak again — a different,
+            // non-actionable state.
+            if s.writer_age_s > 0 && s.writer_age_s < aa {
+                (
+                    "recovering",
+                    format!(
+                        "pipe re-armed {}s ago; the {la}s-old log predates it and the pane has not written since",
+                        s.writer_age_s
+                    ),
+                )
+            } else {
+                (
+                    "stale",
+                    format!("piping on but no write in {la}s while the pane was active {aa}s ago"),
+                )
+            }
+        }
+        (None, _) => ("stale", "piping on but no log file exists".to_string()),
+        (Some(la), _) => {
+            if la > s.stale_s {
+                ("idle", format!("no write in {la}s, but the pane is idle too"))
+            } else {
+                ("ok", format!("last write {la}s ago"))
+            }
+        }
+    }
+}
+
 /// GET /api/debug/logs — per-session logging health.
 ///
 /// This endpoint exists because of the AMUX-2628 failure MODE, not merely the
@@ -6473,53 +6538,25 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
             .map(|d| now - d.as_secs() as i64);
         let act_age = if activity > 0 { Some(now - activity) } else { None };
 
-        let (verdict, detail) = if !running {
-            ("not-running", "no tmux pane for this session".to_string())
-        } else if !piped {
-            unpiped += 1;
-            ("unpiped", "pane is running but pipe-pane is OFF — nothing is being logged".to_string())
-        } else {
-            match (log_age, act_age) {
-                (Some(la), Some(aa)) if la > stale_s as i64 && aa < la => {
-                    // Was a writer even present when that output happened? If
-                    // the writer is YOUNGER than the gap, the missing output
-                    // predates it and the pipe is merely waiting for the pane
-                    // to speak again — a different, non-actionable state.
-                    let writer_age = writers.get(name).map(|(_, st)| now - st).unwrap_or(0);
-                    if writer_age > 0 && writer_age < aa {
-                        recovering += 1;
-                        (
-                            "recovering",
-                            format!(
-                                "pipe re-armed {writer_age}s ago; the {la}s-old log predates it \
-                                 and the pane has not written since"
-                            ),
-                        )
-                    } else {
-                        stale += 1;
-                        (
-                            "stale",
-                            format!(
-                                "piping on but no write in {la}s while the pane was active {aa}s ago"
-                            ),
-                        )
-                    }
-                }
-                (None, _) => {
-                    stale += 1;
-                    ("stale", "piping on but no log file exists".to_string())
-                }
-                (Some(la), _) => {
-                    if la > stale_s as i64 {
-                        idle += 1;
-                        ("idle", format!("no write in {la}s, but the pane is idle too"))
-                    } else {
-                        ok += 1;
-                        ("ok", format!("last write {la}s ago"))
-                    }
-                }
-            }
-        };
+        // The verdict is `log_verdict`'s to make, not this handler's (AF-96) —
+        // the counters below are the only thing that stays here, because they
+        // are a property of the sweep rather than of one session.
+        let (verdict, detail) = log_verdict(&LogSignals {
+            running,
+            piped,
+            log_age_s: log_age,
+            pane_activity_age_s: act_age,
+            writer_age_s: writers.get(name).map(|(_, st)| now - st).unwrap_or(0),
+            stale_s: stale_s as i64,
+        });
+        match verdict {
+            "unpiped" => unpiped += 1,
+            "recovering" => recovering += 1,
+            "stale" => stale += 1,
+            "idle" => idle += 1,
+            "ok" => ok += 1,
+            _ => {}
+        }
         rows.push(json!({
             "name": name,
             "running": running,
@@ -12776,6 +12813,82 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- AF-96: /api/debug/logs verdict, now testable ------------------------
+    //
+    // AMUX-2628's shape, in numbers: pipe-pane reports ON, the writer process is
+    // alive holding the right inode, the file exists — and the log has not grown
+    // for an hour while the pane painted 30 seconds ago. Every individual signal
+    // reads healthy. Only the correlation is wrong, which is why the endpoint
+    // computes a verdict instead of printing three columns.
+
+    fn sig(log_age: Option<i64>, act_age: Option<i64>, writer_age: i64) -> super::LogSignals {
+        super::LogSignals {
+            running: true,
+            piped: true,
+            log_age_s: log_age,
+            pane_activity_age_s: act_age,
+            writer_age_s: writer_age,
+            stale_s: 300,
+        }
+    }
+
+    /// The alarm this endpoint exists for, on the incident's own shape.
+    #[test]
+    fn a_log_that_stopped_growing_while_the_pane_painted_is_stale() {
+        let (v, d) = super::log_verdict(&sig(Some(3600), Some(30), 7200));
+        assert_eq!(v, "stale");
+        assert!(d.contains("3600") && d.contains("30"), "detail must carry both ages: {d}");
+    }
+
+    /// The state that otherwise masquerades as `stale`: the pipe was re-armed
+    /// AFTER the pane last spoke, so the missing output predates the writer and
+    /// there is nothing to act on.
+    #[test]
+    fn a_pipe_rearmed_after_the_pane_last_spoke_is_recovering_not_stale() {
+        assert_eq!(super::log_verdict(&sig(Some(3600), Some(30), 10)).0, "recovering");
+    }
+
+    /// The other masquerade, and the one that matters most for false alarms: the
+    /// log is old because the PANE is old. `aa < la` is the whole discriminator,
+    /// so this case and the stale case differ only in that comparison.
+    #[test]
+    fn a_quiet_pane_with_an_equally_old_log_is_idle_not_stale() {
+        assert_eq!(super::log_verdict(&sig(Some(3600), Some(7200), 7200)).0, "idle");
+    }
+
+    #[test]
+    fn a_recently_written_log_is_ok() {
+        assert_eq!(super::log_verdict(&sig(Some(10), Some(5), 7200)).0, "ok");
+    }
+
+    /// A missing log file with piping on is stale regardless of pane activity —
+    /// there is no age to compare, and "no file" must never fall through to ok.
+    #[test]
+    fn piping_on_with_no_log_file_at_all_is_stale() {
+        assert_eq!(super::log_verdict(&sig(None, Some(30), 7200)).0, "stale");
+        assert_eq!(super::log_verdict(&sig(None, None, 0)).0, "stale");
+    }
+
+    #[test]
+    fn the_pipe_and_pane_preconditions_short_circuit_before_any_age_comparison() {
+        let mut s = sig(Some(3600), Some(30), 7200);
+        s.piped = false;
+        assert_eq!(super::log_verdict(&s).0, "unpiped");
+        s.running = false;
+        assert_eq!(super::log_verdict(&s).0, "not-running", "not-running outranks unpiped");
+    }
+
+    /// The threshold is a threshold, not decoration: one second either side of
+    /// `stale_s` must land in different cells. Without this, raising stale_s to
+    /// infinity would keep every other test green.
+    #[test]
+    fn the_stale_threshold_actually_discriminates() {
+        assert_eq!(super::log_verdict(&sig(Some(301), Some(30), 7200)).0, "stale");
+        assert_eq!(super::log_verdict(&sig(Some(300), Some(30), 7200)).0, "ok",
+            "at exactly stale_s the log is not yet stale — the comparison is strict");
+    }
+
     use super::*;
 
     /// AC-346: the folder-trust seed must fold `hasTrustDialogAccepted=true` into
