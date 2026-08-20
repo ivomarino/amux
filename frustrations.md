@@ -2453,3 +2453,27 @@ FIX: Reconciled by merge, not rebase: `git merge origin/main` (d09c274), conflic
   ahead=1/behind=1 renders `merge` and the block. A backwards condition would have shown
   `merge` in the first case; it does not. The lines this replaces were wrong at every lane
   start for as long as they existed, precisely because nobody had ever rendered the branch.
+
+## POST /api/browser/start accepts unknown fields and silently ignores them
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-20
+SESSION: amux
+CARD: AMUX-3403
+SYMPTOM: Validating AF-18, I passed `{"viewport":"iphone"}` and then `{"device":"iphone"}`
+  to /api/browser/start; both returned ok:true and neither did anything — the viewport is
+  a post-start ACTION (`{"action":"viewport","device":"iphone"}` on /api/browser/action),
+  and start has no viewport parameter at all. Nothing in either response said "unknown
+  field ignored".
+COST: Two full start/eval/stop probe cycles measuring innerWidth 800 against an expectation
+  of 390, and a validation verdict one step from a false NOT-YET on a fix that works —
+  the live re-run then measured 390/844 with mq(max-width:600px) true on the first try
+  through the real parameter. An API that swallows a misspelled or misplaced field
+  manufactures "the feature does not work" evidence for every caller who guesses the
+  contract from the feature's name rather than the contract listing.
+FIX: start (and action) should reject or at least echo unknown top-level fields —
+  `{"ok":true,"ignored_fields":["viewport"]}` is the board API's own established pattern
+  for exactly this (cold-outbound's PATCH entry). Alternatively accept viewport/device at
+  start and apply it after launch, which is what both of my guesses assumed the contract
+  was.
