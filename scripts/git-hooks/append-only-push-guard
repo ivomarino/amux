@@ -54,6 +54,20 @@ log_line() {
     "${AMUX_SESSION:-'(human)'}" "$2" >> "$LOG" 2>/dev/null || true
 }
 
+# The override is PATH-SCOPED so a sanctioned deletion (the frustrations
+# validated-entry lifecycle deletes whole entries, and no content test can
+# tell that from a clobber — intent is the only discriminator) does not
+# require waving through every guarded file in the push. "1" allows all;
+# a comma-separated list allows exactly those paths:
+#     AMUX_ALLOW_SHARED_REWRITE=frustrations.md git push ...
+override_allows() {
+  local v="${AMUX_ALLOW_SHARED_REWRITE:-}" f="$1"
+  [ -z "$v" ] && return 1
+  [ "$v" = "1" ] && return 0
+  case ",$v," in *",$f,"*) return 0 ;; esac
+  return 1
+}
+
 guarded_files() {
   local root cfg
   root=$(git rev-parse --show-toplevel 2>/dev/null) || return 0
@@ -92,6 +106,10 @@ check_pair() {
     head_blob=$(git rev-parse --verify --quiet "$head:$f" 2>/dev/null) || head_blob=""
     [ "$base_blob" = "$head_blob" ] && continue
     if [ -z "$head_blob" ]; then
+      if override_allows "$f"; then
+        log_line "OVERRIDE" "file=$f deletion allowed (AMUX_ALLOW_SHARED_REWRITE)"
+        continue
+      fi
       loss=1
       echo ""
       echo "append-only guard: this push DELETES $f, which the remote currently has." >&2
@@ -168,6 +186,11 @@ if edited:
       log_line "WARNED" "file=$f edited_published_lines=$n"
     fi
     [ -z "$missing" ] && continue
+    if override_allows "$f"; then
+      n=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
+      log_line "OVERRIDE" "file=$f missing_lines=$n allowed (AMUX_ALLOW_SHARED_REWRITE)"
+      continue
+    fi
     loss=1
     n=$(printf '%s\n' "$missing" | wc -l | tr -d ' ')
     {
@@ -184,8 +207,9 @@ if edited:
       echo "Fix: bring $f current before pushing — union-merge per"
       echo ".claude/rules/frustrations.md (take origin's copy, re-append yours):"
       echo "    git checkout origin/main -- $f    # then re-apply YOUR additions on top"
-      echo "If this rewrite is genuinely intentional, say so out loud (logged):"
-      echo "    AMUX_ALLOW_SHARED_REWRITE=1 git push ..."
+      echo "If this rewrite is genuinely intentional, say so out loud (logged), scoped"
+      echo "to the file so the acknowledgment does not blanket the whole push:"
+      echo "    AMUX_ALLOW_SHARED_REWRITE=$f git push ...    # or =1 for all guarded files"
     } >&2
     log_line "REFUSED" "file=$f missing_lines=$n"
   done
@@ -199,11 +223,6 @@ main() {
     shift
     check_pair "$@"
     return $?
-  fi
-
-  if [ -n "${AMUX_ALLOW_SHARED_REWRITE:-}" ]; then
-    log_line "OVERRIDE" "AMUX_ALLOW_SHARED_REWRITE=1 push allowed without the superset check"
-    return 0
   fi
 
   local remote="${1:-origin}" rc=0
