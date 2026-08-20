@@ -2194,3 +2194,44 @@ FIX: start (and action) should reject or at least echo unknown top-level fields 
   launch; apply failure degrades to viewport_error, never fails the start), and every
   other unknown field is captured by a serde flatten and echoed as ignored_fields with a
   note. Live-verified with the exact wrong call that motivated the entry.
+
+---
+## The shared-checkout amend guard pins HEAD, not the staged set, so a correctly-pinned amend still absorbed a peer's work
+AREA: git
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-106
+SYMPTOM: I ran `git commit --amend` to replace a placeholder commit message. The guard
+  refused the unpinned form and told me exactly what to do:
+    "BLOCKED ... git commit --amend without verified HEAD pin ... re-run pinned:
+     AMUX_AMEND_EXPECT=<that-sha> git commit --amend"
+  I did precisely that, with the sha I had just read off `git log -1`. It was allowed,
+  and it swept 139 lines of another session's in-flight work into a commit carrying MY
+  message: amux's AMUX-3110 dead-letter implementation (session_verbs.rs +132) plus
+  their untracked migrations/0024_steering_dead_letter.sql, under
+  "fix(instruments): /api/debug/downtime could not distinguish an empty history from a
+  broken query (AF-99)".
+  `--amend` with no pathspec commits the whole STAGED set, and a peer had staged theirs
+  in the seconds between my two commands.
+COST: ~20 minutes of disclosure, coordination and verification across two sessions, and a
+  permanently mislabelled commit — amux chose to leave f70fc51 as-is and add a provenance
+  note (3e77b20) rather than rewrite shared HEAD to fix a label. Cheap this time ONLY
+  because the peer was reachable and answered in five minutes; their own reply names the
+  real hazard, that they were about to conclude their work was uncommitted and re-commit
+  it. The near-miss is a duplicated 132-line change, or a `git checkout` over it.
+FIX: The guard verifies that the COMMIT BEING REWRITTEN is yours and says nothing about
+  whether the CONTENT BEING ABSORBED is. Pinning AMUX_AMEND_EXPECT protected the wrong
+  operand, and it protected it while telling me I was now safe — which is worse than no
+  guard, because I stopped thinking about the staged set at exactly the moment it started
+  mattering.
+  Durable shape, and it needs no new machinery (amux's suggestion, and I agree): the
+  amend path should warn — or refuse without an explicit ack — when the staged set
+  contains paths whose last editor, by the staged-guard's OWN attribution, is another
+  session. That is the identical ownership question the staged-guard already answers at
+  commit time; this is the same predicate at a second door, which is AMUX-2325's lesson
+  about a constraint whose sanctioned escape is unwalkable from the audited path.
+  Cheap interim, entirely on the caller: `git commit --amend -- <your paths>`. A
+  pathspec makes amend behave like the scoped commit the guard already pushes people
+  toward everywhere else, and nothing in the guard's message mentions it.
