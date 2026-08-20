@@ -17,8 +17,9 @@ import tempfile
 HOOK = os.path.join(os.path.dirname(os.path.abspath(__file__)), "git-shared-guard.py")
 
 
-def run_hook(command, cwd, shared_root):
+def run_hook(command, cwd, shared_root, extra_env=None):
     env = dict(os.environ, AMUX_SHARED_CHECKOUTS=shared_root)
+    env.update(extra_env or {})
     p = subprocess.run(
         [sys.executable, HOOK],
         input=json.dumps({"tool_name": "Bash", "tool_input": {"command": command}, "cwd": cwd}),
@@ -118,7 +119,53 @@ def main():
         if blocked != expect_block:
             failures.append(f"{name}: expected {'BLOCK' if expect_block else 'PASS'}, got {'BLOCK' if blocked else 'PASS'}\n  {err.strip()[:200]}")
 
-    total = len(cases) + len(trio)
+    # AF-106 durable half (AMUX-3407): the staged-set ownership check on a
+    # pinned BARE amend. The refusal branch is exercised in-process below (it
+    # needs a server verdict); these subprocess cases pin the contracts that
+    # must hold WITHOUT a server: fail-open on unreachable, pathspec bypass,
+    # and the disable knob. All three run with real staged content, because
+    # empty-staged short-circuits before any of them.
+    open(os.path.join(work, "g.txt"), "w").write("staged\n")
+    git(work, "add", "g.txt")
+    head2 = git(work, "rev-parse", "HEAD")
+    dead_url = {"AMUX_STAGED_GUARD_URL": "https://127.0.0.1:9", "AMUX_SESSION": "testlane"}
+    quad = [
+        ("amend pinned staged, server unreachable -> fail-open",
+         f"AMUX_AMEND_EXPECT={head2} git commit --amend --no-edit", dead_url, False),
+        ("amend pinned pathspec, staged -> scoped, no refusal",
+         f"AMUX_AMEND_EXPECT={head2} git commit --amend --no-edit -- f.txt", dead_url, False),
+        ("amend pinned staged, check disabled",
+         f"AMUX_AMEND_EXPECT={head2} git commit --amend --no-edit",
+         {**dead_url, "AMUX_AMEND_STAGED_GUARD": "0"}, False),
+        ("amend pinned staged, no session -> human, ungated",
+         f"AMUX_AMEND_EXPECT={head2} git commit --amend --no-edit",
+         {**dead_url, "AMUX_SESSION": ""}, False),
+    ]
+    for name, cmd, extra, expect_block in quad:
+        code, err = run_hook(cmd, work, work, extra_env=extra)
+        blocked = code == 2
+        if blocked != expect_block:
+            failures.append(f"{name}: expected {'BLOCK' if expect_block else 'PASS'}, got {'BLOCK' if blocked else 'PASS'}\n  {err.strip()[:200]}")
+
+    # The refusal decision itself, in-process (pure function, no server).
+    import importlib.machinery
+    guard = importlib.machinery.SourceFileLoader("_gsg", HOOK).load_module()
+    dec = guard._amend_staged_decision
+    matrix = [
+        ("foreign refuses", {"foreign": [{"path": "a.rs"}]}, True),
+        ("no foreign allows", {"foreign": [], "shared": [{"path": "b.rs"}]}, False),
+        ("undecided allows", {"undecided": True, "foreign": [{"path": "a.rs"}]}, False),
+        ("disabled allows", {"enabled": False, "foreign": [{"path": "a.rs"}]}, False),
+        ("non-dict allows", "garbage", False),
+    ]
+    for name, verdict, expect_refuse in matrix:
+        got = dec(verdict)
+        if (got is not None) != expect_refuse:
+            failures.append(f"decision {name}: expected {'refuse' if expect_refuse else 'allow'}, got {got!r}")
+    if dec({"foreign": [{"path": "a.rs"}]}) and "ABSORB" not in dec({"foreign": [{"path": "a.rs"}]}):
+        failures.append("decision refusal must name the absorption hazard")
+
+    total = len(cases) + len(trio) + len(quad) + len(matrix)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

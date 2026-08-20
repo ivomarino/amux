@@ -189,24 +189,20 @@ def _amend_verdict(cmd, scrubbed, run_dir):
                     "never rewritten; make a follow-up commit instead")
     m = re.search(r'AMUX_AMEND_EXPECT=([0-9a-f]{7,40})\b', cmd)
     if m and head.startswith(m.group(1)):
-        # AF-106: the pin proves the COMMIT BEING REWRITTEN is yours. It says
-        # nothing about the STAGED SET being absorbed, and `--amend` with no
-        # pathspec takes all of it. On 2026-08-20 a correctly-pinned amend swept
-        # 139 lines of a peer's in-flight work — their untracked migration and a
-        # 132-line handler change — into a commit carrying an unrelated message,
-        # because they staged it in the seconds between `git log -1` and the
-        # amend. The guard allowed it and, worse, had just told the caller they
-        # were now safe, so the staged set stopped being watched at exactly the
-        # moment it began to matter.
-        #
-        # Not refused here: a pin plus a pathspec is legitimate and common, and
-        # this returns None for BOTH forms. The durable fix is to compare the
-        # staged paths against the staged-guard's own last-editor attribution —
-        # the same ownership question it already answers at commit time, asked at
-        # a second door (AMUX-2325). Until then the refusal text below names the
-        # pathspec form, so the caller at least sees it exists.
-        return None  # inspected + pinned + matches -> safe amend of own fresh HEAD
+        # AF-106 durable half (AMUX-3407): the pin proves the COMMIT BEING
+        # REWRITTEN is yours; the check below proves the STAGED SET being
+        # absorbed is too. On 2026-08-20 a correctly-pinned bare amend swept
+        # 139 lines of a peer's staged work (their migration and a 132-line
+        # handler change) into a commit carrying an unrelated message — the
+        # pin was satisfied and protected the wrong operand. The ownership
+        # question is the one the pre-commit staged-guard already answers;
+        # this asks the SAME server endpoint at the second door (AMUX-2325).
+        return _amend_staged_check(scrubbed, run_dir)
     got = f"pinned {m.group(1)} != HEAD {head[:12]}" if m else "no AMUX_AMEND_EXPECT pin"
+    return _amend_pin_refusal(got)
+
+
+def _amend_pin_refusal(got):
     return ("git commit --amend without verified HEAD pin (" + got + ") — HEAD on this SHARED "
             "branch may be ANOTHER session's commit (2026-07-05 near-miss: an amend silently "
             "rewrote a foreign unpushed commit). Inspect first (`git log -1 --format=%H`), then "
@@ -216,6 +212,83 @@ def _amend_verdict(cmd, scrubbed, run_dir):
             "set you are absorbing, and a bare `--amend` takes everything staged including a "
             "peer's in-flight work (AF-106, 139 lines swept on 2026-08-20). If HEAD is not "
             "yours, use a follow-up commit instead")
+
+
+def _amend_staged_check(scrubbed, run_dir):
+    """AF-106 durable half (AMUX-3407): a pinned BARE amend absorbs the whole
+    staged set, so the staged set's ownership is checked against the same
+    server endpoint the pre-commit staged-guard uses — one predicate, two
+    doors (AMUX-2325). Fail-OPEN on every error (the guard's standing
+    contract: an outage must not brick commits); only a POSITIVE foreign
+    verdict refuses. A pathspec amend absorbs only what it names and passes
+    without asking; the sanctioned escapes from a refusal are the pathspec
+    form (your own work) and ~/.amux/guard-allow-once (deliberate absorption,
+    owner-sanctioned, audit-logged) — the same two doors every other verdict
+    here offers. AMUX_AMEND_STAGED_GUARD=0 disables just this check."""
+    if re.search(r'\bcommit\b[^\n;&|]*\s--\s', scrubbed):
+        return None  # pathspec amend: scoped by construction
+    if os.environ.get("AMUX_AMEND_STAGED_GUARD", "1").strip().lower() in ("0", "false", "off", "no"):
+        return None
+    sess = os.environ.get("AMUX_SESSION", "")
+    if not sess:
+        return None  # a human's amend is not amux's to gate
+    try:
+        import subprocess, ssl, urllib.request
+        staged = subprocess.run(
+            ("git", "-C", run_dir, "diff", "--cached", "--name-only"),
+            capture_output=True, text=True, timeout=10).stdout.split()
+        if not staged:
+            return None  # message-only amend absorbs nothing
+        body = json.dumps({"session": sess, "dir": run_dir, "paths": staged,
+                           "op": "amend", "guard_version": 1}).encode()
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        # Base URL: explicit override first (the test suite points it at an
+        # unreachable port to prove fail-open deterministically — the sibling
+        # resolver below self-heals to the LIVE server, which would silently
+        # turn a fail-open test into a live-server test); then the
+        # staged-guard's own resolver (it self-heals a stale AMUX_URL port);
+        # env fallback last. Any failure falls through to fail-open.
+        base = os.environ.get("AMUX_STAGED_GUARD_URL")
+        if not base:
+            try:
+                import importlib.machinery
+                sib = os.path.join(os.path.dirname(os.path.realpath(__file__)), "amux-staged-guard")
+                mod = importlib.machinery.SourceFileLoader("_asg", sib).load_module()
+                base = mod.amux_base_url()
+            except Exception:
+                base = os.environ.get("AMUX_URL") or "https://localhost:8824"
+        req = urllib.request.Request(
+            base + "/api/git/staged-guard", data=body, method="POST",
+            headers={"Content-Type": "application/json", "X-Amux-Session": sess})
+        with urllib.request.urlopen(req, timeout=5, context=ctx) as r:
+            d = json.loads(r.read().decode())
+        return _amend_staged_decision(d)
+    except Exception:
+        return None  # fail-open
+
+
+def _amend_staged_decision(d):
+    """Pure, so the matrix is testable without a server. Only FOREIGN paths
+    refuse — `shared` (both edited) matches the pre-commit guard's own
+    non-blocking policy, and `undecided`/disabled are not verdicts. The
+    2026-08-20 specimen was foreign: the absorbed migration + handler change
+    had exactly one editing session, and it was not the amender."""
+    if not isinstance(d, dict) or d.get("undecided") or d.get("enabled") is False:
+        return None
+    foreign = [(f.get("path") or "?") for f in (d.get("foreign") or [])]
+    if not foreign:
+        return None
+    shown = ", ".join(foreign[:6]) + (" …" if len(foreign) > 6 else "")
+    return ("git commit --amend would ABSORB another session's staged work — %d staged path(s) "
+            "were last edited by a different session (%s), and a bare --amend takes the whole "
+            "staged set into your commit under your message. This is AF-106's exact incident: "
+            "139 lines swept on 2026-08-20 by an amend whose pin was VALID — the pin protects "
+            "the commit, not the absorbed content. Scope it to your own work: "
+            "`git commit --amend -- <your paths>`. If absorbing their staged work is genuinely "
+            "intended, coordinate with that session, then use the owner-sanctioned one-off "
+            "(~/.amux/guard-allow-once, audit-logged)." % (len(foreign), shown))
 
 
 def _discard_verdict(cmd, scrubbed, run_dir):
@@ -583,7 +656,13 @@ def main():
             return 2
     return 0
 
-try:
-    sys.exit(main())
-except Exception:
-    sys.exit(0)  # fail-open: a guard bug must never break tool calls
+if __name__ == "__main__":
+    # The gate matters beyond convention: the test suite imports this module
+    # to reach the pure decision functions, and an unconditional module-level
+    # sys.exit made that import EXIT THE TEST PROCESS with 0 mid-run — a
+    # whole suite reporting green while its tail never executed (AMUX-3407,
+    # caught because the PASS line went missing, not because anything failed).
+    try:
+        sys.exit(main())
+    except Exception:
+        sys.exit(0)  # fail-open: a guard bug must never break tool calls
