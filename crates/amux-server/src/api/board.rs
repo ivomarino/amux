@@ -76,7 +76,10 @@ pub fn routes() -> Router<AppState> {
 /// Every gate-blocked 409 tells the caller to `GET /api/board/contract`
 /// to understand the rules. Without this endpoint that instruction is a
 /// dead link (AR-123).
-async fn get_contract() -> Response {
+async fn get_contract(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
     use serde_json::json;
     let statuses = ["doing", "review", "done", "verified"];
     let mut gates = serde_json::Map::new();
@@ -94,9 +97,69 @@ async fn get_contract() -> Response {
             gates.insert(ty.to_string(), serde_json::Value::Object(ty_gates));
         }
     }
+    // AF-112: the contract used to serve ONLY the type defaults — tier 5 of a
+    // five-tier precedence — while enforcement resolved all five, so a custom
+    // worker/group/global gate (the amux group's peer-review verified bar,
+    // for one) was advertised NOWHERE and the 409's own "learn the gate at
+    // /contract" pointer sent the reader to a LOWER bar than the one refusing
+    // them. Two repairs: (1) ?card=<id> resolves the ACTUAL gate for a card
+    // through the same effective_gate_configured enforcement uses — one
+    // resolver, never two spellings; (2) the global custom tier, which is
+    // card-agnostic, is served alongside the defaults whenever it exists.
+    let mut card_gates: Option<serde_json::Value> = None;
+    let mut global_gates = serde_json::Map::new();
+    if let Ok(conn) = state.store.read() {
+        for &st in &statuses {
+            if let Some(target) = bs::parse_status(st) {
+                if let Some(g) = bs::configured_gate(&conn, target) {
+                    global_gates.insert(st.to_string(), json!(g));
+                }
+            }
+        }
+        if let Some(card_id) = q.get("card").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            match bs::get_issue(&conn, card_id) {
+                Ok(Some(row)) => {
+                    let mut per = serde_json::Map::new();
+                    for &st in &statuses {
+                        if let Some(target) = bs::parse_status(st) {
+                            let g = bs::effective_gate_configured(&conn, &row, target);
+                            if !g.is_empty() {
+                                per.insert(st.to_string(), json!(g));
+                            }
+                        }
+                    }
+                    card_gates = Some(json!({
+                        "card": card_id,
+                        "type": row.item_type,
+                        "session": row.session,
+                        "gates": per,
+                        "note": "resolved through the SAME precedence enforcement uses \
+                                 (card override → worker → group → global → type default) — \
+                                 this is the gate a transition will actually be judged by",
+                    }));
+                }
+                Ok(None) => {
+                    card_gates = Some(json!({
+                        "card": card_id,
+                        "error": "no such card — the type-default table below still applies",
+                    }));
+                }
+                Err(_) => {}
+            }
+        }
+    }
     Json(json!({
         "types": bs::KNOWN_TYPES,
         "gates": gates,
+        "gates_are": "TYPE DEFAULTS ONLY — tier 5 of 5. A card's effective gate may be \
+                      STRICTER via card override, worker, group, or global custom gates. \
+                      Pass ?card=<id> for the resolved gate enforcement will actually use.",
+        "global_custom_gates": if global_gates.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::Value::Object(global_gates)
+        },
+        "card_effective_gates": card_gates,
         // Global done constraint (Ethan). Applies to EVERY type on top of the
         // per-type gate above, and unlike those criteria it is machine-checked
         // against the card text, so gate_ack / --checked cannot satisfy it.
@@ -1884,7 +1947,7 @@ fn gate_409(
         "how_to_ack": {
             "gate_ack": true,
             "or_gate_checked": eff_gate,
-            "contract": "GET /api/board/contract",
+            "contract": format!("GET /api/board/contract?card={} (the RESOLVED gate for this card — the bare contract lists only type defaults, AF-112)", row.id),
             "wrong_type?": "If this item has no code, set its type (escalation/blocker/investigation/ops/research/chore/doc) — the gate is DERIVED from the type. Never ack a merge that did not happen.",
         },
         "cli": format!("amux board {target_raw} {} --checked {checked_args}", row.id),
@@ -2797,7 +2860,7 @@ pub async fn patch_item(
                                                 "gate_checked": eff_gate,
                                                 "or_gate_ack": true,
                                                 "or_force": "true (explicit bypass; logged)",
-                                                "contract": "GET /api/board/contract",
+                                                "contract": format!("GET /api/board/contract?card={} (the RESOLVED gate for this card — the bare contract lists only type defaults, AF-112)", next.id),
                                                 "wrong_type?": "If these criteria don't fit the work, the TYPE is wrong — fix the type, not the truth.",
                                             },
                                         }),

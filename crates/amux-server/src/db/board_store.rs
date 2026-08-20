@@ -436,7 +436,7 @@ fn scoped_gate(
 /// "cannot tell" answer falls back to the type defaults rather than to an empty
 /// gate. An empty gate would mean NO gate, so a malformed row must never read as
 /// permission (it would silently open the strictest transitions on the board).
-fn configured_gate(conn: &rusqlite::Connection, target: TaskStatus) -> Option<Vec<String>> {
+pub fn configured_gate(conn: &rusqlite::Connection, target: TaskStatus) -> Option<Vec<String>> {
     let id = status_to_db(target, "");
     let (gate, custom): (Option<String>, Option<i64>) = conn
         .query_row(

@@ -124,3 +124,84 @@ async fn the_contract_explains_the_terminal_cap_and_how_to_see_it() {
         assert!(src.contains(h), "list_board must actually set {h}");
     }
 }
+
+/// AF-112: the contract advertised ONLY the type-default gates (tier 5 of 5)
+/// while enforcement resolved card override → worker → group → global →
+/// defaults — so a custom gate was advertised nowhere and the 409's own
+/// "learn the gate at /contract" pointer named a LOWER bar than the one
+/// refusing the caller, drifting in the dangerous direction (an agent reading
+/// the contract concludes self-verification is enough). The repair is one
+/// resolver, two doors: ?card=<id> serves what effective_gate_configured will
+/// actually enforce, and the global custom tier is served whenever it exists.
+#[tokio::test]
+async fn contract_serves_the_enforced_gate_not_just_type_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("contract-gate-test.db")).unwrap();
+    let store = std::sync::Arc::new(store);
+    let state = AppState {
+        store: store.clone(),
+        started: std::time::Instant::now(),
+        build_hash: "test".into(),
+        auth_token: None,
+    };
+    let app = router(state);
+
+    // A custom GLOBAL verified gate, exactly the shape the SPA's gate editor
+    // writes — stricter than any type default.
+    let custom = serde_json::json!([
+        "Peer-reviewed by a DIFFERENT worker (name them)",
+        "That peer verified it themselves rather than taking the author's word"
+    ]);
+    let custom_str = custom.to_string();
+    store
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE statuses SET gate=?1, gate_custom=1 WHERE id='verified'",
+                rusqlite::params![custom_str],
+            )?;
+            Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+    // A card to resolve against.
+    let res = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/board")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"title":"gate drift specimen","type":"investigation"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let created: Value = serde_json::from_slice(&bytes).unwrap();
+    let id = created["id"].as_str().or_else(|| created["item"]["id"].as_str()).unwrap().to_string();
+
+    let res = app
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/board/contract?card={id}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+    let c: Value = serde_json::from_slice(&bytes).unwrap();
+
+    // The card-resolved gate must be the ENFORCED one, not the type default.
+    assert_eq!(
+        c["card_effective_gates"]["gates"]["verified"], custom,
+        "?card= must serve the gate enforcement will use: {c}"
+    );
+    // The global tier is visible card-agnostically too.
+    assert_eq!(c["global_custom_gates"]["verified"], custom, "{c}");
+    // And the bare table now says what it is, so nobody reads tier 5 as the law.
+    assert!(
+        c["gates_are"].as_str().unwrap_or("").contains("TYPE DEFAULTS"),
+        "the defaults table must name itself as defaults: {c}"
+    );
+}
