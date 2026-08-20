@@ -176,6 +176,13 @@ struct StartBody {
     width: Option<u32>,
     #[serde(default)]
     height: Option<u32>,
+    /// Explicit consent to replace ANOTHER session's running browser
+    /// (AMUX-3063). The browser is a machine singleton, so start stomps
+    /// whoever staged it — on 2026-08-20 an unattributed default-profile
+    /// start killed amux-gtm's staged NetSuite login mid-handoff. Without
+    /// this flag, a cross-session start refuses and names the owner.
+    #[serde(default)]
+    takeover: bool,
     /// Every unknown field lands here and is echoed back as
     /// `ignored_fields` (the board API's pattern). Silently swallowing a
     /// misspelled or misplaced field manufactured "the feature does not
@@ -214,6 +221,39 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
     });
     let home = chrome::amux_home();
     let session = resolve_session(body.session.as_deref(), &headers);
+    // TAKEOVER GUARD (AMUX-3063). One browser per machine means start REPLACES
+    // whatever is running — including another session's staged, logged-in
+    // page. Refuse a cross-session replace unless the caller says takeover
+    // out loud, and name the owner in the refusal so the caller knows whose
+    // work they are about to destroy. Adopt first so a browser surviving a
+    // server restart is guarded too, not just one this process spawned.
+    chrome::adopt_if_orphaned(&home).await;
+    if let Some((r_profile, r_owner, r_started, r_pid)) = chrome::running_snapshot() {
+        if r_owner != session && !body.takeover {
+            return err(
+                StatusCode::CONFLICT,
+                json!({
+                    "error": format!(
+                        "a browser is already running under session '{}' — starting yours would DESTROY \
+                         its state (staged logins included). Pass {{\"takeover\": true}} to replace it \
+                         deliberately, or drive the running one via session-scoped verbs.",
+                        if r_owner.is_empty() { "(unattributed)" } else { r_owner.as_str() }
+                    ),
+                    "running": {
+                        "profile": r_profile, "started_by": r_owner,
+                        "started_at": r_started, "pid": r_pid,
+                    },
+                    "requested_by": session,
+                }),
+            );
+        }
+        if r_owner != session {
+            tracing::warn!(
+                requested_by = %session, owner = %r_owner, profile = %r_profile, pid = r_pid,
+                "browser TAKEOVER: replacing another session's running browser (explicit takeover flag)"
+            );
+        }
+    }
     match chrome::start(&home, &body.profile, &body.url, &session).await {
         Ok(info) => {
             let mut v = serde_json::to_value(&info).unwrap_or_else(|_| json!({}));
@@ -270,10 +310,22 @@ async fn status() -> Response {
     // holding a std::sync::Mutex across an await point deadlocks the runtime.
     let snapshot = {
         let guard = chrome::RUNNING.lock().expect("browser registry poisoned");
-        guard.as_ref().map(|r| (r.profile.clone(), r.cdp_port, r.started_at))
+        guard
+            .as_ref()
+            .map(|r| (r.profile.clone(), r.cdp_port, r.started_at, r.started_by.clone()))
     };
-    let Some((profile, cdp_port, started_at)) = snapshot else {
-        return Json(json!({ "running": false })).into_response();
+    // AMUX-3414: why the LAST browser is gone. In-memory, so a server restart
+    // clears it — absent means "no exit recorded by this process", not "no
+    // exit happened"; the field's note says so rather than letting the two
+    // read identically.
+    let last_exit = chrome::LAST_EXIT.lock().expect("last-exit poisoned").clone();
+    let Some((profile, cdp_port, started_at, started_by)) = snapshot else {
+        return Json(json!({
+            "running": false,
+            "last_exit": last_exit,
+            "last_exit_note": "in-memory: a server restart clears it; null means no exit recorded by THIS server process",
+        }))
+        .into_response();
     };
     // Tabs are best-effort: a hung Chrome should degrade the field, not the
     // endpoint. `tabs: null` + `tabs_error` says "could not ask", which is a
@@ -287,17 +339,39 @@ async fn status() -> Response {
         "profile": profile,
         "cdp_port": cdp_port,
         "started_at": started_at,
+        "started_by": started_by,
         "tabs": tabs,
         "tabs_error": tabs_error,
+        "last_exit": last_exit,
     }))
     .into_response()
 }
 
-async fn stop() -> Response {
+async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
+    let session =
+        resolve_session(body.get("session").and_then(Value::as_str), &headers);
     let home = chrome::amux_home();
-    let report = chrome::stop(&home).await;
+    // Cross-session stop stays PERMITTED (a wedged browser must be cleanable
+    // by whoever notices) but LOUD: the log and the response both name owner
+    // and actor, so an anonymous stop can no longer read as a mystery death
+    // (AMUX-3063's other half — the 09:05 stop had no actor on record).
+    let owner = chrome::running_snapshot().map(|(_, o, _, _)| o);
+    if let Some(o) = owner.as_deref() {
+        if o != session {
+            tracing::warn!(
+                stopped_by = %session, owner = %o,
+                "browser: cross-session STOP of another session's browser"
+            );
+        }
+    }
+    let report = chrome::stop_as(&home, &session).await;
     let mut v = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
     v["ok"] = json!(true);
+    v["stopped_by"] = json!(session);
+    if let Some(o) = owner {
+        v["owner"] = json!(o);
+    }
     Json(v).into_response()
 }
 
@@ -1146,6 +1220,36 @@ mod tests {
         extras.sort();
         assert_eq!(extras, ["emulate", "viewport"], "unknown fields must be captured for echo");
         assert_eq!(b.device.as_deref(), Some("iphone"), "device is a real start field now");
+    }
+
+    /// AMUX-3063 incident replay: the EXACT anonymous curl that destroyed
+    /// amux-gtm's staged NetSuite login on 2026-08-20 09:24:57 — POST /start
+    /// {"profile":"default"}, no session header, while another session's
+    /// browser was running — must now refuse, naming the owner, and must
+    /// refuse BEFORE any Chrome is touched (hermetic: seeded registry, temp
+    /// home, no launch). Takeover by the OWNER's own session passes the guard
+    /// (their browser, their restart).
+    #[tokio::test]
+    async fn cross_session_start_refuses_without_takeover_naming_the_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        chrome::test_seed_running("netsuite", "amux-gtm", 424242);
+        let app = app();
+        // The incident's own request shape: anonymous, default profile.
+        let (status, v, _) =
+            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
+        chrome::test_clear_running();
+        assert_eq!(status, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["running"]["started_by"], json!("amux-gtm"), "{v}");
+        assert_eq!(v["running"]["profile"], json!("netsuite"), "{v}");
+        assert!(
+            v["error"].as_str().unwrap_or("").contains("takeover"),
+            "the refusal must name the escape: {v}"
+        );
+        // The pass-through cases (same session; takeover:true) proceed to a
+        // REAL Chrome launch and so cannot run hermetically — they are
+        // exercised by the live post-deploy verification on the incident's
+        // own machine state, recorded on AMUX-3063's card.
     }
 
     /// The action schema answers 400 for malformed requests BEFORE any

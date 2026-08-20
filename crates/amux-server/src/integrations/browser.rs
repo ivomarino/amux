@@ -296,7 +296,134 @@ pub struct RunningBrowser {
     /// restart — we did not spawn it, so we have no handle, but we can still
     /// speak CDP to it and still kill it by pid.
     pub pid: u32,
+    /// The session that started this browser (AMUX-3063). "" for a browser
+    /// adopted from a pre-fix running-file. The one browser is a machine
+    /// singleton, so an anonymous `start` STOMPS whoever staged it — measured
+    /// 2026-08-20 09:24:57: an unattributed default-profile start killed
+    /// amux-gtm's staged NetSuite login mid-handoff. The API layer refuses a
+    /// cross-session start without an explicit takeover flag using this field.
+    pub started_by: String,
     child: Option<tokio::process::Child>,
+}
+
+/// The one running browser's ownership snapshot: (profile, started_by,
+/// started_at, pid). What the start handler's takeover guard reads.
+pub fn running_snapshot() -> Option<(String, String, i64, u32)> {
+    RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .as_ref()
+        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid))
+}
+
+/// Why the last browser is gone (AMUX-3414: a silent Chrome exit left NOTHING
+/// on record — no API call in the window, no exit reason anywhere, and two
+/// sessions spent a morning on hypotheses the log could have settled).
+/// `reason` is "stopped" (an explicit /stop, with `by` naming the actor) or
+/// "exited" (Chrome went away on its own; code/signal when we spawned it and
+/// could reap, null for an adopted browser we could only poll). In-memory
+/// only: a server restart clears it, which GET /status says out loud.
+pub static LAST_EXIT: LazyLock<Mutex<Option<serde_json::Value>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+/// Watch the registered browser and RECORD its death instead of letting the
+/// registry silently disagree with the process table. One global loop, spawned
+/// lazily by start()/adopt: every 5s, a spawned child gets try_wait() (real
+/// exit code/signal), an adopted one gets a kill -0 liveness poll. On death:
+/// WARN with everything known, set LAST_EXIT, clear the registry and the
+/// persisted running-file so no verb adopts a corpse.
+fn spawn_exit_monitor() {
+    static STARTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if STARTED.set(()).is_err() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // (profile, pid, started_by, exit code, signal)
+            type DeadBrowser = (String, u32, String, Option<i32>, Option<i32>);
+            let dead: Option<DeadBrowser> = {
+                let mut g = RUNNING.lock().expect("browser registry poisoned");
+                match g.as_mut() {
+                    None => None,
+                    Some(rb) => match rb.child.as_mut() {
+                        Some(child) => match child.try_wait() {
+                            Ok(Some(status)) => {
+                                #[cfg(unix)]
+                                let signal = std::os::unix::process::ExitStatusExt::signal(&status);
+                                #[cfg(not(unix))]
+                                let signal = None;
+                                Some((rb.profile.clone(), rb.pid, rb.started_by.clone(), status.code(), signal))
+                            }
+                            _ => None,
+                        },
+                        None => None, // adopted: polled below without the lock held
+                    },
+                }
+            };
+            // Adopted browser (no child handle): poll liveness outside the lock.
+            let adopted_dead = if dead.is_none() {
+                let snap = running_snapshot();
+                match snap {
+                    Some((profile, owner, _, pid)) => {
+                        let alive = tokio::process::Command::new("kill")
+                            .args(["-0", &pid.to_string()])
+                            .status()
+                            .await
+                            .map(|s| s.success())
+                            .unwrap_or(true); // cannot poll ≠ dead
+                        // Only report dead if the registry STILL names this pid
+                        // (a stop/start between poll and here changes the pid).
+                        if !alive && running_snapshot().map(|(_, _, _, p)| p) == Some(pid) {
+                            Some((profile, pid, owner, None, None))
+                        } else {
+                            None
+                        }
+                    }
+                    None => None,
+                }
+            } else {
+                None
+            };
+            if let Some((profile, pid, owner, code, signal)) = dead.or(adopted_dead) {
+                tracing::warn!(
+                    profile, pid, started_by = %owner, code, signal,
+                    "browser: Chrome EXITED outside any /stop — recording last_exit and clearing \
+                     the registry (AMUX-3414: a silent exit used to leave nothing on record)"
+                );
+                *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
+                    "ts": chrono::Utc::now().timestamp(),
+                    "reason": "exited",
+                    "profile": profile,
+                    "pid": pid,
+                    "started_by": owner,
+                    "code": code,
+                    "signal": signal,
+                }));
+                *RUNNING.lock().expect("browser registry poisoned") = None;
+                clear_running(&amux_home());
+            }
+        }
+    });
+}
+
+/// Test seam: registry seeding for the takeover-guard tests, which must
+/// exercise the refusal WITHOUT launching a Chrome. `child` stays None.
+#[cfg(test)]
+pub fn test_seed_running(profile: &str, started_by: &str, pid: u32) {
+    *RUNNING.lock().expect("browser registry poisoned") = Some(RunningBrowser {
+        profile: profile.into(),
+        user_data_dir: PathBuf::new(),
+        cdp_port: 1,
+        started_at: 0,
+        pid,
+        started_by: started_by.into(),
+        child: None,
+    });
+}
+#[cfg(test)]
+pub fn test_clear_running() {
+    *RUNNING.lock().expect("browser registry poisoned") = None;
 }
 
 /// Where the handle survives a restart (AC-325).
@@ -316,13 +443,14 @@ fn running_state_path(home: &Path) -> PathBuf {
     home.join("browser-running.json")
 }
 
-fn persist_running(home: &Path, profile: &str, dir: &Path, port: u16, pid: u32, started: i64) {
+fn persist_running(home: &Path, profile: &str, dir: &Path, port: u16, pid: u32, started: i64, started_by: &str) {
     let v = serde_json::json!({
         "profile": profile,
         "user_data_dir": dir.to_string_lossy(),
         "cdp_port": port,
         "pid": pid,
         "started_at": started,
+        "started_by": started_by,
     });
     let _ = std::fs::write(running_state_path(home), v.to_string());
 }
@@ -361,15 +489,19 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
         .map(PathBuf::from)
         .unwrap_or_default();
     let started = v.get("started_at").and_then(serde_json::Value::as_i64).unwrap_or(0);
+    let started_by =
+        v.get("started_by").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
     *RUNNING.lock().expect("browser registry poisoned") = Some(RunningBrowser {
         profile,
         user_data_dir: dir,
         cdp_port: port,
         started_at: started,
         pid,
+        started_by,
         child: None,
     });
     tracing::info!(pid, port, "browser: adopted an orphan left by a previous server process");
+    spawn_exit_monitor();
     true
 }
 
@@ -726,11 +858,13 @@ pub async fn start(
         cdp_port: port,
         started_at,
         pid: pid_num,
+        started_by: session.to_string(),
         child: Some(child),
     });
     // Survive a server restart (AC-325). Written AFTER the handle is live so a
     // file never claims a browser that failed to start.
-    persist_running(home, profile, &udd_for_state, port, pid_num, started_at);
+    persist_running(home, profile, &udd_for_state, port, pid_num, started_at, session);
+    spawn_exit_monitor();
     Ok(info)
 }
 
@@ -749,10 +883,25 @@ pub struct StopReport {
 /// (Python `_chrome_terminate_automation`'s lesson) — escalating to SIGKILL
 /// only if it ignores TERM for 8s.
 pub async fn stop(home: &Path) -> StopReport {
+    stop_as(home, "").await
+}
+
+/// Stop, recording WHO in last_exit (AMUX-3063: an unattributed stop is half
+/// of how a staged login died anonymously; the request log had the row but
+/// nothing browser-side named the actor or the owner it took the browser from).
+pub async fn stop_as(home: &Path, stopped_by: &str) -> StopReport {
     let running = RUNNING.lock().expect("browser registry poisoned").take();
     let Some(mut running) = running else {
         return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
     };
+    *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
+        "ts": chrono::Utc::now().timestamp(),
+        "reason": "stopped",
+        "by": if stopped_by.is_empty() { serde_json::Value::Null } else { serde_json::json!(stopped_by) },
+        "profile": running.profile,
+        "pid": running.pid,
+        "started_by": running.started_by,
+    }));
 
     // std/tokio only offer SIGKILL; /bin/kill sends the TERM we need.
     let _ = tokio::process::Command::new("kill")
