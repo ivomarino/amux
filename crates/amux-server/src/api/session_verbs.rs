@@ -2581,6 +2581,10 @@ fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // was, so the stall warning had nobody to tell and went to a log instead.
     let _ = conn.execute("ALTER TABLE steering_queue ADD COLUMN sender TEXT NOT NULL DEFAULT ''", []);
     let _ = conn.execute("ALTER TABLE cmd_history ADD COLUMN origin TEXT NOT NULL DEFAULT ''", []);
+    // Dead-lettered vs delivered must be distinguishable in history
+    // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
+    // this covers a DB bootstrapped through this legacy path).
+    let _ = conn.execute("ALTER TABLE steering_history ADD COLUMN outcome TEXT", []);
     Ok(())
 }
 
@@ -7538,6 +7542,36 @@ pub(crate) fn steer_max_age_s() -> f64 {
         .unwrap_or(600.0)
 }
 
+/// Grace before a permanently-unroutable steering row is dead-lettered
+/// (AMUX-3110). One hour, not the 600s delivery deadline: the deadline is
+/// about a LIVE lane being slow to reach a turn boundary, this is about a
+/// TARGET that does not exist — the grace only covers the recreate/rename
+/// race, after which no amount of waiting changes the verdict.
+pub(crate) fn steer_dead_letter_s() -> f64 {
+    std::env::var("AMUX_STEER_DEAD_LETTER_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v >= 60.0)
+        .unwrap_or(3600.0)
+}
+
+/// The dead-letter decision, pure so the matrix is testable without a fleet
+/// (AMUX-3110). Some(reason) = move the row to steering_history as
+/// dead:<reason>; None = leave it queued.
+///
+/// Only `no-env-file` and `archived` qualify — the class actually measured
+/// leaking (11 of 11 unroutable rows, oldest 10.3 days). `not-running` never
+/// dead-letters on age: the 2026-08-19 panic held 41 REGISTERED lanes down
+/// for 6.5h and every queued row delivered on restart, and no age threshold
+/// can tell that outage from a dead lane.
+pub(crate) fn steer_dead_letter_verdict(reason: &str, age_s: f64) -> Option<&'static str> {
+    match reason {
+        "no-env-file" if age_s > steer_dead_letter_s() => Some("no-env-file"),
+        "archived" if age_s > steer_dead_letter_s() => Some("archived"),
+        _ => None,
+    }
+}
+
 /// THE DELIVERY DECISION (AMUX-2642). Pure, so the case that matters — a lane
 /// that is NEVER idle — is testable without a fleet.
 ///
@@ -7721,7 +7755,13 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // stuck row is retried (it stays queued, ordering preserved for everything
     // that CAN go) rather than blocking.
     let mut delivered_lanes: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut checked_lane: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Per-lane block reason, evaluated once per tick and CACHED AS A VALUE —
+    // not a checked-set. Every row of a blocked lane must reach the
+    // dead-letter decision below, not just the first (AMUX-3110): with the old
+    // set + short-circuit, a 10-day backlog on a dead lane would drain one row
+    // per tick at best and in practice never, because the skip re-ran first.
+    let mut lane_blocks: std::collections::HashMap<String, Option<&'static str>> =
+        std::collections::HashMap::new();
     let mut delivered = 0usize;
     for (id, session, text, queued_at, guard, sender) in queued {
         if delivered_lanes.contains(&session) {
@@ -7847,15 +7887,71 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // predicate the send path and the queue listing use, so a lane can never
         // be told "queued, delivers at the next boundary" by one and skipped as
         // unreachable by the other (AMUX-2785).
-        if checked_lane.insert(session.clone()) {
-            if let Some(reason) = lane_block_reason(&session).await {
-                skip(&session, &id, reason);
-                // No row on this lane can go, and unlike "busy" nothing about
-                // this resolves by waiting — so stop walking the lane. Its rows
-                // stay pending (per python); the expiry sweep owns dead lanes.
-                delivered_lanes.insert(session.clone());
-                continue;
+        let block = match lane_blocks.get(&session) {
+            Some(b) => *b,
+            None => {
+                let b = lane_block_reason(&session).await;
+                lane_blocks.insert(session.clone(), b);
+                b
             }
+        };
+        if let Some(reason) = block {
+            // DEAD-LETTER (AMUX-3110). The comment that used to live here said
+            // "the expiry sweep owns dead lanes" — no such sweep was ever
+            // written, so a row whose target never materialises was retried
+            // every 5s forever. Measured before this fix: 13 rows, 11
+            // unroutable, the oldest 10.3 days; the same dead target
+            // (amux-rust) re-queued six days after its first ghost was
+            // hand-deleted, which is the proof that cleanup does not hold —
+            // producers keep writing to dead names, so the queue needs an exit.
+            //
+            // Scope is the MEASURED class only: no-env-file and archived are
+            // permanently unroutable while the state holds (no delivery loop
+            // ever wakes them). `not-running` is deliberately NOT here — the
+            // 2026-08-19 panic took 41 registered lanes down for 6.5h and
+            // every queued row delivered on restart; age cannot distinguish
+            // that outage from a dead lane, so a registered-but-stopped lane
+            // keeps its queue. The grace window exists for the recreate/rename
+            // race (rename-remap has its own path).
+            if let Some(dead) = steer_dead_letter_verdict(reason, now_f64() - queued_at) {
+                let (id2, sess2, text2) = (id.clone(), session.clone(), text.clone());
+                let dead2 = dead.to_string();
+                let _ = state
+                    .store
+                    .write_async(move |conn| {
+                        ensure_fleet_tables(conn)?;
+                        conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                        conn.execute(
+                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome) \
+                             VALUES(?,?,?,?,?,?)",
+                            rusqlite::params![id2, sess2, text2, queued_at, now_f64(), format!("dead:{dead2}")],
+                        )?;
+                        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    })
+                    .await;
+                tracing::warn!(
+                    session = %session, id = %id, reason, sender = %sender,
+                    age_s = (now_f64() - queued_at) as i64,
+                    "dead-lettered a steering row — target permanently unroutable; \
+                     the message is preserved in steering_history with outcome dead:{reason}"
+                );
+                emit_event(
+                    state,
+                    &session,
+                    "session.steer_dead_lettered",
+                    Some(json!({
+                        "id": id, "reason": reason, "sender": sender,
+                        "age_s": (now_f64() - queued_at) as i64,
+                        "text_preview": text.chars().take(160).collect::<String>(),
+                    })),
+                    Some(format!("steerdead:{id}")),
+                    "steering",
+                )
+                .await;
+            } else {
+                skip(&session, &id, reason);
+            }
+            continue;
         }
         // THE TURN-BOUNDARY GATE. This has to live HERE, in the caller.
         // `from_steering` inside send_text_inner only refuses on a selector, or
@@ -16016,6 +16112,26 @@ mod steer_max_age_tests {
         // Prose recounting the choice must not press a key into a working lane.
         let prose = "I chose Resume from summary; Resume full session as-is was too costly. Don't ask me again about it.";
         assert!(!is_resume_mode_prompt(prose));
+    }
+
+    /// The dead-letter matrix (AMUX-3110). The cell that must NEVER flip:
+    /// `not-running` at any age stays queued — the 2026-08-19 panic held 41
+    /// registered lanes down 6.5h and every row delivered on restart, so an
+    /// age test on not-running would have destroyed a full fleet's queued
+    /// messages during an outage.
+    #[test]
+    fn dead_letter_takes_only_the_permanently_unroutable_past_grace() {
+        let grace = steer_dead_letter_s();
+        // The measured leak class, past grace: dead-letter.
+        assert_eq!(steer_dead_letter_verdict("no-env-file", grace + 1.0), Some("no-env-file"));
+        assert_eq!(steer_dead_letter_verdict("archived", grace + 1.0), Some("archived"));
+        // Inside the grace window (recreate/rename race): stays queued.
+        assert_eq!(steer_dead_letter_verdict("no-env-file", grace - 1.0), None);
+        assert_eq!(steer_dead_letter_verdict("archived", 1.0), None);
+        // A stopped-but-registered lane NEVER dead-letters, at any age.
+        assert_eq!(steer_dead_letter_verdict("not-running", grace * 300.0), None);
+        // Unknown reasons fail safe: keep the row.
+        assert_eq!(steer_dead_letter_verdict("busy", grace * 300.0), None);
     }
 
     /// The policy is the human's, set once (D2). Default is `summary` — Ethan

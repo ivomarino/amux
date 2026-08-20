@@ -131,6 +131,21 @@ const MIGRATIONS: &[Migration] = &[
         name: "0021_heartbeat",
         sql: include_str!("../../migrations/0021_heartbeat.sql"),
     },
+    Migration {
+        version: 22,
+        name: "0022_downtime_requests_during",
+        sql: include_str!("../../migrations/0022_downtime_requests_during.sql"),
+    },
+    Migration {
+        version: 23,
+        name: "0023_downtime_backfill",
+        sql: include_str!("../../migrations/0023_downtime_backfill.sql"),
+    },
+    Migration {
+        version: 24,
+        name: "0024_steering_dead_letter",
+        sql: include_str!("../../migrations/0024_steering_dead_letter.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -392,6 +407,84 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result
         }
     }
     Ok(false)
+}
+
+#[cfg(test)]
+mod registration_guard {
+    use super::MIGRATIONS;
+
+    /// A `.sql` file nobody registered is a migration that NEVER RUNS, and
+    /// nothing anywhere says so (AF-99).
+    ///
+    /// MIGRATIONS is a hand-maintained array, so adding a file and forgetting the
+    /// entry is silent in every direction: the server boots clean, the schema is
+    /// simply older than the code, and the first symptom is a query failing at
+    /// runtime somewhere far away. That is exactly what happened — 0022/0023 sat
+    /// on disk unregistered while `/api/debug/downtime` returned an empty list,
+    /// which reads identically to "there were never any outages".
+    #[test]
+    fn every_migration_file_on_disk_is_registered() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+        let mut on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .expect("migrations dir")
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".sql"))
+            .map(|n| n.trim_end_matches(".sql").to_owned())
+            .collect();
+        on_disk.sort();
+
+        // The control. If read_dir ever returned nothing — wrong path, renamed
+        // directory — an equality assert could only fail loudly, but a future
+        // rewrite into a subset check would pass vacuously. Pin it here.
+        assert!(
+            on_disk.len() >= 23,
+            "found {} migration files; the scan is looking in the wrong place",
+            on_disk.len()
+        );
+
+        let mut registered: Vec<String> =
+            MIGRATIONS.iter().map(|m| m.name.to_owned()).collect();
+        registered.sort();
+
+        let unregistered: Vec<&String> =
+            on_disk.iter().filter(|n| !registered.contains(n)).collect();
+        let missing_file: Vec<&String> =
+            registered.iter().filter(|n| !on_disk.contains(n)).collect();
+
+        // Name the offending FILE rather than printing two sorted lists. On this
+        // shared checkout the usual cause is a peer mid-work who wrote the .sql
+        // before editing the array, and a diff of 24 names does not say that.
+        assert!(
+            unregistered.is_empty(),
+            "migration file(s) on disk but NOT in the MIGRATIONS array: {unregistered:?}. \
+             An unregistered migration never runs: the server boots clean, the schema \
+             silently lags the code, and the first symptom is a query failing somewhere \
+             far away. Add a Migration{{version, name, sql: include_str!(..)}} entry. \
+             (If this is not your file, a peer is mid-work — tell them rather than \
+             registering it for them.)"
+        );
+        assert!(
+            missing_file.is_empty(),
+            "MIGRATIONS references file(s) that do not exist: {missing_file:?}"
+        );
+    }
+
+    /// Versions must be dense and ascending, or `apply_all`'s ordering and the
+    /// `_amux_migrations` bookkeeping stop lining up with the filenames.
+    #[test]
+    fn versions_are_dense_and_match_their_filenames() {
+        for (i, m) in MIGRATIONS.iter().enumerate() {
+            let expected = i as i64 + 1;
+            assert_eq!(m.version, expected, "{} is out of order", m.name);
+            let prefix = format!("{:04}_", m.version);
+            assert!(
+                m.name.starts_with(&prefix),
+                "{} does not start with its own version prefix {prefix}",
+                m.name
+            );
+        }
+    }
 }
 
 #[cfg(test)]
