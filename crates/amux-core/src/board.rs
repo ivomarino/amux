@@ -1222,6 +1222,13 @@ pub fn is_status_query(text: &str) -> bool {
         "any update on", "any updates on", "any news on", "any progress on",
         "update on ", "where are we on", "where are we with", "where do we stand",
         "is it done", "are we done", "did you finish",
+        // Pure explanation-seeking questions (AMUX-3408: "why is the photo
+        // analysis worker downloading qwen if i'm using gemini?" carded as
+        // code/doing and held a WIP slot). The ≤100-char cap and mandatory
+        // trailing `?` above already exclude compound ask-then-fix prompts;
+        // a why-question whose ANSWER spawns work gets its card from the
+        // follow-up prompt that asks for the work.
+        "why is ", "why are ", "why does ", "why did ", "why was ", "why were ",
     ];
     STATUS_OPENERS.iter().any(|o| lower.starts_with(o))
 }
@@ -1406,6 +1413,9 @@ mod capture_tests {
             "status",
             "status?",
             "is it done?",
+            // The live specimen that minted AMUX-3408 (a pure why-question,
+            // answered in-conversation, no unit of work).
+            "[08:29 AM] why is the photo analysis worker downloading qwen if i'm using gemini?",
         ] {
             assert!(is_status_query(s), "{s:?} should read as a status query");
         }
@@ -1419,6 +1429,11 @@ mod capture_tests {
             "MSG-29602 and MSG-29588 too",
             "make sure dictation goes into the messages list as well",
             "status page is broken, rebuild it with the new layout and ship?",
+            // A why-question with a trailing IMPERATIVE is work, and the
+            // mandatory `?` gate keeps it carded (no trailing question mark).
+            "why is the build red — fix it",
+            // Over-100-chars is not a bare query whatever it opens with.
+            "why is the deploy pipeline failing on the third stage after the cache restore step when the lockfile has not changed at all?",
         ] {
             assert!(!is_status_query(s), "{s:?} is real work, must still card");
         }
