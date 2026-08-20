@@ -259,8 +259,9 @@ pub struct AuthParams {
 /// must be registered on the client, or Google rejects the sign-in BEFORE it
 /// reaches amux. Copy-paste-ready guidance, returned at auth time and on a
 /// redirect_uri_mismatch so a reauth is self-service (AMUX-3352, refresh-house:
-/// an undiscoverable console step blocked a reauth for ~3 days).
-fn oauth_prerequisite(client_id: &str, redirect_uri: &str) -> Value {
+/// an undiscoverable console step blocked a reauth for ~3 days). pub(crate) so
+/// the connectors broker returns the same guidance for its own Google flow.
+pub(crate) fn oauth_prerequisite(client_id: &str, redirect_uri: &str) -> Value {
     json!({
         "requirement": "The redirect URI below must be registered on this OAuth client in the Google Cloud console (APIs & Services -> Credentials -> the OAuth 2.0 Client ID -> Authorized redirect URIs), or Google rejects the sign-in before it reaches amux.",
         "console_url": "https://console.cloud.google.com/apis/credentials",
@@ -584,6 +585,17 @@ async fn account_health(ctx: &GmailAuthCtx, account: &str) -> String {
         .expect("health cache")
         .insert(account.to_string(), (Instant::now(), state.clone()));
     state
+}
+
+/// Uncached health probe for one Gmail account, callable without a
+/// [`GmailAuthCtx`] — the connectors accounts rollup uses this so the
+/// consolidated per-account view and `/api/gmail/accounts` share ONE
+/// discriminator (`ok` / `needs_reauth` / `not_connected`) instead of two
+/// probes that could disagree. Caching is the CALLER's job (the rollup holds
+/// its own 300s cache; `/accounts` keeps the ctx cache).
+pub(crate) async fn health_for(http: Arc<dyn HttpTransport>, home: &Path, account: &str) -> String {
+    let ctx = GmailAuthCtx::new(http, home.to_path_buf());
+    probe_health(&ctx, account).await
 }
 
 async fn probe_health(ctx: &GmailAuthCtx, account: &str) -> String {

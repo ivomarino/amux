@@ -16,6 +16,15 @@
 //!      VALUES live — never the repo, never the DB, never a log) via
 //!      [`crate::api::settings::set_server_env_key`], redacted from logs, and
 //!      only ever echoed back masked.
+//!   4. the OAUTH BROKER (AMUX-3192, Ethan 2026-08-20: "I only need to do it
+//!      once for each account") — `auth` starts a grant (state + PKCE +
+//!      pending file), the public `callback` exchanges the code and writes the
+//!      per-account token store (`~/.amux/connectors/<family>/<account>.json`,
+//!      mirrored into `~/.amux/gmail-tokens/` when the grant covers Gmail),
+//!      `token` hands any worker a live bearer (SA delegation or the stored
+//!      user grant, refreshed by the broker), and `GET /api/connectors/accounts`
+//!      is the consolidated per-account health view with the one reconnect
+//!      action per broken account. See the broker section below.
 //!
 //! SCOPE (global / group / worker) is the existing `connectors` scope
 //! capability (scope.rs); the tab drives it through `PUT /api/scope` with
@@ -31,12 +40,34 @@
 
 use super::AppState;
 use crate::config::{amux_home, canonical_port, parse_env_file};
+use crate::integrations::email::{
+    base64url_nopad, connected_accounts_in, html_escape, HttpTransport, ReqwestTransport,
+    DEFAULT_TOKEN_URI,
+};
 use axum::extract::{Path, Query};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
-use serde_json::{json, Value};
+use axum::{Extension, Json, Router};
+use p256::elliptic_curve::rand_core::{OsRng, RngCore};
+use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
+
+/// Broker context: the HTTP transport (mockable in tests, like
+/// [`super::gmail_auth::GmailAuthCtx`]) plus the amux home the token store
+/// lives under. Only the broker endpoints (auth/callback/token/accounts) use
+/// it; list/credentials/test keep reading the process-global home.
+pub struct ConnectorsCtx {
+    pub http: Arc<dyn HttpTransport>,
+    pub home: PathBuf,
+}
+
+fn default_ctx() -> Arc<ConnectorsCtx> {
+    Arc::new(ConnectorsCtx { http: Arc::new(ReqwestTransport::new()), home: amux_home() })
+}
 
 /// Auth model for a provider. OAuth needs a client id/secret plus a browser
 /// grant; ApiKey needs one pasted secret. Not every connector is OAuth —
@@ -227,7 +258,13 @@ fn has_token(p: &Provider) -> bool {
     if any_json(&dir) {
         return true;
     }
-    if p.category == "Google" && any_json(&home.join("gmail-tokens")) {
+    // The family store: one Google grant per account covers every Google
+    // connector (the broker's union grant), so any google-family token
+    // authorizes them all.
+    if p.category == "Google"
+        && (any_json(&home.join("connectors").join("google"))
+            || any_json(&home.join("gmail-tokens")))
+    {
         return true;
     }
     false
@@ -251,7 +288,8 @@ fn env_val(file_env: &std::collections::BTreeMap<String, String>, key: &str) -> 
 /// copied into server.env by hand (AMUX-3341, and the connectors-setup "reuse
 /// this one" note). The value is for presence/masking and the server's own OAuth
 /// flow only; never emitted raw.
-fn resolve_cred(
+fn resolve_cred_in(
+    home: &std::path::Path,
     file_env: &std::collections::BTreeMap<String, String>,
     category: &str,
     key: &str,
@@ -260,7 +298,7 @@ fn resolve_cred(
         return Some(v);
     }
     if category == "Google" {
-        if let Some((cid, csec)) = crate::api::gmail_auth::google_oauth_client_file(&amux_home()) {
+        if let Some((cid, csec)) = crate::api::gmail_auth::google_oauth_client_file(home) {
             return match key {
                 "GOOGLE_OAUTH_CLIENT_ID" => Some(cid),
                 "GOOGLE_OAUTH_CLIENT_SECRET" => Some(csec),
@@ -269,6 +307,171 @@ fn resolve_cred(
         }
     }
     None
+}
+
+fn resolve_cred(
+    file_env: &std::collections::BTreeMap<String, String>,
+    category: &str,
+    key: &str,
+) -> Option<String> {
+    resolve_cred_in(&amux_home(), file_env, category, key)
+}
+
+// ---- OAuth broker: family model, pending state, token store ----------------
+//
+// The broker exists so Ethan authorizes each ACCOUNT once and every worker
+// shares the grant (2026-08-20 ask: "implement the scaffolding so that I only
+// need to do it once for each account"). Three pieces:
+//
+//   family    — Google connectors share ONE OAuth client and ONE callback, so
+//               they share one grant too: a Google authorization requests the
+//               UNION of the non-admin Google scopes plus the Gmail scopes,
+//               and its token is stored once per account at
+//               `~/.amux/connectors/google/<account>.json`. The same callback
+//               also mirrors the token into `~/.amux/gmail-tokens/<account>.json`
+//               (the exact legacy shape integrations/email.rs reads) when the
+//               grant covers Gmail — so a single approval repairs the email
+//               subsystem AND every Google connector AND worker token mints.
+//   pending   — `~/.amux/connectors/pending.json`, the gmail-pending shape plus
+//               a `family` field: single-use, 1h TTL, survives a restart.
+//   token     — `POST /api/connectors/{id}/token` mints from the service
+//               account when configured (unchanged), and otherwise (or when
+//               `?account=` names a user-granted account) from the stored
+//               user grant, refreshing through the broker so no session ever
+//               re-authorizes.
+
+/// The grant family a provider belongs to: Google rows share client, callback
+/// and (via the union grant) token; everything else is its own family.
+fn family_of(p: &Provider) -> &'static str {
+    if p.category == "Google" {
+        "google"
+    } else {
+        p.id
+    }
+}
+
+/// Union of scopes ONE Google grant should carry, so one approval per account
+/// covers email + calendar + drive/docs + worker mints. `google-admin` is
+/// excluded from the default union (its scopes need a Workspace super-admin
+/// and fail on consumer accounts like a personal gmail); a grant STARTED from
+/// google-admin adds them.
+fn google_union_scopes(requesting: &Provider) -> String {
+    let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for p in REGISTRY.iter().filter(|p| p.category == "Google") {
+        if p.id == "google-admin" && requesting.id != "google-admin" {
+            continue;
+        }
+        if let Auth::OAuth2 { scopes, .. } = p.auth {
+            set.extend(scopes.split_whitespace().map(String::from));
+        }
+    }
+    set.extend(super::gmail_auth::GMAIL_SCOPES.iter().map(|s| s.to_string()));
+    set.into_iter().collect::<Vec<_>>().join(" ")
+}
+
+fn pending_path(home: &std::path::Path) -> PathBuf {
+    home.join("connectors").join("pending.json")
+}
+
+fn now_ts() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+const PENDING_TTL_S: f64 = 3600.0;
+
+/// Persist a pending grant (gmail_auth's shape + `family`): prune stale, 0600.
+fn pending_save(
+    home: &std::path::Path,
+    state: &str,
+    family: &str,
+    account: &str,
+    verifier: Option<&str>,
+) -> std::io::Result<()> {
+    let p = pending_path(home);
+    if let Some(dir) = p.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut d: Map<String, Value> = std::fs::read_to_string(&p)
+        .ok()
+        .and_then(|raw| serde_json::from_str(&raw).ok())
+        .unwrap_or_default();
+    let now = now_ts();
+    d.retain(|_, v| now - v.get("ts").and_then(Value::as_f64).unwrap_or(0.0) < PENDING_TTL_S);
+    d.insert(
+        state.to_string(),
+        json!({ "family": family, "account": account, "verifier": verifier, "ts": now }),
+    );
+    std::fs::write(&p, Value::Object(d).to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+/// SINGLE-USE take (removed even when expired); `(family, account, verifier)`
+/// while fresh.
+fn pending_take(home: &std::path::Path, state: &str) -> Option<(String, String, Option<String>)> {
+    let p = pending_path(home);
+    let mut d: Map<String, Value> = serde_json::from_str(&std::fs::read_to_string(&p).ok()?).ok()?;
+    let e = d.remove(state)?;
+    let _ = std::fs::write(&p, Value::Object(d).to_string());
+    if now_ts() - e.get("ts").and_then(Value::as_f64).unwrap_or(0.0) > PENDING_TTL_S {
+        return None;
+    }
+    Some((
+        e.get("family").and_then(Value::as_str)?.to_string(),
+        e.get("account").and_then(Value::as_str).unwrap_or("").to_string(),
+        e.get("verifier").and_then(Value::as_str).map(String::from),
+    ))
+}
+
+fn token_urlsafe(nbytes: usize) -> String {
+    let mut bytes = vec![0u8; nbytes];
+    OsRng.fill_bytes(&mut bytes);
+    base64url_nopad(&bytes)
+}
+
+/// Family token store path: `~/.amux/connectors/<family>/<account>.json`.
+fn store_path(home: &std::path::Path, family: &str, account: &str) -> PathBuf {
+    home.join("connectors").join(family).join(format!("{account}.json"))
+}
+
+/// Accounts with a stored grant for a family (file stems of the store dir).
+fn store_accounts(home: &std::path::Path, family: &str) -> Vec<String> {
+    let mut out: Vec<String> = std::fs::read_dir(home.join("connectors").join(family))
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "json") {
+                        p.file_stem().map(|s| s.to_string_lossy().into_owned())
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    out.sort();
+    out
+}
+
+fn write_store_file(path: &std::path::Path, body: &Value) -> std::io::Result<()> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(path, body.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
 }
 
 /// GET /api/connectors — the registry with per-provider status. `?worker=` is
@@ -340,9 +543,16 @@ async fn list() -> Response {
             // The actionable half of the status. "connected" meant only
             // "credentials exist somewhere" and handed a session nothing — a
             // caller had to know a key path existed (nissan, AMUX-3362). When a
-            // token CAN be minted right now, name the endpoint that returns one,
-            // so "connected" comes with the door, not just the label.
-            let token_endpoint = if sa_available {
+            // token CAN be minted right now — from the SA or from a stored user
+            // grant — name the endpoint that returns one, so "connected" comes
+            // with the door, not just the label.
+            let grant_accounts = store_accounts(&amux_home(), family_of(p));
+            // Legacy gmail-tokens serve ONLY the gmail connector: their grant
+            // never covered calendar/drive, so claiming those usable off a
+            // gmail token would be the "connected but useless" lie again.
+            let legacy_gmail = p.id == "google-gmail"
+                && !connected_accounts_in(&amux_home()).is_empty();
+            let token_endpoint = if sa_available || !grant_accounts.is_empty() || legacy_gmail {
                 json!(format!("/api/connectors/{}/token", p.id))
             } else {
                 Value::Null
@@ -457,16 +667,32 @@ async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Res
     .into_response()
 }
 
-/// POST /api/connectors/{id}/auth — begin an OAuth grant. Returns the provider
-/// consent URL to open (the tab pops it). For ApiKey providers there is nothing
-/// to authorize. The token exchange (callback) is the OAuth-broker step
-/// (AMUX-3192); until it lands this returns the URL plus the redirect to
-/// register, so the flow is walkable as soon as the client creds are pasted.
-async fn begin_auth(Path(id): Path<String>) -> Response {
-    let Some(p) = provider(&id) else {
+/// POST /api/connectors/{id}/auth?account=<email> — begin an OAuth grant.
+/// Returns the provider consent URL to open (the tab pops it); the callback
+/// completes the exchange and writes the shared token store, after which every
+/// worker mints from the ONE grant (`POST /api/connectors/{id}/token`).
+///
+/// `id` may be a provider (`google-drive`) or the family alias `google` — a
+/// Google grant is family-wide either way (union scopes), so there is exactly
+/// one authorize-once action per account, not one per provider. Google
+/// requires `?account=` (it becomes the `login_hint`, so Ethan's browser picks
+/// the right profile, and it names the token file if the userinfo lookup
+/// cannot). For ApiKey providers there is nothing to authorize.
+async fn begin_auth(
+    Extension(ctx): Extension<Arc<ConnectorsCtx>>,
+    Path(id): Path<String>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let p = if id == "google" {
+        REGISTRY.iter().find(|p| p.category == "Google")
+    } else {
+        provider(&id)
+    };
+    let Some(p) = p else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown connector '{id}'")}))).into_response();
     };
-    let file_env = parse_env_file(&amux_home().join("server.env"));
+    let account = q.get("account").map(|s| s.trim().to_string()).unwrap_or_default();
+    let file_env = parse_env_file(&ctx.home.join("server.env"));
     match p.auth {
         Auth::ApiKey { .. } => Json(json!({
             "ok": true,
@@ -480,7 +706,20 @@ async fn begin_auth(Path(id): Path<String>) -> Response {
             scopes,
             ..
         } => {
-            let Some(client_id) = resolve_cred(&file_env, p.category, client_id_env) else {
+            let family = family_of(p);
+            if family == "google" && account.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "ok": false,
+                        "error": "account required for a Google grant",
+                        "how": format!("POST /api/connectors/{id}/auth?account=<email> — the account names the grant so every worker can address it, and becomes the login_hint so the right browser profile is picked"),
+                    })),
+                )
+                    .into_response();
+            }
+            let Some(client_id) = resolve_cred_in(&ctx.home, &file_env, p.category, client_id_env)
+            else {
                 return (
                     StatusCode::CONFLICT,
                     Json(json!({
@@ -493,23 +732,70 @@ async fn begin_auth(Path(id): Path<String>) -> Response {
                     .into_response();
             };
             let redirect_uri = format!("{}{}", origin(), callback_path);
-            let auth_base = if p.category == "Google" {
-                "https://accounts.google.com/o/oauth2/auth"
+            let state = token_urlsafe(24);
+            let (url, verifier) = if p.category == "Google" {
+                // One grant covers the whole Google family: union scopes, so
+                // Ethan approves ONCE per account (see the broker doc above).
+                let scope = google_union_scopes(p);
+                let verifier = token_urlsafe(64);
+                let challenge = base64url_nopad(&Sha256::digest(verifier.as_bytes()));
+                (
+                    format!(
+                        "https://accounts.google.com/o/oauth2/auth?response_type=code&client_id={}\
+                         &redirect_uri={}&scope={}&state={state}&access_type=offline\
+                         &include_granted_scopes=true&prompt=consent&login_hint={}\
+                         &code_challenge={challenge}&code_challenge_method=S256",
+                        urlencode(&client_id),
+                        urlencode(&redirect_uri),
+                        urlencode(&scope),
+                        urlencode(&account),
+                    ),
+                    Some(verifier),
+                )
             } else {
-                "https://slack.com/oauth/v2/authorize"
+                (
+                    format!(
+                        "https://slack.com/oauth/v2/authorize?client_id={}&redirect_uri={}&scope={}&state={state}",
+                        urlencode(&client_id),
+                        urlencode(&redirect_uri),
+                        urlencode(scopes),
+                    ),
+                    None,
+                )
             };
-            let url = format!(
-                "{auth_base}?response_type=code&access_type=offline&prompt=consent&client_id={}&redirect_uri={}&scope={}",
-                urlencode(&client_id),
-                urlencode(&redirect_uri),
-                urlencode(scopes),
+            if let Err(e) = pending_save(&ctx.home, &state, family, &account, verifier.as_deref()) {
+                // Without the pending entry the callback CANNOT succeed —
+                // failing loudly beats handing out a URL that dead-ends.
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("could not persist pending auth state: {e}") })),
+                )
+                    .into_response();
+            }
+            tracing::info!(
+                "connector_auth: {} grant started for account={} family={} redirect_uri={}",
+                p.id,
+                account,
+                family,
+                redirect_uri
             );
             Json(json!({
                 "ok": true,
                 "auth": "oauth2",
                 "authorize_url": url,
                 "redirect_uri": redirect_uri,
-                "note": "register redirect_uri on the OAuth client, then open authorize_url to grant. Token exchange lands with the OAuth broker (AMUX-3192).",
+                "account": account,
+                "family": family,
+                "prerequisite": if p.category == "Google" {
+                    super::gmail_auth::oauth_prerequisite(&client_id, &redirect_uri)
+                } else {
+                    json!({
+                        "requirement": "The redirect URI below must be added to the Slack app's OAuth & Permissions -> Redirect URLs, or Slack rejects the grant.",
+                        "console_url": "https://api.slack.com/apps",
+                        "add_redirect_uri": redirect_uri,
+                    })
+                },
+                "note": "open authorize_url in a browser and approve — the callback completes the exchange and stores the grant for every worker. One approval per account.",
             }))
             .into_response()
         }
@@ -530,20 +816,214 @@ fn urlencode(s: &str) -> String {
     out
 }
 
-/// OAuth callback landing. The full code->token exchange is the broker step
-/// (AMUX-3192); for now it acknowledges the redirect so a misregistered URI is
-/// diagnosable rather than a blank page, and names what is still to come.
-async fn callback(Path(provider_family): Path<String>, _headers: HeaderMap) -> Response {
-    tracing::info!("connector_oauth_callback: hit for family {}", provider_family);
-    (
+#[derive(serde::Deserialize)]
+pub struct CallbackParams {
+    #[serde(default)]
+    code: Option<String>,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+fn cb_page(status: StatusCode, body: String) -> Response {
+    (status, Html(format!("<html><body>{body}</body></html>"))).into_response()
+}
+
+/// GET /api/connectors/{family}/callback — the OAuth broker's code→token
+/// exchange (AMUX-3192). Mounted on the PUBLIC router like the Gmail callback:
+/// the provider's redirect carries no bearer token, and the single-use
+/// server-minted state is the guard.
+///
+/// On success the grant is written to the family token store
+/// (`~/.amux/connectors/<family>/<account>.json`), and — when the grant covers
+/// Gmail — mirrored into `~/.amux/gmail-tokens/<account>.json` in the exact
+/// legacy shape, so ONE approval also repairs the email subsystem. Every
+/// worker then mints from the stored grant; nobody re-authorizes.
+async fn callback(
+    Extension(ctx): Extension<Arc<ConnectorsCtx>>,
+    Path(url_family): Path<String>,
+    Query(p): Query<CallbackParams>,
+) -> Response {
+    let code = p.code.unwrap_or_default().trim().to_string();
+    let state = p.state.unwrap_or_default().trim().to_string();
+    let error = p.error.unwrap_or_default().trim().to_string();
+    let file_env = parse_env_file(&ctx.home.join("server.env"));
+    if !error.is_empty() {
+        tracing::warn!("connector_oauth_callback: {} answered error={}", url_family, error);
+        if error.contains("redirect_uri_mismatch") && url_family == "google" {
+            let cid = resolve_cred_in(&ctx.home, &file_env, "Google", "GOOGLE_OAUTH_CLIENT_ID")
+                .unwrap_or_default();
+            let uri = format!("{}/api/connectors/google/callback", origin());
+            let pre = super::gmail_auth::oauth_prerequisite(&cid, &uri);
+            return cb_page(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "<h2>Sign-in blocked: redirect URI not registered</h2>\
+                     <p>Open <a href=\"https://console.cloud.google.com/apis/credentials\">the credentials console</a>, \
+                     open OAuth client <code>{}</code> and add <code>{}</code> under Authorized redirect URIs, then retry.</p>",
+                    html_escape(pre["client_id"].as_str().unwrap_or("")),
+                    html_escape(&uri)
+                ),
+            );
+        }
+        return cb_page(
+            StatusCode::BAD_REQUEST,
+            format!("<h2>Auth failed: {}</h2><p>Close this tab.</p>", html_escape(&error)),
+        );
+    }
+    let entry = if state.is_empty() { None } else { pending_take(&ctx.home, &state) };
+    let Some((family, hint_account, verifier)) = entry.filter(|_| !code.is_empty()) else {
+        return cb_page(
+            StatusCode::BAD_REQUEST,
+            "<h2>Invalid or expired auth request.</h2><p>Close this tab and re-run the connect action.</p>".into(),
+        );
+    };
+    if family != url_family {
+        // A state minted for one family arriving on another's callback is a
+        // misconfigured redirect, not a user error — say which is which.
+        return cb_page(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "<h2>Family mismatch</h2><p>This grant was started for <b>{}</b> but the redirect landed on the <b>{}</b> callback. Check the registered redirect URI.</p>",
+                html_escape(&family),
+                html_escape(&url_family)
+            ),
+        );
+    }
+    let category = if family == "google" { "Google" } else { "Chat" };
+    let (id_key, secret_key) = if family == "google" {
+        ("GOOGLE_OAUTH_CLIENT_ID", "GOOGLE_OAUTH_CLIENT_SECRET")
+    } else {
+        ("SLACK_CLIENT_ID", "SLACK_CLIENT_SECRET")
+    };
+    let (Some(client_id), Some(client_secret)) = (
+        resolve_cred_in(&ctx.home, &file_env, category, id_key),
+        resolve_cred_in(&ctx.home, &file_env, category, secret_key),
+    ) else {
+        return cb_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("<h2>Token exchange failed</h2><pre>client credentials for {family} are no longer set</pre>"),
+        );
+    };
+    let redirect_uri = format!("{}/api/connectors/{}/callback", origin(), family);
+    let token_uri = if family == "google" {
+        DEFAULT_TOKEN_URI.to_string()
+    } else {
+        "https://slack.com/api/oauth.v2.access".to_string()
+    };
+    let mut form = vec![
+        ("grant_type".to_string(), "authorization_code".to_string()),
+        ("code".to_string(), code),
+        ("client_id".to_string(), client_id.clone()),
+        ("client_secret".to_string(), client_secret.clone()),
+        ("redirect_uri".to_string(), redirect_uri),
+    ];
+    if let Some(v) = verifier {
+        form.push(("code_verifier".to_string(), v));
+    }
+    let (status, body) = match ctx.http.post_form(&token_uri, &form).await {
+        Ok(pair) => pair,
+        Err(e) => {
+            return cb_page(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("<h2>Token exchange failed</h2><pre>{}</pre>", html_escape(&e)),
+            )
+        }
+    };
+    let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+    // Slack answers HTTP 200 with {"ok": false} on failure — status alone lies.
+    let slack_not_ok = family != "google" && body.get("ok").is_some_and(|v| v == false);
+    if status >= 400 || access.is_empty() || slack_not_ok {
+        tracing::warn!(
+            "connector_oauth_callback: {} exchange failed (HTTP {status}, error={})",
+            family,
+            body.get("error").and_then(|v| v.as_str()).unwrap_or("?")
+        );
+        return cb_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!(
+                "<h2>Token exchange failed</h2><pre>{}</pre>",
+                html_escape(&format!("HTTP {status}: {body}"))
+            ),
+        );
+    }
+    // Resolve the ACCOUNT the grant is actually for. Google: ask userinfo (the
+    // union grant carries userinfo.email), so approving with a different
+    // browser profile than the login_hint cannot mis-file the token. Slack:
+    // the workspace name. Fall back to the hint from pending.
+    let account = if family == "google" {
+        match ctx.http.get("https://www.googleapis.com/oauth2/v2/userinfo", Some(access)).await {
+            Ok((st, v)) if st < 400 => v
+                .get("email")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|e| !e.is_empty())
+                .unwrap_or_else(|| hint_account.clone()),
+            _ => hint_account.clone(),
+        }
+    } else {
+        body.get("team")
+            .and_then(|t| t.get("name"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| if hint_account.is_empty() { "workspace".into() } else { hint_account.clone() })
+    };
+    let granted_scopes = body.get("scope").and_then(Value::as_str).unwrap_or("").to_string();
+    let expires_at = body
+        .get("expires_in")
+        .and_then(Value::as_f64)
+        .map(|s| now_ts() + s);
+    let refresh = body.get("refresh_token").cloned().unwrap_or(Value::Null);
+    let store = json!({
+        "token": access,
+        "refresh_token": refresh,
+        "token_uri": if family == "google" { DEFAULT_TOKEN_URI } else { &token_uri },
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "scopes": granted_scopes,
+        "expires_at": expires_at,
+    });
+    if let Err(e) = write_store_file(&store_path(&ctx.home, &family, &account), &store) {
+        return cb_page(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("<h2>Token exchange failed</h2><pre>{}</pre>", html_escape(&e.to_string())),
+        );
+    }
+    // Gmail mirror: when the grant covers Gmail, write the legacy token file
+    // in the EXACT shape integrations/email.rs::load_token_file reads — one
+    // approval repairs the email API too. Scope-gated so a grant that did not
+    // include Gmail never fakes a working mailbox.
+    let mut mirrored = false;
+    if family == "google" && granted_scopes.contains("auth/gmail.") {
+        let legacy = json!({
+            "token": access,
+            "refresh_token": store["refresh_token"],
+            "token_uri": DEFAULT_TOKEN_URI,
+            "client_id": store["client_id"],
+            "client_secret": store["client_secret"],
+        });
+        let dir = ctx.home.join("gmail-tokens");
+        mirrored = std::fs::create_dir_all(&dir)
+            .and_then(|_| std::fs::write(dir.join(format!("{account}.json")), legacy.to_string()))
+            .is_ok();
+    }
+    tracing::info!(
+        "connector_oauth_callback: {} grant stored for {} (gmail_mirror={}, scopes=[{}])",
+        family,
+        account,
+        mirrored,
+        granted_scopes
+    );
+    cb_page(
         StatusCode::OK,
-        Json(json!({
-            "ok": true,
-            "family": provider_family,
-            "note": "redirect reached this server (URI is registered correctly). Code->token exchange lands with the OAuth broker, AMUX-3192.",
-        })),
+        format!(
+            "<h2>✓ {} connected</h2><p>The grant is stored once and shared by every worker{}. You can close this tab.</p>",
+            html_escape(&account),
+            if mirrored { " (email API included)" } else { "" }
+        ),
     )
-        .into_response()
 }
 
 /// POST /api/connectors/{id}/test — verify the connection actually WORKS, not
@@ -657,6 +1137,7 @@ async fn test_connection(Path(id): Path<String>) -> Response {
 /// Google's own error (e.g. `unauthorized_client`), which names the Admin-console
 /// fix — the same honest-error path `test_connection` uses.
 async fn mint_connector_token(
+    Extension(ctx): Extension<Arc<ConnectorsCtx>>,
     Path(id): Path<String>,
     headers: HeaderMap,
     Query(q): Query<std::collections::HashMap<String, String>>,
@@ -682,25 +1163,83 @@ async fn mint_connector_token(
                 .into_response();
         }
     };
-    // Only SA-backed Google connectors can mint today. Anything else is honestly
-    // "not yet" (the OAuth broker, AMUX-3192), never a fake token.
-    if !(p.category == "Google" && super::google_sa::sa_config().is_some()) {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({
-                "ok": false,
-                "status": "needs_auth",
-                "detail": "minting needs a Google service account with domain-wide delegation (GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT); not configured for this connector. OAuth token exchange is pending (AMUX-3192).",
-            })),
-        )
-            .into_response();
-    }
     let scope = q
         .get("scopes")
         .map(|s| s.replace(',', " "))
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| default_scopes.to_string());
+    let family = family_of(p);
+    let req_account = q.get("account").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let stored = store_accounts(&ctx.home, family);
+    // Route the mint. An explicit `?account=` that has a stored USER grant wins
+    // (the SA cannot impersonate outside its Workspace domain — a personal
+    // gmail account is only reachable through its own grant). Otherwise the SA
+    // path is unchanged. Otherwise a single stored grant is unambiguous.
+    let user_account: Option<String> = match &req_account {
+        Some(a) if stored.contains(a) => Some(a.clone()),
+        Some(a) if family == "google"
+            && ctx.home.join("gmail-tokens").join(format!("{a}.json")).exists() =>
+        {
+            Some(a.clone())
+        }
+        Some(a) => {
+            // Named an account nobody holds a grant for: if the SA can
+            // impersonate it, fall through to the SA path with it as subject;
+            // otherwise the honest answer names how to connect it.
+            if !(p.category == "Google" && super::google_sa::sa_usable()) {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(json!({
+                        "ok": false,
+                        "status": "needs_auth",
+                        "detail": format!("no stored grant for account '{a}' (family {family})"),
+                        "stored_accounts": stored,
+                        "connect": format!("POST /api/connectors/{family}/auth?account={a} → open authorize_url, approve once; every worker shares the grant"),
+                    })),
+                )
+                    .into_response();
+            }
+            None
+        }
+        None => None,
+    };
+    if user_account.is_none() && !(p.category == "Google" && super::google_sa::sa_config().is_some())
+    {
+        // No SA: fall back to the user-grant store. One stored account is
+        // unambiguous; several need `?account=`; none is an honest "connect
+        // first" naming the exact action.
+        let fallback = match stored.len() {
+            1 => Some(stored[0].clone()),
+            0 if family == "google" => {
+                // Legacy gmail-tokens can still serve google-gmail mints.
+                let gm = connected_accounts_in(&ctx.home);
+                if gm.len() == 1 { Some(gm[0].clone()) } else { None }
+            }
+            _ => None,
+        };
+        let Some(acct) = fallback else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({
+                    "ok": false,
+                    "status": "needs_auth",
+                    "detail": if stored.is_empty() {
+                        format!("no grant stored for family {family} and no service account configured")
+                    } else {
+                        format!("several accounts hold grants for family {family} — name one with ?account=")
+                    },
+                    "stored_accounts": stored,
+                    "connect": format!("POST /api/connectors/{family}/auth?account=<email> → open authorize_url, approve once"),
+                })),
+            )
+                .into_response();
+        };
+        return mint_from_user_grant(&ctx, p, family, &acct, &scope).await;
+    }
+    if let Some(acct) = user_account {
+        return mint_from_user_grant(&ctx, p, family, &acct, &scope).await;
+    }
     let Some(subject) = impersonation_subject(&headers) else {
         return (
             StatusCode::BAD_REQUEST,
@@ -708,6 +1247,7 @@ async fn mint_connector_token(
         )
             .into_response();
     };
+    let subject = req_account.unwrap_or(subject);
     match super::google_sa::mint_token_as(&scope, &subject).await {
         Ok(tok) => {
             // Log the FACT of a mint (id, subject, scope, lifetime) so a sweep can
@@ -742,14 +1282,320 @@ async fn mint_connector_token(
     }
 }
 
+/// Mint a bearer from a stored USER grant, refreshing through the broker when
+/// stale — the path that makes "authorize once per account" real for workers.
+/// Response shape matches the SA mint. `invalid_grant` names the ONE reconnect
+/// action instead of a bare 502, and WARNs so a log sweep sees the rot.
+async fn mint_from_user_grant(
+    ctx: &ConnectorsCtx,
+    p: &Provider,
+    family: &str,
+    account: &str,
+    scope: &str,
+) -> Response {
+    let fam_path = store_path(&ctx.home, family, account);
+    let legacy_path = ctx.home.join("gmail-tokens").join(format!("{account}.json"));
+    let (path, legacy) = if fam_path.exists() {
+        (fam_path, false)
+    } else if family == "google" && legacy_path.exists() {
+        (legacy_path, true)
+    } else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({
+                "ok": false,
+                "status": "needs_auth",
+                "detail": format!("no stored grant for {account} (family {family})"),
+                "connect": format!("POST /api/connectors/{family}/auth?account={account}"),
+            })),
+        )
+            .into_response();
+    };
+    let Some(tf) = std::fs::read_to_string(&path).ok().and_then(|r| serde_json::from_str::<Value>(&r).ok())
+    else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"ok": false, "status": "error", "detail": format!("grant file for {account} is unreadable")})),
+        )
+            .into_response();
+    };
+    let s = |k: &str| tf.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    // Fresh stored token (60s safety margin): serve it without a round trip.
+    // Legacy gmail files carry no expires_at, so they always refresh — which
+    // is also what keeps their stored `token` field usable for email.rs.
+    let expires_at = tf.get("expires_at").and_then(Value::as_f64);
+    if let Some(exp) = expires_at {
+        let left = exp - now_ts();
+        if left > 60.0 && !s("token").is_empty() {
+            return Json(json!({
+                "ok": true,
+                "access_token": s("token"),
+                "token_type": "Bearer",
+                "expires_in": left as u64,
+                "scope": tf.get("scopes").and_then(Value::as_str).unwrap_or(scope),
+                "subject": account,
+                "source": "user-grant (stored)",
+                "usage": "Authorization: Bearer <access_token>",
+            }))
+            .into_response();
+        }
+    }
+    let refresh = s("refresh_token");
+    if refresh.is_empty() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "status": "needs_reauth",
+                "detail": format!("the stored grant for {account} has no refresh token — re-approve once and every worker is repaired"),
+                "reconnect": format!("POST /api/connectors/{family}/auth?account={account}"),
+            })),
+        )
+            .into_response();
+    }
+    let token_uri = {
+        let t = s("token_uri");
+        if t.is_empty() { DEFAULT_TOKEN_URI.to_string() } else { t }
+    };
+    let form = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("refresh_token".to_string(), refresh.clone()),
+        ("client_id".to_string(), s("client_id")),
+        ("client_secret".to_string(), s("client_secret")),
+    ];
+    match ctx.http.post_form(&token_uri, &form).await {
+        Ok((st, body)) if st < 400 => {
+            let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+            if access.is_empty() {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"ok": false, "status": "error", "detail": "refresh answered without an access token"})),
+                )
+                    .into_response();
+            }
+            let expires_in = body.get("expires_in").and_then(Value::as_f64).unwrap_or(3599.0);
+            // Persist so the NEXT mint (any worker) skips the round trip; the
+            // legacy gmail shape keeps its exact five fields.
+            let updated = if legacy {
+                json!({
+                    "token": access,
+                    "refresh_token": refresh,
+                    "token_uri": token_uri,
+                    "client_id": s("client_id"),
+                    "client_secret": s("client_secret"),
+                })
+            } else {
+                let mut m = tf.as_object().cloned().unwrap_or_default();
+                m.insert("token".into(), json!(access));
+                m.insert("expires_at".into(), json!(now_ts() + expires_in));
+                Value::Object(m)
+            };
+            let _ = write_store_file(&path, &updated);
+            tracing::info!(
+                "connector_token: {} minted from user grant for {} (family {family}) expires_in={}",
+                p.id,
+                account,
+                expires_in as u64
+            );
+            Json(json!({
+                "ok": true,
+                "access_token": access,
+                "token_type": "Bearer",
+                "expires_in": expires_in as u64,
+                "scope": tf.get("scopes").and_then(Value::as_str).unwrap_or(scope),
+                "subject": account,
+                "source": "user-grant (refreshed)",
+                "usage": "Authorization: Bearer <access_token>",
+            }))
+            .into_response()
+        }
+        Ok((_, body)) if body.to_string().contains("invalid_grant") => {
+            tracing::warn!(
+                "connector_token: {} user grant for {account} is REVOKED (invalid_grant) — needs one re-approval",
+                p.id
+            );
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "ok": false,
+                    "status": "needs_reauth",
+                    "detail": format!("the grant for {account} was revoked or expired (invalid_grant). One re-approval repairs every worker."),
+                    "reconnect": format!("POST /api/connectors/{family}/auth?account={account} → open authorize_url, approve"),
+                })),
+            )
+                .into_response()
+        }
+        Ok((st, body)) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"ok": false, "status": "error", "detail": format!("token refresh failed: HTTP {st}: {body}")})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"ok": false, "status": "error", "detail": format!("token refresh failed: {e}")})),
+        )
+            .into_response(),
+    }
+}
+
+// ---- GET /api/connectors/accounts — the consolidated per-ACCOUNT view ------
+
+/// Rollup cache: the probes behind this (gmail getProfile, Google refresh) are
+/// real provider round trips, and BOTH the endpoint and the autofix detector
+/// read the rollup — one probe per account per 300s, however many readers.
+/// Keyed by HOME so two homes can never serve each other's rollup — in prod
+/// there is one home, but tests run many temp homes in one process, and an
+/// unkeyed cache let one test's fixture answer another test's tick.
+static ROLLUP_CACHE: Mutex<std::collections::BTreeMap<PathBuf, (Instant, Value)>> =
+    Mutex::new(std::collections::BTreeMap::new());
+const ROLLUP_TTL_S: u64 = 300;
+
+/// Build the per-account rollup: every account amux holds any credential for,
+/// which families cover it, each one's LIVE health, and — when broken — the
+/// ONE reconnect action. This is the view Ethan's "do it once per account"
+/// resolves through: each row is one approval at most.
+pub(crate) async fn accounts_rollup(http: &Arc<dyn HttpTransport>, home: &std::path::Path, bypass_cache: bool) -> Value {
+    if !bypass_cache {
+        if let Some((at, v)) = ROLLUP_CACHE.lock().expect("rollup cache").get(home).cloned() {
+            if at.elapsed().as_secs() < ROLLUP_TTL_S {
+                return v;
+            }
+        }
+    }
+    let mut rows: std::collections::BTreeMap<String, Map<String, Value>> = Default::default();
+    // Gmail (legacy store) — health via the SAME probe /api/gmail/accounts uses.
+    for a in connected_accounts_in(home) {
+        let health = super::gmail_auth::health_for(http.clone(), home, &a).await;
+        rows.entry(a.clone()).or_default().insert("gmail".into(), json!(health));
+    }
+    // Family stores. Google health: fresh expires_at is ok on its face; stale
+    // exercises the refresh token — the needs_reauth discriminator.
+    for family in ["google", "slack"] {
+        for a in store_accounts(home, family) {
+            let path = store_path(home, family, &a);
+            let tf: Value = std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|r| serde_json::from_str(&r).ok())
+                .unwrap_or(json!({}));
+            let health = if family != "google" {
+                // Slack bot tokens do not expire; presence is connected (the
+                // Test button does the live check on demand).
+                "ok".to_string()
+            } else if tf.get("expires_at").and_then(Value::as_f64).is_some_and(|e| e - now_ts() > 60.0) {
+                "ok".to_string()
+            } else {
+                probe_google_refresh(http, &path, &tf).await
+            };
+            rows.entry(a.clone()).or_default().insert(family.into(), json!(health));
+        }
+    }
+    let mut accounts: Vec<Value> = Vec::new();
+    let mut needs_reauth: Vec<Value> = Vec::new();
+    for (account, families) in rows {
+        let broken: Vec<String> = families
+            .iter()
+            .filter(|(_, v)| v.as_str() == Some("needs_reauth"))
+            .map(|(k, _)| k.clone())
+            .collect();
+        let reconnect_family = if broken.iter().any(|f| f == "gmail" || f == "google") {
+            Some("google")
+        } else if broken.first().map(String::as_str) == Some("slack") {
+            Some("slack")
+        } else {
+            None
+        };
+        let reconnect = reconnect_family.map(|f| {
+            format!("POST /api/connectors/{f}/auth?account={account} → open authorize_url, approve once")
+        });
+        if let Some(rc) = &reconnect {
+            needs_reauth.push(json!({"account": account, "broken": broken, "reconnect": rc}));
+        }
+        accounts.push(json!({
+            "account": account,
+            "families": families,
+            "needs_reauth": reconnect.is_some(),
+            "reconnect": reconnect,
+        }));
+    }
+    let out = json!({
+        "accounts": accounts,
+        "needs_reauth": needs_reauth,
+        "note": "One row per account; one approval repairs every family listed as needs_reauth (a Google grant covers gmail + calendar + drive/docs at once and every worker shares it).",
+    });
+    ROLLUP_CACHE
+        .lock()
+        .expect("rollup cache")
+        .insert(home.to_path_buf(), (Instant::now(), out.clone()));
+    out
+}
+
+/// Exercise a stored Google grant's refresh token; persist a successful
+/// refresh so the next reader skips the round trip. Same discriminator as the
+/// gmail probe: `invalid_grant` → needs_reauth, anything else unusable →
+/// not_connected.
+async fn probe_google_refresh(http: &Arc<dyn HttpTransport>, path: &std::path::Path, tf: &Value) -> String {
+    let s = |k: &str| tf.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let refresh = s("refresh_token");
+    if refresh.is_empty() {
+        return "needs_reauth".into();
+    }
+    let token_uri = {
+        let t = s("token_uri");
+        if t.is_empty() { DEFAULT_TOKEN_URI.to_string() } else { t }
+    };
+    let form = vec![
+        ("grant_type".to_string(), "refresh_token".to_string()),
+        ("refresh_token".to_string(), refresh),
+        ("client_id".to_string(), s("client_id")),
+        ("client_secret".to_string(), s("client_secret")),
+    ];
+    match http.post_form(&token_uri, &form).await {
+        Ok((st, body)) if st < 400 => {
+            let access = body.get("access_token").and_then(Value::as_str).unwrap_or("");
+            if access.is_empty() {
+                return "not_connected".into();
+            }
+            let expires_in = body.get("expires_in").and_then(Value::as_f64).unwrap_or(3599.0);
+            let mut m = tf.as_object().cloned().unwrap_or_default();
+            m.insert("token".into(), json!(access));
+            m.insert("expires_at".into(), json!(now_ts() + expires_in));
+            let _ = write_store_file(path, &Value::Object(m));
+            "ok".into()
+        }
+        Ok((_, body)) if body.to_string().contains("invalid_grant") => "needs_reauth".into(),
+        _ => "not_connected".into(),
+    }
+}
+
+async fn accounts_view(Extension(ctx): Extension<Arc<ConnectorsCtx>>) -> Response {
+    Json(accounts_rollup(&ctx.http, &ctx.home, false).await).into_response()
+}
+
 pub fn routes() -> Router<AppState> {
+    routes_with(default_ctx())
+}
+
+pub fn routes_with(ctx: Arc<ConnectorsCtx>) -> Router<AppState> {
     Router::new()
         .route("/api/connectors", get(list))
+        .route("/api/connectors/accounts", get(accounts_view))
         .route("/api/connectors/{id}/credentials", post(set_credentials))
         .route("/api/connectors/{id}/auth", post(begin_auth))
         .route("/api/connectors/{id}/test", post(test_connection))
         .route("/api/connectors/{id}/token", post(mint_connector_token))
+        .layer(Extension(ctx))
+}
+
+/// The PUBLIC callback (provider redirects carry no bearer; the single-use
+/// server-minted state is the guard — same mount rationale as gmail_auth).
+pub fn callback_routes() -> Router<AppState> {
+    callback_routes_with(default_ctx())
+}
+
+pub fn callback_routes_with(ctx: Arc<ConnectorsCtx>) -> Router<AppState> {
+    Router::new()
         .route("/api/connectors/{family}/callback", get(callback))
+        .layer(Extension(ctx))
 }
 
 #[cfg(test)]
@@ -826,5 +1672,405 @@ mod tests {
                 assert_eq!(callback_path, "/api/connectors/google/callback");
             }
         }
+    }
+
+    // ---- OAuth broker tests: mocked transport + temp homes only. ----------
+    // Placeholder strings, never real credentials; every token write lands in
+    // a tempdir.
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use tower::ServiceExt;
+
+    type RecordedCall = (String, String, Option<String>, Option<Value>);
+
+    struct MockHttp {
+        calls: Mutex<Vec<RecordedCall>>,
+        script: Mutex<Vec<(String, String, u16, Value)>>,
+    }
+
+    impl MockHttp {
+        fn new(script: Vec<(&str, &str, u16, Value)>) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                script: Mutex::new(
+                    script.into_iter().map(|(m, u, s, v)| (m.into(), u.into(), s, v)).collect(),
+                ),
+            })
+        }
+        fn answer(
+            &self,
+            method: &str,
+            url: &str,
+            bearer: Option<&str>,
+            body: Option<&Value>,
+        ) -> Result<(u16, Value), String> {
+            self.calls.lock().unwrap().push((
+                method.into(),
+                url.into(),
+                bearer.map(String::from),
+                body.cloned(),
+            ));
+            let mut script = self.script.lock().unwrap();
+            if let Some(pos) =
+                script.iter().position(|(m, sub, _, _)| m == method && url.contains(sub.as_str()))
+            {
+                let (_, _, status, v) = script.remove(pos);
+                return Ok((status, v));
+            }
+            Err(format!("mock has no answer for {method} {url}"))
+        }
+        fn calls(&self) -> Vec<RecordedCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl HttpTransport for MockHttp {
+        async fn get(&self, url: &str, bearer: Option<&str>) -> Result<(u16, Value), String> {
+            self.answer("GET", url, bearer, None)
+        }
+        async fn post_json(
+            &self,
+            url: &str,
+            bearer: Option<&str>,
+            body: &Value,
+        ) -> Result<(u16, Value), String> {
+            self.answer("POST", url, bearer, Some(body))
+        }
+        async fn post_form(
+            &self,
+            url: &str,
+            form: &[(String, String)],
+        ) -> Result<(u16, Value), String> {
+            let v = Value::Object(form.iter().map(|(k, val)| (k.clone(), json!(val))).collect());
+            self.answer("FORM", url, None, Some(&v))
+        }
+    }
+
+    const ACCT: &str = "hello@amux.io";
+
+    fn home_with_google_client() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("gmail-oauth-client.json"),
+            json!({ "installed": {
+                "client_id": "PLACEHOLDER_ID.apps.googleusercontent.com",
+                "client_secret": "PLACEHOLDER_SECRET",
+            }})
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn app_with(http: Arc<MockHttp>, home: &std::path::Path) -> (axum::Router, tempfile::TempDir) {
+        let ctx = Arc::new(ConnectorsCtx { http, home: home.to_path_buf() });
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("c.db")).unwrap();
+        let state = AppState {
+            store: Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let router = Router::new()
+            .merge(routes_with(ctx.clone()))
+            .merge(callback_routes_with(ctx))
+            .with_state(state);
+        (router, dir)
+    }
+
+    async fn send(app: &axum::Router, method: &str, path: &str) -> (StatusCode, String) {
+        let req = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let status = res.status();
+        let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
+        (status, String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    async fn send_json(app: &axum::Router, method: &str, path: &str) -> (StatusCode, Value) {
+        let (st, body) = send(app, method, path).await;
+        (st, serde_json::from_str(&body).unwrap_or(Value::String(body)))
+    }
+
+    fn qparam<'a>(url: &'a str, key: &str) -> Option<&'a str> {
+        url.split(['?', '&']).find_map(|kv| kv.strip_prefix(&format!("{key}=")))
+    }
+
+    #[tokio::test]
+    async fn google_auth_carries_union_scopes_pkce_and_pending_state() {
+        let home = home_with_google_client();
+        let (app, _d) = app_with(MockHttp::new(vec![]), home.path());
+
+        // Family alias, account required.
+        let (st, v) = send_json(&app, "POST", "/api/connectors/google/auth").await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{v}");
+        let (st, v) =
+            send_json(&app, "POST", "/api/connectors/google/auth?account=hello%40amux.io").await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        let url = v["authorize_url"].as_str().unwrap();
+
+        // ONE grant covers the family: gmail + calendar + drive/docs scopes in
+        // one consent — this is the "authorize once per account" property.
+        let scope = qparam(url, "scope").unwrap();
+        for want in ["gmail.send", "gmail.modify", "auth%2Fcalendar", "auth%2Fdrive", "auth%2Fdocuments", "userinfo.email"] {
+            assert!(scope.contains(want), "union scope missing {want}: {scope}");
+        }
+        // Admin scopes stay out of the default union (they fail on consumer
+        // accounts); google-admin starts its own wider grant.
+        assert!(!scope.contains("admin.directory"), "{scope}");
+        assert_eq!(qparam(url, "access_type"), Some("offline"));
+        assert_eq!(qparam(url, "code_challenge_method"), Some("S256"));
+        assert_eq!(qparam(url, "login_hint"), Some(urlencode(ACCT).as_str()));
+
+        // Pending state persisted (family + verifier), challenge derived S256.
+        let state = qparam(url, "state").unwrap();
+        let pending: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("connectors").join("pending.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(pending[state]["family"], json!("google"));
+        assert_eq!(pending[state]["account"], json!(ACCT));
+        let verifier = pending[state]["verifier"].as_str().unwrap();
+        let want_challenge = base64url_nopad(&Sha256::digest(verifier.as_bytes()));
+        assert_eq!(qparam(url, "code_challenge"), Some(want_challenge.as_str()));
+
+        // A provider id (not the alias) starts the SAME family-wide grant.
+        let (st, v2) =
+            send_json(&app, "POST", "/api/connectors/google-drive/auth?account=hello%40amux.io")
+                .await;
+        assert_eq!(st, StatusCode::OK);
+        assert_eq!(v2["family"], json!("google"));
+    }
+
+    #[tokio::test]
+    async fn callback_exchanges_writes_family_store_and_gmail_mirror_once() {
+        let home = home_with_google_client();
+        let http = MockHttp::new(vec![
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                200,
+                json!({ "access_token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT",
+                         "expires_in": 3599,
+                         "scope": "https://www.googleapis.com/auth/gmail.modify https://www.googleapis.com/auth/gmail.send https://www.googleapis.com/auth/drive" }),
+            ),
+            // The account is RESOLVED from the grant, not trusted from the hint.
+            ("GET", "oauth2/v2/userinfo", 200, json!({ "email": ACCT })),
+        ]);
+        let (app, _d) = app_with(http.clone(), home.path());
+
+        let (_, v) =
+            send_json(&app, "POST", "/api/connectors/google/auth?account=hint%40other.io").await;
+        let state = qparam(v["authorize_url"].as_str().unwrap(), "state").unwrap().to_string();
+        let (st, page) = send(
+            &app,
+            "GET",
+            &format!("/api/connectors/google/callback?code=authcode123&state={state}"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{page}");
+        assert!(page.contains("connected"), "{page}");
+        assert!(page.contains("email API included"), "{page}");
+
+        // The exchange carried the PKCE verifier and OUR redirect URI.
+        let form = http.calls()[0].3.clone().unwrap();
+        assert_eq!(form["grant_type"], json!("authorization_code"));
+        assert!(form["redirect_uri"].as_str().unwrap().ends_with("/api/connectors/google/callback"));
+        assert!(form["code_verifier"].as_str().is_some());
+
+        // Family store: one file per ACCOUNT (named by userinfo, not the hint).
+        let fam: Value = serde_json::from_str(
+            &std::fs::read_to_string(
+                home.path().join("connectors").join("google").join(format!("{ACCT}.json")),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(fam["token"], json!("PLACEHOLDER_AT"));
+        assert_eq!(fam["refresh_token"], json!("PLACEHOLDER_RT"));
+        assert!(fam["expires_at"].as_f64().unwrap() > now_ts());
+        assert!(!home.path().join("connectors").join("google").join("hint@other.io.json").exists());
+
+        // Gmail mirror: EXACT legacy shape (integrations/email.rs reads this),
+        // so the one approval repaired the email subsystem too.
+        let legacy: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("gmail-tokens").join(format!("{ACCT}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            legacy,
+            json!({
+                "token": "PLACEHOLDER_AT",
+                "refresh_token": "PLACEHOLDER_RT",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "PLACEHOLDER_ID.apps.googleusercontent.com",
+                "client_secret": "PLACEHOLDER_SECRET",
+            })
+        );
+
+        // Single-use state: a replay cannot mint a second grant.
+        let (st, page) = send(
+            &app,
+            "GET",
+            &format!("/api/connectors/google/callback?code=authcode123&state={state}"),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST);
+        assert!(page.contains("Invalid or expired"), "{page}");
+    }
+
+    #[tokio::test]
+    async fn token_serves_fresh_grant_without_a_round_trip_and_refreshes_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let fam_dir = home.path().join("connectors").join("google");
+        std::fs::create_dir_all(&fam_dir).unwrap();
+        // Fresh token: served straight from the store — zero provider calls.
+        std::fs::write(
+            fam_dir.join(format!("{ACCT}.json")),
+            json!({
+                "token": "PLACEHOLDER_FRESH", "refresh_token": "PLACEHOLDER_RT",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "CID", "client_secret": "CSEC",
+                "scopes": "https://www.googleapis.com/auth/drive",
+                "expires_at": now_ts() + 3000.0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let http = MockHttp::new(vec![]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        let (st, v) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/google-drive/token?account=hello%40amux.io",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["access_token"], json!("PLACEHOLDER_FRESH"));
+        assert_eq!(v["subject"], json!(ACCT));
+        assert!(http.calls().is_empty(), "fresh grant must not hit the provider");
+
+        // Stale token: refreshed through the broker and PERSISTED, so the next
+        // worker's mint is free.
+        std::fs::write(
+            fam_dir.join(format!("{ACCT}.json")),
+            json!({
+                "token": "PLACEHOLDER_OLD", "refresh_token": "PLACEHOLDER_RT",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "CID", "client_secret": "CSEC",
+                "scopes": "https://www.googleapis.com/auth/drive",
+                "expires_at": now_ts() - 10.0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let http2 = MockHttp::new(vec![(
+            "FORM",
+            "oauth2.googleapis.com/token",
+            200,
+            json!({ "access_token": "PLACEHOLDER_NEW", "expires_in": 3599 }),
+        )]);
+        let (app2, _d2) = app_with(http2.clone(), home.path());
+        let (st, v) = send_json(
+            &app2,
+            "POST",
+            "/api/connectors/google-drive/token?account=hello%40amux.io",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["access_token"], json!("PLACEHOLDER_NEW"));
+        let persisted: Value = serde_json::from_str(
+            &std::fs::read_to_string(fam_dir.join(format!("{ACCT}.json"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(persisted["token"], json!("PLACEHOLDER_NEW"));
+        assert!(persisted["expires_at"].as_f64().unwrap() > now_ts() + 3000.0);
+    }
+
+    #[tokio::test]
+    async fn revoked_grant_names_the_one_reconnect_action() {
+        let home = tempfile::tempdir().unwrap();
+        let fam_dir = home.path().join("connectors").join("google");
+        std::fs::create_dir_all(&fam_dir).unwrap();
+        std::fs::write(
+            fam_dir.join(format!("{ACCT}.json")),
+            json!({
+                "token": "", "refresh_token": "PLACEHOLDER_RT",
+                "token_uri": "https://oauth2.googleapis.com/token",
+                "client_id": "CID", "client_secret": "CSEC",
+                "expires_at": now_ts() - 10.0,
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let http = MockHttp::new(vec![(
+            "FORM",
+            "oauth2.googleapis.com/token",
+            400,
+            json!({ "error": "invalid_grant" }),
+        )]);
+        let (app, _d) = app_with(http, home.path());
+        let (st, v) = send_json(
+            &app,
+            "POST",
+            "/api/connectors/google-drive/token?account=hello%40amux.io",
+        )
+        .await;
+        assert_eq!(st, StatusCode::CONFLICT, "{v}");
+        assert_eq!(v["status"], json!("needs_reauth"));
+        assert!(
+            v["reconnect"].as_str().unwrap().contains("/api/connectors/google/auth?account=hello@amux.io"),
+            "{v}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accounts_rollup_flags_needs_reauth_with_one_reconnect_per_account() {
+        let home = tempfile::tempdir().unwrap();
+        // A gmail-only account whose refresh answers invalid_grant (the
+        // esteininger21 shape), and a healthy family-store account.
+        let gm = home.path().join("gmail-tokens");
+        std::fs::create_dir_all(&gm).unwrap();
+        std::fs::write(
+            gm.join("broken@x.io.json"),
+            json!({ "token": "PLACEHOLDER_DEAD", "refresh_token": "PLACEHOLDER_RT",
+                     "token_uri": "https://oauth2.googleapis.com/token",
+                     "client_id": "CID", "client_secret": "CSEC" })
+            .to_string(),
+        )
+        .unwrap();
+        let fam = home.path().join("connectors").join("google");
+        std::fs::create_dir_all(&fam).unwrap();
+        std::fs::write(
+            fam.join("healthy@x.io.json"),
+            json!({ "token": "PLACEHOLDER_OK", "refresh_token": "PLACEHOLDER_RT2",
+                     "token_uri": "https://oauth2.googleapis.com/token",
+                     "client_id": "CID", "client_secret": "CSEC",
+                     "expires_at": now_ts() + 3000.0 })
+            .to_string(),
+        )
+        .unwrap();
+        let http: Arc<dyn HttpTransport> = MockHttp::new(vec![
+            ("GET", "/profile", 401, json!({ "error": "unauthorized" })),
+            ("FORM", "oauth2.googleapis.com/token", 400, json!({ "error": "invalid_grant" })),
+        ]);
+        let v = accounts_rollup(&http, home.path(), true).await;
+        let accounts = v["accounts"].as_array().unwrap();
+        assert_eq!(accounts.len(), 2, "{v}");
+        let broken =
+            accounts.iter().find(|a| a["account"] == json!("broken@x.io")).expect("broken row");
+        assert_eq!(broken["families"]["gmail"], json!("needs_reauth"), "{v}");
+        assert!(broken["reconnect"]
+            .as_str()
+            .unwrap()
+            .contains("/api/connectors/google/auth?account=broken@x.io"));
+        let healthy =
+            accounts.iter().find(|a| a["account"] == json!("healthy@x.io")).expect("healthy row");
+        assert_eq!(healthy["families"]["google"], json!("ok"));
+        assert_eq!(healthy["needs_reauth"], json!(false));
+        assert_eq!(v["needs_reauth"].as_array().unwrap().len(), 1);
     }
 }

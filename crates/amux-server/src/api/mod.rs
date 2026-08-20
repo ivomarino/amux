@@ -382,6 +382,9 @@ pub fn router(state: AppState) -> Router {
         // such bypass, so the callback must sit outside it (single-use
         // server-minted state is the guard).
         .merge(gmail_auth::callback_routes())
+        // Same rationale: the connectors broker's callback receives provider
+        // redirects (Google/Slack), which cannot carry a bearer.
+        .merge(connectors::callback_routes())
         .merge(static_files::routes())
         .merge(protected)
         .with_state(state);

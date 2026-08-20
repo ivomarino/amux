@@ -289,6 +289,12 @@ pub enum DetectorKind {
     /// Open file descriptors are close to the process limit, or climbing toward
     /// it fast enough to get there.
     FdPressure,
+    /// A connector/Gmail account's stored grant is revoked or expired
+    /// (`needs_reauth`). The fix is one human re-approval, and until it
+    /// happens every worker touching that account fails — silently, in lanes
+    /// nobody watches, which is why token rot gets a card instead of waiting
+    /// for the Nth lane to rediscover it (AMUX-3353).
+    ConnectorAuth,
 }
 
 impl DetectorKind {
@@ -303,6 +309,7 @@ impl DetectorKind {
             DetectorKind::DiskPressure => "disk",
             DetectorKind::CiFailure => "ci",
             DetectorKind::FdPressure => "fd",
+            DetectorKind::ConnectorAuth => "connector-auth",
         }
     }
 
@@ -318,12 +325,13 @@ impl DetectorKind {
             | DetectorKind::SilentSubsystem
             | DetectorKind::DiskPressure
             | DetectorKind::CiFailure
-            | DetectorKind::FdPressure => "blocker",
+            | DetectorKind::FdPressure
+            | DetectorKind::ConnectorAuth => "blocker",
             _ => "investigation",
         }
     }
 
-    pub fn all() -> [DetectorKind; 9] {
+    pub fn all() -> [DetectorKind; 10] {
         [
             DetectorKind::Http5xx,
             DetectorKind::Latency,
@@ -334,6 +342,7 @@ impl DetectorKind {
             DetectorKind::DiskPressure,
             DetectorKind::CiFailure,
             DetectorKind::FdPressure,
+            DetectorKind::ConnectorAuth,
         ]
     }
 }
@@ -2180,6 +2189,67 @@ fn ci_when(ts: f64) -> String {
         .unwrap_or_else(|| format!("{ts:.0}"))
 }
 
+/// Probe connector/Gmail account health (via the connectors rollup, which
+/// caches its provider round trips 300s) and map every `needs_reauth` account
+/// to a finding. A failed probe is a SUPPRESSION, never silence — absence of
+/// data is not evidence the grants are healthy (the disk-detector rule).
+async fn connector_auth_probe(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppressed>) {
+    let http: std::sync::Arc<dyn crate::integrations::email::HttpTransport> =
+        std::sync::Arc::new(crate::integrations::email::ReqwestTransport::new());
+    let rollup = crate::api::connectors::accounts_rollup(&http, home, false).await;
+    let findings = connector_findings_from_rollup(&rollup, now);
+    for f in &findings {
+        // The WARN is the log-surfacing half of the two-fixes rule: a sweep of
+        // the server log sees token rot even if the card is never read.
+        tracing::warn!(
+            "connector_auth: {} — one re-approval repairs every worker (card follows via autofix)",
+            f.title
+        );
+    }
+    (findings, Vec::new())
+}
+
+/// Pure mapper: the rollup's `needs_reauth` entries → findings. Signature is
+/// `connector-reauth|<account>` — stable per ACCOUNT, so a card files once per
+/// rotted account however many families or ticks report it.
+pub fn connector_findings_from_rollup(rollup: &serde_json::Value, now: f64) -> Vec<Finding> {
+    let mut out = Vec::new();
+    for e in rollup.get("needs_reauth").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
+        let account = e.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        if account.is_empty() {
+            continue;
+        }
+        let broken: Vec<String> = e
+            .get("broken")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let reconnect = e.get("reconnect").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        out.push(Finding {
+            kind: DetectorKind::ConnectorAuth,
+            signature: format!("connector-reauth|{account}"),
+            title: format!(
+                "Connector account {account} needs re-authorization ({})",
+                broken.join(", ")
+            ),
+            evidence: vec![
+                ("account".into(), account.clone()),
+                ("broken".into(), broken.join(", ")),
+                (
+                    "effect".into(),
+                    "every worker using this account fails (email reads/sends, token mints) until ONE re-approval".into(),
+                ),
+                ("reconnect".into(), reconnect),
+            ],
+            recheck: "curl -sk $(amux url)/api/connectors/accounts".into(),
+            owner: None,
+            count: 1,
+            last_ts: now,
+        });
+    }
+    out
+}
+
 /// The decision. Pure: same runs in, same findings out, no clock beyond `now`
 /// and no network — which is what lets the tests build a 31-failure streak and
 /// a recovery without touching GitHub.
@@ -2706,6 +2776,11 @@ pub async fn autofix_tick_with_ci(
         }
     };
 
+    // Connector token rot: async provider probes, so computed OFF the store
+    // lock like disk/CI (the rollup carries its own 300s cache, so a 120s tick
+    // costs one probe per account per 300s, not per tick).
+    let (mut connector_f, mut connector_s) = connector_auth_probe(now, home).await;
+
     let (findings, suppressed, on) = {
         let conn = match state.store.read() {
             Ok(c) => c,
@@ -2733,6 +2808,10 @@ pub async fn autofix_tick_with_ci(
                 }
                 DetectorKind::CiFailure => ci_findings(ci_runs, now),
                 DetectorKind::FdPressure => detect_fd(now),
+                // Computed above, off-runtime and outside this lock, like disk.
+                DetectorKind::ConnectorAuth => {
+                    (std::mem::take(&mut connector_f), std::mem::take(&mut connector_s))
+                }
             };
             findings.extend(f);
             suppressed.extend(s);
@@ -3215,6 +3294,37 @@ fn parse_ts(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── connector-auth: token rot files one card per ACCOUNT ────────────────
+
+    #[test]
+    fn connector_findings_key_on_the_account_and_carry_the_reconnect() {
+        use super::{connector_findings_from_rollup, DetectorKind};
+        let rollup = serde_json::json!({
+            "accounts": [],
+            "needs_reauth": [
+                {"account": "broken@x.io", "broken": ["gmail"],
+                 "reconnect": "POST /api/connectors/google/auth?account=broken@x.io → open authorize_url, approve once"},
+                {"account": "two@x.io", "broken": ["gmail", "google"],
+                 "reconnect": "POST /api/connectors/google/auth?account=two@x.io → open authorize_url, approve once"},
+            ],
+        });
+        let f = connector_findings_from_rollup(&rollup, 1000.0);
+        assert_eq!(f.len(), 2);
+        // Signature is per-ACCOUNT — two broken families on one account are
+        // still ONE approval, so they must be one card.
+        assert_eq!(f[0].signature, "connector-reauth|broken@x.io");
+        assert_eq!(f[1].signature, "connector-reauth|two@x.io");
+        assert!(matches!(f[0].kind, DetectorKind::ConnectorAuth));
+        assert!(f[1].title.contains("two@x.io"), "{}", f[1].title);
+        assert!(f[1].title.contains("gmail, google"), "{}", f[1].title);
+        let reconnect = f[0].evidence.iter().find(|(k, _)| k == "reconnect").unwrap();
+        assert!(reconnect.1.contains("/api/connectors/google/auth?account=broken@x.io"));
+
+        // Healthy rollup → nothing to file (the check CAN pass).
+        let quiet = connector_findings_from_rollup(&serde_json::json!({"needs_reauth": []}), 0.0);
+        assert!(quiet.is_empty());
+    }
 
     // ── du_one: a timeout and an unreadable path are DIFFERENT (AEAB-33) ────
     //

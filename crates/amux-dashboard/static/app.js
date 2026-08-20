@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.693';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.694';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15921,6 +15921,53 @@ function _connectorsRender(d) {
   }
   host.innerHTML = html;
   if (list.some(c => c.id === 'google-gmail')) _gmailAccountsLoad();
+  _connAccountsLoad();
+}
+
+// ── Consolidated accounts panel (AMUX-3418): one row per ACCOUNT across all ──
+// families, live health, and ONE Reconnect that starts the family-wide grant
+// (a Google approval covers gmail + calendar + drive/docs and every worker
+// mints from it — authorize once per account).
+async function _connAccountsLoad() {
+  const host = document.getElementById('connectors-accounts');
+  if (!host) return;
+  try {
+    const r = await fetch('/api/connectors/accounts');
+    const d = await r.json();
+    const accts = d.accounts || [];
+    if (!accts.length) { host.innerHTML = ''; return; }
+    let h = '<div class="conn-card"><div class="conn-head"><span class="conn-title">Accounts</span>'
+      + '<span class="conn-cat">one approval per account, shared by every worker</span></div>';
+    for (const a of accts) {
+      h += '<div class="conn-gmail-row"><span class="conn-gmail-addr">' + esc(a.account) + '</span>';
+      const fams = a.families || {};
+      for (const f of Object.keys(fams)) {
+        const st = fams[f];
+        const color = st === 'ok' ? '#1f8f4e' : st === 'needs_reauth' ? '#c0392b' : '#8a6d3b';
+        h += '<span class="conn-gmail-badge" style="background:' + color + '">' + esc(f) + ': ' + esc(st) + '</span>';
+      }
+      if (a.needs_reauth) {
+        const fam = (a.reconnect || '').indexOf('/slack/') >= 0 ? 'slack' : 'google';
+        h += '<button class="conn-gmail-btn" onclick="_connReconnect(\'' + escJs(fam) + '\',\'' + escJs(a.account) + '\')">Reconnect ↗</button>';
+      }
+      h += '</div>';
+    }
+    h += '<div class="conn-note">Reconnect opens one consent tab; approving repairs email + every Google connector + worker token mints for that account at once.</div></div>';
+    host.innerHTML = h;
+  } catch (e) { host.innerHTML = ''; }
+}
+
+async function _connReconnect(family, account) {
+  try {
+    const r = await fetch('/api/connectors/' + encodeURIComponent(family) + '/auth?account=' + encodeURIComponent(account), { method: 'POST' });
+    const d = await r.json();
+    if (d && d.authorize_url) {
+      window.open(d.authorize_url, '_blank');
+      showToast('Approve in the opened tab — one approval repairs every worker using ' + account);
+    } else {
+      showToast('Could not start the grant: ' + ((d && (d.error || d.detail)) || 'unknown'));
+    }
+  } catch (e) { showToast('Could not start the grant: ' + e); }
 }
 
 // ── Gmail accounts in the Connectors panel (AMUX-3389) ──
