@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.694';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.695';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15961,6 +15961,13 @@ async function _connReconnect(family, account) {
   try {
     const r = await fetch('/api/connectors/' + encodeURIComponent(family) + '/auth?account=' + encodeURIComponent(account), { method: 'POST' });
     const d = await r.json();
+    if (d && d.redirect_uri_registered === false) {
+      // The server live-probed Google and the grant WILL dead-end at the
+      // mismatch wall (AMUX-3427) — surface the one console fix instead of
+      // opening a tab that cannot succeed.
+      alert('Google rejects this app\'s redirect URI, so the grant cannot succeed yet.\n\nOne-time fix: ' + (d.fix_if_unregistered || 'register ' + d.redirect_uri + ' on the OAuth client'));
+      return;
+    }
     if (d && d.authorize_url) {
       window.open(d.authorize_url, '_blank');
       showToast('Approve in the opened tab — one approval repairs every worker using ' + account);
