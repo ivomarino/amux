@@ -189,14 +189,33 @@ def _amend_verdict(cmd, scrubbed, run_dir):
                     "never rewritten; make a follow-up commit instead")
     m = re.search(r'AMUX_AMEND_EXPECT=([0-9a-f]{7,40})\b', cmd)
     if m and head.startswith(m.group(1)):
+        # AF-106: the pin proves the COMMIT BEING REWRITTEN is yours. It says
+        # nothing about the STAGED SET being absorbed, and `--amend` with no
+        # pathspec takes all of it. On 2026-08-20 a correctly-pinned amend swept
+        # 139 lines of a peer's in-flight work — their untracked migration and a
+        # 132-line handler change — into a commit carrying an unrelated message,
+        # because they staged it in the seconds between `git log -1` and the
+        # amend. The guard allowed it and, worse, had just told the caller they
+        # were now safe, so the staged set stopped being watched at exactly the
+        # moment it began to matter.
+        #
+        # Not refused here: a pin plus a pathspec is legitimate and common, and
+        # this returns None for BOTH forms. The durable fix is to compare the
+        # staged paths against the staged-guard's own last-editor attribution —
+        # the same ownership question it already answers at commit time, asked at
+        # a second door (AMUX-2325). Until then the refusal text below names the
+        # pathspec form, so the caller at least sees it exists.
         return None  # inspected + pinned + matches -> safe amend of own fresh HEAD
     got = f"pinned {m.group(1)} != HEAD {head[:12]}" if m else "no AMUX_AMEND_EXPECT pin"
     return ("git commit --amend without verified HEAD pin (" + got + ") — HEAD on this SHARED "
             "branch may be ANOTHER session's commit (2026-07-05 near-miss: an amend silently "
             "rewrote a foreign unpushed commit). Inspect first (`git log -1 --format=%H`), then "
-            "re-run pinned: `AMUX_AMEND_EXPECT=<that-sha> git commit --amend ...` — the guard "
-            "allows it only if HEAD still matches when the amend runs. If HEAD is not yours, "
-            "use a follow-up commit instead")
+            "re-run pinned: `AMUX_AMEND_EXPECT=<that-sha> git commit --amend -- <your paths>` "
+            "— the guard allows it only if HEAD still matches when the amend runs. SCOPE IT "
+            "WITH A PATHSPEC: the pin protects the commit you are rewriting, NOT the staged "
+            "set you are absorbing, and a bare `--amend` takes everything staged including a "
+            "peer's in-flight work (AF-106, 139 lines swept on 2026-08-20). If HEAD is not "
+            "yours, use a follow-up commit instead")
 
 
 def _discard_verdict(cmd, scrubbed, run_dir):
