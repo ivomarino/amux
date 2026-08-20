@@ -984,28 +984,6 @@ FIX: `_apiErrText()` surfaces `error`/`message` plus `cli` (written, uncommitted
   Verified: "403: cannot archive pinned session — unpin first" and "409: already
   holding doing — try: amux board doing AMUX-X --override-doing".
 
-## Editing static/app.js does not rebuild the embedded dashboard
-AREA: instruments
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-09
-SESSION: amux
-CARD: AMUX-2659
-SYMPTOM: `crates/amux-dashboard` has no `build.rs` and rust_embed did not invalidate.
-  After editing `static/app.js`, `cargo build --release -p amux-server` recompiled only
-  `amux-server` and produced a binary serving the PREVIOUS app.js — the page reported
-  `APP_VER 0.9.553` while the file on disk said `0.9.555`. Only
-  `touch crates/amux-dashboard/src/lib.rs` forced the re-embed.
-COST: a full verification pass was run against the OLD client and reported the fixes as
-  not working (the pinned-worker toast still said "Error: 403"). ~25 min, and it is the
-  loud-wrong kind: the sweep produced confident, plausible, false results. Worse in
-  production — a dashboard-only commit can deploy stale client code silently.
-FIX: add `crates/amux-dashboard/build.rs` emitting
-  `cargo:rerun-if-changed=static` (and assert the served APP_VER matches the file, so
-  the check can fail).
-
----
-  VERIFIED 2026-08-20 (amux-frustrations, NOT the author): rust-embed now carries features=["debug-embed"] (Cargo.toml:44) with the AF-60 comment above it at :29, so a debug build embeds the dashboard at COMPILE time and an app.js edit reaches the served page. Awaiting amux sign-off.
 ## A peer's commit shipped this run's in-flight work to origin, mid-edit
 AREA: attribution
 SEVERITY: slows
@@ -2157,36 +2135,6 @@ FIX: The CLI cannot know what landed when the server sends no JSON, so it must s
   SANCTIONED path: `--outcome-stdin` exists precisely so a gated transition never needs a
   hand-rolled curl, so a silent no-op here pushes people back to curl, which is how
   attribution gets lost.
----
-## POST /api/browser/start accepts unknown fields and silently ignores them
-AREA: browser
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-20
-SESSION: amux
-CARD: AMUX-3403
-SYMPTOM: Validating AF-18, I passed `{"viewport":"iphone"}` and then `{"device":"iphone"}`
-  to /api/browser/start; both returned ok:true and neither did anything — the viewport is
-  a post-start ACTION (`{"action":"viewport","device":"iphone"}` on /api/browser/action),
-  and start has no viewport parameter at all. Nothing in either response said "unknown
-  field ignored".
-COST: Two full start/eval/stop probe cycles measuring innerWidth 800 against an expectation
-  of 390, and a validation verdict one step from a false NOT-YET on a fix that works —
-  the live re-run then measured 390/844 with mq(max-width:600px) true on the first try
-  through the real parameter. An API that swallows a misspelled or misplaced field
-  manufactures "the feature does not work" evidence for every caller who guesses the
-  contract from the feature's name rather than the contract listing.
-FIX: start (and action) should reject or at least echo unknown top-level fields —
-  `{"ok":true,"ignored_fields":["viewport"]}` is the board API's own established pattern
-  for exactly this (cold-outbound's PATCH entry). Alternatively accept viewport/device at
-  start and apply it after launch, which is what both of my guesses assumed the contract
-  was.
-  FIXED 2e78f49 — both halves: device/width+height are real start fields now, applied to
-  the just-opened tab via the same CDP call the viewport action uses (validated before
-  launch; apply failure degrades to viewport_error, never fails the start), and every
-  other unknown field is captured by a serde flatten and echoed as ignored_fields with a
-  note. Live-verified with the exact wrong call that motivated the entry.
-
 ---
 ## The shared-checkout amend guard pins HEAD, not the staged set, so a correctly-pinned amend still absorbed a peer's work
 AREA: git
