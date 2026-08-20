@@ -2458,3 +2458,28 @@ FIX: Replaced the inference with the real instrument: begin_auth now GETs the ex
   redirect_uri_mismatch. false carries `fix_if_unregistered` naming the exact URI
   and the client's console deep-link; probe-unreachable is null, never a guess.
   Test scripts both pages so the discriminator is pinned in both directions.
+
+---
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux
+AREA: instruments
+CARD: AMUX-3427
+SYMPTOM: Third strike on the same flow, one layer down. With the redirect URI
+  finally registered, Google redirected the consent tab to the registered
+  http://localhost:8824 callback carrying a valid code+state. The
+  RedirectingAcceptor answered every plain-HTTP request with a 301 into https,
+  where the self-signed CN=amux cert threw an interstitial, so the tab stranded
+  with the grant one hop from landing. Nothing logged: the 301 leaves no trace
+  and the https leg never arrived. The grant only completed because Ethan pasted
+  the stranded URL from his address bar and I curl'd it by hand.
+COST: A third stalled approval for the owner on a flow promised as one-click,
+  and a failure mode with zero log footprint: an unwatched user would retry,
+  consume nothing (state stays pending), and give up with amux reporting nothing.
+FIX: OAuth callback paths are now SERVED on the plain-HTTP leg: the acceptor
+  recognises /api/gmail/callback and /api/connectors/*/callback (dot-segment
+  guarded), replays them against the local TLS listener on loopback, and returns
+  the callback's own HTML, so the consent tab completes without crossing the
+  interstitial. Served-in-place is INFO-logged, proxy failure WARNs and falls
+  back to the old 301 so the flow is never worse than before. Everything else
+  keeps the https redirect.
