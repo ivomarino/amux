@@ -613,6 +613,19 @@ pub(crate) mod test_env {
         _g: MutexGuard<'static, ()>,
     }
 
+    /// Point AMUX_HOME at a fixture for this guard's lifetime.
+    ///
+    /// COVERAGE IS ONE-DIRECTIONAL, and the honest scope matters
+    /// (AMUX-3415): the process-wide LOCK serializes home-MUTATING tests
+    /// against each other — two guards can never interleave — but nothing
+    /// makes the ~79 `amux_home()` READ sites take it, so a guardless test
+    /// reading a home concurrently with a guard's window sees the fixture
+    /// home. Accepted with ~43 users and zero observed bites; if one is ever
+    /// observed, the promotion path is routing test reads through the
+    /// injected-lookup seam `config::resolve_home(get)` already provides
+    /// (built for exactly this), not a bigger lock. Until then: prefer that
+    /// seam over this guard for NEW tests when the code under test can take
+    /// an injected lookup — every test that does shrinks the exposure.
     pub fn set_home(path: &std::path::Path) -> HomeGuard {
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_leaky: Vec<(&'static str, Option<String>)> = leaky_keys()

@@ -158,6 +158,13 @@ pub fn amux_home() -> PathBuf {
 /// most of them. A test that must run single-threaded to be correct is one
 /// that will be made green by `--test-threads=1` and quietly stop
 /// discriminating (ethos rule 7).
+///
+/// SCOPE OF THE MITIGATIONS, stated so this warning is not read as
+/// fully-handled (AMUX-3415): `test_env::set_home`'s LOCK closes the
+/// mutator-vs-mutator half only — reader sites do not take it, so a
+/// guardless concurrent reader can still observe a guard's fixture home.
+/// This injected-lookup seam is the full fix where it can be used; the
+/// guard is the accepted fallback where it cannot.
 fn resolve_home(get: impl Fn(&str) -> Option<String>) -> PathBuf {
     for var in ["AMUX_HOME", "CC_HOME"] {
         match get(var) {
