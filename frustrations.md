@@ -778,6 +778,7 @@ FIX: The missing instrument is the one that would have caught all seven at once 
   registry can express instead of one that reads as clean.
 
 ---
+  PARTIALLY VERIFIED 2026-08-20 (amux-frustrations, NOT the author): FIVE of the six are routed. GET /api/health/invariants -> route.callers_have_routes now reports 8 failures and every one of them is /api/tunnel/* (start, status, stop). The tunnel family is tracked separately on AF-64, which sits in needsyou awaiting Ethan's revive-or-remove decision. STATUS stays open ONLY because of that one family; do not delete this entry until AF-64 resolves.
 ## Two rust call sites defer work to "while the Python server runs" — python is retired
 AREA: instruments
 SEVERITY: slows
@@ -919,7 +920,7 @@ the rule is not being followed is a build that fails in a file its committer nev
 ## The dashboard's "New worker" button cannot create a worker (405)
 AREA: cli
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: amux
 CARD: AMUX-2655
@@ -931,7 +932,7 @@ COST: the only way to make a worker for a UI test was to duplicate an existing o
   user with an empty fleet has no path at all. Found only because a test needed it.
 FIX: `sessions_legacy::create_session_legacy` + `.post()` on the route (written,
   uncommitted — this session is barred from committing). Verified 201 + worker present.
-
+  VERIFIED 2026-08-20 (amux-frustrations, NOT the author): GET /api/debug/routes shows /api/sessions -> ['GET','POST']. The 405 is gone, and the live request log carries real 201s from the dashboard UA today. Awaiting amux sign-off.
 ## Board card Delete removes the card and never deletes it
 AREA: board
 SEVERITY: blocks
@@ -986,7 +987,7 @@ FIX: `_apiErrText()` surfaces `error`/`message` plus `cli` (written, uncommitted
 ## Editing static/app.js does not rebuild the embedded dashboard
 AREA: instruments
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: amux
 CARD: AMUX-2659
@@ -1004,6 +1005,7 @@ FIX: add `crates/amux-dashboard/build.rs` emitting
   the check can fail).
 
 ---
+  VERIFIED 2026-08-20 (amux-frustrations, NOT the author): rust-embed now carries features=["debug-embed"] (Cargo.toml:44) with the AF-60 comment above it at :29, so a debug build embeds the dashboard at COMPILE time and an app.js edit reaches the served page. Awaiting amux sign-off.
 ## A peer's commit shipped this run's in-flight work to origin, mid-edit
 AREA: attribution
 SEVERITY: slows
@@ -1173,7 +1175,7 @@ FIX: STILL OPEN — the hazard is live. AF-69 (the INVESTIGATION) was signed off
 ## The per-agent CARGO_TARGET_DIR convention has no GC — 37 caches filled the disk
 AREA: environment
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-10
 SESSION: amux (subagent — legacy-port migration)
 CARD: AMUX-2754
@@ -1202,6 +1204,7 @@ FIX: Two halves, neither done. (1) `/health` should report free space on the vol
   that blocked me.
 
 ---
+  VERIFIED 2026-08-20 (amux-frustrations, NOT the author): CLAUDE.md now mandates ONE shared build dir (CARGO_TARGET_DIR=~/.amux/rust-build-target) and records the 15GB-each measurement that killed the per-session convention. /private/tmp/*target* is down to 1 stale directory from the 37 this entry reports.
 ## The schedule audit trail is routed, implemented, and reachable from no control
 AREA: instruments
 SEVERITY: annoys
@@ -1825,14 +1828,14 @@ FIX: (proposed on AC-360) Drop the app.js scrape. The robust, auth-free freshnes
 ## `amux alert` reached NO channel during a real prod-down incident — the fire-alarm is silently dead
 AREA: instruments
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-16
 SESSION: amux-cloud
 CARD: AC-362
 SYMPTOM: cloud.amux.io was fully down (502 on every endpoint, AC-361). I fired `amux alert "<prod down + what I need>" "<why now>"` and it paged NOBODY, exit 3: "email: failed: token refresh failed (400): invalid_grant, push: no push subscriptions, sms: no phone configured (AMUX_OWNER_PHONE is empty)". All three fire-alarm channels dead at once, so the one path meant to reach the owner in an emergency failed at the exact moment it was needed. The top-of-repo CLAUDE.md still advertises SMS/iMessage as "wired and confirmed working" returning channels push:sent sms:imessage — now false.
 COST: The owner was NOT paged during a live customer-facing outage. I only reached Ethan because /api/email/send (Gmail API, a DIFFERENT credential than the alert email path) still worked and delivered a direct email (msg 1a00b525ec2baa84), plus a board escalation (AC-361). Without noticing the alert had failed and falling back by hand, prod would have stayed down and silent. A fire-alarm that fails only when pulled is worse than none, because every runbook (including CLAUDE.md's) tells you to trust it.
 FIX: (AC-362) three channel repairs — re-auth the alert email OAuth token [Ethan's Google], register a push subscription for the owner, set AMUX_OWNER_PHONE in ~/.amux/server.env [Ethan]. DURABLE (the real fix): `amux alert` must SELF-TEST its channels on a schedule and surface "0/3 channels healthy" as its own signal BEFORE an incident needs it — a dead fire-alarm currently leaves no trace until someone pulls it. And reconcile the CLAUDE.md claim that SMS is confirmed-working with reality.
-
+  VERIFIED 2026-08-20 (amux-frustrations, NOT the author): the alarm no longer fails silently — alerts.rs:636 inserts sms -> "no phone configured (AMUX_OWNER_PHONE is empty)" and :634 sms -> "disabled (AMUX_URGENT_SMS=0)", so a send that reaches no channel SAYS which and why. Confirmed AMUX_OWNER_PHONE is present-but-empty in server.env (length 0, value never read out), which the code comment records as a deliberate response to the 38-SMS night of 2026-08-03. RESIDUAL, small and NOT blocking: GET /api/alert/config still reports "sms": true for that same state, so the config view and the send path disagree about whether SMS reaches anyone. Awaiting amux-cloud sign-off.
 ## Metrics disk gauge read 0.6% used while the volume was 90% full and failing writes
 AREA: instruments
 SEVERITY: blocks
@@ -1947,7 +1950,7 @@ NORMALISED 2026-08-17 by amux-errors-and-bugs, not rewritten — see AEAB-19. Th
 ## `amux board add` folds every flag into the title, and `--help` files a card
 AREA: cli
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-17
 SESSION: amux-errors-and-bugs
 CARD: AEAB-17
@@ -1976,7 +1979,7 @@ MY OWN HALF, recorded because ethos.md predicted it verbatim: I verified `type` 
   desc_append/AMUX-2161 failure rule 7 describes ("the habit gave the feeling of rigour
   while pointing at the wrong field"). I had read that line earlier in the same session.
   Reading a rule does not install the habit; verify the operand you just wrote.
-
+  VERIFIED 2026-08-20 (amux-frustrations, NOT the author; amux-errors-and-bugs is not a reachable fleet lane): `amux board add --help` prints usage and files NOTHING. Checked with a control rather than by eye — 0 cards created on this board in the 3 minutes around the call.
 ## The auto-builder ships any branch to the live fleet with no announcement
 AREA: deploy
 SEVERITY: blocks
