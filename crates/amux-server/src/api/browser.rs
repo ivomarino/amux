@@ -1203,6 +1203,18 @@ mod tests {
     /// than theatre.
     #[tokio::test]
     async fn driver_verbs_answer_natively_never_proxy() {
+        // AF-109: this test asserts 409-when-not-running, but connect_session
+        // deliberately runs adopt_if_orphaned(&amux_home()) first (AC-325),
+        // and with no home guard that probe reaches the DEVELOPER'S REAL
+        // ~/.amux — on a machine with an amux-launched Chrome there is
+        // genuinely something to adopt, so the test raced the adopt probe and
+        // failed ~6.5% of runs (13/200 measured), while staying green in CI
+        // where no Chrome exists. The sanctioned fix is the existing
+        // HomeGuard: a temp home has no browser-running.json, so the adopt is
+        // a deterministic no-op and the 409 is about the fixture, not about
+        // whatever the host happens to be running.
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::api::settings::test_env::set_home(dir.path());
         let app = app();
 
         for (method, uri, body) in [
