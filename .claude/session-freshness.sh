@@ -64,15 +64,36 @@ if git remote get-url origin >/dev/null 2>&1; then
       out+="  - checkout is ${behind} commit(s) behind ${base}"
       [ -n "$hot" ] && out+=" — including: ${hot}"
       out+=$'\n'
-      out+=$'    git pull --rebase origin main   (review first: this checkout is SHARED)\n'
+      # `--rebase` REWRITES every unpushed commit, and on a shared checkout most
+      # of them are not yours (AF-95: 28 unpushed across ~15 lanes). Recommend it
+      # only when there is nothing local to rewrite.
+      if [ "${ahead:-0}" -gt 0 ]; then
+        out+=$'    git merge origin/main   (NOT --rebase: it rewrites the '"${ahead}"$' unpushed commit(s) here, not all of them yours)\n'
+      else
+        out+=$'    git pull --rebase origin main   (review first: this checkout is SHARED)\n'
+      fi
     fi
 
     # ── Axis 1b: DIVERGED, so append-only shared files written here strand ───
     #
     # Behind alone is recoverable: pull, and your work still reaches origin.
-    # Behind AND ahead is not — the checkout cannot fast-forward, so the hourly
-    # sync job refuses (correctly, it must never rewrite a shared tree) and
-    # nothing carries anything here upstream until a human reconciles it.
+    # Behind AND ahead means no fast-forward, so the hourly sync job refuses
+    # (correctly — it must never rewrite a shared tree) and the append strands.
+    #
+    # This block used to say "until a HUMAN reconciles it" and to send the
+    # session off to a clone that is current. Both were wrong on the canonical
+    # checkout, which is where most lanes read this (AF-95, 2026-08-19): a plain
+    # `git merge origin/main` reconciled 28-ahead/8-behind with no human, no
+    # rewritten SHA, and one conflicted file; and "go log in a current clone" is
+    # unfollowable when this IS the only clone — ethos rule 3, a constraint with
+    # no honest path forward, shipped by the hook that exists to prevent a
+    # different version of the same loss.
+    #
+    # Merge, not rebase, is the recommendation on purpose: a merge preserves
+    # every lane's SHA and `--abort` restores exactly, so it is safe for one lane
+    # to run unilaterally on a tree it shares with fifty others. Nothing here
+    # PUSHES — that stays the human's (ethos rule 8), and the Deploy section of
+    # CLAUDE.md records why.
     #
     # The reason this is worth its own line rather than folding into the count
     # above: the failure is SILENT AND WRITE-SHAPED. A stale checkout announces
@@ -86,9 +107,10 @@ if git remote get-url origin >/dev/null 2>&1; then
     # one that gets stranded without anybody choosing to risk it.
     if [ "${behind:-0}" -gt 0 ] && [ "${ahead:-0}" -gt 0 ]; then
       out+="  - this checkout has DIVERGED (${ahead} unpushed, ${behind} behind ${base})"$'\n'
-      out+=$'    it cannot fast-forward, so nothing here reaches origin until a human reconciles it\n'
-      out+=$'    do NOT append to frustrations.md here — the write succeeds and reaches nobody\n'
-      out+=$'    log friction in a clone that is current instead (.claude/rules/frustrations.md)\n'
+      out+=$'    it cannot fast-forward, so an append here reaches nobody until it is reconciled\n'
+      out+=$'    RECONCILE IT: git merge origin/main   (rewrites no SHAs; abort is clean)\n'
+      out+=$'    then append. If this is the only checkout, reconciling IS the remedy —\n'
+      out+=$'    there is no current clone to go log in (.claude/rules/frustrations.md)\n'
     fi
   fi
 fi

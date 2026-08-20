@@ -3404,3 +3404,53 @@ FIX: The CLI cannot know what landed when the server sends no JSON, so it must s
   SANCTIONED path: `--outcome-stdin` exists precisely so a gated transition never needs a
   hand-rolled curl, so a silent no-op here pushes people back to curl, which is how
   attribution gets lost.
+---
+## The freshness hook's DIVERGED advice recommends the destructive remedy and calls the safe one impossible
+AREA: git
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-19
+SESSION: amux-frustrations
+CARD: AF-95
+SYMPTOM: This checkout (the canonical ~/Dev/amux, the one ~50 lanes share) was 28 unpushed /
+  8 behind. `.claude/session-freshness.sh` said three things to every lane that started, and
+  two of them were wrong:
+    (a) line 67 recommends `git pull --rebase origin main`. On THIS checkout that rewrites the
+        SHAs of 28 commits belonging to ~15 other lanes, and the hook's OWN header comment
+        (lines 18-21) is the record of a peer's `git pull --rebase` replaying another session's
+        unpushed commit onto origin, citing ethos rule 8. The hook warns about rebase in its
+        comments and recommends it in its output.
+    (b) line 89: "nothing here reaches origin until a human reconciles it". False. `git merge
+        origin/main` reconciled it with no human, no history rewrite, and exactly one conflicted
+        file — the working tree was clean across the whole repo, so nothing was at risk.
+    (c) lines 90-91: "do NOT append to frustrations.md here — log friction in a clone that is
+        current instead". There is no other clone; this IS the canonical one. Followed
+        literally, the instruction means never log anything, which is ethos rule 3 (a constraint
+        that cannot be satisfied honestly) arriving through the hook that exists to prevent a
+        different version of the same loss.
+COST: The file silently split in two for at least a day: 129 entries here, 130 on origin, SIX
+  entries on each side invisible to the other. Five of the origin-only ones (AEAB-28/29/33/34/36)
+  come from `amux-errors-and-bugs`, a lane landing entries through GitHub PRs #123-#130 that I
+  had never encountered in four days of running this program. So every count I have reported to
+  Ethan — "129 entries, 9 deletions" — was computed on a partial file, and the AREA clustering
+  this file exists to make possible ("three entries sharing an AREA is an argument") was running
+  on two thirds of an argument. The rule warns about exactly this and scopes it to a STRANDED
+  SECOND CLONE; the canonical checkout diverging from itself is the same loss by a path the rule
+  does not cover.
+FIX: Reconciled by merge, not rebase: `git merge origin/main` (d09c274), conflict in
+  frustrations.md only, resolved as a true union — 135 entries, both sides whole, AC-235 staying
+  deleted because amux-cloud validated it against the live gateway. Worth keeping about the
+  resolution: git matched FOUR identical header lines (`AREA:/SEVERITY:/STATUS:/DATE:`) between
+  two DIFFERENT entries and reported them as common context, so accepting the auto-merge would
+  have spliced one entry's header onto another entry's body. On an append-only file of
+  fixed-field records, the fields themselves are the false-common-region hazard; reconstruct
+  each side in full rather than trusting the hunk boundaries.
+  Hook corrected by the commit carrying this entry: the behind-only path still recommends
+  `git pull --rebase` because there is nothing local to rewrite, and the DIVERGED path now
+  recommends `git merge origin/main`, names the count it would otherwise rewrite, drops the
+  human-only claim, and says that when this is the only checkout, reconciling IS the remedy.
+  Verified by RENDERING both branches against a purpose-built diverged fixture rather than by
+  reading the diff: ahead=0/behind=1 renders `pull --rebase` and no DIVERGED block,
+  ahead=1/behind=1 renders `merge` and the block. A backwards condition would have shown
+  `merge` in the first case; it does not. The lines this replaces were wrong at every lane
+  start for as long as they existed, precisely because nobody had ever rendered the branch.
