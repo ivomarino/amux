@@ -950,6 +950,14 @@ pub(crate) fn is_rate_limited_credit_banner(footer: &str) -> bool {
     let clean = strip_ansi(footer).to_lowercase().replace('\u{2019}', "'");
     clean.contains("usage-credits to finish what you're working on")
         || clean.contains("reached your usage limit and")
+        // The 2026-08 wording: "⚠ Usage limit reached · continuing automatically
+        // at 2am · esc to cancel". Found the hard way on 2026-08-19: 11 lanes
+        // sat limit-parked while /api/sessions reported credit_limited for NONE
+        // of them, so the fleet view showed a wall of "needs input" and the one
+        // question it exists to answer — which workers are limited right now —
+        // was answered wrong. Matched through the interpunct separator (a
+        // sentence no lane emits as prose), footer-scoped like the others.
+        || clean.contains("usage limit reached \u{00b7} continuing automatically at")
 }
 
 /// The policy for what amux does with a rate-limit menu (ethos D2).
@@ -15761,6 +15769,16 @@ mod steer_max_age_tests {
         assert!(!is_rate_limited_credit_banner("the ops key hit its usage limit until 2026-09-01"));
         // A normal working footer is clean.
         assert!(!is_rate_limited_credit_banner(" \u{273B} Crunched for 2m\n \u{276f} type a message"));
+
+        // The 2026-08 wording, live specimen from cold-outbound on 2026-08-19 —
+        // 11 lanes carried it while credit_limited reported 0, because none of
+        // the sentences above appear in it.
+        let parked = "\u{276f}\n  \u{26a0} Usage limit reached \u{b7} continuing automatically at 2am \u{b7} esc to cancel\n  \u{26a0} /usage-credits to continue now";
+        assert!(is_rate_limited_credit_banner(parked), "the 2am auto-continue banner must flag");
+        // Coding/discussing the wording (no interpunct sentence) must not flag.
+        assert!(!is_rate_limited_credit_banner(
+            "clean.contains(\"usage limit reached\") // continuing automatically"
+        ));
     }
 
 
