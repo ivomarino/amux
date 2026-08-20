@@ -67,6 +67,22 @@ pub struct HerdrBackend {
     pane_cache: Mutex<HashMap<String, String>>,
 }
 
+/// Parse herdr's JSON envelope from whichever stream carries it (AF-102).
+///
+/// herdr writes its envelope to STDOUT on success and to STDERR when the server
+/// is not running — stdout is empty in that case. Both call sites parsed stdout
+/// alone, so the `server_not_running` arm below, written precisely to treat a
+/// down herdr as an empty host rather than an error, could never be reached: the
+/// parse failed first and returned "unparseable output:" with an empty string
+/// interpolated. Measured 2026-08-20 on the live tail: 77 of 95 ERROR/WARN lines
+/// (81%) were that one message, ~30 per minute, carrying no diagnostic detail —
+/// an instrument drowning the log it is read from.
+fn parse_envelope(stdout: &str, stderr: &str) -> Option<Value> {
+    serde_json::from_str(stdout.trim())
+        .ok()
+        .or_else(|| serde_json::from_str(stderr.trim()).ok())
+}
+
 impl HerdrBackend {
     pub fn new(herdr_session: impl Into<String>) -> Self {
         Self {
@@ -107,13 +123,14 @@ impl HerdrBackend {
     async fn run_json(&self, args: &[&str], timeout: Duration) -> Result<Value> {
         let out = self.run_raw(args, timeout).await?;
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let v: Value = serde_json::from_str(stdout.trim()).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let v: Value = parse_envelope(&stdout, &stderr).ok_or_else(|| {
             BackendError::CommandFailed(format!(
                 "herdr {}: unparseable output (exit {:?}): {} {}",
                 args.join(" "),
                 out.status.code(),
                 stdout.trim(),
-                String::from_utf8_lossy(&out.stderr).trim(),
+                stderr.trim(),
             ))
         })?;
         if let Some((code, message)) = envelope_error(&v) {
@@ -427,10 +444,16 @@ impl SessionBackend for HerdrBackend {
     async fn reconcile(&self) -> Result<Vec<BackendSession>> {
         let out = self.run_raw(&["workspace", "list"], OP_TIMEOUT).await?;
         let stdout = String::from_utf8_lossy(&out.stdout);
-        let v: Value = serde_json::from_str(stdout.trim()).map_err(|_| {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // Both streams, and BOTH streams in the failure message — the old text
+        // interpolated only stdout, which is empty in exactly the case that fires,
+        // so the log line ended in a colon and told the reader nothing (AF-102).
+        let v: Value = parse_envelope(&stdout, &stderr).ok_or_else(|| {
             BackendError::CommandFailed(format!(
-                "herdr workspace list: unparseable output: {}",
-                stdout.trim()
+                "herdr workspace list: unparseable output (exit {:?}): stdout={:?} stderr={:?}",
+                out.status.code(),
+                stdout.trim(),
+                stderr.trim()
             ))
         })?;
         if let Some((code, message)) = envelope_error(&v) {
@@ -546,6 +569,39 @@ fn sh_quote(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// AF-102. The exact bytes `herdr workspace list` produced on this machine on
+    /// 2026-08-20 with no herdr server running: envelope on STDERR, stdout EMPTY,
+    /// exit 1. Captured from the real CLI, not composed — the old code parsed
+    /// stdout alone, so this specimen is what made the `server_not_running` arm
+    /// in `reconcile` unreachable and put 77 of 95 ERROR/WARN lines in the log.
+    const REAL_STDERR_WHEN_SERVER_DOWN: &str = r#"{"id":"cli:workspace:list","error":{"code":"server_not_running","message":"no herdr server is running at /Users/ethan/.config/herdr/herdr.sock; run `herdr` to start or attach it"}}"#;
+
+    #[test]
+    fn the_envelope_is_found_on_stderr_when_stdout_is_empty() {
+        let v = super::parse_envelope("", REAL_STDERR_WHEN_SERVER_DOWN)
+            .expect("the real down-server specimen must parse");
+        let (code, _msg) = super::envelope_error(&v).expect("it is an error envelope");
+        assert_eq!(code, "server_not_running",
+            "reconcile keys its empty-host arm on this exact code; if it does not \
+             surface, that arm stays unreachable and the WARN storm returns");
+    }
+
+    #[test]
+    fn stdout_still_wins_when_it_carries_the_envelope() {
+        let v = super::parse_envelope(r#"{"id":"x","workspaces":[]}"#, "ignored noise")
+            .expect("normal success path");
+        assert!(v.get("workspaces").is_some(), "stdout must take precedence over stderr");
+    }
+
+    /// The control. Without it, a `parse_envelope` that returned Some(Null) for
+    /// anything would pass both tests above and silently swallow real breakage.
+    #[test]
+    fn genuinely_unparseable_output_is_still_none() {
+        assert!(super::parse_envelope("", "").is_none());
+        assert!(super::parse_envelope("not json", "also not json").is_none());
+    }
+
     use super::*;
 
     #[test]
