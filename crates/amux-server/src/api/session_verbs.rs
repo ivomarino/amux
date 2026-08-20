@@ -147,6 +147,35 @@ pub(crate) struct EnvFile {
     pairs: Vec<(String, String)>,
 }
 
+/// A temp path unique to THIS CALL, for the write-then-rename dance (AF-104).
+///
+/// It used to be keyed on `std::process::id()` alone, which is constant for the
+/// life of the server — so two concurrent writes of the SAME env file inside one
+/// process chose the SAME temp path. The first rename consumed it and the second
+/// got ENOENT. Observed in production 2026-08-19 13:18:22.734: two POST
+/// /api/sessions arriving in the same millisecond from one browser (a double
+/// submit), one 201 and one
+/// `500 could not write session env: No such file or directory (os error 2)`.
+///
+/// The 500 was the mild outcome. The same collision has the loser truncating and
+/// rewriting the winner's temp file WHILE it is being written, so a torn env file
+/// can be renamed into place and a worker boots with half its environment.
+///
+/// pid still distinguishes processes (two servers, or a test binary sharing the
+/// dir); the counter distinguishes calls within one. Callers in BOTH modules use
+/// this one function, because the previous duplication is exactly why the bug had
+/// to be found and fixed twice.
+pub(crate) fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    path.with_file_name(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("env"),
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ))
+}
+
 impl EnvFile {
     fn load(path: &Path) -> Self {
         let mut pairs = Vec::new();
@@ -204,11 +233,7 @@ impl EnvFile {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let tmp = path.with_file_name(format!(
-            ".{}.{}.tmp",
-            path.file_name().and_then(|n| n.to_str()).unwrap_or("env"),
-            std::process::id()
-        ));
+        let tmp = unique_tmp_path(path);
         {
             let mut f = std::fs::File::create(&tmp)?;
             #[cfg(unix)]
@@ -12813,6 +12838,60 @@ fn getrandom_fill(buf: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
+
+    // ---- AF-104: concurrent env writes must not share a temp path -----------
+    //
+    // Rebuilt from the incident's own artifact: two POST /api/sessions at
+    // 2026-08-19 13:18:22.734 from one browser (a double submit), one 201 and one
+    // 500 "could not write session env: No such file or directory (os error 2)".
+    // A standalone reproduction of the pre-fix code reproduced that exact errno.
+
+    /// The invariant, tested deterministically so it cannot flake: two calls
+    /// never choose the same temp path. A concurrency test alone can pass by
+    /// simply not colliding on a given run.
+    #[test]
+    fn two_temp_paths_for_the_same_file_are_never_equal() {
+        let p = std::path::Path::new("/tmp/amux-af104/foo.env");
+        let a = super::unique_tmp_path(p);
+        let b = super::unique_tmp_path(p);
+        assert_ne!(a, b, "a shared temp path is the whole bug: the first rename \
+                          consumes it and the second gets ENOENT");
+        assert_ne!(a, p.to_path_buf());
+        assert_eq!(a.parent(), p.parent(), "temp must stay on the same filesystem \
+                                            or the rename stops being atomic");
+    }
+
+    /// Corroboration against the real write path. With the pid-only temp name
+    /// this fails with os error 2; it can never false-FAIL, only false-pass by
+    /// not colliding — which is why the deterministic test above is the gate.
+    #[test]
+    fn concurrent_writes_of_one_env_file_all_succeed_and_leave_it_intact() {
+        let dir = std::env::temp_dir().join(format!("amux-af104-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("worker.env");
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut e = super::EnvFile::default();
+                    e.set("CC_DESC", &format!("writer-{i}"));
+                    e.write(&path).map_err(|err| err.to_string())
+                })
+            })
+            .collect();
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let failures: Vec<_> = results.iter().filter_map(|r| r.as_ref().err()).collect();
+        assert!(failures.is_empty(), "concurrent writers failed: {failures:?}");
+
+        // And the survivor must be a WHOLE file, not a torn one — the quiet half
+        // of this bug is the loser truncating the winner's temp mid-write.
+        let text = std::fs::read_to_string(&path).expect("env file exists");
+        assert!(text.starts_with("# updated: "), "header missing: {text:?}");
+        assert_eq!(text.matches("CC_DESC=").count(), 1, "expected exactly one CC_DESC: {text:?}");
+        assert!(text.ends_with('\n'), "truncated write: {text:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
 
     // ---- AF-96: /api/debug/logs verdict, now testable ------------------------
     //

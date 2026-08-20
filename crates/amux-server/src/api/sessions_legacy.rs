@@ -1436,11 +1436,11 @@ fn write_env_file(path: &std::path::Path, pairs: &[(&str, String)]) -> std::io::
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
-    let tmp = path.with_file_name(format!(
-        ".{}.{}.tmp",
-        path.file_name().and_then(|n| n.to_str()).unwrap_or("env"),
-        std::process::id()
-    ));
+    // ONE implementation, shared with session_verbs::EnvFile::write (AF-104).
+    // The pid-only temp name lived in BOTH copies, so the same race had to be
+    // found twice; the header above still explains why the ~15 lines around it
+    // were duplicated, and this is the line where that duplication cost money.
+    let tmp = crate::api::session_verbs::unique_tmp_path(path);
     {
         let mut f = std::fs::File::create(&tmp)?;
         #[cfg(unix)]
