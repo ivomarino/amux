@@ -199,6 +199,15 @@ fallback when a finding needs row-level inspection.
      cold-outbound, 08-18 amux-cloud + random — the last two did *nothing else*
      all day). Exclude it before flagging, the same way GETs are excluded.
 
+   - **A card DELETE leaves no trace in the board snapshot.** `mixpeek-clustering`
+     was flagged on 2026-08-20 for one mutating write with no board activity. That
+     write was `DELETE /api/board/MC-1328 -> 200` — closing out a card IS the ledger
+     working, but the cross-check reads `max(created, updated)` over cards that
+     still EXIST, and a deleted card exists nowhere to be counted. The check is
+     structurally blind to the one board action that removes its own evidence.
+     Before flagging, look for `DELETE /api/board/` in the lane's writes, the same
+     way you look for `POST /api/board` when `updated` is unset.
+
    - **`POST /api/sessions/<n>/send` and `/api/workers/<n>/send` are not work
      either.** Messaging a peer is a mutating METHOD with no board consequence,
      so a lane whose only write that day was a relay reads as silent. Fourth
@@ -250,6 +259,9 @@ A fix whose confirmation needs a natural specimen cannot be verified the day it
 ships. Those land here, because the card that records them is a store this sweep
 never opens (ethos rule 4: a tag where the reader does not look is no tag). Clear
 a line when it resolves; do not let one rot unchecked.
+
+- **2026-08-20: zero 504s of ANY kind in the 24h window** (`SELECT COUNT(*) ...
+  WHERE status=504` -> 0). AF-86 below could not discriminate; not a pass.
 
 - **AF-86 — helper 504 must report the TOTAL the caller waited.** On any 504 group
   for `/api/orchestrate/plan` or `/api/lookup`, read `error_body`. PASS is
