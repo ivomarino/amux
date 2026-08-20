@@ -3947,7 +3947,7 @@ const PEEK_TABS = (function _discoverPeekTabs() {
     const lbl = b.querySelector('.tab-lbl');
     out.push({ id, label: lbl ? lbl.textContent.trim() : id });
   });
-  return out.length ? out : [{ id: 'simple', label: 'Simple' }];
+  return out.length ? out : [{ id: 'simple', label: 'Translate' }];
 })();
 let peekHiddenTabs = (function() {
   try { const v = localStorage.getItem('amux_peek_hidden_tabs'); if (v !== null) return new Set(JSON.parse(v)); } catch(e) {}
@@ -6309,7 +6309,11 @@ function _simpleCfgRender() {
   const cfg = _simpleCfg(name);
   const scope = _simpleCfgScope();
   el.innerHTML =
-    '<div style="font-size:0.72rem;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Simple view</div>'
+    '<div style="font-size:0.72rem;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Translate</div>'
+    // The prompt leads (Ethan 2026-08-20: the tab IS the prompt — plain
+    // English is just the default translation).
+    + '<label style="display:block;font-size:0.78rem;margin-bottom:8px;">Translation prompt'
+    +   '<textarea rows="3" placeholder="Leave blank for the default plain-English prompt" onchange="_simpleCfgSet(\'prompt\',this.value)" style="width:100%;margin-top:3px;font-size:0.75rem;">' + esc(cfg.prompt || '') + '</textarea></label>'
     + '<label style="display:block;font-size:0.78rem;margin-bottom:8px;">Applies to'
     +   '<select onchange="localStorage.setItem(\'amux_simple_cfg_scope\',this.value);_simpleCfgRender();_simpleRender()" style="width:100%;margin-top:3px;">'
     +     '<option value="global"' + (scope === 'global' ? ' selected' : '') + '>All workers (default)</option>'
@@ -6317,15 +6321,13 @@ function _simpleCfgRender() {
     +   '</select></label>'
     + '<label style="display:block;font-size:0.78rem;margin-bottom:8px;">Font size: ' + esc(cfg.px) + 'px'
     +   '<input type="range" min="12" max="28" value="' + esc(cfg.px) + '" oninput="_simpleCfgSet(\'px\',this.value)" style="width:100%;"></label>'
-    + '<label style="display:block;font-size:0.78rem;margin-bottom:8px;">Font'
+    + '<label style="display:block;font-size:0.78rem;">Font'
     +   '<select onchange="_simpleCfgSet(\'font\',this.value)" style="width:100%;margin-top:3px;">'
     +     '<option value=""' + (!cfg.font ? ' selected' : '') + '>Default</option>'
     +     '<option value="system-ui"' + (cfg.font === 'system-ui' ? ' selected' : '') + '>System</option>'
     +     '<option value="Georgia,serif"' + (cfg.font === 'Georgia,serif' ? ' selected' : '') + '>Serif</option>'
     +     '<option value="ui-monospace,monospace"' + (cfg.font === 'ui-monospace,monospace' ? ' selected' : '') + '>Mono</option>'
-    +   '</select></label>'
-    + '<label style="display:block;font-size:0.78rem;">Standing prompt'
-    +   '<textarea rows="3" placeholder="Leave blank for the default plain-English prompt" onchange="_simpleCfgSet(\'prompt\',this.value)" style="width:100%;margin-top:3px;font-size:0.75rem;">' + esc(cfg.prompt || '') + '</textarea></label>';
+    +   '</select></label>';
 }
 function _simpleCfgToggle(e) {
   if (e) e.stopPropagation();
@@ -6399,10 +6401,14 @@ async function _simpleRender(gen) {
   // Spinner on an explicit generate or a first load for this worker; otherwise
   // keep the list on screen while refetching.
   if (gen === true || body.dataset.simpleFor !== name) {
+    // Name what is actually happening: a custom prompt may be translating to
+    // Spanish or executive-summary-ese, and "plain English" would be a lie
+    // about it. The default keeps its honest wording.
+    const busy = cfg.prompt
+      ? (gen === true ? 'Running your translation prompt…' : 'Translating…')
+      : (gen === true ? 'Writing a new plain-English summary…' : 'Putting it in plain English…');
     body.innerHTML = '<div style="color:var(--dim);display:flex;align-items:center;gap:8px;padding:8px 2px;">'
-      + '<span class="simple-spin"></span>'
-      + (gen === true ? 'Writing a new plain-English summary…' : 'Putting it in plain English…')
-      + '</div>';
+      + '<span class="simple-spin"></span>' + busy + '</div>';
   }
   try {
     const params = [];
@@ -7855,7 +7861,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.690';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.691';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
