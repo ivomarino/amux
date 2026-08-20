@@ -1630,15 +1630,62 @@ fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
 /// which also does nothing. Snapshots are purgeable by macOS under pressure and
 /// thinnable with `tmutil`, so this line turns an unexplainable non-recovery
 /// into a one-command fix.
-fn local_snapshot_count() -> Option<usize> {
-    let out = std::process::Command::new("/usr/bin/tmutil")
-        .args(["listlocalsnapshots", "/"])
-        .output()
+/// Run a short subprocess with a wall-clock ceiling, killing AND reaping it on
+/// overrun.
+///
+/// Exists because `du_one` was the only bounded subprocess in this file and the
+/// bound was written into its body, so the next subprocess added here inherited
+/// nothing (AF-97). `tmutil` was that next one. Reaping matters for the same
+/// reason it does in `du_one`: an unreaped child is a zombie holding the very
+/// FDs the neighbouring `detect_fd` detector counts, so an unbounded probe here
+/// makes the detector beside it report pressure that the probe itself caused.
+fn bounded_output(program: &str, args: &[&str], budget: std::time::Duration) -> Option<Vec<u8>> {
+    let deadline = std::time::Instant::now() + budget;
+    let mut child = std::process::Command::new(program)
+        .args(args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
         .ok()?;
-    if !out.status.success() {
-        return None;
+    loop {
+        match child.try_wait() {
+            Ok(Some(st)) => {
+                let out = child.wait_with_output().ok()?;
+                return st.success().then_some(out.stdout);
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    // WARN, not debug: unlike du's per-path skips this is one
+                    // line per tick at most, and a `tmutil` that stops answering
+                    // is a real machine fault worth seeing in a log sweep.
+                    tracing::warn!(
+                        program,
+                        budget_s = budget.as_secs_f64(),
+                        "autofix: subprocess exceeded its budget and was killed — \
+                         the value it would have produced is reported as absent, not as zero"
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(_) => return None,
+        }
     }
-    Some(String::from_utf8_lossy(&out.stdout).matches("com.apple.TimeMachine").count())
+}
+
+fn local_snapshot_count() -> Option<usize> {
+    // 5s: `tmutil listlocalsnapshots /` answers in well under a second on a
+    // healthy machine. It talks to backupd, so a wedged Time Machine can hang it
+    // indefinitely — and before AF-97 that hang had no ceiling at all, on a
+    // thread that was also holding the SQLite store lock.
+    let stdout = bounded_output(
+        "/usr/bin/tmutil",
+        &["listlocalsnapshots", "/"],
+        std::time::Duration::from_secs(5),
+    )?;
+    Some(String::from_utf8_lossy(&stdout).matches("com.apple.TimeMachine").count())
 }
 
 pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppressed>) {
@@ -2614,6 +2661,51 @@ pub async fn autofix_tick_with_ci(
         ));
     }
 
+    // DISK DETECTION RUNS OFF THE RUNTIME, AND OUTSIDE THE STORE LOCK (AF-97 —
+    // the deeper exit AMUX-35 named and did not take).
+    //
+    // `detect_disk` is the only detector that shells out: a bounded `du -skx`
+    // per candidate path, and `tmutil listlocalsnapshots /`. Every other
+    // detector reads SQLite. Run inline it did two harmful things at once, and
+    // the second reaches the whole fleet:
+    //
+    //   - it parked a tokio worker for the duration. `du_one` polls with
+    //     `std::thread::sleep(50ms)` up to `AMUX_DISK_DU_TOTAL_TIMEOUT_S`
+    //     (default 15s), which blocks the THREAD, not the task. Unbounded, this
+    //     is precisely what took the server silent on AMUX-35: "each tick parked
+    //     another worker until none were left to poll the accept loop". The
+    //     budgets bounded the damage; they did not move it off the runtime.
+    //
+    //   - it held `state.store.read()` for that whole time, because the detector
+    //     loop runs inside the lock scope — and `detect_disk` is one of the three
+    //     detectors that never touches `conn`. Writers take BEGIN IMMEDIATE, so a
+    //     15s disk walk was 15s of stalled writes for every lane, every 120s.
+    //
+    // `fetch_ci_runs` was hoisted out of this scope for exactly this reason
+    // ("so the tick never touches the store lock and GitHub in the same breath").
+    // The subprocess detector is the same hazard and was left behind.
+    let (mut disk_f, mut disk_s) = {
+        let home_owned = home.to_path_buf();
+        match tokio::task::spawn_blocking(move || detect_disk(now, &home_owned)).await {
+            Ok(v) => v,
+            // A panicked or cancelled blocking task must not read as "disk is
+            // fine". A detector that silently reports nothing is the exact shape
+            // this file exists to catch, so the failure is filed as a suppression
+            // and shows up in the report's `suppressed` list.
+            Err(e) => (
+                Vec::new(),
+                vec![sup(
+                    DetectorKind::DiskPressure,
+                    "disk|detector-did-not-run",
+                    &format!(
+                        "the disk detector did not run ({e}) — this is absence of DATA, \
+                         not evidence that the disk is healthy"
+                    ),
+                )],
+            ),
+        }
+    };
+
     let (findings, suppressed, on) = {
         let conn = match state.store.read() {
             Ok(c) => c,
@@ -2635,7 +2727,10 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::SilentSubsystem => detect_silent(&conn, now),
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
-                DetectorKind::DiskPressure => detect_disk(now, home),
+                // Computed above, off-runtime and outside this lock (AF-97).
+                DetectorKind::DiskPressure => {
+                    (std::mem::take(&mut disk_f), std::mem::take(&mut disk_s))
+                }
                 DetectorKind::CiFailure => ci_findings(ci_runs, now),
                 DetectorKind::FdPressure => detect_fd(now),
             };
@@ -3148,6 +3243,97 @@ mod tests {
     /// would make the suite fail for a reason that has nothing to do with the
     /// code. The `du` probe below is what decides, so this can never pass by
     /// mistaking a missing directory for a permissions error.
+    /// AF-97, the class kill. Every blocking `std::process::Command` in this
+    /// file's PRODUCTION half must live in one of the two bounded helpers.
+    ///
+    /// The original defect was not that `du` was slow — it was that a detector
+    /// shelled out synchronously from an `async fn` that was holding the SQLite
+    /// store lock, and nothing anywhere could say so. Bounding `du` (AMUX-35)
+    /// and then `tmutil` (AF-97) each fixed one instance; the third one lands
+    /// the same way unless adding it is what fails.
+    ///
+    /// Reading the source rather than the behaviour is deliberate: the property
+    /// is "no unbounded subprocess reachable from the tick", and there is no
+    /// runtime observation that distinguishes a bounded call from a lucky fast
+    /// one. `tests/system_jobs.rs` guards `lib.rs` the same way.
+    #[test]
+    fn every_blocking_subprocess_here_goes_through_a_bounded_helper() {
+        let src = include_str!("autofix.rs");
+        let prod = src.split("\nmod tests").next().unwrap_or(src);
+        const ALLOWED: [&str; 2] = ["du_one", "bounded_output"];
+
+        let mut current = "<file scope>";
+        let mut offenders: Vec<(usize, &str)> = Vec::new();
+        for (i, line) in prod.lines().enumerate() {
+            let t = line.trim_start();
+            if !line.starts_with(' ') && (t.starts_with("fn ") || t.starts_with("pub fn ")) {
+                current = t
+                    .trim_start_matches("pub ")
+                    .trim_start_matches("fn ")
+                    .split(['(', '<'])
+                    .next()
+                    .unwrap_or("?");
+            }
+            if line.contains("std::process::Command::new") && !ALLOWED.contains(&current) {
+                offenders.push((i + 1, current));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "blocking subprocess outside a bounded helper: {offenders:?}. \
+             The autofix tick is an async fn that holds state.store.read() while the \
+             detectors run, so an unbounded child here stalls every lane's writes for \
+             as long as it hangs (AMUX-35, AF-97). Route it through `bounded_output`."
+        );
+    }
+
+    /// The control for the test above: it must be able to FIND the calls it is
+    /// vetting. An empty scan and a clean scan are the same green, and this file
+    /// is 3000+ lines — a pattern that silently stops matching would read as
+    /// "no blocking subprocesses" forever.
+    #[test]
+    fn the_subprocess_scan_actually_finds_the_calls_it_vets() {
+        let src = include_str!("autofix.rs");
+        let prod = src.split("\nmod tests").next().unwrap_or(src);
+        let n = prod.matches("std::process::Command::new").count();
+        assert!(n >= 2, "scan found {n} blocking subprocess call sites, expected at least the two bounded helpers — the pattern has drifted from the code");
+    }
+
+    /// AF-97. `bounded_output` must return on ITS deadline, not the command's.
+    ///
+    /// Discriminating by construction: `/bin/sleep 30` against a 1s budget takes
+    /// 30s and returns `Some` if the ceiling is not enforced, so removing the
+    /// deadline check fails this on both the value AND the clock. The elapsed
+    /// assertion is the one that survives someone "fixing" the return value.
+    #[test]
+    fn bounded_output_returns_on_its_own_deadline_not_the_commands() {
+        let t0 = std::time::Instant::now();
+        let got = bounded_output("/bin/sleep", &["30"], std::time::Duration::from_secs(1));
+        let elapsed = t0.elapsed();
+        assert_eq!(got, None, "an overrun must report ABSENT, never an empty success");
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "returned after {elapsed:?} — the 1s budget was not enforced"
+        );
+    }
+
+    /// The control. Without it the test above passes just as well against a
+    /// `bounded_output` that always returns None, which would silently disable
+    /// the snapshot count rather than bound it.
+    #[test]
+    fn bounded_output_still_returns_output_for_a_command_that_finishes() {
+        let got = bounded_output("/bin/echo", &["hello"], std::time::Duration::from_secs(10));
+        assert_eq!(got.as_deref(), Some(&b"hello\n"[..]));
+    }
+
+    /// A non-zero exit is not output. `local_snapshot_count` counts marker
+    /// strings in stdout, so a failed command whose stdout happened to contain
+    /// one would otherwise be counted as a snapshot.
+    #[test]
+    fn bounded_output_rejects_a_nonzero_exit() {
+        assert_eq!(bounded_output("/bin/sh", &["-c", "echo x; exit 3"], std::time::Duration::from_secs(10)), None);
+    }
+
     #[test]
     fn an_unreadable_path_is_not_reported_as_a_timeout() {
         let trash = match std::env::var("HOME") {
