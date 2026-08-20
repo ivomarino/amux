@@ -1178,7 +1178,11 @@ async fn mint_connector_token(
     // path is unchanged. Otherwise a single stored grant is unambiguous.
     let user_account: Option<String> = match &req_account {
         Some(a) if stored.contains(a) => Some(a.clone()),
-        Some(a) if family == "google"
+        // Legacy gmail-tokens serve ONLY the gmail connector: their grant never
+        // covered calendar/drive, so minting them for another provider would
+        // hand out a token that cannot do what the caller asked (the
+        // "connected but useless" lie the list() endpoint already refuses).
+        Some(a) if p.id == "google-gmail"
             && ctx.home.join("gmail-tokens").join(format!("{a}.json")).exists() =>
         {
             Some(a.clone())
@@ -1211,8 +1215,9 @@ async fn mint_connector_token(
         // first" naming the exact action.
         let fallback = match stored.len() {
             1 => Some(stored[0].clone()),
-            0 if family == "google" => {
-                // Legacy gmail-tokens can still serve google-gmail mints.
+            0 if p.id == "google-gmail" => {
+                // Legacy gmail-tokens can still serve google-gmail mints (and
+                // only gmail — see the routing note above).
                 let gm = connected_accounts_in(&ctx.home);
                 if gm.len() == 1 { Some(gm[0].clone()) } else { None }
             }
@@ -2025,6 +2030,54 @@ mod tests {
             v["reconnect"].as_str().unwrap().contains("/api/connectors/google/auth?account=hello@amux.io"),
             "{v}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_gmail_only_legacy_token_never_serves_a_calendar_or_drive_mint() {
+        // The grant behind ~/.amux/gmail-tokens/ never covered calendar/drive.
+        // Serving it for those providers hands out a token that cannot do what
+        // the caller asked — the "connected but useless" lie. The honest answer
+        // is needs_auth naming the connect action.
+        let home = tempfile::tempdir().unwrap();
+        let gm = home.path().join("gmail-tokens");
+        std::fs::create_dir_all(&gm).unwrap();
+        std::fs::write(
+            gm.join(format!("{ACCT}.json")),
+            json!({ "token": "PLACEHOLDER_GMAIL_ONLY", "refresh_token": "PLACEHOLDER_RT",
+                     "token_uri": "https://oauth2.googleapis.com/token",
+                     "client_id": "CID", "client_secret": "CSEC" })
+            .to_string(),
+        )
+        .unwrap();
+        let http = MockHttp::new(vec![]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        for provider in ["google-calendar", "google-drive"] {
+            let (st, v) = send_json(
+                &app,
+                "POST",
+                &format!("/api/connectors/{provider}/token?account=hello%40amux.io"),
+            )
+            .await;
+            assert_ne!(st, StatusCode::OK, "{provider} must not mint from a gmail-only grant: {v}");
+            assert_eq!(v["status"], json!("needs_auth"), "{v}");
+            assert!(v["connect"].as_str().unwrap().contains("/api/connectors/google/auth"), "{v}");
+        }
+        // gmail itself still mints from the legacy file (refresh path).
+        let http2 = MockHttp::new(vec![(
+            "FORM",
+            "oauth2.googleapis.com/token",
+            200,
+            json!({ "access_token": "PLACEHOLDER_NEW", "expires_in": 3599 }),
+        )]);
+        let (app2, _d2) = app_with(http2, home.path());
+        let (st, v) = send_json(
+            &app2,
+            "POST",
+            "/api/connectors/google-gmail/token?account=hello%40amux.io",
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["access_token"], json!("PLACEHOLDER_NEW"));
     }
 
     #[tokio::test]
