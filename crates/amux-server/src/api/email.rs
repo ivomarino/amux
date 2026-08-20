@@ -671,6 +671,7 @@ pub async fn message(
         return err(StatusCode::BAD_REQUEST, json!({ "error": "message id required" }));
     }
     let account = qs.get("account").map(|s| s.trim().to_string()).unwrap_or_default();
+    let explicit_account = !account.is_empty();
     let connected = ctx.client.connected_accounts();
     let accounts: Vec<String> = if !account.is_empty() {
         if !connected.contains(&account) {
@@ -689,11 +690,63 @@ pub async fn message(
     // Resolve the RFC822 id to a gmail message id, then fetch format=full so the
     // FULL body + attachments come back — not the list-path snippet (AMUX-3354,
     // autodesk: the snippet path truncated bodies and hid attachments).
+    //
+    // SERVE THE SENT COPY WHEN WE SENT IT (GT-59). A cross-account send
+    // (info@ -> ethan@) stores TWO objects with one Message-ID, and Gmail's
+    // DELIVERY pipeline rewrites the recipient copy's text/plain part —
+    // measured on the 2026-08-20 RB2B digest and reproduced with a controlled
+    // probe: the sent copy read 120 lines / 44 blanks, the delivered copy 87
+    // lines / 0 blanks, newlines collapsed and rewrapped. The account loop
+    // used to return whichever copy matched first, which for our own outbound
+    // mail was the MANGLED delivered copy — so "read back what was actually
+    // sent" audited Gmail's rewrite and filed a bug against our composer
+    // (GT-59 did exactly that; the composer was verbatim all along). When the
+    // found copy's From is one of OUR connected accounts and a copy exists in
+    // that account, serve THAT one — the bytes we actually handed Gmail. The
+    // response's `copy` field names which one was served, so forensics can
+    // see the discriminator instead of inferring it (rule 4). An explicit
+    // ?account= always wins and is labelled honestly.
     for acct in &accounts {
         if let Some(meta) = ctx.client.find_message_by_rfc822(acct, &id).await {
             if let Some(gmail_id) = meta.get("id").and_then(Value::as_str) {
                 return match ctx.client.get_message_full(acct, gmail_id).await {
-                    Ok(full) => Json(full).into_response(),
+                    Ok(mut full) => {
+                        let from = full.get("from").and_then(Value::as_str).unwrap_or("");
+                        let from_acct = connected
+                            .iter()
+                            .find(|a| from.to_lowercase().contains(&a.to_lowercase()))
+                            .cloned();
+                        let explicit = explicit_account;
+                        match from_acct {
+                            Some(fa) if fa != *acct && !explicit => {
+                                // Our own outbound mail, found via the recipient
+                                // copy: re-resolve in the sending account.
+                                if let Some(smeta) =
+                                    ctx.client.find_message_by_rfc822(&fa, &id).await
+                                {
+                                    if let Some(sid) = smeta.get("id").and_then(Value::as_str) {
+                                        if let Ok(mut sent) =
+                                            ctx.client.get_message_full(&fa, sid).await
+                                        {
+                                            sent["copy"] = json!("sent");
+                                            sent["delivered_copy_account"] = json!(acct);
+                                            return Json(sent).into_response();
+                                        }
+                                    }
+                                }
+                                full["copy"] = json!("delivered");
+                                Json(full).into_response()
+                            }
+                            Some(fa) if fa == *acct => {
+                                full["copy"] = json!("sent");
+                                Json(full).into_response()
+                            }
+                            _ => {
+                                full["copy"] = json!("delivered");
+                                Json(full).into_response()
+                            }
+                        }
+                    }
                     Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e })),
                 };
             }
