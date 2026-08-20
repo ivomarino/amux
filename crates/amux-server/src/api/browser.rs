@@ -101,9 +101,36 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// The ATTRIBUTION resolution: explicit `session` (body/query) →
+/// `X-Amux-Session` header → None. No default constant — amux-cloud's
+/// validation of the takeover guard caught the harm: a header-less curl's
+/// refusal said requested_by:"amux", framing that lane for every anonymous
+/// call (AMUX-1768's class), and worse, the guard's same-session shortcut
+/// let any TWO anonymous callers stomp each other's browsers because both
+/// resolved to the same constant. Ownership records and guard comparisons
+/// use THIS; an unattributed caller never matches any owner, its own
+/// browsers included — anonymity forfeits the shortcut, and the refusal
+/// says "(unattributed)".
+fn explicit_session(explicit: Option<&str>, headers: &HeaderMap) -> Option<String> {
+    if let Some(s) = explicit {
+        let s = s.trim();
+        if !s.is_empty() {
+            return Some(s.to_string());
+        }
+    }
+    headers
+        .get("x-amux-session")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string)
+}
+
 /// AC-293's resolution order, ported: explicit `session` (body/query) →
 /// `X-Amux-Session` header → `"amux"`. The header half is what keeps two
-/// well-behaved lanes from silently driving one tab.
+/// well-behaved lanes from silently driving one tab. The `"amux"` default is
+/// the shared TAB-BINDING bucket and nothing more — it must never reach an
+/// ownership record or an attribution field (see `explicit_session`).
 fn resolve_session(explicit: Option<&str>, headers: &HeaderMap) -> String {
     if let Some(s) = explicit {
         let s = s.trim();
@@ -221,6 +248,11 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
     });
     let home = chrome::amux_home();
     let session = resolve_session(body.session.as_deref(), &headers);
+    // ATTRIBUTION is explicit-only (amux-cloud's validation catch): the
+    // tab-binding default must never become an ownership record or a
+    // same-session match, or two anonymous callers stomp each other freely
+    // and every anonymous refusal frames the default lane.
+    let attrib = explicit_session(body.session.as_deref(), &headers);
     // TAKEOVER GUARD (AMUX-3063). One browser per machine means start REPLACES
     // whatever is running — including another session's staged, logged-in
     // page. Refuse a cross-session replace unless the caller says takeover
@@ -229,7 +261,12 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
     // server restart is guarded too, not just one this process spawned.
     chrome::adopt_if_orphaned(&home).await;
     if let Some((r_profile, r_owner, r_started, r_pid)) = chrome::running_snapshot() {
-        if r_owner != session && !body.takeover {
+        // Same-session requires BOTH sides attributed and equal. An
+        // unattributed caller matches nothing — anonymity forfeits the
+        // shortcut, including against an unattributed owner (two anonymous
+        // callers are not one session).
+        let same = attrib.as_deref().is_some_and(|a| !r_owner.is_empty() && a == r_owner);
+        if !same && !body.takeover {
             return err(
                 StatusCode::CONFLICT,
                 json!({
@@ -243,18 +280,21 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
                         "profile": r_profile, "started_by": r_owner,
                         "started_at": r_started, "pid": r_pid,
                     },
-                    "requested_by": session,
+                    "requested_by": attrib.as_deref().unwrap_or("(unattributed)"),
                 }),
             );
         }
-        if r_owner != session {
+        if !same {
             tracing::warn!(
-                requested_by = %session, owner = %r_owner, profile = %r_profile, pid = r_pid,
+                requested_by = %attrib.as_deref().unwrap_or("(unattributed)"),
+                owner = %r_owner, profile = %r_profile, pid = r_pid,
                 "browser TAKEOVER: replacing another session's running browser (explicit takeover flag)"
             );
         }
     }
-    match chrome::start(&home, &body.profile, &body.url, &session).await {
+    match chrome::start(&home, &body.profile, &body.url, &session, attrib.as_deref().unwrap_or(""))
+        .await
+    {
         Ok(info) => {
             let mut v = serde_json::to_value(&info).unwrap_or_else(|_| json!({}));
             v["ok"] = json!(true);
@@ -356,8 +396,10 @@ async fn status() -> Response {
 
 async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     let body = body.map(|Json(v)| v).unwrap_or_else(|| json!({}));
-    let session =
-        resolve_session(body.get("session").and_then(Value::as_str), &headers);
+    // Explicit attribution only — the tab-binding default must not sign the
+    // stop record as "amux" for an anonymous caller (amux-cloud's catch).
+    let attrib = explicit_session(body.get("session").and_then(Value::as_str), &headers);
+    let actor = attrib.as_deref().unwrap_or("(unattributed)");
     let home = chrome::amux_home();
     // Cross-session stop stays PERMITTED (a wedged browser must be cleanable
     // by whoever notices) but LOUD: the log and the response both name owner
@@ -365,17 +407,17 @@ async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     // (AMUX-3063's other half — the 09:05 stop had no actor on record).
     let owner = chrome::running_snapshot().map(|(_, o, _, _)| o);
     if let Some(o) = owner.as_deref() {
-        if o != session {
+        if attrib.as_deref() != Some(o) {
             tracing::warn!(
-                stopped_by = %session, owner = %o,
+                stopped_by = %actor, owner = %o,
                 "browser: cross-session STOP of another session's browser"
             );
         }
     }
-    let report = chrome::stop_as(&home, &session).await;
+    let report = chrome::stop_as(&home, attrib.as_deref().unwrap_or("")).await;
     let mut v = serde_json::to_value(&report).unwrap_or_else(|_| json!({}));
     v["ok"] = json!(true);
-    v["stopped_by"] = json!(session);
+    v["stopped_by"] = json!(actor);
     if let Some(o) = owner {
         v["owner"] = json!(o);
     }
@@ -437,7 +479,10 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
     let mut launch_error = Value::Null;
     if !body.url.trim().is_empty() {
         let session = resolve_session(body.session.as_deref(), &headers);
-        match chrome::start(&home, &name, body.url.trim(), &session).await {
+        let attrib = explicit_session(body.session.as_deref(), &headers);
+        match chrome::start(&home, &name, body.url.trim(), &session, attrib.as_deref().unwrap_or(""))
+            .await
+        {
             Ok(_) => launched = true,
             Err(e) => launch_error = json!(e.to_string()),
         }
@@ -1252,6 +1297,33 @@ mod tests {
         assert!(
             v["error"].as_str().unwrap_or("").contains("takeover"),
             "the refusal must name the escape: {v}"
+        );
+        assert_eq!(
+            v["requested_by"],
+            json!("(unattributed)"),
+            "a header-less caller must not be framed as any lane (amux-cloud's catch): {v}"
+        );
+        // amux-cloud's validation catch: the tab-binding default ("amux") must
+        // never become a same-session match. An anonymous caller resolves to
+        // that default for TAB purposes only — against a browser OWNED by the
+        // real amux session it must still refuse, or every anonymous caller
+        // could stomp amux's browsers (and each other's, via the shared
+        // constant).
+        chrome::test_seed_running("default", "amux", 424242);
+        let (st_amux, v_amux, _) =
+            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
+        chrome::test_clear_running();
+        assert_eq!(st_amux, StatusCode::CONFLICT, "anonymous must not match the default bucket: {v_amux}");
+        // Two anonymous callers are not one session: an unattributed OWNER is
+        // matched by nobody, its (anonymous) starter included.
+        chrome::test_seed_running("default", "", 424242);
+        let (st_anon, v_anon, _) =
+            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
+        chrome::test_clear_running();
+        assert_eq!(st_anon, StatusCode::CONFLICT, "anonymous-vs-anonymous is not same-session: {v_anon}");
+        assert!(
+            v_anon["error"].as_str().unwrap_or("").contains("(unattributed)"),
+            "an unattributed owner is named as such: {v_anon}"
         );
         // The pass-through cases (same session; takeover:true) proceed to a
         // REAL Chrome launch and so cannot run hermetically — they are

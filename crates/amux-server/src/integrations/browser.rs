@@ -678,6 +678,7 @@ pub async fn start(
     profile: &str,
     url: &str,
     session: &str,
+    started_by: &str,
 ) -> anyhow::Result<StartedBrowser> {
     let binary = chrome_binary().ok_or_else(|| {
         anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
@@ -895,12 +896,16 @@ pub async fn start(
         cdp_port: port,
         started_at,
         pid: pid_num,
-        started_by: session.to_string(),
+        // Ownership is the EXPLICIT attribution, never the tab-binding
+        // default ("amux") — an anonymous start records "" so the guard can
+        // refuse the next anonymous caller instead of treating them as the
+        // same session (amux-cloud's validation catch on AMUX-3063).
+        started_by: started_by.to_string(),
         child: Some(child),
     });
     // Survive a server restart (AC-325). Written AFTER the handle is live so a
     // file never claims a browser that failed to start.
-    persist_running(home, profile, &udd_for_state, port, pid_num, started_at, session);
+    persist_running(home, profile, &udd_for_state, port, pid_num, started_at, started_by);
     spawn_exit_monitor();
     Ok(info)
 }
@@ -2180,7 +2185,7 @@ mod tests {
         }
         let home = fake_home();
         // Use a scratch profile name so the target dir is amux-owned + temp.
-        let info = start(home.path(), "default", "about:blank", "live-smoke").await.expect("start");
+        let info = start(home.path(), "default", "about:blank", "live-smoke", "live-smoke").await.expect("start");
         assert!(info.cdp_port > 0);
         let tabs = cdp_list(info.cdp_port).await.expect("cdp /json/list");
         assert!(tabs.is_array());
@@ -2254,7 +2259,7 @@ mod tests {
             return;
         }
         let home = fake_home();
-        let info = start(home.path(), "default", "about:blank", "owner").await.expect("start");
+        let info = start(home.path(), "default", "about:blank", "owner", "owner").await.expect("start");
 
         // The launch tab as CHROME reports it — the incident's artifact.
         let launch_tab = cdp_list(info.cdp_port)
