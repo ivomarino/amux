@@ -166,17 +166,99 @@ struct StartBody {
     /// caller, or a peer adopts it.
     #[serde(default)]
     session: Option<String>,
+    /// Viewport at launch (AMUX-3403). Both start-time guesses a caller
+    /// naturally makes now work: `device` (same preset table as the viewport
+    /// action) or `width`+`height`. Applied right after the tab opens, so
+    /// start-at-phone-width is one call instead of start-then-action.
+    #[serde(default)]
+    device: Option<String>,
+    #[serde(default)]
+    width: Option<u32>,
+    #[serde(default)]
+    height: Option<u32>,
+    /// Every unknown field lands here and is echoed back as
+    /// `ignored_fields` (the board API's pattern). Silently swallowing a
+    /// misspelled or misplaced field manufactured "the feature does not
+    /// work" evidence: two AF-18 validation probes measured a default
+    /// viewport against ok:true responses whose viewport request had been
+    /// dropped on the floor (AMUX-3403).
+    #[serde(flatten)]
+    extra: serde_json::Map<String, Value>,
 }
 
 // `HeaderMap` before `Json` — axum requires the body extractor last.
 async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
     let Json(body) = body.unwrap_or_default();
+    // Viewport request validated BEFORE launching — a 400 must not cost a
+    // Chrome start, and the contract wording matches the viewport action's.
+    let dev = body.device.as_deref().unwrap_or("").trim().to_lowercase();
+    let named =
+        VIEWPORT_DEVICES.iter().find(|(n, ..)| *n == dev).map(|(_, w, h)| (*w, *h));
+    if !dev.is_empty() && named.is_none() {
+        let mut names: Vec<&str> = VIEWPORT_DEVICES.iter().map(|(n, ..)| *n).collect();
+        names.sort_unstable();
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": format!("unknown device {dev:?} (one of {})", names.join(", ")) }),
+        );
+    }
+    if body.width.is_some() != body.height.is_some() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({ "error": "width and height go together" }),
+        );
+    }
+    let viewport_wh = named.or(match (body.width, body.height) {
+        (Some(w), Some(h)) => Some((w, h)),
+        _ => None,
+    });
     let home = chrome::amux_home();
     let session = resolve_session(body.session.as_deref(), &headers);
     match chrome::start(&home, &body.profile, &body.url, &session).await {
         Ok(info) => {
             let mut v = serde_json::to_value(&info).unwrap_or_else(|_| json!({}));
             v["ok"] = json!(true);
+            // Apply the requested viewport to the tab start just opened —
+            // same CDP call as the viewport action. A failure here degrades
+            // the FIELD (`viewport_error`), never the start: the browser is
+            // up either way, and the caller can retry via the action.
+            if let Some((w, h)) = viewport_wh {
+                match connect_session(&session, None).await {
+                    Ok((_page, mut cdp)) => {
+                        let r = cdp
+                            .call(
+                                "Emulation.setDeviceMetricsOverride",
+                                json!({ "width": w, "height": h, "deviceScaleFactor": 0, "mobile": w <= 500 }),
+                                Duration::from_secs(10),
+                            )
+                            .await;
+                        match r {
+                            Ok(_) => {
+                                let seen = cdp
+                                    .eval("({w:window.innerWidth,h:window.innerHeight})", 10)
+                                    .await
+                                    .unwrap_or(Value::Null);
+                                v["viewport"] = json!({ "w": w, "h": h, "measured": seen });
+                            }
+                            Err(e) => v["viewport_error"] = json!(e.to_string()),
+                        }
+                    }
+                    Err(_) => {
+                        v["viewport_error"] =
+                            json!("could not attach to the started tab to apply the viewport — retry with the viewport action")
+                    }
+                }
+            }
+            // Echo what was dropped (AMUX-3403): an accepted-and-ignored
+            // field reads as "the feature does not work" to every caller who
+            // guessed the contract. Same pattern as the board API's
+            // ignored_fields.
+            if !body.extra.is_empty() {
+                v["ignored_fields"] = json!(body.extra.keys().collect::<Vec<_>>());
+                v["ignored_note"] = json!(
+                    "not part of POST /api/browser/start and did nothing; viewport at start is device or width+height"
+                );
+            }
             Json(v).into_response()
         }
         Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
@@ -987,7 +1069,8 @@ fn catalog_body(path: &str) -> Response {
                 "GET /api/browser/status", "GET /api/browser/state", "GET /api/browser/screenshot",
                 "GET /api/browser/profiles", "GET /api/browser/pw-profiles", "GET /api/browser/sessions",
                 "GET /api/browser/inspect", "GET /api/browser/search",
-                "POST /api/browser/start", "POST /api/browser/navigate", "POST /api/browser/action",
+                "POST /api/browser/start (profile, url, session; viewport at launch via device or width+height)",
+                "POST /api/browser/navigate", "POST /api/browser/action",
                 "POST /api/browser/stop", "POST /api/browser/inspect/clear",
                 "POST /api/browser/save-profile", "POST /api/browser/profile/create",
                 "DELETE /api/browser/profile/{name}",
@@ -1049,6 +1132,22 @@ mod tests {
         (status, v, proxied)
     }
 
+    /// AMUX-3403: an unknown field posted to start is CAPTURED, not silently
+    /// dropped — the serde seam that feeds `ignored_fields`. Both of the wrong
+    /// guesses that motivated the card land in `extra`; the fields that
+    /// became real ones do not.
+    #[test]
+    fn start_body_captures_unknown_fields_and_owns_viewport_params() {
+        let b: StartBody = serde_json::from_str(
+            r#"{"profile":"default","url":"x","viewport":"iphone","emulate":"ipad","device":"iphone"}"#,
+        )
+        .unwrap();
+        let mut extras: Vec<&String> = b.extra.keys().collect();
+        extras.sort();
+        assert_eq!(extras, ["emulate", "viewport"], "unknown fields must be captured for echo");
+        assert_eq!(b.device.as_deref(), Some("iphone"), "device is a real start field now");
+    }
+
     /// The action schema answers 400 for malformed requests BEFORE any
     /// browser state is consulted — hermetic, message parity with Python.
     #[tokio::test]
@@ -1070,6 +1169,16 @@ mod tests {
                 v["error"].as_str().unwrap_or("").contains(needle),
                 "{body}: {v}"
             );
+        }
+        // start's viewport validation runs BEFORE any Chrome launch (AMUX-3403),
+        // so a bad request is hermetic too.
+        for (body, needle) in [
+            (r#"{"device":"nokia"}"#, "unknown device"),
+            (r#"{"width":390}"#, "width and height go together"),
+        ] {
+            let (status, v, _) = send(&app, "POST", "/api/browser/start", Some(body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
+            assert!(v["error"].as_str().unwrap_or("").contains(needle), "{body}: {v}");
         }
         // navigate's own required field.
         let (status, v, _) = send(&app, "POST", "/api/browser/navigate", Some("{}")).await;
