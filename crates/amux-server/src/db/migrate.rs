@@ -342,7 +342,13 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn apply_one(conn: &Connection, sql: &str) -> anyhow::Result<()> {
+/// Apply ONE migration's body, honouring `-- ADDCOL:` directives.
+///
+/// `pub(crate)` so tests can build a schema through the SHIPPED path. A fixture
+/// that `execute_batch`es a migration file silently SKIPS every ADDCOL line —
+/// they are SQL comments — so it would prove a column exists that production
+/// has and the test does not, or vice versa (AF-99).
+pub(crate) fn apply_one(conn: &Connection, sql: &str) -> anyhow::Result<()> {
     // Split ADDCOL directives from plain SQL. Directives are full-line
     // comments so the file stays valid SQL for external tools.
     let mut plain = String::new();

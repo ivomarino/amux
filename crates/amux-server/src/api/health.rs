@@ -236,9 +236,18 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
     };
     let mut rows: Vec<serde_json::Value> = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT down_from, up_at, seconds, port FROM server_downtime ORDER BY up_at DESC LIMIT 100",
+        "SELECT down_from, up_at, seconds, port, requests_during FROM server_downtime \
+         ORDER BY up_at DESC LIMIT 100",
     ) {
         if let Ok(it) = stmt.query_map([], |r| {
+            let served: Option<i64> = r.get(4)?;
+            // The row's own verdict, so a reader never has to re-derive the rule
+            // (AF-99). It is the same predicate downtime_within() subtracts on.
+            let (kind, subtractable) = match served {
+                Some(0) => ("downtime", true),
+                Some(_) => ("heartbeat-gap", false),
+                None => ("unverified", false),
+            };
             Ok(serde_json::json!({
                 "down_from": crate::api::request_log::local_when(r.get::<_, f64>(0)?),
                 "up_at": crate::api::request_log::local_when(r.get::<_, f64>(1)?),
@@ -247,6 +256,9 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
                 "seconds": r.get::<_, f64>(2)?,
                 "minutes": (r.get::<_, f64>(2)? / 60.0 * 10.0).round() / 10.0,
                 "noticed_by_port": r.get::<_, Option<i64>>(3)?,
+                "requests_during": served,
+                "kind": kind,
+                "counts_as_downtime": subtractable,
             }))
         }) {
             rows.extend(it.filter_map(|r| r.ok()));
@@ -256,12 +268,17 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
         .query_row("SELECT beat_at FROM server_heartbeat WHERE id = 1", [], |r| r.get(0))
         .ok();
     axum::Json(serde_json::json!({
-        "note": "Stretches with no amux server running, derived from the liveness \
-                 heartbeat. `down_from` is the LAST CONFIRMED BEAT, so the true stop is \
-                 within one beat interval after it — the number is deliberately the one \
-                 that can be proved rather than a guess. A duration reported elsewhere \
-                 (steer queue age, rot, missed schedules) that spans one of these rows \
-                 includes time no lane could have made progress.",
+        "note": "Gaps in the liveness heartbeat. `down_from` is the LAST CONFIRMED \
+                 BEAT, so the true stop is within one beat interval after it — the \
+                 number is deliberately the one that can be proved rather than a guess. \
+                 READ `kind` BEFORE USING A ROW: only `downtime` (requests_during = 0) \
+                 means no server was running, and only those are subtracted by \
+                 downtime_within(). `heartbeat-gap` means the server SERVED requests \
+                 throughout — the beat loop stopped, amux did not — and `unverified` \
+                 means the request log could not be counted. Filing all three was AF-99: \
+                 a row claiming 759 minutes of downtime covered 33,455 served requests, \
+                 and this table is built to be SUBTRACTED from steer-queue age, rot \
+                 timers and missed schedules.",
         "beat_interval_s": crate::runtime_jobs::heartbeat::beat_interval().as_secs(),
         "min_gap_s": crate::runtime_jobs::heartbeat::min_gap_s(),
         "last_beat_at": last_beat.map(crate::api::request_log::local_when),

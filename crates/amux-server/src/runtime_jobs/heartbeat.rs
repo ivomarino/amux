@@ -82,6 +82,38 @@ pub struct Gap {
     pub down_from: f64,
     pub up_at: f64,
     pub seconds: f64,
+    /// Requests SERVED inside the gap — the discriminator this detector shipped
+    /// without (AF-99).
+    ///
+    /// `Some(0)` the server really was absent. `Some(n>0)` the server was UP and
+    /// the HEARTBEAT stopped, which is a different fault wearing the same shape.
+    /// `None` could not be measured, so neither claim is made.
+    pub requests_during: Option<i64>,
+}
+
+impl Gap {
+    /// True only when nothing was served. This is the predicate every consumer
+    /// must use, because this table exists to be SUBTRACTED from other
+    /// durations, and subtracting a stretch the server was actually serving
+    /// makes stalls look shorter than they were.
+    pub fn is_real_downtime(&self) -> bool {
+        self.requests_during == Some(0)
+    }
+}
+
+/// Requests served strictly inside a candidate gap.
+///
+/// `None` when the count cannot be taken at all (no request log yet, e.g. a
+/// fresh DB or a test fixture) — deliberately distinct from `Some(0)`, because
+/// "nothing was served" and "we could not look" support opposite conclusions and
+/// collapsing them is the exact shape of the bug this repairs.
+fn requests_between(conn: &rusqlite::Connection, from: f64, to: f64) -> Option<i64> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM _amux_request_log WHERE ts > ?1 AND ts < ?2",
+        rusqlite::params![from, to],
+        |r| r.get::<_, i64>(0),
+    )
+    .ok()
 }
 
 static BOOT_GAP: OnceLock<Option<Gap>> = OnceLock::new();
@@ -123,14 +155,25 @@ fn boot_tx(
 ) -> rusqlite::Result<Option<Gap>> {
     let prev = stamp(conn, now)?;
     let gap = match prev {
-        Some(p) if now - p > min_gap => Some(Gap { down_from: p, up_at: now, seconds: now - p }),
+        Some(p) if now - p > min_gap => Some(Gap {
+            down_from: p,
+            up_at: now,
+            seconds: now - p,
+            // Asked BEFORE the row is filed, in the same transaction, so the row
+            // can never exist without the fact that qualifies it (AF-99).
+            requests_during: requests_between(conn, p, now),
+        }),
         _ => None,
     };
     if let Some(g) = gap {
+        // Filed either way. A heartbeat that stopped while the server ran is a
+        // real fault too, and burying it would repeat this module's founding
+        // mistake — an absence is not a signal. The column is what keeps it from
+        // being SUBTRACTED as downtime.
         conn.execute(
-            "INSERT INTO server_downtime (down_from, up_at, seconds, port) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![g.down_from, g.up_at, g.seconds, port as i64],
+            "INSERT INTO server_downtime (down_from, up_at, seconds, port, requests_during) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![g.down_from, g.up_at, g.seconds, port as i64, g.requests_during],
         )?;
     }
     Ok(gap)
@@ -187,18 +230,28 @@ pub fn record_boot(store: &Store, port: u16) -> Option<Gap> {
         .ok()
         .and_then(|c| {
             c.query_row(
-                "SELECT down_from, up_at, seconds FROM server_downtime \
+                "SELECT down_from, up_at, seconds, requests_during FROM server_downtime \
                  WHERE up_at = ?1 ORDER BY id DESC LIMIT 1",
                 [now],
-                |r| Ok(Gap { down_from: r.get(0)?, up_at: r.get(1)?, seconds: r.get(2)? }),
+                |r| {
+                    Ok(Gap {
+                        down_from: r.get(0)?,
+                        up_at: r.get(1)?,
+                        seconds: r.get(2)?,
+                        requests_during: r.get(3)?,
+                    })
+                },
             )
             .ok()
         });
 
-    let _ = BOOT_GAP.set(gap);
+    // Only a gap with NOTHING served is downtime, and only downtime reaches
+    // `/health`'s `downtime_before_boot_s`. A heartbeat gap published there would
+    // be subtracted by every consumer that polls it (AF-99).
+    let _ = BOOT_GAP.set(gap.filter(|g| g.is_real_downtime()));
 
-    if let Some(g) = gap {
-        tracing::warn!(
+    match gap {
+        Some(g) if g.is_real_downtime() => tracing::warn!(
             down_from = %crate::api::request_log::local_when(g.down_from),
             up_at = %crate::api::request_log::local_when(g.up_at),
             seconds = g.seconds,
@@ -206,7 +259,28 @@ pub fn record_boot(store: &Store, port: u16) -> Option<Gap> {
             "amux was DOWN — no server was running for this stretch. Durations reported \
              across it (steer queue age, rot timers, missed schedules) include time with \
              no amux, not just a stalled lane (AEAB-29)"
-        );
+        ),
+        // The fault this detector could not previously name. Loud, because a
+        // liveness probe that stopped while the thing it watches kept running is
+        // worse than one that never ran: everything downstream reads healthy.
+        Some(g) if g.requests_during.unwrap_or(0) > 0 => tracing::warn!(
+            down_from = %crate::api::request_log::local_when(g.down_from),
+            up_at = %crate::api::request_log::local_when(g.up_at),
+            seconds = g.seconds,
+            requests_during = g.requests_during,
+            "HEARTBEAT GAP, NOT DOWNTIME — the server served requests throughout this \
+             stretch, so the beat loop stopped while amux kept running. Recorded, but NOT \
+             counted as downtime and NOT published on /health (AF-99)"
+        ),
+        Some(g) => tracing::warn!(
+            down_from = %crate::api::request_log::local_when(g.down_from),
+            up_at = %crate::api::request_log::local_when(g.up_at),
+            seconds = g.seconds,
+            "heartbeat gap recorded but UNVERIFIED — the request log could not be counted, \
+             so whether amux was absent or merely not beating is unknown. Not counted as \
+             downtime (AF-99)"
+        ),
+        None => {}
     }
     gap
 }
@@ -226,8 +300,13 @@ pub fn beat(store: &Store) {
 /// Seconds of KNOWN downtime inside `[from, to]`, for readers that want to say
 /// how much of a long duration was the server's absence rather than a lane's.
 pub fn downtime_within(conn: &rusqlite::Connection, from: f64, to: f64) -> f64 {
+    // `requests_during = 0` strictly: NULL (unmeasured) and > 0 (heartbeat gap)
+    // are both excluded. This is the SUBTRACTED number, so the safe direction is
+    // to under-subtract — failing to discount a real outage overstates a lane's
+    // stall, while discounting a stretch the server was serving hides one (AF-99).
     let mut stmt = match conn.prepare(
-        "SELECT down_from, up_at FROM server_downtime WHERE up_at >= ?1 AND down_from <= ?2",
+        "SELECT down_from, up_at FROM server_downtime \
+         WHERE up_at >= ?1 AND down_from <= ?2 AND requests_during = 0",
     ) {
         Ok(s) => s,
         Err(_) => return 0.0,
@@ -267,8 +346,30 @@ mod tests {
     /// about the real one.
     fn db() -> Connection {
         let c = Connection::open_in_memory().unwrap();
-        c.execute_batch(include_str!("../../migrations/0021_heartbeat.sql")).unwrap();
+        // Through the migration RUNNER, not execute_batch: `-- ADDCOL:` lines are
+        // SQL comments, so a batch-applied fixture silently lacks every column
+        // added that way — including `requests_during`, the one AF-99 turns on.
+        for sql in [
+            include_str!("../../migrations/0010_request_log.sql"),
+            include_str!("../../migrations/0021_heartbeat.sql"),
+            include_str!("../../migrations/0022_downtime_requests_during.sql"),
+        ] {
+            crate::db::migrate::apply_one(&c, sql).unwrap();
+        }
         c
+    }
+
+    /// Put N request rows inside a window, so a gap can be given real traffic.
+    fn serve(c: &Connection, from: f64, to: f64, n: usize) {
+        for i in 0..n {
+            let ts = from + (to - from) * ((i + 1) as f64 / (n + 1) as f64);
+            c.execute(
+                "INSERT INTO _amux_request_log (ts, method, path, family, status, latency_ms) \
+                 VALUES (?1, 'GET', '/api/board', '/api/board', 200, 1.0)",
+                rusqlite::params![ts],
+            )
+            .unwrap();
+        }
     }
 
     fn outages(c: &Connection) -> Vec<(f64, f64, f64)> {
@@ -389,4 +490,97 @@ mod tests {
         assert!(beat_interval().as_secs() >= 1);
         assert!(min_gap_s() >= 1.0);
     }
+
+    // ---- AF-99: a gap is only downtime if nothing was served ----------------
+    //
+    // Built from the incident's own numbers: /api/debug/downtime reported
+    // 2026-08-19 09:04:20 -> 21:43:38 (759.3 min) as "no amux server running"
+    // while _amux_request_log held 33,455 rows spanning 09:04:25 -> 21:43:27.
+
+    #[test]
+    fn a_gap_with_traffic_inside_it_is_a_heartbeat_gap_not_downtime() {
+        let c = db();
+        let (down_from, up_at) = (1_787_144_660.0, 1_787_190_218.0); // the real bracket
+        c.execute("INSERT INTO server_heartbeat (id, beat_at) VALUES (1, ?1)", [down_from])
+            .unwrap();
+        serve(&c, down_from, up_at, 40);
+
+        let gap = boot_tx(&c, up_at, 120.0, 8824).unwrap().expect("a gap is still recorded");
+        assert_eq!(gap.requests_during, Some(40));
+        assert!(
+            !gap.is_real_downtime(),
+            "the server served 40 requests inside this stretch — calling it downtime is \
+             the bug, and downtime_within() would SUBTRACT it from every lane's stall"
+        );
+        assert_eq!(outages(&c).len(), 1, "still filed: a stopped heartbeat is its own fault");
+        assert_eq!(
+            downtime_within(&c, down_from - 1.0, up_at + 1.0),
+            0.0,
+            "a heartbeat gap must contribute ZERO subtractable downtime"
+        );
+    }
+
+    #[test]
+    fn a_gap_with_no_traffic_is_real_downtime_and_is_subtracted() {
+        let c = db();
+        let (down_from, up_at) = (1_000.0, 20_000.0);
+        c.execute("INSERT INTO server_heartbeat (id, beat_at) VALUES (1, ?1)", [down_from])
+            .unwrap();
+        // deliberately NO serve() — and rows OUTSIDE the window must not count
+        serve(&c, 100.0, 900.0, 5);
+        serve(&c, 20_100.0, 20_900.0, 5);
+
+        let gap = boot_tx(&c, up_at, 120.0, 8824).unwrap().expect("gap");
+        assert_eq!(gap.requests_during, Some(0), "traffic outside the bracket is not inside it");
+        assert!(gap.is_real_downtime());
+        assert_eq!(downtime_within(&c, down_from, up_at), 19_000.0);
+    }
+
+    /// The direction that matters: this is the SUBTRACTED number, so an
+    /// unverifiable row must not be subtracted. Under-subtracting overstates a
+    /// lane's stall; over-subtracting HIDES one.
+    #[test]
+    fn an_unverified_row_is_never_subtracted() {
+        let c = db();
+        c.execute(
+            "INSERT INTO server_downtime (down_from, up_at, seconds, port, requests_during) \
+             VALUES (1000.0, 20000.0, 19000.0, 8824, NULL)",
+            [],
+        )
+        .unwrap();
+        assert_eq!(downtime_within(&c, 1_000.0, 20_000.0), 0.0);
+    }
+
+    /// The migration must repair the row that is already wrong in production,
+    /// not just qualify future ones.
+    #[test]
+    fn the_backfill_corrects_a_row_filed_before_the_column_existed() {
+        let c = db();
+        let (down_from, up_at) = (1_787_144_660.0, 1_787_190_218.0);
+        c.execute(
+            "INSERT INTO server_downtime (down_from, up_at, seconds, port) \
+             VALUES (?1, ?2, ?3, 8824)",
+            rusqlite::params![down_from, up_at, up_at - down_from],
+        )
+        .unwrap();
+        serve(&c, down_from, up_at, 33);
+        assert_eq!(
+            downtime_within(&c, down_from, up_at),
+            0.0,
+            "NULL is not subtracted even before the backfill"
+        );
+
+        crate::db::migrate::apply_one(
+            &c,
+            include_str!("../../migrations/0023_downtime_backfill.sql"),
+        )
+        .unwrap();
+
+        let served: Option<i64> = c
+            .query_row("SELECT requests_during FROM server_downtime", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(served, Some(33), "the backfill must count the traffic that was served");
+        assert_eq!(downtime_within(&c, down_from, up_at), 0.0);
+    }
+
 }
