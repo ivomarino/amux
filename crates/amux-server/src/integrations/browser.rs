@@ -714,6 +714,17 @@ pub async fn start(
 
     let port = ephemeral_port()?;
     let mut cmd = tokio::process::Command::new(&binary);
+    // OWN PROCESS GROUP (AMUX-3414 root cause). Chrome inherited this server's
+    // group, and the builder's self-adoption relaunch (`launchctl kickstart -k`)
+    // kills the whole group — so every build adoption, several per hour on this
+    // machine, silently killed the running browser. That contradicted AC-325's
+    // entire adopt design, which assumes the browser SURVIVES a server restart;
+    // it never did, and the deaths recorded no reason (three staged-login kills
+    // in one morning were root-caused by starting a browser, committing, and
+    // watching the adoption take it down). Detached, the group kill misses
+    // Chrome and the next server process adopts it, as designed.
+    #[cfg(unix)]
+    cmd.process_group(0);
     cmd.arg(format!("--remote-debugging-port={port}"))
         .arg(format!("--user-data-dir={}", target.user_data_dir.display()))
         .arg("--no-first-run")

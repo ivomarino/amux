@@ -306,6 +306,13 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
 }
 
 async fn status() -> Response {
+    // Adopt BEFORE reading (AMUX-3414): status is the first place anyone looks
+    // after a death, and it was the one verb that never ran the adopt — so a
+    // browser surviving a restart read as "running": false here while every
+    // driver verb would have found it, and a browser that DIED with the old
+    // server left its corpse-record untriggered because nothing on the
+    // observability path opened the running-file.
+    chrome::adopt_if_orphaned(&chrome::amux_home()).await;
     // Read the registry under the lock, then drop it before any await —
     // holding a std::sync::Mutex across an await point deadlocks the runtime.
     let snapshot = {
