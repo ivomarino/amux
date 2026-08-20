@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.692';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.693';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -14878,7 +14878,7 @@ let _explorePath = '';
 let _exploreShowHidden = true;
 let _exploreLastData = null;  // last loaded dir data (for search re-filter)
 let _filesLastData = null;    // last loaded dir data for Files tab
-let _filesSort = { col: 'name', dir: 1 }; // sort state
+let _filesSort = { col: 'modified', dir: -1 }; // default: newest first (Ethan 2026-08-20); dirs still lead
 
 function _filesSortEntries(entries) {
   return [...entries].sort((a, b) => {
