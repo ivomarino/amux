@@ -385,6 +385,15 @@ When the user says **"deploy"**, run the full pipeline:
 3. Run the two checks above
 4. `git push origin main`
 
+**A fix you can see in `git log` is not a fix the server is running (AF-82).** Before
+any "why does deployed behaviour disagree with the code" investigation, compare
+`/health`'s `build` against the commit time of the code you are reading
+(`git log -1 --format=%ad <sha>`): if the fix postdates the running binary, stop —
+there is nothing to diagnose, the server just has not adopted it yet. This is the
+same instrument the timing-bracket rule above uses, answering a different question.
+It cost a real session an afternoon of diagnosing "deployed" behaviour against
+source that had never shipped.
+
 ## Single-codebase rule (CRITICAL)
 
 **The server code is identical for both local (OSS) and cloud deployments — no exceptions.**
