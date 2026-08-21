@@ -2189,7 +2189,6 @@ mod tests {
         let mut mine_obs = HashMap::new();
         mine_obs.insert("/repo/f.rs".to_string(), 1900.0);
         apply_observed(&mut g, &mine_obs, &[]);
-        assert!(g.mine_firsthand.contains("/repo/f.rs"));
         let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
         assert!(v.foreign.is_empty(), "{:?}", v.foreign);
         assert_eq!(v.shared.len(), 1, "both claims real -> shared, warned not blocked");
@@ -2213,6 +2212,13 @@ mod tests {
             v.foreign
         );
         assert_eq!(v.shared.len(), 1, "two real claims are a contest, not a sweep");
+        // Mechanism check, deliberately BELOW the cell (amux-frustrations'
+        // AF-125 correction, 2026-08-21): asserting the insert directly is the
+        // mutation's own inverse, and placed above the behavioral cell it
+        // panicked first and masked it in a plain mutation run. It stays
+        // because a right verdict via the wrong channel (recency) lapses; it
+        // just must never be the first thing the mutation hits.
+        assert!(g.mine_firsthand.contains("/repo/stale-mine.rs"));
 
         // A PEER's observed record beats their stale entry and clears
         // restore-kind (kind follows the latest record).
