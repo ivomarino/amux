@@ -2431,3 +2431,85 @@ COST: origin/main red on check, blocking the CI-green verification gate
 FIX: pending (AMUX-3446): an ownership signal that survives record expiry —
   once the window closes the guard is blind by construction, and a per-file
   add on a shared checkout stages whatever is in the file, attributed or not.
+
+## `amux board add --help` said "server unreachable" one command after the same server answered
+AREA: cli
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux-frustrations
+CARD: AF-122
+SYMPTOM: `amux board add --help` printed `types: (server unreachable — see GET
+  /api/board/contract)` immediately after `amux board progress` had succeeded against
+  that server, with `amux url` correct at 8824 and `curl $(amux url)/api/board/contract`
+  returning 200 and all eleven types. `_board_valid_types()` read
+  `["fields"]["valid_types"]`; the contract publishes `types` at TOP LEVEL and carries no
+  `fields` key at all, so the lookup threw, `except Exception: pass` swallowed it, and the
+  empty result fell through to a hardcoded unreachable message.
+COST: small in minutes, large in direction. The message names a cause the whole fleet is
+  primed to chase — AMUX-3046 stranded lanes really do carry the retired 8822, and
+  CLAUDE.md teaches every session to suspect it — so it routes a reader at a phantom
+  connectivity hunt instead of a key-path bug one line above. I chased the port first.
+  And the one thing the helper exists to do, letting a session discover the valid card
+  types from the CLI, did not work for any lane.
+FIX: e823ae3. Reads `types` with the historical nested spelling as fallback, and separates
+  the two failures that had been sharing one sentence: transport now names the http code,
+  a 200 with no list says the contract shape changed. The comment above that function
+  already promised "confidently wrong help is worse than none" — it could not keep the
+  promise while both failures printed the same words.
+
+## The test fixture served the CLI's WRONG shape, so the suite certified the bug for months
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux-frustrations
+CARD: AF-122
+SYMPTOM: `scripts/test-board-add-flags.sh` stubs `/api/board/contract` and served
+  `{"fields": {"valid_types": [...]}}` — a shape the real server has never served — because
+  the fixture was written to match the CLI rather than the server. Fixture and code agreed
+  with each other and both disagreed with production, and the suite was green the entire
+  time `--help` was broken. Worse: NO assertion anywhere read the types line, so the stub's
+  response was decorative and could have been any JSON at all.
+COST: the defect shipped and survived every run of a 30-case suite whose whole subject is
+  this command. A fixture built to match the code under test cannot fail on the defect; it
+  certifies it. That is ethos rule 7 with the fixture as the accomplice, and it is a shape
+  worth naming separately from the CLI bug itself because the next one will also look green.
+FIX: e823ae3. Fixture serves the real shape; seven assertions now READ the output across all
+  three cells (200+real, transport failure, 200+unknown shape). Mutation-verified: restoring
+  the original helper turns 5 of the 7 red, and the 2 survivors are exactly the two the old
+  code got right. Plus a producer-side anchor in `tests/board_contract_filters.rs` asserting
+  both that the contract publishes top-level `types` and that the shipped bash CLI still
+  reads that key — mutation-verified in both directions, because the bash CLI is not
+  compiled and nothing else could catch a rename on that side.
+
+## The staged-guard blocks Bash-editing lanes structurally: 75% of blocks are firsthand=0
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-21
+SESSION: amux-frustrations
+CARD: AF-123
+SYMPTOM: 140 AF-27 block lines in the retained server log (08-19 to 08-21); 105 of them
+  (75%) carry `firsthand=0`. A FIRSTHAND edit record is minted only by the PostToolUse hook
+  matching `Write|Edit|MultiEdit|NotebookEdit`, so a lane that edits through Bash never
+  mints one and lives at firsthand=0 permanently. `amux` is the control: it edits with the
+  Edit/Write tools and is the only lane in the table with 0 of its 4 blocks at firsthand=0,
+  against 8/8 for me, 6/6 amux-cloud, 25/26 mixpeek-observability. My own block read
+  `mine=39 (firsthand=0, newest_any=17.6s ago); per-path: amux in_mine=false` seventeen
+  seconds after I rewrote the file `amux` — through a `python3 - <<'PY'` heredoc, which the
+  inferred-path extractor cannot see into, so the one path I was editing is the one it
+  recorded as not mine.
+COST: four blocked commits for me today alone, each needing a hand-audited
+  AMUX_VERIFIED_SOLO. The real cost is the reflex: when the honest exit is required on
+  essentially every commit, acking the guard stops being a judgement and becomes a keystroke
+  — and that judgement is the only thing standing between the fleet and the AMUX-1315 sweep
+  class the guard exists to stop. Ethos rule 3: bypass-permissions sessions are INSTRUCTED to
+  prefer Bash over Edit/Write, so the harness mandates the working style that makes its own
+  strongest ownership signal unobtainable, then blocks the lane for not having it.
+FIX: unowned, routed to amux on AF-123. Three directions there; the one I would pick is a
+  PostToolUse Bash hook recording paths whose MTIME CHANGED during the command — observed
+  rather than parsed, so no quoting or heredoc can hide a write. Note also that no
+  per-verdict outcome is recorded, so nobody can compute what share of those 105 were
+  CORRECT blocks that merely also had firsthand=0; that missing discriminator is the same
+  one open on AMUX-1315.
