@@ -32,7 +32,7 @@
 //! permanently. Name the file as contested and say who else is in it; the
 //! recipient can then stage per-hunk instead of per-file.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The staged-guard's verdict, transcribed. Every field is a list of paths.
 ///
@@ -166,6 +166,61 @@ pub fn build(
         .map(str::to_string)
         .collect();
 
+    // WHOSE files? (MG-1484's other half; mixpeek-general's 3-vs-20.) The
+    // STALE and DIVERGED headers used to say "{n} of your dirty file(s)" over
+    // sets with NO ownership filter — dirty ∩ stale on a SHARED checkout
+    // includes peers' work and generated churn (an SDK regen landing on
+    // origin makes its outputs read stale in every checkout behind it). The
+    // pronoun was accidentally right when the recipient's touched set
+    // coincided (a firing of 3) and wrong when the regen widened it (20, of
+    // which 17 the addressed session had never opened — they classified the
+    // noise by hand to find their 3). Same axis commit_worthy_body already
+    // uses: only a positive attribution is "yours"; the rest is named as
+    // such, with the owner where one is known.
+    let foreign_owner: BTreeMap<&str, &str> =
+        own.foreign.iter().map(|(p, o)| (p.as_str(), o.as_str())).collect();
+    let unknown_owner: BTreeSet<&str> = own
+        .unclaimed
+        .iter()
+        .chain(own.undecided.iter())
+        .map(String::as_str)
+        .collect();
+    let not_mine = |p: &str| foreign_owner.contains_key(p) || unknown_owner.contains(p);
+    let whose = |paths: &[&str]| {
+        let n = paths.len();
+        let n_mine = paths.iter().filter(|p| !not_mine(p)).count();
+        if n_mine == n {
+            "of your dirty file(s)".to_string()
+        } else if n_mine == 0 {
+            "dirty file(s) in this SHARED checkout (NONE carries your edit record — peers' \
+             work or generated churn, e.g. an SDK regen on origin; not yours to reconcile, \
+             but do not commit them either)"
+                .to_string()
+        } else {
+            format!(
+                "dirty file(s) in this SHARED checkout ({n_mine} with your edit record, {} \
+                 without — peers' work or generated churn)",
+                n - n_mine
+            )
+        }
+    };
+    let tagged_list = |paths: &[&str]| -> String {
+        let mut mine: Vec<String> = Vec::new();
+        let mut other: Vec<String> = Vec::new();
+        for p in paths {
+            if let Some(o) = foreign_owner.get(*p) {
+                other.push(format!("  {p}  [{o}'s]\n"));
+            } else if unknown_owner.contains(*p) {
+                other.push(format!("  {p}  [no edit record of yours]\n"));
+            } else {
+                mine.push(format!("  {p}\n"));
+            }
+        }
+        let n = mine.len() + other.len();
+        mine.into_iter().chain(other).take(10).collect::<String>()
+            + if n > 10 { "  …\n" } else { "" }
+    };
+
     let mut sections: Vec<String> = Vec::new();
 
     // DIVERGED before everything: both remedies the rest of this message
@@ -177,14 +232,10 @@ pub fn build(
     // reachable-from-a-commit too.
     if !diverged_paths.is_empty() {
         let n = diverged_paths.len();
-        let list: String = diverged_paths
-            .iter()
-            .take(10)
-            .map(|p| format!("  {p}\n"))
-            .collect::<String>()
-            + if n > 10 { "  …\n" } else { "" };
+        let list = tagged_list(&diverged_paths);
+        let whose_d = whose(&diverged_paths);
         sections.push(format!(
-            "DIVERGED: {n} of your dirty file(s) under {dir} have commits in BOTH directions — \
+            "DIVERGED: {n} {whose_d} under {dir} have commits in BOTH directions — \
              origin/main carries commits on them that your HEAD lacks, AND your HEAD carries \
              commits origin lacks. They are novel and stale AT ONCE, so NEITHER standard remedy \
              is safe:\n{list}\
@@ -226,14 +277,10 @@ pub fn build(
     // for a never-committed mid-edit and its `git checkout` remedy deleted it.
     if !stale_paths.is_empty() {
         let n = stale_paths.len();
-        let list: String = stale_paths
-            .iter()
-            .take(10)
-            .map(|p| format!("  {p}\n"))
-            .collect::<String>()
-            + if n > 10 { "  …\n" } else { "" };
+        let list = tagged_list(&stale_paths);
+        let whose_s = whose(&stale_paths);
         sections.push(format!(
-            "STALE: {n} of your dirty file(s) under {dir} are OLDER than origin/main. Origin \
+            "STALE: {n} {whose_s} under {dir} are OLDER than origin/main. Origin \
              has commits on these paths that your local HEAD does not (this checkout is behind). \
              DO NOT COMMIT them. `git add -A` or `git commit -a` would carry the older copy \
              forward and SILENTLY REVERT origin (no conflict, the older file just wins, \
@@ -1698,6 +1745,48 @@ mod tests {
         assert!(stale_at < commit_at, "STALE must be rendered FIRST: {msg}");
         assert!(msg.contains("1 uncommitted change(s)"), "count MUST exclude the stale path: {msg}");
         assert!(msg.contains("new.rs"), "the commit-worthy path must be listed: {msg}");
+    }
+
+    /// MG-1484 (mixpeek-general's 3-vs-20): the STALE header said "of your
+    /// dirty file(s)" over a set with no ownership filter, so a regen bot's
+    /// churn on a shared checkout was addressed to whoever the nudge reached —
+    /// 17 of 20 paths the recipient had never opened, classified by hand to
+    /// find their 3. Only a positive attribution may say "your"; the rest is
+    /// named as not-yours, with the owner where one is known.
+    #[test]
+    fn stale_paths_without_your_edit_record_are_not_called_yours() {
+        let dirty = s(&["mine.rs", "sdk/model_a.py", "sdk/model_b.py"]);
+        let fresh = Freshness {
+            stale: s(&["mine.rs", "sdk/model_a.py", "sdk/model_b.py"]),
+            ..Default::default()
+        };
+        let own = Ownership {
+            unclaimed: s(&["sdk/model_a.py"]),
+            foreign: vec![("sdk/model_b.py".into(), "peer-lane".into())],
+            ..Default::default()
+        };
+        let msg = build("/repo", &dirty, &own, &fresh, "test-provenance").unwrap();
+        assert!(
+            msg.contains("1 with your edit record, 2 without"),
+            "the header must split the claim instead of calling all three yours: {msg}"
+        );
+        assert!(
+            !msg.contains("of your dirty file(s)"),
+            "a mixed set must not carry the unqualified pronoun: {msg}"
+        );
+        assert!(msg.contains("[no edit record of yours]"), "{msg}");
+        assert!(msg.contains("[peer-lane's]"), "the known owner must be named: {msg}");
+        // The all-bot firing (the 20-shape with zero of yours): the header
+        // must say NONE carries the recipient's record.
+        let own_none = Ownership {
+            unclaimed: s(&["mine.rs", "sdk/model_a.py", "sdk/model_b.py"]),
+            ..Default::default()
+        };
+        let msg = build("/repo", &dirty, &own_none, &fresh, "test-provenance").unwrap();
+        assert!(
+            msg.contains("NONE carries your edit record"),
+            "the zero-yours firing must say so: {msg}"
+        );
     }
 
     /// SAME files are byte-identical to origin, dirty only because local HEAD is
