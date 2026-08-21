@@ -50,6 +50,7 @@
 pub mod autofix;
 pub mod board_drive;
 pub mod commit_nudge;
+pub mod disk_watch;
 pub mod ghost_rescue;
 pub mod heartbeat;
 pub mod pane_size;

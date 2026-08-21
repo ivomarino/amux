@@ -1,0 +1,467 @@
+//! Disk watch — report regenerable caches that are growing, and delete nothing.
+//!
+//! # Why this reports instead of capping
+//!
+//! DESKT-12 purged 43.4GB of ML caches and DESKT-13 thinned 24 APFS snapshots.
+//! Both outcomes were gone within days: `~/.cache` refilled and the snapshots
+//! regenerated, because a one-shot purge of a LIVE cache has no durable
+//! outcome by construction. The obvious next move was a scheduled cap, and
+//! measuring first is what stopped it being built.
+//!
+//! The measurement, from a completed scan of 310,218 directories: 337 GiB sits
+//! in nominally-regenerable paths, but only **17.3 GiB of it is untouched for
+//! more than 30 days**. Everything large is hot — the shared cargo target dir
+//! and a peer repo's `target/` were both written the same day. So an age-based
+//! cap reclaims a rounding error, and a size-based cap aggressive enough to
+//! matter deletes build artifacts that ~50 lanes are actively using, turning
+//! free disk into fleet-wide cold rebuilds. Neither is a good trade, and the
+//! owner picked the third option: report, and leave the judgment with the human
+//! (ethos rule 8 — report and recommend, do not sweep).
+//!
+//! That also keeps this honest as models improve. A threshold that auto-deletes
+//! is a policy frozen into code; a report is an observation a better reader can
+//! act on differently.
+//!
+//! # The interval is read from the database, not held in memory
+//!
+//! `PeriodicTask` is in-memory and dies with the process, and this server
+//! re-execs whenever ANY lane commits to the shared checkout — often several
+//! times an hour. A weekly in-memory timer would therefore essentially never
+//! fire, and would fail *silently*, which is the exact shape ethos.md records
+//! under D1: the scan-demotion optimisation lived in memory, so a restart
+//! removed it most of the time and nothing said so.
+//!
+//! So the tick is hourly and cheap, and "has a week passed?" is answered by
+//! `reclaim_scans` — durable state that survives every restart. The job is
+//! idempotent per scan: one card per scan id, ever, enforced by `source_ref`.
+
+use crate::api::AppState;
+use crate::db::board_store as bs;
+use serde_json::json;
+
+/// Registry id. `spawn_periodic` derives this job's kill switch from the name.
+const JOB: &str = "disk-watch";
+
+/// How often the job wakes. Not how often it scans — see the module docs.
+const TICK_SECS: u64 = 3600;
+
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+}
+
+/// Minimum gap between watcher-initiated scans.
+fn scan_every_secs() -> u64 {
+    env_u64("AMUX_DISK_WATCH_EVERY_SECS", 7 * 86_400)
+}
+
+/// A regenerable path at or above this many GiB is worth telling someone about.
+///
+/// 25 GiB is not a tuned parameter: it is the floor at which a single path is
+/// a meaningful fraction of this volume. Anything smaller is noise on a 1.8TB
+/// disk and would file cards nobody acts on, which is how a report becomes
+/// something people filter out.
+fn floor_bytes() -> u64 {
+    env_u64("AMUX_DISK_WATCH_FLOOR_GB", 25) * 1024 * 1024 * 1024
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Growth {
+    pub path: String,
+    pub bytes: u64,
+    /// Same path in the previous completed scan, if it appeared there.
+    pub was: Option<u64>,
+}
+
+impl Growth {
+    fn delta_gib(&self) -> Option<f64> {
+        self.was
+            .map(|w| (self.bytes as f64 - w as f64) / 1_073_741_824.0)
+    }
+}
+
+fn gib(b: u64) -> f64 {
+    b as f64 / 1_073_741_824.0
+}
+
+/// The two most recent COMPLETED scans, newest first.
+///
+/// Deliberately `status='done'`: a cancelled or stalled scan has partial
+/// totals, and comparing a partial scan against a complete one would report
+/// every unvisited path as having shrunk to nothing. That is the confident
+/// wrong answer ethos rule 7 is about, and it would arrive as a card telling
+/// someone their caches had cleared themselves.
+fn last_two_completed(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT id, finished_at FROM reclaim_scans
+          WHERE status='done' AND finished_at IS NOT NULL
+          ORDER BY finished_at DESC LIMIT 2",
+    ) else {
+        return vec![];
+    };
+    stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Regenerable paths in `scan_id` at or above the floor, with their size in
+/// `prev_id` when they appeared there.
+pub(crate) fn growth_for(
+    conn: &rusqlite::Connection,
+    scan_id: &str,
+    prev_id: Option<&str>,
+    floor: u64,
+) -> Vec<Growth> {
+    // `regenerable` rather than a category list: the walk sets that flag at the
+    // point it decides what a finding IS, so reading it here cannot drift from
+    // the producer the way a re-derived category filter would (ethos rule 1 —
+    // a view must share the predicate of the mechanism it describes).
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT path, bytes FROM reclaim_findings
+          WHERE scan_id=?1 AND regenerable=1 AND bytes >= ?2
+          ORDER BY bytes DESC",
+    ) else {
+        return vec![];
+    };
+    let rows: Vec<(String, i64)> = stmt
+        .query_map(rusqlite::params![scan_id, floor as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .map(|rows| rows.flatten().collect())
+        .unwrap_or_default();
+
+    rows.into_iter()
+        .map(|(path, bytes)| {
+            let was = prev_id.and_then(|p| {
+                conn.query_row(
+                    "SELECT bytes FROM reclaim_findings WHERE scan_id=?1 AND path=?2",
+                    rusqlite::params![p, &path],
+                    |r| r.get::<_, i64>(0),
+                )
+                .ok()
+                .map(|b| b as u64)
+            });
+            Growth { path, bytes: bytes.max(0) as u64, was }
+        })
+        .collect()
+}
+
+/// The card body. Separate from the filing so it can be tested without a store.
+pub(crate) fn render(scan_id: &str, rows: &[Growth], free_gib: f64, total_gib: f64) -> String {
+    let mut s = String::new();
+    s.push_str(
+        "Regenerable caches at or above the reporting floor. **Nothing has been moved or \
+         deleted** — this is a report, and every path below is yours to decide about.\n\n",
+    );
+    s.push_str(&format!(
+        "Volume: {free_gib:.0} GiB free of {total_gib:.0} GiB ({:.0}% used).\n\n",
+        (1.0 - free_gib / total_gib.max(1.0)) * 100.0
+    ));
+    for g in rows {
+        match g.delta_gib() {
+            Some(d) if d.abs() >= 1.0 => s.push_str(&format!(
+                "- `{}` is **{:.1} GiB** ({}{:.1} GiB since the last scan)\n",
+                g.path,
+                gib(g.bytes),
+                if d > 0.0 { "+" } else { "" },
+                d
+            )),
+            Some(_) => s.push_str(&format!(
+                "- `{}` is **{:.1} GiB** (flat since the last scan)\n",
+                g.path,
+                gib(g.bytes)
+            )),
+            // Absence of a previous reading is stated, never rendered as a
+            // change from zero. A "+82 GiB this week" on a path that simply was
+            // not measured before is a fabricated trend.
+            None => s.push_str(&format!(
+                "- `{}` is **{:.1} GiB** (no previous reading to compare)\n",
+                g.path,
+                gib(g.bytes)
+            )),
+        }
+    }
+    s.push_str(&format!(
+        "\nFrom reclaim scan `{scan_id}`. Reclaim any of these from the dashboard's Disk \
+         Cleanup tab, which quarantines first so a mistake is restorable.\n\n\
+         Note before acting on the big ones: shared cargo target dirs are a warm cache the \
+         whole fleet builds against, so clearing one buys disk and costs every lane a cold \
+         rebuild.\n"
+    ));
+    s
+}
+
+/// Has a card already been filed for this scan?
+fn already_filed(conn: &rusqlite::Connection, scan_id: &str) -> bool {
+    conn.query_row(
+        "SELECT 1 FROM issues WHERE source_ref=?1 AND deleted IS NULL LIMIT 1",
+        [format!("diskwatch:{scan_id}")],
+        |_| Ok(()),
+    )
+    .is_ok()
+}
+
+async fn tick(state: AppState) {
+    let (scans, running) = {
+        let Ok(conn) = state.store.read() else { return };
+        let running: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reclaim_scans WHERE status='running'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(0);
+        (last_two_completed(&conn), running)
+    };
+
+    let now = crate::api::reclaim::now_secs();
+    let newest = scans.first().cloned();
+    let stale = newest
+        .as_ref()
+        .map(|(_, fin)| now - fin > scan_every_secs() as i64)
+        .unwrap_or(true);
+
+    // Kick a scan when the newest completed one has aged out. Never two at
+    // once: the reclaim API refuses that anyway, and a walker competing with
+    // another walker is the disruption this whole feature avoids.
+    if stale && running == 0 {
+        match crate::api::reclaim::start_background_scan(&state).await {
+            Ok(id) => tracing::info!(job = JOB, scan = %id, "disk watch started a scan"),
+            Err(e) => tracing::warn!(job = JOB, error = %e, "disk watch could not start a scan"),
+        }
+        return;
+    }
+
+    let Some((scan_id, _)) = newest else { return };
+    let prev = scans.get(1).map(|(id, _)| id.clone());
+
+    let (rows, free, total) = {
+        let Ok(conn) = state.store.read() else { return };
+        if already_filed(&conn, &scan_id) {
+            return;
+        }
+        let rows = growth_for(&conn, &scan_id, prev.as_deref(), floor_bytes());
+        let (free, total) = conn
+            .query_row(
+                "SELECT COALESCE(df_free,0), COALESCE(df_total,0) FROM reclaim_scans WHERE id=?1",
+                [&scan_id],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .unwrap_or((0, 0));
+        (rows, free, total)
+    };
+
+    // Nothing over the floor is the healthy state and files nothing. The INFO
+    // is what distinguishes "ran and found nothing" from "never ran" — a job
+    // whose silence is ambiguous is one nobody can tell is broken.
+    if rows.is_empty() {
+        tracing::info!(job = JOB, scan = %scan_id, "disk watch: nothing over the floor");
+        return;
+    }
+
+    let title = format!(
+        "{} regenerable cache(s) over {} GiB — review, nothing deleted",
+        rows.len(),
+        floor_bytes() / (1024 * 1024 * 1024)
+    );
+    let desc = render(&scan_id, &rows, gib(free as u64), gib(total as u64));
+    let src = format!("diskwatch:{scan_id}");
+    let n = rows.len();
+
+    let res = state
+        .store
+        .write_async(move |conn| {
+            // Re-checked inside the writer so two ticks cannot race a double file.
+            if already_filed(conn, &scan_id) {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let new = bs::NewIssue {
+                title: title.clone(),
+                desc: desc.clone(),
+                status: "todo".into(),
+                session: None,
+                // `ops`, not `code`: there is nothing to implement or merge, so
+                // a code gate could not be satisfied honestly and the card
+                // would rot or be force-closed (ethos rule 3).
+                item_type: "ops".into(),
+                creator: JOB.into(),
+                // owner_type=human on purpose. This card asks a person to make
+                // a call about their own files; an agent-owned one would be
+                // auto-picked up, and the whole point of the owner choosing
+                // "report only" was that the deciding stays with them.
+                owner_type: "human".into(),
+                due: None,
+                due_time: None,
+                reviewer: None,
+                shepherd: None,
+                gate: vec![],
+                depends_on: vec![],
+                tags: vec!["disk".into(), "reclaim".into()],
+            };
+            let row = bs::create_issue(conn, &new, crate::api::reclaim::now_secs())?;
+            conn.execute(
+                "UPDATE issues SET source_ref = ?1 WHERE id = ?2",
+                rusqlite::params![src, row.id],
+            )?;
+            tracing::info!(job = JOB, card = %row.id, paths = n, "disk watch filed a report");
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Task,
+                    entity_id: row.id.clone(),
+                    mutation: amux_core::revision::MutationKind::Created,
+                    payload: Some(json!({"id": row.id, "source": JOB})),
+                }],
+            })
+        })
+        .await;
+    if let Err(e) = res {
+        tracing::error!(job = JOB, error = %e, "disk watch could not file its report");
+    }
+}
+
+pub fn spawn(state: AppState) -> super::PeriodicTask {
+    super::spawn_periodic(JOB, TICK_SECS, move || {
+        let st = state.clone();
+        async move { tick(st).await }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn store() -> (crate::db::SharedStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        (s, dir)
+    }
+
+    fn seed_scan(s: &crate::db::SharedStore, id: &str, status: &str, fin: i64) {
+        let (id, status) = (id.to_string(), status.to_string());
+        s.write(move |c| {
+            c.execute(
+                "INSERT INTO reclaim_scans (id, started_at, finished_at, status, roots, df_free, df_total)
+                 VALUES (?1, ?2, ?2, ?3, '[]', 100000000000, 1000000000000)",
+                rusqlite::params![id, fin, status],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+    }
+
+    fn seed_finding(s: &crate::db::SharedStore, scan: &str, path: &str, gib: u64, regen: bool) {
+        let (scan, path) = (scan.to_string(), path.to_string());
+        s.write(move |c| {
+            c.execute(
+                "INSERT INTO reclaim_findings
+                   (scan_id, category, path, bytes, file_count, mtime, regenerable, detail)
+                 VALUES (?1,'build',?2,?3,1,0,?4,'')",
+                rusqlite::params![scan, path, (gib * 1_073_741_824) as i64, regen as i64],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .unwrap();
+    }
+
+    /// The floor selects, `regenerable` gates, and the previous reading is
+    /// carried across — with a control proving the query excluded something,
+    /// since an unbounded match and a correct one look identical from the rows.
+    #[test]
+    fn growth_reports_only_regenerable_paths_over_the_floor() {
+        let (s, _d) = store();
+        seed_scan(&s, "S2", "done", 200);
+        seed_scan(&s, "S1", "done", 100);
+        seed_finding(&s, "S1", "/big", 40, true);
+        seed_finding(&s, "S2", "/big", 55, true);
+        seed_finding(&s, "S2", "/small", 3, true); // under the floor
+        seed_finding(&s, "S2", "/precious", 90, false); // not regenerable
+
+        let conn = s.read().unwrap();
+        let rows = growth_for(&conn, "S2", Some("S1"), 25 * 1_073_741_824);
+
+        assert_eq!(rows.len(), 1, "floor and regenerable must both bite: {rows:?}");
+        assert_eq!(rows[0].path, "/big");
+        assert_eq!(rows[0].was, Some(40 * 1_073_741_824));
+        assert!((rows[0].delta_gib().unwrap() - 15.0).abs() < 0.01);
+
+        // Control: /precious is over the floor and IS present, so its absence
+        // above is the regenerable flag and not an empty table.
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM reclaim_findings WHERE scan_id='S2'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 3, "the rows the filter rejected must actually exist");
+    }
+
+    /// A path with no previous reading must not be rendered as growth from
+    /// zero. "+82 GiB this week" on a path that was never measured is a
+    /// fabricated trend, and it is the number a reader would act on.
+    #[test]
+    fn a_path_with_no_previous_reading_is_not_reported_as_growth() {
+        let g = Growth { path: "/new".into(), bytes: 82 * 1_073_741_824, was: None };
+        let out = render("S9", &[g], 100.0, 1000.0);
+        assert!(out.contains("no previous reading"), "{out}");
+        assert!(!out.contains("+82"), "must not invent a delta: {out}");
+    }
+
+    /// Comparing against a partial scan would report every unvisited path as
+    /// having shrunk to nothing, so only completed scans are candidates.
+    #[test]
+    fn only_completed_scans_are_compared() {
+        let (s, _d) = store();
+        seed_scan(&s, "GOOD_OLD", "done", 100);
+        seed_scan(&s, "STALLED", "stalled", 150);
+        seed_scan(&s, "CANCELLED", "cancelled", 175);
+        seed_scan(&s, "GOOD_NEW", "done", 200);
+
+        let conn = s.read().unwrap();
+        let got: Vec<String> = last_two_completed(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(got, vec!["GOOD_NEW".to_string(), "GOOD_OLD".to_string()]);
+    }
+
+    /// One card per scan, forever. A weekly job on an hourly tick would
+    /// otherwise file the same report 168 times.
+    #[tokio::test]
+    async fn a_scan_is_reported_at_most_once() {
+        let (s, _d) = store();
+        let state = AppState {
+            store: s.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let now = crate::api::reclaim::now_secs();
+        seed_scan(&s, "S1", "done", now);
+        seed_finding(&s, "S1", "/huge", 90, true);
+
+        tick(state.clone()).await;
+        tick(state.clone()).await;
+        tick(state.clone()).await;
+
+        let conn = s.read().unwrap();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM issues WHERE source_ref='diskwatch:S1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 1, "three ticks on one scan must file exactly one card");
+
+        // And it is owned by a human, so board_drive never auto-picks it up:
+        // the owner chose report-only precisely so the deciding stays theirs.
+        let (owner, kind): (String, String) = conn
+            .query_row(
+                "SELECT owner_type, type FROM issues WHERE source_ref='diskwatch:S1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(owner, "human");
+        assert_eq!(kind, "ops");
+    }
+}

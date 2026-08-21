@@ -292,7 +292,7 @@ fn record_stalled_dir(store: &crate::db::SharedStore, path: String, detail: Stri
 
 // ── volume state ─────────────────────────────────────────────────────────────
 
-fn now_secs() -> i64 {
+pub(crate) fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
@@ -976,17 +976,24 @@ fn default_roots() -> Vec<PathBuf> {
     v
 }
 
-async fn start_scan(
-    State(state): State<AppState>,
-    headers: axum::http::HeaderMap,
-    body: Option<Json<StartScan>>,
-) -> Response {
-    let body = body.map(|Json(b)| b).unwrap_or(StartScan {
-        roots: vec![],
-        large_file_mb: None,
-        stale_days: None,
-    });
+/// Start a scan the way the HTTP endpoint does, for callers that are not HTTP.
+///
+/// The disk-watch job needs to kick a scan on a schedule. Giving it its own
+/// copy of the setup would be a second spelling of the roots, the config
+/// defaults and the one-at-a-time guard, and CLAUDE.md's own record of what a
+/// duplicated seam costs applies directly: the two would drift the first time
+/// either changed, and the drift would be invisible because both still work.
+/// So the handler is a thin wrapper over this.
+pub(crate) async fn start_background_scan(state: &AppState) -> Result<String, String> {
+    begin_scan(state, StartScan { roots: vec![], large_file_mb: None, stale_days: None }, "disk-watch")
+        .await
+}
 
+async fn begin_scan(
+    state: &AppState,
+    body: StartScan,
+    session: &str,
+) -> Result<String, String> {
     // One scan at a time: two concurrent walkers on a loaded disk is exactly
     // the disruption this feature is supposed to avoid.
     if let Ok(conn) = state.store.read() {
@@ -998,24 +1005,12 @@ async fn start_scan(
             )
             .unwrap_or(0);
         if running > 0 {
-            return (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": "a scan is already running",
-                    "hint": "GET /api/reclaim/scan for its id, or POST /api/reclaim/scan/<id>/cancel"
-                })),
-            )
-                .into_response();
+            return Err("a scan is already running".into());
         }
     }
 
+    let session_owned = session.to_string();
     let scan_id = ulid::Ulid::new().to_string();
-    let session = headers
-        .get("X-Amux-Session")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-
     let mut roots = default_roots();
     for r in &body.roots {
         let p = PathBuf::from(shellexpand_home(r));
@@ -1046,13 +1041,13 @@ async fn start_scan(
             c.execute(
                 "INSERT INTO reclaim_scans (id, started_at, status, roots, df_total, df_free, snapshot_count, session)
                  VALUES (?1, ?2, 'running', ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![sid, started, roots_json, total as i64, free as i64, snaps, session],
+                rusqlite::params![sid, started, roots_json, total as i64, free as i64, snaps, session_owned],
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await
     {
-        return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+        return Err(e.to_string());
     }
 
     let cancel = Arc::new(AtomicBool::new(false));
@@ -1068,8 +1063,39 @@ async fn start_scan(
         .spawn(move || run_scan(store, sid, cfg, cancel))
         .ok();
 
-    tracing::info!(scan = %scan_id, roots = roots.len(), "reclaim scan started");
-    Json(json!({"ok": true, "scan_id": scan_id, "status": "running"})).into_response()
+    tracing::info!(scan = %scan_id, roots = roots.len(), by = %session, "reclaim scan started");
+    Ok(scan_id)
+}
+
+async fn start_scan(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    body: Option<Json<StartScan>>,
+) -> Response {
+    let body = body.map(|Json(b)| b).unwrap_or(StartScan {
+        roots: vec![],
+        large_file_mb: None,
+        stale_days: None,
+    });
+    let session = headers
+        .get("X-Amux-Session")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    match begin_scan(&state, body, &session).await {
+        Ok(scan_id) => Json(json!({"ok": true, "scan_id": scan_id, "status": "running"}))
+            .into_response(),
+        Err(e) if e.contains("already running") => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": e,
+                "hint": "GET /api/reclaim/scan for its id, or POST /api/reclaim/scan/<id>/cancel"
+            })),
+        )
+            .into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    }
 }
 
 fn shellexpand_home(s: &str) -> String {
