@@ -974,7 +974,6 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/reclaim/quarantine/{id}", methods: &["DELETE"] },
     RouteEntry { path: "/api/reclaim/quarantine/{id}/restore", methods: &["POST"] },
     RouteEntry { path: "/api/reclaim/snapshots", methods: &["GET"] },
-    RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },
     RouteEntry { path: "/api/usage", methods: &["GET"] },
     RouteEntry { path: "/api/alert/config", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/alert/owner", methods: &["GET", "POST"] },
