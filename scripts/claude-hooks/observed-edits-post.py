@@ -138,8 +138,16 @@ def main():
         for f in files:
             p = os.path.join(root, f)
             try:
-                if os.stat(p).st_mtime >= t0:
-                    hits.append(p)
+                mt = os.stat(p).st_mtime
+                if mt >= t0:
+                    # AF-130: send the mtime we just read, not merely the path.
+                    # This hook fires after the WHOLE Bash command, so for
+                    # edit-and-commit in one compound call a hook-time stamp
+                    # postdates the commit and the guard's SettledByOwner can
+                    # never fire — the false at-risk notice on every such
+                    # commit. The server accepts bare strings too (older
+                    # installed copies), stamping those with its own clock.
+                    hits.append({"path": p, "mtime": mt})
                     if len(hits) >= MAX_PATHS:
                         break
             except OSError:

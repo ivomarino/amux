@@ -681,9 +681,49 @@ fn observed_key(session: &str) -> String {
     format!("observed_edits:{session}")
 }
 
+/// AF-130: an observed record must carry the FILE's write time, not the
+/// hook's run time. The PostToolUse hook fires after the WHOLE Bash command,
+/// so for the dominant bypass-permissions shape — edit and commit in ONE
+/// compound call — a hook-time stamp postdates the commit by construction,
+/// and `owner_committed_since` (strictly-newer commit wins) can then NEVER
+/// return SettledByOwner for an observed record. The loud AtRisk line fired
+/// on correctly-committed work on every such commit, which is how the one
+/// notice that must be believed teaches lanes to skim it. So the hook sends
+/// the mtime it already read (`{"path": .., "mtime": ..}`), and a bare
+/// string row (an older installed hook copy) keeps hook-time — coverage
+/// degrades toward over-warning, never toward silence. A future mtime clamps
+/// to `now` so a skewed clock cannot mint a record that outlives the window.
+pub(crate) fn parse_observed_reports(body: &Value, now: f64) -> Vec<(String, f64)> {
+    body.get("paths")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| match v {
+                    Value::String(p) => Some((p.clone(), now)),
+                    Value::Object(_) => {
+                        let p = v.get("path").and_then(Value::as_str)?.to_string();
+                        let ts = v
+                            .get("mtime")
+                            .and_then(Value::as_f64)
+                            .map(|m| m.min(now))
+                            .unwrap_or(now);
+                        Some((p, ts))
+                    }
+                    _ => None,
+                })
+                .filter(|(p, _)| !p.trim().is_empty())
+                .take(OBSERVED_MAX_ROWS)
+                .map(|(p, ts)| (realpath(Path::new(&p)), ts))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// POST /api/git/observed-edits — the hook's report: `{paths: [..]}` with
-/// `X-Amux-Session` naming the lane. Merged newest-wins, pruned by window and
-/// row cap, stored in prefs (no migration: rows are small and windowed).
+/// `X-Amux-Session` naming the lane. Rows are bare paths or
+/// `{path, mtime}` objects (see `parse_observed_reports`). Merged
+/// newest-wins, pruned by window and row cap, stored in prefs (no migration:
+/// rows are small and windowed).
 pub async fn observed_edits(
     axum::extract::State(state): axum::extract::State<super::AppState>,
     headers: HeaderMap,
@@ -696,22 +736,11 @@ pub async fn observed_edits(
             axum::Json(json!({"error": "X-Amux-Session required — an unattributed observation attributes nothing"})),
         );
     }
-    let paths: Vec<String> = body
-        .get("paths")
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .filter(|p| !p.trim().is_empty())
-                .take(OBSERVED_MAX_ROWS)
-                .map(|p| realpath(Path::new(p)))
-                .collect()
-        })
-        .unwrap_or_default();
+    let now = now_epoch();
+    let paths = parse_observed_reports(&body, now);
     if paths.is_empty() {
         return (StatusCode::OK, axum::Json(json!({"ok": true, "stored": 0})));
     }
-    let now = now_epoch();
     let key = observed_key(&session);
     let n = paths.len();
     let write = state.store.write_async(move |conn| {
@@ -724,10 +753,10 @@ pub async fn observed_edits(
             .unwrap_or_default();
         let mut merged = prior;
         merged.retain(|_, ts| now - *ts <= OBSERVED_WINDOW_S);
-        for p in paths {
+        for (p, ts) in paths {
             let slot = merged.entry(p).or_insert(0.0);
-            if now > *slot {
-                *slot = now;
+            if ts > *slot {
+                *slot = ts;
             }
         }
         // Row cap: drop OLDEST first, never newest — the newest observation
@@ -1922,14 +1951,36 @@ pub async fn staged_guard_inner(
                 // committed" from "edited and still staged" — so it used to hand the
                 // recipient a `git log` to run every time. Now it runs it for them.
                 let mut lines: Vec<String> = Vec::new();
-                let mut all_settled = true;
+                let mut n_at_risk = 0usize;
                 for (pth, age, prov) in paths.iter().take(10) {
                     let fate = path_fate(&wd, pth, &owner, *age).await;
                     let (line, at_risk) = victim_path_line(pth, &fate, prov);
                     if at_risk {
-                        all_settled = false;
+                        n_at_risk += 1;
                     }
                     lines.push(line);
+                }
+                let all_settled = n_at_risk == 0;
+                // AF-130: the victim notice was delivered as a session message
+                // and NEVER logged, so `grep -c 'WORK ITSELF is at risk'`
+                // returned 0 across the whole retained window — nobody could
+                // count how often it fired or how often it was wrong (the
+                // reporter said "n=1 because n=1 is what the instrument
+                // permits"). WARN when an at-risk line ships (the loud fate
+                // must be countable and auditable for false positives), INFO
+                // for the all-settled shape.
+                if n_at_risk > 0 {
+                    tracing::warn!(
+                        target: "amux::git_guard", victim = %owner, committer = %session,
+                        paths = paths.len(), at_risk = n_at_risk,
+                        "victim notice sent: WORK ITSELF is at risk lines included"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "amux::git_guard", victim = %owner, committer = %session,
+                        paths = paths.len(),
+                        "victim notice sent: all paths settled/absorbed/landed"
+                    );
                 }
                 let list = lines.join("\n");
                 let more = paths.len().saturating_sub(10);
@@ -2231,6 +2282,41 @@ mod tests {
         assert_eq!(g.theirs.get("/repo/g.rs").map(|(_, t)| *t), Some(500.0));
         assert!(!g.theirs_restore.contains("/repo/g.rs"));
         assert!(g.theirs_firsthand.contains("/repo/g.rs"));
+    }
+
+    /// AF-130, rebuilt from the incident's own timeline: f84a485 committed at
+    /// 12:26:04, the observed record for the SAME `cat >>` minted at 12:26:38
+    /// because the hook fires after the whole compound command — so the
+    /// record postdated the commit and `owner_committed_since` (strictly
+    /// newer wins) could never settle it. The false AtRisk notice fired on
+    /// correctly-committed work, on every edit-then-commit-in-one-Bash-call,
+    /// which is the dominant bypass-permissions shape. The fix is stamping
+    /// the REPORTED mtime; these cells pin the parse.
+    #[test]
+    fn observed_report_stamps_the_file_mtime_not_the_hook_time() {
+        let now = 2000.0;
+        // The AF-130 cell: a reported mtime in the past is KEPT. Reverting the
+        // fix (stamping `now`) fails here on behavior.
+        let body = serde_json::json!({"paths": [{"path": "/repo/x.rs", "mtime": 1500.0}]});
+        let rows = parse_observed_reports(&body, now);
+        assert_eq!(
+            rows,
+            vec![("/repo/x.rs".to_string(), 1500.0)],
+            "a reported mtime must survive as the record's timestamp — hook-run \
+             time postdates the commit in the one-Bash-call shape and manufactures \
+             false AtRisk notices"
+        );
+        // Bare string (older installed hook copy): hook-time stamp, i.e. the
+        // pre-AF-130 behavior — degraded toward over-warning, never silence.
+        let body = serde_json::json!({"paths": ["/repo/y.rs"]});
+        assert_eq!(parse_observed_reports(&body, now), vec![("/repo/y.rs".to_string(), now)]);
+        // A future mtime clamps to now: a skewed clock must not mint a record
+        // that outlives the pruning window.
+        let body = serde_json::json!({"paths": [{"path": "/repo/z.rs", "mtime": 99999.0}]});
+        assert_eq!(parse_observed_reports(&body, now), vec![("/repo/z.rs".to_string(), now)]);
+        // Junk rows (no path, wrong types, empty) are skipped, not defaulted.
+        let body = serde_json::json!({"paths": [{"mtime": 1.0}, 42, "", {"path": "  "}]});
+        assert!(parse_observed_reports(&body, now).is_empty());
     }
 
     /// AMUX-3446, rebuilt from the incident's own bytes: my staged diff for
