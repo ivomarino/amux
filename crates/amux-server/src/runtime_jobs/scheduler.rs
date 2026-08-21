@@ -907,6 +907,17 @@ pub fn soft_delete_schedule(conn: &Connection, id: &str, now_ts: i64) -> rusqlit
     )
 }
 
+/// The inverse, for an EXPLICIT `resurrect` PATCH only (AMUX-3431).
+/// `update_schedule` deliberately excludes `deleted` from its column list so
+/// an ordinary write can never flip a tombstone by accident — clearing it is
+/// its own audited act, mirroring soft_delete_schedule above.
+pub fn resurrect_schedule(conn: &Connection, id: &str) -> rusqlite::Result<usize> {
+    conn.execute(
+        "UPDATE schedules SET deleted=NULL WHERE id=?1 AND deleted IS NOT NULL",
+        rusqlite::params![id],
+    )
+}
+
 /// Audit a schedule mutation into `schedule_audit` (AMUX-1735/1812: every
 /// create/update/delete leaves a `by_who` trail; an unattributed write on
 /// this table is a forensics gap by definition).
