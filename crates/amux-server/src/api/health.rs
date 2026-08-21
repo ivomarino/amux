@@ -15,6 +15,16 @@ use serde::Serialize;
 pub struct Health {
     pub status: &'static str,
     pub build: String,
+    /// The commit the binary was built from (AMUX-3454), stamped by build.rs.
+    /// `build` discriminates BINARIES but cannot answer "does this build
+    /// contain commit X", and the AF-82 time-comparison fails when two
+    /// commits land seconds apart — which produced two wasted verification
+    /// rounds in one afternoon (a build adopted mid-window was read as
+    /// containing the later commit). `-dirty` suffix when the tree had
+    /// uncommitted changes under crates/ at build time (the local builder
+    /// compiles the working tree, so a bare sha would overclaim);
+    /// "unknown" outside a git checkout (the cloud image).
+    pub commit: &'static str,
     pub uptime_s: u64,
     pub rev: Option<u64>,
     pub store: &'static str,
@@ -124,6 +134,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
                 "ok"
             },
             build: state.build_hash.clone(),
+            commit: env!("AMUX_BUILD_COMMIT"),
             uptime_s: state.started.elapsed().as_secs(),
             rev,
             store,
