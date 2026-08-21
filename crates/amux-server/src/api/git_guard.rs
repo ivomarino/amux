@@ -343,7 +343,18 @@ pub(crate) async fn path_fate(dir: &str, path: &str, owner: &str, edit_age_secs:
         // absorbed or reverted. `git_out` is None on nonzero exit, so a real
         // difference, a missing origin ref, or any git failure all fall
         // through to AtRisk — the loud direction stays the default.
-        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some() {
+        //
+        // BOTH trees, because the commit takes the STAGED blob (backend's
+        // amendment, measured same-day: worktree == origin while the INDEX
+        // held a pre-graft copy 44 lines behind — a receipt on that state
+        // talks the victim out of checking while the pending commit would
+        // revert their landed lines). Worktree-clean AND index-clean against
+        // origin, or it stays AtRisk.
+        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some()
+            && git_out(dir, &["diff", "--quiet", "--cached", "origin/main", "--", path])
+                .await
+                .is_some()
+        {
             let sha = git_out(dir, &["log", "origin/main", "-1", "--format=%h", "--", path])
                 .await
                 .unwrap_or_default()
@@ -1699,11 +1710,25 @@ mod tests {
         git(&["update-ref", "refs/remotes/origin/main", &graft]);
         git(&["reset", "-q", "--hard", &base]);
         std::fs::write(dir.path().join("grafted.txt"), "landed v2\n").unwrap();
+        // backend's amendment, THE TRAP ARM: worktree == origin bytes but the
+        // INDEX still holds the pre-graft blob (reset --hard left it at v1).
+        // The commit takes the staged blob, so committing HERE would revert
+        // the landed lines — a receipt on this state talks the victim out of
+        // checking. Must stay AtRisk. (The first fix's own fixture sat in
+        // exactly this state and asserted the receipt, which is the proof the
+        // amendment was needed.)
+        assert_eq!(
+            path_fate(&d, "grafted.txt", "backend", 3600).await,
+            PathFate::AtRisk,
+            "stale staged blob under origin-identical worktree is the revert-in-waiting"
+        );
+        // Receipt only when BOTH trees match origin: stage the origin bytes.
+        git(&["add", "grafted.txt"]);
         match path_fate(&d, "grafted.txt", "backend", 3600).await {
             PathFate::LandedOnOrigin(sha) => {
                 assert!(!sha.is_empty(), "the receipt must carry origin's sha")
             }
-            other => panic!("bytes identical to origin cannot be at risk: {other:?}"),
+            other => panic!("bytes identical to origin in BOTH trees cannot be at risk: {other:?}"),
         }
         // Control: worktree differing from BOTH HEAD and origin is the real
         // at-risk case, and it must stay loud.
