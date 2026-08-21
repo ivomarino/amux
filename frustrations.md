@@ -1841,13 +1841,21 @@ COST: About 40 minutes, most of it re-walking the home directory by hand with
   returns from readdir on this machine (90s, zero entries, still blocked),
   while `stat` on it answers instantly with the same st_dev as $HOME, so the
   walker's cross-mount guard had no reason to skip it.
-FIX: Position and phase are published per directory BEFORE the syscall that
+FIX: 7ecb766. Position and phase are published per directory BEFORE the syscall that
   can block, separately from the throttled write that persists them; the
   reaper preserves both and names them in its error text; a watchdog marks a
   45s stall terminal and WARNs to server-rs.log BEFORE it touches the store,
   so a stall in the write lock still reports rather than hanging where the
   walker did. Stalled directories are recorded and skipped by later scans,
   with a Re-include button so the exemption is not a one-way ratchet.
+  Same commit fixed a second bug found by measuring rather than by theory:
+  `devtool_roots()` is a list of real absolute paths that `walk()` sized
+  regardless of cfg.roots, so every unit test calling walk() on a tempdir also
+  scanned ~/.cache, ~/Library/Caches and the 15GB shared cargo target dir. Two
+  such tests ran 14 hours at 0% CPU and took every lane's `cargo test` hostage
+  on the shared build lock. A peer read the 0% CPU as the FileProvider hang
+  above, which had been proven real an hour earlier and so corroborated itself;
+  lsof showing NO directory fd at all is what separated them.
 
 ---
 
