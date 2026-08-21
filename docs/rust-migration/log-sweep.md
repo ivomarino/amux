@@ -199,6 +199,19 @@ fallback when a finding needs row-level inspection.
      cold-outbound, 08-18 amux-cloud + random — the last two did *nothing else*
      all day). Exclude it before flagging, the same way GETs are excluded.
 
+   - **A lane that writes to a card it does not OWN is invisible to this check.**
+     This is the general form of the two rules below and it produced THREE false
+     positives in one sweep (2026-08-21): `mixpeek-general` (7 board PATCHes),
+     `gtm-videos` (a card CREATE), `gtm-media-assets` (one PATCH). Verified at the
+     cards: MG-1483 and MG-1484 carry `session='amux'`, GMA-84 carries
+     `session='mixpeek-frustrations'` — all three were updated INSIDE the window,
+     by lanes that do not own them. The cross-check keys on CARD OWNERSHIP
+     (`card.session == lane`) while the evidence of work is WHO MADE THE REQUEST.
+     Cross-lane board writes are normal and constant here: delegation, a reviewer
+     acking someone's gate, a peer moving your card. Before flagging, look for the
+     lane in the REQUEST LOG as the writer — `POST/PATCH /api/board*` with
+     `amux_session = <lane>` — not for its name on the card.
+
    - **A card DELETE leaves no trace in the board snapshot.** `mixpeek-clustering`
      was flagged on 2026-08-20 for one mutating write with no board activity. That
      write was `DELETE /api/board/MC-1328 -> 200` — closing out a card IS the ledger
