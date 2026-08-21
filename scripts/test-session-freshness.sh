@@ -83,7 +83,16 @@ setup_ok() { case "$2" in *"SETUP BROKEN"*) FAIL=$((FAIL+1)); echo "$2" | head -
 says()  { case "$2" in *"$1"*) PASS=$((PASS+1));; *) FAIL=$((FAIL+1)); echo "FAIL: expected output to mention '$1'"; echo "  got: ${2:-<empty>}";; esac; }
 lacks() { case "$2" in *"$1"*) FAIL=$((FAIL+1)); echo "FAIL: output should NOT mention '$1'"; echo "  got: ${2:-<empty>}";; *) PASS=$((PASS+1));; esac; }
 
-MARK="do NOT append to frustrations.md here"
+# AF-95 changed what the DIVERGED banner says, and this MARK was not updated with
+# it — so `says` (case b) broke while the two `lacks` (c, d) went VACUOUS, unable to
+# fail against a string the hook no longer prints. Two assertions became theatre and
+# one broke, from one edit that was verified by RENDERING the branches rather than by
+# running this suite.
+#
+# The replacement is the REMEDY line, which appears only inside the diverged block
+# (session-freshness.sh:111) and nowhere in the behind-only or ahead-only paths — so
+# (c) and (d) can genuinely fail again if that gating is ever broken.
+MARK="RECONCILE IT: git merge origin/main"
 
 # (a) CONTROL — current checkout: the hook must stay SILENT. Without this, a hook
 #     that printed the warning unconditionally would pass every other case.
@@ -96,7 +105,11 @@ out=$(mk diverged 2 3)
 says "DIVERGED" "$out"
 says "$MARK" "$out"
 says "2 unpushed" "$out"
-lacks "reached nobody" "$out"   # the rationale belongs in the rule, not the banner
+# The advice AF-95 removed must not come back: on the canonical checkout there is no
+# other clone to go log in, so this line sent a reader somewhere that does not exist.
+# Pinning its ABSENCE is worth more than the old tense-fragile rationale check, which
+# passed only because the replacement text says "reaches" where it said "reached".
+lacks "log friction in a clone that is current" "$out"
 
 # (c) Behind ONLY — recoverable by a pull, so the strand warning must NOT fire.
 #     It should still report the ordinary staleness line.
