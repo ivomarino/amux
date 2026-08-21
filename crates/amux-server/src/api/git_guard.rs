@@ -2129,6 +2129,26 @@ mod tests {
         assert!(v.foreign.is_empty(), "{:?}", v.foreign);
         assert_eq!(v.shared.len(), 1, "both claims real -> shared, warned not blocked");
 
+        // AF-125, the cell where ONLY RANK decides — written across the
+        // reverse-recency case amux-frustrations' mutation exposed. The
+        // committer's observed record is 900s STALER than the peer's
+        // firsthand claim, so the AF-27 recency rule alone would block
+        // (committer_fresher=false); firsthand rank skips that branch
+        // entirely and both real claims read shared. Deleting the
+        // mine_firsthand insert in apply_observed fails THIS assert on
+        // behavior, not on the insert's own inverse.
+        let mut g = peer_wrote("stale-mine.rs", "alice", 1900.0);
+        let mut mine_obs = HashMap::new();
+        mine_obs.insert("/repo/stale-mine.rs".to_string(), 1000.0);
+        apply_observed(&mut g, &mine_obs, &[]);
+        let v = classify(&[pair("stale-mine.rs")], 2000.0, 3600.0, &g);
+        assert!(
+            v.foreign.is_empty(),
+            "rank must carry the staler-self cell — recency alone blocks it: {:?}",
+            v.foreign
+        );
+        assert_eq!(v.shared.len(), 1, "two real claims are a contest, not a sweep");
+
         // A PEER's observed record beats their stale entry and clears
         // restore-kind (kind follows the latest record).
         let mut g = GuardInputs::default();
