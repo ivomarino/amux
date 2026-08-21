@@ -2666,6 +2666,16 @@ mod tests {
         )
         .await;
         assert_eq!(code, StatusCode::BAD_REQUEST, "proceeded must carry the declared override");
+        // Refusal 1b (amux-frustrations' review gap): a CLIENT may not claim
+        // basis="inferred" — that label is server-assigned only, and it is
+        // the property the read-time arithmetic leans on. Before this cell,
+        // widening the whitelist passed the entire suite.
+        let (code, _) = call(
+            "alice",
+            json!({"resolution": "trimmed", "basis": "inferred", "verdict_id": 2}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "inferred is server-assigned, never client-claimed");
         // Refusal 2: bob cannot close alice's row.
         let (code, body) = call(
             "bob",
