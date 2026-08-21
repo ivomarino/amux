@@ -1945,3 +1945,43 @@ FIX: ae73d72. `amux board assign <ID> <worker>` is that PATCH, attributed (X-Amu
   and outcome-surfaced through _board_outcome; the 409 now names the exact invocation
   (verified live: the error text carries "amux board assign PO-3 amux"). The honest path
   is now the easy path, which is the only durable fix for this class.
+
+---
+
+## The documented pre-push gate hangs, and the test that hangs cannot fail or say what wedged it
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-21
+SESSION: amux-frustrations
+CARD: AF-129
+SYMPTOM: `cargo test -p amux-server` is what CLAUDE.md tells every lane to run before
+  pushing. 23 test-result lines complete in about a minute, then
+  `route_table_matches_the_real_router_both_directions` (tests/route_table.rs:91) prints
+  "has been running for over 60 seconds" and stays there. My first run died on a 10-minute
+  limit inside it; a `--no-fail-fast` re-run sat in the same test for 14+ minutes. Zero
+  failures throughout — it does not fail, it stops. Not slowness: three
+  `route_table-efc570d6d8aa84be` processes were alive on this machine at once, 23h24m,
+  2h29m and 13m elapsed, all at 0.0% CPU with seconds of accumulated CPU. Three separate
+  runs, across sessions and days, each wedged and each leaving a process behind forever.
+  The 23-hour one was not mine. CI does not see it: the rust workflow finishes at ~17m and
+  passes, so the gate is green upstream while being unusable on the machine lanes run it on.
+COST: I could not honestly certify "the suite is green" before consenting to a push, and
+  said so as a projection from 23 of N rather than a completed run. Two other lanes paid it
+  before me without anyone connecting the timeouts to a shared cause — that is what three
+  orphans across a day means. Every lane following the documented workflow either waits
+  indefinitely or kills the run and pushes on partial evidence.
+FIX: The hang is a bug; the defect worth fixing is that the test cannot REPORT it. The loop
+  runs `for entry in ROUTE_TABLE { fire(&app, method, &path).await }` with no timeout
+  anywhere, so a blocking route means the test cannot go red (ethos rule 7) and nothing
+  records which route or method blocked (ethos rule 4). The evidence a reader is left with
+  is "over 60 seconds" and a process list. Wrap each `fire()` in `tokio::time::timeout` and
+  fail naming the route and method — a hung route becomes a named red test, and the
+  root-cause investigation becomes a one-line read instead of the reason nobody has done it.
+  Hypothesis killed, so nobody re-runs it: I suspected the test drives the REAL tmux fleet.
+  route_table.rs has no tmux isolation, there is no cfg!(test) guard in session_verbs.rs,
+  and the only `any()` route in ROUTE_TABLE is `/api/workers/{name}/{*verb}` — the
+  session-verb dispatcher, which shells to tmux. It fits the open AF-69/AMUX-3221 entry
+  exactly. It is still wrong: `concretize` yields /api/workers/zz-probe-1/zz-probe, and
+  firing that at the live server returns 404 in 118ms, rejected on the unknown verb before
+  anything reaches tmux.
