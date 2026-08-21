@@ -555,12 +555,24 @@ so "why is this 50 columns wide" is answerable from the instrument instead of fr
   Mechanism removed both ends — runtime_jobs/pane_size.rs:207 issues `set-option -w -t <s>
   window-size latest` to undo the manual pin, and app.js:9340-9359 records the
   resize-on-peek machinery as deleted.
-  PART 2 IS NOT DONE and is now AF-128: peek still cannot answer "how wide is this pane".
+  PART 2 IS NOW DONE TOO — AF-128, shipped 12e8013 and live-verified.
   GET /api/sessions/<n>/peek returns no width, cols or geometry key. This entry's recorded
   COST was a wrong root cause and a reverted CSS change, because a narrow pane and a narrow
   render present identically — and that ambiguity survives the fix. Two lanes are at 80
   columns right now for unrelated reasons; the next reader who notices lands in the same
   undecidable spot.
+
+  PART 2 CLOSED 2026-08-21: GET /api/sessions/<n>/peek now carries pane_cols and pane_rows
+  (12e8013), verified on the running server rather than from the diff — amux 80x25,
+  mvs-infra 80x24, amux-cloud 220x50. The two 80-column lanes are the control: the field
+  tracks the ACTUAL width per session rather than reporting a constant, which is the only
+  way it can settle this entry's actual question — narrow pane, or narrow render.
+  No threshold and no "looks narrow" verdict, deliberately: picking a column count to warn
+  at is the tuned parameter ethos.md warns about, and a reader comparing 50 against the 220
+  everywhere else needs no constant. The parse returns None for every shape tmux emits when
+  it cannot answer, because a fabricated 0 would answer this entry's question falsely.
+  Still open, and small: the SPA peek header does not show it. The API is where every
+  consumer can reach it; app.js was dirty with a peer's work at the time.
 
 ## The subagent switcher is wired end-to-end and reaches 0 of 50 sessions
 AREA: instruments
