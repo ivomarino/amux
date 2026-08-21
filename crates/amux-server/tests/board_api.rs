@@ -1705,3 +1705,55 @@ async fn cross_lane_archive_guard_sees_x_amux_worker_callers() {
     .await;
     assert_eq!(st, StatusCode::OK, "the owner may archive its own card: {v}");
 }
+
+// AVE-36: `amux board progress` reported success while notifying nobody, and
+// `ask` notified — nothing at the call site distinguished delivery from
+// intent, so three cross-group confirms went unread on a card the owner was
+// actively working. A non-owner's desc_append now earns the owner a notice,
+// and the RESPONSE says honestly whether one was sent. In tests no lane runs,
+// so the honest answer is the not-running reason — which is exactly the cell
+// the incident lived in from the sender's side.
+#[tokio::test]
+async fn a_peers_progress_note_reports_owner_notification_honestly() {
+    let (app, _dir) = app();
+    let v = create(&app, json!({ "title": "Handoff", "session": "ave36-nonexistent-owner" })).await;
+    let id = v["id"].as_str().unwrap().to_string();
+
+    // A DIFFERENT lane appends: the response must carry the notify verdict.
+    let (_, _, r) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc_append": "confirm: BOTH PASS" })),
+        &[("X-Amux-Session", "ai-video-editor")],
+    )
+    .await;
+    assert_eq!(r["applied"], json!(true), "{r}");
+    assert_eq!(r["owner_notified"], json!(false), "{r}");
+    assert!(
+        r["owner_notify_reason"].as_str().unwrap().contains("not running"),
+        "the reason must name WHY nobody was told: {r}"
+    );
+
+    // The owner's own append is a self-note: no notify verdict at all.
+    let (_, _, r) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc_append": "my own journal line" })),
+        &[("X-Amux-Session", "ave36-nonexistent-owner")],
+    )
+    .await;
+    assert_eq!(r["applied"], json!(true), "{r}");
+    assert!(r.get("owner_notified").is_none(), "a self-note must not claim a notice: {r}");
+
+    // An unattributed append (server-side automation) notifies nobody either.
+    let (_, _, r) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc_append": "automation outcome line" })),
+    )
+    .await;
+    assert!(r.get("owner_notified").is_none(), "{r}");
+}

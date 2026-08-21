@@ -2287,7 +2287,17 @@ if 'desc_append' in ign:
     sys.exit(1)
 if 'id' not in d:
     print('progress NOT recorded: unexpected response %s' % str(d)[:200], file=sys.stderr); sys.exit(1)
-print(d['id'], '— progress noted')
+# AVE-36: say whether the OWNER was told, not just that bytes landed. Both
+# progress and ask reported success, only ask notified, and nothing at the
+# call site distinguished them — three cross-group confirms went unread on a
+# card its owner was actively working.
+n = d.get('owner_notified')
+if n is True:
+    print(d['id'], \"— progress noted; owner '%s' notified at their next turn\" % d.get('session', '?'))
+elif n is False:
+    print(d['id'], '— progress noted, but OWNER NOT NOTIFIED: %s' % d.get('owner_notify_reason', 'no reason given'))
+else:
+    print(d['id'], '— progress noted (own card or no owner: no cross-owner notice due)')
 "
       # Check if task has a gh: tag — if so, post comment to GH issue
       local task_json

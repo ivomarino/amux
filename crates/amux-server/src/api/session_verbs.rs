@@ -10819,7 +10819,11 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
          messaging is intra-group unless explicitly configured. To allow it: set \
          CC_SEND_ALLOW on {origin} (comma-separated groups, or *), or CC_RECEIVE_ANY=1 \
          on {target} if it is a fleet-wide routing target. A human send is never \
-         restricted — this applies only to sends carrying a worker origin.",
+         restricted — this applies only to sends carrying a worker origin. For a \
+         cross-group HANDOFF, use the board on a card owned by {target}: \
+         `amux board progress <CARD> --stdin` notifies the owner at their next turn, \
+         and `amux board ask <CARD>` requests a status update from them (AVE-36: a \
+         bare desc PATCH records without notifying).",
         fmt(&og), fmt(&tg)
     ))
 }
@@ -13323,6 +13327,12 @@ mod tests {
         // The refusal must NAME both escapes, or it is a wall rather than a rule.
         assert!(err.contains("CC_SEND_ALLOW"), "{err}");
         assert!(err.contains("CC_RECEIVE_ANY"), "{err}");
+        // AVE-36: it must also name the board fallback BY NOTIFYING VERB.
+        // "Use a board card" alone left every cross-group handoff with a
+        // latent silent-delivery failure: `progress` recorded without
+        // notifying, `ask` notified, and the refusal never said which.
+        assert!(err.contains("amux board progress"), "{err}");
+        assert!(err.contains("amux board ask"), "{err}");
 
         // Same group is untouched.
         assert_eq!(cross_group_send_ok("ts-gke", "tubescience").unwrap(), "same-group");

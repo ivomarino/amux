@@ -1848,6 +1848,25 @@ const PATCH_CONTROL: [&str; 8] = [
     "desc_append",
 ];
 
+/// One owner-notice per (owner, card, author) per 10 minutes (AVE-36): a burst
+/// of appends collapses to one turn-boundary message; the notes themselves all
+/// land on the card regardless.
+fn progress_notify_once(key: &str) -> bool {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::HashMap<String, f64>>> = Mutex::new(None);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    let Ok(mut g) = SEEN.lock() else { return false };
+    let m = g.get_or_insert_with(Default::default);
+    if m.get(key).is_some_and(|at| now - at < 600.0) {
+        return false;
+    }
+    m.insert(key.to_string(), now);
+    true
+}
+
 enum PatchOut {
     NotFound,
     /// Any pre-write refusal (400/409) with its exact body.
@@ -1861,6 +1880,15 @@ enum PatchOut {
         /// for reactive pickup: if the transition freed the lane (done/verified/
         /// discarded), fire an immediate pickup instead of waiting 60s.
         status_transition: Option<(String, String, String)>,
+        /// (owner_session, title, note) when a NON-owner appended a progress
+        /// note to someone else's card (AVE-36). `amux board progress`
+        /// reported success while notifying nobody, and `ask` notified — with
+        /// nothing at the call site distinguishing them, a worker reporting a
+        /// RESULT reached for progress and the owner missed three confirms in
+        /// a row on a card they were actively working. The write that already
+        /// happens gains its consequence: a named consumer (the owner), at
+        /// the next turn boundary, deduped.
+        progress_notify: Option<(String, String, String)>,
     },
 }
 
@@ -2050,6 +2078,7 @@ pub async fn patch_item(
     let slot: Arc<Mutex<Option<PatchOut>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
     let id_w = id.clone();
+    let caller_for_notify = caller_lane.clone();
 
     let write = state
         .store
@@ -2118,6 +2147,7 @@ pub async fn patch_item(
             //   {desc_append: "text"}             -> old + "\n" + text
             //   {desc: "text", desc_append: true} -> old + "\n" + text
             //   {desc_append: false}              -> plain replace semantics
+            let mut appended_note: Option<String> = None;
             let desc_effective: Option<String> = match map.get("desc_append") {
                 None | Some(Value::Bool(false)) => body_str(&map, "desc"),
                 Some(v) => {
@@ -2128,6 +2158,8 @@ pub async fn patch_item(
                     };
                     match text {
                         Some(t) if !t.is_empty() => {
+                            // Kept for the AVE-36 owner notice below.
+                            appended_note = Some(t.trim().chars().take(400).collect());
                             let old = next.desc.trim_end();
                             Some(if old.is_empty() {
                                 t.trim().to_string()
@@ -3153,12 +3185,21 @@ pub async fn patch_item(
                     t.clone(),
                 )
             });
+            // AVE-36: a non-owner's append earns the owner a notice. Self-notes
+            // and unattributed callers notify nobody (the automation that
+            // appends server-side carries no session header on purpose).
+            let progress_notify = appended_note.and_then(|note| {
+                let owner = next.session.clone().unwrap_or_default();
+                (!owner.is_empty() && !caller_lane.is_empty() && owner != caller_lane)
+                    .then(|| (owner, next.title.clone(), note))
+            });
             finish(
                 &slot_w,
                 PatchOut::Applied {
                     body: detail_body(&next),
                     ignored,
                     status_transition: st,
+                    progress_notify,
                 },
                 WriteOutcome {
                     applied: true,
@@ -3188,7 +3229,7 @@ pub async fn patch_item(
             }
             (StatusCode::OK, Json(body)).into_response()
         }
-        Some(PatchOut::Applied { mut body, ignored, status_transition }) => {
+        Some(PatchOut::Applied { mut body, ignored, status_transition, progress_notify }) => {
             body["applied"] = json!(true);
             body["global_rev"] = json!(reply.rev.0);
             if !ignored.is_empty() {
@@ -3197,6 +3238,43 @@ pub async fn patch_item(
                     "these keys are not writable via PATCH and were NOT applied; \
                      the rest of this response reflects the card as stored"
                 );
+            }
+            // AVE-36: the note landed; now say honestly whether the OWNER was
+            // told. "progress noted" with nobody notified is how three confirms
+            // in a row went unread on a card its owner was actively working.
+            if let Some((owner, title, note)) = progress_notify {
+                if !crate::api::session_verbs::is_running(&owner).await {
+                    body["owner_notified"] = json!(false);
+                    body["owner_notify_reason"] = json!(format!(
+                        "owner session '{owner}' is not running — the note is on the card but \
+                         nobody was told; re-run `amux board ask {id}` when they are up if it \
+                         needs their attention"
+                    ));
+                } else if !progress_notify_once(&format!("{owner}|{id}|{caller_for_notify}")) {
+                    body["owner_notified"] = json!(false);
+                    body["owner_notify_reason"] = json!(
+                        "owner was already notified about your notes on this card in the last \
+                         10 minutes (deduped); the note itself is saved"
+                    );
+                } else {
+                    let prompt = format!(
+                        "[amux board note on {id}: {}] {caller_for_notify} appended a progress \
+                         note to YOUR card:\n{note}\n(Full note is on the card {id}. This notice \
+                         is delivery of a peer's note, not a status request.)",
+                        title.chars().take(60).collect::<String>()
+                    );
+                    crate::api::session_verbs::steer_enqueue(
+                        &state,
+                        &owner,
+                        &prompt,
+                        "board-progress",
+                        &caller_for_notify,
+                    )
+                    .await;
+                    body["owner_notified"] = json!(true);
+                    body["owner_notify_note"] =
+                        json!(format!("{owner} will see the note at their next turn boundary"));
+                }
             }
             // REACTIVE PICKUP: when a card transitions to a terminal state,
             // immediately check if the lane has a next todo card and claim it.
