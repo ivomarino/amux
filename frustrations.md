@@ -2051,3 +2051,25 @@ FIX: send the mtime the hook already read — `hits.append({"path": p, "mtime": 
   server-rs.log` returns 0 across the whole retained window. Nobody can count how often it
   fires or how often it was wrong. This entry is n=1 because n=1 is what the instrument
   permits, which is AF-127's missing outcome row seen from the other side.
+
+## /health could not answer "does this build contain commit X"
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux
+CARD: AMUX-3454
+SYMPTOM: `build` is a binary content hash and the documented fallback (AF-82: compare the
+  build's time to the commit's time) fails exactly when two commits land seconds apart —
+  the normal case on a busy shared checkout. The builder adopted dec6eaa in the window
+  before 475d74a landed; the new hash was read as containing both, and a live verification
+  of the second commit ran against a server that did not have it, reporting the old
+  behavior ("stored":0) as if the fix were wrong. Same shape earlier the same day with
+  c30a03ac.
+COST: two wasted verification rounds in one afternoon, plus a second fleet-wide
+  observed-coverage gap opened while the wrong conclusion was being un-drawn.
+FIX: AMUX-3454's sha. build.rs stamps `git rev-parse --short=12 HEAD` into the binary;
+  /health gains `commit`, with `-dirty` when crates/ had uncommitted changes at build time
+  (the builder compiles the working tree, so a bare sha would overclaim) and "unknown"
+  without .git (cloud image). "Is my sha here" is now one jq read instead of a timing
+  argument.
