@@ -1771,29 +1771,6 @@ FIX: Position and phase are published per directory BEFORE the syscall that
 
 ---
 
-## My per-file git add swept a peer's hunk after their edit records aged out, and no guard spoke
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-21
-SESSION: amux
-CARD: AMUX-3446
-SYMPTOM: 7797e45 staged request_log.rs for my one-row AF-116 change while
-  desktop's uncommitted reclaim work sat in the same file. Their ROUTE_TABLE
-  row shipped under my commit message; its mount stayed uncommitted in their
-  worktree. The staged-guard said nothing — desktop had been parked at a
-  selector for hours, their edit records had aged out of the attribution
-  window, and there was no foreign claim left to warn on. Main went red a day
-  later when the route_table both-directions test caught the map shipped
-  without the territory (AF-121, filed by amux-frustrations against me).
-COST: origin/main red on check, blocking the CI-green verification gate
-  fleet-wide (40+ done cards on that gate) until the revert reached origin;
-  one absorbed hunk reverted (836de21, pushed); desktop must re-land their
-  row with the mount.
-FIX: pending (AMUX-3446): an ownership signal that survives record expiry —
-  once the window closes the guard is blind by construction, and a per-file
-  add on a shared checkout stages whatever is in the file, attributed or not.
-
 ## `amux board add --help` said "server unreachable" one command after the same server answered
 AREA: cli
 SEVERITY: annoys
@@ -1845,43 +1822,10 @@ FIX: e823ae3. Fixture serves the real shape; seven assertions now READ the outpu
   reads that key — mutation-verified in both directions, because the bash CLI is not
   compiled and nothing else could catch a rename on that side.
 
-## The staged-guard blocks Bash-editing lanes structurally: 75% of blocks are firsthand=0
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-21
-SESSION: amux-frustrations
-CARD: AF-123
-SYMPTOM: 140 AF-27 block lines in the retained server log (08-19 to 08-21); 105 of them
-  (75%) carry `firsthand=0`. A FIRSTHAND edit record is minted only by the PostToolUse hook
-  matching `Write|Edit|MultiEdit|NotebookEdit`, so a lane that edits through Bash never
-  mints one and lives at firsthand=0 permanently. `amux` is the control: it edits with the
-  Edit/Write tools and is the only lane in the table with 0 of its 4 blocks at firsthand=0,
-  against 8/8 for me, 6/6 amux-cloud, 25/26 mixpeek-observability. My own block read
-  `mine=39 (firsthand=0, newest_any=17.6s ago); per-path: amux in_mine=false` seventeen
-  seconds after I rewrote the file `amux` — through a `python3 - <<'PY'` heredoc, which the
-  inferred-path extractor cannot see into, so the one path I was editing is the one it
-  recorded as not mine.
-COST: four blocked commits for me today alone, each needing a hand-audited
-  AMUX_VERIFIED_SOLO. The real cost is the reflex: when the honest exit is required on
-  essentially every commit, acking the guard stops being a judgement and becomes a keystroke
-  — and that judgement is the only thing standing between the fleet and the AMUX-1315 sweep
-  class the guard exists to stop. Ethos rule 3: bypass-permissions sessions are INSTRUCTED to
-  prefer Bash over Edit/Write, so the harness mandates the working style that makes its own
-  strongest ownership signal unobtainable, then blocks the lane for not having it.
-FIX: unowned, routed to amux on AF-123. Three directions there; the one I would pick is a
-  PostToolUse Bash hook recording paths whose MTIME CHANGED during the command — observed
-  rather than parsed, so no quoting or heredoc can hide a write. Note also that no
-  per-verdict outcome is recorded, so nobody can compute what share of those 105 were
-  CORRECT blocks that merely also had firsthand=0; that missing discriminator is the same
-  one open on AMUX-1315.
-
----
-
 ## The inferred-edit WARN names a verb that cannot support the conclusion the WARN asks you to draw
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-21
 SESSION: amux-frustrations
 CARD: AF-126
@@ -1910,3 +1854,14 @@ FIX: Print the segment that FAILED the read test, not the first one — `verb=cd
   conclude from a field, that field has to be the one the conclusion is about. A confident
   instrument pointed at the wrong operand is worse than a silent one, because the reader
   stops at the log line — which is exactly what the line is for.
+
+  FIXED 2026-08-21 by amux, a495918, within the hour of filing. The WARN now carries
+  blocked_by=<the verb that actually failed the read test> (redirects and git-<sub> spelled
+  out), verb= is kept so existing greps still work, and the diagnostic sentence points at
+  blocked_by with an explicit note that the first segment is usually `cd` and says nothing.
+  Comment segments are skipped in BOTH walks — the rust canonical and the observed-hook
+  python port — and the two rust walks now share one hoisted const table so they cannot
+  drift. Comment-plus-a-real-write still blocks, naming the writer.
+  Not yet deleted: no inferred-edit WARN has fired since the build carrying it started, so
+  the live line has not been READ with blocked_by on it. Verifying from the log, not from
+  the diff, is the whole point of this entry.
