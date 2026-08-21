@@ -1,5 +1,68 @@
 [
   {
+    "hash": "7404228",
+    "short": "7404228",
+    "title": "Board progress note notifies the card owner",
+    "date": "2026-08-21",
+    "type": "feat",
+    "tags": ["board", "notifications", "agents"],
+    "description": "When a peer session adds a progress note to a board card you own, the card owner now receives a live notification and the success line names the recipient. Previously a progress note was written silently — the card owner had no way to know a peer had updated their card without polling the board. Works across all running sessions in the same fleet."
+  },
+  {
+    "hash": "418e23c",
+    "short": "418e23c",
+    "title": "Pane-churn — model-agnostic generation signal for any AI agent",
+    "date": "2026-08-20",
+    "type": "feat",
+    "tags": ["status", "observability", "agents"],
+    "description": "amux can now detect when any AI coding agent is actively generating output — not just Claude Code. The pane-churn signal watches for rapid terminal output change and infers a 'working' status regardless of which model or runtime is running (Claude Code, Codex, Gemini CLI, Aider, or a custom script). Previously, working-state detection relied on Claude Code-specific UI patterns. Pane-churn works universally."
+  },
+  {
+    "hash": "318a37e",
+    "short": "318a37e",
+    "title": "Status-explain — see exactly how amux derived a session's current state",
+    "date": "2026-08-20",
+    "type": "feat",
+    "tags": ["status", "observability", "dashboard"],
+    "description": "Each session status chip in the dashboard now carries an explanation tooltip showing exactly how amux derived that state — which signal won, what it saw in the pane, and why it chose that status over alternatives. Previously a session that showed 'idle' or 'working' gave no indication of the reasoning behind the label. Status-explain makes the derivation transparent, so you can trust the status or understand why it's wrong."
+  },
+  {
+    "hash": "68e87ef",
+    "short": "68e87ef",
+    "title": "Live canary per connector service — ok / api_error / unreachable / not_granted",
+    "date": "2026-08-20",
+    "type": "feat",
+    "tags": ["connectors", "observability", "dashboard"],
+    "description": "Each service in the Connectors tab now shows a live health indicator — ok, api_error, unreachable, or not_granted — updated in real time by a background canary probe. If a credential stops working (expired token, revoked key, wrong scope), the connector shows api_error or not_granted immediately, and amux creates an autofix card on the board naming the affected service. Dashboard status dots reflect connector health so you can see at a glance whether your agent fleet has the credentials it needs."
+  },
+  {
+    "hash": "ddd3ee9",
+    "short": "ddd3ee9",
+    "title": "OAuth broker — authorize once, every agent shares the grant",
+    "date": "2026-08-20",
+    "type": "feat",
+    "tags": ["connectors", "oauth", "credentials", "agents"],
+    "description": "The new OAuth broker lets you authorize an external service (Google, GitHub, or any OAuth 2.0 provider) a single time and share that grant across every agent in your fleet. Previously each session that needed an OAuth-protected API had to either hold its own token or go through a separate auth flow. Now the broker holds the grant centrally, mints short-lived tokens on demand, and injects them as environment variables at session launch. Tokens stay out of CLAUDE.md and git history."
+  },
+  {
+    "hash": "05d925f",
+    "short": "05d925f",
+    "title": "Files view sorts by last modified (newest first) by default",
+    "date": "2026-08-20",
+    "type": "feat",
+    "tags": ["files", "dashboard", "ux"],
+    "description": "The Files tab now opens with files sorted by last-modified time, newest first — the file you just wrote or edited is at the top. Previously the default sort was alphabetical, which buried the most recently changed files in the middle of long directory listings. The sort preference is persisted per-session so it stays across page refreshes."
+  },
+  {
+    "hash": "dff05ce",
+    "short": "dff05ce",
+    "title": "PWA resume lands on your exact last location — peek tab and closed state included",
+    "date": "2026-08-20",
+    "type": "feat",
+    "tags": ["pwa", "ios", "ux", "sessions"],
+    "description": "Reopening the amux PWA (or reloading the dashboard) now returns you to exactly where you left off — the same session selected, the same peek panel open (or closed), and the same tab active inside the peek. Previously reopening the app always landed on the sessions list with no peek open, requiring several taps to get back to the session you were monitoring. The restored state includes which peeks were explicitly closed, so a closed peek stays closed rather than reopening on resume."
+  },
+  {
     "hash": "e58c085",
     "short": "e58c085",
     "title": "Email read-back shows your sent copy, not Gmail's rewritten version",
