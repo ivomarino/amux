@@ -1875,3 +1875,38 @@ FIX: unowned, routed to amux on AF-123. Three directions there; the one I would 
   per-verdict outcome is recorded, so nobody can compute what share of those 105 were
   CORRECT blocks that merely also had firsthand=0; that missing discriminator is the same
   one open on AMUX-1315.
+
+---
+
+## The inferred-edit WARN names a verb that cannot support the conclusion the WARN asks you to draw
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-21
+SESSION: amux-frustrations
+CARD: AF-126
+SYMPTOM: `[staged-guard/inferred-edit AMUX-3128] session=X path=P verb=V` ends with "A
+  READ verb here means is_pure_read_command missed a reader and it may be minting false
+  co-authorship." It names the field and the inference. Over the retained window there
+  are 10,722 such lines across 41 sessions, and the verb histogram is 6173 `cd`, 802
+  `cat`, 315 `grep`, 227 `tail`, 89 `#`. Applied as instructed that reads as ~75% false
+  co-authorship, fleet-wide. It is not: `is_pure_read_command` checks EVERY segment and
+  `cd` is in READ_ONLY_VERBS (added under AEAB-24, with a comment saying why), so
+  `verb=cd` means a LATER segment was the write. The records are fine; the field names
+  the wrong segment.
+COST: I had the ~75% figure written into a card draft before reading the function. It
+  would have been a fleet-scale claim that the guard is mostly manufacturing false
+  attribution — corroborated by a real histogram, from the instrument's own guidance,
+  and wrong. What stopped it was reading the code the log line describes, which is the
+  step the sentence is written to make unnecessary. Separately it cost a full diff
+  reconciliation of commit 8fd9fa1: amux-homepage got `verb=#` records on frustrations.md
+  from a READ (their union-merge, visible in the same WARN burst) while my write moved the
+  mtime, which surfaced as "also edited by amux-homepage 0m ago" on my commit.
+FIX: Print the segment that FAILED the read test, not the first one — `verb=cd
+  blocked_by=sed`. Then a `blocked_by` holding a read verb is the signal the sentence
+  promises, and it is rare enough to act on. Also skip segments whose first token starts
+  with `#`; a comment cannot write, and `#` currently forces the whole command non-read.
+  The general rule this is an instance of: when a log line tells the reader what to
+  conclude from a field, that field has to be the one the conclusion is about. A confident
+  instrument pointed at the wrong operand is worse than a silent one, because the reader
+  stops at the log line — which is exactly what the line is for.
