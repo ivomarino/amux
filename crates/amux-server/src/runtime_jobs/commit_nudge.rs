@@ -843,13 +843,55 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
             })
             .unwrap_or_default()
     };
-    Some(Ownership {
+    let mut own = Ownership {
         foreign: pairs("foreign"),
         shared: pairs("shared"),
         undecided: plain("undecided"),
         partial,
         unclaimed: plain("unclaimed"),
-    })
+    };
+    // SETTLED-MINE + DIRTY-THEIRS IS NOT A CONTEST (AMUX-3436). `shared` keys
+    // on edit records inside the window, which cannot tell edited-and-committed
+    // from edited-and-dirty: a session whose every hunk already landed in HEAD
+    // was told to stage per-hunk over a file where all dirty bytes were a
+    // peer's in-flight work. The discriminator exists — owner_committed_since,
+    // the same check the victim notice runs — so ask it: a shared path whose
+    // OWN edit is strictly settled by a newer own commit demotes to foreign
+    // (NOT YOURS, the peer named). Unsettled, unknown-peer, or unanswerable
+    // rows keep today's CONTESTED, the safe direction.
+    let mut settled: BTreeSet<String> = BTreeSet::new();
+    if let Some(rows) = v.get("shared").and_then(Value::as_array) {
+        for row in rows {
+            let Some(path) = row.get("path").and_then(Value::as_str) else { continue };
+            let peer = row.get("owner").and_then(Value::as_str).unwrap_or("(unknown)");
+            let Some(mine_age) = row.get("mine_age_secs").and_then(Value::as_i64) else {
+                continue;
+            };
+            if peer == "(unknown)" || session.is_empty() {
+                continue;
+            }
+            if crate::api::git_guard::owner_committed_since(dir, path, session, mine_age)
+                .await
+                .is_some()
+            {
+                settled.insert(path.to_string());
+            }
+        }
+    }
+    demote_settled_shared(&mut own, &settled);
+    Some(own)
+}
+
+/// Pure half of the AMUX-3436 demotion: move settled shared rows to foreign,
+/// keeping the peer as the named owner.
+fn demote_settled_shared(own: &mut Ownership, settled: &BTreeSet<String>) {
+    if settled.is_empty() {
+        return;
+    }
+    let (moved, kept): (Vec<_>, Vec<_>) =
+        own.shared.drain(..).partition(|(p, _)| settled.contains(p));
+    own.shared = kept;
+    own.foreign.extend(moved);
 }
 
 /// Per-path freshness for `paths`, computed against origin/main (MG-1467).
@@ -1787,6 +1829,38 @@ mod tests {
             msg.contains("NONE carries your edit record"),
             "the zero-yours firing must say so: {msg}"
         );
+    }
+
+    /// AMUX-3436: a shared path whose OWN edit is already settled in HEAD
+    /// demotes to foreign — the nudge then says NOT YOURS (with the peer
+    /// named) instead of prescribing per-hunk staging over a file where the
+    /// recipient owns zero dirty hunks. An unsettled shared path keeps
+    /// CONTESTED, the safe direction.
+    #[test]
+    fn a_settled_shared_path_renders_not_yours_instead_of_contested() {
+        let mut own = Ownership {
+            shared: vec![
+                ("app.js".into(), "desktop".into()),
+                ("still-mine.rs".into(), "desktop".into()),
+            ],
+            ..Default::default()
+        };
+        let settled: BTreeSet<String> = ["app.js".to_string()].into_iter().collect();
+        demote_settled_shared(&mut own, &settled);
+        assert_eq!(own.shared, vec![("still-mine.rs".to_string(), "desktop".to_string())]);
+        assert_eq!(own.foreign, vec![("app.js".to_string(), "desktop".to_string())]);
+
+        let dirty = s(&["app.js", "still-mine.rs"]);
+        let msg =
+            build("/repo", &dirty, &own, &Freshness::default(), "test-provenance").unwrap();
+        let contested =
+            msg.split("CONTESTED — ").nth(1).expect("CONTESTED section: {msg}").split("\n\n").next().unwrap();
+        assert!(contested.contains("still-mine.rs"), "{msg}");
+        assert!(!contested.contains("app.js"), "the settled path must not read contested: {msg}");
+        let notyours =
+            msg.split("NOT YOURS — ").nth(1).expect("NOT YOURS section").split("\n\n").next().unwrap();
+        assert!(notyours.contains("app.js"), "{msg}");
+        assert!(notyours.contains("desktop"), "the peer must be named: {msg}");
     }
 
     /// SAME files are byte-identical to origin, dirty only because local HEAD is

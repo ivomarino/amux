@@ -207,7 +207,12 @@ async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
 /// Authorship is by the Amux-Session TRAILER, not `%an` — every lane on this
 /// machine commits as the same person, so `%an` cannot discriminate (CLAUDE.md
 /// deploy section).
-async fn owner_committed_since(dir: &str, path: &str, owner: &str, edit_age_secs: i64) -> Option<String> {
+pub(crate) async fn owner_committed_since(
+    dir: &str,
+    path: &str,
+    owner: &str,
+    edit_age_secs: i64,
+) -> Option<String> {
     let out = git_out(
         dir,
         &["log", "-8", "--format=%h%x09%ct%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
@@ -904,6 +909,13 @@ pub(crate) fn classify(
                     "owner": hit.map(|(o, _)| o.as_str()).unwrap_or("(unknown)"),
                     "peer": hit.is_some(),
                     "age_secs": hit.map(|(_, ts)| (now - ts).max(0.0) as i64).unwrap_or(0),
+                    // The committer's own edit age on this path (AMUX-3436):
+                    // what lets a consumer ask owner_committed_since whether
+                    // that edit is already settled in HEAD — a settled-mine +
+                    // dirty-theirs path is NOT a contest, and telling its
+                    // owner to stage per-hunk sends them into a needless
+                    // git add -p over zero hunks of their own.
+                    "mine_age_secs": inp.mine.get(ap).map(|ts| (now - ts).max(0.0) as i64),
                     "has_unstaged_changes": is_dirty,
                 }));
             }
@@ -1747,6 +1759,19 @@ mod tests {
         let g2 = peer_wrote("f.md", "alice", 1000.0);
         let v2 = classify(&[pair("f.md")], 2000.0, 3600.0, &g2);
         assert_eq!(v2.foreign[0]["provenance"], serde_json::json!("firsthand"));
+    }
+
+    /// AMUX-3436: shared rows carry the COMMITTER's edit age, so the nudge can
+    /// ask owner_committed_since whether that edit is already settled — the
+    /// input the settled-mine demotion runs on.
+    #[test]
+    fn shared_rows_carry_the_committers_edit_age() {
+        let mut g = peer_wrote("f.md", "alice", 1000.0);
+        g.mine.insert("/repo/f.md".into(), 1500.0);
+        g.mine_firsthand.insert("/repo/f.md".into());
+        let v = classify(&[pair("f.md")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "both firsthand -> shared: {:?}", v.foreign);
+        assert_eq!(v.shared[0]["mine_age_secs"], serde_json::json!(500));
     }
 
     /// The other half of the discriminator, and the anti-regression guarantee:
