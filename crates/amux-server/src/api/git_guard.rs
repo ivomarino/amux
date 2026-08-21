@@ -329,6 +329,16 @@ pub(crate) async fn path_fate(dir: &str, path: &str, owner: &str, edit_age_secs:
     if sha.is_empty() {
         return PathFate::AtRisk;
     }
+    // Self-absorption is SETTLED, not absorption. This arm is reachable with
+    // who == owner when the owner's newest EDIT RECORD postdates their own
+    // last commit (a peer's write moved the file's mtime under one of the
+    // owner's commands, refreshing the record), so owner_committed_since
+    // correctly misses — and the notice then read "absorbed into a08d120
+    // under `amux`", ADDRESSED TO amux, about amux's own commit. Your own
+    // commit carrying your bytes is nothing to reconcile.
+    if who == owner {
+        return PathFate::SettledByOwner(sha);
+    }
     PathFate::AbsorbedBy(sha, if who.is_empty() { "(untrailered)".into() } else { who })
 }
 
@@ -1605,6 +1615,16 @@ mod tests {
         std::fs::write(dir.path().join("absorbed.txt"), "alice wrote this\n").unwrap();
         git(&["add", "absorbed.txt"]);
         git(&["commit", "-q", "-m", "bob's message\n\nAmux-Session: bob"]);
+
+        // SELF-absorption collapses to settled (2026-08-21, fired live): bob's
+        // edit record postdating his own commit lands here with who == owner,
+        // and "absorbed into <sha> under `bob`" ADDRESSED TO BOB reads as
+        // someone having taken work that nobody took. edit_age=0 forces
+        // owner_committed_since to miss, which is the live mechanism.
+        match path_fate(&d, "absorbed.txt", "bob", 0).await {
+            PathFate::SettledByOwner(_) => {}
+            other => panic!("your own commit is settled, never an absorption: {other:?}"),
+        }
 
         match path_fate(&d, "absorbed.txt", "alice", 3600).await {
             PathFate::AbsorbedBy(_, who) => assert_eq!(who, "bob",
