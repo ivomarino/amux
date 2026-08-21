@@ -1889,3 +1889,47 @@ FIX: e823ae3. Fixture serves the real shape; seven assertions now READ the outpu
   both that the contract publishes top-level `types` and that the shipped bash CLI still
   reads that key — mutation-verified in both directions, because the bash CLI is not
   compiled and nothing else could catch a rename on that side.
+
+## The CLI help promised backlog was claimable; the server refused it
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux
+CARD: AMUX-3450
+SYMPTOM: `amux board --help` has said "Atomically claim a todo/backlog card" since before
+  08-05; `POST /api/board/{id}/claim` 409'd anything not `todo`. Hit live on a real
+  handover: amux-frustrations parked AF-127 in backlog precisely so it would not re-queue
+  to them, wrote "It is claimable — amux board claim AF-127" on the card, and the claim
+  bounced. Two components disagreeing about the same fact, and the disagreeing side was
+  the one peers read when deciding how to hand work over.
+COST: a handover instruction on a card was false at execution time; the claimer burned a
+  round discovering the real contract, and every prior reader of that help line carries
+  the same wrong model.
+FIX: ae73d72. Manual claim accepts backlog via `claim_card_from` (its own CAS on the
+  observed status); auto-pickup stays todo-only, because parking a card mid-race is how
+  an owner defeats a racing pickup, so widening THAT CAS would let pickup steal parked
+  work. Card log says "Claimed from backlog by X" — the auto-pickup wording would be a
+  false statement for a card that was never queue-dispatched. Verified live (probe card:
+  backlog -> claim -> doing, log line exact).
+
+## The claim 409 said "reassign it first" and no sanctioned command could
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux
+CARD: AMUX-3450
+SYMPTOM: claiming a card owned by another worker 409'd with "reassign it first" — and the
+  CLI had no reassign verb, so the server's own error directed every follower off the
+  audited path onto a hand-rolled `curl -X PATCH`. Ethos rule 6 verbatim: the documented
+  escape was unwalkable from the sanctioned tooling, on the exact flow (claim) that
+  AMUX-2140 already taught us gets followed literally. I walked it via raw PATCH (with
+  X-Amux-Session, but nothing guarantees the next follower remembers the header).
+COST: one hand-rolled PATCH by this session; unbounded copies of the same by anyone else
+  the error text ever instructed, each one an attribution hole in the exact subsystem the
+  attribution program is hardening.
+FIX: ae73d72. `amux board assign <ID> <worker>` is that PATCH, attributed (X-Amux-Worker)
+  and outcome-surfaced through _board_outcome; the 409 now names the exact invocation
+  (verified live: the error text carries "amux board assign PO-3 amux"). The honest path
+  is now the easy path, which is the only durable fix for this class.
