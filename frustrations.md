@@ -2483,3 +2483,31 @@ FIX: OAuth callback paths are now SERVED on the plain-HTTP leg: the acceptor
   interstitial. Served-in-place is INFO-logged, proxy failure WARNs and falls
   back to the old 301 so the flow is never worse than before. Everything else
   keeps the https redirect.
+
+---
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux
+AREA: instruments
+CARD: AMUX-3426
+SYMPTOM: The peek header said IDLE while autodesk was 21m48s into a visibly
+  active turn (Ethan's screenshot, 2026-08-20 ~12:58). Root cause: Claude
+  Code's spinner cycles through ·✢✶✻✽*, and the plain middle-dot and asterisk
+  phases are ordinary characters outside the dingbat/braille ranges
+  detect_claude_status knew. A capture landing on the · phase, with the bar's
+  esc-to-interrupt rightly discounted for its agents hint (AMUX-2959), left
+  nothing to say active; the ❯ fallback said idle, and the idle->active
+  contradiction rule could not fire because its evidence is this same
+  detector. Intermittent by construction (a per-capture lottery on spinner
+  phase), which is why it resisted reproduction and cost a screenshot
+  investigation.
+COST: A false IDLE badge over a 21-minute active turn, a screenshot round trip
+  from the owner, and an investigation card. The failure left zero log trace:
+  a misclassified frame and a correctly-idle frame were byte-identical to
+  every consumer.
+FIX: 2441c5e. Spinner frames are recognized by SHAPE (verb + … + the
+  elapsed-time parenthetical only the spinner line carries), not by glyph. The
+  class self-announces: when the ❯ fallback is about to say idle over a
+  generating-shaped line whose glyph no rule classified, a WARN names the
+  glyph (once per process), so the NEXT spinner variant costs one log line
+  instead of another screenshot. Tests rebuild the exact screenshot frame.
