@@ -71,23 +71,52 @@ fn allow_set(res: &axum::response::Response) -> BTreeSet<String> {
         .collect()
 }
 
+/// Per-probe wall-clock budget. In-process oneshot fires answer in
+/// microseconds; 15s is ~10^5 headroom, chosen loud rather than tight.
+const FIRE_BUDGET: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// AF-129: this walk had no per-route timeout, so ONE blocking route turned
+/// the documented pre-push gate into a silent hang — it could not go red
+/// (rule 7) and nothing named which route wedged it (rule 4). Three orphaned
+/// test processes, the oldest 23h, accumulated before anyone connected the
+/// timeouts, because "over 60 seconds" reads as slowness and gets waited on.
+///
+/// The shape matters: the wedge parks with ~zero CPU and every thread asleep
+/// (desktop's diagnosis of the orphans), i.e. the handler BLOCKS its thread
+/// rather than yielding — and `timeout(dur, future)` cannot preempt a poll
+/// that never returns. So the probe runs as its OWN task on the multi_thread
+/// runtime (see the test attribute) and the timeout is on the JoinHandle:
+/// the join times out on another worker even while the wedged task stays
+/// blocked, and the panic names route+method, turning the next occurrence
+/// into a one-line read instead of a process listing.
 async fn fire(app: &axum::Router, method: &str, path: &str) -> axum::response::Response {
-    app.clone()
-        .oneshot(
-            Request::builder()
-                .method(method)
-                .uri(path)
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap()
+    let app = app.clone();
+    let req = Request::builder()
+        .method(method)
+        .uri(path)
+        .body(Body::empty())
+        .unwrap();
+    let task = tokio::spawn(async move { app.oneshot(req).await.unwrap() });
+    match tokio::time::timeout(FIRE_BUDGET, task).await {
+        Ok(joined) => joined.expect("probe task panicked"),
+        Err(_) => panic!(
+            "{method} {path}: no answer in {FIRE_BUDGET:?} — this route BLOCKS, and without \
+             this timeout the whole pre-push gate hangs instead of failing (AF-129). The \
+             wedged probe task is still parked; chase this route's handler for the block \
+             (a held store connection or an unbounded external wait are the known shapes)."
+        ),
+    }
 }
 
 /// One test fn on purpose: it mutates process env (AMUX_PY_URL, AMUX_HOME)
 /// and tests within a binary share the process (same shape as
 /// proxy_composition.rs).
-#[tokio::test]
+///
+/// multi_thread flavor is load-bearing for the AF-129 timeout in `fire` —
+/// on the default current-thread runtime a synchronously-blocking handler
+/// starves the timer and the timeout can never fire. Two workers: one to
+/// stay wedged, one to keep the test making progress.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn route_table_matches_the_real_router_both_directions() {
     // Dead python: /api/scope's any() probe must answer a deterministic 502,
     // never touch a real server.
@@ -100,6 +129,13 @@ async fn route_table_matches_the_real_router_both_directions() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("sessions")).unwrap();
     std::env::set_var("AMUX_HOME", home.path());
+    // AF-129, the named wedge: mdai_root() falls back to $HOME, so the fired
+    // GET /api/files/mdai walked the developer's ENTIRE home tree — unbounded
+    // in time on a real machine (one slow or kernel-blocking directory and
+    // the gate hangs; CI's tiny $HOME is why CI stayed green). mdai.rs says
+    // "tests pin a temp root" — this test constructs the full router and
+    // fires real GETs, so it is exactly such a test and must pin it too.
+    std::env::set_var("AMUX_FILES_ROOT", home.path());
 
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("t.db")).unwrap();
@@ -167,8 +203,17 @@ async fn route_table_matches_the_real_router_both_directions() {
             // route answered, and some GET routes stream forever
             // (/api/events is SSE — to_bytes on it never returns).
             if status == 404 {
-                let body =
-                    axum::body::to_bytes(res.into_body(), 64 * 1024).await.unwrap();
+                // Same AF-129 budget: a 404 body that never finishes streaming
+                // must fail naming the route, not hang the gate.
+                let body = tokio::time::timeout(
+                    FIRE_BUDGET,
+                    axum::body::to_bytes(res.into_body(), 64 * 1024),
+                )
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("GET {}: 404 body did not finish in {FIRE_BUDGET:?} (AF-129)", entry.path)
+                })
+                .unwrap();
                 let body = String::from_utf8_lossy(&body);
                 assert!(
                     body != STATIC_404_BODY,
@@ -197,6 +242,7 @@ async fn route_table_matches_the_real_router_both_directions() {
 
     std::env::remove_var("AMUX_PY_URL");
     std::env::remove_var("AMUX_HOME");
+    std::env::remove_var("AMUX_FILES_ROOT");
 }
 
 /// THE OTHER DIRECTION: a route MOUNTED but absent from the table.

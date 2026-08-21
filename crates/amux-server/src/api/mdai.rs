@@ -865,9 +865,27 @@ pub fn run_dag(
 /// Recursively find every `.mdai` file under the root. Bounded traversal that
 /// skips dotdirs and common heavy directories so listing does not walk a whole
 /// home.
-fn find_mdai_files(root: &Path) -> Vec<PathBuf> {
-    fn walk(dir: &Path, out: &mut Vec<PathBuf>, depth: usize) {
-        if depth > 12 || out.len() > 5000 {
+/// Wall-clock budget for the scan. AF-129: the $HOME default root makes this
+/// walk's size unknowable (the comment on `mdai_root` already records it
+/// timing out the live list request, AMUX-3310), and with NO time bound one
+/// slow or kernel-blocking directory turned `GET /api/files/mdai` into the
+/// route that silently wedged the whole pre-push gate — three orphaned test
+/// processes, the oldest 23h. A budget makes the walk answer with what it
+/// found; the `truncated` flag and the WARN below make the cut visible
+/// instead of reading as "that's all the files there are" (rule 4).
+const SCAN_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Returns the files found plus whether the scan was CUT (budget or caps).
+fn find_mdai_files(root: &Path) -> (Vec<PathBuf>, bool) {
+    fn walk(
+        dir: &Path,
+        out: &mut Vec<PathBuf>,
+        depth: usize,
+        deadline: std::time::Instant,
+        cut: &mut bool,
+    ) {
+        if depth > 12 || out.len() > 5000 || std::time::Instant::now() > deadline {
+            *cut = true;
             return;
         }
         let Ok(rd) = std::fs::read_dir(dir) else { return };
@@ -881,16 +899,24 @@ fn find_mdai_files(root: &Path) -> Vec<PathBuf> {
                 if matches!(name.as_str(), "node_modules" | "target" | ".git" | "Library") {
                     continue;
                 }
-                walk(&p, out, depth + 1);
+                walk(&p, out, depth + 1, deadline, cut);
             } else if is_mdai(&p) {
                 out.push(p);
             }
         }
     }
     let mut out = Vec::new();
-    walk(root, &mut out, 0);
+    let mut cut = false;
+    walk(root, &mut out, 0, std::time::Instant::now() + SCAN_BUDGET, &mut cut);
     out.sort();
-    out
+    if cut {
+        tracing::warn!(
+            target: "amux::mdai", root = %root.display(), found = out.len(),
+            "mdai scan CUT (budget/depth/cap) — the list is partial; scope mdai_root \
+             (pref or AMUX_FILES_ROOT) to a real notes tree"
+        );
+    }
+    (out, cut)
 }
 
 // ---------------------------------------------------------------------------
@@ -915,7 +941,8 @@ async fn list(State(state): State<AppState>) -> Response {
             Err(e) => return Err(e),
         };
         let mut items: Vec<Value> = Vec::new();
-        for path in find_mdai_files(&root_canon) {
+        let (found, truncated) = find_mdai_files(&root_canon);
+        for path in found {
             let rel = rel_key(&root_canon, &path);
             let (sources, model, title) = match std::fs::read_to_string(&path) {
                 Ok(text) => match parse_mdai(&text) {
@@ -957,11 +984,15 @@ async fn list(State(state): State<AppState>) -> Response {
                 "last_run": last_run,
             }));
         }
-        Ok(items)
+        Ok((items, truncated))
     })
     .await;
     match res {
-        Ok(Ok(items)) => Json(json!({ "files": items })).into_response(),
+        // `truncated` rides in the response so a partial scan cannot read as
+        // "that is every file" (AF-129 / rule 4).
+        Ok(Ok((items, truncated))) => {
+            Json(json!({ "files": items, "truncated": truncated })).into_response()
+        }
         Ok(Err(e)) => e.into_response(),
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
             .into_response(),
