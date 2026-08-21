@@ -1,4 +1,7 @@
 #!/bin/sh
+# guard-features: interpret-trailers
+# (Drift token for install-hooks.sh — see append-only-push-guard's header for
+#  the mechanism. A vendored copy lacking a canonical token reads STALE.)
 # amux-session-stamp — tags each commit with the originating amux session, and
 # stamps `(human)` when there is none.
 #

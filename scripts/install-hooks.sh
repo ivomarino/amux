@@ -195,6 +195,25 @@ install_guard_only() {
     echo '         if [ -x "$g" ]; then "$g" || exit 1; fi' >&2
     fail=1
   fi
+  # SHIM RESOLUTION (mixpeek 1721501b81): presence in the effective dir is
+  # NECESSARY AND NOT SUFFICIENT — the consuming shim's lookup path is a
+  # second variable. mixpeek's pre-commit resolved guards via ../.git/hooks/
+  # (per-clone, untracked) while the guard sat vendored right next to the
+  # shim, so a fresh clone skipped it with only a stderr warning. A shim that
+  # references .git/hooks WITHOUT a dirname-based resolution does not travel;
+  # one that prefers dirname($0) with .git/hooks as fallback is fine.
+  if [ "$tracked_hooks" -eq 1 ]; then
+    local shim
+    for shim in "$hooksdir/pre-commit" "$hooksdir/pre-push"; do
+      [ -f "$shim" ] || continue
+      if grep -q '\.git/hooks/' "$shim" && ! grep -q 'dirname' "$shim"; then
+        echo "  WARN $shim resolves guards via .git/hooks/ only — per-clone and untracked, so" >&2
+        echo "       a FRESH CLONE skips the guard even with the vendored copy next to the" >&2
+        echo '       shim. Prefer "$(dirname -- "$0")/<guard>" with .git/hooks as fallback.' >&2
+        fail=1
+      fi
+    done
+  fi
   return $fail
 }
 

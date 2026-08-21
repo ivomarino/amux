@@ -38,7 +38,7 @@
 //!
 //! ```json
 //! {"ok": true,
-//!  "foreign":   [{"path","owner","age_secs","has_unstaged_changes","why"}],
+//!  "foreign":   [{"path","owner","age_secs","provenance","has_unstaged_changes","why"}],
 //!  "shared":    [{"path","owner","peer","age_secs","has_unstaged_changes"}],
 //!  "unclaimed": [{"path","has_unstaged_changes"}],
 //!  "cotenants": ["<session>"], "window_secs": 21600}
@@ -255,6 +255,47 @@ pub(crate) enum PathFate {
     AtRisk,
 }
 
+/// The victim notice's per-path line, pure so the wording is testable
+/// (MG-1484). Returns (line, counts_as_at_risk). The distinction the incident
+/// demanded: an AtRisk path whose owner's record is a RESTORE carries no
+/// authored content — "your WORK is at risk" plus "record your reasoning"
+/// operated on an empty set, and the reader had to disprove the warning by
+/// hand. Say what the record actually was.
+pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> (String, bool) {
+    match fate {
+        PathFate::SettledByOwner(sha) => {
+            (format!("  {pth}  — already committed by you in {sha}; nothing at risk"), false)
+        }
+        // Absorbed but SAFE. The bytes are in HEAD under someone else's
+        // commit, so the code is fine and only the reasoning is stranded —
+        // point at the card, do not send anyone hunting for lost work.
+        // Reporting this as at-risk is what cries wolf on every absorption
+        // that went fine.
+        PathFate::AbsorbedBy(sha, who) => (
+            format!(
+                "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe, \
+                 record the REASONING on the card"
+            ),
+            false,
+        ),
+        PathFate::AtRisk if provenance == "restore" => (
+            format!(
+                "  {pth}  — your only recorded touch here is a RESTORE from a committed ref \
+                 (no authored content of yours; MG-1484). Nothing of your work can be lost; \
+                 if the restore mattered, re-check the path after their commit lands"
+            ),
+            false,
+        ),
+        PathFate::AtRisk => (
+            format!(
+                "  {pth}  — differs from HEAD and you have no commit for it; \
+                 the WORK ITSELF is at risk — CHECK THIS ONE"
+            ),
+            true,
+        ),
+    }
+}
+
 /// Decide between the three. Content-in-HEAD is checked with `git diff HEAD`,
 /// which answers "are these bytes committed by ANYONE" — the question the
 /// trailer-only check could not ask.
@@ -345,6 +386,13 @@ fn pathlike_re() -> &'static regex::Regex {
 #[derive(Clone, Default)]
 struct EditScan {
     paths: HashMap<String, f64>,
+    /// Paths whose LATEST record came from a restore-shaped command
+    /// (`git checkout <ref> -- p`, `git restore`). An edit record is not
+    /// authored content (MG-1484): a restore writes bytes that equal a
+    /// committed ref, so telling its author "your WORK is at risk" hands them
+    /// a remedy that operates on an empty set. A later Edit/Write or mutating
+    /// Bash on the same path clears the mark — kind follows the latest record.
+    restores: HashMap<String, f64>,
     transcript_found: bool,
 }
 
@@ -487,6 +535,55 @@ fn is_pure_read_command(cmd: &str) -> bool {
     saw
 }
 
+/// MG-1484: is this command a RESTORE and nothing else? True when every
+/// segment is a read, a git read, or a `git checkout`/`git restore` — the two
+/// verbs that write bytes equal to a committed ref rather than authoring
+/// anything — with no output redirection and at least one restore segment.
+/// A mixed command (`git checkout origin/main -- f && sed -i … f`) is NOT a
+/// restore: the sed authored content, so the record must read authored.
+/// Conservative both ways: anything unrecognized falls through to authored,
+/// which at worst repeats the old (over-warning) behavior.
+fn is_restore_only_command(cmd: &str) -> bool {
+    if has_output_redirection(cmd) {
+        return false;
+    }
+    let mut saw_restore = false;
+    for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
+        let seg = seg.trim();
+        if seg.is_empty() {
+            continue;
+        }
+        if is_pure_read_command(seg) {
+            continue;
+        }
+        let Some(tok) = seg.split_whitespace().next() else {
+            return false;
+        };
+        let verb = Path::new(tok).file_name().and_then(|s| s.to_str()).unwrap_or(tok);
+        if verb != "git" {
+            return false;
+        }
+        let mut rest = seg.split_whitespace().skip(1);
+        let mut sub = None;
+        while let Some(t) = rest.next() {
+            if t == "-C" || t == "-c" {
+                rest.next();
+                continue;
+            }
+            if t.starts_with('-') {
+                continue;
+            }
+            sub = Some(t);
+            break;
+        }
+        match sub {
+            Some("checkout") | Some("restore") => saw_restore = true,
+            _ => return false,
+        }
+    }
+    saw_restore
+}
+
 /// AMUX-3128 surfacing half: every INFERRED edit record (a Bash command whose
 /// named path moved mtime within slack) is logged so the class stays countable.
 /// A future false co-authorship now leaves a trace naming the verb — and if a
@@ -620,6 +717,12 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                             let ap = realpath(&abs);
                             if mt > *scan.paths.get(&ap).unwrap_or(&0.0) {
                                 warn_inferred_edit(name, &ap, cmd);
+                                // Kind follows the latest record (MG-1484).
+                                if is_restore_only_command(cmd) {
+                                    scan.restores.insert(ap.clone(), mt);
+                                } else {
+                                    scan.restores.remove(&ap);
+                                }
                                 scan.paths.insert(ap, mt);
                             }
                         }
@@ -636,7 +739,10 @@ fn recent_edit_paths(name: &str, since_secs: f64, firsthand_only: bool) -> EditS
                     .and_then(Value::as_str)
                     .unwrap_or("");
                 if !fp.is_empty() {
-                    scan.paths.insert(realpath(Path::new(fp)), ts);
+                    let rp = realpath(Path::new(fp));
+                    // A firsthand Edit after a restore is authored content.
+                    scan.restores.remove(&rp);
+                    scan.paths.insert(rp, ts);
                 }
             }
         }
@@ -664,6 +770,11 @@ pub(crate) struct GuardInputs {
     pub theirs: HashMap<String, (String, f64)>,
     /// abs realpath, any cotenant, first-hand only.
     pub theirs_firsthand: HashSet<String>,
+    /// abs realpath whose WINNING owner's latest record is a restore
+    /// (MG-1484): an edit record without authored content. Drives the
+    /// `provenance` field on foreign verdicts so the victim notice never
+    /// tells a restorer their work is at risk.
+    pub theirs_restore: HashSet<String>,
     /// abs realpath of files with UNSTAGED changes right now.
     pub dirty: HashSet<String>,
     /// Is ANY cotenant invisible to this verdict (transcript unreadable)?
@@ -685,6 +796,20 @@ pub(crate) struct Verdict {
     pub foreign: Vec<Value>,
     pub shared: Vec<Value>,
     pub unclaimed: Vec<Value>,
+}
+
+/// How the winning owner's claim to a path arose (MG-1484): `firsthand` (an
+/// Edit/Write in their transcript), `inferred` (a Bash command + mtime), or
+/// `restore` (a checkout/restore from a committed ref — an edit record with
+/// NO authored content, which consumers must not call "work at risk").
+fn provenance_of(inp: &GuardInputs, ap: &str) -> &'static str {
+    if inp.theirs_restore.contains(ap) {
+        "restore"
+    } else if inp.theirs_firsthand.contains(ap) {
+        "firsthand"
+    } else {
+        "inferred"
+    }
 }
 
 /// py:19470-19545. `paths` is (repo-relative, absolute realpath) pairs.
@@ -744,6 +869,7 @@ pub(crate) fn classify(
                         "path": rel,
                         "owner": owner,
                         "age_secs": (now - ts).max(0.0) as i64,
+                        "provenance": provenance_of(inp, ap),
                         "has_unstaged_changes": is_dirty,
                         // Python emitted "your claim is inferred" here
                         // unconditionally, including when the committer had NO
@@ -788,6 +914,7 @@ pub(crate) fn classify(
                 "path": rel,
                 "owner": owner,
                 "age_secs": (now - ts).max(0.0) as i64,
+                "provenance": provenance_of(inp, ap),
                 "has_unstaged_changes": is_dirty,
                 // WHY, recorded on the verdict (AF-26): a block that says only
                 // "edited by X" cannot be told apart from a block that is
@@ -1080,6 +1207,7 @@ pub async fn staged_guard_inner(
         };
         let mut theirs: HashMap<String, (String, f64)> = HashMap::new();
         let mut theirs_fh: HashSet<String> = HashSet::new();
+        let mut theirs_restore: HashSet<String> = HashSet::new();
         let mut blind: Vec<String> = Vec::new();
         for other in &scan_cotenants {
             let fh = recent_edit_paths(other, window, true);
@@ -1087,20 +1215,27 @@ pub async fn staged_guard_inner(
                 blind.push(other.clone());
             }
             theirs_fh.extend(fh.paths.keys().cloned());
-            for (p, ts) in recent_edit_paths(other, window, false).paths {
-                match theirs.get(&p) {
-                    Some((_, cur)) if *cur >= ts => {}
+            let full = recent_edit_paths(other, window, false);
+            for (p, ts) in &full.paths {
+                match theirs.get(p) {
+                    Some((_, cur)) if *cur >= *ts => {}
                     _ => {
-                        theirs.insert(p, (other.clone(), ts));
+                        // Provenance follows the WINNING owner (MG-1484).
+                        if full.restores.contains_key(p) {
+                            theirs_restore.insert(p.clone());
+                        } else {
+                            theirs_restore.remove(p);
+                        }
+                        theirs.insert(p.clone(), (other.clone(), *ts));
                     }
                 }
             }
         }
-        (mine, mine_fh, theirs, theirs_fh, blind)
+        (mine, mine_fh, theirs, theirs_fh, theirs_restore, blind)
     })
     .await;
 
-    let (mine, mine_fh, theirs, theirs_fh, blind) = match scan {
+    let (mine, mine_fh, theirs, theirs_fh, theirs_restore, blind) = match scan {
         Ok(t) => t,
         Err(e) => {
             // NEVER a 500. A 5xx reaches the hook as an exception and the whole
@@ -1246,6 +1381,7 @@ pub async fn staged_guard_inner(
         mine_firsthand: mine_fh.paths.keys().cloned().collect(),
         theirs,
         theirs_firsthand: theirs_fh,
+        theirs_restore,
         dirty,
             // Live or stopped alike: a stopped lane's PRE-STOP staged work is exactly
         // what gets swept, and the degraded message already admits those edits are
@@ -1332,7 +1468,7 @@ pub async fn staged_guard_inner(
         // channel (delivered at the owner's next turn boundary, which is the
         // soonest they could act on it anyway).
         if let Some(st) = state.as_ref() {
-            let mut by_owner: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
+            let mut by_owner: BTreeMap<String, Vec<(String, i64, String)>> = BTreeMap::new();
             for f in &v.foreign {
                 let owner = f["owner"].as_str().unwrap_or("").to_string();
                 let path = f["path"].as_str().unwrap_or("").to_string();
@@ -1340,14 +1476,15 @@ pub async fn staged_guard_inner(
                     continue;
                 }
                 let age = f["age_secs"].as_i64().unwrap_or(0);
-                by_owner.entry(owner).or_default().push((path, age));
+                let prov = f["provenance"].as_str().unwrap_or("inferred").to_string();
+                by_owner.entry(owner).or_default().push((path, age, prov));
             }
             for (owner, paths) in by_owner {
                 // DEDUPE, because a pre-commit hook fires on every attempt and
                 // a session that keeps retrying a blocked commit would
                 // otherwise message the owner once per keystroke-adjacent
                 // retry. Keyed on (owner, committer, path-set) for an hour.
-                let path_names: Vec<String> = paths.iter().map(|(p, _)| p.clone()).collect();
+                let path_names: Vec<String> = paths.iter().map(|(p, _, _)| p.clone()).collect();
                 let key = format!("{owner}|{session}|{}", path_names.join(","));
                 if !notify_once(&key) {
                     continue;
@@ -1358,27 +1495,13 @@ pub async fn staged_guard_inner(
                 // recipient a `git log` to run every time. Now it runs it for them.
                 let mut lines: Vec<String> = Vec::new();
                 let mut all_settled = true;
-                for (pth, age) in paths.iter().take(10) {
-                    match path_fate(&wd, pth, &owner, *age).await {
-                        PathFate::SettledByOwner(sha) => lines
-                            .push(format!("  {pth}  — already committed by you in {sha}; nothing at risk")),
-                        // Absorbed but SAFE. The bytes are in HEAD under someone
-                        // else's commit, so the code is fine and only the
-                        // reasoning is stranded — point at the card, do not send
-                        // anyone hunting for lost work. Reporting this as at-risk
-                        // is what cries wolf on every absorption that went fine.
-                        PathFate::AbsorbedBy(sha, who) => lines.push(format!(
-                            "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe, \
-                             record the REASONING on the card"
-                        )),
-                        PathFate::AtRisk => {
-                            all_settled = false;
-                            lines.push(format!(
-                                "  {pth}  — differs from HEAD and you have no commit for it; \
-                                 the WORK ITSELF is at risk — CHECK THIS ONE"
-                            ));
-                        }
+                for (pth, age, prov) in paths.iter().take(10) {
+                    let fate = path_fate(&wd, pth, &owner, *age).await;
+                    let (line, at_risk) = victim_path_line(pth, &fate, prov);
+                    if at_risk {
+                        all_settled = false;
                     }
+                    lines.push(line);
                 }
                 let list = lines.join("\n");
                 let more = paths.len().saturating_sub(10);
@@ -1562,6 +1685,68 @@ mod tests {
         ] {
             assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
         }
+    }
+
+    /// MG-1484: a restore writes bytes equal to a committed ref — an edit
+    /// record with no authored content. The command classifier must separate
+    /// pure restores from anything that also AUTHORS.
+    #[test]
+    fn restore_only_commands_are_recognized_and_mixed_ones_are_not() {
+        for cmd in [
+            "git checkout origin/main -- docs/api-reference/openapi.json",
+            "git restore --source=origin/main frustrations.md",
+            "git checkout -- src/lib.rs",
+            "cd /repo && git checkout origin/main -- a.md b.md",
+            "git -C /repo checkout origin/main -- f.md && git status",
+        ] {
+            assert!(is_restore_only_command(cmd), "should be restore-only: {cmd}");
+        }
+        for cmd in [
+            // The incident's own remedy paragraph names this shape: restore
+            // then author. The sed half is authored content.
+            "git checkout origin/main -- f.md && sed -i 's/a/b/' f.md",
+            "sed -i 's/a/b/' f.rs",
+            "git commit -m x",
+            "git checkout origin/main -- f.md > out.log",
+            "head -3 f.md",     // pure read, restores nothing
+        ] {
+            assert!(!is_restore_only_command(cmd), "should NOT be restore-only: {cmd}");
+        }
+    }
+
+    /// MG-1484 wording: a restore-provenance path must never read as "WORK at
+    /// risk" — the remedy that line prescribes operates on an empty set.
+    #[test]
+    fn a_restore_only_touch_is_never_reported_as_work_at_risk() {
+        let (line, at_risk) = victim_path_line("docs/openapi.json", &PathFate::AtRisk, "restore");
+        assert!(!at_risk, "a restore carries no authored content");
+        assert!(line.contains("RESTORE"), "{line}");
+        assert!(!line.contains("CHECK THIS ONE"), "{line}");
+        // Authored content stays the loud case.
+        let (line, at_risk) = victim_path_line("src/lib.rs", &PathFate::AtRisk, "firsthand");
+        assert!(at_risk);
+        assert!(line.contains("CHECK THIS ONE"), "{line}");
+        // Settled and absorbed keep their calm wording regardless.
+        let (line, at_risk) =
+            victim_path_line("a.rs", &PathFate::SettledByOwner("abc123".into()), "restore");
+        assert!(!at_risk);
+        assert!(line.contains("nothing at risk"), "{line}");
+    }
+
+    /// MG-1484: the foreign verdict carries the owner's claim PROVENANCE so
+    /// every consumer (victim notice, nudges, external tripwires) can say
+    /// "you restored this" instead of "you edited this".
+    #[test]
+    fn foreign_verdicts_carry_the_owners_claim_provenance() {
+        let mut g = peer_wrote("f.md", "alice", 1000.0);
+        g.theirs_restore.insert("/repo/f.md".into());
+        let v = classify(&[pair("f.md")], 2000.0, 3600.0, &g);
+        assert_eq!(v.foreign.len(), 1, "{:?}", v.foreign);
+        assert_eq!(v.foreign[0]["provenance"], serde_json::json!("restore"));
+        // Without the restore mark, a firsthand claim reads firsthand.
+        let g2 = peer_wrote("f.md", "alice", 1000.0);
+        let v2 = classify(&[pair("f.md")], 2000.0, 3600.0, &g2);
+        assert_eq!(v2.foreign[0]["provenance"], serde_json::json!("firsthand"));
     }
 
     /// The other half of the discriminator, and the anti-regression guarantee:
