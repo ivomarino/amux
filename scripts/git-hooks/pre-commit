@@ -270,7 +270,14 @@ fi
 # own exit code makes that distinction).
 if echo "$STAGED" | grep -qx 'frustrations.md' && [ -f "$ROOT/scripts/frustrations_audit.py" ]; then
   echo "Checking frustrations.md structure..."
-  if ! python3 "$ROOT/scripts/frustrations_audit.py" >/dev/null 2>&1; then
+  # Exit contract (the script's docstring): 0 clean, 1 structural problems,
+  # 2 board unreachable with structure CLEAN. Structural problems are
+  # decidable without a board, so only 1 blocks; 2 happens whenever the amux
+  # server is mid-restart (which on this checkout is every builder adoption)
+  # and blocking a structurally-clean commit on it would train bypassing.
+  AUDIT_RC=0
+  python3 "$ROOT/scripts/frustrations_audit.py" >/dev/null 2>&1 || AUDIT_RC=$?
+  if [ "$AUDIT_RC" != "0" ] && [ "$AUDIT_RC" != "2" ]; then
     python3 "$ROOT/scripts/frustrations_audit.py" 2>&1 | head -12
     echo ""
     echo "BLOCKED: frustrations.md fails its own structural audit (usually an entry"
@@ -279,5 +286,9 @@ if echo "$STAGED" | grep -qx 'frustrations.md' && [ -f "$ROOT/scripts/frustratio
     echo "in the file's own header. Fix the entry, restage, retry."
     exit 1
   fi
-  echo "frustrations.md structure ok."
+  if [ "$AUDIT_RC" = "2" ]; then
+    echo "frustrations.md structure ok (board unreachable — card pointers unchecked)."
+  else
+    echo "frustrations.md structure ok."
+  fi
 fi

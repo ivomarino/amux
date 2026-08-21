@@ -76,9 +76,21 @@ jobs:
       # vanishes from every census), and NOTHING RAN IT — six malformed
       # entries landed on main while the purpose-built check sat unread.
       # This step is its CI consumer; the pre-commit hook is the local one.
+      # Exit contract (the script's own docstring, which the first wiring of
+      # this step did not read): 0 clean, 1 structural problems (decidable
+      # with NO board, so it must fail here), 2 board unreachable with
+      # structure clean — CI never has a board, so 2 is this environment's
+      # green. Failing on 2 turned the consumer red on every push (33b92a5).
       - name: frustrations.md structural audit + its own test suite (AF-120)
         run: |
+          set +e
           python3 scripts/frustrations_audit.py > /dev/null
+          rc=$?
+          set -e
+          if [ "$rc" != "0" ] && [ "$rc" != "2" ]; then
+            python3 scripts/frustrations_audit.py | head -20
+            exit "$rc"
+          fi
           bash scripts/test-frustrations-audit.sh
 
       # MHC-377. `amux board status-update <ID> --outcome-file <path>` used to
