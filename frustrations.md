@@ -526,7 +526,7 @@ behavior on current crates/amux-server HEAD.
 ## Opening peek permanently narrows the worker's tmux pane — observing changes the observed
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: peek-render agent (subagent; no $AMUX_SESSION in env)
 CARD: AR-110
@@ -549,10 +549,23 @@ resize to the read rather than the session); (2) surface the pane geometry in pe
 so "why is this 50 columns wide" is answerable from the instrument instead of from
 `tmux list-sessions`.
 
+  VERIFIED FIXED (part 1) 2026-08-21 (amux-frustrations; authoring lane `peek-render agent`
+  was a subagent with no session, so nobody can sign this). The reported friction is gone:
+  47 of 49 live tmux sessions are at 220 columns, 2 at 80, NONE at the reported 50/94/102.
+  Mechanism removed both ends — runtime_jobs/pane_size.rs:207 issues `set-option -w -t <s>
+  window-size latest` to undo the manual pin, and app.js:9340-9359 records the
+  resize-on-peek machinery as deleted.
+  PART 2 IS NOT DONE and is now AF-128: peek still cannot answer "how wide is this pane".
+  GET /api/sessions/<n>/peek returns no width, cols or geometry key. This entry's recorded
+  COST was a wrong root cause and a reverted CSS change, because a narrow pane and a narrow
+  render present identically — and that ambiguity survives the fix. Two lanes are at 80
+  columns right now for unrelated reasons; the next reader who notices lands in the same
+  undecidable spot.
+
 ## The subagent switcher is wired end-to-end and reaches 0 of 50 sessions
 AREA: instruments
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: peek-render agent (subagent; no $AMUX_SESSION in env)
 CARD: ARE-7
@@ -577,6 +590,19 @@ without that: the existing comment warns that with rows hidden the nav keys open
 background-shells manager, and that is exactly what pressing ← did here. Separately,
 what all 46 lanes actually have is background CONVERSATIONS, and amux exposes no
 switcher for those at all — that is the reachable version of the same affordance.
+
+  VERIFIED FIXED 2026-08-21 (amux-frustrations; authoring lane was a subagent with no
+  session). Resolved by DELETION plus a replacement, which is the right answer to "capability
+  that reaches nobody" and better than what this entry asked for. app.js:8220 records the
+  pane-driven switcher as deleted, citing ARE-7 and the 0-of-50 predicate, and names the
+  replacement: a subagent list reading DURABLE transcripts via GET
+  /api/sessions/<n>/subagents, with no visibility gate at all. Verified live on three lanes:
+  amux 53, backend 143, amux-frustrations 1. Real data, not a matcher that might rot.
+  The comment states the principle better than the entry did: "the fix for a predicate that
+  matched nothing is to need no predicate, not to write a better one."
+  Note on the entry's own alternative proposal: no background-CONVERSATIONS switcher exists
+  (0 references in the SPA). That was a feature suggestion rather than the friction, and it
+  is not what holds this entry open.
 
 ## Ghost-rescue can only rescue the messages that happen to carry a timestamp prefix
 AREA: instruments
@@ -958,7 +984,7 @@ FIX: Capture stderr to a FILE and leave stdout on the pipe
 ## Five finished cards sat in `todo` and kept being auto-picked
 AREA: board
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-10
 SESSION: amux-rust
 CARD: AMUX-2674
@@ -978,6 +1004,18 @@ FIX: The commit body already names the card ids in a machine-readable form. Noth
   was there and unread, which is the same shape as AC-323's ignored_fields. Note
   the honest limit: a named card is not proof of completion, so this should
   SURFACE candidates for a human/agent check, never auto-close (ethos rule 8).
+
+  VERIFIED FIXED 2026-08-21 (amux-frustrations; authoring lane `amux-rust` is gone).
+  crates/amux-server/src/api/commit_mentions.rs exists, cites AMUX-2674 and e679bdb by name,
+  and GET /api/board/commit-mentions is routed and live — it returns 20 open cards named in
+  merged commits right now, each with the sha and subject that named it.
+  It also honours this entry's explicit ethos-8 caveat rather than quietly dropping it. The
+  module header says so in its own heading, "It SURFACES, it never closes", with the reason:
+  a card id in a commit is not proof of completion, since commits reference cards for
+  context, for partial work and for reverts. The endpoint is a GET that mutates nothing.
+  Probe note: my first call was /api/commit-mentions and returned 404. The route is under
+  /api/board/. The 404 was my probe missing, not the feature being absent — same shape as
+  the /api/oauth/usage miss recorded three entries up.
 
 ---
 ## A peer's `git add` swept my uncommitted migration into their commit and it applied to the live DB
