@@ -2574,7 +2574,7 @@ FIX: The installer resolves the effective hooks dir first and installs there.
   installed into the effective dir, fleet census shows zero stale live copies.
 
 ---
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-21
 SESSION: amux
 AREA: notices
@@ -2589,5 +2589,8 @@ COST: One diff inspection to establish "none of this is mine" — small, but
   every session with recently-committed work on a shared file pays it on
   every idle nudge, and a per-hunk git add -p instruction on a file with zero
   own hunks is the kind of misdirection that eventually gets followed.
-FIX: pending (AMUX-3436): consult path_fate before emitting CONTESTED; settled-mine
-  + dirty-theirs reads NOT YOURS.
+FIX: 5409ac4. Shared rows from the guard carry mine_age_secs; the nudge asks
+  owner_committed_since per shared row and demotes settled-mine rows to
+  foreign (NOT YOURS, peer named). Verified on the incident's own specimen:
+  the live app.js row (mine_age_secs=9261) settles against commit 6b75622
+  (age 9224s, strictly newer).
