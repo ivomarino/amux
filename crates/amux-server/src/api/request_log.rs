@@ -974,6 +974,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/reclaim/quarantine/{id}", methods: &["DELETE"] },
     RouteEntry { path: "/api/reclaim/quarantine/{id}/restore", methods: &["POST"] },
     RouteEntry { path: "/api/reclaim/snapshots", methods: &["GET"] },
+    RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },
     RouteEntry { path: "/api/usage", methods: &["GET"] },
     RouteEntry { path: "/api/alert/config", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/alert/owner", methods: &["GET", "POST"] },
@@ -1106,6 +1107,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // begin/callback, live Test, and the DWD token mint (AMUX-3362). `list` is
     // GET; credentials/auth/test/token are POST; callback is the GET landing.
     RouteEntry { path: "/api/connectors", methods: &["GET"] },
+    RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },
     RouteEntry { path: "/api/connectors/{id}/credentials", methods: &["POST"] },
     RouteEntry { path: "/api/connectors/{id}/auth", methods: &["POST"] },
     RouteEntry { path: "/api/connectors/{id}/test", methods: &["POST"] },
@@ -1840,6 +1842,63 @@ pub async fn debug_routes() -> axum::Json<Value> {
 
 #[cfg(test)]
 mod tests {
+    /// AF-116: ROUTE_TABLE is hand-maintained beside the mounts, so it drifts
+    /// exactly the way the MIGRATIONS array did (AF-99: a .sql on disk was
+    /// never registered; the fix was a check that fails when the two
+    /// disagree). /api/connectors/accounts was mounted and answering 200
+    /// while absent here — so /api/debug/routes under-reported ("routing
+    /// questions are answered there, never by a grep") and
+    /// route.callers_have_routes filed a FALSE failure against a live route,
+    /// which trains readers to skim past the 8 real ones next to it.
+    ///
+    /// This is the source→table direction: every absolute `/api/...` literal
+    /// passed to `.route(` anywhere under src/api must appear in ROUTE_TABLE.
+    /// Nested routers mounting relative paths ("/{id}" under a nest) are out
+    /// of scope by the /api prefix, and that boundary is deliberate — the
+    /// absolute literals are where this class actually bit.
+    #[test]
+    fn every_absolute_route_literal_is_in_route_table() {
+        let api_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/api");
+        let re = regex::Regex::new(r#"\.route\(\s*"(/api/[^"]+)""#).unwrap();
+        let table: std::collections::BTreeSet<&str> =
+            super::ROUTE_TABLE.iter().map(|r| r.path).collect();
+        let mut missing = Vec::new();
+        let mut found_any = false;
+        for entry in std::fs::read_dir(&api_dir).expect("src/api readable") {
+            let p = entry.expect("dir entry").path();
+            if p.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let src = std::fs::read_to_string(&p).expect("source readable");
+            // Test-module routers mount fixture paths (/api/echo, /api/thing)
+            // that are never in the production table — scan only the shipped
+            // half of each file.
+            let src = src.split("#[cfg(test)]").next().unwrap_or(&src);
+            for cap in re.captures_iter(src) {
+                found_any = true;
+                let path = cap.get(1).expect("capture").as_str();
+                if !table.contains(path) {
+                    missing.push(format!(
+                        "{}: {}",
+                        p.file_name().unwrap_or_default().to_string_lossy(),
+                        path
+                    ));
+                }
+            }
+        }
+        // The empty-grep trap: an extractor that matched nothing is broken,
+        // not vindicated (the invariant's own rule, applied to its guard).
+        assert!(found_any, "no .route(\"/api/...\") literals matched — the probe is broken");
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "mounted but ABSENT from ROUTE_TABLE — debug/routes will under-report these and \
+             route.callers_have_routes will file FALSE failures against them (AF-116):\n{}",
+            missing.join("\n")
+        );
+    }
+
     use axum::http::StatusCode;   // lib no longer needs it; these tests do
     use super::*;
     use axum::body::Body;
