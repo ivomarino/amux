@@ -1069,6 +1069,65 @@ pub(crate) fn has_current_api_error(raw_output: &str) -> bool {
     lines[n.saturating_sub(8)..].iter().any(|l| re.is_match(l.trim()))
 }
 
+/// A spinner frame whose glyph is OUTSIDE the dingbat/braille ranges
+/// (AMUX-3426). Claude Code's spinner cycles through ·✢✶✻✽* — the plain
+/// middle-dot and asterisk phases are ordinary characters, so a capture
+/// landing on one of them read a GENERATING turn as idle. The live specimen:
+/// autodesk, 21m48s into a turn, frame `· Befuddling… (21m 48s · ↓ 15.0k
+/// tokens)`, with the bar's esc-to-interrupt rightly discounted for its
+/// agents hint (AMUX-2959) — so nothing was left to say active, the ❯
+/// fallback said idle, and the idle->active contradiction rule (whose
+/// evidence is THIS detector) could never fire. Recognise the frame by its
+/// SHAPE, not its glyph: a verb ending in … plus the elapsed-time
+/// parenthetical only the spinner line carries. A prose bullet quoting an
+/// ellipsis has no `(21m 48s` suffix.
+fn is_plain_spinner_line(s: &str) -> bool {
+    let Some(first) = s.chars().next() else { return false };
+    (first == '\u{b7}' || first == '*')
+        && s.contains('\u{2026}')
+        && cached_re!(r"\((\d+h )?(\d+m )?\d+s\b").is_match(s)
+}
+
+/// The class-kill half of AMUX-3426: when the ❯ fallback is about to say
+/// idle, a spinner-SHAPED line (… + elapsed-time suffix, symbol first char)
+/// that none of the glyph rules classified means a spinner variant this
+/// parser does not know. Say so ONCE per glyph — the next variant announces
+/// itself in the log instead of costing another screenshot investigation.
+fn warn_once_on_unrecognized_spinner(lines: &[&str]) {
+    use std::sync::Mutex;
+    static SEEN: Mutex<Option<std::collections::BTreeSet<char>>> = Mutex::new(None);
+    let timer_re = cached_re!(r"\((\d+h )?(\d+m )?\d+s\b");
+    let n = lines.len();
+    for l in lines[n.saturating_sub(30)..].iter() {
+        let s = l.trim();
+        if !s.contains('\u{2026}')
+            || is_prompt_line(s)
+            || is_plain_spinner_line(s)
+            || !timer_re.is_match(s)
+        {
+            continue;
+        }
+        let Some(c) = s.chars().next() else { continue };
+        if c.is_alphanumeric()
+            || ('\u{2700}'..='\u{27bf}').contains(&c)
+            || ('\u{2800}'..='\u{28ff}').contains(&c)
+        {
+            continue;
+        }
+        let mut g = SEEN.lock().unwrap_or_else(|p| p.into_inner());
+        let set = g.get_or_insert_with(Default::default);
+        if set.insert(c) {
+            tracing::warn!(
+                "unrecognized spinner glyph U+{:04X} on a generating-shaped line ({:?}) — \
+                 detect_claude_status reads this frame as idle; teach the glyph to the \
+                 spinner rules (AMUX-3426 class)",
+                c as u32,
+                s.chars().take(48).collect::<String>()
+            );
+        }
+    }
+}
+
 pub(crate) fn detect_claude_status(raw_output: &str) -> String {
     if raw_output.is_empty() {
         return String::new();
@@ -1100,6 +1159,10 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
             if ('\u{2800}'..='\u{28ff}').contains(&c) {
                 return "active".into();
             }
+        }
+        // The ·/* spinner phases — ordinary chars, matched by SHAPE (AMUX-3426).
+        if is_plain_spinner_line(s) {
+            return "active".into();
         }
         if s.starts_with("Running\u{2026}") || reading_re.is_match(s) {
             return "active".into();
@@ -1178,6 +1241,9 @@ pub(crate) fn detect_claude_status(raw_output: &str) -> String {
         return "waiting".into();
     }
     if clean.contains('\u{276f}') {
+        // About to settle on idle: if a generating-shaped line sits in frame
+        // unclassified, that is the next AMUX-3426 — make it self-announce.
+        warn_once_on_unrecognized_spinner(&lines);
         return "idle".into();
     }
     String::new()
@@ -16249,6 +16315,39 @@ mod steer_max_age_tests {
         let short_plain = "make sure we have a scroll to the bottom thing";
         assert!(!at_picker_text(short_plain));
         assert!(at_picker_text("/compact"));
+    }
+}
+
+#[cfg(test)]
+mod plain_spinner_tests {
+    use super::*;
+
+    /// The autodesk specimen (AMUX-3426), rebuilt from Ethan's screenshot:
+    /// middle-dot spinner phase, 21m48s elapsed, agents hint on the bar. The
+    /// bar's esc-to-interrupt is rightly discounted (AMUX-2959), so the
+    /// spinner line is the ONLY honest active signal in this frame — and the
+    /// pre-fix parser fell through to `❯ present -> idle`.
+    const AUTODESK: &str = "  \u{b7} Befuddling\u{2026} (21m 48s \u{b7} \u{2193} 15.0k tokens)\n\
+        \u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f}\u{a0}\n\u{2500}\u{2500}\u{2500}\u{2500}\n  \
+        \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents\n";
+
+    #[test]
+    fn the_middle_dot_spinner_phase_reads_active() {
+        assert_eq!(detect_claude_status(AUTODESK), "active");
+    }
+
+    #[test]
+    fn the_asterisk_phase_with_a_short_timer_reads_active() {
+        let f = "  * Reticulating\u{2026} (3s \u{b7} esc to interrupt)\n\u{276f}\u{a0}\n";
+        assert_eq!(detect_claude_status(f), "active");
+    }
+
+    #[test]
+    fn a_prose_bullet_with_an_ellipsis_but_no_timer_is_not_a_spinner() {
+        // Shape, not glyph: without the elapsed-time suffix the middle dot is
+        // a bullet, and reading it as active would label parked lanes busy.
+        let f = "  \u{b7} first point\u{2026} continued below\n\u{2500}\u{2500}\n\u{276f}\u{a0}\n";
+        assert_eq!(detect_claude_status(f), "idle");
     }
 }
 
