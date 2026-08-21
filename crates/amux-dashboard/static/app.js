@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.696';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.697';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -27375,12 +27375,20 @@ async function _offlineInfoRefresh() {
 }
 // Settings controls for the offline caps. Both persist to /api/prefs, so the
 // limits follow you to every device instead of each phone keeping its own.
-// Icon-only tabs. Persisted to /api/prefs rather than localStorage so the
-// choice follows you to the phone, where the space actually matters — a
-// per-device setting would mean setting it again on every client.
+// Icon-only tabs. Persisted to /api/prefs so the choice follows you to the
+// phone, AND cached in localStorage so it is saved on the client too
+// (AMUX-3432): the cache applies instantly on load (no flash of the default
+// while the async pref fetch is in flight) and survives the pref endpoint
+// being unreachable — the old catch reset to 'both', so going offline or a
+// slow start visibly wiped the setting. Server value wins on reconcile.
 const _TABS_MODES = ['both', 'icons', 'text'];
 const _TABS_LABEL = { both: 'Icons and text', icons: 'Icons only', text: 'Text only' };
-let _tabsDisplay = 'both';
+let _tabsDisplay = (function () {
+  try {
+    const v = localStorage.getItem('amux_tabs_display');
+    return _TABS_MODES.includes(v) ? v : 'both';
+  } catch (e) { return 'both'; }
+})();
 function _tabsDisplayApply() {
   document.body.classList.toggle('tabs-icons', _tabsDisplay === 'icons');
   document.body.classList.toggle('tabs-text',  _tabsDisplay === 'text');
@@ -27406,11 +27414,17 @@ async function _tabsDisplayLoad() {
       v = String((old && old.value) || '') === '1' ? 'icons' : 'both';
     }
     _tabsDisplay = _TABS_MODES.includes(v) ? v : 'both';
-  } catch (e) { _tabsDisplay = 'both'; }
+    try { localStorage.setItem('amux_tabs_display', _tabsDisplay); } catch (e2) {}
+  } catch (e) {
+    // Prefs unreachable (offline PWA, slow start): KEEP the client-cached
+    // choice. Resetting to 'both' here was the visible "my setting did not
+    // save" (AMUX-3432) — the save had worked; this reset undid it.
+  }
   _tabsDisplayApply();
 }
 async function _tabsDisplaySet(mode) {
   _tabsDisplay = _TABS_MODES.includes(mode) ? mode : 'both';
+  try { localStorage.setItem('amux_tabs_display', _tabsDisplay); } catch (e) {}
   _tabsDisplayApply();
   try {
     await fetch(API + '/api/prefs', { method: 'POST', headers: {'Content-Type':'application/json'},
@@ -27421,8 +27435,11 @@ async function _tabsDisplaySet(mode) {
 function toggleTabsIcons() {   // header button: cycle both -> icons -> text
   _tabsDisplaySet(_TABS_MODES[(_TABS_MODES.indexOf(_tabsDisplay) + 1) % _TABS_MODES.length]);
 }
-if (document.body) _tabsDisplayLoad();
-else document.addEventListener('DOMContentLoaded', _tabsDisplayLoad);
+// Apply the cached choice synchronously (no flash of the default), then
+// reconcile with the server pref so the choice still roams across devices.
+function _tabsDisplayInit() { _tabsDisplayApply(); _tabsDisplayLoad(); }
+if (document.body) _tabsDisplayInit();
+else document.addEventListener('DOMContentLoaded', _tabsDisplayInit);
 
 function _offlineSettingsHTML() {
   const mb = _OFFLINE_MB_CHOICES.map(v =>
