@@ -2071,6 +2071,23 @@ status-CHANGE verbs (done, verified, review, backlog), not on this one." ;;
       echo "$result" | _board_outcome
       return $?
       ;;
+    assign)
+      # Sanctioned reassignment (AMUX-3450). The claim endpoint's 409 for a
+      # card owned by another worker used to say "reassign it first" while no
+      # CLI verb could — the documented escape was walkable only via a
+      # hand-rolled PATCH, which is ethos rule 6's unaudited back door. This
+      # verb IS that PATCH, attributed and with the outcome surfaced loudly.
+      local id="${1:-}" who="${2:-}"
+      [[ -n "$id" && -n "$who" ]] || die "Usage: amux board assign <ISSUE-ID> <worker>"
+      _board_id_guard "assign" "$id"
+      local result
+      result=$(curl -sk -X PATCH -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+        -d "{\"session\":\"$who\"}" \
+        "$AMUX_API/api/board/$id")
+      echo "$result" | _board_outcome "$id" "" "assigned to $who"
+      return $?
+      ;;
     import)
       # amux board import gh:owner/repo#N [--workspace W] [--project P]
       local gh_ref="${1:-}"; [[ -n "$gh_ref" ]] || die "Usage: amux board import gh:<owner>/<repo>#<number> [--workspace W] [--project P]"
@@ -2408,6 +2425,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    (--stdin/--file for the TITLE. Unknown flags are
                                     REFUSED, not folded into the title — AEAB-17.)
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
+  amux board assign <ID> <worker>  Reassign a card to a worker (the claim 409's sanctioned exit)
   amux board needsyou <ID> [ask]   Mark a card as blocked on the human (surfaces in Needs-you).
                                    A sign-in/login ask auto-gets a clickable resume link into
                                    this session's live browser view (Ethan clicks to sign in).

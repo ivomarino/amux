@@ -1695,16 +1695,20 @@ pub async fn get_item(State(state): State<AppState>, Path(id): Path<String>) -> 
     }
 }
 
-/// POST /api/board/{id}/claim — atomically take a `todo` card and start it.
+/// POST /api/board/{id}/claim — atomically take a `todo` or `backlog` card and
+/// start it.
 ///
 /// The assignment notifications tell every session to run `amux board claim
 /// <id>`, and the CLI has always POSTed here — but the route was never mounted,
 /// so the call hit the GET-only SPA catch-all (405), the CLI printed a good
 /// message and (pre-fix) exited 0, and the card was untouched (AMUX-3131, the
 /// AMUX-2140 class one layer down: the sanctioned instruction was theatre). It
-/// now runs the SAME operation auto-pickup uses (`claim_card`: compare-and-swap
-/// todo->doing, assign the claimer, emit `task.claimed` for the 24h re-claim
-/// cooldown), so a manual claim and an auto-pickup are one mechanism.
+/// now runs the SAME operation auto-pickup uses (`claim_card_from`:
+/// compare-and-swap ->doing, assign the claimer, emit `task.claimed` for the
+/// 24h re-claim cooldown), so a manual claim and an auto-pickup are one
+/// mechanism. Backlog is claimable HERE only (AMUX-3450): the CLI help always
+/// promised todo/backlog and a peer handover relied on it, but auto-pickup's
+/// CAS stays todo-only so parking a card mid-race still defeats the pickup.
 pub async fn claim_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1755,18 +1759,23 @@ pub async fn claim_item(
     };
     let owner = row.session.clone().unwrap_or_default().trim().to_string();
     match row.status.as_str() {
-        "todo" => {
+        "todo" | "backlog" => {
+            let from: &'static str = if row.status == "todo" { "todo" } else { "backlog" };
             if !owner.is_empty() && owner != session {
                 return (
                     StatusCode::CONFLICT,
                     Json(json!({
-                        "error": format!("card is assigned to '{owner}', not yours to claim — reassign it first"),
-                        "id": id, "status": "todo", "session": owner,
+                        // Name the sanctioned path (AMUX-3450): the old text said
+                        // "reassign it first" while no CLI verb could — ethos
+                        // rule 6's unwalkable escape, and it forced a raw PATCH.
+                        "error": format!("card is assigned to '{owner}', not yours to claim — the owner (or you, deliberately) can hand it over with: amux board assign {id} {session}"),
+                        "id": id, "status": from, "session": owner,
                     })),
                 )
                     .into_response();
             }
-            if crate::runtime_jobs::board_drive::claim_card(&state, &session, &id).await {
+            if crate::runtime_jobs::board_drive::claim_card_from(&state, &session, &id, from).await
+            {
                 (
                     StatusCode::OK,
                     Json(json!({
@@ -1775,12 +1784,12 @@ pub async fn claim_item(
                 )
                     .into_response()
             } else {
-                // Raced out of `todo` between the read above and the swap
-                // (owner closed it, or a peer claimed first).
+                // Raced out of the status we read between the read above and
+                // the swap (owner closed it, or a peer claimed first).
                 (
                     StatusCode::CONFLICT,
                     Json(json!({
-                        "error": "claim raced — the card left 'todo' between read and write; re-check its status",
+                        "error": format!("claim raced — the card left '{from}' between read and write; re-check its status"),
                         "id": id,
                     })),
                 )
@@ -1797,7 +1806,7 @@ pub async fn claim_item(
         other => (
             StatusCode::CONFLICT,
             Json(json!({
-                "error": format!("card is '{other}', not claimable — only a 'todo' card can be claimed (move it first: amux board todo {id})"),
+                "error": format!("card is '{other}', not claimable — only a 'todo' or 'backlog' card can be claimed (move it first: amux board todo {id})"),
                 "id": id, "status": other, "session": owner,
             })),
         )

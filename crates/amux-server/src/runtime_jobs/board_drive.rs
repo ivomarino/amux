@@ -3034,6 +3034,22 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
 /// of these races is visible (the API being down and pickup running off a
 /// stale view is the same failure this closes — the write sees the real row).
 pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
+    claim_card_from(state, session, card, "todo").await
+}
+
+/// `claim_card` with the expected PRIOR status as a parameter. Auto-pickup and
+/// every drive-loop path stay on `claim_card` ("todo"): a card parked
+/// todo->backlog mid-race must DEFEAT a racing pickup, so widening that CAS to
+/// backlog would let pickup steal deliberately parked work. Only the MANUAL
+/// claim endpoint passes "backlog" — an explicit claim of a named parked card
+/// is a deliberate act (AMUX-3450: the CLI help promised todo/backlog claim,
+/// the server refused backlog, and a peer's handover relied on the promise).
+pub async fn claim_card_from(
+    state: &AppState,
+    session: &str,
+    card: &str,
+    from: &'static str,
+) -> bool {
     let card_s = card.to_string();
     // Assign the claimer as part of the swap. For auto-pickup this is a no-op
     // (the card is already `i.session=lane`), but it makes a MANUAL claim
@@ -3058,15 +3074,15 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
             // caller is supposed to prevent) visible in the card's own log.
             let prior_owner: String = conn
                 .query_row(
-                    "SELECT COALESCE(session,'') FROM issues WHERE id=?1 AND status='todo'",
-                    rusqlite::params![card_s],
+                    "SELECT COALESCE(session,'') FROM issues WHERE id=?1 AND status=?2",
+                    rusqlite::params![card_s, from],
                     |r| r.get(0),
                 )
                 .optional()?
                 .unwrap_or_default();
             let n = conn.execute(
-                "UPDATE issues SET status='doing', session=?1, updated=?2 WHERE id=?3 AND status='todo'",
-                rusqlite::params![session_s, now, card_s],
+                "UPDATE issues SET status='doing', session=?1, updated=?2 WHERE id=?3 AND status=?4",
+                rusqlite::params![session_s, now, card_s, from],
             )?;
             if n == 0 {
                 // Not todo any more (closed, discarded, already doing, or gone):
@@ -3093,6 +3109,10 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
                      if you see this, a dispatch path let a lane claim another lane's card"
                 );
                 format!("Auto-picked up from queue by {session_s} (reassigned from {prior_owner})")
+            } else if from == "backlog" {
+                // A backlog card is never queue-dispatched; this line only ever
+                // means a deliberate manual claim, so say that.
+                format!("Claimed from backlog by {session_s}")
             } else {
                 format!("Auto-picked up from queue by {session_s}")
             };
@@ -3109,7 +3129,8 @@ pub async fn claim_card(state: &AppState, session: &str, card: &str) -> bool {
     if !claimed {
         tracing::info!(
             target: "amux::board_drive", %session, %card,
-            "auto-pickup NOT claimed — card left 'todo' between select and claim \
+            %from,
+            "claim NOT applied — card left the expected status between select and claim \
              (raced to a terminal/doing state, or store unreadable); prompt NOT dispatched"
         );
         return false;
@@ -3956,6 +3977,65 @@ mod tests {
         assert_eq!(status_of("T-1"), "doing");
         // And a second claim of the now-doing card refuses (idempotent).
         assert!(!claim_card(&state, "lane", "T-1").await, "re-claiming a doing card must refuse");
+    }
+
+    /// AMUX-3450: the CLI help always promised "claim a todo/backlog card";
+    /// the server refused backlog, and a peer's handover (AF-127) relied on
+    /// the promise. The MANUAL claim path (`claim_card_from` "backlog") takes
+    /// a parked card; the auto-pickup path (`claim_card` = "todo") must still
+    /// REFUSE one, because parking a card todo->backlog mid-race is exactly
+    /// how an owner defeats a racing pickup — widening that CAS would let
+    /// pickup steal deliberately parked work.
+    #[tokio::test]
+    async fn backlog_claims_manually_but_never_via_the_todo_cas() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let state = crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
+                     VALUES ('B-1','t','','backlog','lane',100,100,'agent','code')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let read_row = |col: &str| -> String {
+            store
+                .read()
+                .unwrap()
+                .query_row(
+                    &format!("SELECT COALESCE({col},'') FROM issues WHERE id='B-1'"),
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap()
+        };
+        assert!(
+            !claim_card(&state, "lane", "B-1").await,
+            "the todo CAS must refuse a parked card"
+        );
+        assert_eq!(read_row("status"), "backlog", "the refused claim must leave it parked");
+        assert!(
+            claim_card_from(&state, "lane", "B-1", "backlog").await,
+            "an explicit manual claim of a named backlog card must work"
+        );
+        assert_eq!(read_row("status"), "doing");
+        // Mechanism check, deliberately last (AF-125 ordering): a backlog card
+        // is never queue-dispatched, so "Auto-picked up from queue" here would
+        // be a false statement in the card's own log.
+        let log = read_row("log");
+        assert!(
+            log.contains("Claimed from backlog by lane"),
+            "the card log must record the claim as what it was: {log}"
+        );
     }
 
     /// AF-79 ("auto-pickup dispatches cards owned by another session"). The
