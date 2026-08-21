@@ -2511,3 +2511,64 @@ FIX: 2441c5e. Spinner frames are recognized by SHAPE (verb + … + the
   generating-shaped line whose glyph no rule classified, a WARN names the
   glyph (once per process), so the NEXT spinner variant costs one log line
   instead of another screenshot. Tests rebuild the exact screenshot frame.
+
+## A wedged disk scan could not say whether the walk or the database was stuck
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: desktop
+CARD: DESKT-15
+SYMPTOM: A reclaim scan froze at 1,087 directories and sat there for 35
+  minutes until a builder restart reaped it. `dirs_walked` stops moving in
+  exactly the same way whether `read_dir` is blocked in the kernel or the
+  SQLite flush is blocked on the write lock, and the row carried no phase, so
+  the two hypotheses were indistinguishable from outside the process. Worse,
+  the reaper I had written to make dead scans legible was clearing
+  `current_path` as it marked them interrupted, so the finished row said the
+  server had restarted and refused to say where. The one field that would have
+  answered the question in a second was being deleted by the code whose stated
+  job was to expose the failure.
+COST: About 40 minutes, most of it re-walking the home directory by hand with
+  a stopwatch to find what the scan already knew and had thrown away. The
+  culprit turned out to be one directory: `~/Library/Mobile Documents` never
+  returns from readdir on this machine (90s, zero entries, still blocked),
+  while `stat` on it answers instantly with the same st_dev as $HOME, so the
+  walker's cross-mount guard had no reason to skip it.
+FIX: Position and phase are published per directory BEFORE the syscall that
+  can block, separately from the throttled write that persists them; the
+  reaper preserves both and names them in its error text; a watchdog marks a
+  45s stall terminal and WARNs to server-rs.log BEFORE it touches the store,
+  so a stall in the write lock still reports rather than hanging where the
+  walker did. Stalled directories are recorded and skipped by later scans,
+  with a Re-include button so the exemption is not a one-way ratchet.
+
+---
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux
+AREA: instruments
+CARD: MG-1485
+SYMPTOM: install-hooks.sh installed every guard into $target/.git/hooks while
+  its own pre-push check resolved core.hooksPath — split-brain in one function.
+  In mixpeek (hooksPath=.githooks) every refresh landed in a directory git
+  never consults: the MG-1485 resurrection guard was live in the repo where it
+  was authored and DARK in the repo where the incident happened, and mixpeek's
+  amux-staged-guard was missing from .githooks entirely, so its pre-commit
+  shim fail-opened silently the whole time. My own verification compounded it:
+  I grepped .git/hooks and reported "mixpeek verified carrying the check" —
+  reading the dead copy as proof. mixpeek-frustrations caught it by running
+  the test suite against the copy that RUNS (which failed exactly the two new
+  cases) and landed the merge themselves (mixpeek 3e692f3c6e).
+COST: A false "verified" shipped to a peer and to a closed card; the incident
+  repo unprotected for the window; a third hook (staged-guard) dark in mixpeek
+  for its whole life there.
+FIX: The installer resolves the effective hooks dir first and installs there.
+  A custom hooksPath dir is tracked (repo-owned), so divergent files are NEVER
+  overwritten — a blind copy would have destroyed the peer's merge. Drift is
+  classified by the guard's own `# guard-features:` tokens: a copy missing a
+  canonical feature WARNs as STALE (the dark-guard shape, exit 1); one that
+  differs but carries every feature reads as a deliberate local merge and is
+  left alone. Missing files are installed with a commit-it note. Verified
+  against mixpeek live: resurrection copy recognized as a merge, staged-guard
+  installed into the effective dir, fleet census shows zero stale live copies.

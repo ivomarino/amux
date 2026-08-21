@@ -1,4 +1,11 @@
 #!/usr/bin/env bash
+# guard-features: resurrection
+# (Feature tokens for install-hooks.sh: a repo with core.hooksPath tracks its
+#  own vendored copy, which may deliberately diverge. The installer greps that
+#  copy for each token to tell STALE — dark in the repo where it runs, the
+#  MG-1485 shape — from a local merge that carries everything. Add a token
+#  here whenever the guard learns a new enforcement.)
+#
 # append-only-push-guard — refuse to publish a commit whose copy of a guarded
 # shared file DROPS lines the remote already has (MG-1483, 2026-08-19).
 #
