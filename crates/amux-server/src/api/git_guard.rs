@@ -1397,6 +1397,10 @@ struct Envelope {
     /// clear", and the v2 hook says so out loud rather than exiting 0 silently.
     undecided: Option<String>,
     hook_outdated: bool,
+    /// AF-127: the row id of this verdict in guard_verdicts. The v6 hook
+    /// carries it in its block marker so the eventual outcome report attaches
+    /// to THIS decision by id rather than by a nearest-match guess.
+    verdict_id: Option<i64>,
 }
 
 impl Envelope {
@@ -1413,6 +1417,7 @@ impl Envelope {
             "reason": self.undecided.unwrap_or_default(),
             "degraded": self.degraded,
             "hook_outdated": self.hook_outdated,
+            "verdict_id": self.verdict_id,
         })
     }
 }
@@ -2021,12 +2026,297 @@ pub async fn staged_guard_inner(
         }
     }
 
+    // AF-127: record the verdict as a ROW, not only a log line. The guard
+    // logged BLOCK/ALLOW and never what happened next, so a true positive
+    // (audited override) and a false positive (reflexive ack) were
+    // byte-identical and no guard change could be measured against a
+    // false-positive rate. One row per verdict is the denominator; the
+    // outcome half is filled by POST /api/git/guard-outcome.
+    let mut verdict_id: Option<i64> = None;
+    if let Some(st) = state.as_ref() {
+        let vk = if v.foreign.is_empty() { "allow" } else { "block" };
+        let paths_json = serde_json::to_string(
+            &v.foreign.iter().filter_map(|f| f["path"].as_str()).take(40).collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
+        let mut prov: HashMap<String, i64> = HashMap::new();
+        for f in &v.foreign {
+            *prov
+                .entry(f["provenance"].as_str().unwrap_or("inferred").to_string())
+                .or_insert(0) += 1;
+        }
+        let prov_json = serde_json::to_string(&prov).unwrap_or_default();
+        let (n_f, n_s, n_u) =
+            (v.foreign.len() as i64, v.shared.len() as i64, v.unclaimed.len() as i64);
+        let (sess_c, dir_c, vk_s) = (session.clone(), wd_root.clone(), vk.to_string());
+        let id_slot = std::sync::Arc::new(Mutex::new(None::<i64>));
+        let id_w = id_slot.clone();
+        let (now_ts, gv) = (now, guard_version);
+        // Failure to record must never fail the guard call — the verdict the
+        // hook is waiting on is the product; the row is the instrument.
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT INTO guard_verdicts (ts, session, dir, verdict, n_foreign, n_shared, \
+                     n_unclaimed, paths, provenance, guard_version) \
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+                    rusqlite::params![
+                        now_ts, sess_c, dir_c, vk_s, n_f, n_s, n_u, paths_json, prov_json, gv
+                    ],
+                )?;
+                *id_w.lock().unwrap() = Some(conn.last_insert_rowid());
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        verdict_id = *id_slot.lock().unwrap();
+    }
+
     (
         StatusCode::OK,
         Json(
-            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, ..Default::default() }
+            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, verdict_id, ..Default::default() }
                 .json(),
         ),
+    )
+}
+
+/// POST /api/git/guard-outcome — the hook's follow-up report (AF-127): what
+/// resolved a block. The one design rule, from amux-frustrations' correction
+/// and accepted before a line was written: `proceeded` comes from the
+/// DECLARED override (AMUX_VERIFIED_SOLO vs AMUX_ALLOW_FOREIGN — different
+/// claims the hook actually saw set), NEVER from correlation. Inferring it
+/// from a later commit's shape is the D1 scraper pattern and bundles the two
+/// opposite cases this table exists to separate. `trimmed`/`reallowed` are
+/// reported by the hook from a direct comparison of the next staged set
+/// (basis=observed); aborted is never written at all — it is computed at
+/// read time from unresolved-and-old rows (/api/debug/guard-outcomes).
+pub async fn guard_outcome(
+    axum::extract::State(state): axum::extract::State<super::AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> (StatusCode, axum::Json<Value>) {
+    let session = super::alerts::hdr_worker(&headers);
+    if session.is_empty() || session == "api-anonymous" {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "X-Amux-Session required — an unattributed outcome audits nothing"})),
+        );
+    }
+    let s = |k: &str| body.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let resolution = s("resolution");
+    if !matches!(resolution.as_str(), "proceeded" | "trimmed" | "reallowed") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": format!("resolution must be proceeded|trimmed|reallowed, got {resolution:?}"),
+            })),
+        );
+    }
+    let override_used = s("override");
+    let basis = s("basis");
+    // The cell everyone's false-positive rate depends on must be the honestly
+    // reported one: a `proceeded` without the declared override is exactly the
+    // inference this endpoint exists to refuse.
+    if resolution == "proceeded"
+        && !matches!(override_used.as_str(), "allow_foreign" | "verified_solo")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "error": "proceeded requires override = allow_foreign|verified_solo — \
+                          it is the declared claim, not a correlation guess",
+            })),
+        );
+    }
+    if !matches!(basis.as_str(), "declared" | "observed") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "basis must be declared|observed (inferred is server-assigned)"})),
+        );
+    }
+    let verdict_id = body.get("verdict_id").and_then(Value::as_i64);
+    let dir = s("dir");
+    if verdict_id.is_none() && dir.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "need verdict_id or dir (for the nearest unresolved block)"})),
+        );
+    }
+    let elapsed = body.get("elapsed_s").and_then(Value::as_f64);
+    let now = now_epoch();
+    let (sess_c, res_c, ov_c, basis_c) =
+        (session.clone(), resolution.clone(), override_used.clone(), basis.clone());
+    let linked = std::sync::Arc::new(Mutex::new((0usize, String::new())));
+    let linked_w = linked.clone();
+    let write = state.store.write_async(move |conn| {
+        use rusqlite::OptionalExtension;
+        let ov: Option<&str> = (!ov_c.is_empty()).then_some(ov_c.as_str());
+        // Resolve to an id first (both branches), and only the reporter's own
+        // unresolved row — a peer must not be able to close someone else's
+        // block. Without an id (marker lost, or the block predates the v6
+        // hook) the newest unresolved block for session+dir inside the window
+        // is taken, labeled 'nearest' — the one server-assigned inference.
+        let (target_id, link): (Option<i64>, &str) = if let Some(id) = verdict_id {
+            (
+                conn.query_row(
+                    "SELECT id FROM guard_verdicts WHERE id=?1 AND session=?2 \
+                     AND resolution IS NULL",
+                    rusqlite::params![id, sess_c],
+                    |r| r.get(0),
+                )
+                .optional()?,
+                "marker",
+            )
+        } else {
+            (
+                conn.query_row(
+                    "SELECT id FROM guard_verdicts WHERE session=?1 AND dir=?2 \
+                     AND verdict='block' AND resolution IS NULL AND ts > ?3 \
+                     ORDER BY ts DESC LIMIT 1",
+                    rusqlite::params![sess_c, dir, now - OBSERVED_WINDOW_S],
+                    |r| r.get(0),
+                )
+                .optional()?,
+                "nearest",
+            )
+        };
+        let mut n = 0usize;
+        if let Some(tid) = target_id {
+            n = conn.execute(
+                "UPDATE guard_verdicts SET resolution=?1, override_used=?2, outcome_basis=?3, \
+                 outcome_ts=?4, outcome_elapsed_s=?5, outcome_link=?6 WHERE id=?7",
+                rusqlite::params![res_c, ov, basis_c, now, elapsed, link, tid],
+            )?;
+            // Close the episode's earlier retry-blocks as 'superseded' —
+            // each retry inserts a fresh block row, and leaving them
+            // unresolved would inflate the inferred-aborted cell with rows
+            // whose episode demonstrably ENDED. Same session, same dir (read
+            // off the attached row so the by-id branch needs no dir), older
+            // id, inside the window. Labeled inferred: this is bookkeeping
+            // derived from the attach, not a report.
+            conn.execute(
+                "UPDATE guard_verdicts SET resolution='superseded', outcome_basis='inferred', \
+                 outcome_ts=?1, outcome_link='episode' \
+                 WHERE session=?2 AND dir=(SELECT dir FROM guard_verdicts WHERE id=?3) \
+                 AND verdict='block' AND resolution IS NULL AND id < ?3 AND ts > ?4",
+                rusqlite::params![now, sess_c, tid, now - OBSERVED_WINDOW_S],
+            )?;
+        }
+        *linked_w.lock().unwrap() = (n, link.to_string());
+        Ok(crate::db::WriteOutcome { applied: n > 0, events: vec![] })
+    });
+    match write.await {
+        Ok(_) => {
+            let (n, link) = linked.lock().unwrap().clone();
+            // Countable at the source (rule 4): every outcome is a log line,
+            // so the resolution mix is a grep before it is a query.
+            tracing::info!(
+                target: "staged_guard",
+                "[staged-guard/AF-127] outcome {} (basis={}, override={}) from {} — {} ({} row)",
+                resolution, basis,
+                if override_used.is_empty() { "-" } else { &override_used },
+                session,
+                if n > 0 { "attached" } else { "NO OPEN VERDICT MATCHED" },
+                link,
+            );
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": true,
+                    "attached": n > 0,
+                    "link": link,
+                    // n == 0 is a real answer, said plainly: the hook's ledger
+                    // records it rather than reading ok:true as attached.
+                    "note": if n > 0 { "" } else { "no unresolved block matched — marker stale, or the verdict predates guard_verdicts" },
+                })),
+            )
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error": e.to_string()})))
+        }
+    }
+}
+
+/// GET /api/debug/guard-outcomes?since_h=24 — the read the card demands: the
+/// verdict/outcome mix, computable in both directions from day one. `aborted`
+/// is COMPUTED here (unresolved block older than the guard window), never
+/// written into a row — the one cell that would otherwise need a sweep.
+pub async fn guard_outcomes_debug(
+    axum::extract::State(state): axum::extract::State<super::AppState>,
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> (StatusCode, axum::Json<Value>) {
+    let since_h: f64 = q.get("since_h").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let now = now_epoch();
+    let cutoff = now - since_h * 3600.0;
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": e.to_string()})),
+            )
+        }
+    };
+    let count = |sql: &str, p: &[&dyn rusqlite::ToSql]| -> i64 {
+        conn.query_row(sql, p, |r| r.get(0)).unwrap_or(-1)
+    };
+    let c = &cutoff as &dyn rusqlite::ToSql;
+    let abort_edge = now - OBSERVED_WINDOW_S;
+    let a = &abort_edge as &dyn rusqlite::ToSql;
+    let mut recent = Vec::new();
+    if let Ok(mut st) = conn.prepare(
+        "SELECT id, ts, session, dir, verdict, n_foreign, resolution, override_used, \
+         outcome_basis, outcome_link, outcome_elapsed_s FROM guard_verdicts \
+         WHERE ts > ?1 AND verdict='block' ORDER BY ts DESC LIMIT 20",
+    ) {
+        let rows = st.query_map([cutoff], |r| {
+            Ok(json!({
+                "id": r.get::<_, i64>(0)?,
+                "ts": r.get::<_, f64>(1)?,
+                "session": r.get::<_, String>(2)?,
+                "dir": r.get::<_, String>(3)?,
+                "verdict": r.get::<_, String>(4)?,
+                "n_foreign": r.get::<_, i64>(5)?,
+                "resolution": r.get::<_, Option<String>>(6)?,
+                "override": r.get::<_, Option<String>>(7)?,
+                "basis": r.get::<_, Option<String>>(8)?,
+                "link": r.get::<_, Option<String>>(9)?,
+                "elapsed_s": r.get::<_, Option<f64>>(10)?,
+            }))
+        });
+        if let Ok(rows) = rows {
+            recent = rows.flatten().collect();
+        }
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "since_h": since_h,
+            "verdicts": {
+                "allow": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='allow'", &[c]),
+                "block": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block'", &[c]),
+            },
+            "block_outcomes": {
+                "proceeded_verified_solo": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='proceeded' AND override_used='verified_solo'", &[c]),
+                "proceeded_allow_foreign": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='proceeded' AND override_used='allow_foreign'", &[c]),
+                "trimmed": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='trimmed'", &[c]),
+                "reallowed": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='reallowed'", &[c]),
+                "superseded": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution='superseded'", &[c]),
+                // COMPUTED, labeled with its own uncertainty: no report and
+                // past the window. A pending block (recent, unresolved) is a
+                // different cell — collapsing them would manufacture aborts
+                // out of every block younger than the window.
+                "aborted_or_walked_away_inferred": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution IS NULL AND ts < ?2", &[c, a]),
+                "pending": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='block' AND resolution IS NULL AND ts >= ?2", &[c, a]),
+            },
+            "links": {
+                "marker": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND outcome_link='marker'", &[c]),
+                "nearest": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND outcome_link='nearest'", &[c]),
+            },
+            "recent_blocks": recent,
+            "note": "proceeded cells are DECLARED (the committer's own override env var); trimmed/reallowed are hook-OBSERVED staged-set comparisons; aborted is inferred at read time and named so. -1 = query failed, never silently 0.",
+        })),
     )
 }
 
@@ -2317,6 +2607,103 @@ mod tests {
         // Junk rows (no path, wrong types, empty) are skipped, not defaulted.
         let body = serde_json::json!({"paths": [{"mtime": 1.0}, 42, "", {"path": "  "}]});
         assert!(parse_observed_reports(&body, now).is_empty());
+    }
+
+    /// AF-127, the design's two load-bearing refusals plus the episode
+    /// bookkeeping, exercised through the real handler:
+    /// - `proceeded` without a declared override is REJECTED — inferring it
+    ///   is the D1 scraper pattern and bundles the audited override with the
+    ///   reflexive ack, the two cases this table exists to separate.
+    /// - a peer cannot close someone else's block.
+    /// - attaching an outcome closes the episode's older retry-blocks as
+    ///   'superseded', so they cannot inflate the inferred-aborted cell.
+    #[tokio::test]
+    async fn guard_outcome_takes_declared_overrides_and_closes_the_episode() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let mk_state = || crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let now = now_epoch();
+        store
+            .write(move |conn| {
+                // alice's retry episode (1 then 2), and bob's separate block.
+                for (id, sess, d) in
+                    [(1, "alice", "/repo"), (2, "alice", "/repo"), (3, "bob", "/other")]
+                {
+                    conn.execute(
+                        "INSERT INTO guard_verdicts (id, ts, session, dir, verdict, n_foreign, guard_version) \
+                         VALUES (?1, ?2, ?3, ?4, 'block', 1, 6)",
+                        rusqlite::params![id, now - 100.0 + id as f64, sess, d],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let hdrs = |sess: &str| {
+            let mut h = HeaderMap::new();
+            h.insert("x-amux-session", sess.parse().unwrap());
+            h
+        };
+        let call = |sess: &str, body: Value| {
+            let st = mk_state();
+            let h = hdrs(sess);
+            async move {
+                guard_outcome(axum::extract::State(st), h, axum::Json(body)).await
+            }
+        };
+        // Refusal 1: proceeded without the declared override.
+        let (code, _) = call(
+            "alice",
+            json!({"resolution": "proceeded", "basis": "declared", "verdict_id": 2}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "proceeded must carry the declared override");
+        // Refusal 2: bob cannot close alice's row.
+        let (code, body) = call(
+            "bob",
+            json!({"resolution": "proceeded", "basis": "declared",
+                   "override": "verified_solo", "verdict_id": 2}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.0["attached"], false, "a peer must not close someone else's block");
+        // The real attach: alice, by id, SOLO declared.
+        let (code, body) = call(
+            "alice",
+            json!({"resolution": "proceeded", "basis": "declared",
+                   "override": "verified_solo", "verdict_id": 2, "elapsed_s": 42.0}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.0["attached"], true);
+        assert_eq!(body.0["link"], "marker");
+        let row = |id: i64| -> (Option<String>, Option<String>, Option<String>) {
+            store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT resolution, override_used, outcome_link FROM guard_verdicts WHERE id=?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap()
+        };
+        assert_eq!(
+            row(2),
+            (Some("proceeded".into()), Some("verified_solo".into()), Some("marker".into())),
+            "the declared override is the record — SOLO and ALLOW_FOREIGN are different claims"
+        );
+        assert_eq!(
+            row(1).0,
+            Some("superseded".into()),
+            "the episode's earlier retry-block must close as superseded, not linger toward aborted"
+        );
+        assert_eq!(row(3).0, None, "bob's unrelated block is untouched");
     }
 
     /// AMUX-3446, rebuilt from the incident's own bytes: my staged diff for

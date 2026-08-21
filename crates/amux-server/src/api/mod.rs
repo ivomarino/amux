@@ -301,6 +301,11 @@ pub fn router(state: AppState) -> Router {
         // moved during a command, reported rather than parsed, so a heredoc
         // or an extensionless path cannot hide a write from attribution.
         .route("/api/git/observed-edits", axum::routing::post(git_guard::observed_edits))
+        // AF-127: the per-verdict OUTCOME instrument. The guard records its
+        // verdict as a row; the hook reports what resolved a block (declared
+        // override / observed trim); the debug read computes the mix.
+        .route("/api/git/guard-outcome", axum::routing::post(git_guard::guard_outcome))
+        .route("/api/debug/guard-outcomes", axum::routing::get(git_guard::guard_outcomes_debug))
         // Client diagnostic beacons (AR-128): the SPA sends geometry/tap
         // traces for mobile layout debugging.
         //

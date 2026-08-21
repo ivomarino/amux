@@ -37,12 +37,12 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
-# (`grep -L 'GUARD_VERSION = 5' */.git/hooks/amux-staged-guard`), so a tracked
+# (`grep -L 'GUARD_VERSION = 6' */.git/hooks/amux-staged-guard`), so a tracked
 # file that changed without moving this number makes every stale installed copy
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 5
+GUARD_VERSION = 6
 
 
 def amux_base_url():
@@ -171,6 +171,81 @@ def report_unenforced_backlog(w, sess):
         pass
 
 
+# ---------------------------------------------------------------------------
+# AF-127: per-verdict OUTCOME reporting. The guard's verdict rows record
+# BLOCK/ALLOW; these helpers report what happened NEXT, which is the half no
+# instrument carried — a true positive (audited override) and a false positive
+# (reflexive ack) were byte-identical. `proceeded` is DECLARED (the override
+# env var the operator actually set); trimmed/reallowed are OBSERVED (this
+# hook compares the next staged set itself); aborted is never reported at all
+# — the server computes it from unresolved-and-old rows.
+def _marker_path(sess, top):
+    import hashlib
+    h = hashlib.sha256(top.encode()).hexdigest()[:12]
+    d = os.path.join(os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),
+                     "hooks", "state")
+    try:
+        os.makedirs(d, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(d, "guard-block-%s-%s.json" % (sess, h))
+
+
+def _read_marker(sess, top):
+    try:
+        with open(_marker_path(sess, top)) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+
+def _write_marker(sess, top, verdict_id, paths):
+    try:
+        with open(_marker_path(sess, top), "w") as fh:
+            json.dump({"verdict_id": verdict_id, "ts": time.time(),
+                       "dir": top, "paths": paths}, fh)
+    except Exception:
+        pass
+
+
+def _clear_marker(sess, top):
+    try:
+        os.remove(_marker_path(sess, top))
+    except Exception:
+        pass
+
+
+def _post_outcome(sess, top, resolution, basis, override=None,
+                  verdict_id=None, elapsed=None):
+    """Fire-and-forget outcome report. Failure must never touch the commit;
+    a failed send is appended to the local ledger so the data point is not
+    silently lost (same pattern as the unenforced ledger)."""
+    body = {"resolution": resolution, "basis": basis, "dir": top}
+    if override:
+        body["override"] = override
+    if verdict_id is not None:
+        body["verdict_id"] = verdict_id
+    if elapsed is not None:
+        body["elapsed_s"] = round(elapsed, 1)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(
+            amux_base_url() + "/api/git/guard-outcome",
+            data=json.dumps(body).encode(), method="POST",
+            headers={"Content-Type": "application/json", "X-Amux-Session": sess})
+        with urllib.request.urlopen(req, timeout=3, context=ctx) as r:
+            d = json.loads(r.read().decode())
+        if not d.get("attached"):
+            # A real answer, kept: pre-emptive override with no open block,
+            # or a verdict predating guard_verdicts.
+            record_unenforced("outcome-unattached: %s" % (d.get("note") or "")[:80],
+                              sess, [])
+    except Exception as e:
+        record_unenforced("outcome-send-failed: %r" % (e,), sess, [])
+
+
 def main():
     sess = os.environ.get("AMUX_SESSION", "")
     # AMUX_VERIFIED_SOLO is the HONEST half of the same exit (AF-26). Both skip the
@@ -179,7 +254,27 @@ def main():
     # "I read the staged diff and none of it is theirs". Clearing a FALSE positive
     # previously required claiming the first, which is ethos rule 3: a constraint with no
     # truthful path forward in a legitimate state.
-    if not sess or os.environ.get("AMUX_ALLOW_FOREIGN") or os.environ.get("AMUX_VERIFIED_SOLO"):
+    if not sess:
+        return 0
+    _ov = ("allow_foreign" if os.environ.get("AMUX_ALLOW_FOREIGN")
+           else "verified_solo" if os.environ.get("AMUX_VERIFIED_SOLO") else None)
+    if _ov:
+        # AF-127: the override IS the outcome — the one honestly-reported cell.
+        # Which var was set is a different claim in each case, and recording
+        # only "proceeded" would throw that distinction away (the reporter's
+        # own worked example: e823ae3, blocked, audited, chose SOLO because
+        # SOLO was the true statement).
+        try:
+            _top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                                  capture_output=True, text=True,
+                                  timeout=5).stdout.strip() or os.getcwd()
+            _m = _read_marker(sess, _top) or {}
+            _el = (time.time() - _m["ts"]) if _m.get("ts") else None
+            _post_outcome(sess, _top, "proceeded", "declared", override=_ov,
+                          verdict_id=_m.get("verdict_id"), elapsed=_el)
+            _clear_marker(sess, _top)
+        except Exception:
+            pass
         return 0
     w = sys.stderr.write
     try:
@@ -390,7 +485,18 @@ def main():
           "one, it is a peer's in-flight hunk riding your git add — stage "
           "per-hunk instead (git add -p %s).\n" % _ua.get("path", ""))
     foreign = d.get("foreign") or []
+    _m = _read_marker(sess, top)
     if not foreign:
+        if _m:
+            # AF-127, the OBSERVED cells: a prior block in this repo resolved
+            # without an override. Which way is a fact this hook can read
+            # directly off the staged set — no correlation, no guessing.
+            _prev = set(_m.get("paths") or [])
+            _res = "trimmed" if not (_prev & set(paths)) else "reallowed"
+            _el = (time.time() - _m["ts"]) if _m.get("ts") else None
+            _post_outcome(sess, top, _res, "observed",
+                          verdict_id=_m.get("verdict_id"), elapsed=_el)
+            _clear_marker(sess, top)
         return 0
     w("\namux staged-guard: COMMIT BLOCKED — staged files were edited by "
       "OTHER amux sessions sharing this checkout:\n\n")
@@ -420,6 +526,11 @@ def main():
     w("\nThen take the exit that is TRUE:\n"
       "  AMUX_ALLOW_FOREIGN=1 git commit ...   # yes, their work is in it, and I mean to ship it\n"
       "  AMUX_VERIFIED_SOLO=1 git commit ...   # I checked the staged diff: none of it is theirs\n\n")
+    # AF-127: anchor the episode. The marker carries THIS verdict's row id so
+    # the eventual outcome attaches by id; on a retry-block the marker moves to
+    # the newest verdict and the server closes the older row as superseded.
+    _write_marker(sess, top, d.get("verdict_id"),
+                  [f.get("path", "") for f in foreign])
     return 1
 
 

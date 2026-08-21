@@ -156,6 +156,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0026_reclaim_skipped",
         sql: include_str!("../../migrations/0026_reclaim_skipped.sql"),
     },
+    Migration {
+        version: 27,
+        name: "0027_guard_verdicts",
+        sql: include_str!("../../migrations/0027_guard_verdicts.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

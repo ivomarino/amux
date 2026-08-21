@@ -998,6 +998,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // `except: return 0` hid the 405, so the only visible symptom was silence.
     RouteEntry { path: "/api/git/staged-guard", methods: &["POST"] },
     RouteEntry { path: "/api/git/observed-edits", methods: &["POST"] },
+    RouteEntry { path: "/api/git/guard-outcome", methods: &["POST"] },
+    RouteEntry { path: "/api/debug/guard-outcomes", methods: &["GET"] },
     RouteEntry { path: "/api/sessions/{name}", methods: ANY },
     RouteEntry { path: "/api/sessions/{name}/{*verb}", methods: ANY },
     RouteEntry { path: "/api/identity", methods: &["GET"] },
