@@ -2717,6 +2717,48 @@ mod tests {
             "the episode's earlier retry-block must close as superseded, not linger toward aborted"
         );
         assert_eq!(row(3).0, None, "bob's unrelated block is untouched");
+
+        // Both clauses of the by-id attach query, pinned (amux-frustrations'
+        // second sweep: dropping EITHER passed the whole 1171-test suite,
+        // leaving the stale-marker guard documented-but-unenforced — the
+        // comment on the query was quietly doing a test's job).
+        //
+        // Clause 1, `AND verdict='block'`: an id from a stale marker must not
+        // close an ALLOW row that happens to share it.
+        store
+            .write(move |conn| {
+                conn.execute(
+                    "INSERT INTO guard_verdicts (id, ts, session, dir, verdict, guard_version) \
+                     VALUES (4, ?1, 'alice', '/repo', 'allow', 6)",
+                    rusqlite::params![now_epoch() - 10.0],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let (code, body) = call(
+            "alice",
+            json!({"resolution": "proceeded", "basis": "declared",
+                   "override": "verified_solo", "verdict_id": 4}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.0["attached"], false, "an allow row must never take an outcome by id");
+        assert_eq!(row(4).0, None, "the allow row stays outcome-free");
+        // Clause 2, `AND resolution IS NULL`: a resolved block must not be
+        // closed twice — a late or duplicate report must not overwrite the
+        // outcome that already attached.
+        let (code, body) = call(
+            "alice",
+            json!({"resolution": "trimmed", "basis": "observed", "verdict_id": 2}),
+        )
+        .await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(body.0["attached"], false, "a resolved block must refuse a second outcome");
+        assert_eq!(
+            row(2),
+            (Some("proceeded".into()), Some("verified_solo".into()), Some("marker".into())),
+            "the first outcome survives — a duplicate report must not rewrite history"
+        );
     }
 
     /// AMUX-3446, rebuilt from the incident's own bytes: my staged diff for
