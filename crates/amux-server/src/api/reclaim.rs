@@ -109,11 +109,30 @@ fn cancel_registry() -> &'static Mutex<HashMap<String, Arc<AtomicBool>>> {
 
 // ── where the walk thread is, and what it is doing there ─────────────────────
 
-/// A scan stalled for longer than this is not slow, it is blocked: the walk
-/// sleeps 1ms every 64 directories and flushes every 700ms, so on the worst
-/// directory this machine has produced, nothing legitimately goes quiet for
-/// three quarters of a minute.
-const STALL_SECS: u64 = 45;
+/// Quiet for this long is worth a log line. Nothing more.
+///
+/// The first version treated 45s as proof of a block and ended the scan on it.
+/// Its first production run stalled on `~/Downloads` and permanently exempted
+/// it — a directory that answers `readdir` in 2 seconds with 318 entries, and
+/// one of the places a cleanup scan most needs to look. The threshold was below
+/// the baseline: this machine runs ~50 agent sessions at load 95, and the scan
+/// is itself competing for the disk it is measuring, so quiet for a minute is
+/// contention, not a hang.
+const STALL_WARN_SECS: u64 = 45;
+
+/// Quiet for THIS long is a block, and the scan ends rather than spinning.
+///
+/// The discriminator is duration, because it is what actually separates the two
+/// cases: a wedged FileProvider root returns nothing ever (`~/Library/Mobile
+/// Documents` gave zero entries in 90s and was still blocked), while a merely
+/// slow directory returns. Five minutes of zero movement on ONE directory is
+/// not a load spike.
+const STALL_ABORT_SECS: u64 = 300;
+
+/// A directory is only routed around after it has hung this many separate
+/// scans. One observation is an anecdote, and the cost of believing it is a
+/// permanent hole in the scan that nothing announces.
+const STALL_HITS_TO_SKIP: i64 = 2;
 
 /// The walk thread's position, published once per directory.
 ///
@@ -230,8 +249,15 @@ fn load_skips(store: &crate::db::SharedStore) -> std::collections::HashSet<PathB
 
     let mut out = std::collections::HashSet::new();
     if let Ok(conn) = store.read() {
-        if let Ok(mut stmt) = conn.prepare("SELECT path FROM reclaim_skipped") {
-            if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+        // A learned skip needs corroboration. `provider` rows are a standing
+        // decision and apply immediately; a `stalled` row is one observation
+        // until a second scan hangs on the same path, because a single 5-minute
+        // quiet spell on a loaded machine is not proof a directory is broken.
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT path FROM reclaim_skipped
+              WHERE reason='provider' OR (reason='stalled' AND hits >= ?1)",
+        ) {
+            if let Ok(rows) = stmt.query_map([STALL_HITS_TO_SKIP], |r| r.get::<_, String>(0)) {
                 for p in rows.flatten() {
                     out.insert(PathBuf::from(p));
                 }
@@ -1099,13 +1125,29 @@ fn spawn_stall_watchdog(
     done: Arc<AtomicBool>,
 ) {
     std::thread::spawn(move || {
+        let mut warned_at = String::new();
         loop {
             std::thread::sleep(std::time::Duration::from_secs(5));
             if done.load(Ordering::Relaxed) {
                 return;
             }
             let (path, phase, stalled) = pos.read();
-            if stalled < STALL_SECS as f64 {
+
+            // Notice early, act late. The WARN costs a log line and is what
+            // makes a slow directory visible without deciding anything about
+            // it; ending the scan is a verdict and needs the longer evidence.
+            // Collapsing the two is what exempted ~/Downloads on one reading.
+            if stalled >= STALL_WARN_SECS as f64
+                && stalled < STALL_ABORT_SECS as f64
+                && warned_at != path
+            {
+                warned_at = path.clone();
+                tracing::warn!(
+                    scan = %scan_id, path = %path, phase, quiet_s = stalled as u64,
+                    "reclaim scan is quiet on one directory (still waiting, not yet a verdict)"
+                );
+            }
+            if stalled < STALL_ABORT_SECS as f64 {
                 continue;
             }
 
@@ -1145,7 +1187,10 @@ fn spawn_stall_watchdog(
                 record_stalled_dir(
                     &store,
                     path.clone(),
-                    format!("readdir did not return after {stalled_s}s; skipped by later scans"),
+                    format!(
+                        "readdir did not return after {stalled_s}s (needs {STALL_HITS_TO_SKIP} \
+                         such scans before it is skipped)"
+                    ),
                 );
             }
 
@@ -1505,13 +1550,21 @@ fn read_skips(conn: &rusqlite::Connection) -> Vec<serde_json::Value> {
         return vec![];
     };
     stmt.query_map([], |r| {
+        let reason: String = r.get(1)?;
+        let hits: i64 = r.get(5)?;
         Ok(json!({
             "path": r.get::<_, String>(0)?,
-            "reason": r.get::<_, String>(1)?,
+            "reason": reason,
             "detail": r.get::<_, Option<String>>(2)?,
             "first_seen": r.get::<_, i64>(3)?,
             "last_seen": r.get::<_, i64>(4)?,
-            "hits": r.get::<_, i64>(5)?,
+            "hits": hits,
+            // Whether this row is actually EXCLUDING anything, as opposed to
+            // being a recorded observation waiting for corroboration. Without
+            // it the list reads as "these are all skipped", which is the
+            // view-disagrees-with-the-mechanism failure: a reader would see
+            // ~/Downloads listed and conclude it was no longer scanned.
+            "active": reason == "provider" || hits >= STALL_HITS_TO_SKIP,
         }))
     })
     .map(|rows| rows.flatten().collect())
@@ -2352,6 +2405,48 @@ mod tests {
 
     /// A learned skip records WHY, so a future reader can tell an intentional
     /// exemption from a filesystem that hung once during a transient outage.
+    /// One stall records an observation; it does not create an exemption.
+    ///
+    /// The version without this shipped, and its first production run ended on
+    /// `~/Downloads` after 48 quiet seconds and permanently excluded it. That
+    /// directory answers readdir in 2 seconds with 318 entries — it was
+    /// contention on a machine running ~50 agents, on a disk the scan itself
+    /// was busy reading. A detector whose action is a silent permanent hole in
+    /// the scan has to need more than one reading.
+    #[test]
+    fn one_stall_records_but_does_not_exempt_and_two_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: crate::db::SharedStore =
+            Arc::new(crate::db::Store::open(&dir.path().join("t.db")).expect("open"));
+        let victim = "/Users/someone/Downloads";
+
+        record_stalled_dir(&store, victim.into(), "quiet 300s".into());
+        let after_one = load_skips(&store);
+        assert!(
+            !after_one.contains(&PathBuf::from(victim)),
+            "one stall must NOT exempt a directory"
+        );
+
+        record_stalled_dir(&store, victim.into(), "quiet 300s".into());
+        let after_two = load_skips(&store);
+        assert!(
+            after_two.contains(&PathBuf::from(victim)),
+            "a second stall on the same path must take effect"
+        );
+
+        // Control: the row existed the whole time, so the first assertion is
+        // about the SKIP rule and not about a missing record.
+        let conn = store.read().expect("read");
+        let hits: i64 = conn
+            .query_row(
+                "SELECT hits FROM reclaim_skipped WHERE path=?1",
+                [victim],
+                |r| r.get(0),
+            )
+            .expect("the observation must be recorded from the first stall");
+        assert_eq!(hits, 2);
+    }
+
     #[test]
     fn a_stalled_directory_is_recorded_with_its_reason_and_counts_repeats() {
         let dir = tempfile::tempdir().expect("tempdir");

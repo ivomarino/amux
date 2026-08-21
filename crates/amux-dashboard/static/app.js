@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.698';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.699';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -29953,8 +29953,9 @@ function _reclaimRender() {
       <div style="font-size:0.78rem;line-height:1.55;">
         ${esc(scan.error || '')}
         <div style="margin-top:6px;">
-          It has been added to the skip list, so the next scan steps over it.
-          Results below cover ${(scan.dirs_walked||0).toLocaleString()} folders walked before the stall.
+          Recorded below. A directory is only stepped over after it hangs a second scan,
+          because one quiet spell on a loaded machine is contention rather than a broken folder.
+          Results cover ${(scan.dirs_walked||0).toLocaleString()} folders walked before the stall.
         </div>
       </div>
     </div>`;
@@ -29995,9 +29996,9 @@ function _reclaimRender() {
   const skipped = _reclaimScan?.skipped || [];
   if (skipped.length) {
     html += `<div class="reclaim-skips">
-      <div style="font-weight:600;margin-bottom:4px;">Not scanned (${skipped.length})</div>
+      <div style="font-weight:600;margin-bottom:4px;">Coverage notes (${skipped.length})</div>
       ${skipped.map(s => `<div class="reclaim-skip-row">
-        <span class="reclaim-skip-reason ${s.reason === 'stalled' ? 'bad' : ''}">${esc(s.reason)}</span>
+        <span class="reclaim-skip-reason ${s.active ? 'bad' : ''}">${esc(s.active ? 'skipped' : 'watching')}</span>
         <code>${esc(s.path)}</code>
         <span class="reclaim-skip-why">${esc(s.detail || '')}</span>
         <button class="reclaim-minibtn" onclick="_reclaimUnskip('${escJs(s.path)}')" title="Try this directory again on the next scan">Re-include</button>
