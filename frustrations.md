@@ -1994,6 +1994,22 @@ FIX: The hang is a bug; the defect worth fixing is that the test cannot REPORT i
   firing that at the live server returns 404 in 118ms, rejected on the unknown verb before
   anything reaches tmux.
 
+  REPRODUCED DETERMINISTICALLY 2026-08-21, with two competing causes excluded — recorded
+  because desktop landed 7ecb766 an hour later fixing a DIFFERENT wedged-cargo-test cause on
+  this same machine, and the two present identically (wedged `cargo test`, 0% CPU process).
+  `cargo test -p amux-server --test route_table`, 240s cap: build "Finished in 0.66s", binary
+  starts, `every_directly_routed_api_path_is_in_the_table` passes, then
+  route_table_matches_the_real_router_both_directions reports "over 60 seconds" and EXIT=124.
+  NOT the shared build lock: 0.66s to build, with two other cargo processes on the machine.
+  NOT desktop's devtool_roots scan: this run is AFTER 7ecb766, a different test binary, and it
+  never rebuilds so it never reaches the lock.
+  Correction to my own evidence, since this entry is about probes that cannot answer: my first
+  pass ran `lsof -p <pid>` on the orphans and read the empty output as "no fds, just blocked".
+  lsof is not on this shell's PATH (/usr/sbin/lsof), so the command never ran. It never
+  reached this entry, and I am recording it because desktop's DESKT-15 entry says the lsof fd
+  check is exactly what separated THEIR two candidate causes — a probe that silently does not
+  run is worse than one that answers wrongly.
+
 ---
 
 ## The at-risk notice fired on work I had already committed, because the edit record is stamped when the HOOK ran
