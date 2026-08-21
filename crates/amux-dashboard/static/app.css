@@ -4823,6 +4823,12 @@
   .reclaim-danger { border-color: var(--red, #f85149) !important; color: var(--red, #f85149) !important; }
   .reclaim-minibtn { font-size: 0.7rem !important; padding: 3px 9px !important; margin-left: 8px; text-transform: none; letter-spacing: 0; font-weight: 500; min-height: 28px; }
   .reclaim-upbtn { font-size: 0.74rem; padding: 4px 10px; min-height: 32px; }
+  .reclaim-skips { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-bottom: 16px; font-size: 0.78rem; }
+  .reclaim-skip-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; flex-wrap: wrap; }
+  .reclaim-skip-row code { font-family: var(--mono, monospace); font-size: 0.72rem; overflow: hidden; text-overflow: ellipsis; }
+  .reclaim-skip-reason { font-size: 0.64rem; text-transform: uppercase; letter-spacing: 0.04em; border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; color: var(--dim); flex-shrink: 0; }
+  .reclaim-skip-reason.bad { border-color: var(--yellow, #e3b341); color: var(--yellow, #e3b341); }
+  .reclaim-skip-why { color: var(--dim); font-size: 0.72rem; flex: 1; min-width: 0; }
   .metrics-table td input[type=checkbox] { width: 16px; height: 16px; cursor: pointer; }
 
   .metrics-load-row { display: flex; gap: 8px; margin-bottom: 20px; flex-wrap: wrap; }

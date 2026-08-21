@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.697';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.698';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -29810,6 +29810,17 @@ async function _reclaimRestore(batchId) {
   _reclaimLoad();
 }
 
+// The exit condition for a learned skip. A filesystem that hung once may
+// answer next week, and without a way back the scan's coverage only ever
+// shrinks — silently, which is the part that makes it worse than the hang.
+async function _reclaimUnskip(path) {
+  const r = await fetch(API + '/api/reclaim/skipped?path=' + encodeURIComponent(path), { method: 'DELETE' });
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { showToast(d.error || 'Could not clear that skip'); return; }
+  showToast('Will be scanned again next run');
+  _reclaimLoad();
+}
+
 async function _reclaimPurge(batchId, bytes) {
   const msg = 'PERMANENTLY DELETE this quarantine batch?\n\n'
     + 'Size: ' + _fmtBytes(bytes) + '\n\n'
@@ -29928,7 +29939,23 @@ function _reclaimRender() {
         <div style="font-size:0.75rem;color:var(--dim);">
           ${(scan.dirs_walked||0).toLocaleString()} folders · ${(scan.files_walked||0).toLocaleString()} files · ${_fmtBytes(scan.bytes_seen)} seen
         </div>
-        <div class="reclaim-curpath">${esc(scan.current_path || '')}</div>
+        <div class="reclaim-curpath">${scan.current_phase ? `<b>${esc(scan.current_phase)}</b> · ` : ''}${esc(scan.current_path || '')}</div>
+      </div>
+    </div>`;
+  }
+
+  // A scan the watchdog declared stuck. This is a different failure from
+  // "interrupted" and must not be shown as one: nothing restarted, a directory
+  // stopped answering, and the walk thread is still parked in the kernel on it.
+  if (scan.status === 'stalled') {
+    html += `<div class="reclaim-warn">
+      <div style="font-weight:600;margin-bottom:4px;">⚠ Scan stalled on one directory</div>
+      <div style="font-size:0.78rem;line-height:1.55;">
+        ${esc(scan.error || '')}
+        <div style="margin-top:6px;">
+          It has been added to the skip list, so the next scan steps over it.
+          Results below cover ${(scan.dirs_walked||0).toLocaleString()} folders walked before the stall.
+        </div>
       </div>
     </div>`;
   }
@@ -29958,6 +29985,23 @@ function _reclaimRender() {
         <div style="margin-top:6px;">Release them from a terminal (needs sudo, so amux will not run it for you):</div>
         <code class="reclaim-code">sudo tmutil thinlocalsnapshots / 21474836480 4</code>
       </div>
+    </div>`;
+  }
+
+  // What the scan did NOT look at. Shown next to the results rather than
+  // behind a separate view, because a home-directory total that silently omits
+  // a subtree is a confident wrong answer — the reader has to be able to see
+  // the hole to weigh the number.
+  const skipped = _reclaimScan?.skipped || [];
+  if (skipped.length) {
+    html += `<div class="reclaim-skips">
+      <div style="font-weight:600;margin-bottom:4px;">Not scanned (${skipped.length})</div>
+      ${skipped.map(s => `<div class="reclaim-skip-row">
+        <span class="reclaim-skip-reason ${s.reason === 'stalled' ? 'bad' : ''}">${esc(s.reason)}</span>
+        <code>${esc(s.path)}</code>
+        <span class="reclaim-skip-why">${esc(s.detail || '')}</span>
+        <button class="reclaim-minibtn" onclick="_reclaimUnskip('${escJs(s.path)}')" title="Try this directory again on the next scan">Re-include</button>
+      </div>`).join('')}
     </div>`;
   }
 
