@@ -2160,8 +2160,11 @@ pub async fn guard_outcome(
         let (target_id, link): (Option<i64>, &str) = if let Some(id) = verdict_id {
             (
                 conn.query_row(
+                    // verdict='block' also here: only blocks HAVE outcomes,
+                    // and an id from a stale marker must not close an allow
+                    // row that happens to share it.
                     "SELECT id FROM guard_verdicts WHERE id=?1 AND session=?2 \
-                     AND resolution IS NULL",
+                     AND verdict='block' AND resolution IS NULL",
                     rusqlite::params![id, sess_c],
                     |r| r.get(0),
                 )
