@@ -646,6 +646,150 @@ fn is_restore_only_command(cmd: &str) -> bool {
     saw_restore
 }
 
+// ---------------------------------------------------------------------------
+// OBSERVED edit records (AF-123)
+// ---------------------------------------------------------------------------
+//
+// 75% of AF-27 blocks (105/140 in the retained log) hit lanes with
+// firsthand=0 — and those lanes edit through Bash because bypass-permissions
+// sessions are INSTRUCTED to prefer it, so firsthand records are a signal the
+// harness itself makes unobtainable for them, then ranks them down for
+// lacking (ethos rule 3). The inferred extractor cannot fix this by parsing
+// harder: the specimen write was a `python3 - <<'PY'` heredoc rewriting the
+// extensionless file `amux`, invisible to a pathlike regex twice over.
+//
+// So the record is OBSERVED instead of parsed: a Bash hook pair marks t0
+// before the command and reports every file whose mtime moved during it.
+// Observed records rank WITH firsthand — they are facts about the disk, not
+// guesses about a command string — and no quoting can hide an mtime.
+
+/// Matches the guard's default window; observed rows older than this are
+/// pruned at write.
+const OBSERVED_WINDOW_S: f64 = 21_600.0;
+const OBSERVED_MAX_ROWS: usize = 500;
+
+fn observed_key(session: &str) -> String {
+    format!("observed_edits:{session}")
+}
+
+/// POST /api/git/observed-edits — the hook's report: `{paths: [..]}` with
+/// `X-Amux-Session` naming the lane. Merged newest-wins, pruned by window and
+/// row cap, stored in prefs (no migration: rows are small and windowed).
+pub async fn observed_edits(
+    axum::extract::State(state): axum::extract::State<super::AppState>,
+    headers: HeaderMap,
+    axum::Json(body): axum::Json<Value>,
+) -> (StatusCode, axum::Json<Value>) {
+    let session = super::alerts::hdr_worker(&headers);
+    if session.is_empty() || session == "api-anonymous" {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "X-Amux-Session required — an unattributed observation attributes nothing"})),
+        );
+    }
+    let paths: Vec<String> = body
+        .get("paths")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .filter(|p| !p.trim().is_empty())
+                .take(OBSERVED_MAX_ROWS)
+                .map(|p| realpath(Path::new(p)))
+                .collect()
+        })
+        .unwrap_or_default();
+    if paths.is_empty() {
+        return (StatusCode::OK, axum::Json(json!({"ok": true, "stored": 0})));
+    }
+    let now = now_epoch();
+    let key = observed_key(&session);
+    let n = paths.len();
+    let write = state.store.write_async(move |conn| {
+        let prior: HashMap<String, f64> = conn
+            .query_row("SELECT value FROM prefs WHERE key=?1", [&key], |r| {
+                r.get::<_, String>(0)
+            })
+            .ok()
+            .and_then(|v| serde_json::from_str(&v).ok())
+            .unwrap_or_default();
+        let mut merged = prior;
+        merged.retain(|_, ts| now - *ts <= OBSERVED_WINDOW_S);
+        for p in paths {
+            let slot = merged.entry(p).or_insert(0.0);
+            if now > *slot {
+                *slot = now;
+            }
+        }
+        // Row cap: drop OLDEST first, never newest — the newest observation
+        // is the one the next commit is about.
+        if merged.len() > OBSERVED_MAX_ROWS {
+            let mut rows: Vec<(String, f64)> = merged.into_iter().collect();
+            rows.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            rows.truncate(OBSERVED_MAX_ROWS);
+            merged = rows.into_iter().collect();
+        }
+        conn.execute(
+            "INSERT INTO prefs (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            rusqlite::params![key, serde_json::to_string(&merged).unwrap_or_default()],
+        )?;
+        Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+    });
+    match write.await {
+        Ok(_) => (StatusCode::OK, axum::Json(json!({"ok": true, "stored": n}))),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": e.to_string()})),
+        ),
+    }
+}
+
+/// Load a session's observed records inside the window.
+fn load_observed(conn: &rusqlite::Connection, session: &str, window: f64) -> HashMap<String, f64> {
+    let now = now_epoch();
+    conn.query_row(
+        "SELECT value FROM prefs WHERE key=?1",
+        [observed_key(session)],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .and_then(|v| serde_json::from_str::<HashMap<String, f64>>(&v).ok())
+    .map(|m| m.into_iter().filter(|(_, ts)| now - *ts <= window).collect())
+    .unwrap_or_default()
+}
+
+/// Merge observed records into the guard inputs AT FIRSTHAND RANK (AF-123).
+/// Pure, so the rank claim is testable: a lane whose only signal is observed
+/// must read exactly like a lane that used the Edit tool.
+pub(crate) fn apply_observed(
+    inputs: &mut GuardInputs,
+    mine_obs: &HashMap<String, f64>,
+    theirs_obs: &[(String, HashMap<String, f64>)],
+) {
+    for (p, ts) in mine_obs {
+        let slot = inputs.mine.entry(p.clone()).or_insert(0.0);
+        if *ts > *slot {
+            *slot = *ts;
+        }
+        inputs.mine_firsthand.insert(p.clone());
+    }
+    for (owner, obs) in theirs_obs {
+        for (p, ts) in obs {
+            match inputs.theirs.get(p) {
+                Some((_, cur)) if *cur >= *ts => {}
+                _ => {
+                    // Kind-follows-latest: an observed write is authored
+                    // content as far as anyone can tell, never a restore.
+                    inputs.theirs_restore.remove(p);
+                    inputs.theirs.insert(p.clone(), (owner.clone(), *ts));
+                }
+            }
+            inputs.theirs_firsthand.insert(p.clone());
+        }
+    }
+}
+
 /// AMUX-3446: the committer's own firsthand edit CONTENT per file, from their
 /// transcript — new_string/content of Edit/Write/MultiEdit/NotebookEdit calls
 /// inside the window, concatenated per abs realpath, capped so a rewrite-heavy
@@ -1551,6 +1695,26 @@ pub async fn staged_guard_inner(
         // BLIND only — absent lanes are excluded (see the partition above).
         blind_cotenant: !blind_live.is_empty(),
 };
+    // AF-123: merge OBSERVED records (the Bash hook pair's mtime reports) at
+    // firsthand rank, for the committer and every cotenant. This is what ends
+    // the structural firsthand=0 penalty on Bash-editing lanes: their writes
+    // become facts here regardless of how the command spelled the path.
+    let mut inputs = inputs;
+    if let Some(st) = state.as_ref() {
+        if let Ok(conn) = st.store.read() {
+            let mine_obs = if session.is_empty() {
+                HashMap::new()
+            } else {
+                load_observed(&conn, &session, window)
+            };
+            let theirs_obs: Vec<(String, HashMap<String, f64>)> = cotenants
+                .iter()
+                .map(|c| (c.clone(), load_observed(&conn, c, window)))
+                .filter(|(_, m)| !m.is_empty())
+                .collect();
+            apply_observed(&mut inputs, &mine_obs, &theirs_obs);
+        }
+    }
     let v = classify(&pairs, now, window, &inputs);
 
     // AMUX-3446: account each staged path's ADDED lines against the
@@ -1939,6 +2103,43 @@ mod tests {
         ] {
             assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
         }
+    }
+
+    /// AF-123: observed records rank WITH firsthand. The 75%-of-blocks lane
+    /// bias exists because Bash-editing lanes can never mint a firsthand
+    /// record; an observed mtime report is a fact about the disk, so a lane
+    /// whose only signal is observed must classify exactly like one that used
+    /// the Edit tool — here, the committer's fresher observed edit turns a
+    /// would-be AF-27 block into a shared warning.
+    #[test]
+    fn observed_records_rank_with_firsthand_and_lift_the_bash_lane_penalty() {
+        // Without observed: peer firsthand vs committer NOTHING -> foreign block.
+        let g = peer_wrote("f.rs", "alice", 1000.0);
+        let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.foreign.len(), 1, "control: the bash lane is blocked today");
+
+        // With an observed record 900s fresher than alice's claim: firsthand
+        // rank + the AF-27 recency rule -> shared (warned), never blocked.
+        let mut g = peer_wrote("f.rs", "alice", 1000.0);
+        let mut mine_obs = HashMap::new();
+        mine_obs.insert("/repo/f.rs".to_string(), 1900.0);
+        apply_observed(&mut g, &mine_obs, &[]);
+        assert!(g.mine_firsthand.contains("/repo/f.rs"));
+        let v = classify(&[pair("f.rs")], 2000.0, 3600.0, &g);
+        assert!(v.foreign.is_empty(), "{:?}", v.foreign);
+        assert_eq!(v.shared.len(), 1, "both claims real -> shared, warned not blocked");
+
+        // A PEER's observed record beats their stale entry and clears
+        // restore-kind (kind follows the latest record).
+        let mut g = GuardInputs::default();
+        g.theirs.insert("/repo/g.rs".into(), ("bob".into(), 100.0));
+        g.theirs_restore.insert("/repo/g.rs".into());
+        let mut bob_obs = HashMap::new();
+        bob_obs.insert("/repo/g.rs".to_string(), 500.0);
+        apply_observed(&mut g, &HashMap::new(), &[("bob".to_string(), bob_obs)]);
+        assert_eq!(g.theirs.get("/repo/g.rs").map(|(_, t)| *t), Some(500.0));
+        assert!(!g.theirs_restore.contains("/repo/g.rs"));
+        assert!(g.theirs_firsthand.contains("/repo/g.rs"));
     }
 
     /// AMUX-3446, rebuilt from the incident's own bytes: my staged diff for

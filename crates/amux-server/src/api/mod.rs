@@ -297,6 +297,10 @@ pub fn router(state: AppState) -> Router {
         // (`except Exception: return 0`), so every commit on every shared
         // checkout has been unguarded and SILENT about it. See api/git_guard.rs.
         .route("/api/git/staged-guard", axum::routing::post(git_guard::staged_guard))
+        // AF-123: OBSERVED edit records from the Bash hook pair — mtimes that
+        // moved during a command, reported rather than parsed, so a heredoc
+        // or an extensionless path cannot hide a write from attribution.
+        .route("/api/git/observed-edits", axum::routing::post(git_guard::observed_edits))
         // Client diagnostic beacons (AR-128): the SPA sends geometry/tap
         // traces for mobile layout debugging.
         //
