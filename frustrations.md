@@ -353,7 +353,7 @@ FRESH SPECIMEN 2026-08-18, amux-frustrations — STILL OPEN, and the same class 
 ## Dashboard's usage-limit discriminator says 'worker'; the live endpoint says 'session'
 AREA: instruments
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-09
 SESSION: rust-rebuild (provider adapters, RR-0043)
 CARD: AMUX-2581
@@ -368,6 +368,20 @@ COST: ~10 min re-probing the live endpoint; one step from encoding a never-match
 FIX: loadUsage() should accept both "session" and "worker" (the Rust mapper now does);
   better, both consumers should assert the discriminator against a recorded live
   fixture so endpoint drift fails a test instead of silently unlabeling a bar.
+
+  VERIFIED FIXED 2026-08-21 (amux-frustrations; authoring lane `rust-rebuild (provider
+  adapters, RR-0043)` is gone, so no author can sign this). The rust mapper accepts BOTH
+  spellings — provider/claude.rs:317, `if kind_str == "session" || kind_str == "worker"`,
+  with a comment naming which is live and which is older. Live check: GET /api/usage
+  returns limits kinds ['session','weekly_all','weekly_scoped'], so the live spelling
+  matches. The FIX section's actual ask is met too: recorded fixtures at claude.rs:404-405
+  carry both kinds, so endpoint drift fails a test rather than silently unlabelling a bar.
+  The dead `l.kind === 'worker'` filter is gone from the SPA.
+  Probe note, since this entry is itself about a silent probe: I first called
+  /api/oauth/usage and read its 404 as evidence. That is Anthropic's UPSTREAM URL
+  (provider/claude.rs:51), never an amux route — amux serves /api/usage. The 404 was my
+  probe missing, not the endpoint being absent, and it would have supported the wrong
+  conclusion in the same direction the entry warns about.
 
 ---
 ## Group-config PATCH: COALESCE arms are dead code — explicit JSON null 500s on both origins
@@ -883,7 +897,7 @@ FIX: Not a rule ("remember to `git add` specific files" is the kind of rule that
 ## A CLI probe measured a connection failure and it read as the bug reproducing
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-10
 SESSION: amux-rust
 CARD: AMUX-2672
@@ -902,10 +916,17 @@ FIX: AMUX-2672 — point the default at a port that exists. The general shape is
   connection error and an application error should not both surface as exit 1 with
   no discriminator.
 
+  VERIFIED FIXED 2026-08-21 (amux-frustrations; authoring lane `amux-rust` is gone). The
+  defect was that amux-rs defaulted to https://localhost:8823, where nothing listens, so
+  every verb died on connect and read as the application bug reproducing. Tested the built
+  binary directly (~/.amux/rust-build-target/debug/amux-rs, since amux-rs is not on PATH):
+  a bare `amux-rs board list` with no AMUX_RS_URL set exits 0 and returns 1,722 lines of
+  real board data. It resolves the live endpoint on its own.
+
 ## A stderr capture moved stdout off the pipe, so nothing could break
 AREA: instruments
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-10
 SESSION: amux-rust
 CARD: AMUX-2653
@@ -924,6 +945,15 @@ FIX: Capture stderr to a FILE and leave stdout on the pipe
   a known-broken and a known-fixed artifact, the probe is the candidate before the
   conclusion is. This is the "loud wrong probe" from ethos rule 7 — it answered,
   and its answer was agreeable.
+
+  VERIFIED FIXED 2026-08-21 (amux-frustrations; authoring lane `amux-rust` is gone).
+  Tested with the probe the entry says was botched — stdout ON the pipe, stderr to a FILE
+  (`amux-rs board list 2>/tmp/e.txt | head -2`), not the `2>&1 >/dev/null` that detached
+  stdout and made a panic impossible. Result: amux-rs exits 141 (128+13, SIGPIPE), which is
+  correct Unix behaviour for a closed stdout, with 0 bytes on stderr and no `panicked` line.
+  Not exit 101. And the control the entry's own lesson demands: unpiped, the same command
+  emits 1,722 lines, so stdout really was attached to the pipe and an EPIPE panic was
+  reachable — the silence is the fix, not the probe missing again.
 
 ## Five finished cards sat in `todo` and kept being auto-picked
 AREA: board
