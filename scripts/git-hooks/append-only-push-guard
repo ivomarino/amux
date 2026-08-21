@@ -213,6 +213,101 @@ if edited:
     } >&2
     log_line "REFUSED" "file=$f missing_lines=$n"
   done
+
+  # ---- RESURRECTION (MG-1485): the union rule's blind half. -----------------
+  # A stale push that RE-ADDS entries the remote has already ARCHIVED removes
+  # nothing, so the loss test above passes it BY CONSTRUCTION — that is how 12
+  # entries archived in mixpeek's 154df02be6 came back into FRUSTRATIONS.md,
+  # still [x], with their archive copies untouched. No data is lost (both
+  # copies exist), but CLOSED WORK READS AS OPEN, and the cost lands on
+  # whoever triages the file most diligently.
+  #
+  # The push-time signature is duplication: the same ENTRY line present in
+  # both the pushed active file and its pushed archive companion. Only entry
+  # bullets ("- [ ]"/"- [x]", checkbox-normalized) are compared — field labels
+  # and separators legitimately recur across the two files. And only
+  # duplicates INTRODUCED by this push refuse: inherited duplication (already
+  # on the remote) warns, so a pusher is never blocked on someone else's mess.
+  # The pair is the point: the union rule covers deletion, this covers
+  # resurrection; either alone leaves half the surface open.
+  local dirn bn stem ext arch cand a_head a_base f_base r_out r_new r_old n2
+  for f in "${files[@]}"; do
+    case "$f" in *ARCHIVE*|*archive*) continue ;; esac
+    head_blob=$(git rev-parse --verify --quiet "$head:$f" 2>/dev/null) || continue
+    dirn=$(dirname "$f"); bn=$(basename "$f")
+    stem="${bn%.*}"; ext=""
+    [ "$stem" != "$bn" ] && ext=".${bn##*.}"
+    arch=""
+    for cand in "${stem}_ARCHIVE${ext}" "${stem}_archive${ext}"; do
+      [ "$dirn" != "." ] && cand="$dirn/$cand"
+      if git rev-parse --verify --quiet "$head:$cand" >/dev/null 2>&1; then
+        arch="$cand"
+        break
+      fi
+    done
+    [ -z "$arch" ] && continue
+    a_head=$(git rev-parse --verify --quiet "$head:$arch" 2>/dev/null) || continue
+    f_base=$(git rev-parse --verify --quiet "$base:$f" 2>/dev/null) || f_base=""
+    a_base=$(git rev-parse --verify --quiet "$base:$arch" 2>/dev/null) || a_base=""
+    # Neither side changed: any duplication is inherited state, not this push.
+    [ "$head_blob" = "$f_base" ] && [ "$a_head" = "$a_base" ] && continue
+    r_out=$(python3 -c '
+import re, subprocess, sys
+def blob(sha):
+    if not sha:
+        return ""
+    return subprocess.run(["git", "cat-file", "blob", sha],
+                          capture_output=True, text=True).stdout
+ent = lambda t: {re.sub(r"^- \[[xX]\]", "- [ ]", l)
+                 for l in t.splitlines() if re.match(r"^- \[[ xX]\]", l)}
+h_act, h_arc, b_act, b_arc = (ent(blob(s)) for s in sys.argv[1:5])
+dup_head = h_act & h_arc
+dup_base = b_act & b_arc
+for l in sorted(dup_head - dup_base):
+    print("N\t" + l)
+for l in sorted(dup_head & dup_base):
+    print("O\t" + l)
+' "$head_blob" "$a_head" "$f_base" "$a_base") || r_out=""
+    r_new=$(printf '%s\n' "$r_out" | grep '^N	' | cut -f2-)
+    r_old=$(printf '%s\n' "$r_out" | grep '^O	' | cut -f2-)
+    if [ -n "$r_old" ]; then
+      n2=$(printf '%s\n' "$r_old" | wc -l | tr -d ' ')
+      {
+        echo ""
+        echo "append-only guard: NOTE — $n2 entry line(s) exist in BOTH $f and $arch already"
+        echo "on the remote (inherited duplication, not this push's doing). An entry lives"
+        echo "ONCE — worth an archive-census pass."
+      } >&2
+      log_line "WARNED-RESURRECTION" "file=$f inherited_duplicates=$n2"
+    fi
+    [ -z "$r_new" ] && continue
+    if override_allows "$f"; then
+      n2=$(printf '%s\n' "$r_new" | wc -l | tr -d ' ')
+      log_line "OVERRIDE" "file=$f resurrected_lines=$n2 allowed (AMUX_ALLOW_SHARED_REWRITE)"
+      continue
+    fi
+    loss=1
+    n2=$(printf '%s\n' "$r_new" | wc -l | tr -d ' ')
+    {
+      echo ""
+      echo "append-only guard: PUSH BLOCKED — $f as pushed RE-ADDS $n2 entry line(s) that"
+      echo "live in $arch. The union rule cannot see this direction (re-adding removes"
+      echo "nothing), and it is how 12 archived entries came back marked [x] on 2026-08-20"
+      echo "(MG-1485): closed work reads as open, and whoever works the list most"
+      echo "diligently re-investigates finished entries."
+      echo ""
+      echo "Resurrected lines (first $MAX_SHOWN):"
+      printf '%s\n' "$r_new" | head -"$MAX_SHOWN" | cut -c1-120 | sed 's/^/    | /'
+      [ "$n2" -gt "$MAX_SHOWN" ] && echo "    ... and $((n2 - MAX_SHOWN)) more"
+      echo ""
+      echo "Fix: your $f is stale — take origin's copy and re-append only YOUR new entries:"
+      echo "    git checkout origin/main -- $f    # then re-apply your additions on top"
+      echo "If an entry is genuinely RE-OPENED, remove its line from $arch in the same"
+      echo "push (the union rule reads that as the move it is), or say so out loud (logged):"
+      echo "    AMUX_ALLOW_SHARED_REWRITE=$f git push ..."
+    } >&2
+    log_line "REFUSED" "file=$f resurrected_lines=$n2"
+  done
   rm -f "$union_tmp" 2>/dev/null
   return $loss
 }
