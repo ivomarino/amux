@@ -2572,3 +2572,22 @@ FIX: The installer resolves the effective hooks dir first and installs there.
   left alone. Missing files are installed with a commit-it note. Verified
   against mixpeek live: resurrection copy recognized as a merge, staged-guard
   installed into the effective dir, fleet census shows zero stale live copies.
+
+---
+STATUS: open
+DATE: 2026-08-21
+SESSION: amux
+AREA: notices
+CARD: AMUX-3436
+SYMPTOM: The idle commit nudge labeled app.js CONTESTED (me + desktop) and
+  prescribed per-hunk staging, when every hunk of mine was already committed
+  and all dirty bytes were desktop's in-flight reclaim work. The verdict keys
+  on edit records in the window; edited-and-committed vs edited-and-dirty is
+  answerable (path_fate / owner_committed_since exists and the victim notice
+  already uses it) but the CONTESTED line does not ask.
+COST: One diff inspection to establish "none of this is mine" — small, but
+  every session with recently-committed work on a shared file pays it on
+  every idle nudge, and a per-hunk git add -p instruction on a file with zero
+  own hunks is the kind of misdirection that eventually gets followed.
+FIX: pending (AMUX-3436): consult path_fate before emitting CONTESTED; settled-mine
+  + dirty-theirs reads NOT YOURS.
