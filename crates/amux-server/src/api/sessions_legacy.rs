@@ -154,6 +154,81 @@ fn pane_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
     CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
 }
 
+// ---------------------------------------------------------------------------
+// Pane churn — the MODEL-AGNOSTIC generation signal (AMUX-3433)
+// ---------------------------------------------------------------------------
+//
+// Every active-detection rule bets on provider UI strings (spinner glyph
+// ranges, esc-to-interrupt, verb lists), and each new provider or skin change
+// costs another regex — the AMUX-3426 middle-dot miss is only the latest
+// instance, and its fix is still a string bet. The provider-agnostic fact
+// underneath all of them: a generating lane REPAINTS (Claude Code ~6x/s,
+// gemini/codex similar) while a parked lane's pane is byte-stable. So: hash
+// each freshly captured frame's CONTENT (ANSI-stripped, MINUS the bottom bar
+// zone, so a bar-only repaint or an agents-count tick never counts) and call
+// a lane churning when the recent window holds several DISTINCT frames.
+//
+// In-memory on purpose, and the loss mode is named: a restart drops the
+// history and churn reads "no evidence" for one window, which degrades to
+// exactly today's string-based detection — never to a wrong answer. A lane
+// that stops painting falls out of the capture candidate set, so its
+// observations age out and churn goes quiet on its own.
+
+/// Distinct content-frames within the window required to call it churning.
+/// 1 is a parked pane; 2 can be one legitimate single repaint (a notification
+/// landing, a human's pasted line); 3+ inside a minute is something REDRAWING.
+const CHURN_MIN_DISTINCT: usize = 3;
+
+/// lane -> recent (ts, content-hash) observations.
+type ChurnMap = BTreeMap<String, Vec<(f64, u64)>>;
+
+fn churn_store() -> &'static std::sync::Mutex<ChurnMap> {
+    static S: std::sync::OnceLock<std::sync::Mutex<ChurnMap>> = std::sync::OnceLock::new();
+    S.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Hash of the frame's content EXCLUDING the bar zone (last 3 non-blank
+/// lines) and blank lines. The exclusion is what keeps a shift-tab mode
+/// change, an agents-count tick, or any future bar decoration from reading
+/// as generation; the spinner line, streaming prose, and tool output all
+/// live above it.
+fn pane_content_hash(raw: &str) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let clean = crate::backend::adapter::strip_ansi(raw);
+    let lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
+    let body = &lines[..lines.len().saturating_sub(3)];
+    if body.is_empty() {
+        return None;
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for l in body {
+        l.hash(&mut h);
+    }
+    Some(h.finish())
+}
+
+/// Record one freshly captured frame. `window_s` bounds both pruning and the
+/// later distinct-count, so an observation can never outlive its relevance.
+pub(crate) fn note_pane_frame(name: &str, raw: &str, now: f64, window_s: f64) {
+    let Some(hash) = pane_content_hash(raw) else { return };
+    if let Ok(mut g) = churn_store().lock() {
+        let v = g.entry(name.to_string()).or_default();
+        v.retain(|(ts, _)| now - *ts <= window_s);
+        v.push((now, hash));
+    }
+}
+
+/// ≥ CHURN_MIN_DISTINCT distinct content-frames inside the window.
+fn pane_churn_distinct(name: &str, now: f64, window_s: f64) -> usize {
+    let Ok(g) = churn_store().lock() else { return 0 };
+    let Some(v) = g.get(name) else { return 0 };
+    v.iter()
+        .filter(|(ts, _)| now - *ts <= window_s)
+        .map(|(_, h)| *h)
+        .collect::<std::collections::BTreeSet<u64>>()
+        .len()
+}
+
 /// Response-level cache for `build_array`: the serialized JSON string + the
 /// epoch it was computed at. At 3,714 req/hr (~1/s) with each call spawning
 /// ~100 tmux subprocesses for previews + N git subprocesses + ~226 filesystem
@@ -714,6 +789,22 @@ impl FleetSignals {
         };
         (bar_generating && !bar_has_agents)
             || crate::api::session_verbs::detect_claude_status(raw) == "active"
+            // The model-agnostic leg (AMUX-3433): several DISTINCT content
+            // frames inside the window means something is REDRAWING above the
+            // bar, whatever glyphs it uses. This is what catches the spinner
+            // variant no string rule knows yet — the AMUX-3426 class without
+            // the next screenshot. Observations exist only for admissible
+            // captured panes, so a lane that stops painting goes quiet here
+            // on its own.
+            || self.pane_churning(name)
+    }
+
+    /// See the churn block above [`note_pane_frame`].
+    pub(crate) fn pane_churning(&self, name: &str) -> bool {
+        if self.pane_of(name).is_none() {
+            return false;
+        }
+        pane_churn_distinct(name, self.now, self.contradiction_window()) >= CHURN_MIN_DISTINCT
     }
 
     /// Capture the panes that could contradict a report.
@@ -763,6 +854,10 @@ impl FleetSignals {
                 .collect();
             for h in handles {
                 if let Ok(Some((n, raw))) = h.join() {
+                    // Churn evidence (AMUX-3433): only REAL captures record —
+                    // a cache hit re-serves the same frame and adds no
+                    // information about repainting.
+                    note_pane_frame(&n, &raw, self.now, self.contradiction_window());
                     self.panes.insert(n, raw);
                 }
             }
@@ -868,6 +963,14 @@ impl FleetSignals {
                     .map(crate::api::session_verbs::detect_claude_status)
                     .unwrap_or_default(),
                 "says_working": self.pane_says_working(name),
+                // AMUX-3433: the model-agnostic leg, visible where people
+                // look — distinct content-frames in the window vs the bar.
+                "churn_distinct_frames": pane_churn_distinct(
+                    name,
+                    self.now,
+                    self.contradiction_window()
+                ),
+                "churn_threshold": CHURN_MIN_DISTINCT,
                 "contradiction_window_s": self.contradiction_window(),
             }),
         );
@@ -3063,6 +3166,75 @@ Claude usage limit reached. Your limit will reset at 3pm.
         let (status, ex) = s.derive_status_explain("x", false);
         assert_eq!(status, "");
         assert_eq!(ex["decided_by"], json!("not_running"));
+    }
+
+    /// AMUX-3433, the property the card exists for: a lane generating with a
+    /// spinner glyph NO string rule knows must still read active, because its
+    /// pane demonstrably REDRAWS. Frames use ◐/◑/◒ (U+25D0..) — outside every
+    /// glyph range detect_claude_status covers, so detection says idle and
+    /// only churn can carry the flip. Distinct lane names on purpose: the
+    /// churn store is process-global and shared-key tests would pollute each
+    /// other (the ROLLUP_CACHE lesson).
+    #[test]
+    fn churn_flips_idle_to_active_for_a_glyph_no_string_rule_knows() {
+        let frame = |glyph: &str, secs: u32| {
+            format!(
+                "  {glyph} Mystifying\u{2026} ({secs}s \u{b7} \u{2193} 1.2k tokens)\n\
+                 \u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f}\u{a0}\n\u{2500}\u{2500}\u{2500}\u{2500}\n  \
+                 \u{23f5}\u{23f5} bypass permissions on (shift+tab to cycle) \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents\n"
+            )
+        };
+        let mut s = signals();
+        let lane = "churn-glyphless";
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports =
+            json!({lane: {"state": "idle", "ts": s.now - 1076.0, "source": "stop-hook-test"}});
+        let last = frame("\u{25d2}", 5);
+        // The string rules genuinely do not know this glyph — the control
+        // that makes the churn assertion mean something.
+        assert_eq!(
+            crate::api::session_verbs::detect_claude_status(&last),
+            "idle",
+            "fixture must be invisible to string detection or this test proves nothing"
+        );
+        for (i, f) in
+            [frame("\u{25d0}", 3), frame("\u{25d1}", 4), last.clone()].iter().enumerate()
+        {
+            note_pane_frame(lane, f, s.now - 4.0 + i as f64, s.contradiction_window());
+        }
+        s.panes.insert(lane.into(), last);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "active", "{ex}");
+        assert_eq!(ex["decided_by"], json!("contradiction_pane_generating"), "{ex}");
+        assert!(ex["pane"]["churn_distinct_frames"].as_u64().unwrap() >= 3, "{ex}");
+    }
+
+    /// The two controls that keep churn honest: the SAME frame re-captured is
+    /// one distinct hash (a parked pane never churns), and frames that differ
+    /// ONLY in the bar zone (an agents-count tick, a mode toggle) hash equal —
+    /// so neither flips idle.
+    #[test]
+    fn a_stable_or_bar_only_repaint_never_reads_as_churn() {
+        let bar_frame = |agents: u32| {
+            format!(
+                "  some finished output text\n\u{2500}\u{2500}\n\u{276f}\u{a0}\n\u{2500}\u{2500}\n  \
+                 \u{23f5}\u{23f5} bypass permissions on \u{b7} \u{2190} {agents} agents\n"
+            )
+        };
+        let mut s = signals();
+        let lane = "churn-baronly";
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports =
+            json!({lane: {"state": "idle", "ts": s.now - 1076.0, "source": "stop-hook-test"}});
+        for (i, f) in [bar_frame(1), bar_frame(2), bar_frame(3)].iter().enumerate() {
+            note_pane_frame(lane, f, s.now - 4.0 + i as f64, s.contradiction_window());
+        }
+        s.panes.insert(lane.into(), bar_frame(3));
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "bar-only repaints must not read as generation: {ex}");
+        assert_eq!(ex["pane"]["churn_distinct_frames"], json!(1), "{ex}");
     }
 
     /// The wrapper IS the explain's verdict — one fn, so the view can never
