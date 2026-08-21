@@ -1,5 +1,19 @@
 //! `POST /api/git/staged-guard` — the shared-checkout staged-state guard.
 //!
+//! # Invariant comments in this file must be PINNED, not narrated
+//!
+//! A 2026-08-21 mutation sweep (amux-frustrations, AF-127 follow-up) found
+//! four protection-losing invariants here that were correct, deliberate,
+//! explained in a comment — and held by nothing: forcing each passed all
+//! 1171 tests. This file's comments are good enough to convince a reader an
+//! invariant is enforced, which is exactly when nothing goes red. The rule,
+//! deliberately NARROW so it stays true: a comment stating an invariant
+//! whose violation LOSES PROTECTION (blocks stop firing, records outlive
+//! their window, the newest observation gets dropped) must have a test that
+//! fails when the enforcing line is removed — mutation-check it before
+//! trusting it. Noise-adding invariants are exempt; a rule covering
+//! everything becomes a chore and then a lie.
+//!
 //! # Why this file exists at all
 //!
 //! The endpoint is called by `.git/hooks/amux-staged-guard`, a script the
@@ -795,6 +809,18 @@ fn load_observed(conn: &rusqlite::Connection, session: &str, window: f64) -> Has
     .and_then(|v| serde_json::from_str::<HashMap<String, f64>>(&v).ok())
     .map(|m| m.into_iter().filter(|(_, ts)| now - *ts <= window).collect())
     .unwrap_or_default()
+}
+
+/// AC-355's gate bit, pure so it is PINNED: any LIVE blind cotenant forces
+/// unclaimed staged paths to BLOCK. "UNKNOWN treated as SAFE" was the whole
+/// AC-355 bug, and the 2026-08-21 mutation sweep found this derivation held
+/// by nothing — forcing it constant in EITHER direction passed all 1171
+/// tests (forcing `false` silently re-opens AC-355). The construction site
+/// in `staged_guard_inner` is the one residual unpinned line (a hardcoded
+/// constant there would still evade; pinning it needs a liveness seam the
+/// endpoint does not yet have).
+fn gates_unclaimed(blind_live: &[String]) -> bool {
+    !blind_live.is_empty()
 }
 
 /// Merge observed records into the guard inputs AT FIRSTHAND RANK (AF-123).
@@ -1792,7 +1818,7 @@ pub async fn staged_guard_inner(
         // invisible. Liveness answers "can they be editing now", which is a
         // different question from "could this staged file be theirs".
         // BLIND only — absent lanes are excluded (see the partition above).
-        blind_cotenant: !blind_live.is_empty(),
+        blind_cotenant: gates_unclaimed(&blind_live),
 };
     // AF-123: merge OBSERVED records (the Bash hook pair's mtime reports) at
     // firsthand rank, for the committer and every cotenant. This is what ends
@@ -2610,6 +2636,88 @@ mod tests {
         // Junk rows (no path, wrong types, empty) are skipped, not defaulted.
         let body = serde_json::json!({"paths": [{"mtime": 1.0}, 42, "", {"path": "  "}]});
         assert!(parse_observed_reports(&body, now).is_empty());
+    }
+
+    /// AC-355's gate bit, both directions (mutation-sweep survivor #1: forcing
+    /// the derivation constant passed the whole suite either way, and the
+    /// `false` direction re-opens the exact bug — unclaimed paths never block).
+    #[test]
+    fn a_live_blind_cotenant_gates_unclaimed_paths() {
+        assert!(gates_unclaimed(&["blind-lane".into()]),
+                "a live blind cotenant must force unclaimed paths to block — UNKNOWN as SAFE is AC-355");
+        assert!(!gates_unclaimed(&[]),
+                "no blind cotenant, no gate — forcing this true would block every unclaimed path everywhere");
+    }
+
+    /// The observed-edits STORE half (mutation-sweep survivors #2-4): the parse
+    /// half got pinned because it got reviewed, and the retention/cap/ordering
+    /// semantics next to it had nothing — deleting the window prune, reversing
+    /// the cap sort, or removing the cap entirely each passed all 1171 tests.
+    /// All three through the real handler against a real store.
+    #[tokio::test]
+    async fn observed_store_prunes_the_window_and_the_cap_drops_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(crate::db::Store::open(&dir.path().join("t.db")).unwrap());
+        let mk_state = || crate::api::AppState {
+            store: store.clone(),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let hdrs = || {
+            let mut h = HeaderMap::new();
+            h.insert("x-amux-session", "obs-pin".parse().unwrap());
+            h
+        };
+        let post = |body: Value| {
+            let st = mk_state();
+            let h = hdrs();
+            async move { observed_edits(axum::extract::State(st), h, axum::Json(body)).await }
+        };
+        let read_map = || -> HashMap<String, f64> {
+            store
+                .read()
+                .unwrap()
+                .query_row(
+                    "SELECT value FROM prefs WHERE key='observed_edits:obs-pin'",
+                    [],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok()
+                .and_then(|v| serde_json::from_str(&v).ok())
+                .unwrap_or_default()
+        };
+        let now = now_epoch();
+        // Window prune (L726): a record far beyond OBSERVED_WINDOW_S is
+        // dropped from the PRIOR map on the next write. Without the retain it
+        // lives forever and a stale observation vetoes AF-27 indefinitely.
+        let _ = post(json!({"paths": [{"path": "/repo-obs/ancient.rs", "mtime": now - 30_000.0}]})).await;
+        let _ = post(json!({"paths": [{"path": "/repo-obs/fresh.rs", "mtime": now}]})).await;
+        let m = read_map();
+        assert!(m.contains_key("/repo-obs/fresh.rs"));
+        assert!(
+            !m.contains_key("/repo-obs/ancient.rs"),
+            "a record older than the window must be pruned at the next write, not live forever"
+        );
+        // Cap (L764) + sort direction (L762): 1 fresh + 500 batch = 501 rows,
+        // one over the cap. The cap must hold at exactly OBSERVED_MAX_ROWS and
+        // the victim must be the OLDEST — "the newest observation is the one
+        // the next commit is about".
+        let batch: Vec<Value> = (0..OBSERVED_MAX_ROWS)
+            .map(|i| json!({"path": format!("/repo-obs/p{i:03}.rs"), "mtime": now - 600.0 + i as f64}))
+            .collect();
+        let _ = post(json!({"paths": batch})).await;
+        let m = read_map();
+        assert_eq!(m.len(), OBSERVED_MAX_ROWS, "the row cap must actually cap");
+        assert!(
+            m.contains_key("/repo-obs/fresh.rs"),
+            "the NEWEST record must survive the cap — a reversed sort drops it first"
+        );
+        assert!(
+            !m.contains_key("/repo-obs/p000.rs"),
+            "the OLDEST record is the cap's victim, per the design comment"
+        );
     }
 
     /// AF-127, the design's two load-bearing refusals plus the episode
