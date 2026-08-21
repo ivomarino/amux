@@ -6982,6 +6982,52 @@ async fn session_dirty_files(name: &str, work_dir: &str) -> Vec<String> {
 // per request — reintroduce a cache if the SPA's poll cadence lands here).
 // ---------------------------------------------------------------------------
 
+/// AF-128 (split from AR-110): the pane's OWN geometry, reported where the reader is.
+///
+/// AR-110's recorded cost was not the narrow pane — it was a wrong root cause and a
+/// shipped CSS change that had to be reverted, because a narrow PANE and a narrow
+/// RENDER present identically in peek and nothing in the response could tell them
+/// apart. The narrowing itself is fixed (`runtime_jobs::pane_size` undoes tmux's
+/// `window-size manual` pin), but a pane can still be narrow for reasons nobody
+/// caused: a terminal resize, an 80-column launch — two lanes sit at 80 today
+/// against a 220 spawn width. So the ambiguity outlived the fix, which is the half
+/// worth closing: fixing a cause removes one instance, fixing the instrument
+/// removes the misdiagnosis.
+///
+/// Deliberately NO threshold and no "this pane looks narrow" verdict. Picking a
+/// column count at which to warn is the guess this repo's ethos names as the tell
+/// (`ethos.md`: "prefer the structurally-absent signal over the tuned parameter"),
+/// and the reader comparing 50 against the 220 they see elsewhere needs no help
+/// from a constant. Report the fact; let the consumer judge.
+async fn tmux_pane_geometry(name: &str) -> Option<(i64, i64)> {
+    if session_backend(name) == "herdr" {
+        return None;
+    }
+    let pt = pt(name);
+    let out = tmux(&[
+        "display-message", "-t", &pt, "-p", "#{window_width}x#{window_height}",
+    ])
+    .await?;
+    parse_pane_geometry(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// The parse half of [`tmux_pane_geometry`], split out so it is testable without
+/// tmux. Every rejection below is a shape tmux really produces: an unknown format
+/// specifier comes back as the literal string, a dead session gives empty stdout,
+/// and `display-message` on a missing target prints an error to stderr leaving
+/// stdout blank. Returning None for all of them is why a caller can treat
+/// `pane_cols` as absent-or-true rather than absent-or-wrong.
+fn parse_pane_geometry(raw: &str) -> Option<(i64, i64)> {
+    let (w, h) = raw.trim().split_once('x')?;
+    let cols: i64 = w.trim().parse().ok()?;
+    let rows: i64 = h.trim().parse().ok()?;
+    // A zero or negative dimension is not a pane, it is tmux failing to answer.
+    if cols <= 0 || rows <= 0 {
+        return None;
+    }
+    Some((cols, rows))
+}
+
 async fn peek_response(name: &str, lines: i64, live_only: bool, no_trim: bool) -> Value {
     let provider = provider_of(&parse_env(name));
     if live_only {
@@ -9316,7 +9362,18 @@ async fn get_dispatch(
             let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
             let live_only = qs_flag(qs, "live");
             let no_trim = qs_flag(qs, "notrim");
-            j200(peek_response(name, lines, live_only, no_trim).await)
+            // Geometry is attached HERE rather than inside peek_response because
+            // that function has six return points (live_only, alt-screen, normal,
+            // short-output, empty…) and a key added to one of them is a key the
+            // reader cannot rely on. One injection site covers every shape.
+            let mut resp = peek_response(name, lines, live_only, no_trim).await;
+            if let (Some((cols, rows)), Some(obj)) =
+                (tmux_pane_geometry(name).await, resp.as_object_mut())
+            {
+                obj.insert("pane_cols".into(), json!(cols));
+                obj.insert("pane_rows".into(), json!(rows));
+            }
+            j200(resp)
         }
         "transcript" => {
             // Codex/Ollama run a native TUI whose raw mirror is what Ethan saw
@@ -14360,6 +14417,31 @@ mod tests {
         let none = dir.path().join("none.jsonl");
         std::fs::write(&none, "{\"type\":\"user\"}\n").unwrap();
         assert_eq!(transcript_display_name(&none), None);
+    }
+
+    /// AF-128. The geometry parse must reject every shape tmux produces when it
+    /// CANNOT answer, because a wrong number here is worse than no number: the
+    /// whole point of the field is to let a reader tell a narrow pane from a
+    /// narrow render, and a fabricated 0 would answer that question falsely.
+    #[test]
+    fn pane_geometry_parses_tmux_output_and_rejects_every_non_answer() {
+        assert_eq!(parse_pane_geometry("220x50\n"), Some((220, 50)));
+        assert_eq!(parse_pane_geometry(" 80x24 "), Some((80, 24)));
+        assert_eq!(parse_pane_geometry("50x50"), Some((50, 50)));
+
+        // Dead/missing session: tmux writes nothing to stdout.
+        assert_eq!(parse_pane_geometry(""), None);
+        assert_eq!(parse_pane_geometry("\n"), None);
+        // Unknown format specifier: tmux echoes the literal back.
+        assert_eq!(parse_pane_geometry("#{window_width}x#{window_height}"), None);
+        // Partial or malformed answers.
+        assert_eq!(parse_pane_geometry("220"), None);
+        assert_eq!(parse_pane_geometry("220x"), None);
+        assert_eq!(parse_pane_geometry("x50"), None);
+        // Zero is tmux failing to answer, not a pane. Reported as absent.
+        assert_eq!(parse_pane_geometry("0x50"), None);
+        assert_eq!(parse_pane_geometry("220x0"), None);
+        assert_eq!(parse_pane_geometry("-1x50"), None);
     }
 
     #[test]
