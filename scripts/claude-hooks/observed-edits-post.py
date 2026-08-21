@@ -68,7 +68,9 @@ def is_pure_read_command(cmd):
     saw = False
     for seg in __import__("re").split(r"[|;&\n()`]", cmd):
         seg = seg.strip()
-        if not seg:
+        if not seg or seg.startswith("#"):
+            # AF-126: a comment segment writes nothing and must not force the
+            # command non-read (same fix as the rust canonical).
             continue
         saw = True
         tok = seg.split()[0] if seg.split() else ""

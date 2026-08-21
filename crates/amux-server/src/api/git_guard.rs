@@ -514,29 +514,34 @@ fn has_output_redirection(cmd: &str) -> bool {
 /// python heredocs, a prefixed `sudo head`) falls through to the mtime gate
 /// exactly as before, so no real inferred WRITE loses its attribution — only the
 /// unambiguous readers are excluded.
+const READ_ONLY_VERBS: &[&str] = &[
+    "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep",
+    "rg", "ag", "wc", "stat", "file", "find", "cmp", "diff", "sort", "uniq",
+    "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
+    "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
+    "pwd", "echo", "printf",
+    // `cd` cannot modify anything, and its ABSENCE silently undid the
+    // git-read exemption directly below: `git show f` was correctly a read,
+    // while `cd /repo && git show f` was not, because the FIRST segment's
+    // verb decided the whole command. `cd` is the most common prefix in this
+    // repo's own workflow, so the exemption was defeated in the majority of
+    // real invocations — 117 of 191 inferred-edit records in 24h had
+    // verb=cd (AEAB-24). Safe because a real mutation still trips either the
+    // output-redirection check above or its own non-read verb in a later
+    // segment; `cd x && rm f`, `cd x && sed -i`, `cd x && git commit` and
+    // `cd x && cat > f <<EOF` all remain non-read, and the test below pins
+    // exactly that.
+    "cd",
+    ];
+const GIT_READ_SUBCMDS: &[&str] = &[
+    "show", "log", "diff", "status", "blame", "grep", "cat-file", "shortlog",
+    "describe", "rev-parse", "rev-list", "ls-files", "ls-tree", "reflog",
+    "whatchanged", "annotate", "name-rev", "show-ref", "for-each-ref",
+    ];
 fn is_pure_read_command(cmd: &str) -> bool {
     if has_output_redirection(cmd) {
         return false;
     }
-    const READ_ONLY_VERBS: &[&str] = &[
-        "ls", "cat", "head", "tail", "less", "more", "grep", "egrep", "fgrep",
-        "rg", "ag", "wc", "stat", "file", "find", "cmp", "diff", "sort", "uniq",
-        "cut", "column", "od", "xxd", "hexdump", "tree", "du", "basename",
-        "dirname", "realpath", "readlink", "sha256sum", "md5sum", "nl", "tac",
-        "pwd", "echo", "printf",
-        // `cd` cannot modify anything, and its ABSENCE silently undid the
-        // git-read exemption directly below: `git show f` was correctly a read,
-        // while `cd /repo && git show f` was not, because the FIRST segment's
-        // verb decided the whole command. `cd` is the most common prefix in this
-        // repo's own workflow, so the exemption was defeated in the majority of
-        // real invocations — 117 of 191 inferred-edit records in 24h had
-        // verb=cd (AEAB-24). Safe because a real mutation still trips either the
-        // output-redirection check above or its own non-read verb in a later
-        // segment; `cd x && rm f`, `cd x && sed -i`, `cd x && git commit` and
-        // `cd x && cat > f <<EOF` all remain non-read, and the test below pins
-        // exactly that.
-        "cd",
-    ];
     // `git <read-subcommand>` is how a careful VERIFIER reads a file — `git show`,
     // `git log --stat`, `git diff`, `git grep`, `git blame` to chase a specific
     // row (AMUX-3128 follow-up, gtm-ticker). The verb is `git`, which is NOT in
@@ -548,15 +553,19 @@ fn is_pure_read_command(cmd: &str) -> bool {
     // reset/restore/rm/mv/apply/stash/merge/rebase/pull/am/…) are ABSENT on
     // purpose, so a real working-tree mutation still falls through to the mtime
     // gate and keeps its attribution.
-    const GIT_READ_SUBCMDS: &[&str] = &[
-        "show", "log", "diff", "status", "blame", "grep", "cat-file", "shortlog",
-        "describe", "rev-parse", "rev-list", "ls-files", "ls-tree", "reflog",
-        "whatchanged", "annotate", "name-rev", "show-ref", "for-each-ref",
-    ];
     let mut saw = false;
     for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
         let seg = seg.trim();
         if seg.is_empty() {
+            continue;
+        }
+        // AF-126: a comment segment writes nothing. `set -x; # note; cat f`
+        // used to force the whole command non-read because verb `#` is not a
+        // read verb — and with the mtime gate, that minted records off a
+        // PEER's concurrent write (measured live: a lane's union-merge READS
+        // of frustrations.md claimed the file while its author was writing
+        // it, costing them a full-diff reconcile of their own commit).
+        if seg.starts_with('#') {
             continue;
         }
         saw = true;
@@ -880,6 +889,56 @@ pub(crate) fn unaccounted_added_lines(added: &[String], own_content: &str) -> Ve
 /// `is_pure_read_command` and the exclusion list is missing it. Deduped per
 /// (session, path basename, verb) for an hour so legit `sed -i` churn cannot spam.
 static INFERRED_WARNED: Mutex<Option<HashMap<String, f64>>> = Mutex::new(None);
+
+/// AF-126: the verb of the segment that actually FAILED the read test — the
+/// one the WARN's diagnostic sentence is about. Naming the FIRST segment
+/// instead put `verb=cd` on 6,173 of 10,722 retained WARN lines (cd is
+/// read-only under AEAB-24; a LATER segment wrote), and an operator applying
+/// the sentence as written would have concluded ~75% false co-authorship
+/// fleet-wide — the number was in a draft card before its author read the
+/// function. Returns None for a pure-read command; "redirect" when only the
+/// output redirection blocks.
+fn first_blocking_verb(cmd: &str) -> Option<String> {
+    for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
+        let seg = seg.trim();
+        if seg.is_empty() || seg.starts_with('#') {
+            continue;
+        }
+        let Some(tok) = seg.split_whitespace().next() else {
+            return Some("?".into());
+        };
+        let verb =
+            Path::new(tok).file_name().and_then(|s| s.to_str()).unwrap_or(tok).to_string();
+        if verb == "git" {
+            let mut rest = seg.split_whitespace().skip(1);
+            let mut sub = None;
+            while let Some(t) = rest.next() {
+                if t == "-C" || t == "-c" {
+                    rest.next();
+                    continue;
+                }
+                if t.starts_with('-') {
+                    continue;
+                }
+                sub = Some(t);
+                break;
+            }
+            match sub {
+                Some(s) if GIT_READ_SUBCMDS.contains(&s) => continue,
+                Some(s) => return Some(format!("git-{s}")),
+                None => return Some("git".into()),
+            }
+        }
+        if !READ_ONLY_VERBS.contains(&verb.as_str()) {
+            return Some(verb);
+        }
+    }
+    if has_output_redirection(cmd) {
+        return Some("redirect".into());
+    }
+    None
+}
+
 fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     let verb = cmd
         .split(['|', ';', '&', '\n', '(', ')', '`'])
@@ -887,6 +946,9 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
         .next()
         .map(|t| Path::new(t).file_name().and_then(|s| s.to_str()).unwrap_or(t))
         .unwrap_or("?");
+    // The segment that FAILED the read test — the sentence below is about
+    // THIS one, not the first (AF-126). `verb=` stays for grep continuity.
+    let blocked_by = first_blocking_verb(cmd).unwrap_or_else(|| "?".into());
     let base = Path::new(abs_path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -902,12 +964,15 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     }
     tracing::warn!(
         target: "staged_guard",
-        "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} — ownership \
-         INFERRED from a bash command, not a firsthand Edit/Write. A READ verb here means \
-         is_pure_read_command missed a reader and it may be minting false co-authorship.",
+        "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} blocked_by={} — \
+         ownership INFERRED from a bash command, not a firsthand Edit/Write. A READ verb in \
+         blocked_by means is_pure_read_command missed a reader and may be minting false \
+         co-authorship; a WRITE verb there is the record working as designed (AF-126: the \
+         first segment's verb is usually `cd` and says nothing).",
         if session.is_empty() { "(none)" } else { session },
         base,
         verb,
+        blocked_by,
     );
 }
 
@@ -2266,6 +2331,42 @@ mod tests {
         let v = classify(&[pair("f.md")], 2000.0, 3600.0, &g);
         assert_eq!(v.shared.len(), 1, "both firsthand -> shared: {:?}", v.foreign);
         assert_eq!(v.shared[0]["mine_age_secs"], serde_json::json!(500));
+    }
+
+    /// AF-126: the WARN must name the segment that FAILED the read test, not
+    /// the first segment — `verb=cd` on 6,173 of 10,722 retained lines read
+    /// as ~75% false co-authorship until the function was consulted. And a
+    /// comment segment must never force a command non-read: with the mtime
+    /// gate, that minted records off a PEER's concurrent write (measured
+    /// live, a 73/539 false-CONTESTED reconcile).
+    #[test]
+    fn the_blocking_segment_is_named_and_comments_never_force_non_read() {
+        // The histogram's top shape: cd leads, sed blocks.
+        assert_eq!(
+            first_blocking_verb("cd /repo && sed -i 's/a/b/' f.rs").as_deref(),
+            Some("sed")
+        );
+        // Pure read -> no blocker (this command mints nothing anyway).
+        assert_eq!(first_blocking_verb("cd /repo && cat f.rs | head -3"), None);
+        // Redirection is the blocker when every verb reads.
+        assert_eq!(
+            first_blocking_verb("cat template > out.md").as_deref(),
+            Some("redirect")
+        );
+        // Git write subcommand named with its verb.
+        assert_eq!(
+            first_blocking_verb("cd x && git commit -m y").as_deref(),
+            Some("git-commit")
+        );
+        // Comment segments are skipped: this command is a pure read despite
+        // `#` and would previously have minted off a peer's concurrent mtime.
+        assert!(is_pure_read_command("# note\ncat frustrations.md"));
+        assert_eq!(first_blocking_verb("# note\ncat frustrations.md"), None);
+        // ...but a comment plus a real write still blocks, named correctly.
+        assert_eq!(
+            first_blocking_verb("# note\nsed -i 's/a/b/' f.rs").as_deref(),
+            Some("sed")
+        );
     }
 
     /// The other half of the discriminator, and the anti-regression guarantee:
