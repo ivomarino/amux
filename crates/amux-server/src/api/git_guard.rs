@@ -254,6 +254,16 @@ pub(crate) enum PathFate {
     /// Keying only on the owner's own trailer reported this as at-risk, which
     /// cries wolf on every absorption that already went fine.
     AbsorbedBy(String, String),
+    /// The worktree bytes are byte-identical to origin/main (AMUX-3445): the
+    /// work is LANDED, whatever local HEAD thinks. Graft-push lanes ship by
+    /// building a dangling commit from origin bytes and pushing it, so the
+    /// shared checkout's local HEAD never advances and every grafted edit
+    /// permanently reads "differs from HEAD, no commit of yours" — which made
+    /// the at-risk warning fire on every peer commit sweeping the file,
+    /// forever (two identical warnings in one hour, both resolving to
+    /// byte-identical no-ops). Nothing identical to origin can be absorbed or
+    /// reverted; carries origin's newest sha on the path for the receipt.
+    LandedOnOrigin(String),
     /// The path differs from HEAD and the owner has no commit for it: the work
     /// is genuinely uncommitted and a sweep would take it. This is the state
     /// the AC-355 block exists to prevent.
@@ -280,6 +290,17 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
             format!(
                 "  {pth}  — absorbed into {sha} under `{who}`; your CODE is safe, \
                  record the REASONING on the card"
+            ),
+            false,
+        ),
+        // AMUX-3445: landed on origin = a receipt, never a warning. The old
+        // at-risk line here cost both sides a reconciliation cycle per peer
+        // commit, forever, on graft-push lanes whose local HEAD never moves.
+        PathFate::LandedOnOrigin(sha) => (
+            format!(
+                "  {pth}  — byte-identical to origin/main{}; nothing can be absorbed or \
+                 reverted (local HEAD is just behind — graft-push lane)",
+                if sha.is_empty() { String::new() } else { format!(" (as of {sha})") }
             ),
             false,
         ),
@@ -315,6 +336,21 @@ pub(crate) async fn path_fate(dir: &str, path: &str, owner: &str, edit_age_secs:
         .map(|o| !o.trim().is_empty())
         .unwrap_or(true); // unreadable -> assume at risk, never reassure
     if dirty {
+        // AMUX-3445: worktree-vs-HEAD is the wrong risk discriminator on a
+        // graft-push checkout — local HEAD never advances there, so a landed
+        // graft reads dirty forever. The discriminator that matters is
+        // worktree-vs-ORIGIN: bytes identical to origin/main cannot be
+        // absorbed or reverted. `git_out` is None on nonzero exit, so a real
+        // difference, a missing origin ref, or any git failure all fall
+        // through to AtRisk — the loud direction stays the default.
+        if git_out(dir, &["diff", "--quiet", "origin/main", "--", path]).await.is_some() {
+            let sha = git_out(dir, &["log", "origin/main", "-1", "--format=%h", "--", path])
+                .await
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            return PathFate::LandedOnOrigin(sha);
+        }
         return PathFate::AtRisk;
     }
     let last = git_out(
@@ -1642,6 +1678,37 @@ mod tests {
         git(&["commit", "-q", "-m", "alice\n\nAmux-Session: alice"]);
         assert!(matches!(path_fate(&d, "mine.txt", "alice", 3600).await,
                          PathFate::SettledByOwner(_)));
+
+        // AMUX-3445, the graft-push shape: backend's work landed on ORIGIN via
+        // a dangling commit, local HEAD never advanced, worktree carries the
+        // origin bytes. Two identical at-risk warnings fired in one hour on
+        // exactly this — both resolving to byte-identical no-ops — because
+        // worktree-vs-HEAD reads a landed graft as dirty forever.
+        // The base commit is a PEER's: a graft lane never commits locally, so
+        // owner_committed_since must miss (a backend-authored base here made
+        // the case exit early as SettledByOwner — also calm, but not the arm
+        // this test exists to pin).
+        std::fs::write(dir.path().join("grafted.txt"), "v1\n").unwrap();
+        git(&["add", "grafted.txt"]);
+        git(&["commit", "-q", "-m", "base\n\nAmux-Session: alice"]);
+        let base = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        std::fs::write(dir.path().join("grafted.txt"), "landed v2\n").unwrap();
+        git(&["add", "grafted.txt"]);
+        git(&["commit", "-q", "-m", "graft\n\nAmux-Session: backend"]);
+        let graft = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap().trim().to_string();
+        git(&["update-ref", "refs/remotes/origin/main", &graft]);
+        git(&["reset", "-q", "--hard", &base]);
+        std::fs::write(dir.path().join("grafted.txt"), "landed v2\n").unwrap();
+        match path_fate(&d, "grafted.txt", "backend", 3600).await {
+            PathFate::LandedOnOrigin(sha) => {
+                assert!(!sha.is_empty(), "the receipt must carry origin's sha")
+            }
+            other => panic!("bytes identical to origin cannot be at risk: {other:?}"),
+        }
+        // Control: worktree differing from BOTH HEAD and origin is the real
+        // at-risk case, and it must stay loud.
+        std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
+        assert_eq!(path_fate(&d, "grafted.txt", "backend", 0).await, PathFate::AtRisk);
     }
 
     #[tokio::test]
@@ -1763,6 +1830,11 @@ mod tests {
             victim_path_line("a.rs", &PathFate::SettledByOwner("abc123".into()), "restore");
         assert!(!at_risk);
         assert!(line.contains("nothing at risk"), "{line}");
+        // AMUX-3445: landed-on-origin is a receipt, never a warning.
+        let (line, at_risk) =
+            victim_path_line("g.rs", &PathFate::LandedOnOrigin("def456".into()), "firsthand");
+        assert!(!at_risk, "identical-to-origin cannot be at risk");
+        assert!(line.contains("origin/main") && line.contains("def456"), "{line}");
     }
 
     /// MG-1484: the foreign verdict carries the owner's claim PROVENANCE so
