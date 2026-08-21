@@ -205,3 +205,40 @@ async fn contract_serves_the_enforced_gate_not_just_type_defaults() {
         "the defaults table must name itself as defaults: {c}"
     );
 }
+
+/// The shipped `amux` CLI reads this list to print `amux board add --help`.
+///
+/// It read `["fields"]["valid_types"]` while the server published `types` at top
+/// level, so `--help` against a perfectly HEALTHY server printed "server
+/// unreachable" and routed the reader at the AMUX-3046 stranded-port hunt
+/// instead of at a key-path bug. Nothing caught it for the same reason the cap
+/// above went unnoticed: the bash suite's stub served the CLI's wrong shape, so
+/// fixture and code agreed with each other and both disagreed with production. A
+/// fixture built to match the code under test cannot fail on the defect.
+///
+/// Asserted in BOTH directions, like the filter test above — the contract
+/// publishes a non-empty `types`, and the shipped CLI still reads that key.
+/// Either side renaming turns this red rather than silently blanking the help.
+#[tokio::test]
+async fn the_contract_publishes_the_type_list_the_cli_reads() {
+    let c = contract().await;
+    let types = c["types"]
+        .as_array()
+        .unwrap_or_else(|| panic!("contract must publish `types` at top level: {c}"));
+    assert!(!types.is_empty(), "contract published an empty type list: {c}");
+    for want in ["code", "investigation", "escalation"] {
+        assert!(types.iter().any(|t| t == want), "contract types missing {want}: {types:?}");
+    }
+
+    // The consumer half: the bash CLI is not compiled, so nothing else can catch
+    // a rename on this side.
+    let cli = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../amux"),
+    )
+    .expect("shipped `amux` CLI not found at the repo root");
+    assert!(
+        cli.contains(r#"d.get("types")"#),
+        "the shipped `amux` CLI no longer reads the `types` key this contract publishes — \
+         `amux board add --help` will fall back instead of listing the types"
+    );
+}

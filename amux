@@ -1457,12 +1457,31 @@ transport failure, not a refused gate. Re-run when the server is back." >&2
 # list anywhere in this file. On an unreachable server it returns a POINTER, not
 # a guess: confidently wrong help is worse than none.
 _board_valid_types() {
-  local _t
-  _t=$(curl -sk --max-time 3 "$AMUX_API/api/board/contract" 2>/dev/null \
-    | python3 -c 'import json,sys
-try: print(" ".join(json.load(sys.stdin)["fields"]["valid_types"]))
-except Exception: pass' 2>/dev/null)
-  [[ -n "$_t" ]] && echo "$_t" || echo "(server unreachable — see GET /api/board/contract)"
+  local _resp _code _body _t
+  # -w captures the STATUS so a transport failure and a 200-with-an-unexpected
+  # -shape cannot print the same sentence. They did, for every session: this
+  # helper read ["fields"]["valid_types"] while the server publishes `types` at
+  # top level (board.rs, KNOWN_TYPES), so `amux board add --help` on a perfectly
+  # healthy server said "server unreachable" and pointed the reader at the
+  # AMUX-3046 stranded-port hunt instead of at a key-path bug one line away.
+  # The note above already said confidently wrong help is worse than none; this
+  # separates the two failures so the message can keep that promise.
+  _resp=$(curl -sk --max-time 3 -w '\n%{http_code}' "$AMUX_API/api/board/contract" 2>/dev/null)
+  _code="${_resp##*$'\n'}"
+  _body="${_resp%$'\n'*}"
+  if [[ "$_code" != "200" ]]; then
+    echo "(server unreachable at ${AMUX_API} (http=${_code:-000}) — see GET /api/board/contract)"
+    return
+  fi
+  # Read BOTH spellings: `types` is what the server publishes, the nested one is
+  # the historical shape this helper was written against. Accepting either means
+  # the next rename degrades to the other key rather than blanking the list.
+  _t=$(printf '%s' "$_body" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+t = d.get("types") or (d.get("fields") or {}).get("valid_types") or []
+print(" ".join(t))' 2>/dev/null)
+  [[ -n "$_t" ]] && echo "$_t" \
+    || echo "(server answered 200 but published no type list — contract shape changed; see GET /api/board/contract)"
 }
 
 # Refuse an argument that LOOKS like a flag but is not one this verb knows.

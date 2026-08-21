@@ -167,7 +167,14 @@ class H(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
     def do_GET(self):   # /api/board/contract, for the types list in usage
-        b = json.dumps({"fields": {"valid_types": ["code", "blocker", "chore"]}}).encode()
+        # The REAL server publishes `types` at TOP LEVEL (board.rs, KNOWN_TYPES).
+        # This stub used to serve {"fields": {"valid_types": [...]}} — a shape the
+        # server has never served — which matched what the CLI helper read, so the
+        # two agreed with each other and both disagreed with production. The test
+        # was green the whole time `amux board add --help` printed "server
+        # unreachable" against a healthy server. A fixture built to match the code
+        # under test cannot fail on the defect; it certifies it.
+        b = json.dumps({"types": ["code", "blocker", "chore"]}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b)))
@@ -209,6 +216,58 @@ print("status="+repr(b.get("status")))' "$BODY")
 else
   FAIL=$((FAIL+1)); echo "FAIL: (i) stub server recorded no POST body — cannot verify the payload"
 fi
+
+# ---------------------------------------------------------------------------
+# (j) The types list in `--help`, and the THREE cells it can land in.
+#
+# Until 2026-08-21 nothing here read the types line at all, so the stub above
+# could serve any shape it liked and the suite stayed green. It served
+# {"fields": {"valid_types": [...]}} because that is what the CLI helper read —
+# and the real server publishes `types` at TOP LEVEL, so on a healthy server
+# `amux board add --help` printed "server unreachable" and sent the reader off
+# on the AMUX-3046 stranded-port hunt. Fixture and code agreed with each other
+# and both disagreed with production. Asserting the OUTPUT is what makes that
+# impossible to repeat: a fixture nobody reads certifies nothing.
+#
+# Three cells, because the whole point of the fix is that they are distinct:
+#   200 + real shape  -> the actual list
+#   transport failure -> "unreachable", naming the http code
+#   200 + no types    -> "contract shape changed", NOT "unreachable"
+helptypes() { AMUX_API="$1" HOME="$TMP" "$AMUX_BIN" board add --help 2>&1 | grep "^types:"; }
+
+got=$(helptypes "http://127.0.0.1:8899")
+check_has   "(j) 200 + real contract shape lists the types" "code blocker chore" "$got"
+check_lacks "(j) a healthy server is never called unreachable" "unreachable"     "$got"
+
+got=$(helptypes "https://127.0.0.1:9")
+check_has   "(j) transport failure says unreachable"        "unreachable"        "$got"
+check_has   "(j) transport failure names the http code"     "http=000"           "$got"
+check_lacks "(j) transport failure is not a shape complaint" "shape changed"     "$got"
+
+# A 200 carrying neither spelling of the list.
+python3 - >/dev/null 2>&1 <<'PYSTUB2' &
+import json, http.server
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        b = json.dumps({"gates": {}}).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", 8902), H).serve_forever()
+PYSTUB2
+STUB2_PID=$!
+disown "$STUB2_PID" 2>/dev/null || true
+for _ in $(seq 1 50); do
+  if curl -s -o /dev/null --max-time 1 "http://127.0.0.1:8902/api/board/contract" 2>/dev/null; then break; fi
+  sleep 0.1
+done
+got=$(helptypes "http://127.0.0.1:8902")
+kill "$STUB2_PID" 2>/dev/null; wait "$STUB2_PID" 2>/dev/null
+check_has   "(j) 200 without a type list blames the CONTRACT" "shape changed"    "$got"
+check_lacks "(j) 200 without a type list is not 'unreachable'" "unreachable"     "$got"
 
 echo
 echo "test-board-add-flags: $PASS passed, $FAIL failed"
