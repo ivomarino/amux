@@ -257,3 +257,27 @@ if [ -n "$JS_STAGED" ]; then
   done
   echo "JS syntax checks passed."
 fi
+
+# ── 4. frustrations.md structural audit (AF-120) ─────────────────────────────
+#
+# The audit existed, detected exactly this failure (an entry appended with no
+# `## ` heading folds into the previous entry and vanishes from every census),
+# named the delta, and NOTHING RAN IT — so a check built after this exact
+# incident sat unread while the incident recurred six times, all via bash
+# heredoc appends that no Edit-tool hook ever sees. Commit time is the one
+# gate every append passes through; this is the audit's consumer. Structure
+# drift blocks; the informational card-title CHECK lines do not (the audit's
+# own exit code makes that distinction).
+if echo "$STAGED" | grep -qx 'frustrations.md' && [ -f "$ROOT/scripts/frustrations_audit.py" ]; then
+  echo "Checking frustrations.md structure..."
+  if ! python3 "$ROOT/scripts/frustrations_audit.py" >/dev/null 2>&1; then
+    python3 "$ROOT/scripts/frustrations_audit.py" 2>&1 | head -12
+    echo ""
+    echo "BLOCKED: frustrations.md fails its own structural audit (usually an entry"
+    echo "appended without a '## <title>' heading — the parser folds it into the"
+    echo "previous entry and every census undercounts it, AF-120). The format lives"
+    echo "in the file's own header. Fix the entry, restage, retry."
+    exit 1
+  fi
+  echo "frustrations.md structure ok."
+fi

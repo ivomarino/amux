@@ -71,6 +71,15 @@ jobs:
       # complements the static gate; it does not replace it.
       - name: runtime smoke -- CLI launch unbound-var (the AMUX-3145 scope shape shellcheck cannot see)
         run: bash scripts/test-cli-launch-unbound.sh
+      # AF-120: the frustrations audit existed, detected its failure class
+      # precisely (a headingless append folds into the previous entry and
+      # vanishes from every census), and NOTHING RAN IT — six malformed
+      # entries landed on main while the purpose-built check sat unread.
+      # This step is its CI consumer; the pre-commit hook is the local one.
+      - name: frustrations.md structural audit + its own test suite (AF-120)
+        run: |
+          python3 scripts/frustrations_audit.py > /dev/null
+          bash scripts/test-frustrations-audit.sh
 
       # MHC-377. `amux board status-update <ID> --outcome-file <path>` used to
       # record the literal flag string, print "status update posted" and exit 0,

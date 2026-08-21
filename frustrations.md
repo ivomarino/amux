@@ -2214,10 +2214,13 @@ FIX: Derive both from ONE table. A view must share the predicate of the mechanis
   Not fixed here: which of the two is authoritative is amux's call, not a guess of mine.
 
 ---
+
+## Reconnect dead-ended at Google's redirect_uri_mismatch wall, which amux can never observe
 STATUS: fixed
 DATE: 2026-08-20
 SESSION: amux
 AREA: instruments
+SEVERITY: blocks
 CARD: AMUX-3427
 SYMPTOM: The first live Reconnect through the connectors OAuth broker dead-ended at
   Google's own wall: `Error 400: redirect_uri_mismatch`, because the flow issued
@@ -2240,10 +2243,13 @@ FIX: Reuse what is proven instead of demanding new registration: google-family
   registered. Regression tests pin the URI and the delegation.
 
 ---
+
+## redirect_uri_registered answered true from token presence while the console held only the retired URI
 STATUS: fixed
 DATE: 2026-08-20
 SESSION: amux
 AREA: instruments
+SEVERITY: slows
 CARD: AMUX-3427
 SYMPTOM: The fix for the entry above shipped its own rule-7 violation, caught by
   Ethan's SECOND redirect_uri_mismatch screenshot within the hour. The broker's new
@@ -2265,10 +2271,13 @@ FIX: Replaced the inference with the real instrument: begin_auth now GETs the ex
   Test scripts both pages so the discriminator is pinned in both directions.
 
 ---
+
+## The consent tab stranded on the self-signed-cert interstitial one hop from landing, with zero log trace
 STATUS: fixed
 DATE: 2026-08-20
 SESSION: amux
 AREA: instruments
+SEVERITY: blocks
 CARD: AMUX-3427
 SYMPTOM: Third strike on the same flow, one layer down. With the redirect URI
   finally registered, Google redirected the consent tab to the registered
@@ -2290,10 +2299,13 @@ FIX: OAuth callback paths are now SERVED on the plain-HTTP leg: the acceptor
   keeps the https redirect.
 
 ---
+
+## The peek header said IDLE 21 minutes into a visibly active turn
 STATUS: fixed
 DATE: 2026-08-21
 SESSION: amux
 AREA: instruments
+SEVERITY: slows
 CARD: AMUX-3426
 SYMPTOM: The peek header said IDLE while autodesk was 21m48s into a visibly
   active turn (Ethan's screenshot, 2026-08-20 ~12:58). Root cause: Claude
@@ -2349,10 +2361,13 @@ FIX: Position and phase are published per directory BEFORE the syscall that
   with a Re-include button so the exemption is not a one-way ratchet.
 
 ---
+
+## install-hooks wrote guards into .git/hooks while git ran core.hooksPath — live where authored, dark where the incident happened
 STATUS: fixed
 DATE: 2026-08-21
 SESSION: amux
 AREA: instruments
+SEVERITY: blocks
 CARD: MG-1485
 SYMPTOM: install-hooks.sh installed every guard into $target/.git/hooks while
   its own pre-push check resolved core.hooksPath — split-brain in one function.
@@ -2379,10 +2394,13 @@ FIX: The installer resolves the effective hooks dir first and installs there.
   installed into the effective dir, fleet census shows zero stale live copies.
 
 ---
+
+## The idle nudge called a file CONTESTED and prescribed per-hunk staging when every hunk of mine was already committed
 STATUS: fixed
 DATE: 2026-08-21
 SESSION: amux
 AREA: notices
+SEVERITY: slows
 CARD: AMUX-3436
 SYMPTOM: The idle commit nudge labeled app.js CONTESTED (me + desktop) and
   prescribed per-hunk staging, when every hunk of mine was already committed
