@@ -37,12 +37,12 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
-# (`grep -L 'GUARD_VERSION = 4' */.git/hooks/amux-staged-guard`), so a tracked
+# (`grep -L 'GUARD_VERSION = 5' */.git/hooks/amux-staged-guard`), so a tracked
 # file that changed without moving this number makes every stale installed copy
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 4
+GUARD_VERSION = 5
 
 
 def amux_base_url():
@@ -375,6 +375,20 @@ def main():
           "a peer staged it before the window and a plain commit ships it under "
           "YOUR name. Commit path-scoped (git commit -- <your paths>) or "
           "unstage (git restore --staged -- <path>).\n")
+    # AMUX-3446: staged ADDED lines the committer's OWN firsthand edit content
+    # cannot account for — the one ownership signal that survives peer-record
+    # expiry (7797e45 swept a peer's table row silently because their records
+    # had aged out; this line-level check would have named the exact hunk).
+    # Advisory, never blocking: shell-edited files are skipped server-side,
+    # and an Edit+sed workflow can false-positive.
+    for _ua in d.get("unaccounted") or []:
+        w("amux staged-guard: NOTE — %d staged added line(s) in %s match nothing "
+          "you edited firsthand in the window:\n" % (_ua.get("count", 0), _ua.get("path", "?")))
+        for _l in _ua.get("lines") or []:
+            w("    + %s\n" % _l)
+        w("  If these are yours via shell edits, proceed. If you do not recognize "
+          "one, it is a peer's in-flight hunk riding your git add — stage "
+          "per-hunk instead (git add -p %s).\n" % _ua.get("path", ""))
     foreign = d.get("foreign") or []
     if not foreign:
         return 0

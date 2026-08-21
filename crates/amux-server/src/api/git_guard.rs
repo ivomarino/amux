@@ -646,6 +646,89 @@ fn is_restore_only_command(cmd: &str) -> bool {
     saw_restore
 }
 
+/// AMUX-3446: the committer's own firsthand edit CONTENT per file, from their
+/// transcript — new_string/content of Edit/Write/MultiEdit/NotebookEdit calls
+/// inside the window, concatenated per abs realpath, capped so a rewrite-heavy
+/// session cannot balloon a request. This is what staged hunks are accounted
+/// against: peer records expire, the committer's own content at commit time
+/// does not (you commit right after editing).
+fn firsthand_edit_content(name: &str, since_secs: f64, cap_per_file: usize) -> HashMap<String, String> {
+    let mut out: HashMap<String, String> = HashMap::new();
+    let Some(jf) = session_jsonl_path(name) else { return out };
+    let cutoff = now_epoch() - since_secs;
+    for e in iter_jsonl_tail(&jf, JSONL_TAIL_BYTES) {
+        let Some(ts) = e.get("timestamp").and_then(Value::as_str).and_then(parse_ts) else {
+            continue;
+        };
+        if ts < cutoff {
+            continue;
+        }
+        let Some(content) = e.get("message").and_then(|m| m.get("content")).and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for blk in content {
+            if blk.get("type").and_then(Value::as_str) != Some("tool_use") {
+                continue;
+            }
+            let tool = blk.get("name").and_then(Value::as_str).unwrap_or("");
+            if !EDIT_TOOL_NAMES.contains(&tool) {
+                continue;
+            }
+            let inp = blk.get("input");
+            let fp = inp
+                .and_then(|i| i.get("file_path"))
+                .or_else(|| inp.and_then(|i| i.get("notebook_path")))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if fp.is_empty() {
+                continue;
+            }
+            let slot = out.entry(realpath(Path::new(fp))).or_default();
+            let mut push = |s: &str| {
+                if slot.len() < cap_per_file && !s.is_empty() {
+                    slot.push('\n');
+                    slot.push_str(&s.chars().take(cap_per_file - slot.len().min(cap_per_file)).collect::<String>());
+                }
+            };
+            if let Some(i) = inp {
+                if let Some(s) = i.get("new_string").and_then(Value::as_str) {
+                    push(s);
+                }
+                if let Some(s) = i.get("content").and_then(Value::as_str) {
+                    push(s);
+                }
+                if let Some(s) = i.get("new_source").and_then(Value::as_str) {
+                    push(s);
+                }
+                if let Some(edits) = i.get("edits").and_then(Value::as_array) {
+                    for ed in edits {
+                        if let Some(s) = ed.get("new_string").and_then(Value::as_str) {
+                            push(s);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// AMUX-3446, the pure half: which staged ADDED lines does the committer's own
+/// content NOT contain? Trivial lines (short after trim) are auto-accounted —
+/// a bare brace or blank appears everywhere and would drown the signal. A miss
+/// here means: on a shared checkout, this staged line is likely a PEER's
+/// in-flight hunk riding a per-file `git add` (the 7797e45 sweep shape).
+pub(crate) fn unaccounted_added_lines(added: &[String], own_content: &str) -> Vec<String> {
+    added
+        .iter()
+        .map(|l| l.trim())
+        .filter(|l| l.len() >= 8)
+        .filter(|l| !own_content.contains(*l))
+        .map(str::to_string)
+        .collect()
+}
+
 /// AMUX-3128 surfacing half: every INFERRED edit record (a Bash command whose
 /// named path moved mtime within slack) is logged so the class stays countable.
 /// A future false co-authorship now leaves a trace naming the verb — and if a
@@ -1061,6 +1144,14 @@ struct Envelope {
     verdict: Verdict,
     cotenants: Vec<String>,
     window: f64,
+    /// AMUX-3446: staged ADDED lines the committer's own firsthand edit
+    /// content cannot account for. The one ownership signal that SURVIVES
+    /// record expiry — peer records age out (that is how 7797e45 swept a
+    /// peer's table row silently), but the committer's own edit content is
+    /// fresh at commit time by construction. Advisory, never blocking: a
+    /// shell-edited file has no firsthand content and is skipped entirely,
+    /// and a partial Edit+sed workflow can false-positive, so the hook WARNs.
+    unaccounted: Vec<Value>,
     /// A verdict WAS computed but may UNDER-report: a peer we could not see, a
     /// git call that failed, paths truncated.
     degraded: Vec<String>,
@@ -1077,6 +1168,7 @@ impl Envelope {
             "foreign": self.verdict.foreign,
             "shared": self.verdict.shared,
             "unclaimed": self.verdict.unclaimed,
+            "unaccounted": self.unaccounted,
             "cotenants": self.cotenants,
             "window_secs": self.window as i64,
             "undecided": self.undecided.is_some(),
@@ -1461,6 +1553,44 @@ pub async fn staged_guard_inner(
 };
     let v = classify(&pairs, now, window, &inputs);
 
+    // AMUX-3446: account each staged path's ADDED lines against the
+    // committer's own firsthand edit content. Skipped entirely for a path
+    // with no firsthand content (a shell-edited file would false-positive on
+    // every line), and never blocking — but a hit is the one signal that
+    // survives peer-record expiry, which is the hole 7797e45 shipped through.
+    let mut unaccounted_rows: Vec<Value> = Vec::new();
+    if !session.is_empty() {
+        let own = tokio::task::spawn_blocking({
+            let s = session.clone();
+            let w = window;
+            move || firsthand_edit_content(&s, w, 400_000)
+        })
+        .await
+        .unwrap_or_default();
+        for (rel, ap) in &pairs {
+            let Some(content) = own.get(ap) else { continue };
+            let Some(diff) = git_out(&wd, &["diff", "--cached", "--unified=0", "--", rel]).await
+            else {
+                continue;
+            };
+            let added: Vec<String> = diff
+                .lines()
+                .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+                .map(|l| l[1..].to_string())
+                .collect();
+            let missing = unaccounted_added_lines(&added, content);
+            if missing.is_empty() {
+                continue;
+            }
+            unaccounted_rows.push(json!({
+                "path": rel,
+                "count": missing.len(),
+                "lines": missing.iter().take(5).map(|l| l.chars().take(120).collect::<String>()).collect::<Vec<_>>(),
+                "note": "staged ADDED lines matching nothing you edited firsthand in the window — on a shared checkout these are likely a peer's in-flight hunks riding your git add (AMUX-3446; a per-file add stages whatever is in the file). If they are yours via shell edits, proceed; otherwise stage per-hunk (git add -p).",
+            }));
+        }
+    }
+
     if !v.foreign.is_empty() {
         // BLOCK-TIME FORENSICS (AF-27). A block is the expensive verdict and
         // the only one that was undiagnosable after the fact — by the time
@@ -1614,7 +1744,7 @@ pub async fn staged_guard_inner(
     (
         StatusCode::OK,
         Json(
-            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, ..Default::default() }
+            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, ..Default::default() }
                 .json(),
         ),
     )
@@ -1809,6 +1939,32 @@ mod tests {
         ] {
             assert!(is_pure_read_command(cmd), "should be pure read: {cmd}");
         }
+    }
+
+    /// AMUX-3446, rebuilt from the incident's own bytes: my staged diff for
+    /// 7797e45 carried MY row (present in my Edit new_string) and DESKTOP's
+    /// row (present in nobody's — their records had expired). Content
+    /// accounting names exactly the swept line, and it never consulted a peer
+    /// record, which is the property the card demands. Trivial lines are
+    /// auto-accounted so braces cannot drown the signal.
+    #[test]
+    fn content_accounting_names_the_swept_peer_hunk_without_peer_records() {
+        let added = vec![
+            r#"    RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },"#.to_string(),
+            r#"    RouteEntry { path: "/api/reclaim/skipped", methods: &["GET", "DELETE"] },"#.to_string(),
+            "}".to_string(), // trivial: auto-accounted
+        ];
+        let my_edit_content = r#"
+    RouteEntry { path: "/api/connectors", methods: &["GET"] },
+    RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },
+    RouteEntry { path: "/api/connectors/{id}/credentials", methods: &["POST"] },
+"#;
+        let missing = unaccounted_added_lines(&added, my_edit_content);
+        assert_eq!(missing.len(), 1, "{missing:?}");
+        assert!(missing[0].contains("/api/reclaim/skipped"), "{missing:?}");
+        // Everything accounted -> silence (the check CAN pass).
+        let all_mine = unaccounted_added_lines(&added[..1], my_edit_content);
+        assert!(all_mine.is_empty(), "{all_mine:?}");
     }
 
     /// MG-1484: a restore writes bytes equal to a committed ref — an edit
