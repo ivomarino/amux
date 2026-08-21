@@ -2417,3 +2417,28 @@ FIX: 5409ac4. Shared rows from the guard carry mine_age_secs; the nudge asks
   foreign (NOT YOURS, peer named). Verified on the incident's own specimen:
   the live app.js row (mine_age_secs=9261) settles against commit 6b75622
   (age 9224s, strictly newer).
+
+---
+
+## My per-file git add swept a peer's hunk after their edit records aged out, and no guard spoke
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-21
+SESSION: amux
+CARD: AMUX-3446
+SYMPTOM: 7797e45 staged request_log.rs for my one-row AF-116 change while
+  desktop's uncommitted reclaim work sat in the same file. Their ROUTE_TABLE
+  row shipped under my commit message; its mount stayed uncommitted in their
+  worktree. The staged-guard said nothing — desktop had been parked at a
+  selector for hours, their edit records had aged out of the attribution
+  window, and there was no foreign claim left to warn on. Main went red a day
+  later when the route_table both-directions test caught the map shipped
+  without the territory (AF-121, filed by amux-frustrations against me).
+COST: origin/main red on check, blocking the CI-green verification gate
+  fleet-wide (40+ done cards on that gate) until the revert reached origin;
+  one absorbed hunk reverted (836de21, pushed); desktop must re-land their
+  row with the mount.
+FIX: pending (AMUX-3446): an ownership signal that survives record expiry —
+  once the window closes the guard is blind by construction, and a per-file
+  add on a shared checkout stages whatever is in the file, attributed or not.
