@@ -797,23 +797,58 @@ impl FleetSignals {
 
     /// Python's status value for one session (see the derivation note above).
     pub fn derive_status(&self, name: &str, running: bool) -> String {
+        self.derive_status_explain(name, running).0
+    }
+
+    /// The derivation WITH its why (AMUX-3434). This IS the implementation —
+    /// `derive_status` discards the explanation — so the explain can never
+    /// drift from the verdict it describes (a view must share the predicate of
+    /// the mechanism, ethos rule 1). Built because AMUX-3426 cost a screenshot
+    /// investigation: nothing could answer "which rule decided, over what
+    /// evidence, inside which trust window". Served by
+    /// GET /api/sessions/{name}/status-explain.
+    pub fn derive_status_explain(
+        &self,
+        name: &str,
+        running: bool,
+    ) -> (String, serde_json::Value) {
+        use serde_json::json;
+        let mut ex = serde_json::Map::new();
         if !running {
-            return String::new();
+            ex.insert("decided_by".into(), json!("not_running"));
+            return (String::new(), serde_json::Value::Object(ex));
         }
+        let mut decided = "activity_fallback";
         let heartbeat = env_secs("AMUX_ACTIVE_HEARTBEAT_S", 120.0);
         let act = self
             .activity
             .get(&format!("amux-{name}"))
             .copied()
             .unwrap_or(0) as f64;
+        ex.insert(
+            "activity".into(),
+            json!({"age_s": (self.now - act).max(0.0), "heartbeat_s": heartbeat}),
+        );
         let mut status: Option<String> = None;
         if let Some((st, ts)) = self.transitions.get(name) {
             // A transition from before the session's last (re)start describes
             // a previous life — Python never emits a transition out of the ""
             // state, so a restart leaves the old row behind (verified: the
             // guard flipped 1 live mismatch on 2026-08-09).
-            if self.started.get(name).copied().unwrap_or(0.0) <= *ts {
-                if st == "active" && self.now - act > heartbeat {
+            let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= *ts;
+            let demoted = st == "active" && self.now - act > heartbeat;
+            ex.insert(
+                "transition".into(),
+                json!({
+                    "state": st,
+                    "age_s": (self.now - ts).max(0.0),
+                    "from_this_life": from_this_life,
+                    "stale_active_demoted_to_idle": from_this_life && demoted,
+                }),
+            );
+            if from_this_life {
+                decided = "transition";
+                if demoted {
                     // An active session paints its pane continuously; silence
                     // past the heartbeat means the transition went stale.
                     status = Some("idle".into());
@@ -822,6 +857,20 @@ impl FleetSignals {
                 }
             }
         }
+        // The pane evidence, recorded regardless of which rule ends up
+        // deciding — when the verdict is wrong, this is what the reader needs.
+        ex.insert(
+            "pane".into(),
+            json!({
+                "admissible": self.pane_of(name).is_some(),
+                "detect": self
+                    .pane_of(name)
+                    .map(crate::api::session_verbs::detect_claude_status)
+                    .unwrap_or_default(),
+                "says_working": self.pane_says_working(name),
+                "contradiction_window_s": self.contradiction_window(),
+            }),
+        );
         // No transition: prefer the PANE over the activity timestamp when the
         // pane is admissible. A timestamp says something painted; the pane
         // says what. `detect_claude_status` returning "" is the documented
@@ -831,8 +880,14 @@ impl FleetSignals {
         // lane mid-turn (empty capture, and `act` is fresh, so: active).
         let mut status = status.unwrap_or_else(|| {
             match self.pane_of(name).map(crate::api::session_verbs::detect_claude_status) {
-                Some(v) if v == "active" || v == "waiting" => v,
-                Some(_) => "idle".into(),
+                Some(v) if v == "active" || v == "waiting" => {
+                    decided = "pane";
+                    v
+                }
+                Some(_) => {
+                    decided = "pane";
+                    "idle".into()
+                }
                 None if self.now - act < 60.0 => "active".into(),
                 None => "idle".into(),
             }
@@ -856,17 +911,30 @@ impl FleetSignals {
             let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= ts;
             let age = self.now - ts;
             let stale_active = st == "active" && age > heartbeat;
-            let live = age
-                < if st == "idle" {
-                    env_secs("AMUX_HOOKS_LIVE_IDLE_S", 86400.0)
-                } else {
-                    env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
-                };
-            if from_this_life
+            let trust_window = if st == "idle" {
+                env_secs("AMUX_HOOKS_LIVE_IDLE_S", 86400.0)
+            } else {
+                env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
+            };
+            let live = age < trust_window;
+            let applied = from_this_life
                 && !stale_active
                 && live
-                && matches!(st, "active" | "idle" | "waiting")
-            {
+                && matches!(st, "active" | "idle" | "waiting");
+            ex.insert(
+                "report".into(),
+                json!({
+                    "state": st,
+                    "source": rep.get("source").and_then(|v| v.as_str()).unwrap_or(""),
+                    "age_s": age.max(0.0),
+                    "trust_window_s": trust_window,
+                    "from_this_life": from_this_life,
+                    "stale_active": stale_active,
+                    "applied": applied,
+                }),
+            );
+            if applied {
+                decided = "report";
                 status = st.to_string();
                 if st == "idle" {
                     idle_report_age = Some(age);
@@ -879,11 +947,16 @@ impl FleetSignals {
         // the pane both painted inside the window and shows the main turn
         // generating. It can only ever flip idle -> active, so a missed frame
         // costs a late correction, never a false "busy".
-        if status == "idle"
-            && idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true)
-            && self.pane_says_working(name)
-        {
+        let idle_gate_open =
+            idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true);
+        ex.insert(
+            "idle_report_age_s".into(),
+            idle_report_age.map(|a| json!(a)).unwrap_or(serde_json::Value::Null),
+        );
+        ex.insert("idle_contradiction_gate_open".into(), json!(idle_gate_open));
+        if status == "idle" && idle_gate_open && self.pane_says_working(name) {
             status = "active".into();
+            decided = "contradiction_pane_generating";
         }
         // A PICKER CONTRADICTS IDLE TOO (AMUX-2952's status half). The rule
         // above only ever flips idle -> active on a GENERATING pane, so a lane
@@ -899,12 +972,11 @@ impl FleetSignals {
         // gated on the same report-age window, evidence from the same
         // admissible pane. A missed frame costs a late correction, never a
         // false "waiting".
-        if status == "idle"
-            && idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true)
-        {
+        if status == "idle" && idle_gate_open {
             if let Some(raw) = self.pane_of(name) {
                 if crate::api::session_verbs::detect_claude_status(raw) == "waiting" {
                     status = "waiting".into();
+                    decided = "contradiction_picker_waiting";
                 }
             }
         }
@@ -927,11 +999,9 @@ impl FleetSignals {
         // -> the flip still fires), and once a real idle report ages past the
         // window a still-writing subagent flips it active as the bounded late
         // correction the window was always documented to cost.
-        if status == "idle"
-            && idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true)
-            && self.subagents_working(name)
-        {
+        if status == "idle" && idle_gate_open && self.subagents_working(name) {
             status = "active".into();
+            decided = "contradiction_subagents_working";
         }
         // API-ERROR (5xx / Overloaded) is its own status (Ethan 2026-08-18).
         // Claude Code ENDS the turn on a 529 and returns to the prompt, so its
@@ -953,8 +1023,10 @@ impl FleetSignals {
                 .unwrap_or(false)
         {
             status = "api_error".into();
+            decided = "api_error_banner";
         }
-        status
+        ex.insert("decided_by".into(), json!(decided));
+        (status, serde_json::Value::Object(ex))
     }
 }
 
@@ -2948,6 +3020,60 @@ Claude usage limit reached. Your limit will reset at 3pm.
             s.panes.insert("x".into(), p.into());
         }
         s.derive_status("x", c.running)
+    }
+
+    /// AMUX-3434: the explanation must NAME the rule that decided, and its
+    /// evidence must be what the verdict actually weighed. The AMUX-3426/2646
+    /// specimen (stale idle report + working pane) explains as the
+    /// contradiction firing; a FRESH idle report explains as report-trusted
+    /// with the gate closed — the two cells a screenshot investigation had to
+    /// reconstruct by hand.
+    #[test]
+    fn status_explain_names_the_deciding_rule_and_its_evidence() {
+        let mut s = signals();
+        s.activity.insert("amux-x".into(), (s.now - 1.0) as i64);
+        s.running.insert("amux-x".into());
+        s.reports =
+            json!({"x": {"state": "idle", "ts": s.now - 1076.0, "source": "stop-hook-test"}});
+        s.panes.insert("x".into(), WORKING_BAR.into());
+        let (status, ex) = s.derive_status_explain("x", true);
+        assert_eq!(status, "active");
+        assert_eq!(ex["decided_by"], json!("contradiction_pane_generating"), "{ex}");
+        assert_eq!(ex["report"]["state"], json!("idle"));
+        assert_eq!(ex["report"]["applied"], json!(true));
+        assert!(ex["report"]["age_s"].as_f64().unwrap() > 1000.0, "{ex}");
+        assert!(ex["report"]["trust_window_s"].as_f64().unwrap() > 0.0, "{ex}");
+        assert_eq!(ex["idle_contradiction_gate_open"], json!(true), "{ex}");
+        assert_eq!(ex["pane"]["says_working"], json!(true), "{ex}");
+
+        // A FRESH idle report: trusted, gate closed, no contradiction — the
+        // report/repaint race grace window, now legible.
+        let mut s = signals();
+        s.activity.insert("amux-x".into(), (s.now - 1.0) as i64);
+        s.running.insert("amux-x".into());
+        s.reports = json!({"x": {"state": "idle", "ts": s.now - 3.0, "source": "stop-hook"}});
+        s.panes.insert("x".into(), WORKING_BAR.into());
+        let (status, ex) = s.derive_status_explain("x", true);
+        assert_eq!(status, "idle");
+        assert_eq!(ex["decided_by"], json!("report"), "{ex}");
+        assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "{ex}");
+
+        // Not running explains itself rather than returning a bare "".
+        let s = signals();
+        let (status, ex) = s.derive_status_explain("x", false);
+        assert_eq!(status, "");
+        assert_eq!(ex["decided_by"], json!("not_running"));
+    }
+
+    /// The wrapper IS the explain's verdict — one fn, so the view can never
+    /// disagree with the mechanism it describes.
+    #[test]
+    fn derive_status_is_the_explain_verdict() {
+        let mut s = signals();
+        s.activity.insert("amux-x".into(), (s.now - 1.0) as i64);
+        s.running.insert("amux-x".into());
+        s.panes.insert("x".into(), WORKING_BAR.into());
+        assert_eq!(s.derive_status("x", true), s.derive_status_explain("x", true).0);
     }
 
     /// THE TABLE. Every cell is a (report, age, source, pane, activity,

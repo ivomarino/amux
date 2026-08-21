@@ -9358,6 +9358,44 @@ async fn get_dispatch(
                 "empty": txt.is_empty(),
             }))
         }
+        "status-explain" => {
+            // AMUX-3434: the status derivation's WHY — which rule decided,
+            // over what evidence, inside which trust window — from the SAME
+            // snapshot and the same code path the session list uses
+            // (derive_status_explain IS the derivation; the list discards the
+            // explanation). When a badge is wrong, this is one GET instead of
+            // a screenshot investigation (AMUX-3426; ethos rule 4).
+            let store = state.store.clone();
+            let nm = name.to_string();
+            let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                let conn = store.read()?;
+                let mut fs = crate::api::sessions_legacy::FleetSignals::load(&conn);
+                fs.capture_panes();
+                let running = fs.agent_running(&format!("amux-{nm}"));
+                let (status, explain) = fs.derive_status_explain(&nm, running);
+                Ok((running, status, explain))
+            })
+            .await;
+            match joined {
+                Ok(Ok((running, status, explain))) => j200(json!({
+                    "session": name,
+                    "running": running,
+                    "status": status,
+                    "explain": explain,
+                    "note": "decided_by names the rule that produced `status`; transition/pane/report carry the evidence and trust windows the rules weighed. Fresh snapshot, same derivation the session list uses.",
+                })),
+                Ok(Err(e)) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
         "info" => {
             // py:20461 get_session_info.
             let cfg = parse_env(name);
