@@ -182,6 +182,23 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
             Err(e) => (false, format!("twilio error: {}", truncate(&e.to_string(), 120))),
         };
     }
+    // Circuit breaker on the TCC wall (AMUX-3492). With the Automation
+    // permission missing, the osascript below hangs to the full 12s timeout —
+    // and it did so INLINE on every owner alert, three pages in three days at
+    // a near-identical 12.6-12.7s. A wall that just ate 12s will eat the next
+    // 12s too, so after a timeout the channel is skipped (saying so in the
+    // channels map, never silently — AMUX-2938) until the cooldown passes,
+    // then probed again so a granted permission resumes within one window.
+    // Fast errors are NOT breakered: they cost nothing and carry their own
+    // diagnosis. Deliberately in-process state — a restart re-probing once is
+    // the behavior you want from a fire alarm.
+    if let Some(skip) = imessage_breaker_verdict(
+        IMSG_WALL_TS.load(std::sync::atomic::Ordering::Relaxed),
+        now_f64() as u64,
+        imessage_retry_s(&home),
+    ) {
+        return (false, skip);
+    }
     let run = tokio::process::Command::new("osascript")
         .args([
             "-e", "on run {msg, ph}",
@@ -197,18 +214,59 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
         .arg(phone)
         .output();
     match tokio::time::timeout(std::time::Duration::from_secs(12), run).await {
-        Err(_) => (
-            false,
-            "imessage timed out — grant Automation permission for Messages, or set TWILIO_* creds"
-                .into(),
-        ),
+        Err(_) => {
+            IMSG_WALL_TS.store(now_f64() as u64, std::sync::atomic::Ordering::Relaxed);
+            // TWO-FIXES: the 12s burn used to leave no log line of its own —
+            // only the channel string in the ledger, invisible unless every
+            // channel failed. The wall is now greppable where sweeps look.
+            tracing::warn!(
+                "[urgent-alert] imessage hit the 12s TCC wall — Automation permission for \
+                 Messages is missing; channel breakered for {}s (AMUX_IMESSAGE_RETRY_S)",
+                imessage_retry_s(&home)
+            );
+            (
+                false,
+                "imessage timed out — grant Automation permission for Messages, or set TWILIO_* creds"
+                    .into(),
+            )
+        }
         Ok(Err(e)) => (false, format!("imessage error: {}", truncate(&e.to_string(), 100))),
-        Ok(Ok(out)) if out.status.success() => (true, "imessage".into()),
+        Ok(Ok(out)) if out.status.success() => {
+            IMSG_WALL_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+            (true, "imessage".into())
+        }
         Ok(Ok(out)) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
             (false, format!("imessage error: {}", truncate(stderr.trim(), 100)))
         }
     }
+}
+
+/// Epoch seconds of the last 12s-timeout failure; 0 = closed (send normally).
+static IMSG_WALL_TS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn imessage_retry_s(home: &std::path::Path) -> u64 {
+    effective_env(home, "AMUX_IMESSAGE_RETRY_S")
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(900)
+}
+
+/// Pure breaker decision, split out so the skip/probe boundary is testable
+/// without a Messages.app or a 12s wait. Some(reason) = skip the send.
+fn imessage_breaker_verdict(last_wall_ts: u64, now_s: u64, retry_s: u64) -> Option<String> {
+    if last_wall_ts == 0 {
+        return None;
+    }
+    let elapsed = now_s.saturating_sub(last_wall_ts);
+    if elapsed >= retry_s {
+        return None; // cooldown over — probe the channel again
+    }
+    Some(format!(
+        "imessage skipped — hit the 12s Automation-permission wall {elapsed}s ago \
+         (AMUX-3492); next probe in {}s. Grant Automation permission for Messages \
+         or set TWILIO_* creds",
+        retry_s - elapsed
+    ))
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -798,6 +856,28 @@ async fn get_owner_ledger(State(state): State<AppState>, Query(qp): Query<Ledger
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-3492 — the breaker's whole value is at its three boundaries: a
+    /// closed breaker must send (or every alert silently loses a channel), a
+    /// fresh wall must skip WITH the reason and retry time (a bare skip is
+    /// AMUX-2938's indistinguishable-absence bug), and an expired cooldown
+    /// must probe again (or a granted permission never resumes).
+    #[test]
+    fn imessage_breaker_skips_only_inside_the_cooldown_and_says_why() {
+        // Closed (never walled): send.
+        assert_eq!(imessage_breaker_verdict(0, 1_000_000, 900), None);
+        // Walled 10s ago, 900s cooldown: skip, naming elapsed and remaining.
+        let skip = imessage_breaker_verdict(1_000_000, 1_000_010, 900).expect("must skip");
+        assert!(skip.contains("10s ago"), "elapsed missing: {skip}");
+        assert!(skip.contains("890s"), "retry-remaining missing: {skip}");
+        assert!(skip.contains("Automation permission"), "remedy missing: {skip}");
+        // Cooldown exactly over, and past it: probe again.
+        assert_eq!(imessage_breaker_verdict(1_000_000, 1_000_900, 900), None);
+        assert_eq!(imessage_breaker_verdict(1_000_000, 1_001_000, 900), None);
+        // Clock skew (wall ts in the future): treat as fresh, skip — never
+        // underflow into a probe storm.
+        assert!(imessage_breaker_verdict(1_000_100, 1_000_000, 900).is_some());
+    }
 
     /// The config view and the send path share one SMS gate (found verifying
     /// AC-362: config said "sms": true in exactly the state where a real send
