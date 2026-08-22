@@ -91,21 +91,39 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(self_reports_check(state));
 
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
-    // source? (AMUX-3033). The committed source is embedded at build time so the
-    // binary always carries the canonical version; the runtime copy is read from
-    // ~/.amux/hooks, and any drift (an unreviewed fleet-wide hand-edit) fails here
-    // instead of hiding until the next "can't reproduce on the current file".
+    // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
+    // time — these scripts deploy on COMMIT (install), not on binary rebuild, so
+    // a sha baked at build time goes stale on every script-only commit and the
+    // check then fires on the healthy state. The include_str! remains ONLY as
+    // the no-repo fallback (cloud image), where the message hedges instead of
+    // asserting a hand-edit.
     {
-        const COMMITTED_GUARD: &str = include_str!(concat!(
+        const BAKED_GUARD: &str = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/git-hooks/git-shared-guard.py"
         ));
+        let repo = crate::api::self_update::repo_dir();
+        let read_head = |rel: &str| -> Option<String> {
+            let dir = repo.as_ref()?;
+            let out = std::process::Command::new("git")
+                .args(["-C", &dir.to_string_lossy(), "show", &format!("HEAD:{rel}")])
+                .output()
+                .ok()?;
+            out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+        };
+        let read_worktree = |rel: &str| -> Option<String> {
+            repo.as_ref().and_then(|d| std::fs::read_to_string(d.join(rel)).ok())
+        };
         let amux_home = crate::config::ServerConfig::from_process_env().amux_home;
         let runtime = std::fs::read_to_string(amux_home.join("hooks/git-shared-guard.py"))
             .map_err(|e| e.to_string());
+        let head = read_head(checks::GIT_SHARED_GUARD.committed_path);
+        let wt = read_worktree(checks::GIT_SHARED_GUARD.committed_path);
         out.extend(checks::installed_script_matches_committed(
             &checks::GIT_SHARED_GUARD,
-            COMMITTED_GUARD,
+            BAKED_GUARD,
+            head.as_deref(),
+            wt.as_deref(),
             runtime,
         ));
 
@@ -114,15 +132,19 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         // spent months as an unversioned runtime file whose own header warned
         // about the forking that then happened anyway — a warning nobody reads
         // before editing is not a control.
-        const COMMITTED_REPORT_HOOK: &str = include_str!(concat!(
+        const BAKED_REPORT_HOOK: &str = include_str!(concat!(
             env!("CARGO_MANIFEST_DIR"),
             "/../../scripts/hooks/hook-report.sh"
         ));
         let runtime = std::fs::read_to_string(amux_home.join("hook-report.sh"))
             .map_err(|e| e.to_string());
+        let head = read_head(checks::REPORT_HOOK.committed_path);
+        let wt = read_worktree(checks::REPORT_HOOK.committed_path);
         out.extend(checks::installed_script_matches_committed(
             &checks::REPORT_HOOK,
-            COMMITTED_REPORT_HOOK,
+            BAKED_REPORT_HOOK,
+            head.as_deref(),
+            wt.as_deref(),
             runtime,
         ));
     }

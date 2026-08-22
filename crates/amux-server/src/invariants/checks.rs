@@ -834,44 +834,116 @@ pub const REPORT_HOOK: InstalledScript = InstalledScript {
     noun: "report hook",
 };
 
+/// AF-132: the committed side must be read at CHECK time, not baked at build
+/// time. These scripts are not compiled into the binary's deploy unit — the
+/// builder rebuilds only on crates//Cargo.* commits — so a script-only commit
+/// (4f06e22) left the baked sha stale and this check fired on the HEALTHY
+/// state, calling "runtime == HEAD, tree clean" an unreviewed hand-edit and
+/// prescribing a remedy (reinstall from source) that produces the
+/// byte-identical file already running. A loud wrong probe with an unwalkable
+/// remedy is the AMUX-2140 shape: the sanctioned instruction and the failure
+/// are the same action.
+///
+/// `head_src` is `git show HEAD:<path>` at check time (None when no repo is
+/// reachable — the cloud image); `worktree_src` is the tracked source file as
+/// it sits on disk. The verdict table, in order:
+/// - runtime == HEAD                          -> PASS (the healthy state).
+/// - runtime == worktree != HEAD              -> fail: an UNCOMMITTED edit is
+///   installed — real, actionable, and a different claim from a hand-edit.
+/// - runtime != both                          -> the original hand-edit alarm,
+///   now true when it fires.
+/// - no git (head_src None): fall back to the build-time baked source, and a
+///   mismatch HEDGES — it names both possible causes and this binary's own
+///   commit (AMUX_BUILD_COMMIT), because from a baked sha alone a hand-edit
+///   and a binary predating a legitimate script commit are indistinguishable.
 pub fn installed_script_matches_committed(
     spec: &InstalledScript,
-    committed_src: &str,
+    baked_src: &str,
+    head_src: Option<&str>,
+    worktree_src: Option<&str>,
     runtime: Result<String, String>,
 ) -> Vec<InvariantResult> {
     let id = spec.id;
-    let committed_sha = sha256_hex(committed_src.as_bytes());
-    match runtime {
-        Err(e) => vec![InvariantResult::unknown(
-            id,
-            format!("runtime {} {} unreadable: {e}", spec.noun, spec.runtime_path),
-        )],
-        Ok(content) => {
-            let runtime_sha = sha256_hex(content.as_bytes());
-            if runtime_sha == committed_sha {
-                vec![InvariantResult::pass(id)]
-            } else {
-                vec![InvariantResult::fail(
-                    id,
-                    format!("runtime {} == committed sha {}", spec.noun, &committed_sha[..12]),
-                    format!(
-                        "runtime {} sha {} DRIFTED from {} — the fleet is running an unreviewed \
-                         hand-edit. Reinstall from source (install.sh) or fold the edit back into \
-                         the committed copy.",
-                        spec.noun,
-                        &runtime_sha[..12],
-                        spec.committed_path,
-                    ),
-                )
-                .evidence(json!({
-                    "committed_sha": committed_sha,
-                    "runtime_sha": runtime_sha,
-                    "runtime_path": spec.runtime_path,
-                    "committed_path": spec.committed_path,
-                }))]
-            }
+    let content = match runtime {
+        Err(e) => {
+            return vec![InvariantResult::unknown(
+                id,
+                format!("runtime {} {} unreadable: {e}", spec.noun, spec.runtime_path),
+            )]
         }
+        Ok(c) => c,
+    };
+    let runtime_sha = sha256_hex(content.as_bytes());
+    if let Some(head) = head_src {
+        let head_sha = sha256_hex(head.as_bytes());
+        if runtime_sha == head_sha {
+            return vec![InvariantResult::pass(id)];
+        }
+        let wt_matches =
+            worktree_src.map(|w| sha256_hex(w.as_bytes()) == runtime_sha).unwrap_or(false);
+        let observed = if wt_matches {
+            format!(
+                "runtime {} matches an UNCOMMITTED edit of {} (runtime == worktree, sha {}, \
+                 HEAD has {}) — commit the tracked source; the installed copy already \
+                 carries the edit.",
+                spec.noun,
+                spec.committed_path,
+                &runtime_sha[..12],
+                &head_sha[..12],
+            )
+        } else {
+            format!(
+                "runtime {} sha {} DRIFTED from {} at HEAD ({}) and matches the worktree \
+                 copy of neither — the fleet is running an unreviewed hand-edit. Reinstall \
+                 from source (install.sh) or fold the edit back into the committed copy.",
+                spec.noun,
+                &runtime_sha[..12],
+                spec.committed_path,
+                &head_sha[..12],
+            )
+        };
+        return vec![InvariantResult::fail(
+            id,
+            format!("runtime {} == committed sha {}", spec.noun, &head_sha[..12]),
+            observed,
+        )
+        .evidence(json!({
+            "committed_sha": head_sha,
+            "runtime_sha": runtime_sha,
+            "runtime_matches_worktree": wt_matches,
+            "committed_source": "HEAD (read at check time)",
+            "runtime_path": spec.runtime_path,
+            "committed_path": spec.committed_path,
+        }))];
     }
+    // No repo reachable: baked fallback, hedged on mismatch.
+    let baked_sha = sha256_hex(baked_src.as_bytes());
+    if runtime_sha == baked_sha {
+        return vec![InvariantResult::pass(id)];
+    }
+    vec![InvariantResult::fail(
+        id,
+        format!("runtime {} == baked sha {}", spec.noun, &baked_sha[..12]),
+        format!(
+            "runtime {} sha {} differs from the source baked into this binary (built at \
+             commit {}) and no repo is reachable to read HEAD — EITHER a hand-edit of the \
+             runtime copy OR this binary predates a legitimate commit of {} (script-only \
+             commits do not trigger a rebuild). Confirm against /health's commit before \
+             acting; reinstalling only helps in the first case.",
+            spec.noun,
+            &runtime_sha[..12],
+            env!("AMUX_BUILD_COMMIT"),
+            spec.committed_path,
+        ),
+    )
+    .evidence(json!({
+        "committed_sha": baked_sha,
+        "runtime_sha": runtime_sha,
+        "committed_source": "baked at build time (no repo reachable)",
+        "build_commit": env!("AMUX_BUILD_COMMIT"),
+        "runtime_path": spec.runtime_path,
+        "committed_path": spec.committed_path,
+    }))]
 }
 
 // ---------------------------------------------------------------------------
@@ -1961,21 +2033,81 @@ mod negative_controls {
     #[test]
     fn shared_guard_drift_is_detected() {
         let committed = "#!/usr/bin/env python3\n# canonical guard source\n";
-        let same =
-            installed_script_matches_committed(&GIT_SHARED_GUARD, committed, Ok(committed.into()));
+        let same = installed_script_matches_committed(
+            &GIT_SHARED_GUARD,
+            committed,
+            Some(committed),
+            Some(committed),
+            Ok(committed.into()),
+        );
         assert_eq!(same[0].status, Status::Pass, "identical must pass: {same:?}");
+
+        // AF-132, THE false-fire cell: runtime matches HEAD while the BAKED
+        // source is stale (a script-only commit landed; no rebuild happened).
+        // This is the healthy state, and the old build-time comparison called
+        // it "an unreviewed hand-edit" with a remedy that reproduced the same
+        // bytes. Must PASS.
+        let stale_baked = installed_script_matches_committed(
+            &GIT_SHARED_GUARD,
+            "# OLD baked source from the running binary's commit\n",
+            Some(committed),
+            Some(committed),
+            Ok(committed.into()),
+        );
+        assert_eq!(
+            stale_baked[0].status,
+            Status::Pass,
+            "runtime == HEAD is healthy whatever the binary baked: {stale_baked:?}"
+        );
+
+        // Runtime matches an UNCOMMITTED worktree edit: a real warn, but a
+        // DIFFERENT claim from a hand-edit — the remedy is committing the
+        // tracked source, not reinstalling.
+        let uncommitted = committed.to_string() + "# staged but not committed\n";
+        let wt = installed_script_matches_committed(
+            &GIT_SHARED_GUARD,
+            committed,
+            Some(committed),
+            Some(&uncommitted),
+            Ok(uncommitted.clone()),
+        );
+        assert_eq!(wt[0].status, Status::Fail);
+        assert!(wt[0].observed.contains("UNCOMMITTED"), "{}", wt[0].observed);
+        assert!(!wt[0].observed.contains("hand-edit"), "{}", wt[0].observed);
 
         let drifted = installed_script_matches_committed(
             &GIT_SHARED_GUARD,
             committed,
+            Some(committed),
+            Some(committed),
             Ok(committed.to_string() + "# HAND EDIT\n"),
         );
         assert_eq!(drifted[0].status, Status::Fail, "a hand-edit must fail: {drifted:?}");
         assert!(drifted[0].observed.contains("DRIFTED"), "{}", drifted[0].observed);
 
+        // No repo reachable (cloud): baked fallback must HEDGE — a mismatch
+        // there cannot distinguish a hand-edit from a binary predating a
+        // legitimate script commit, and must say so with this binary's commit.
+        let hedged = installed_script_matches_committed(
+            &GIT_SHARED_GUARD,
+            committed,
+            None,
+            None,
+            Ok(committed.to_string() + "# newer legit commit\n"),
+        );
+        assert_eq!(hedged[0].status, Status::Fail);
+        assert!(hedged[0].observed.contains("predates"), "{}", hedged[0].observed);
+        assert!(
+            !hedged[0].observed.contains("unreviewed hand-edit"),
+            "the no-repo fallback must not ASSERT a hand-edit: {}",
+            hedged[0].observed
+        );
+
         let missing = installed_script_matches_committed(
             &GIT_SHARED_GUARD,
             committed,
+            Some(committed),
+            Some(committed),
             Err("No such file (os error 2)".into()),
         );
         assert_eq!(missing[0].status, Status::Unknown, "unreadable is Unknown not pass: {missing:?}");
@@ -1983,12 +2115,20 @@ mod negative_controls {
         // The generalisation must not have silently renamed the ids consumers
         // match on, and the two specs must not collide onto one id.
         assert_eq!(same[0].invariant_id, "hooks.shared_guard_matches_committed");
-        let rep = installed_script_matches_committed(&REPORT_HOOK, committed, Ok(committed.into()));
+        let rep = installed_script_matches_committed(
+            &REPORT_HOOK,
+            committed,
+            Some(committed),
+            Some(committed),
+            Ok(committed.into()),
+        );
         assert_eq!(rep[0].invariant_id, "hooks.report_hook_matches_committed");
         // ...and the prose must follow the spec, not stay hardcoded to the guard.
         let rep_drift = installed_script_matches_committed(
             &REPORT_HOOK,
             committed,
+            Some(committed),
+            Some(committed),
             Ok(committed.to_string() + "x"),
         );
         assert!(
