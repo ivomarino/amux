@@ -348,6 +348,17 @@ fn is_append_only_shared(path: &str) -> bool {
 /// peer's entries and restoring DELETES yours. The direction test cannot separate
 /// these because both are true, so name the file and prescribe the only safe
 /// operation, which neither generic remedy performs.
+///
+/// CORRECTED by CD-78 (creative-dna retracting their own AMUX-3367 directive,
+/// 2026-08-21): these files are not truly append-only — an entry legitimately
+/// LEAVES via a companion archive (FRUSTRATIONS_ARCHIVE.md), so a blind
+/// re-append re-injects deliberately archived entries. Measured on the shared
+/// mixpeek checkout: 15 of 15 "lost" entries were archive moves, zero were
+/// lost work, and the restore/remove cycle had run three times on origin
+/// (d89dcf843a "restore 13 entries" -> 1391eed484 "12 archived entries came
+/// back"). The general form: a set-difference over ONE file cannot see a
+/// move and reports it as a deletion every time — before treating a
+/// disappearance as loss, look where it may have legitimately moved to.
 fn append_only_note(dirty: &[String]) -> Option<String> {
     let mut ao: Vec<&str> = dirty
         .iter()
@@ -364,8 +375,13 @@ fn append_only_note(dirty: &[String]) -> Option<String> {
          appended to different bases), so BOTH remedies above lose data on it: committing the \
          path REVERTS the peer's origin-only entries, `git checkout origin/main -- <path>` \
          DELETES yours. UNION-MERGE instead — `git checkout origin/main -- <path>` to take their \
-         version, then RE-APPEND your entries and commit. Never a plain add/commit or a bare \
-         restore (AMUX-3367).",
+         version, then re-append ONLY YOUR OWN entries, with the ARCHIVE CHECK first (CD-78 \
+         corrected AMUX-3367): an entry can legitimately LEAVE this file by moving to its \
+         companion archive (e.g. FRUSTRATIONS_ARCHIVE.md), so before re-appending anything \
+         'missing', grep the archive for it — present there means the deletion was a deliberate \
+         move, and re-appending it manufactures a duplicate (measured: 15 of 15 'lost' entries \
+         were archive moves; the restore/remove cycle ran three times on origin). Only an entry \
+         absent from BOTH files is lost work. Never a plain add/commit or a bare restore.",
         ao.join(", ")
     ))
 }
@@ -1920,6 +1936,12 @@ mod tests {
         assert!(msg.contains("APPEND-ONLY SHARED FILE"), "{msg}");
         assert!(msg.contains("UNION-MERGE"), "{msg}");
         assert!(msg.contains("frustrations.md"), "{msg}");
+        // CD-78's correction is protection-losing if it regresses: without the
+        // archive check the directive re-injects deliberately archived entries
+        // (measured 15/15 on the mixpeek checkout, three restore/remove cycles
+        // on origin), so its presence is pinned like the directive itself.
+        assert!(msg.contains("ARCHIVE CHECK"), "{msg}");
+        assert!(msg.contains("absent from BOTH files"), "{msg}");
 
         // No append-only file in the set -> no such block.
         let plain = s(&["app.js", "main.rs"]);

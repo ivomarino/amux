@@ -31,10 +31,17 @@ origin-only entries a peer landed (AMUX-3367, seen live on the Mixpeek
 FRUSTRATIONS.md) — do NOT reach for either single-arm git remedy: `git add` +
 commit REVERTS the peer's entries, `git checkout origin/main -- <file>` DELETES
 yours, and the direction test cannot separate them because BOTH are true at once.
-UNION-MERGE: `git checkout origin/main -- <file>` to take origin's version, then
-RE-APPEND your entries on top and commit. The idle commit-nudge now prints this
-directive by name when a dirty append-only file is in the set, but the operation
-is yours to run.
+UNION-MERGE, with the ARCHIVE CHECK (CD-78 corrected AMUX-3367): `git checkout
+origin/main -- <file>` to take origin's version, then re-append ONLY YOUR OWN
+entries — and before re-appending anything that merely looks lost, grep the
+file's companion archive (e.g. FRUSTRATIONS_ARCHIVE.md) for it. Present there
+means the deletion was a deliberate archive move and re-appending it
+manufactures a duplicate; creative-dna measured 15 of 15 "lost" entries as
+archive moves, with the restore/remove cycle run three times on origin before
+anyone noticed. Only an entry absent from BOTH files is lost work. The general
+form: a set-difference over one file cannot see a MOVE and reports it as a
+deletion every time. The idle commit-nudge prints this directive by name when a
+dirty append-only file is in the set, but the operation is yours to run.
 
 This is not a diary. It is the input to deciding what to fix next, so it has to be
 greppable and it has to be honest about cost.
