@@ -74,11 +74,27 @@ fallback when a finding needs row-level inspection.
    with `since_h=192` and compare. Finding = today's p95 > ~2x trailing p95
    (use judgment on low-volume families; never conclude from n < 20 requests).
 
-   **The trailing norm is capped, and the cap lies about its size (AR-134).**
-   `stats` scans at most 200,000 rows. Asking for `since_h=192` on a busy day
-   returns `scan_truncated: true` and an `actual_window_h` of ~35, not 192 —
-   identical counts come back for 192h, 336h and 720h, because all three hit the
-   same cap. So "the 8-day norm" can silently be 1.5 days.
+   **The trailing norm is still capped, but the cap no longer lies (AR-134,
+   fixed AF-131 on 2026-08-22).** `stats` scans at most 200,000 rows, so a busy
+   `since_h=192` still comes back `scan_truncated: true` with identical counts
+   for 192h, 336h and 720h. What changed is that the scan now keeps the NEWEST
+   rows and `actual_window_h` is computed from them, so it reports the span that
+   was actually read — measured live at the fix: 96h, 192h, 336h and 720h all
+   returned `actual_window_h: 84.56`, which is the truth, where the day before
+   they returned 96.0, 191.98, 299.81 and 299.81.
+
+   Read `actual_window_h` and BELIEVE it now; it is no longer a number to route
+   around. `analyze` carries the same field for the same reason.
+
+   What that fix repaired, and why the field is worth trusting rather than
+   ignoring: before it, truncation kept the OLDEST rows, so "the 8-day norm" was
+   really days 8 through 5 — and the staleness was invisible. On 2026-08-22 that
+   produced a FALSE FINDING this sweep was one step from filing: `/api/sessions`
+   p95 read 6.46x over the "192h" norm on 42,230 requests, comfortably past the
+   2x threshold with no low-volume escape. Against an honest untruncated 72h
+   norm the same family was 1.07x. After the fix the truncated norm gives 1.09x,
+   agreeing with the honest one. Every guard in this contract would have passed
+   the false version through, because the window field claimed 8 days.
 
    Judge it on `actual_window_h`, NOT by comparing `totals.count` between the two
    calls. Comparing counts was the first version of this guard and it gives the
@@ -87,8 +103,9 @@ fallback when a finding needs row-level inspection.
    reason they differ is the cap. On 2026-08-11 that guard reported the norm
    usable over what was really a 35h window.
 
-   Say the real window in the summary — "p95 vs a 35h norm, not 8 days" — rather
-   than reporting a comparison the reader will assume covers a week.
+   Say the real window in the summary — "p95 vs an 85h norm, not 8 days", taking
+   the number from `actual_window_h` rather than from `since_h` — rather than
+   reporting a comparison the reader will assume covers a week.
    Deep-dive fallback: `GET /api/logs?since=$SINCE&family=/api/board&limit=2000`.
 
    Routing questions along the way ("is PATCH mounted at X?") are answered by
