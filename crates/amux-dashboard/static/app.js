@@ -2566,9 +2566,20 @@ function _staleShellRecover() {
   } catch (e) {}
 }
 
+let _sessEtag = null;
 async function fetchSessions() {
   try {
-    const r = await fetch(API + '/api/sessions');
+    // AMUX-3504: conditional fetch — the server hashes the (now byte-stable)
+    // payload, so an unchanged fleet answers 304 with no body. That is the
+    // whole cost of the reconnect/resume refetches intermittent mobile fires.
+    const r = await fetch(API + '/api/sessions', _sessEtag ? { headers: { 'If-None-Match': _sessEtag } } : undefined);
+    if (r.status === 304) {
+      consecutiveFailures = 0;
+      _lastDataTime = Date.now();
+      if (!online) setOnline(true);
+      return;
+    }
+    _sessEtag = r.headers.get('ETag') || null;
     const data = await r.json();
     // Same guard as fetchBoard (live crash 2026-08-09): a 401 error object
     // must not become `sessions` — every card render maps over it.
@@ -7863,7 +7874,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.704';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.705';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

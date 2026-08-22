@@ -1527,12 +1527,43 @@ pub async fn list_sessions_legacy(
     headers: axum::http::HeaderMap,
 ) -> Response {
     match legacy_sessions_array(&state.store) {
-        Ok(json) => (
-            StatusCode::OK,
-            [(axum::http::header::CONTENT_TYPE, "application/json")],
-            filter_isolated_for_peer(&json, &headers),
-        )
-            .into_response(),
+        Ok(json) => {
+            let body = filter_isolated_for_peer(&json, &headers);
+            // CONTENT-hash ETag (AMUX-3504), not a store-rev one: this payload
+            // is part store, part scrape (pane previews, token counts), so a
+            // rev ETag would serve stale 304s when scrape state moved. The
+            // hash costs the build either way; what the 304 saves is the 19KB
+            // gzipped transfer — which is the whole bill on the reconnect and
+            // resume refetches an intermittent mobile client fires constantly.
+            // Only meaningful because the payload is now byte-stable between
+            // real changes (age_s/task_board_age churn fixed above); hashed
+            // over the FILTERED body, since peers and the owner see different
+            // fleets and must never share a validator.
+            let etag = {
+                use sha2::Digest;
+                let mut h = sha2::Sha256::new();
+                h.update(body.as_bytes());
+                format!("\"sess-{}\"", &hex::encode(h.finalize())[..16])
+            };
+            if let Some(inm) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+                if inm == etag || inm == format!("W/{etag}") {
+                    let mut h = axum::http::HeaderMap::new();
+                    if let Ok(v) = etag.parse() {
+                        h.insert("etag", v);
+                    }
+                    return (StatusCode::NOT_MODIFIED, h).into_response();
+                }
+            }
+            let mut h = axum::http::HeaderMap::new();
+            h.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/json"),
+            );
+            if let Ok(v) = etag.parse() {
+                h.insert("etag", v);
+            }
+            (StatusCode::OK, h, body).into_response()
+        }
         Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
@@ -2206,9 +2237,14 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                 "summary" => meta["task_summary_ts"].as_i64().unwrap_or(0),
                 _ => 0,
             });
+            // Day-quantized (AMUX-3504): the one consumer (app.js:3373)
+            // renders floor(age/86400) days, so second-precision here only
+            // churned the payload every poll and defeated the response ETag.
+            // Quantizing to whole days preserves every rendered value while
+            // the byte churn drops from per-request to once a day per row.
             v["task_board_age"] = json!(
                 if board.is_some() && board_updated != 0 && !board_fresh {
-                    (now - board_updated).max(0)
+                    ((now - board_updated).max(0) / 86400) * 86400
                 } else {
                     0
                 }
@@ -2294,9 +2330,17 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     // ts is time.time() — a FLOAT; as_i64() read it as 0 and
                     // age_s came out as the whole epoch (found 2026-08-09).
                     let ts = rep["ts"].as_f64().unwrap_or(0.0);
+                    // `ts`, not the old `age_s` (AMUX-3504). age_s was
+                    // (now - ts) stamped at REQUEST time, so 52 of 119 rows
+                    // churned every poll while nothing had actually changed —
+                    // singlehandedly defeating the response ETag (a 304 that
+                    // can never fire is rule-7 theatre). Nothing in this repo
+                    // ever read age_s (Python-dashboard parity shape; that
+                    // client is gone); a reader that wants an age derives it
+                    // from ts, which is the stable fact.
                     v["self_report"] = json!({
                         "state": rep["state"].as_str().unwrap_or(""),
-                        "age_s": ((signals.now - ts).max(0.0)) as i64,
+                        "ts": ts as i64,
                         "source": rep["source"].as_str().unwrap_or(""),
                     });
                     // AMUX-2676: a REPORTED model/token count replaces the
