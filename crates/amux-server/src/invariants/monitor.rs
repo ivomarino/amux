@@ -161,6 +161,11 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // nobody until a human-named trigger happened to say "unattributed-http".
     out.extend(reports_attributed_check(state));
 
+    // -- 6d. are auto-filed cards DISPATCHABLE? (AF-137: 215 session=NULL
+    // reports invisible to auto-pickup's session-keyed predicate, both
+    // halves reporting success for 11 days).
+    out.extend(autofix_dispatchable_check(state));
+
     // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
     // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
     // rate" as its detector but nothing read it; this closes that loop.
@@ -610,6 +615,33 @@ mod report_hook_wiring_tests {
 /// `amux_session` column is the header stamp, and it is the same column the
 /// attribution audit and the send-ledger read. Deriving it from anywhere else
 /// would let the check disagree with the thing it describes.
+fn autofix_dispatchable_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.autofix_cards_are_dispatchable";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    // Same open-statuses shape the board's own views use; desc marker is the
+    // filer's fixed first line, so the check and the filer cannot drift apart
+    // without this going red.
+    let rows: Result<Vec<String>, _> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0 \
+             AND status NOT IN ('done','verified','discarded') \
+             AND COALESCE(session,'')='' \
+             AND desc LIKE '%Filed automatically by amux%' ORDER BY created DESC",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0)).map(|it| it.flatten().collect())
+        });
+    match rows {
+        Ok(ids) => {
+            let examples: Vec<String> = ids.iter().take(3).cloned().collect();
+            checks::autofix_cards_are_dispatchable(ids.len() as i64, &examples)
+        }
+        Err(e) => vec![InvariantResult::unknown(ID, format!("query failed: {e}"))],
+    }
+}
+
 fn reports_attributed_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "hooks.reports_are_attributed";
     let Ok(conn) = state.store.read() else {

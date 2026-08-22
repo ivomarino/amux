@@ -947,6 +947,37 @@ pub fn installed_script_matches_committed(
 }
 
 // ---------------------------------------------------------------------------
+// 6b2. Are auto-filed cards DISPATCHABLE? (AF-137)
+// ---------------------------------------------------------------------------
+
+/// AF-137: 215 auto-filed cards sat in todo with session=NULL while
+/// auto-pickup's predicate is `i.session=?1` — every card the autofix files
+/// was structurally invisible to the mechanism that hands cards to lanes,
+/// and BOTH halves reported success (the filer filed, the pickup found
+/// nothing to do). AMUX-2872 said "this card is the only place it shows up"
+/// and then sat unseen for 11 days while the nightly failed 13 of 13 runs.
+/// Rule 1 in its exact shape: who receives this, by default? Nobody — and
+/// rule 4's: the gap left no trace anywhere anyone looks. This check IS that
+/// trace. The remedy it names is real: AMUX_AUTOFIX_SESSION routes new
+/// filings; the backlog needs the recovery sweep, not a 215-card discharge
+/// into one lane's queue (the migration-event shape rule 1 warns about).
+pub fn autofix_cards_are_dispatchable(open_unowned: i64, examples: &[String]) -> Vec<InvariantResult> {
+    const ID: &str = "board.autofix_cards_are_dispatchable";
+    if open_unowned <= 0 {
+        return vec![InvariantResult::pass(ID)];
+    }
+    vec![InvariantResult::fail(
+        ID,
+        "every open auto-filed card has a session, so auto-pickup can reach it".to_string(),
+        format!(
+            "{open_unowned} open auto-filed card(s) have NO session — auto-pickup selects on              i.session=?1, so no lane will EVER be offered them; the detector that filed them              is writing reports nobody receives (e.g. {}). New filings: set              AMUX_AUTOFIX_SESSION in server.env. Backlog: run the recovery sweep (close              reports whose subject has recovered, route the live ones) — do NOT bulk-assign              215 cards into one queue.",
+            examples.join(", "),
+        ),
+    )
+    .evidence(json!({"open_unowned": open_unowned, "examples": examples}))]
+}
+
+// ---------------------------------------------------------------------------
 // 6c. Are session reports ATTRIBUTED? (AF-67)
 // ---------------------------------------------------------------------------
 
@@ -2024,6 +2055,25 @@ mod negative_controls {
         let lanes = vec![LaneReport { name: "solo".into(), report_age_s: Some(999_999.0) }];
         let rs = self_reports_landing(&lanes, 10, 3600.0);
         assert_eq!(rs[0].status, Status::Unknown, "too-small fleet must be Unknown: {rs:?}");
+    }
+
+    /// AF-137 both directions: unowned auto-filed cards must go RED naming
+    /// the count and the remedy (215 accumulated silently while both halves
+    /// reported success); zero unowned must pass, or the check becomes the
+    /// permanent-red that trains skimming.
+    #[test]
+    fn unowned_autofix_cards_fail_the_dispatchability_check() {
+        let ok = autofix_cards_are_dispatchable(0, &[]);
+        assert_eq!(ok[0].status, Status::Pass, "{ok:?}");
+        let bad = autofix_cards_are_dispatchable(215, &["AMUX-2872".into(), "AMUX-3447".into()]);
+        assert_eq!(bad[0].status, Status::Fail);
+        assert!(bad[0].observed.contains("215"), "{}", bad[0].observed);
+        assert!(bad[0].observed.contains("AMUX_AUTOFIX_SESSION"), "names the remedy: {}", bad[0].observed);
+        assert!(bad[0].observed.contains("AMUX-2872"), "names examples: {}", bad[0].observed);
+        assert!(
+            bad[0].observed.contains("do NOT bulk-assign"),
+            "carries the migration-event caution: {}", bad[0].observed
+        );
     }
 
     /// AMUX-3033: an identical runtime guard passes, a hand-edit is DETECTED as a

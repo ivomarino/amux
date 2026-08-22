@@ -237,8 +237,16 @@ fn ignore_list() -> Vec<String> {
 }
 
 /// The lane that owns a card when the fault names no worker of its own.
-/// Empty (the default) means UNOWNED: the board's own pickup decides, and no
-/// lane is volunteered for work nobody asked it to do.
+///
+/// Empty (the default) means UNOWNED — and UNOWNED means UNREACHABLE by
+/// auto-pickup, whose predicate is `i.session=?1`; only a manual claim or a
+/// human scroll ever finds such a card. The previous comment here said "the
+/// board's own pickup decides", which described a mechanism that does not
+/// exist, and under that claim 215 auto-filed reports accumulated invisible
+/// to every lane while the nightly failed 13 of 13 runs (AF-137). Set
+/// AMUX_AUTOFIX_SESSION in server.env to route filings to a lane;
+/// board.autofix_cards_are_dispatchable goes red when unowned reports
+/// accumulate, so this gap can never again be silent.
 fn fixer_session() -> String {
     env_str("AMUX_AUTOFIX_SESSION")
 }
