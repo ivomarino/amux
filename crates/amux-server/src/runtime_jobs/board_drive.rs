@@ -1473,14 +1473,15 @@ fn verify_nudge_text(cards: &[(String, String, String)], total: i64) -> String {
         "[amux] You have no queued work (no todo/doing/review cards), but {total} of your \
          cards sit in `done` awaiting verification.\n\n\
          {list}\n\n\
-         For each card where ALL of these hold:\n\
-         1. CI/CD passed on the merged commit\n\
-         2. The change is deployed to production\n\
-         3. Confirmed working end-to-end in prod\n\
-         4. No regressions in existing behavior\n\n\
-         Move it to `verified` with evidence of what you checked. If you cannot confirm \
-         all four, leave it in `done`. If the work is stale or was superseded, archive \
-         it with a note explaining why.\n\n\
+         For each card, read its RESOLVED gate first — GET /api/board/contract?card=<id> — \
+         and move to `verified` only when EVERY criterion there holds, with evidence of \
+         what you checked. The gate resolves card -> worker -> group -> global -> type \
+         default, so it varies by card; this nudge deliberately does not restate it \
+         (AMUX-3477: a previous version hardcoded four criteria the board does not use, \
+         and following the instruction literally moved cards on the wrong basis — the \
+         AF-112 family, one layer up). If you cannot satisfy the resolved gate honestly, \
+         leave the card in `done`. If the work is stale or was superseded, archive it \
+         with a note explaining why.\n\n\
          To see ALL of them (this list is the 8 most recent): \
          GET /api/board?status=done&done_limit=0 scoped to you. NOTE: the UNSCOPED \
          /api/board caps terminal (done/verified/discarded) cards at 100, so a done card \
@@ -3513,6 +3514,22 @@ mod tests {
         for (id, _, _) in &cards {
             assert!(text.contains(id.as_str()), "{id} listed in the selector but absent from the prompt");
         }
+    }
+
+    /// AMUX-3477: the nudge must point at the RESOLVED gate, never restate
+    /// criteria — the previous version hardcoded four the board does not use,
+    /// and following it literally moved cards on the wrong basis (the AF-112
+    /// family: instruction and enforcement disagreeing about what the gate is).
+    #[test]
+    fn the_verify_nudge_points_at_the_resolved_gate_and_restates_nothing() {
+        let cards: Vec<(String, String, String)> =
+            vec![("A-1".into(), "t".into(), "code".into())];
+        let text = verify_nudge_text(&cards, 1);
+        assert!(text.contains("/api/board/contract?card="), "must name the contract read: {text}");
+        assert!(
+            !text.contains("CI/CD passed") && !text.contains("deployed to production"),
+            "hardcoded criteria are the defect, not the fix: {text}"
+        );
     }
 
     /// A lane with exactly the cap must not be told there are "0 more".
