@@ -2128,3 +2128,30 @@ FIX: shipped by amux in 67137cc — the fixture clears its own residue before as
      trust relationship between the two. If a test must use a relative path to reach a branch,
      it owns cleaning up after itself; tempdirs cannot help, because a path under a tempdir is
      no longer relative.
+
+---
+
+## The freshness hook reported the running server "1 behind" for a commit the builder is designed to ignore
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-22
+SESSION: amux
+CARD: AMUX-2872
+SYMPTOM: After committing 2b7daf4 (workflows + scripts only, nothing under crates/), the
+  SessionStart freshness hook announced "the RUNNING SERVER is 1 commit(s) behind
+  origin/main ... A fix on main is not a fix in prod until then." The builder had done
+  exactly the right thing: its trigger is `git log -1 -- crates/ Cargo.toml Cargo.lock`,
+  and no build-relevant commit had moved. The hook counted `prov_sha..origin/main` with
+  no pathspec, so its verdict and the builder's predicate disagreed about the same fact.
+  Ethos rule 1's exact shape: a view that does not share the predicate of the mechanism
+  it describes, wrong in whichever direction it disagrees.
+COST: one session-start reconcile chase (fetch, rev-list, /health compare) to establish
+  that nothing was stale — small once, but this line fires at EVERY session start of
+  every lane after any docs/scripts/workflow commit, and a staleness banner that cries
+  wolf trains the fleet to skim past the one time it means a fix sat undeployed
+  overnight (the AEAB-32 case it exists for).
+FIX: both the count and the oldest-commit age in .claude/session-freshness.sh now carry
+  the builder's own pathspec, with the incident recorded at the site. Verified live on
+  the specimen: server at fc62250 with 2 commits upstream, all-commits count 2,
+  build-relevant count 0 — silent, correctly.

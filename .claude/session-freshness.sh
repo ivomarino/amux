@@ -167,7 +167,15 @@ if [ -r "$PROV" ]; then
   # minute in the builder. Report, never act: nothing below touches a tree.
   if [ -n "${prov_sha:-}" ] && git rev-parse --verify -q origin/main >/dev/null 2>&1; then
     if git cat-file -e "${prov_sha}^{commit}" 2>/dev/null; then
-      built_behind="$(git rev-list --count "${prov_sha}..origin/main" 2>/dev/null || echo 0)"
+      # Count only commits the BUILDER would act on. The pathspec is copied
+      # from rust-auto-build.sh's own trigger (`log -1 -- crates/ Cargo.toml
+      # Cargo.lock`) — a view must share the predicate of the mechanism it
+      # describes (ethos rule 1). Without it, a scripts-only or workflow-only
+      # commit read as "the RUNNING SERVER is 1 behind ... a fix on main is
+      # not a fix in prod", and sent a session reconciling a staleness that
+      # did not exist (measured 2026-08-22: 2b7daf4, workflows+scripts only,
+      # flagged as undeployed while the server was correctly current).
+      built_behind="$(git rev-list --count "${prov_sha}..origin/main" -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo 0)"
       if [ "${built_behind:-0}" -gt 0 ]; then
         # Age of the OLDEST commit the running build is missing. A count alone
         # reads as bookkeeping; "and the oldest is 11 hours old" is the number
@@ -181,7 +189,7 @@ if [ -r "$PROV" ]; then
         # and the second case is the one it could never show. A bare count reads
         # as bookkeeping; the age is what makes it actionable, so an age that is
         # always small makes the whole line reassuring noise.
-        oldest="$(git log --reverse --format=%cr "${prov_sha}..origin/main" 2>/dev/null | head -1)"
+        oldest="$(git log --reverse --format=%cr "${prov_sha}..origin/main" -- crates/ Cargo.toml Cargo.lock 2>/dev/null | head -1)"
         out+="  - the RUNNING SERVER is ${built_behind} commit(s) behind origin/main"$'\n'
         out+="    built ${prov_sha:0:9}; oldest undeployed commit landed ${oldest:-?}"$'\n'
         out+=$'    merging does NOT deploy — the build source advances only when someone\n'
