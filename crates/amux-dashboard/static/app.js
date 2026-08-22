@@ -7874,7 +7874,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.705';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.706';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10919,6 +10919,63 @@ async function _syncChipsFromServer() {
 }
 if (document.body) _syncChipsFromServer();
 else document.addEventListener('DOMContentLoaded', _syncChipsFromServer);
+// AMUX-3514: external emails a worker tried to send sit HELD until a human
+// releases them (AMUX-3510). This strip is that human path: visible on every
+// tab, previews the frozen draft, and the Approve POST goes out from this
+// browser with no worker origin — which is exactly the gate's definition of
+// a human context. Polled at 60s (a pending approval expires in 1h, so a
+// minute of latency costs nothing; the endpoint is ~200 bytes).
+async function _approvalsRefresh() {
+  const el = document.getElementById('email-approvals-banner');
+  if (!el) return;
+  try {
+    const r = await fetch(API + '/api/email/approvals', { headers: _authHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    const pending = Array.isArray(d.pending) ? d.pending : [];
+    if (!pending.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    let html = '<div style="max-width:860px;margin:0 auto;">'
+      + '<div style="font-weight:600;margin-bottom:6px;">&#x2709;&#xFE0F; '
+      + pending.length + ' external email' + (pending.length === 1 ? '' : 's')
+      + ' held for your approval</div>';
+    for (const p of pending) {
+      const pv = p.preview || {};
+      const mins = Math.max(1, Math.round((p.expires_in_s || 0) / 60));
+      html += '<details style="margin:4px 0;text-align:left;">'
+        + '<summary style="cursor:pointer;display:flex;align-items:center;gap:10px;min-height:34px;">'
+        + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
+        + '<b>' + esc(p.session || '?') + '</b> &rarr; ' + esc(pv.to || '?')
+        + ' &middot; ' + esc(pv.subject || '(reply)') + '</span>'
+        + '<span style="opacity:0.7;font-size:0.76rem;">expires in ' + mins + 'm</span>'
+        + '<button onclick="event.preventDefault();_apprApprove(\'' + esc(p.id) + '\',this)" '
+        + 'style="background:#16a34a;color:#fff;border:none;border-radius:6px;'
+        + 'padding:8px 14px;font-size:0.8rem;cursor:pointer;min-height:34px;">Approve &amp; send</button>'
+        + '</summary>'
+        + '<div style="white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.25);'
+        + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:180px;overflow:auto;">'
+        + (pv.cc ? 'cc: ' + esc(pv.cc) + '\n' : '')
+        + esc(pv.body || '') + '</div></details>';
+    }
+    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">Unapproved drafts expire on their own; nothing sends without the button.</div></div>';
+    el.innerHTML = html;
+    el.style.display = 'block';
+  } catch (e) {}
+}
+async function _apprApprove(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  try {
+    const r = await fetch(API + '/api/email/approve/' + encodeURIComponent(id), {
+      method: 'POST', headers: _authHeaders(),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) showToast('Approved — sent for ' + (d.sent_for_session || 'worker'));
+    else showToast('Approve failed: ' + (d.error || r.status));
+  } catch (e) { showToast('Approve failed: ' + e); }
+  _approvalsRefresh();
+}
+function _approvalsBoot() { _approvalsRefresh(); setInterval(_approvalsRefresh, 60_000); }
+if (document.body) _approvalsBoot();
+else document.addEventListener('DOMContentLoaded', _approvalsBoot);
 function _saveChips(chips) {
   localStorage.setItem('amux_chips', JSON.stringify(chips));
   _pushChipsToServer(chips);
