@@ -521,10 +521,24 @@ async fn async_main() {
 
     // Self-adoption (parity with the Python server's own-mtime watch): when
     // the INSTALLED binary changes underneath us — the builder agent just
-    // installed a new build — exit 0 and let launchd's KeepAlive relaunch
-    // the new code. The binary is the unit of deploy; a server that keeps
-    // running stale code after a deploy is the Python shared-checkout
-    // staleness incident wearing a compiled coat.
+    // installed a new build — replace this process with the new code. The
+    // binary is the unit of deploy; a server that keeps running stale code
+    // after a deploy is the Python shared-checkout staleness incident wearing
+    // a compiled coat.
+    //
+    // exec(), NOT exit (AMUX-3458, gtm-ticker's capacity signal): exiting for
+    // launchd's KeepAlive relaunch paid launchd's ThrottleInterval on every
+    // adoption — measured at a flat 10.09s exit-to-start across six restarts
+    // in one evening, even after 25 minutes of clean uptime — and with the
+    // high commit cadence of a busy day that was a connection-refused window
+    // per commit, which cost real consumer reads (/api/email/inbox mid-scan,
+    // twice). exec replaces the process image in place: same PID, launchd
+    // uninvolved, no throttle, and the refusal window shrinks to the new
+    // binary's boot (~1s). Crash respawns still go through launchd and KEEP
+    // the 10s damping, which is correct — a crash loop should damp; a
+    // deliberate deploy should not. exit(0) stays as the fallback if exec
+    // itself fails (missing/unreadable binary), because the old behavior is
+    // strictly better than a server running stale code.
     jobs::spawn_loop(jobs::ids::SELF_ADOPT, Some(secs(5)), async {
         let Ok(exe) = std::env::current_exe() else { return };
         let Ok(meta) = std::fs::metadata(&exe) else { return };
@@ -535,7 +549,16 @@ async fn async_main() {
             jobs::tick(jobs::ids::SELF_ADOPT);
             let current = std::fs::metadata(&exe).ok().and_then(|m| m.modified().ok());
             if current.is_some() && current != initial {
-                tracing::info!("binary changed on disk — exiting for relaunch (self-adoption)");
+                tracing::info!(
+                    "binary changed on disk — exec'ing the new build in place (self-adoption, \
+                     AMUX-3458: no exit means no launchd throttle window)"
+                );
+                let err = std::os::unix::process::CommandExt::exec(
+                    &mut std::process::Command::new(&exe),
+                );
+                // Only reachable when exec FAILED. Fall back to the old
+                // exit-for-relaunch path — slower (throttle) but correct.
+                tracing::warn!(%err, "exec failed — falling back to exit-for-relaunch");
                 std::process::exit(0);
             }
         }
