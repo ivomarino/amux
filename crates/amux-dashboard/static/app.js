@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.702';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.703';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10869,8 +10869,48 @@ function _loadChips() {
   } catch(e) {}
   return null;
 }
+// AMUX-3499 (Ethan, 2026-08-22): the chip set — which buttons, custom ones,
+// and their ORDER — persists on the SERVER (prefs key ui_chips), so the
+// phone PWA and desktop stop diverging. localStorage stays the runtime read
+// path and the offline cache; the server is the sync backbone. Server wins
+// at boot; saves push up debounced (a drag-reorder is one POST, not ten);
+// an empty server pref is seeded from the first device that has local
+// customizations, so nobody's existing layout is lost by the migration.
+let _chipsPushTimer = null;
+function _pushChipsToServer(chips) {
+  clearTimeout(_chipsPushTimer);
+  _chipsPushTimer = setTimeout(() => {
+    fetch(API + '/api/prefs', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify({ key: 'ui_chips', value: JSON.stringify(chips) }),
+    }).catch(() => {});  // offline: localStorage still holds it; the next save retries
+  }, 800);
+}
+async function _syncChipsFromServer() {
+  try {
+    const r = await fetch(API + '/api/prefs?key=ui_chips', { headers: _authHeaders() });
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d && typeof d.value === 'string' && d.value) {
+      const chips = JSON.parse(d.value);
+      if (Array.isArray(chips) && chips.length) {
+        localStorage.setItem('amux_chips', JSON.stringify(chips));
+        refreshAllChipBars();
+        return;
+      }
+    }
+    // Server has no chip pref yet: seed it from this device's customizations
+    // (null when the user never customized — nothing to seed, defaults rule).
+    const local = _loadChips();
+    if (local) _pushChipsToServer(local);
+  } catch (e) {}
+}
+if (document.body) _syncChipsFromServer();
+else document.addEventListener('DOMContentLoaded', _syncChipsFromServer);
 function _saveChips(chips) {
   localStorage.setItem('amux_chips', JSON.stringify(chips));
+  _pushChipsToServer(chips);
 }
 function _getChips() {
   const saved = _loadChips();
