@@ -3754,7 +3754,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("blob.bin");
         std::fs::write(&f, vec![0u8; 512 * 1024]).unwrap();
-        let got = du_top(&[f.clone()], 8, None);
+        let got = du_top(std::slice::from_ref(&f), 8, None);
         assert_eq!(got.len(), 1, "a plain file must be sized, not dropped: {got:?}");
         assert!(got[0].bytes > 0, "a 512KB file must size non-zero: {got:?}");
     }
