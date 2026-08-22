@@ -1058,6 +1058,92 @@ pub fn autofix_cards_are_dispatchable(open_unowned: i64, examples: &[String]) ->
 }
 
 // ---------------------------------------------------------------------------
+// 10. Host memory + kernel-panic tripwire (AMUX-3397)
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AMUX-3396, 2026-08-19): the host kernel panicked on memory/swap
+/// exhaustion at 14:03 and the entire 45-lane fleet died at once. Nothing in
+/// amux recorded pressure before, the death during, or the cause after —
+/// "why did every lane vanish" was answered by a human reading
+/// /Library/Logs/DiagnosticReports by hand.
+///
+/// The verdict here is the KERNEL's, not a tuned amux threshold: level 4
+/// (critical) means jetsam is imminent. Level 2 (warn) stays a pass — this
+/// box visits warn routinely under normal load, and a flapping incident
+/// teaches everyone to ignore it — but the level and swap numbers ride in
+/// the evidence of every evaluation, and /health carries them continuously.
+pub fn host_memory_not_critical(
+    pressure_level: Option<u32>,
+    swap_used_mb: Option<f64>,
+    swap_total_mb: Option<f64>,
+) -> Vec<InvariantResult> {
+    const ID: &str = "host.memory_not_critical";
+    let ev = json!({
+        "pressure_level": pressure_level,
+        "swap_used_mb": swap_used_mb,
+        "swap_total_mb": swap_total_mb,
+    });
+    match pressure_level {
+        Some(4) => vec![InvariantResult::fail(
+            ID,
+            "kernel memory pressure below critical".to_string(),
+            format!(
+                "kern.memorystatus_vm_pressure_level = 4 (CRITICAL), swap {:.0}/{:.0}MB — \
+                 the state that preceded the 08-19 fleet-killing panic (AMUX-3396). Jetsam \
+                 is imminent: shed lanes or memory before the kernel does it for you.",
+                swap_used_mb.unwrap_or(0.0),
+                swap_total_mb.unwrap_or(0.0),
+            ),
+        )
+        .evidence(ev)],
+        Some(_) => vec![InvariantResult::pass(ID).evidence(ev)],
+        None => vec![InvariantResult::unknown(
+            ID,
+            "pressure level unmeasurable on this platform (no kern.memorystatus_vm_pressure_level)",
+        )
+        .evidence(ev)],
+    }
+}
+
+/// The after-the-fact half of AMUX-3397: a fresh `.panic` artifact in the
+/// diagnostic-reports directory means the host died out from under the fleet,
+/// and the incident should be READ off amux instead of reconstructed from
+/// "every lane's uptime reset at once". One result per file, entity-keyed on
+/// the filename, so each panic is exactly one incident (the store's dedupe)
+/// and each HEALS when its file ages past the dwell window — stale files get
+/// an explicit entity-keyed pass, which is what resolves the incident row.
+pub fn no_fresh_kernel_panic(panics: &[(String, f64)], window_s: f64) -> Vec<InvariantResult> {
+    const ID: &str = "host.no_fresh_kernel_panic";
+    if panics.is_empty() {
+        return vec![InvariantResult::pass(ID)];
+    }
+    panics
+        .iter()
+        .map(|(name, age_s)| {
+            if *age_s < window_s {
+                InvariantResult::fail(
+                    ID,
+                    "no kernel panic artifact inside the dwell window".to_string(),
+                    format!(
+                        "{name} is {:.1}h old — the host kernel panicked and the whole fleet \
+                         died at once (the 08-19 memory-exhaustion panic was invisible to \
+                         every amux instrument: AMUX-3396). Read the artifact for the memory \
+                         state at death; this stays visible {:.0} days (AMUX_PANIC_FRESH_S) \
+                         so it cannot scroll away unacknowledged.",
+                        age_s / 3600.0,
+                        window_s / 86400.0,
+                    ),
+                )
+                .entity(name.as_str())
+                .evidence(json!({"file": name, "age_h": age_s / 3600.0}))
+            } else {
+                InvariantResult::pass(ID).entity(name.as_str())
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // 6e. Is the invariant system's OWN evaluation log bounded? (AMUX-3489)
 // ---------------------------------------------------------------------------
 
@@ -2488,6 +2574,48 @@ mod negative_controls {
         // settings file into an API response.
         assert!(the_incident[0].evidence["entries"][0]["command_head"].is_string());
         assert!(healthy[0].evidence["entries"][0]["command_head"].is_null());
+    }
+
+    /// AMUX-3397 cells, built from the real incident artifact. The specimen
+    /// panic file at 2.7 days must FAIL inside the 7-day dwell and PASS (with
+    /// its entity, so the incident resolves) once the window shrinks past it.
+    #[test]
+    fn the_0819_panic_specimen_fails_inside_the_dwell_and_heals_past_it() {
+        let specimen = vec![(
+            "panic-base+socd-2026-08-19-210001.panic".to_string(),
+            2.7 * 86400.0,
+        )];
+
+        let fresh = no_fresh_kernel_panic(&specimen, 7.0 * 86400.0);
+        assert_eq!(fresh[0].status, Status::Fail, "{:?}", fresh[0]);
+        assert_eq!(fresh[0].entity_key, "panic-base+socd-2026-08-19-210001.panic");
+        assert!(fresh[0].observed.contains("AMUX-3396"), "{:?}", fresh[0].observed);
+
+        // Past the window the SAME entity gets an explicit pass — that is
+        // what resolves the incident row; a bare pass would leave it open
+        // forever (the store resolves on matching (invariant, entity)).
+        let aged = no_fresh_kernel_panic(&specimen, 2.0 * 86400.0);
+        assert_eq!(aged[0].status, Status::Pass);
+        assert_eq!(aged[0].entity_key, "panic-base+socd-2026-08-19-210001.panic");
+
+        // No artifacts at all: a bare pass so the check reads alive.
+        assert_eq!(no_fresh_kernel_panic(&[], 7.0 * 86400.0)[0].status, Status::Pass);
+    }
+
+    /// The pressure check carries the kernel's verdict: only critical fails,
+    /// warn stays a pass (this box visits warn under normal load), and an
+    /// unmeasurable platform is unknown, NOT a pass.
+    #[test]
+    fn only_critical_pressure_fails_and_unmeasurable_is_unknown_not_pass() {
+        let crit = host_memory_not_critical(Some(4), Some(30000.0), Some(32768.0));
+        assert_eq!(crit[0].status, Status::Fail, "{:?}", crit[0]);
+        assert!(crit[0].observed.contains("CRITICAL"), "{:?}", crit[0].observed);
+
+        assert_eq!(host_memory_not_critical(Some(1), Some(0.0), Some(0.0))[0].status, Status::Pass);
+        assert_eq!(host_memory_not_critical(Some(2), Some(9000.0), Some(16384.0))[0].status, Status::Pass);
+
+        let unk = host_memory_not_critical(None, None, None);
+        assert_eq!(unk[0].status, Status::Unknown, "{:?}", unk[0]);
     }
 
     /// AMUX-3489 cells. The incident specimen (8M rows) must FAIL with the

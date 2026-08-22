@@ -69,6 +69,13 @@ pub struct Health {
     /// stamped (which logs a WARN of its own rather than reporting health).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub downtime_before_boot_s: Option<f64>,
+    /// Host memory state (AMUX-3397). The 2026-08-19 kernel panic
+    /// (memory/swap exhaustion, AMUX-3396) killed the whole fleet and was
+    /// invisible to every amux instrument before, during, and after. Same
+    /// reasoning as `fds`: a host that is dying of memory exhaustion will
+    /// soon be unable to say so, so the useful move is publishing the
+    /// approach continuously on the endpoint everyone already polls.
+    pub mem: MemHealth,
 }
 
 #[derive(Serialize)]
@@ -76,6 +83,89 @@ pub struct FdHealth {
     pub open: usize,
     pub limit: u64,
     pub ratio: f64,
+}
+
+#[derive(Serialize)]
+pub struct MemHealth {
+    /// The KERNEL's own verdict, not a tuned amux threshold (ethos rule 7:
+    /// prefer the structurally-present signal): macOS
+    /// `kern.memorystatus_vm_pressure_level` — 1 normal, 2 warn, 4 critical
+    /// (jetsam imminent). `None` when unmeasurable (non-macOS).
+    pub pressure_level: Option<u32>,
+    /// The level spelled out, so a reader does not need the mapping.
+    pub pressure: &'static str,
+    pub swap_used_mb: Option<f64>,
+    pub swap_total_mb: Option<f64>,
+}
+
+/// One syscall per field on macOS (`sysctlbyname`), `/proc/meminfo` on Linux
+/// — no subprocess, for the fd_health reason: spawning costs the resources
+/// being measured, and fails exactly when the condition it reports is present.
+pub fn mem_health() -> MemHealth {
+    let level = pressure_level();
+    let swap = swap_usage();
+    MemHealth {
+        pressure_level: level,
+        pressure: match level {
+            Some(1) => "normal",
+            Some(2) => "warn",
+            Some(4) => "critical",
+            Some(_) | None => "unknown",
+        },
+        swap_used_mb: swap.map(|(u, _)| u),
+        swap_total_mb: swap.map(|(_, t)| t),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_by_name<T>(name: &str) -> Option<T> {
+    let cname = std::ffi::CString::new(name).ok()?;
+    let mut val = std::mem::MaybeUninit::<T>::uninit();
+    let mut len = std::mem::size_of::<T>();
+    // SAFETY: the kernel writes at most `len` bytes into a T-sized buffer;
+    // we only assume_init when it reports success AND filled the whole T.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            cname.as_ptr(),
+            val.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && len == std::mem::size_of::<T>()).then(|| unsafe { val.assume_init() })
+}
+
+#[cfg(target_os = "macos")]
+fn pressure_level() -> Option<u32> {
+    sysctl_by_name::<libc::c_int>("kern.memorystatus_vm_pressure_level").map(|v| v as u32)
+}
+
+#[cfg(target_os = "macos")]
+fn swap_usage() -> Option<(f64, f64)> {
+    sysctl_by_name::<libc::xsw_usage>("vm.swapusage")
+        .map(|x| (x.xsu_used as f64 / 1048576.0, x.xsu_total as f64 / 1048576.0))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn pressure_level() -> Option<u32> {
+    // Linux exposes PSI, not a discrete level; mapping PSI to warn/critical
+    // would be a tuned parameter invented here, so it is honestly absent.
+    None
+}
+
+#[cfg(not(target_os = "macos"))]
+fn swap_usage() -> Option<(f64, f64)> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let get = |k: &str| {
+        s.lines()
+            .find(|l| l.starts_with(k))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<f64>().ok())
+    };
+    let total_kb = get("SwapTotal:")?;
+    let free_kb = get("SwapFree:")?;
+    Some(((total_kb - free_kb) / 1024.0, total_kb / 1024.0))
 }
 
 /// The same `AMUX_FD_MAX_RATIO` the autofix detector triggers on, read from the
@@ -145,6 +235,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             confidence_age_s: conf_age,
             downtime_before_boot_s: crate::runtime_jobs::heartbeat::boot_gap()
                 .map(|g| g.seconds),
+            mem: mem_health(),
         }),
     )
 }

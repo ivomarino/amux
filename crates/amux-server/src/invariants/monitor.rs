@@ -185,6 +185,14 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // self-announces instead of a lying capability report.
     out.extend(provider_launch_check());
 
+    // -- 10. host memory + kernel-panic tripwire (AMUX-3397): the 08-19
+    // memory-exhaustion panic killed all 45 lanes and left no trace in any
+    // amux instrument. The pressure check publishes the kernel's own verdict;
+    // the panic check makes the artifact self-announce for a week instead of
+    // waiting for a human to read /Library/Logs/DiagnosticReports.
+    out.extend(host_memory_check());
+    out.extend(kernel_panic_check());
+
     // -- 9. fire-alarm reachability: can the owner-alert channel reach a human?
     // (AMUX-3203). Both channels read healthy-enabled while neither had a
     // destination (0 push subs, empty phone), so five serious pages (a prod-down
@@ -620,6 +628,58 @@ mod report_hook_wiring_tests {
 /// `amux_session` column is the header stamp, and it is the same column the
 /// attribution audit and the send-ledger read. Deriving it from anywhere else
 /// would let the check disagree with the thing it describes.
+/// AMUX-3397. The check itself only fails at critical, but the WARN
+/// transition still lands in the server log — that is the "death spiral in
+/// progress" line the card asks a log sweep to be able to catch, emitted on
+/// the crossing rather than every cycle so it cannot wallpaper the log.
+fn host_memory_check() -> Vec<InvariantResult> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static LAST_LEVEL: AtomicU32 = AtomicU32::new(0);
+    let m = crate::api::health::mem_health();
+    let lvl = m.pressure_level.unwrap_or(0);
+    let prev = LAST_LEVEL.swap(lvl, Ordering::Relaxed);
+    if lvl >= 2 && prev < 2 {
+        tracing::warn!(
+            pressure_level = lvl,
+            swap_used_mb = m.swap_used_mb.unwrap_or(0.0),
+            swap_total_mb = m.swap_total_mb.unwrap_or(0.0),
+            "host memory pressure crossed to {} — the 08-19 panic class (AMUX-3397); \
+             watch swap growth and consider shedding lanes",
+            m.pressure,
+        );
+    }
+    checks::host_memory_not_critical(m.pressure_level, m.swap_used_mb, m.swap_total_mb)
+}
+
+/// AMUX-3397. Filename + mtime only — most artifacts in this directory are
+/// root-owned and unreadable to the server user, but the LISTING is enough
+/// for the tripwire, and the fail text routes a human to the file.
+fn kernel_panic_check() -> Vec<InvariantResult> {
+    let window_s = std::env::var("AMUX_PANIC_FRESH_S")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .unwrap_or(7.0 * 86400.0);
+    let dir = std::env::var("AMUX_PANIC_DIR")
+        .unwrap_or_else(|_| "/Library/Logs/DiagnosticReports".into());
+    let now = std::time::SystemTime::now();
+    let mut files: Vec<(String, f64)> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(&dir) {
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            // Dotfiles are the OS's staging copies (`.contents.panic` is
+            // rewritten in place); the named artifact is the durable one.
+            if name.starts_with('.') || !name.ends_with(".panic") {
+                continue;
+            }
+            if let Ok(mt) = e.metadata().and_then(|md| md.modified()) {
+                let age_s = now.duration_since(mt).map(|d| d.as_secs_f64()).unwrap_or(0.0);
+                files.push((name, age_s));
+            }
+        }
+    }
+    checks::no_fresh_kernel_panic(&files, window_s)
+}
+
 /// AMUX-3489. The budget is env-tunable (AMUX_INVARIANT_RESULT_BUDGET) so a
 /// deliberate fan-out increase moves the number in config rather than
 /// re-tuning a constant; 500k sits ~10x above the post-differential-retention
