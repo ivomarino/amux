@@ -1703,11 +1703,56 @@ fn du_top(
 /// pile of per-agent cargo target dirs under /private/tmp, and 24 hourly Time
 /// Machine snapshots — none of which live under amux's home. A detector that
 /// could only see its own directory would have named the innocent party.
+/// A plain FILE big enough to matter to the ranking (AEAB-42).
+///
+/// Default 256 MB. Env-overridable rather than a constant because it is a
+/// policy about what is worth a human's attention, and deviation D4 is the
+/// record of what happens when that kind of number is compiled in.
+fn disk_file_floor_bytes() -> u64 {
+    std::env::var("AMUX_DISK_FILE_MIN_MB")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(256)
+        * 1024
+        * 1024
+}
+
+/// True for a regular file at or above the floor. Directories are handled by
+/// the caller; symlinks are skipped, since `read_dir` metadata follows them and
+/// a link into a scanned directory would double-count.
+fn is_big_file(e: &std::fs::DirEntry, floor: u64) -> bool {
+    match e.file_type() {
+        Ok(ft) if ft.is_file() => e.metadata().map(|m| m.len() >= floor).unwrap_or(false),
+        _ => false,
+    }
+}
+
 fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut v: Vec<std::path::PathBuf> = Vec::new();
+    // AEAB-42: FILES count, not only directories. Every branch of this function
+    // used to push only `is_dir()` entries, which made a large file unrankable
+    // BY CONSTRUCTION — not skipped for budget, not skipped for permissions,
+    // simply never a candidate, so no timeout or budget change could ever
+    // surface one. On 2026-08-22 `~/.amux/amux.db` was 1.8 GB on a volume with
+    // 1.8 GB free, would have ranked FOURTH (above ~/.claude), and was absent
+    // from all 26 entries of the ranker's own cache. amux's disk report pointed
+    // the owner at caches and node_modules and structurally could not mention
+    // the largest thing amux itself writes.
+    //
+    // This sits one layer under AEAB-33. That card taught the ranking to declare
+    // the candidates it FAILED on — and that warning can only ever report
+    // candidates that were GENERATED, so it was blind to this by construction
+    // too. After adding a surfacing mechanism, ask what the mechanism itself
+    // cannot express.
+    //
+    // Sizing stays uniform: a file candidate goes through `du_one` like any
+    // other, rather than being short-circuited from the metadata we already
+    // hold. `du` on a plain file is instant, and two sizing paths is the second
+    // spelling that drifts.
+    let floor = disk_file_floor_bytes();
     if let Ok(rd) = std::fs::read_dir(home) {
         for e in rd.flatten() {
-            if e.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            if e.metadata().map(|m| m.is_dir()).unwrap_or(false) || is_big_file(&e, floor) {
                 v.push(e.path());
             }
         }
@@ -3739,6 +3784,77 @@ mod tests {
             !got.iter().any(|r| r.bytes == 0),
             "a skipped path was reported with a size instead of being omitted: {got:?}"
         );
+    }
+
+    // ── the ranker must be able to see a FILE (AEAB-42) ───────────────────
+
+    /// THE POINT OF THE CARD. A large plain file must be a candidate.
+    ///
+    /// This test FAILS against the previous code, which pushed only entries
+    /// where `is_dir()` — verify that before believing it. `~/.amux/amux.db`
+    /// was 1.8 GB on a volume with 1.8 GB free, would have ranked fourth, and
+    /// was absent from all 26 entries of the ranker's own cache.
+    ///
+    /// The control assertion matters as much as the treatment: the directory
+    /// must STILL appear. A "fix" that swapped one exclusion for the opposite
+    /// one would pass a file-only assertion and silently drop every directory,
+    /// which is the same defect with the sign flipped — and this repo has
+    /// already shipped both signs of it in one night (ethos rule 1).
+    #[test]
+    fn disk_candidates_include_a_big_file_and_still_include_directories() {
+        let _g = du_env_lock();
+        std::env::set_var("AMUX_DISK_FILE_MIN_MB", "1");
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(home.path().join("a-directory")).unwrap();
+        std::fs::write(home.path().join("big.db"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        std::fs::write(home.path().join("small.txt"), b"tiny").unwrap();
+
+        let got = disk_candidates(home.path());
+        std::env::remove_var("AMUX_DISK_FILE_MIN_MB");
+
+        let has = |n: &str| got.iter().any(|p| p.file_name().map(|f| f == n).unwrap_or(false));
+        assert!(has("big.db"), "a 2MB file above a 1MB floor must be a candidate: {got:?}");
+        assert!(has("a-directory"), "directories must STILL be candidates: {got:?}");
+        assert!(!has("small.txt"), "a file below the floor is noise, not a candidate: {got:?}");
+    }
+
+    /// The floor is a POLICY knob, not a constant (deviation D4). If the env
+    /// var did not reach the decision this test would pass anyway with the
+    /// default 256 MB floor excluding a 2 MB file — so it asserts the INVERSE
+    /// too: the same file crosses the same floor when the floor is lowered.
+    /// One assertion alone here cannot fail for the right reason.
+    #[test]
+    fn the_file_floor_is_configurable_and_actually_consulted() {
+        let _g = du_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join("two-mb.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
+        let seen = |v: &[std::path::PathBuf]| {
+            v.iter().any(|p| p.file_name().map(|f| f == "two-mb.bin").unwrap_or(false))
+        };
+
+        std::env::set_var("AMUX_DISK_FILE_MIN_MB", "64");
+        let high = disk_candidates(home.path());
+        std::env::set_var("AMUX_DISK_FILE_MIN_MB", "1");
+        let low = disk_candidates(home.path());
+        std::env::remove_var("AMUX_DISK_FILE_MIN_MB");
+
+        assert!(!seen(&high), "2MB is below a 64MB floor and must be excluded: {high:?}");
+        assert!(seen(&low), "2MB is above a 1MB floor and must be included: {low:?}");
+    }
+
+    /// A file candidate must survive the whole pipeline, not merely be
+    /// generated. `disk_candidates` feeding a `du_top` that cannot size a file
+    /// would be the ethos-1 split all over again — a view that disagrees with
+    /// the mechanism it feeds.
+    #[test]
+    fn du_top_can_size_a_plain_file() {
+        let _g = du_env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("blob.bin");
+        std::fs::write(&f, vec![0u8; 512 * 1024]).unwrap();
+        let got = du_top(std::slice::from_ref(&f), 8, None);
+        assert_eq!(got.len(), 1, "a plain file must be sized, not dropped: {got:?}");
+        assert!(got[0].bytes > 0, "a 512KB file must size non-zero: {got:?}");
     }
 
     /// Control: a path that CAN be walked is still measured and non-zero, so
