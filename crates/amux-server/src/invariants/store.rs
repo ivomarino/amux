@@ -163,12 +163,44 @@ pub fn live_incidents(store: &SharedStore) -> anyhow::Result<Vec<serde_json::Val
 /// its last (stale) verdict — evidence freshness, spec §25.
 pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_json::Value>> {
     let conn = store.read()?;
+    // AEAB-44. The obvious spelling of this — a `GROUP BY invariant_id`
+    // subquery — scans the WHOLE evaluation log to produce 304 rows, and that
+    // log is the largest table amux has (9.4M rows / 1.7 GB with indexes on
+    // 2026-08-22, see AEAB-41). Measured on the live DB: 12.9s for the GROUP BY
+    // form, 0.002s for this one, returning row-for-row identical results.
+    //
+    // The recursive CTE is a loose index scan: walk the DISTINCT invariant_ids
+    // by repeatedly asking for the next one greater than the last, then ask
+    // `max(ts)` per id. Both steps are index seeks on
+    // idx_inv_result_id (invariant_id, ts DESC) — the index was already there,
+    // the GROUP BY simply could not use it. Cost is O(distinct ids), not
+    // O(rows), so this stays fast as the log grows rather than degrading in
+    // exact proportion to the thing it measures. That mattered: this is the
+    // ONLY view of live incidents and of checks that have STOPPED running, so
+    // it was least usable at the moment it was most needed.
+    //
+    // NOTE it is deliberately NOT one row per invariant despite the name. It
+    // returns every row of the newest BATCH for each invariant — one per
+    // entity — which is what the caller renders. Collapsing to one row per
+    // invariant would silently hide 63 of the 64 entities of
+    // route.callers_have_routes.
     let mut stmt = conn.prepare(
-        "SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts
+        "WITH RECURSIVE ids(id) AS (
+             SELECT (SELECT min(invariant_id) FROM _amux_invariant_result)
+             UNION ALL
+             SELECT (SELECT min(invariant_id) FROM _amux_invariant_result
+                      WHERE invariant_id > ids.id)
+               FROM ids WHERE ids.id IS NOT NULL
+         ),
+         latest AS (
+             SELECT id AS invariant_id,
+                    (SELECT max(ts) FROM _amux_invariant_result r
+                      WHERE r.invariant_id = ids.id) AS mt
+               FROM ids WHERE id IS NOT NULL
+         )
+         SELECT r.invariant_id, r.status, r.entity_key, r.expected, r.observed, r.ts
            FROM _amux_invariant_result r
-           JOIN (SELECT invariant_id, MAX(ts) mt
-                   FROM _amux_invariant_result GROUP BY invariant_id) m
-             ON m.invariant_id = r.invariant_id AND m.mt = r.ts
+           JOIN latest l ON l.invariant_id = r.invariant_id AND l.mt = r.ts
           ORDER BY r.invariant_id",
     )?;
     let now = now();
@@ -199,6 +231,87 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let s = crate::db::Store::open(&d.path().join("t.db")).unwrap();
         (std::sync::Arc::new(s), d)
+    }
+
+    /// Insert an evaluation row at an EXPLICIT ts, so the test does not depend
+    /// on wall-clock ordering between two `record` calls.
+    async fn put(s: &SharedStore, ts: f64, id: &str, entity: &str, status: &str) {
+        let (id, entity, status) = (id.to_string(), entity.to_string(), status.to_string());
+        s.write_async(move |c| {
+            c.execute(
+                "INSERT INTO _amux_invariant_result
+                   (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms)
+                 VALUES (?1,?2,?3,?4,'','','{}',0)",
+                rusqlite::params![ts, id, status, entity],
+            )?;
+            Ok(WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .unwrap();
+    }
+
+    /// AEAB-44. `latest_per_invariant` returns the newest BATCH for each
+    /// invariant — every entity in it — not one row per invariant.
+    ///
+    /// Both halves can fail independently and both have to be here:
+    ///   - drop the older generation (a query that returns everything passes a
+    ///     "the newest row is present" assertion and is still wrong), and
+    ///   - keep ALL entities of the newest generation (collapsing to one row
+    ///     per invariant would hide 63 of the 64 entities of
+    ///     route.callers_have_routes in production, and would pass any
+    ///     assertion phrased per-invariant).
+    ///
+    /// This is the test the index rewrite had to survive. Verified against the
+    /// live 9.4M-row table too: old and new forms returned 304 rows with
+    /// `EXCEPT` empty in BOTH directions — and note that had to be done inside
+    /// ONE transaction, because comparing two queries against a table the
+    /// monitor is writing to every 30s reports every row as different.
+    #[tokio::test]
+    async fn latest_per_invariant_is_the_newest_batch_with_every_entity() {
+        let (s, _d) = store();
+        // Older generation — must NOT appear.
+        put(&s, 100.0, "a.check", "e1", "fail").await;
+        put(&s, 100.0, "a.check", "e2", "fail").await;
+        put(&s, 100.0, "b.check", "", "pass").await;
+        // Newest generation for a.check: three entities, all must appear.
+        put(&s, 200.0, "a.check", "e1", "pass").await;
+        put(&s, 200.0, "a.check", "e2", "fail").await;
+        put(&s, 200.0, "a.check", "e3", "unknown").await;
+        // b.check's newest is older than a.check's — per-invariant, not global.
+        put(&s, 150.0, "b.check", "", "fail").await;
+
+        let got = latest_per_invariant(&s).unwrap();
+
+        let a: Vec<_> = got.iter().filter(|r| r["invariant_id"] == "a.check").collect();
+        assert_eq!(a.len(), 3, "every entity of the newest batch must appear: {got:?}");
+        assert!(
+            a.iter().all(|r| r["checked_at"].as_f64().unwrap() == 200.0),
+            "the older generation must be gone: {got:?}"
+        );
+        let mut ents: Vec<&str> =
+            a.iter().map(|r| r["entity"].as_str().unwrap()).collect();
+        ents.sort();
+        assert_eq!(ents, vec!["e1", "e2", "e3"]);
+
+        let b: Vec<_> = got.iter().filter(|r| r["invariant_id"] == "b.check").collect();
+        assert_eq!(b.len(), 1, "b.check has one entity: {got:?}");
+        assert_eq!(
+            b[0]["checked_at"].as_f64().unwrap(),
+            150.0,
+            "each invariant's own newest ts, not the table's: {got:?}"
+        );
+        assert_eq!(b[0]["status"], "fail");
+    }
+
+    /// The empty case, because the recursive CTE seeds itself from
+    /// `min(invariant_id)` — which is NULL on an empty table. A seed that is
+    /// NULL must terminate the recursion rather than loop or error, and
+    /// "nothing has ever run" must come back as an empty list rather than as a
+    /// failure the caller renders as `unwrap_or_default()` silence.
+    #[tokio::test]
+    async fn latest_per_invariant_is_empty_and_ok_on_an_empty_table() {
+        let (s, _d) = store();
+        assert_eq!(latest_per_invariant(&s).unwrap().len(), 0);
     }
 
     /// THE dedupe property: the same failure 100 times is ONE incident.
