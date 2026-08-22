@@ -157,6 +157,26 @@ fn latency_floor_ms() -> f64 {
 fn latency_min_samples() -> i64 {
     env_i64("AMUX_AUTOFIX_LATENCY_MIN_SAMPLES", 30).max(5)
 }
+/// Endpoints whose DESIGN includes a long blocking call, with their design
+/// budget (AMUX-3485). POST /api/files/mdai/run is a model synthesis whose
+/// accepted duration is ~100s for a large node (AF-142 — measured, judged,
+/// and recommended for acceptance); its per-node budget is MODEL_TIMEOUT_S
+/// (150s). A 10s outlier threshold under a 150s design budget files a card
+/// per legitimate run — the threshold-below-baseline defect, per-endpoint,
+/// and with occurrence-identity signatures that is a NEW card every time.
+/// The outlier still fires ABOVE the design budget, where it means the
+/// endpoint's own timeout failed to bound the call — the one latency story
+/// on these routes that IS wrong.
+const LONG_BY_DESIGN: &[(&str, f64)] = &[("/api/files/mdai/run", 150_000.0)];
+
+fn design_budget_ms(target: &str) -> f64 {
+    LONG_BY_DESIGN
+        .iter()
+        .find(|(p, _)| target == *p)
+        .map(|(_, b)| *b)
+        .unwrap_or(0.0)
+}
+
 /// A single request slower than this is absurd on its face, whatever the
 /// family's norm is.
 fn outlier_ms() -> f64 {
@@ -712,6 +732,11 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
         }
     }
     for ((method, target), (n, worst, last_ts, sample)) in seen {
+        // AMUX-3485: for long-by-design endpoints the effective threshold is
+        // their design budget, not the global outlier floor.
+        if worst <= design_budget_ms(&target) {
+            continue;
+        }
         // OCCURRENCE IDENTITY in the signature (AMUX-3472). An outlier report
         // is about SPECIFIC requests, not a standing condition — but the
         // signature carried only method+target, so discarding the card
@@ -4115,6 +4140,30 @@ mod tests {
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         assert!(ev["verdict"].contains("Threshold"), "state the threshold: {ev:?}");
         assert!(ev.contains_key("window_samples") && ev.contains_key("baseline_samples"));
+    }
+
+    /// AMUX-3485 both directions: a run INSIDE an endpoint's design budget
+    /// (the mdai synthesis, ~100s accepted under AF-142, node timeout 150s)
+    /// files nothing — a card per legitimate run is the threshold-below-
+    /// baseline defect per-endpoint; a run PAST the design budget still
+    /// files, because that means the endpoint's own timeout failed to bound
+    /// the call, which is the one latency story there that IS wrong.
+    #[tokio::test]
+    async fn a_long_by_design_endpoint_files_only_past_its_own_budget() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(&st, Row { ts: now - 500.0, method: "POST", path: "/api/files/mdai/run", family: "/api/files", status: 200, body: "", worker: "", ua: "curl/8", ms: 109_896.0 });
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/files/mdai/run")),
+            "a synthesis inside its 150s design budget is designed behavior: {f:?}"
+        );
+        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/files/mdai/run", family: "/api/files", status: 200, body: "", worker: "", ua: "curl/8", ms: 200_000.0 });
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/files/mdai/run")),
+            "past the design budget the endpoint's own timeout failed — that must file: {f2:?}"
+        );
     }
 
     /// AMUX-3472: the outlier signature carries the newest offending row's
