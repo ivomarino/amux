@@ -238,6 +238,20 @@ fallback when a finding needs row-level inspection.
      Before flagging, look for `DELETE /api/board/` in the lane's writes, the same
      way you look for `POST /api/board` when `updated` is unset.
 
+   - **`POST /api/sessions/<n>/commit-report` is not work either.** It attaches a sha to
+     the in-flight card and is fired by the commit machinery, so a lane that only committed
+     shows up with it and nothing else. FIFTH instance of this class, found 2026-08-22 by
+     the sweep flagging its OWN author: `amux-frustrations` and `desktop` both came back as
+     silent-worker candidates whose only non-excluded write was this.
+
+     **STOP ENUMERATING AND MATCH THE SHAPE.** Five exclusions in, the pattern is stable and
+     the list keeps needing another line: staged-guard, send, observed-edits, guard-outcome
+     and commit-report are all REPORT endpoints — a mutating METHOD carrying a fact about
+     work already done, fired by machinery rather than chosen by the lane. Before flagging,
+     ask what the write WAS, not what its verb was. The list below is examples of the shape,
+     not the definition, and a new endpoint of this kind does not need to be added here
+     before the rule covers it.
+
    - **`POST /api/git/observed-edits` is not work either.** It is the AF-123 Bash
      hook pair reporting mtimes that moved during a command — fired on EVERY Bash
      call a lane makes, so a lane that only read files all day still posts dozens of
