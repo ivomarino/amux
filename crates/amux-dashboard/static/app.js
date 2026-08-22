@@ -7874,7 +7874,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.707';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.708';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10772,6 +10772,54 @@ function _fuzzyScore(q, name) {
   if (n.startsWith(q)) score += 10;             // exact prefix is best
   score -= name.length * 0.05;                  // gently prefer shorter names
   return { score, hits: new Set(hits) };
+}
+
+// ── generic @-mention attach (AMUX-3509, Ethan: "the same worker dropdown
+// in EVERY input, including the scheduler command editor") ──
+// Wires the existing _atQuery/_atRender machinery onto ANY input/textarea:
+// a dropdown appears under the field while the cursor sits in an @word,
+// arrows navigate, Enter/Tab picks, Escape closes, tap picks on mobile.
+// One dropdown is open at a time, so a single module-level current pair is
+// enough for the pick callback the rendered rows call by name.
+let _atGenCur = null;
+function _atGenPick(i) {
+  const cur = _atGenCur;
+  if (!cur || !cur.dd._atItems || !cur.dd._atItems[i]) return;
+  const inp = cur.inp;
+  const at = _atQuery(inp);
+  if (!at) return;
+  const name = cur.dd._atItems[i].name;
+  const after = inp.value.slice(inp.selectionStart);
+  inp.value = inp.value.slice(0, at.idx) + '@' + name + ' ' + after;
+  const pos = at.idx + name.length + 2;
+  inp.setSelectionRange(pos, pos);
+  cur.dd.classList.remove('open');
+  inp.focus();
+}
+function _atAttach(inp) {
+  if (!inp || inp._atWired) return;
+  inp._atWired = true;
+  const wrap = inp.parentElement;
+  if (getComputedStyle(wrap).position === 'static') wrap.style.position = 'relative';
+  const dd = document.createElement('div');
+  dd.className = 'ac-list';  // the styled dropdown container the composer uses
+  wrap.appendChild(dd);
+  let sel = -1;
+  const rows = () => dd.querySelectorAll('.at-item');
+  const highlight = () => rows().forEach((r, i) => r.classList.toggle('selected', i === sel));
+  inp.addEventListener('input', () => {
+    _atGenCur = { inp, dd };
+    sel = -1;
+    if (!_atRender(inp, dd, '_atGenPick')) dd.classList.remove('open');
+  });
+  inp.addEventListener('keydown', (e) => {
+    if (!dd.classList.contains('open')) return;
+    if (e.key === 'ArrowDown') { sel = Math.min(sel + 1, rows().length - 1); highlight(); e.preventDefault(); }
+    else if (e.key === 'ArrowUp') { sel = Math.max(sel - 1, 0); highlight(); e.preventDefault(); }
+    else if (e.key === 'Enter' || e.key === 'Tab') { _atGenCur = { inp, dd }; _atGenPick(Math.max(sel, 0)); e.preventDefault(); e.stopPropagation(); }
+    else if (e.key === 'Escape') { dd.classList.remove('open'); e.stopPropagation(); }
+  });
+  inp.addEventListener('blur', () => setTimeout(() => dd.classList.remove('open'), 200));
 }
 
 // Populate dropdown with @session matches; returns true if @ mode active.
@@ -23829,6 +23877,9 @@ function schedModeOf(s) {
 function openSchedModal(editId) {
   _schedEditId = editId || null;
   const overlay = document.getElementById('sched-overlay');
+  // AMUX-3509: the command editor gets the same @-worker dropdown as the
+  // main composer (idempotent — _atAttach wires once per element).
+  _atAttach(document.getElementById('sched-command'));
   // Populate session list
   const sel = document.getElementById('sched-session');
   sel.innerHTML = (sessions || []).map(s => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join('');
