@@ -1310,14 +1310,14 @@ fn preview_of(raw: &str) -> (String, Vec<String>) {
         if distinct.len() <= 2 {
             continue;
         }
-        intelligible.push(chars_truncate(&cl, 200));
+        intelligible.push(strip_elapsed_suffix(&chars_truncate(&cl, 200)));
     }
     let preview_lines: Vec<String> = if intelligible.is_empty() {
         // Fallback: last few non-empty stripped lines (spinner/tool output).
         let start = lines.len().saturating_sub(8);
         let cleaned: Vec<String> = lines[start..]
             .iter()
-            .map(|l| chars_truncate(strip_ansi(l).trim(), 200))
+            .map(|l| strip_elapsed_suffix(&chars_truncate(strip_ansi(l).trim(), 200)))
             .filter(|l| !l.is_empty())
             .collect();
         let s = cleaned.len().saturating_sub(5);
@@ -1327,6 +1327,36 @@ fn preview_of(raw: &str) -> (String, Vec<String>) {
         intelligible[s..].to_vec()
     };
     (preview, preview_lines)
+}
+
+/// Drop a trailing elapsed-time counter — `3m 17s`, `47s`, `1h 2m 3s` —
+/// separated from the line's text by a run of 2+ spaces (Claude Code's
+/// column-padded subagent status lines). The counter ticks every repaint, so
+/// with 40+ live lanes SOME preview churned on every poll and the sessions
+/// ETag (AMUX-3504) could never 304: measured, 5 of 119 rows differed across
+/// an idle 3s and every diff was this suffix. The counter is decoration in a
+/// 5-line preview; the TEXT still churns when activity is real, which is the
+/// correct invalidation. A line without the shape passes through untouched.
+fn strip_elapsed_suffix(line: &str) -> String {
+    let trimmed = line.trim_end();
+    let Some(gap) = trimmed.rfind("  ") else { return trimmed.to_string() };
+    let suffix = trimmed[gap..].trim_start();
+    let is_elapsed = !suffix.is_empty()
+        && suffix.split_whitespace().all(|tok| {
+            // Char-based, not split_at: a byte index panics on a multi-byte
+            // final char, and pane text is arbitrary UTF-8.
+            let mut cs = tok.chars();
+            let Some(unit) = cs.next_back() else { return false };
+            let num = cs.as_str();
+            matches!(unit, 'h' | 'm' | 's')
+                && !num.is_empty()
+                && num.chars().all(|c| c.is_ascii_digit())
+        });
+    if is_elapsed {
+        trimmed[..gap].trim_end().to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Saved-log tail for a STOPPED session (py:20218-20223): last 16KB of
@@ -3820,5 +3850,29 @@ Claude usage limit reached. Your limit will reset at 3pm.
         );
         assert_eq!(parse_list_sessions_line("amux-x:200"), Some(("amux-x", Some(200), None)));
         assert_eq!(parse_list_sessions_line(""), None);
+    }
+
+    /// AMUX-3504 — the elapsed-counter suffix is what kept the sessions ETag
+    /// from ever answering 304 (5 of 119 rows churned across an idle 3s, every
+    /// diff a ticking `3m 17s`). Specimens are the live capture's own lines.
+    /// The controls matter as much: prose that merely ENDS in something
+    /// time-shaped, and a single-space gap, must pass through untouched — an
+    /// over-eager strip would corrupt real preview text fleet-wide.
+    #[test]
+    fn elapsed_suffix_strips_the_ticker_and_only_the_ticker() {
+        // The live specimens (column-padded status lines).
+        assert_eq!(
+            strip_elapsed_suffix("◯ general-purpose  Pricing gala event ticket costs         3m 13s "),
+            "◯ general-purpose  Pricing gala event ticket costs"
+        );
+        assert_eq!(strip_elapsed_suffix("◯ x  Fetching pages   47s"), "◯ x  Fetching pages");
+        assert_eq!(strip_elapsed_suffix("task   1h 2m 3s"), "task");
+        // Controls: no elapsed shape, or no 2-space gap -> untouched.
+        assert_eq!(strip_elapsed_suffix("deploys in 3m 13s"), "deploys in 3m 13s");
+        assert_eq!(strip_elapsed_suffix("meeting at  9am sharp"), "meeting at  9am sharp");
+        assert_eq!(strip_elapsed_suffix("plain line"), "plain line");
+        assert_eq!(strip_elapsed_suffix(""), "");
+        // Multi-byte final char must not panic (byte-indexed split would).
+        assert_eq!(strip_elapsed_suffix("計測  3分"), "計測  3分");
     }
 }
