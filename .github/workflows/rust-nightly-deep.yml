@@ -128,7 +128,16 @@ jobs:
         # broken filter for weeks, by turning "my selector matched nothing"
         # into a green run of the wrong thing. If the projects below stop
         # existing, this must go red.
+        #
+        # AMUX_E2E_WORKING_TREE=1 is load-bearing (AMUX-2872): a CI checkout
+        # IS the commit, and without it serve-head.sh builds HEAD into a
+        # SEPARATE worktree with a cold target dir — three per-project
+        # servers each cold-building the same code, starving the webServer
+        # boots into ERR_CONNECTION_REFUSED. rust.yml's green e2e job has
+        # always set this; this job was born without it and never passed.
         run: npx playwright test --config e2e/playwright.config.ts ${{ matrix.projects }}
+        env:
+          AMUX_E2E_WORKING_TREE: '1'
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
