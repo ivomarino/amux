@@ -724,7 +724,7 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
     // 300s: comfortably more than several delivery ticks, so a normal
     // busy->idle transition never trips it, but far below the 2h6m the real
     // incident reached.
-    checks::queue_has_live_consumer(&items, now, 300.0)
+    checks::queue_has_live_consumer(&items, now, 300.0, crate::api::session_verbs::steer_dead_letter_s())
 }
 
 /// Client call sites, extracted from the shipped artifacts.

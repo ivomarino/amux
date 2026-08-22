@@ -466,7 +466,22 @@ pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Optio
 ///
 /// The IDLE qualifier is load-bearing: a deep queue behind a busy worker is
 /// correct behaviour, and flagging it would train everyone to ignore this.
-pub fn queue_has_live_consumer(items: &[QueuedItem], now: f64, stale_after_s: f64) -> Vec<InvariantResult> {
+/// `dead_letter_after_s` is `steer_dead_letter_s()` — the SAME deadline the
+/// reaper uses, passed in so the check stays pure. AMUX-3473: this check used
+/// to fail unroutable rows after `stale_after_s` (300s) while the dead-letter
+/// deliberately waits an hour, so for 55 minutes per row the invariant flagged
+/// a fate the system had already scheduled — the view disagreeing with the
+/// predicate of the mechanism it describes, flapping across 18 entities and
+/// refiling within hours of every retirement. And `not-running` rows are
+/// KEPT by design (the 2026-08-19 panic: age cannot distinguish a 6.5h outage
+/// from a dead lane, and every queued row delivered on restart), so failing
+/// them forever was a permanent red that trains skimming.
+pub fn queue_has_live_consumer(
+    items: &[QueuedItem],
+    now: f64,
+    stale_after_s: f64,
+    dead_letter_after_s: f64,
+) -> Vec<InvariantResult> {
     const ID: &str = "queue.has_live_consumer";
     let mut out = Vec::new();
     for it in items {
@@ -477,31 +492,43 @@ pub fn queue_has_live_consumer(items: &[QueuedItem], now: f64, stale_after_s: f6
             continue;
         }
         match it.block_reason.as_deref() {
-            // The target is not a live consumer at all (no env file, not
-            // running, archived). The message is UNROUTABLE, not merely late:
-            // no delivery tick will ever land it, so this is a distinct, louder
-            // fact than an idle consumer with lagging delivery, and it was
-            // misread as the latter because the invariant did not consult
-            // lane_block_reason (AMUX-3084 / AMUX-3111, ethos rule 4: the
-            // instrument could not express the discriminator). The cure is a
-            // dead-letter path (AMUX-3110), not waiting for a consumer that will
-            // never exist.
+            // A registered-but-stopped lane KEEPS its queue by design (the
+            // 08-19 panic lesson above); the sender was told "queued" at send
+            // time. Not a failure — a failing invariant on a deliberate state
+            // is the AF-132 shape.
+            Some("not-running") => {
+                out.push(InvariantResult::pass(ID).entity(&it.target));
+            }
+            // no-env-file / archived: the dead-letter reaper OWNS this row's
+            // fate. Inside its deadline the wait is sanctioned; PAST it, the
+            // reaper failed to reap — a real wedge, and the louder fact.
             Some(reason) => {
-                out.push(
-                    InvariantResult::fail(
-                        ID,
-                        format!("queued item delivered or dead-lettered within {stale_after_s:.0}s"),
-                        format!("undelivered for {age:.0}s; target is UNROUTABLE ({reason})"),
-                    )
-                    .entity(&it.target)
-                    .evidence(json!({
-                        "target": it.target, "age_s": age, "queue": it.queue,
-                        "class": "unroutable-target",
-                        "block_reason": reason,
-                        "fix": "dead-letter unreachable rows (AMUX-3110); do not wait for a \
-                                consumer that will never exist",
-                    })),
-                );
+                if age <= dead_letter_after_s {
+                    out.push(InvariantResult::pass(ID).entity(&it.target));
+                } else {
+                    out.push(
+                        InvariantResult::fail(
+                            ID,
+                            format!(
+                                "an unroutable row is dead-lettered within {dead_letter_after_s:.0}s"
+                            ),
+                            format!(
+                                "undelivered for {age:.0}s, {:.0}s PAST the dead-letter deadline; \
+                                 target is UNROUTABLE ({reason}) and the reaper did not reap it",
+                                age - dead_letter_after_s
+                            ),
+                        )
+                        .entity(&it.target)
+                        .evidence(json!({
+                            "target": it.target, "age_s": age, "queue": it.queue,
+                            "class": "dead-letter-wedged",
+                            "block_reason": reason,
+                            "dead_letter_after_s": dead_letter_after_s,
+                            "fix": "the reaper (steer_dead_letter_verdict path) should have \
+                                    moved this row to steering_history; find out why it did not",
+                        })),
+                    );
+                }
             }
             // A live consumer sitting IDLE with an old item in front of it is
             // the original producer-without-consumer incident: it is not draining.
@@ -1875,8 +1902,43 @@ mod negative_controls {
             target_idle: true,
             block_reason: None,
         }];
-        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0); // 2h6m, the real age
+        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0); // 2h6m, the real age
         assert!(rs.iter().any(|r| r.status == Status::Fail), "must detect the dead consumer");
+    }
+
+    /// AMUX-3473, the flap that refiled across 18 entities: the check must
+    /// share the predicates of the mechanisms it describes. An unroutable row
+    /// INSIDE the dead-letter deadline has a scheduled fate (pass); PAST the
+    /// deadline the reaper failed and it fails as dead-letter-wedged; and a
+    /// `not-running` row is KEPT by design (the 08-19 panic: an outage and a
+    /// dead lane are indistinguishable by age, and every row delivered on
+    /// restart) so it passes however old.
+    #[test]
+    fn the_check_shares_the_reaper_and_outage_predicates() {
+        let mk = |reason: &str, queued_at: f64| QueuedItem {
+            queue: "steering".into(),
+            target: "ETHAN".into(),
+            queued_at,
+            target_idle: false,
+            block_reason: Some(reason.into()),
+        };
+        // Inside the reaper's deadline: sanctioned wait, pass.
+        let rs = queue_has_live_consumer(&[mk("no-env-file", 6_000.0)], 7_560.0, 300.0, 3_600.0);
+        assert!(
+            rs.iter().all(|r| r.status == Status::Pass),
+            "a row the reaper will reap is scheduled fate, not a failure: {rs:?}"
+        );
+        // Past the deadline: the reaper is wedged — the louder fact.
+        let rs = queue_has_live_consumer(&[mk("no-env-file", 0.0)], 7_560.0, 300.0, 3_600.0);
+        let f = rs.iter().find(|r| r.status == Status::Fail).expect("past-deadline must fail");
+        assert_eq!(f.evidence["class"].as_str(), Some("dead-letter-wedged"), "{}", f.evidence);
+        assert!(f.observed.contains("PAST the dead-letter deadline"), "{}", f.observed);
+        // not-running: kept by design, passes at any age.
+        let rs = queue_has_live_consumer(&[mk("not-running", 0.0)], 7_560.0, 300.0, 3_600.0);
+        assert!(
+            rs.iter().all(|r| r.status == Status::Pass),
+            "a stopped-but-registered lane keeps its queue deliberately: {rs:?}"
+        );
     }
 
     /// AMUX-3084 / AMUX-3111: a target that is not a live consumer at all (its
@@ -1894,14 +1956,17 @@ mod negative_controls {
             target_idle: true, // carries a stale, never-decaying idle report (AMUX-2646)
             block_reason: Some("no-env-file".into()),
         }];
-        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0);
+        // Post-AMUX-3473: the ghost still fails, but only PAST the reaper's
+        // deadline (2h6m old vs a 1h deadline here), and the class names the
+        // wedged reaper — the discriminator one level deeper than AMUX-3084's.
+        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0);
         let f = rs
             .iter()
             .find(|r| r.status == Status::Fail)
-            .expect("an 18h-stuck row must still fail");
+            .expect("a row past the dead-letter deadline must still fail");
         assert_eq!(
             f.evidence["class"].as_str(),
-            Some("unroutable-target"),
+            Some("dead-letter-wedged"),
             "a ghost target must be classed unroutable, not producer-without-consumer: {}",
             f.evidence
         );
@@ -2063,7 +2128,7 @@ mod negative_controls {
             target_idle: false, // mid-turn: queueing is the POINT
             block_reason: None,
         }];
-        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0);
+        let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0);
         assert!(
             rs.iter().all(|r| r.status == Status::Pass),
             "a deep queue behind a busy worker is correct, not a fault"
