@@ -1368,6 +1368,10 @@ struct ErrGroup {
     count: u64,
     first_ts: f64,
     last_ts: f64,
+    /// ts of the row `sample` came from — sample choice must not depend on
+    /// scan order (AF-131 flipped the scan to DESC; the old overwrite rule
+    /// silently keyed "newest" to iteration position).
+    sample_ts: f64,
     clients: std::collections::BTreeSet<String>,
     sample: Value,
     sample_has_body: bool,
@@ -1401,17 +1405,19 @@ async fn analyze(
     let mut groups: std::collections::BTreeMap<(i64, String, String, String), ErrGroup> =
         Default::default();
     let mut scanned = 0i64;
+    let mut oldest_scanned: Option<f64> = None;
     let res = (|| -> rusqlite::Result<()> {
         let mut stmt = conn.prepare(
             "SELECT ts, method, path, family, status, latency_ms, client_ip, user_agent, \
                     amux_session, worker, answered_by, error_body, req_meta \
              FROM _amux_request_log WHERE status >= 400 AND ts >= ?1 \
-             ORDER BY ts ASC LIMIT ?2",
+             ORDER BY ts DESC LIMIT ?2",
         )?;
         let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP])?;
         while let Some(r) = rows.next()? {
             scanned += 1;
             let ts: f64 = r.get(0)?;
+            oldest_scanned = Some(oldest_scanned.map_or(ts, |p: f64| p.min(ts)));
             let method: String = r.get(1)?;
             let path: String = r.get(2)?;
             let family: String = r.get(3)?;
@@ -1443,6 +1449,7 @@ async fn analyze(
                 count: 0,
                 first_ts: ts,
                 last_ts: ts,
+                sample_ts: ts,
                 clients: Default::default(),
                 sample: sample.clone(),
                 sample_has_body: has_body,
@@ -1452,17 +1459,24 @@ async fn analyze(
                 family,
             });
             g.count += 1;
-            g.last_ts = ts;
+            // min/max, never positional: the scan is newest-first now
+            // (AF-131), and `last_ts = ts` under DESC would report the
+            // group's OLDEST hit as its most recent.
+            g.first_ts = g.first_ts.min(ts);
+            g.last_ts = g.last_ts.max(ts);
             if g.clients.len() < 1000 {
                 g.clients.insert(ident);
             }
             // Sample = the newest row that carries an error_body (a body
-            // beats a newer bodyless row; among bodied rows, newest wins —
-            // rows arrive ts-ASC so later iterations are newer).
-            if has_body || !g.sample_has_body {
+            // beats a newer bodyless row; among equally-bodied rows, newest
+            // ts wins). Decided on ts, never iteration position (AF-131).
+            let better = (has_body && !g.sample_has_body)
+                || (has_body == g.sample_has_body && ts > g.sample_ts);
+            if better {
                 g.sample = sample;
                 g.sample_has_body = has_body;
                 g.sample_path = path;
+                g.sample_ts = ts;
             }
         }
         Ok(())
@@ -1513,6 +1527,10 @@ async fn analyze(
         "generated_at": unix_now(),
         "total_errors": scanned,
         "scan_truncated": scanned >= ANALYZE_SCAN_CAP,
+        // AF-131: the REAL covered span. Under truncation this is smaller
+        // than since_h, and saying so is the difference between "the last N
+        // hours" and a confident answer about a window that was not read.
+        "actual_window_h": oldest_scanned.map(|o| ((unix_now() - o) / 3600.0 * 100.0).round() / 100.0),
         "groups": out,
         "groups_total": groups_total,
         "verdicts": verdicts,
@@ -1589,8 +1607,16 @@ async fn stats(
     let mut oldest_ts: Option<f64> = None;
     let res = (|| -> rusqlite::Result<()> {
         let mut stmt = conn.prepare(
+            // AF-131: ORDER BY ts DESC is load-bearing. With no ORDER BY,
+            // SQLite returned insertion order and LIMIT kept the OLDEST rows,
+            // so a truncated "trailing" window was actually days 8-5 — and
+            // actual_window_h (computed from the slice) then claimed the full
+            // requested span. Both lies at once: a 6.46x p95 "regression" on
+            // 42k requests was 1.07x against an honest window. Newest-first
+            // makes the slice the trailing window everyone assumes AND makes
+            // actual_window_h truthful by construction.
             "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts \
-             FROM _amux_request_log WHERE ts >= ?1 LIMIT ?2",
+             FROM _amux_request_log WHERE ts >= ?1 ORDER BY ts DESC LIMIT ?2",
         )?;
         let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP])?;
         while let Some(r) = rows.next()? {
@@ -2541,6 +2567,105 @@ mod tests {
 
     fn logs_api(store: Arc<crate::db::Store>) -> Router {
         Router::new().nest("/api/logs", routes()).with_state(state(store))
+    }
+
+    /// AF-131, rebuilt from the sweep's own numbers: three /api/logs/stats
+    /// calls (96h/192h/336h) each scanned exactly the 200k cap over the SAME
+    /// rows, yet actual_window_h reported min(requested, data_span) — and the
+    /// capped slice kept the OLDEST rows, so the "trailing norm" was days 8-5
+    /// and a 6.46x p95 finding was 1.07x against an honest window. Both
+    /// endpoints share the scan shape, so one over-cap store pins both: the
+    /// slice must be the NEWEST rows, and the window claim must shrink to
+    /// what was actually read.
+    #[tokio::test]
+    async fn truncated_scans_keep_the_newest_rows_and_say_the_real_window() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // 50k "old-era" rows around 90-80h ago, then 210k "new-era" rows in
+        // the last 70h — 260k total against the 200k cap, so a truthful
+        // truncation contains ZERO old-era rows.
+        store
+            .write(move |conn| {
+                let tx_like = conn; // Store::write is already one transaction
+                let mut stmt = tx_like.prepare(
+                    "INSERT INTO _amux_request_log \
+                     (ts, method, path, family, status, latency_ms, client_ip, \
+                      amux_session, worker, answered_by, error_body) \
+                     VALUES (?1,'GET',?2,?3,500,1.0,'127.0.0.1','lane',NULL,'native',NULL)",
+                )?;
+                for i in 0..50_000 {
+                    let ts = now - 90.0 * 3600.0 + i as f64 * 0.5;
+                    stmt.execute(rusqlite::params![ts, "/api/old-era", "old-era"])?;
+                }
+                for i in 0..210_000 {
+                    let ts = now - 70.0 * 3600.0 + i as f64;
+                    stmt.execute(rusqlite::params![ts, "/api/new-era", "new-era"])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+        let api = logs_api(store.clone());
+
+        // STATS: the capped slice is the newest 200k (all new-era), and the
+        // window claim shrinks to what was read.
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=96").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["scan_truncated"], true, "{v}");
+        let fams: Vec<&str> = v["families"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["family"].as_str().unwrap())
+            .collect();
+        assert!(
+            !fams.contains(&"old-era"),
+            "a truncated trailing window must keep the NEWEST rows — old-era rows \
+             surviving means the cap ate the recent traffic: {fams:?}"
+        );
+        assert!(fams.contains(&"new-era"), "{fams:?}");
+        let aw = v["actual_window_h"].as_f64().unwrap();
+        assert!(
+            aw < 70.0,
+            "actual_window_h must report the span actually READ (the newest ~200k of \
+             the last 70h), never min(requested, data_span): got {aw} vs since_h=96"
+        );
+
+        // ANALYZE: same slice rule, same honest window, and the group's
+        // last_ts must be its NEWEST hit even though the scan is now DESC.
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder()
+                .uri("/api/logs/analyze?since_h=96")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["scan_truncated"], true, "{v}");
+        let groups = v["groups"].as_array().unwrap();
+        assert!(
+            groups.iter().all(|g| g["family"] != "old-era"),
+            "analyze must also keep the newest under the cap: {v}"
+        );
+        let new_era = groups.iter().find(|g| g["family"] == "new-era").expect("new-era group");
+        let last = new_era["last_ts"].as_f64().unwrap();
+        // The fixture's newest new-era row is at now - (70h - 209,999s), i.e.
+        // ~11.67h ago; a positional overwrite under the DESC scan would land
+        // ~70h ago instead.
+        let expected_newest = now - 70.0 * 3600.0 + 209_999.0;
+        assert!(
+            (last - expected_newest).abs() < 5.0,
+            "last_ts must be the group's NEWEST hit — a positional overwrite under the \
+             DESC scan reports the oldest: last_ts {last} vs expected {expected_newest}"
+        );
+        let aw = v["actual_window_h"].as_f64().unwrap();
+        assert!(aw < 70.0, "analyze window claim must shrink too: {aw}");
     }
 
     #[tokio::test]
