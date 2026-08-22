@@ -761,14 +761,29 @@ impl GmailClient {
         body: Option<&Value>,
     ) -> Result<Value, String> {
         let mut token = self.access_token(account, false).await?;
-        for attempt in 0..2 {
+        let mut refreshed = false;
+        let mut last: Option<(u16, Value)> = None;
+        for attempt in 0..4u32 {
             let (status, v) = match (method, body) {
                 ("GET", _) => self.http.get(url, Some(&token)).await?,
                 ("POST", Some(b)) => self.http.post_json(url, Some(&token), b).await?,
                 _ => return Err(format!("unsupported method {method}")),
             };
-            if status == 401 && attempt == 0 {
+            if status == 401 && !refreshed {
+                refreshed = true;
                 token = self.access_token(account, true).await?;
+                continue;
+            }
+            // AMUX-3495: quota pushback retries instead of failing. The 8-wide
+            // inbox fetch (AMUX-3337) sits just under Gmail's 250 units/s
+            // budget, and its per-message caller `.ok()`s failures — so before
+            // this, a 429 didn't slow the inbox down, it silently DROPPED the
+            // message from the response. Three short backoffs (250/500/1000ms)
+            // absorb a transient limit; a sustained one still errors, loudly,
+            // at the caller's WARN.
+            if (status == 429 || status == 503) && attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+                last = Some((status, v));
                 continue;
             }
             if status >= 400 {
@@ -776,7 +791,8 @@ impl GmailClient {
             }
             return Ok(v);
         }
-        unreachable!("loop always returns");
+        let (status, v) = last.unwrap_or((0, Value::Null));
+        Err(format!("gmail api {status} after retries: {v}"))
     }
 
     fn metadata_url(&self, id: &str, headers: &[&str]) -> String {
@@ -1223,7 +1239,19 @@ impl GmailClient {
         .map(|mid| async move {
             let url =
                 self.metadata_url(&mid, &["From", "To", "Subject", "Date", "Message-ID"]);
-            self.api(account, "GET", &url, None).await.ok().map(|full| (mid, full))
+            match self.api(account, "GET", &url, None).await {
+                Ok(full) => Some((mid, full)),
+                Err(e) => {
+                    // AMUX-3495 two-fixes half: this `.ok()` used to swallow
+                    // the failure, so a rate-limited fetch didn't slow the
+                    // inbox — it silently OMITTED the message. The drop is
+                    // now greppable where sweeps look.
+                    tracing::warn!(
+                        "[email] inbox metadata fetch DROPPED message {mid} for {account}: {e} — the response is missing it"
+                    );
+                    None
+                }
+            }
         })
         .buffered(8)
         .map(|r| r.map(|(mid, full)| json!({"__mid": mid, "__full": full})))
@@ -2127,6 +2155,62 @@ mod tests {
         let calls = http.calls.lock().unwrap();
         let url = &calls.iter().find(|(m, u, _)| m == "GET" && u.contains("/messages?q=")).unwrap().1;
         assert!(url.contains(&urlencode("in:inbox after:")[..20]), "{url}");
+    }
+
+    /// AMUX-3495 — a 429 must RETRY, not silently drop the message. The
+    /// 8-wide inbox fetch sits just under Gmail's quota budget and its
+    /// per-message caller used to `.ok()` failures, so quota pushback OMITTED
+    /// messages from the response with nothing anywhere saying so — a reader
+    /// concludes "no such mail". One 429 then 200 for the same id: the
+    /// message must arrive; a SUSTAINED 429 (all retries eaten) must drop
+    /// with the other message still served, never fail the whole inbox.
+    #[tokio::test]
+    async fn a_transient_429_retries_and_the_message_still_arrives() {
+        let home = temp_home_with_token("acct@example.com", true);
+        let meta = json!({
+            "id": "g1", "threadId": "T", "snippet": "snip", "labelIds": ["INBOX"],
+            "payload": { "headers": [
+                { "name": "From", "value": "a@ext.com" },
+                { "name": "Subject", "value": "s" },
+                { "name": "Message-ID", "value": "<m1@x>" },
+            ]},
+        });
+        let http = MockHttp::new(vec![
+            ("GET", "/messages?q=", 200, json!({ "messages": [{ "id": "g1" }] })),
+            ("GET", "/messages/g1", 429, json!({ "error": "rateLimitExceeded" })),
+            ("GET", "/messages/g1", 200, meta),
+        ]);
+        let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+        let res = client.inbox_messages("acct@example.com", 1, "", 3.0).await.unwrap();
+        let msgs = res["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "the 429'd message must be retried into the response");
+        assert_eq!(msgs[0]["message_id"], json!("<m1@x>"));
+        // Both the 429 and the retry hit the wire.
+        let gets = http.calls.lock().unwrap().iter().filter(|(m, u, _)| m == "GET" && u.contains("/messages/g1")).count();
+        assert_eq!(gets, 2);
+    }
+
+    #[tokio::test]
+    async fn a_sustained_429_drops_one_message_never_the_whole_inbox() {
+        let home = temp_home_with_token("acct@example.com", true);
+        let meta = json!({
+            "id": "g2", "threadId": "T", "snippet": "ok", "labelIds": ["INBOX"],
+            "payload": { "headers": [ { "name": "Message-ID", "value": "<m2@x>" } ] },
+        });
+        let http = MockHttp::new(vec![
+            ("GET", "/messages?q=", 200, json!({ "messages": [{ "id": "g1" }, { "id": "g2" }] })),
+            // g1: four 429s — every attempt eaten, the message drops (loudly, WARN).
+            ("GET", "/messages/g1", 429, json!({ "error": "rateLimitExceeded" })),
+            ("GET", "/messages/g1", 429, json!({ "error": "rateLimitExceeded" })),
+            ("GET", "/messages/g1", 429, json!({ "error": "rateLimitExceeded" })),
+            ("GET", "/messages/g1", 429, json!({ "error": "rateLimitExceeded" })),
+            ("GET", "/messages/g2", 200, meta),
+        ]);
+        let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+        let res = client.inbox_messages("acct@example.com", 2, "", 3.0).await.unwrap();
+        let msgs = res["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), 1, "g2 must survive g1's sustained quota failure");
+        assert_eq!(msgs[0]["message_id"], json!("<m2@x>"));
     }
 
     #[tokio::test]
