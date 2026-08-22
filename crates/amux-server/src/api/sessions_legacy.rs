@@ -1733,12 +1733,14 @@ pub async fn create_session_legacy(
             .into_response();
     }
     let dir = s("dir");
-    if !dir.is_empty() && !std::path::Path::new(&dir).is_dir() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(json!({"error": format!("working directory '{dir}' does not exist")})),
-        )
-            .into_response();
+    match ensure_work_dir(&dir) {
+        WorkDirOutcome::Ok => {}
+        WorkDirOutcome::Created => {
+            tracing::info!(dir = %dir, "created working directory for new worker");
+        }
+        WorkDirOutcome::Refused(msg) => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": msg}))).into_response();
+        }
     }
     let provider = {
         let p = s("provider");
@@ -2535,6 +2537,61 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 mod tests {
     use super::*;
 
+    /// Worker creation CREATES a missing working directory instead of refusing
+    /// (Ethan, 2026-08-22). The four cells are separated because the single
+    /// message this replaces was false about two of them.
+    #[test]
+    fn a_missing_working_directory_is_created_not_refused() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Empty = inherit. Not a path question at all.
+        assert!(matches!(ensure_work_dir(""), WorkDirOutcome::Ok));
+
+        // Already a directory: untouched.
+        let existing = tmp.path().join("already");
+        std::fs::create_dir_all(&existing).unwrap();
+        assert!(matches!(
+            ensure_work_dir(existing.to_str().unwrap()),
+            WorkDirOutcome::Ok
+        ));
+
+        // THE REPORTED CASE: absent, absolute, nested. Created, and it is
+        // really on disk afterwards — asserting the enum alone would pass on a
+        // function that only ever returned Created.
+        let fresh = tmp.path().join("Vault").join("Datacenter");
+        assert!(!fresh.exists(), "fixture must start absent");
+        assert!(matches!(
+            ensure_work_dir(fresh.to_str().unwrap()),
+            WorkDirOutcome::Created
+        ));
+        assert!(fresh.is_dir(), "the directory must actually exist afterwards");
+
+        // Exists as a FILE: creation is impossible, and "does not exist" was a
+        // false statement about this path.
+        let file = tmp.path().join("a-file");
+        write!(std::fs::File::create(&file).unwrap(), "x").unwrap();
+        match ensure_work_dir(file.to_str().unwrap()) {
+            WorkDirOutcome::Refused(m) => {
+                assert!(m.contains("is not a directory"), "{m}");
+                assert!(!m.contains("does not exist"), "must not claim absence: {m}");
+            }
+            _ => panic!("a file must be refused, not created over"),
+        }
+
+        // RELATIVE and absent: refused. create_dir_all would resolve this
+        // against the SERVER's cwd and silently make a directory nobody asked
+        // for, so a typo must not succeed.
+        match ensure_work_dir("some/relative/path-that-does-not-exist") {
+            WorkDirOutcome::Refused(m) => assert!(m.contains("absolute"), "{m}"),
+            _ => panic!("a relative path must be refused"),
+        }
+        assert!(
+            !std::path::Path::new("some/relative/path-that-does-not-exist").exists(),
+            "the refusal must not have created it anyway"
+        );
+    }
+
     /// ISOLATED (AMUX-3232): the peer-facing fleet list strips isolated
     /// (raw-agent) workers so peers cannot discover them, while the OWNER
     /// dashboard (no worker header) sees the full fleet. The normal worker is the
@@ -3030,6 +3087,67 @@ mod tests {
 //     agents, that test goes red and this override needs rethinking, which is
 //     the whole point of keeping the frame rather than a paraphrase of it.
 // ---------------------------------------------------------------------------
+
+/// What [`ensure_work_dir`] decided about the `dir` field on worker creation.
+pub(crate) enum WorkDirOutcome {
+    /// Empty (inherit) or already a directory.
+    Ok,
+    /// Did not exist and was created.
+    Created,
+    /// Cannot be used, with the sentence the user sees.
+    Refused(String),
+}
+
+/// Resolve the working directory a new worker asked for, CREATING it when it is
+/// missing (Ethan, 2026-08-22: "it should create the folder/dir if it doesnt
+/// exist").
+///
+/// Refusing was the wrong shape for what the user had just done: naming a
+/// directory in the create form IS the instruction for where this worker should
+/// work, and answering "it does not exist" hands back a fact they already know,
+/// with no way forward except leaving the dialog, running `mkdir -p` by hand and
+/// starting over.
+///
+/// Pure, so the four cases are testable without standing up the router — the
+/// handler only maps the outcome to a status code. Three of them are separated
+/// deliberately, because the single old message was FALSE about two:
+///
+/// - exists as a FILE: creation is impossible, and "does not exist" was simply
+///   untrue about that path.
+/// - creation FAILED (permissions, read-only mount): name which, with the OS
+///   error, instead of the generic refusal.
+/// - RELATIVE path: still refused, and this is the one restriction added rather
+///   than removed. `create_dir_all` on a relative path resolves against the
+///   SERVER's cwd, so accepting one would silently create a directory somewhere
+///   nobody was looking — a typo would succeed and the worker would run in the
+///   wrong place. A relative path does not name a location from here.
+pub(crate) fn ensure_work_dir(dir: &str) -> WorkDirOutcome {
+    if dir.is_empty() {
+        return WorkDirOutcome::Ok;
+    }
+    let p = std::path::Path::new(dir);
+    if p.is_dir() {
+        return WorkDirOutcome::Ok;
+    }
+    if p.exists() {
+        return WorkDirOutcome::Refused(format!(
+            "'{dir}' exists but is not a directory — pick another working directory"
+        ));
+    }
+    if !p.is_absolute() {
+        return WorkDirOutcome::Refused(format!(
+            "working directory '{dir}' does not exist and is not an absolute path — give a \
+             full path (e.g. /Users/you/Projects/thing) and it will be created"
+        ));
+    }
+    match std::fs::create_dir_all(p) {
+        Ok(()) => WorkDirOutcome::Created,
+        Err(e) => WorkDirOutcome::Refused(format!(
+            "could not create working directory '{dir}': {e}"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod status_truth {
     use super::tests::signals;
