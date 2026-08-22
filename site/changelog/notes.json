@@ -1,5 +1,23 @@
 [
   {
+    "hash": "726ca46ef70d237c4e8084bd15582b23925338eb",
+    "short": "726ca46",
+    "title": "Weekly disk watchdog warns before caches fill your drive",
+    "date": "2026-08-21",
+    "type": "feat",
+    "tags": ["disk", "monitoring", "maintenance"],
+    "description": "amux now runs a weekly disk watchdog that scans for directories consuming more than configurable thresholds and emits a warning before writes start failing. Particularly useful for teams running amux on a shared server with heavy multi-session usage — Rust build caches, log archives, and tmux scrollback can accumulate several gigabytes per week without notice."
+  },
+  {
+    "hash": "c510cad16da7ca1c3d0ee3672f99e9cc21120dbe",
+    "short": "c510cad",
+    "title": "Server updates apply in place — no restart window",
+    "date": "2026-08-21",
+    "type": "fix",
+    "tags": ["server", "reliability", "deploy"],
+    "description": "The amux Rust server now self-adopts new builds in place: when the auto-builder detects a new commit touching the server crate, it installs the updated binary and the running process exits cleanly for launchd to relaunch immediately. Sessions keep running through the changeover. Previously, applying a server update required a manual restart and introduced a brief window where the server was unavailable."
+  },
+  {
     "hash": "7404228",
     "short": "7404228",
     "title": "Board progress note notifies the card owner",
