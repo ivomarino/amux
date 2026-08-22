@@ -970,7 +970,7 @@ pub fn autofix_cards_are_dispatchable(open_unowned: i64, examples: &[String]) ->
         ID,
         "every open auto-filed card has a session, so auto-pickup can reach it".to_string(),
         format!(
-            "{open_unowned} open auto-filed card(s) have NO session — auto-pickup selects on              i.session=?1, so no lane will EVER be offered them; the detector that filed them              is writing reports nobody receives (e.g. {}). New filings: set              AMUX_AUTOFIX_SESSION in server.env. Backlog: run the recovery sweep (close              reports whose subject has recovered, route the live ones) — do NOT bulk-assign              215 cards into one queue.",
+            "{open_unowned} open auto-filed card(s) have NO session — auto-pickup selects on              i.session=?1, so no lane will EVER be offered them; the detector that filed them              is writing reports nobody receives (e.g. {}). New filings: set              AMUX_AUTOFIX_SESSION in server.env. Backlog: run the recovery sweep (close              reports whose subject has recovered, route the live ones) — do NOT bulk-assign              the backlog into one queue.",
             examples.join(", "),
         ),
     )

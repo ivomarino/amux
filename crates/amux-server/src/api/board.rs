@@ -3134,6 +3134,33 @@ pub async fn patch_item(
             }
             next.updated = now_secs();
             bs::save_patched(conn, &next)?;
+            // AF-137 / AMUX-3464: retiring an auto-filed REPORT re-arms its
+            // detector. The filing dedupe is a PERMANENT session_events idem
+            // row ("a restart must not refile"), so a discarded report whose
+            // idem survives would suppress every future recurrence of the same
+            // signature — the signal dies with the card. Deleting the row on
+            // the discard transition makes recurrence file a FRESH card (which
+            // now reaches a lane via AMUX_AUTOFIX_SESSION). Doctrine intact:
+            // nothing here closes on green — this fires only when a WORKER
+            // discards, and makes that judgment signal-safe. source_ref and
+            // the idem key are the same "autofix:<signature>" string.
+            if next.status == "discarded" && row.status != "discarded" {
+                if let Some(sr) =
+                    next.source_ref.as_deref().filter(|s| s.starts_with("autofix:"))
+                {
+                    let n = conn.execute(
+                        "DELETE FROM session_events WHERE idem = ?1",
+                        rusqlite::params![sr],
+                    )?;
+                    if n > 0 {
+                        tracing::info!(
+                            target: "autofix", card = %next.id, signature = %sr,
+                            "report discarded — detector RE-ARMED (idem cleared); \
+                             recurrence files fresh"
+                        );
+                    }
+                }
+            }
             if let Some(tags) = &tags_change {
                 bs::set_tags(conn, &next.id, tags, next.updated)?;
             }

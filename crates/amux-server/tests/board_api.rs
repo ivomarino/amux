@@ -15,6 +15,19 @@ use axum::http::{header, HeaderMap, Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) {
+    std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
+    let dir = tempfile::tempdir().unwrap();
+    let store = std::sync::Arc::new(Store::open(&dir.path().join("amux-test.db")).unwrap());
+    let state = AppState {
+        store: store.clone(),
+        started: std::time::Instant::now(),
+        build_hash: "test".into(),
+        auth_token: None,
+    };
+    (router(state), store, dir)
+}
+
 fn app() -> (axum::Router, tempfile::TempDir) {
     // Pin the global done-link gate ON so this suite is hermetic (not dependent
     // on whether the real ~/.amux disables it): the gate tests here provide a
@@ -1757,3 +1770,72 @@ async fn a_peers_progress_note_reports_owner_notification_honestly() {
     .await;
     assert!(r.get("owner_notified").is_none(), "{r}");
 }
+
+// ---- AF-137 / AMUX-3464: discarding an auto-filed report RE-ARMS its detector
+
+/// The filing dedupe is a PERMANENT session_events idem row, so a discarded
+/// report whose idem survives suppresses every future recurrence of that
+/// signature — the signal dies with the card. The discard transition must
+/// clear it (and ONLY the autofix idem: a non-autofix source_ref card must
+/// touch nothing).
+#[tokio::test]
+async fn discarding_an_autofix_report_rearms_the_detector() {
+    let (app, store, _dir) = app_with_store();
+    let made = create(
+        &app,
+        serde_json::json!({"title": "auto report", "session": "amux",
+                            "type": "investigation",
+                            "desc": "Filed automatically by amux (runtime_jobs/autofix)"}),
+    )
+    .await;
+    let id = made["id"].as_str().unwrap().to_string();
+    // Arm: source_ref + the idem row, exactly as the filer writes them.
+    store
+        .write({
+            let id = id.clone();
+            move |conn| {
+                conn.execute(
+                    "UPDATE issues SET source_ref='autofix:sig-x' WHERE id=?1",
+                    rusqlite::params![id],
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+                     VALUES (1, 'amux', 'autofix.filed', '{}', 'autofix:sig-x', 'autofix')",
+                    [],
+                )?;
+                Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+            }
+        })
+        .unwrap();
+    let idem_count = |store: &std::sync::Arc<Store>| -> i64 {
+        store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE idem='autofix:sig-x'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(idem_count(&store), 1, "fixture must actually be armed");
+    // Discard through the REAL handler (gate_ack: a report retirement is the
+    // worker's judgment, which is exactly what the ack asserts).
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(serde_json::json!({"status": "discarded", "gate_ack": true,
+                            "desc_append": "retired: condition re-checked, recovered"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success(), "discard must apply: {st}");
+    assert_eq!(
+        idem_count(&store),
+        0,
+        "the discard transition must clear the autofix idem — a surviving row \
+         suppresses every future recurrence of this signature"
+    );
+}
+
