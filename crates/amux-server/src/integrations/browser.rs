@@ -679,6 +679,7 @@ pub async fn start(
     url: &str,
     session: &str,
     started_by: &str,
+    headless: bool,
 ) -> anyhow::Result<StartedBrowser> {
     let binary = chrome_binary().ok_or_else(|| {
         anyhow::anyhow!("no Chrome/Chromium binary found (looked in /Applications and PATH)")
@@ -730,6 +731,13 @@ pub async fn start(
         .arg(format!("--user-data-dir={}", target.user_data_dir.display()))
         .arg("--no-first-run")
         .arg("--no-default-browser-check");
+    // AMUX-3508: same profile dirs, no window — the logins made headfully in
+    // the amux Browser UI ride along, which is the whole point of profiles
+    // being durable. `new` headless shares the profile format with headful
+    // Chrome (the old --headless did not persist everything).
+    if headless {
+        cmd.arg("--headless=new");
+    }
     // amux serves its own dashboard over a SELF-SIGNED cert, so without this the
     // one site this browser most needs to reach — amux itself — lands on
     // chrome-error://chromewebdata/ and every subsequent verb runs against the
@@ -2185,7 +2193,7 @@ mod tests {
         }
         let home = fake_home();
         // Use a scratch profile name so the target dir is amux-owned + temp.
-        let info = start(home.path(), "default", "about:blank", "live-smoke", "live-smoke").await.expect("start");
+        let info = start(home.path(), "default", "about:blank", "live-smoke", "live-smoke", false).await.expect("start");
         assert!(info.cdp_port > 0);
         let tabs = cdp_list(info.cdp_port).await.expect("cdp /json/list");
         assert!(tabs.is_array());
@@ -2259,7 +2267,7 @@ mod tests {
             return;
         }
         let home = fake_home();
-        let info = start(home.path(), "default", "about:blank", "owner", "owner").await.expect("start");
+        let info = start(home.path(), "default", "about:blank", "owner", "owner", false).await.expect("start");
 
         // The launch tab as CHROME reports it — the incident's artifact.
         let launch_tab = cdp_list(info.cdp_port)

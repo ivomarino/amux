@@ -203,6 +203,10 @@ struct StartBody {
     width: Option<u32>,
     #[serde(default)]
     height: Option<u32>,
+    /// AMUX-3508: launch with no window (`--headless=new`), same profile
+    /// dirs — log in headfully once, reuse the cookies headlessly forever.
+    #[serde(default)]
+    headless: Option<bool>,
     /// Explicit consent to replace ANOTHER session's running browser
     /// (AMUX-3063). The browser is a machine singleton, so start stomps
     /// whoever staged it — on 2026-08-20 an unattributed default-profile
@@ -292,7 +296,7 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
             );
         }
     }
-    match chrome::start(&home, &body.profile, &body.url, &session, attrib.as_deref().unwrap_or(""))
+    match chrome::start(&home, &body.profile, &body.url, &session, attrib.as_deref().unwrap_or(""), body.headless.unwrap_or(false))
         .await
     {
         Ok(info) => {
@@ -480,7 +484,10 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
     if !body.url.trim().is_empty() {
         let session = resolve_session(body.session.as_deref(), &headers);
         let attrib = explicit_session(body.session.as_deref(), &headers);
-        match chrome::start(&home, &name, body.url.trim(), &session, attrib.as_deref().unwrap_or(""))
+        match chrome::start(&home, &name, body.url.trim(), &session, attrib.as_deref().unwrap_or(""),
+            // create-profile launches headfully by definition: its purpose is a
+            // human logging in (AMUX-3508's headless is for REUSING the result).
+            false)
             .await
         {
             Ok(_) => launched = true,
