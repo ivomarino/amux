@@ -1843,11 +1843,21 @@ COST: About 40 minutes, most of it re-walking the home directory by hand with
   walker's cross-mount guard had no reason to skip it.
 FIX: 7ecb766. Position and phase are published per directory BEFORE the syscall that
   can block, separately from the throttled write that persists them; the
-  reaper preserves both and names them in its error text; a watchdog marks a
-  45s stall terminal and WARNs to server-rs.log BEFORE it touches the store,
-  so a stall in the write lock still reports rather than hanging where the
-  walker did. Stalled directories are recorded and skipped by later scans,
-  with a Re-include button so the exemption is not a one-way ratchet.
+  reaper preserves both and names them in its error text; a watchdog WARNs to
+  server-rs.log BEFORE it touches the store, so a stall in the write lock still
+  reports rather than hanging where the walker did. Stalled directories are
+  recorded, and skipped by later scans once corroborated, with a Re-include
+  button so the exemption is not a one-way ratchet.
+  CORRECTION, 0371230: 7ecb766 made the watchdog END a scan at 45s and
+  permanently exempt the directory it was on. Its first production run did that
+  to ~/Downloads, which answers readdir in 2 seconds with 318 entries. The
+  threshold was below the baseline — ~50 sessions at load 95, with the scan
+  competing for the disk it measures — so the detector fired on contention it
+  was itself producing, and its action was a silent hole in the scan. Now it
+  WARNs at 45s and decides nothing, ends a scan at 300s, and routes around a
+  path only after it hangs two separate scans. On the verifying run ~/Documents
+  went quiet for 46s, was named in the log, and was NOT exempted. The fix
+  found its own bug within the hour, which is the argument for the instrument.
   Same commit fixed a second bug found by measuring rather than by theory:
   `devtool_roots()` is a list of real absolute paths that `walk()` sized
   regardless of cfg.roots, so every unit test calling walk() on a tempdir also
@@ -1858,57 +1868,6 @@ FIX: 7ecb766. Position and phase are published per directory BEFORE the syscall 
   lsof showing NO directory fd at all is what separated them.
 
 ---
-
-## `amux board add --help` said "server unreachable" one command after the same server answered
-AREA: cli
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-21
-SESSION: amux-frustrations
-CARD: AF-122
-SYMPTOM: `amux board add --help` printed `types: (server unreachable — see GET
-  /api/board/contract)` immediately after `amux board progress` had succeeded against
-  that server, with `amux url` correct at 8824 and `curl $(amux url)/api/board/contract`
-  returning 200 and all eleven types. `_board_valid_types()` read
-  `["fields"]["valid_types"]`; the contract publishes `types` at TOP LEVEL and carries no
-  `fields` key at all, so the lookup threw, `except Exception: pass` swallowed it, and the
-  empty result fell through to a hardcoded unreachable message.
-COST: small in minutes, large in direction. The message names a cause the whole fleet is
-  primed to chase — AMUX-3046 stranded lanes really do carry the retired 8822, and
-  CLAUDE.md teaches every session to suspect it — so it routes a reader at a phantom
-  connectivity hunt instead of a key-path bug one line above. I chased the port first.
-  And the one thing the helper exists to do, letting a session discover the valid card
-  types from the CLI, did not work for any lane.
-FIX: e823ae3. Reads `types` with the historical nested spelling as fallback, and separates
-  the two failures that had been sharing one sentence: transport now names the http code,
-  a 200 with no list says the contract shape changed. The comment above that function
-  already promised "confidently wrong help is worse than none" — it could not keep the
-  promise while both failures printed the same words.
-
-## The test fixture served the CLI's WRONG shape, so the suite certified the bug for months
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-21
-SESSION: amux-frustrations
-CARD: AF-122
-SYMPTOM: `scripts/test-board-add-flags.sh` stubs `/api/board/contract` and served
-  `{"fields": {"valid_types": [...]}}` — a shape the real server has never served — because
-  the fixture was written to match the CLI rather than the server. Fixture and code agreed
-  with each other and both disagreed with production, and the suite was green the entire
-  time `--help` was broken. Worse: NO assertion anywhere read the types line, so the stub's
-  response was decorative and could have been any JSON at all.
-COST: the defect shipped and survived every run of a 30-case suite whose whole subject is
-  this command. A fixture built to match the code under test cannot fail on the defect; it
-  certifies it. That is ethos rule 7 with the fixture as the accomplice, and it is a shape
-  worth naming separately from the CLI bug itself because the next one will also look green.
-FIX: e823ae3. Fixture serves the real shape; seven assertions now READ the output across all
-  three cells (200+real, transport failure, 200+unknown shape). Mutation-verified: restoring
-  the original helper turns 5 of the 7 red, and the 2 survivors are exactly the two the old
-  code got right. Plus a producer-side anchor in `tests/board_contract_filters.rs` asserting
-  both that the contract publishes top-level `types` and that the shipped bash CLI still
-  reads that key — mutation-verified in both directions, because the bash CLI is not
-  compiled and nothing else could catch a rename on that side.
 
 ## The CLI help promised backlog was claimable; the server refused it
 AREA: board
