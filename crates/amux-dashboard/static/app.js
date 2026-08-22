@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.700';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.701';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16336,7 +16336,19 @@ async function _mdaiRun(opts) {
     // finishes well inside 3 min; past that it is a stuck source or a wedged
     // model call, and a timeout that surfaces an error beats an infinite spinner.
     const _ctrl = new AbortController();
-    const _to = setTimeout(() => _ctrl.abort(), 180000);
+    // AF-141: this bounds the WHOLE RUN; the server bounds each NODE
+    // (MODEL_TIMEOUT_S, 150s). Both were 180 — two different quantities wearing
+    // the same number — so this abort always won the race and the server's
+    // specific error, which names the CLI and the budget, could never reach the
+    // user. They got the guess below instead. And a legitimate two-node chain of
+    // 100s each was killed here having exceeded no server limit at all.
+    //
+    // 600s is deliberately generous because this is a BACKSTOP against a hung
+    // server, not a quality bar: the server now fails each node at 150s and
+    // answers, so a run reaching 600s means the server itself stopped talking.
+    // A long wait is affordable now that it is not a blank one — the previous
+    // result renders immediately and this refresh lands behind it.
+    const _to = setTimeout(() => _ctrl.abort(), 600000);
     let r;
     try {
       r = await fetch(API + '/api/files/mdai/run', {
@@ -16355,7 +16367,7 @@ async function _mdaiRun(opts) {
     }
   } catch (e) {
     _mdaiRunError = (e && e.name === 'AbortError')
-      ? 'The run took too long (over 3 min) and was stopped — likely a stuck source or a wedged model call. Try again, or simplify the instruction/sources.'
+      ? 'No answer from the server for 10 minutes, so the run was stopped. Each step is capped at 150s server-side and reports its own error, so reaching this means the server stopped responding rather than one step being slow — check that amux is up, then retry.'
       : ((e && e.message) || 'run failed');
     _mdaiRunCycle = null;
   }

@@ -79,7 +79,27 @@ const MAX_FOLDER_BYTES: usize = 256 * 1024;
 
 /// How long a single node's model call may take before the run fails loudly
 /// rather than hanging the request.
-const MODEL_TIMEOUT_S: u64 = 180;
+const MODEL_TIMEOUT_S: u64 = 150;
+/// The CLIENT's whole-RUN abort, in seconds (`app.js`, `_mdaiRun`). Kept here so
+/// the relation is checkable from one place — the two numbers live in different
+/// languages and drifted into being EQUAL, which is how AF-141 happened.
+const CLIENT_RUN_ABORT_S: u64 = 600;
+
+/// AF-141, enforced at COMPILE time rather than in a test: a per-node budget
+/// that leaves the client no room to receive the server's answer is not a
+/// configuration mistake to discover on a run, it is a build that should not
+/// exist. Clippy pointed this out by refusing the same assertion in a test as
+/// "constant value", and it was right — a constant relation belongs in a const.
+///
+/// The cross-file half CANNOT live here (it reads app.js at runtime) and stays
+/// in `the_two_budgets_cannot_collide`. That split is the point: the numeric
+/// relation is a fact about this file, the agreement with app.js is a claim
+/// about another one, and only the second can go stale silently.
+const _: () = assert!(
+    MODEL_TIMEOUT_S * 2 <= CLIENT_RUN_ABORT_S,
+    "per-node budget must leave the client's per-run backstop room to receive the \
+     server's answer — equal or near-equal budgets are AF-141"
+);
 
 // ---------------------------------------------------------------------------
 // Routes
@@ -356,6 +376,18 @@ pub fn resolve_model(per_file: Option<&str>) -> String {
 /// `claude`) invoked with `--print --model <resolved>`. Same mechanism the rest
 /// of the server's helper calls use. Bounded by [`MODEL_TIMEOUT_S`] so a wedged
 /// CLI fails the run instead of hanging the request.
+///
+/// AF-141: this budget is PER NODE and the client's abort is PER RUN, and both
+/// were 180. Two different quantities wearing the same number, so the client
+/// always won the race and this error — which names the CLI and the budget —
+/// could never reach a user; they got the client's guess ("a stuck source or a
+/// wedged model call") instead. Worse for a chain: two legitimate 100s nodes
+/// were killed by a budget that was never meant to bound the run.
+///
+/// The layering, now explicit: the SERVER bounds each node (it is the only side
+/// that knows how many there are), and the CLIENT's abort is a backstop against
+/// a hung server, so it must be generous enough that the server's specific
+/// answer always arrives first.
 pub struct CliModel;
 
 impl ModelClient for CliModel {
@@ -1310,6 +1342,42 @@ mod tests {
         assert_eq!(fake.count(), 2, "a changed source MUST recompute");
         assert!(!r3.cached);
         assert_ne!(r1.output, r3.output, "changed input produces a new output");
+    }
+
+    /// AF-141. The server bounds each NODE; the client bounds the whole RUN.
+    /// They were both 180 — the same number for two different quantities — so
+    /// the client always won the race and this server's specific error could
+    /// never reach a user.
+    ///
+    /// The second half is the load-bearing one. Asserting only that the two
+    /// Rust constants differ would pass forever while `app.js` said something
+    /// else entirely, because CLIENT_RUN_ABORT_S is a CLAIM ABOUT ANOTHER FILE.
+    /// So read that file and check the claim is still true. Same pattern as
+    /// board_contract_filters.rs reading the shipped `amux` CLI.
+    #[test]
+    fn the_two_budgets_cannot_collide() {
+        let app_js = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../amux-dashboard/static/app.js"),
+        )
+        .expect("dashboard app.js not found");
+        let needle = "_ctrl.abort(), ";
+        let at = app_js
+            .find(needle)
+            .unwrap_or_else(|| panic!("no mdai run abort found in app.js — did it move?"));
+        let ms: u64 = app_js[at + needle.len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect::<String>()
+            .parse()
+            .expect("abort budget in app.js is not a plain integer of milliseconds");
+        assert_eq!(
+            ms / 1000,
+            CLIENT_RUN_ABORT_S,
+            "app.js aborts the run at {}s but CLIENT_RUN_ABORT_S here says {CLIENT_RUN_ABORT_S}s \
+             — this constant is a claim about that file and it has gone stale",
+            ms / 1000
+        );
     }
 
     // resolve_model: per-file override wins, then AMUX_HELPER_MODEL, then the
