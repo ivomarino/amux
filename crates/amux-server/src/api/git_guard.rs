@@ -831,26 +831,65 @@ pub(crate) fn apply_observed(
     mine_obs: &HashMap<String, f64>,
     theirs_obs: &[(String, HashMap<String, f64>)],
 ) {
-    for (p, ts) in mine_obs {
+    // AMUX-3497: an observed row EXPLAINED by the other side's TRANSCRIPT
+    // record of the same path at the same instant is one write seen twice —
+    // the mtime the observer's Bash window caught is the tool edit the other
+    // session's transcript already attributes. Merging the echo minted a
+    // phantom co-editor (live specimen: a session whose window held only
+    // HTTP probes was named co-editor of board_store.rs, costing the
+    // committer a wipe-apology sweep to an innocent peer). The echo test
+    // runs against the ENTRY state of the firsthand sets — after the loop
+    // below starts inserting, "firsthand" no longer means transcript.
+    //
+    // Both drops degrade toward protection: dropping a peer's echo of MY
+    // transcript edit removes a warn about my own write; dropping MY echo of
+    // a peer's transcript edit removes my counterclaim, so their firsthand
+    // BLOCKS me (the AF-19 tie already blocked deliberately). The margin is
+    // RECENCY_SKEW_MARGIN_S — the same transcript-clock vs mtime unit
+    // conversion that constant exists for.
+    let echo_of_theirs = |p: &String, ts: &f64| -> bool {
+        inputs.theirs_firsthand.contains(p)
+            && matches!(inputs.theirs.get(p), Some((_, tts)) if (*ts - *tts).abs() <= RECENCY_SKEW_MARGIN_S)
+    };
+    let echo_of_mine = |p: &String, ts: &f64| -> bool {
+        inputs.mine_firsthand.contains(p)
+            && matches!(inputs.mine.get(p), Some(mts) if (*ts - *mts).abs() <= RECENCY_SKEW_MARGIN_S)
+    };
+    let mine_keep: Vec<(String, f64)> = mine_obs
+        .iter()
+        .filter(|(p, ts)| !echo_of_theirs(p, ts))
+        .map(|(p, ts)| (p.clone(), *ts))
+        .collect();
+    let theirs_keep: Vec<(String, String, f64)> = theirs_obs
+        .iter()
+        .flat_map(|(owner, obs)| {
+            obs.iter()
+                .filter(|(p, ts)| !echo_of_mine(p, ts))
+                .map(move |(p, ts)| (owner.clone(), p.clone(), *ts))
+        })
+        .collect();
+    for (p, ts) in mine_keep {
         let slot = inputs.mine.entry(p.clone()).or_insert(0.0);
-        if *ts > *slot {
-            *slot = *ts;
+        if ts > *slot {
+            *slot = ts;
         }
-        inputs.mine_firsthand.insert(p.clone());
+        inputs.mine_firsthand.insert(p);
     }
-    for (owner, obs) in theirs_obs {
-        for (p, ts) in obs {
-            match inputs.theirs.get(p) {
-                Some((_, cur)) if *cur >= *ts => {}
-                _ => {
-                    // Kind-follows-latest: an observed write is authored
-                    // content as far as anyone can tell, never a restore.
-                    inputs.theirs_restore.remove(p);
-                    inputs.theirs.insert(p.clone(), (owner.clone(), *ts));
-                }
+    for (owner, p, ts) in theirs_keep {
+        match inputs.theirs.get(&p) {
+            Some((_, cur)) if *cur >= ts => {}
+            _ => {
+                // Kind-follows-latest: an observed write is authored
+                // content as far as anyone can tell, never a restore.
+                inputs.theirs_restore.remove(&p);
+                // The WINNING claim for this path is now observation-based
+                // (transcript rows are all loaded before this runs, so
+                // nothing re-wins after; a losing observed row marks nothing).
+                inputs.theirs.insert(p.clone(), (owner, ts));
+                inputs.theirs_observed_only.insert(p.clone());
             }
-            inputs.theirs_firsthand.insert(p.clone());
         }
+        inputs.theirs_firsthand.insert(p);
     }
 }
 
@@ -1179,6 +1218,14 @@ pub(crate) struct GuardInputs {
     pub theirs: HashMap<String, (String, f64)>,
     /// abs realpath, any cotenant, first-hand only.
     pub theirs_firsthand: HashSet<String>,
+    /// abs realpath whose WINNING peer claim came from an OBSERVED (mtime)
+    /// row rather than a transcript record (AMUX-3497). An observed row is a
+    /// fact about the disk, but on a shared checkout its attribution to the
+    /// observing session is an inference — any concurrent session's write
+    /// lands in the observer's mtime window. classify() uses this to say HOW
+    /// a co-edit signal knows what it claims, so a phantom co-editor is
+    /// labeled as possibly your own write seen twice instead of asserted.
+    pub theirs_observed_only: HashSet<String>,
     /// abs realpath whose WINNING owner's latest record is a restore
     /// (MG-1484): an edit record without authored content. Drives the
     /// `provenance` field on foreign verdicts so the victim notice never
@@ -1308,7 +1355,7 @@ pub(crate) fn classify(
                 // said "also edited by session '(unknown)'" for the second
                 // case — a phantom co-editor on a solo edit, which is how a
                 // real co-edit warning stops being read.
-                v.shared.push(json!({
+                let mut row = json!({
                     "path": rel,
                     "owner": hit.map(|(o, _)| o.as_str()).unwrap_or("(unknown)"),
                     "peer": hit.is_some(),
@@ -1321,7 +1368,29 @@ pub(crate) fn classify(
                     // git add -p over zero hunks of their own.
                     "mine_age_secs": inp.mine.get(ap).map(|ts| (now - ts).max(0.0) as i64),
                     "has_unstaged_changes": is_dirty,
-                }));
+                });
+                // AMUX-3497, rule-4 half: when the peer's claim is an OBSERVED
+                // mtime that COINCIDES with the committer's own record, the
+                // co-edit signal may be one write seen through two sessions'
+                // Bash windows — say so, instead of asserting a co-editor the
+                // reader will go apologize to. Old hooks ignore unknown keys.
+                let coincident = hit
+                    .map(|(_, tts)| {
+                        inp.mine
+                            .get(ap)
+                            .map(|m| (m - tts).abs() <= RECENCY_SKEW_MARGIN_S)
+                            .unwrap_or(false)
+                    })
+                    .unwrap_or(false);
+                if hit.is_some() && coincident && inp.theirs_observed_only.contains(ap) {
+                    row.as_object_mut().expect("shared row is an object").insert(
+                        "co_signal".into(),
+                        json!("observed mtime coinciding with your own edit — possibly one \
+                               write seen through two sessions' Bash windows, not a real \
+                               co-editor (AMUX-3497)"),
+                    );
+                }
+                v.shared.push(row);
             }
             continue;
         }
@@ -1811,6 +1880,7 @@ pub async fn staged_guard_inner(
         mine_firsthand: mine_fh.paths.keys().cloned().collect(),
         theirs,
         theirs_firsthand: theirs_fh,
+        theirs_observed_only: HashSet::new(), // filled by apply_observed
         theirs_restore,
         dirty,
             // Live or stopped alike: a stopped lane's PRE-STOP staged work is exactly
@@ -2516,6 +2586,83 @@ mod tests {
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
         g.theirs_firsthand.insert(format!("/repo/{path}"));
         g
+    }
+
+    /// AMUX-3497, rebuilt from the live specimen: a session whose Bash window
+    /// held only HTTP probes was named co-editor of board_store.rs, because a
+    /// CONCURRENT session's tool edit moved the mtime inside that window and
+    /// the observed row attributed the write to the observer. An observed row
+    /// explained by the other side's TRANSCRIPT record at the same instant is
+    /// one write seen twice and must attribute nothing; past the skew margin
+    /// it is a real second write and must keep protecting.
+    #[test]
+    fn an_observed_echo_of_a_transcript_edit_attributes_nothing() {
+        // (a) THE SPECIMEN: committer transcript-firsthand at t=1000; the
+        // peer's observed row carries the same write's mtime (within skew).
+        // The echo must not mint a co-editor: no shared row, no foreign row.
+        let mut g = GuardInputs::default();
+        g.mine.insert("/repo/board_store.rs".into(), 1000.0);
+        g.mine_firsthand.insert("/repo/board_store.rs".into());
+        let mut probe_lane = HashMap::new();
+        probe_lane.insert("/repo/board_store.rs".to_string(), 1002.0);
+        apply_observed(&mut g, &HashMap::new(), &[("amux-cloud".to_string(), probe_lane)]);
+        let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
+        assert!(v.foreign.is_empty());
+        assert!(
+            v.shared.is_empty(),
+            "the phantom co-editor NOTE must not fire on an mtime echo: {:?}",
+            v.shared
+        );
+
+        // (b) CONTROL — the same peer row 900s LATER than the transcript edit
+        // is a real second write; dropping it too would unprotect genuinely
+        // co-edited files. It stays, and classifies shared.
+        let mut g = GuardInputs::default();
+        g.mine.insert("/repo/board_store.rs".into(), 1000.0);
+        g.mine_firsthand.insert("/repo/board_store.rs".into());
+        let mut real_edit = HashMap::new();
+        real_edit.insert("/repo/board_store.rs".to_string(), 1900.0);
+        apply_observed(&mut g, &HashMap::new(), &[("amux-cloud".to_string(), real_edit)]);
+        let v = classify(&[pair("board_store.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "a real later write must still warn");
+
+        // (c) MIRROR: MY observed echo of a PEER's transcript edit drops my
+        // counterclaim, so their firsthand BLOCKS my commit (the AF-19 tie
+        // blocked deliberately; the echo drop must not soften it to shared).
+        let mut g = peer_wrote("theirs.rs", "alice", 1000.0);
+        let mut my_echo = HashMap::new();
+        my_echo.insert("/repo/theirs.rs".to_string(), 1001.0);
+        apply_observed(&mut g, &my_echo, &[]);
+        let v = classify(&[pair("theirs.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.foreign.len(), 1, "my echo of alice's write is not a claim");
+        assert!(v.shared.is_empty());
+
+        // (d) OBSERVED-vs-OBSERVED coincidence cannot be resolved server-side
+        // (two Bash windows saw one mtime; either could own it) — both claims
+        // stay, but the shared row must SAY how it knows (rule 4): co_signal
+        // names the ambiguity instead of asserting a co-editor.
+        let mut g = GuardInputs::default();
+        let mut mine_obs = HashMap::new();
+        mine_obs.insert("/repo/both.rs".to_string(), 1500.0);
+        let mut peer_obs = HashMap::new();
+        peer_obs.insert("/repo/both.rs".to_string(), 1501.0);
+        apply_observed(&mut g, &mine_obs, &[("bob".to_string(), peer_obs)]);
+        let v = classify(&[pair("both.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1);
+        assert!(
+            v.shared[0]["co_signal"].as_str().unwrap_or("").contains("AMUX-3497"),
+            "ambiguous mtime co-signal must name itself: {:?}",
+            v.shared[0]
+        );
+
+        // (e) co_signal control: a TRANSCRIPT peer claim coinciding with mine
+        // carries no ambiguity marker — the transcript says who wrote it.
+        let mut g = peer_wrote("t.rs", "alice", 1000.0);
+        g.mine.insert("/repo/t.rs".into(), 1001.0);
+        g.mine_firsthand.insert("/repo/t.rs".into());
+        let v = classify(&[pair("t.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1);
+        assert!(v.shared[0].get("co_signal").is_none(), "{:?}", v.shared[0]);
     }
 
     /// AMUX-3128 FIRING PATH: a read-only command must not mint an inferred edit,

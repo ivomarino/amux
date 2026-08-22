@@ -2213,7 +2213,7 @@ FIX: the script now uses VACUUM INTO (one WAL read snapshot, immune to writer
 ## staged-guard named a co-editing session that never edited the file — ownership inferred from API traffic
 AREA: attribution
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-22
 SESSION: amux
 CARD: AMUX-3497
@@ -2226,6 +2226,12 @@ COST: a needless wipe-apology sweep to a peer (made plausible by a real git-chec
   hazard in the same window), plus the standing cost of the shape: once the guard is
   known to name phantom co-editors, its real co-edit warnings get discounted — on the
   exact commit type (shared-file sweeps) it exists to catch.
-FIX: open — AMUX-3497 names the direction: the ownership row must carry HOW it knows
-  (tool-edit evidence vs inference), and an inference that cannot distinguish a curl
-  from an Edit cannot carry an ownership claim.
+FIX: shipped same day (see AMUX-3497 for the sha). Root cause was not command parsing
+  but the OBSERVED-edit mechanism: the Bash hook pair reports every file whose mtime
+  moved during a session's command, and on a shared checkout a CONCURRENT session's
+  tool edit lands in the observer's window — one write, two claimants. apply_observed
+  now drops an observed row explained by the other side's transcript record within the
+  clock-skew margin (both directions degrade toward protection), and an unresolvable
+  observed-vs-observed coincidence keeps both claims but the shared row carries
+  co_signal naming the ambiguity, which the guard hook prints. Five test cells incl.
+  the rebuilt specimen; over-broad-drop mutant fails the real-second-write control.

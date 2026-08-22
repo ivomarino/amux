@@ -454,6 +454,13 @@ def main():
           "  Then verify the STAGED blob, not the worktree:  git show \":%s\" | "
           "python3 -c 'import ast,sys; ast.parse(sys.stdin.read())'\n"
           % (_level, f.get("path"), _who, _n, f.get("path"), f.get("path")))
+        # AMUX-3497: when the server marks the co-edit signal as an ambiguous
+        # mtime echo (one write possibly seen through two sessions' Bash
+        # windows), say so HERE, where the reader decides whether to go
+        # apologize to a peer who never touched the file. Absent on real
+        # transcript co-edits; old servers never send it.
+        if f.get("co_signal"):
+            w("  Co-edit signal caveat: %s\n" % f.get("co_signal"))
     # THE BELT (AMUX-2443 / AF-19 residual / AC-297 — three sightings, one gap):
     # staged paths with NO edit record from ANY session in the window were
     # invisible to both classifications above, and a plain commit ships them
