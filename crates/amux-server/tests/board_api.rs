@@ -1778,6 +1778,60 @@ async fn a_peers_progress_note_reports_owner_notification_honestly() {
 /// signature — the signal dies with the card. The discard transition must
 /// clear it (and ONLY the autofix idem: a non-autofix source_ref card must
 /// touch nothing).
+/// AMUX-3472: OCCURRENCE-class reports are judged forever. The outlier
+/// signature names specific requests, so its idem must SURVIVE the discard —
+/// re-arming it refiled the identical specimen while it sat in the scan
+/// window. New occurrences mint new signatures and file regardless.
+#[tokio::test]
+async fn discarding_an_outlier_report_does_not_rearm() {
+    let (app, store, _dir) = app_with_store();
+    let made = create(
+        &app,
+        serde_json::json!({"title": "outlier report", "session": "amux",
+                            "type": "investigation",
+                            "desc": "Filed automatically by amux (runtime_jobs/autofix)"}),
+    )
+    .await;
+    let id = made["id"].as_str().unwrap().to_string();
+    store
+        .write({
+            let id = id.clone();
+            move |conn| {
+                conn.execute(
+                    "UPDATE issues SET source_ref='autofix:latency|outlier|PATCH|/api/x|123' WHERE id=?1",
+                    rusqlite::params![id],
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+                     VALUES (1, 'amux', 'autofix.filed', '{}', 'autofix:latency|outlier|PATCH|/api/x|123', 'autofix')",
+                    [],
+                )?;
+                Ok(amux_server::db::WriteOutcome { applied: true, events: vec![] })
+            }
+        })
+        .unwrap();
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(serde_json::json!({"status": "discarded", "gate_ack": true,
+                            "desc_append": "judged: churn-window specimen"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success(), "discard must apply: {st}");
+    let n: i64 = store
+        .read()
+        .unwrap()
+        .query_row(
+            "SELECT COUNT(*) FROM session_events WHERE idem='autofix:latency|outlier|PATCH|/api/x|123'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(n, 1, "an occurrence-class idem must SURVIVE the discard — deleting it refiles the same specimen");
+}
+
 #[tokio::test]
 async fn discarding_an_autofix_report_rearms_the_detector() {
     let (app, store, _dir) = app_with_store();

@@ -3145,8 +3145,21 @@ pub async fn patch_item(
             // discards, and makes that judgment signal-safe. source_ref and
             // the idem key are the same "autofix:<signature>" string.
             if next.status == "discarded" && row.status != "discarded" {
-                if let Some(sr) =
-                    next.source_ref.as_deref().filter(|s| s.starts_with("autofix:"))
+                if let Some(sr) = next
+                    .source_ref
+                    .as_deref()
+                    .filter(|s| s.starts_with("autofix:"))
+                    // OCCURRENCE-class reports are judged forever (AMUX-3472):
+                    // an outlier signature names specific requests (it carries
+                    // the newest row's ts), and re-arming it refiled the SAME
+                    // specimen while it sat inside the detector's window — the
+                    // identical card back with zero new information. A new
+                    // occurrence mints a new signature and files regardless of
+                    // this idem, so keeping it loses nothing. CONDITION-class
+                    // signatures (invariant streaks, p95-vs-norm, CI) keep the
+                    // re-arm: their refile requires the condition to be live
+                    // again, which is exactly the signal.
+                    .filter(|s| !s.starts_with("autofix:latency|outlier|"))
                 {
                     let n = conn.execute(
                         "DELETE FROM session_events WHERE idem = ?1",

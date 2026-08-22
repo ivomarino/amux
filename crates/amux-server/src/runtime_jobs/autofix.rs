@@ -712,9 +712,21 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
         }
     }
     for ((method, target), (n, worst, last_ts, sample)) in seen {
+        // OCCURRENCE IDENTITY in the signature (AMUX-3472). An outlier report
+        // is about SPECIFIC requests, not a standing condition — but the
+        // signature carried only method+target, so discarding the card
+        // (which re-arms the idem, AF-137) refiled the SAME rows on the next
+        // scan as long as they sat inside the 6h window: the identical
+        // specimen came back with zero new information, twice in one day.
+        // The newest offending row's second-resolution timestamp makes each
+        // occurrence batch its own signature: a NEW slow request files a NEW
+        // card whatever happened to the old one, and the same rows re-scanned
+        // mint the same signature. The board's re-arm hook deliberately skips
+        // `latency|outlier|` refs for the same reason — an occurrence, once
+        // judged, is judged forever.
         out.push(Finding {
             kind: DetectorKind::Latency,
-            signature: format!("latency|outlier|{method}|{target}"),
+            signature: format!("latency|outlier|{method}|{target}|{}", last_ts as i64),
             title: format!("{method} {target} took {:.1}s ({n}x over {:.0}s)", worst / 1000.0, outlier_ms() / 1000.0),
             evidence: vec![
                 ("verdict".into(), format!(
@@ -4103,6 +4115,28 @@ mod tests {
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         assert!(ev["verdict"].contains("Threshold"), "state the threshold: {ev:?}");
         assert!(ev.contains_key("window_samples") && ev.contains_key("baseline_samples"));
+    }
+
+    /// AMUX-3472: the outlier signature carries the newest offending row's
+    /// ts, so the same specimen re-scanned mints the SAME signature (idem
+    /// dedupes it) while a NEW slow request mints a NEW one and files
+    /// regardless of what happened to the old card. Without this, a discard's
+    /// re-arm refiled the identical rows on the next scan — twice in one day.
+    #[tokio::test]
+    async fn a_new_outlier_occurrence_is_a_new_signature_the_same_rows_are_not() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(&st, Row { ts: now - 3000.0, method: "PATCH", path: "/api/sessions/desktop/config", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 22_371.0 });
+        let (f1, _) = detect_latency(&st.store.read().unwrap(), now);
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 60.0);
+        let sig1 = f1.iter().find(|x| x.signature.starts_with("latency|outlier|PATCH")).expect("files").signature.clone();
+        let sig2 = f2.iter().find(|x| x.signature.starts_with("latency|outlier|PATCH")).expect("files").signature.clone();
+        assert_eq!(sig1, sig2, "same rows re-scanned must mint the same signature");
+        // A new occurrence: newer ts -> new signature.
+        log_row(&st, Row { ts: now - 100.0, method: "PATCH", path: "/api/sessions/desktop/config", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 30_000.0 });
+        let (f3, _) = detect_latency(&st.store.read().unwrap(), now + 120.0);
+        let sig3 = f3.iter().find(|x| x.signature.starts_with("latency|outlier|PATCH")).expect("files").signature.clone();
+        assert_ne!(sig1, sig3, "a NEW slow request must be a NEW signature, filed whatever became of the old card");
     }
 
     /// A single absurd request is not a percentile shift and must not be
