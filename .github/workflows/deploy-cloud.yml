@@ -575,6 +575,20 @@ jobs:
                 bad=1
               fi
             done
+            # A collided recreate is INVISIBLE to both loops above: they iterate
+            # `docker ps` (running only), and the collision's signature is the old
+            # container killed and the replacement stuck in Created under a
+            # hash-prefixed name — so the env drops out of the running list and the
+            # job stays green. That happened on 2026-08-22 (org_02699…: Exited(137)
+            # + stray Created, deploy reported SUCCESS, env down until a human
+            # counted containers). Assert the absence directly: after a recreate,
+            # NO amux-user container may exist in a non-running state.
+            wedged=$(docker ps -a --filter 'name=amux-user' --format '{{.Names}}: {{.State}}' | grep -v ': running$' || true)
+            if [ -n "$wedged" ]; then
+              echo "RECREATE LEFT WEDGED CONTAINERS (exists but not running):"
+              echo "$wedged" | sed 's/^/  /'
+              bad=1
+            fi
             exit "$bad"
           ENDSSH
 

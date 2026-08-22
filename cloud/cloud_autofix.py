@@ -258,6 +258,7 @@ def run(*a):
     except Exception: return ""
 names = [n for n in run("docker","ps","--format","{{.Names}}").splitlines() if n.startswith("amux-user-")]
 orphans = []
+missing = []
 try:
     c = sqlite3.connect("/var/amux/gateway.db")
     for n in names:
@@ -265,7 +266,20 @@ try:
         row = c.execute("SELECT 1 FROM orgs WHERE id=? UNION SELECT 1 FROM users WHERE id=? LIMIT 1", (oid, oid)).fetchone()
         if not row:
             orphans.append(oid)
-    print(json.dumps({"running": len(names), "orphans": orphans}))
+    # INVERSE direction: an amux-user container that EXISTS but is not running
+    # (Exited/Created). On 2026-08-22 a force-recreate name-collision left one env
+    # Exited(137) plus a stray Created container while the deploy job reported
+    # SUCCESS — orphan-checking alone is blind to this whole direction. The
+    # discriminator is deliberately NOT "dir with no container": idle envs are
+    # scaled to zero by REMOVING their container (15 dirs, 8 running, 0 stopped
+    # on a healthy host), so exists-but-stopped is anomalous and dir-absence is
+    # normal — the dir version would cry wolf on every idle user env (verified
+    # against the live host before shipping this check).
+    for line in run("docker","ps","-a","--filter","name=amux-user","--format","{{.Names}}\t{{.State}}").splitlines():
+        parts = line.split("\t")
+        if len(parts) == 2 and parts[1] != "running":
+            missing.append("%s (%s)" % (parts[0], parts[1]))
+    print(json.dumps({"running": len(names), "orphans": orphans, "missing": missing}))
 except Exception as e:
     print(json.dumps({"running": len(names), "error": str(e)[:80]}))
 ''', timeout=45)
@@ -310,9 +324,19 @@ def main():
         # Orphaned (DB-less) running containers — a deploy resurrection self-announces here.
         result["orphans"] = check_orphans()
         _orph = result["orphans"].get("orphans") or []
-        trace("orphans", "running=%s orphaned=%s%s" % (
+        _miss = result["orphans"].get("missing") or []
+        trace("orphans", "running=%s orphaned=%s%s stopped=%s%s" % (
             result["orphans"].get("running"), len(_orph),
-            (" -> " + ",".join(_orph)) if _orph else ""), not _orph)
+            (" -> " + ",".join(_orph)) if _orph else "",
+            len(_miss), (" -> " + ",".join(_miss)) if _miss else ""), not (_orph or _miss))
+        if _miss and not env_problem:
+            # A container that exists but is not running is a customer env DOWN in a
+            # way the gateway's wake path cannot repair (it wakes absent containers,
+            # not wedged ones) — the 2026-08-22 recreate collision shape.
+            env_problem = ("%d container(s) exist but are not running" % len(_miss),
+                           "Wedged (Exited/Created) amux-user containers: %s. The deploy job "
+                           "likely reported green anyway; remove the collided containers and "
+                           "`docker compose up -d` in the env dir." % ", ".join(_miss))
         # An env layer that is failing or unknowable must dent the verdict — on
         # 2026-08-22 a 401'd env check rode under "HEALTHY exit 0", which is the
         # green-check-that-cannot-fail shape (ethos rule 7). Board-only escalation:
