@@ -2067,3 +2067,25 @@ FIX: put the observation timestamp in the message, beside the origin-tip timesta
   ("amux-helper — treated as ABSENT, not blind"), so the vocabulary exists.
   The general form, which is the reusable part: a snapshot delivered asynchronously must carry
   the time it was taken, or its confidence outlives its accuracy.
+
+## A peer's half-saved file blocks an unrelated commit's gate — third sighting in one day
+AREA: shared-checkout
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux
+CARD: AMUX-1315
+SYMPTOM: my commit of a one-file autofix.rs fix was refused because the pre-commit gate
+  (cargo check/clippy) compiles the WHOLE workspace, which at that moment contained a
+  peer's mid-edit mdai.rs (their AF-141 work, uncommitted). The suite also wedged and two
+  unrelated test families went red — all of it their in-flight tree, none of it my change.
+  Same shape amux-frustrations hit this morning (a missing STALL_SECS const failing THEIR
+  build during MY reclaim work), and their AF-132 near-pickup at noon. Three sightings,
+  one day, three different victims.
+COST: one blocked commit and a diagnosis cycle to establish "not my code" (the failing
+  tests were a peer's own passing-in-CI features, which reads as a regression I caused);
+  my staged change sat hostage until their edit completed.
+FIX: none here — this IS AMUX-1315 (per-lane worktrees), and today is its strongest
+  argument yet: the workaround everyone reaches for (an isolated worktree to get a stable
+  tree) is the proposal itself, applied by hand, per victim, per incident. The count now
+  argues for the build.

@@ -573,7 +573,19 @@ pub fn status_agrees_with_pane(lanes: &[LaneTruth]) -> Vec<InvariantResult> {
         // a quiet pane is not: a lane can be legitimately mid-turn with
         // nothing painting (a long tool call, a subagent), and flagging it
         // would fire constantly and train everyone to ignore this.
-        if l.pane_says_working && l.status == "idle" {
+        // GRACE (AMUX-3474): only a disagreement that has AGED is a
+        // contradiction. A fresh idle report under a working pane is the
+        // routine turn-boundary race — Stop landed, the next steered prompt
+        // began, its prompt-hook report is in flight — and this class filed
+        // ~100 per-entity cards over weeks, flapping healed-by-read-time
+        // every time. 120s keeps the incident this check exists for
+        // (AMUX-2646's fabricated report was HOURS old) and the dropped-report
+        // case (a lost prompt-hook report ages past the grace within two
+        // minutes of real work, still fires, still files — and a dropped
+        // report IS worth a card). The dominant drop producer, reports fired
+        // into a 10s restart window, died with AMUX-3458's exec adoption;
+        // this grace covers the residue.
+        if l.pane_says_working && l.status == "idle" && l.report_age_s > 120.0 {
             out.push(
                 InvariantResult::fail(
                     ID,
@@ -1920,6 +1932,30 @@ mod negative_controls {
             "must detect a card that contradicts its own pane"
         );
         assert_eq!(rs[0].entity_key, "amux-rust", "the failure must name the lane");
+    }
+
+    /// AMUX-3474, the flap that filed ~100 per-entity cards: a FRESH idle
+    /// report under a working pane is the turn-boundary race (Stop landed,
+    /// the next steered prompt began, its report in flight) and must PASS;
+    /// the same disagreement AGED past the grace is the dropped-report /
+    /// fabricated-report case and must still fail (the 1076s incident cell
+    /// above stays red).
+    #[test]
+    fn a_fresh_idle_report_under_a_working_pane_is_a_race_not_a_contradiction() {
+        let lanes = vec![LaneTruth {
+            name: "amux-gtm".into(),
+            status: "idle".into(),
+            pane_says_working: true,
+            report_state: "idle".into(),
+            report_age_s: 8.0,
+            report_source: "stop-hook".into(),
+            report_origin: "amux-gtm".into(),
+        }];
+        assert!(
+            status_agrees_with_pane(&lanes).iter().all(|r| r.status == Status::Pass),
+            "a seconds-old idle report over a working pane is the routine race — \
+             failing it is the flap that buried the board"
+        );
     }
 
     /// ...and must NOT fire in the other direction. A lane reported `active`
