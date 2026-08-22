@@ -190,13 +190,24 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
     // channels map, never silently — AMUX-2938) until the cooldown passes,
     // then probed again so a granted permission resumes within one window.
     // Fast errors are NOT breakered: they cost nothing and carry their own
-    // diagnosis. Deliberately in-process state — a restart re-probing once is
-    // the behavior you want from a fire alarm.
-    if let Some(skip) = imessage_breaker_verdict(
-        IMSG_WALL_TS.load(std::sync::atomic::Ordering::Relaxed),
-        now_f64() as u64,
-        imessage_retry_s(&home),
-    ) {
+    // diagnosis.
+    //
+    // The wall stamp PERSISTS across restarts (AMUX-3500 corrected AMUX-3492's
+    // own judgment here). The first cut kept it in-process, reasoning "a
+    // restart re-probing once is the behavior you want" — which assumed
+    // restarts are rare. On this machine the auto-builder restarts the server
+    // on every landed commit (~6x on the day this shipped), so with sparse
+    // alerts virtually EVERY page was a fresh process paying the 12s probe:
+    // the breaker was measurably inert (12,674ms at 11:28 pre-fix, 12,526ms
+    // at 14:11 post-fix, each the first alert on its process). The wall is
+    // per-MACHINE state — a TCC permission — so the stamp is a file under
+    // AMUX_HOME (mtime = wall time), machine-scoped like the thing it
+    // records. The atomic stays as the in-process fast path.
+    let wall_ts = IMSG_WALL_TS
+        .load(std::sync::atomic::Ordering::Relaxed)
+        .max(imessage_wall_stamp_ts(&home));
+    if let Some(skip) = imessage_breaker_verdict(wall_ts, now_f64() as u64, imessage_retry_s(&home))
+    {
         return (false, skip);
     }
     let run = tokio::process::Command::new("osascript")
@@ -216,6 +227,7 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
     match tokio::time::timeout(std::time::Duration::from_secs(12), run).await {
         Err(_) => {
             IMSG_WALL_TS.store(now_f64() as u64, std::sync::atomic::Ordering::Relaxed);
+            stamp_imessage_wall(&home);
             // TWO-FIXES: the 12s burn used to leave no log line of its own —
             // only the channel string in the ledger, invisible unless every
             // channel failed. The wall is now greppable where sweeps look.
@@ -233,6 +245,7 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
         Ok(Err(e)) => (false, format!("imessage error: {}", truncate(&e.to_string(), 100))),
         Ok(Ok(out)) if out.status.success() => {
             IMSG_WALL_TS.store(0, std::sync::atomic::Ordering::Relaxed);
+            clear_imessage_wall(&home);
             (true, "imessage".into())
         }
         Ok(Ok(out)) => {
@@ -240,6 +253,35 @@ async fn send_sms(phone: &str, text: &str) -> (bool, String) {
             (false, format!("imessage error: {}", truncate(stderr.trim(), 100)))
         }
     }
+}
+
+/// The wall stamp's file: mtime = when the 12s TCC timeout last fired.
+/// Machine-scoped on purpose (see the breaker comment above).
+fn imessage_wall_stamp_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("imessage-wall.stamp")
+}
+
+/// Epoch seconds of the persisted wall, 0 when none (or unreadable — an
+/// absent stamp means probe, which fails toward one 12s wait, never toward
+/// a silently skipped channel).
+fn imessage_wall_stamp_ts(home: &std::path::Path) -> u64 {
+    std::fs::metadata(imessage_wall_stamp_path(home))
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn stamp_imessage_wall(home: &std::path::Path) {
+    let _ = std::fs::write(
+        imessage_wall_stamp_path(home),
+        b"mtime of this file = last 12s iMessage TCC-wall timeout (AMUX-3500)\n",
+    );
+}
+
+fn clear_imessage_wall(home: &std::path::Path) {
+    let _ = std::fs::remove_file(imessage_wall_stamp_path(home));
 }
 
 /// Epoch seconds of the last 12s-timeout failure; 0 = closed (send normally).
@@ -877,6 +919,27 @@ mod tests {
         // Clock skew (wall ts in the future): treat as fresh, skip — never
         // underflow into a probe storm.
         assert!(imessage_breaker_verdict(1_000_100, 1_000_000, 900).is_some());
+    }
+
+    /// AMUX-3500 — the wall stamp must survive a process restart, because the
+    /// builder restarts this server on every landed commit and an in-process
+    /// breaker was measurably inert (every alert was a fresh process paying
+    /// the 12s probe). File semantics: absent = 0 (probe), stamped = now,
+    /// cleared = 0 again — and a stamp in home A is invisible from home B
+    /// (perf harnesses boot temp homes; their probes must not inherit the
+    /// real machine's wall).
+    #[test]
+    fn imessage_wall_stamp_survives_what_a_process_restart_destroys() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(imessage_wall_stamp_ts(dir.path()), 0, "absent stamp = probe");
+        stamp_imessage_wall(dir.path());
+        let now = crate::config::now_f64() as u64;
+        let ts = imessage_wall_stamp_ts(dir.path());
+        assert!(ts > 0 && now.abs_diff(ts) <= 5, "stamp must read ≈now, got {ts} vs {now}");
+        let other = tempfile::tempdir().unwrap();
+        assert_eq!(imessage_wall_stamp_ts(other.path()), 0, "stamps are per-home");
+        clear_imessage_wall(dir.path());
+        assert_eq!(imessage_wall_stamp_ts(dir.path()), 0, "cleared stamp = probe again");
     }
 
     /// The config view and the send path share one SMS gate (found verifying
