@@ -29,6 +29,29 @@ p = d.get('tool_input', {}).get('file_path', '')
 print(os.path.realpath(p) if p else '')
 " 2>/dev/null || echo "")
 
+# Shell artifacts whose ONLY gate is checks.yml get their paired CI suite run
+# at edit time. Rust has the builder and cargo; dashboard JS has node --check
+# below; but a hook script outside crates/ has no local gate at all, so its
+# first red is post-push CI (AMUX-3494: the freshness hook's pathspec fix
+# shipped, its fixture suite went red twice on origin/main, and the editor
+# only learned the suite existed from the CI failure). Same rule as the JS
+# gate: run the check the CI will run, where the edit happens. One line per
+# pair; add the pair when a checks.yml suite bites the same way.
+SUITE=""
+case "$FILE_PATH" in
+  "$REPO"/.claude/session-freshness.sh|"$REPO"/scripts/test-session-freshness.sh)
+    SUITE="scripts/test-session-freshness.sh" ;;
+esac
+if [ -n "$SUITE" ]; then
+  if ! (cd "$REPO" && "./$SUITE" >/tmp/amux-hook-suite.$$ 2>&1); then
+    echo "CI suite $SUITE FAILS after this edit — checks.yml will go red on push:" >&2
+    tail -20 "/tmp/amux-hook-suite.$$" >&2
+    rm -f "/tmp/amux-hook-suite.$$"
+    exit 2  # surface the failure to the editor now, not post-push
+  fi
+  rm -f "/tmp/amux-hook-suite.$$"
+fi
+
 # Only gate client JS under the dashboard's static dir.
 case "$FILE_PATH" in
   "$STATIC_REAL"/*.js|"$STATIC_REAL"/*.mjs) ;;

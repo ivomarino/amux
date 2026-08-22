@@ -173,6 +173,14 @@ NEVERMARK="not a commit this checkout knows"
 # Builds an origin+clone, then writes a provenance file naming a commit that is
 # `$1` commits back from origin/main. Real repos and the shipped hook, so this
 # cannot pass against a paraphrase of the logic.
+#
+# The lag commits land under crates/ because the hook counts only commits the
+# BUILDER would act on (`-- crates/ Cargo.toml Cargo.lock`, copied from
+# rust-auto-build.sh's trigger). The first cut of that pathspec fix (ac6f8b3)
+# broke this suite for two pushes (AMUX-3494): these fixtures wrote n$i.txt,
+# which the builder ignores, so the hook was correctly silent and every lag
+# assertion read <empty>. The fixture must share the predicate of the
+# mechanism it exercises — the same rule the hook fix itself was about.
 lag_run() { # $1 = how many commits the BUILT sha is behind origin/main
   local d="$TMP/lag$1"; rm -rf "$d"
   git init -q --bare -b main "$d/origin.git"
@@ -186,17 +194,19 @@ lag_run() { # $1 = how many commits the BUILT sha is behind origin/main
   built=$(cd "$d/work" && git rev-parse HEAD)
   if [ "$1" -gt 0 ]; then
     ( cd "$d/work"
-      for i in $(seq 1 "$1"); do echo "n$i" > "n$i.txt"; git add -A; git commit -qm "n$i"; done
+      mkdir -p crates
+      for i in $(seq 1 "$1"); do echo "n$i" > "crates/n$i.rs"; git add -A; git commit -qm "n$i"; done
       git push -q origin main ) >/dev/null 2>&1
   fi
   local pf="$d/prov.json"
   printf '{"sha":"%s","ref":"main","on_main":"yes","built_at":"x"}\n' "$built" > "$pf"
   # SELF-CHECK before consulting the hook: if the repo is not in the shape the
-  # case claims, a setup bug would read as a hook bug.
+  # case claims, a setup bug would read as a hook bug. Counted with the hook's
+  # own pathspec, so "the shape the case claims" is the shape the hook sees.
   ( cd "$d/work"
     git fetch -q origin 2>/dev/null
-    got=$(git rev-list --count "${built}..origin/main" 2>/dev/null || echo x)
-    if [ "$got" != "$1" ]; then echo "SETUP BROKEN for lag$1: wanted behind=$1, got $got"; exit 0; fi
+    got=$(git rev-list --count "${built}..origin/main" -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo x)
+    if [ "$got" != "$1" ]; then echo "SETUP BROKEN for lag$1: wanted build-relevant behind=$1, got $got"; exit 0; fi
     AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
 }
 
@@ -214,6 +224,47 @@ out=$(lag_run 0)
 if setup_ok "lag0" "$out"; then
   lacks "$BEHINDMARK" "$out"
   lacks "$NEVERMARK" "$out"
+fi
+
+# (g2) NEGATIVE CONTROL for the pathspec itself (ac6f8b3) — the repo IS behind,
+#      but every undeployed commit touches only files the builder ignores
+#      (scripts/, docs). The builder will never rebuild for these, so the server
+#      is NOT behind and the banner must stay dark. Before ac6f8b3 the hook
+#      counted these and cried "1 behind" on every scripts-only push — the
+#      false positive that made the banner ignorable. Reverting the pathspec
+#      turns this cell red.
+lag_nonbuild_run() {
+  local d="$TMP/lagnb"; rm -rf "$d"
+  git init -q --bare -b main "$d/origin.git"
+  git clone -q "$d/origin.git" "$d/work" 2>/dev/null
+  local built=""
+  ( cd "$d/work"
+    git checkout -q -B main
+    mkdir -p .claude; cp "$HOOK" .claude/session-freshness.sh
+    echo seed > seed.txt; git add -A; git commit -qm seed
+    git push -q -u origin main ) >/dev/null 2>&1
+  built=$(cd "$d/work" && git rev-parse HEAD)
+  ( cd "$d/work"
+    mkdir -p scripts docs
+    echo s > scripts/tool.sh;  git add -A; git commit -qm "scripts-only"
+    echo d > docs/note.md;     git add -A; git commit -qm "docs-only"
+    git push -q origin main ) >/dev/null 2>&1
+  local pf="$d/prov.json"
+  printf '{"sha":"%s","ref":"main","on_main":"yes","built_at":"x"}\n' "$built" > "$pf"
+  # Both halves of the shape must hold or the silence proves nothing: the repo
+  # genuinely behind (plain count 2), and none of it build-relevant (pathspec 0).
+  ( cd "$d/work"
+    git fetch -q origin 2>/dev/null
+    plain=$(git rev-list --count "${built}..origin/main" 2>/dev/null || echo x)
+    build=$(git rev-list --count "${built}..origin/main" -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo x)
+    if [ "$plain" != "2" ] || [ "$build" != "0" ]; then
+      echo "SETUP BROKEN for lagnb: wanted plain=2 build-relevant=0, got plain=$plain build=$build"; exit 0
+    fi
+    AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
+}
+out=$(lag_nonbuild_run)
+if setup_ok "lagnb" "$out"; then
+  lacks "$BEHINDMARK" "$out"
 fi
 
 # (i2) AEAB-32 follow-up — the AGE must be the OLDEST undeployed commit, not the
@@ -240,16 +291,17 @@ lag_age_run() {
   # OLD commit first, then a RECENT one. If the hook reports the newest, it will
   # say "seconds/minutes"; if it reports the oldest it must say years.
   ( cd "$d/work"
-    echo a > a.txt; git add -A
+    mkdir -p crates
+    echo a > crates/a.rs; git add -A
     GIT_AUTHOR_DATE="2020-01-01T00:00:00" GIT_COMMITTER_DATE="2020-01-01T00:00:00" git commit -qm old
-    echo b > b.txt; git add -A; git commit -qm recent
+    echo b > crates/b.rs; git add -A; git commit -qm recent
     git push -q origin main ) >/dev/null 2>&1
   local pf="$d/prov.json"
   printf '{"sha":"%s","ref":"main","on_main":"yes","built_at":"x"}\n' "$built" > "$pf"
   ( cd "$d/work"
     git fetch -q origin 2>/dev/null
-    n=$(git rev-list --count "${built}..origin/main" 2>/dev/null || echo x)
-    [ "$n" = "2" ] || { echo "SETUP BROKEN for lagage: wanted 2 behind, got $n"; exit 0; }
+    n=$(git rev-list --count "${built}..origin/main" -- crates/ Cargo.toml Cargo.lock 2>/dev/null || echo x)
+    [ "$n" = "2" ] || { echo "SETUP BROKEN for lagage: wanted 2 build-relevant behind, got $n"; exit 0; }
     AMUX_RS_BUILD_PROVENANCE="$pf" bash .claude/session-freshness.sh 2>&1 )
 }
 out=$(lag_age_run)
