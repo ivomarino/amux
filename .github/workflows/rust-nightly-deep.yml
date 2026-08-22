@@ -150,6 +150,16 @@ jobs:
     name: performance benchmarks + regression thresholds (RR-0117b)
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      # The RSS ceiling for THIS context, read by both perf-baseline.sh's
+      # assert and perf-compare.py's ABSOLUTE_MAX. Two runs 30 minutes apart
+      # on the SAME frozen corpus and code measured 220MB and 281MB
+      # (2026-08-22, runs 32579799804 / 32581179735) — shared-runner noise is
+      # ±28%, so a ceiling at measured+27% flaps on weather. 350 clears the
+      # observed max by 25% and still fires on anything leak-shaped. The
+      # script default stays 280 so a LOCAL run keeps failing on the real
+      # 310MB fresh-boot debt (AMUX-3488) instead of absorbing it.
+      PERF_RSS_MAX_MB: '350'
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

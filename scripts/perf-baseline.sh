@@ -69,7 +69,11 @@ echo "{ $M1, $M2, $M3, $M4, $M5, \"rss_mb\": $RSS_MB, \"board_default_bytes\": $
 # streak. 280 is today's 220 plus headroom, still a ceiling that can fail;
 # the growth itself is AMUX-3488 — attribute it before absorbing more, and
 # TIGHTEN this back if that hunt finds a leak. Overridable so the hunt can
-# pin it: PERF_RSS_MAX_MB.
+# pin it: PERF_RSS_MAX_MB. The nightly CI job pins 350 at the job level:
+# same-day runs on a frozen corpus measured 220 and 281 (±28% shared-runner
+# noise), and a ceiling inside the noise band flaps on weather. The local
+# default stays lower on purpose — a local run at today's 310 SHOULD fail,
+# and route the reader to AMUX-3488.
 RSS_MAX_MB="${PERF_RSS_MAX_MB:-280}"
 fail=0
 avg() { echo "$1" | sed 's/.*_avg_ms": \([0-9]*\).*/\1/'; }
