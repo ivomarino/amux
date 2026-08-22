@@ -863,18 +863,127 @@ pub fn list_issues(
     }
     // Python sort: pinned first, then explicitly-positioned (pos != 0) by pos
     // ascending, then the rest by updated descending.
-    rows.sort_by(|a, b| {
-        b.pinned
-            .cmp(&a.pinned)
-            .then_with(|| {
-                let za = i32::from(a.pos == 0.0);
-                let zb = i32::from(b.pos == 0.0);
-                za.cmp(&zb)
-            })
-            .then_with(|| a.pos.partial_cmp(&b.pos).unwrap_or(std::cmp::Ordering::Equal))
-            .then_with(|| b.updated.cmp(&a.updated))
-    });
+    rows.sort_by(|a, b| board_order(a.pinned, a.pos, a.updated, b.pinned, b.pos, b.updated));
     Ok(rows)
+}
+
+/// The one Python board ordering, shared by [`list_issues`] and the light pass
+/// in [`list_issues_capped`] so the two can never sort differently: pinned
+/// first, then explicitly-positioned (pos != 0) by pos ascending, then updated
+/// descending.
+fn board_order(
+    a_pinned: i64,
+    a_pos: f64,
+    a_updated: i64,
+    b_pinned: i64,
+    b_pos: f64,
+    b_updated: i64,
+) -> std::cmp::Ordering {
+    b_pinned
+        .cmp(&a_pinned)
+        .then_with(|| i32::from(a_pos == 0.0).cmp(&i32::from(b_pos == 0.0)))
+        .then_with(|| a_pos.partial_cmp(&b_pos).unwrap_or(std::cmp::Ordering::Equal))
+        .then_with(|| b_updated.cmp(&a_updated))
+}
+
+/// Filter/sort/cap fields only — what [`list_issues_capped`]'s first pass
+/// reads for every row, so the prose columns (desc 23MB+, log 3.5MB on the
+/// live table) are decoded only for rows that actually ship.
+struct LightRow {
+    id: String,
+    status: String,
+    session: Option<String>,
+    archived: i64,
+    pinned: i64,
+    pos: f64,
+    updated: i64,
+}
+
+/// [`list_issues`] + [`cap_terminal`] fused, decoding heavy columns only for
+/// survivors (AMUX-3491). The single-pass shape decoded EVERY undeleted row's
+/// desc+log — 8,335 rows / ~27MB of prose on the live DB — to ship the 1,657
+/// that survive the default filter+cap, and it did so on every list request:
+/// 215ms avg where 2026-08-09 measured 28ms, tracking table growth rather
+/// than payload size (30MB and 0.7MB responses cost the same ~250ms).
+///
+/// Pass 1 reads only [`LightRow`] columns, applies the same canon filters,
+/// the same [`board_order`], and the same cap; pass 2 hydrates the kept ids
+/// chunk-wise through the identical COLS+tags query [`get_issue`] uses.
+/// Returns `(kept, terminal_total, terminal_kept)` — [`cap_terminal`]'s exact
+/// contract. A row deleted between the passes is dropped, which is the same
+/// answer a request a moment later would give.
+pub fn list_issues_capped(
+    conn: &Connection,
+    status_filter: &[String],
+    session_filter: &[String],
+    archived: ArchivedFilter,
+    done_limit: i64,
+) -> rusqlite::Result<(Vec<IssueRow>, usize, usize)> {
+    let canon = |s: &str| -> String {
+        parse_status(s)
+            .map(|st| db_status_spelling(st).to_string())
+            .unwrap_or_else(|| s.trim().to_lowercase())
+    };
+    let want_status: Vec<String> = status_filter.iter().map(|s| canon(s)).collect();
+    // ORDER BY i.id matches the practical row order of the joined GROUP BY
+    // query in list_issues, so ties in board_order break identically on both
+    // paths (sort_by is stable; the input order is the tiebreaker).
+    let mut stmt = conn.prepare(
+        "SELECT i.id, i.status, i.session, COALESCE(i.archived,0), COALESCE(i.pinned,0), \
+                COALESCE(i.pos,0), i.updated \
+         FROM issues i WHERE i.deleted IS NULL ORDER BY i.id",
+    )?;
+    let mut light: Vec<LightRow> = Vec::new();
+    for row in stmt.query_map([], |r| {
+        Ok(LightRow {
+            id: r.get(0)?,
+            status: r.get(1)?,
+            session: r.get(2)?,
+            archived: r.get(3)?,
+            pinned: r.get(4)?,
+            pos: r.get(5)?,
+            updated: r.get(6)?,
+        })
+    })? {
+        let row = row?;
+        if !want_status.is_empty() && !want_status.contains(&canon(&row.status)) {
+            continue;
+        }
+        if !session_filter.is_empty()
+            && !session_filter.contains(&row.session.clone().unwrap_or_default())
+        {
+            continue;
+        }
+        match archived {
+            ArchivedFilter::ActiveOnly if row.archived != 0 => continue,
+            ArchivedFilter::ArchivedOnly if row.archived == 0 => continue,
+            _ => {}
+        }
+        light.push(row);
+    }
+    light.sort_by(|a, b| board_order(a.pinned, a.pos, a.updated, b.pinned, b.pos, b.updated));
+    let (kept_light, term_total, term_kept) =
+        cap_terminal_by(light, done_limit, |r| &r.status, |r| r.updated);
+
+    // Pass 2: hydrate survivors only, preserving pass-1 order. Chunked well
+    // under SQLITE_MAX_VARIABLE_NUMBER's historical floor of 999.
+    let mut by_id: std::collections::HashMap<String, IssueRow> = std::collections::HashMap::new();
+    for chunk in kept_light.chunks(500) {
+        let marks = vec!["?"; chunk.len()].join(",");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
+             WHERE i.deleted IS NULL AND i.id IN ({marks}) GROUP BY i.id"
+        ))?;
+        let params: Vec<&dyn rusqlite::types::ToSql> =
+            chunk.iter().map(|r| &r.id as &dyn rusqlite::types::ToSql).collect();
+        for row in stmt.query_map(params.as_slice(), issue_from_row)? {
+            let row = row?;
+            by_id.insert(row.id.clone(), row);
+        }
+    }
+    let kept: Vec<IssueRow> =
+        kept_light.iter().filter_map(|l| by_id.remove(&l.id)).collect();
+    Ok((kept, term_total, term_kept))
 }
 
 /// The Python `_BOARD_TERMINAL` set for the done_limit cap. NOTE: this is
@@ -895,13 +1004,25 @@ fn cap_terminal_status(raw: &str) -> bool {
 /// `(kept, terminal_total, terminal_kept)`, `limit <= 0` -> uncapped with
 /// `(_, 0, 0)`. Active items are never capped; order is preserved.
 pub fn cap_terminal(items: Vec<IssueRow>, limit: i64) -> (Vec<IssueRow>, usize, usize) {
+    cap_terminal_by(items, limit, |r| &r.status, |r| r.updated)
+}
+
+/// The cap algorithm itself, generic over the two fields it reads so
+/// [`list_issues_capped`]'s light pass runs the IDENTICAL logic (not a
+/// re-derivation that can drift — the predicate-sharing rule).
+fn cap_terminal_by<T>(
+    items: Vec<T>,
+    limit: i64,
+    status_of: impl Fn(&T) -> &str,
+    updated_of: impl Fn(&T) -> i64,
+) -> (Vec<T>, usize, usize) {
     if limit <= 0 {
         return (items, 0, 0);
     }
     let term_idx: Vec<usize> = items
         .iter()
         .enumerate()
-        .filter(|(_, r)| cap_terminal_status(&r.status))
+        .filter(|(_, r)| cap_terminal_status(status_of(r)))
         .map(|(i, _)| i)
         .collect();
     let total = term_idx.len();
@@ -909,13 +1030,13 @@ pub fn cap_terminal(items: Vec<IssueRow>, limit: i64) -> (Vec<IssueRow>, usize, 
         return (items, total, total);
     }
     let mut by_updated = term_idx.clone();
-    by_updated.sort_by(|a, b| items[*b].updated.cmp(&items[*a].updated));
+    by_updated.sort_by(|a, b| updated_of(&items[*b]).cmp(&updated_of(&items[*a])));
     let keep: std::collections::HashSet<usize> =
         by_updated.into_iter().take(limit as usize).collect();
     let kept = items
         .into_iter()
         .enumerate()
-        .filter(|(i, r)| !cap_terminal_status(&r.status) || keep.contains(i))
+        .filter(|(i, r)| !cap_terminal_status(status_of(r)) || keep.contains(i))
         .map(|(_, r)| r)
         .collect();
     (kept, total, limit as usize)
@@ -1397,6 +1518,82 @@ mod tests {
             depends_on: vec![],
             tags: vec![],
         }
+    }
+
+    /// AMUX-3491 — list_issues_capped is an OPTIMIZATION and must be
+    /// byte-equivalent to the single-pass it replaced, across every axis the
+    /// two passes could disagree on: filter canon, sort ties (shared
+    /// `updated`), pins, explicit pos, the terminal cap, archived scoping,
+    /// tags (the join only the hydration pass runs), and a deleted row.
+    /// Rows compare by (id, desc, tags, log) so a hydration that dropped or
+    /// misordered prose cannot pass on ids alone.
+    #[test]
+    fn capped_two_pass_equals_the_single_pass_it_replaced() {
+        let conn = create_db();
+        let statuses = ["todo", "done", "verified", "doing", "discarded", "backlog", "needsyou"];
+        for i in 0..40 {
+            let id = format!("C-{i:02}");
+            conn.execute(
+                "INSERT INTO issues (id, title, desc, status, session, updated, pos, pinned, \
+                                     archived, log, deleted) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    id,
+                    format!("card {i}"),
+                    format!("desc-{i} with prose"),
+                    statuses[i % statuses.len()],
+                    format!("lane{}", i % 3),
+                    1000 + ((i % 7) as i64) * 10, // deliberate updated ties
+                    if i % 5 == 0 { i as f64 } else { 0.0 },
+                    i64::from(i % 11 == 0),
+                    i64::from(i % 6 == 0),
+                    if i % 4 == 0 { Some(format!("log-{i}")) } else { None },
+                    if i == 39 { Some(1i64) } else { None },
+                ],
+            )
+            .unwrap();
+            if i % 3 == 0 {
+                conn.execute(
+                    "INSERT INTO issue_tags VALUES (?1, 'zeta', 1.0), (?1, 'alpha', 2.0)",
+                    params![format!("C-{i:02}")],
+                )
+                .unwrap();
+            }
+        }
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let cases: Vec<(Vec<String>, Vec<String>, ArchivedFilter, i64)> = vec![
+            (vec![], vec![], ArchivedFilter::All, 5), // cap must engage
+            (vec![], vec![], ArchivedFilter::All, 0), // uncapped
+            (s(&["done"]), vec![], ArchivedFilter::ActiveOnly, 3),
+            (vec![], s(&["lane1"]), ArchivedFilter::All, 2),
+            (s(&["needs_you"]), vec![], ArchivedFilter::All, 100), // canon spelling
+            (vec![], vec![], ArchivedFilter::ArchivedOnly, 1),
+        ];
+        let mut cap_engaged_somewhere = false;
+        for (status_f, session_f, archived, limit) in cases {
+            let (single, st, sk) =
+                cap_terminal(list_issues(&conn, &status_f, &session_f, archived).unwrap(), limit);
+            let (fused, ft, fk) =
+                list_issues_capped(&conn, &status_f, &session_f, archived, limit).unwrap();
+            let key =
+                |r: &IssueRow| (r.id.clone(), r.desc.clone(), r.tags.clone(), r.log.clone());
+            assert_eq!(
+                single.iter().map(key).collect::<Vec<_>>(),
+                fused.iter().map(key).collect::<Vec<_>>(),
+                "rows diverged for {status_f:?}/{session_f:?}/{archived:?}/limit={limit}"
+            );
+            assert_eq!((st, sk), (ft, fk), "cap counts diverged for limit={limit}");
+            if st > sk {
+                cap_engaged_somewhere = true;
+            }
+        }
+        // The equivalence means nothing if no case ever engaged the cap.
+        assert!(cap_engaged_somewhere, "fixture too small: the terminal cap never engaged");
+        // Nor if the deleted row leaked into either path.
+        let (all, _, _) =
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 0).unwrap();
+        assert!(all.iter().all(|r| r.id != "C-39"), "deleted row must stay invisible");
+        assert!(!all.is_empty());
     }
 
     /// CONTROL: the helpers must not be matching everything. An unrelated tag is

@@ -1261,10 +1261,16 @@ pub async fn list_board(
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
-        let rows = bs::list_issues(&conn, &status_f, &session_f, archived)?;
+        // Fused filter+cap with lazy hydration (AMUX-3491): the old
+        // list_issues + cap_terminal pair decoded every undeleted row's
+        // desc+log (~27MB of prose) to ship the ~20% that survive the cap.
+        // The doing/review probe below is equivalent on the capped set —
+        // those statuses are never terminal, so the cap cannot drop them.
+        let (kept, term_total, term_kept) =
+            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit)?;
         // The `stale` flag needs the active-session set only when an
         // in-progress card is present (Python computes it in `_load_board`).
-        let working = if rows
+        let working = if kept
             .iter()
             .any(|r| matches!(r.status.as_str(), "doing" | "review"))
         {
@@ -1272,15 +1278,14 @@ pub async fn list_board(
         } else {
             Default::default()
         };
-        Ok((rows, working))
+        Ok((kept, term_total, term_kept, working))
     })
     .await;
-    let (rows, working) = match joined {
+    let (kept, term_total, term_kept, working) = match joined {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
     };
-    let (kept, term_total, term_kept) = bs::cap_terminal(rows, done_limit);
     let total = kept.len();
     let now = now_secs();
 
