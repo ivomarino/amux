@@ -179,9 +179,11 @@ def restart_gateway():
     return ok
 
 
-def escalate(summary, detail):
-    trace("escalate", summary, None)
-    # board card (attributed) so the fleet sees it even if paging is down
+def escalate_board(summary, detail):
+    """Board-only escalation: for problems worth a human's queue but not the owner
+    fire-alarm (e.g. cloud serves traffic fine but the env-check instrument is down).
+    escalate() layers the alert on top of this for real outages."""
+    trace("escalate_board", summary, None)
     try:
         base = subprocess.run(["amux", "url"], capture_output=True, text=True, timeout=10).stdout.strip()
         subprocess.run(["curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
@@ -191,6 +193,12 @@ def escalate(summary, detail):
                         "%s/api/board" % base], capture_output=True, text=True, timeout=15)
     except Exception:
         pass
+
+
+def escalate(summary, detail):
+    trace("escalate", summary, None)
+    # board card (attributed) so the fleet sees it even if paging is down
+    escalate_board(summary, detail)
     # fire-alarm (email channel is repaired; push/sms are owner setup)
     try:
         subprocess.run(["amux", "alert", "cloud-autofix could not self-heal: %s. %s" % (summary, detail),
@@ -199,24 +207,37 @@ def escalate(summary, detail):
         pass
 
 
-def check_envs():
-    """Run the per-environment/persona suite for a green/red matrix (read-only)."""
-    try:
-        r = subprocess.run([sys.executable, os.path.join(REPO, "cloud/tests/e2e_personas.py"), "--json"],
-                           capture_output=True, text=True, timeout=600, cwd=REPO)
-        out = (r.stdout or "").strip()
-        if not out:
-            return {"error": "no output"}
-        # e2e_personas.py --json emits a SINGLE pretty-printed JSON object across ~191
-        # lines (progress goes to stderr). Parse the WHOLE stdout — splitlines()[-1]
-        # grabbed the closing "}" and errored every run, so this env check was silently
-        # dead and the daily health rode the 302 probe alone (ethos rule 7, fixed here).
+def check_envs(retries=1):
+    """Run the per-environment/persona suite for a green/red matrix (read-only).
+    One retry on error: a single sample cannot tell a transient 401 (token-mint or
+    container-wake race, seen 2026-08-22 — the direct re-run passed seconds later)
+    from a real auth outage, and a once-daily check must not cry wolf on a blip."""
+    last = {"error": "no attempt"}
+    for attempt in range(retries + 1):
         try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            return json.loads(out.splitlines()[-1])  # fallback: trailing-JSON-line format
-    except Exception as e:
-        return {"error": str(e)[:100]}
+            r = subprocess.run([sys.executable, os.path.join(REPO, "cloud/tests/e2e_personas.py"), "--json"],
+                               capture_output=True, text=True, timeout=600, cwd=REPO)
+            out = (r.stdout or "").strip()
+            if not out:
+                last = {"error": "no output"}
+            else:
+                # e2e_personas.py --json emits a SINGLE pretty-printed JSON object across ~191
+                # lines (progress goes to stderr). Parse the WHOLE stdout — splitlines()[-1]
+                # grabbed the closing "}" and errored every run, so this env check was silently
+                # dead and the daily health rode the 302 probe alone (ethos rule 7, fixed here).
+                try:
+                    return json.loads(out)
+                except json.JSONDecodeError:
+                    try:
+                        return json.loads(out.splitlines()[-1])  # fallback: trailing-JSON-line format
+                    except Exception:
+                        last = {"error": "unparseable output: %s" % out[:80]}
+        except Exception as e:
+            last = {"error": str(e)[:100]}
+        if attempt < retries:
+            time.sleep(10)
+    last["retried"] = retries
+    return last
 
 
 def check_orphans():
@@ -270,19 +291,37 @@ def main():
         # Surface a broken or failing env-check LOUDLY (ok=FAILED), not as a bland None:
         # a None reads as "no data", which is how the parse bug above hid for so long.
         _env = result["envs"]
+        env_problem = None
         if _env.get("error"):
-            trace("check_envs", "ERROR: %s" % _env["error"], False)
+            trace("check_envs", "ERROR after retry: %s" % _env["error"], False)
+            env_problem = ("env check BROKEN (ran + retried, still erroring)",
+                           "e2e_personas could not run or parse on either attempt: %s. Cloud "
+                           "serves a %d so this is the INSTRUMENT down, not the gateway — but "
+                           "env health is unknowable until it is fixed." % (_env["error"], status))
         else:
             _failed = _env.get("failed")
             trace("check_envs", "reachable=%s provisioned=%s passed=%s warned=%s failed=%s" % (
                 _env.get("cloud_reachable"), _env.get("provisioned"), _env.get("passed"),
                 _env.get("warned"), _failed), (_failed == 0))
+            if _failed:
+                _bad = ["%s (%s)" % (r0.get("env"), "; ".join(r0.get("reasons") or []))
+                        for r0 in _env.get("results", []) if r0.get("status") == "FAIL"]
+                env_problem = ("%d customer env FAILURE(s)" % _failed, " | ".join(_bad)[:600])
         # Orphaned (DB-less) running containers — a deploy resurrection self-announces here.
         result["orphans"] = check_orphans()
         _orph = result["orphans"].get("orphans") or []
         trace("orphans", "running=%s orphaned=%s%s" % (
             result["orphans"].get("running"), len(_orph),
             (" -> " + ",".join(_orph)) if _orph else ""), not _orph)
+        # An env layer that is failing or unknowable must dent the verdict — on
+        # 2026-08-22 a 401'd env check rode under "HEALTHY exit 0", which is the
+        # green-check-that-cannot-fail shape (ethos rule 7). Board-only escalation:
+        # the gateway IS up, so the owner fire-alarm stays quiet; warns do not
+        # trip this (the standing idle-worker WARN should not page daily).
+        if env_problem:
+            escalate_board(env_problem[0], env_problem[1])
+            result["healthy"] = False
+            result["env_problem"] = env_problem[0]
     else:
         # Cloud is DOWN. Diagnose and apply deterministic repairs.
         d = diagnose()
@@ -325,10 +364,11 @@ def main():
     if as_json:
         print(json.dumps(result, indent=2))
     else:
-        print("\ncloud-autofix: %s (status %s%s)" % (
+        print("\ncloud-autofix: %s (status %s%s)%s" % (
             "HEALTHY" if result["healthy"] else "UNHEALTHY / ESCALATED",
             result.get("cloud_status"),
-            "->%s" % result["cloud_status_after"] if "cloud_status_after" in result else ""))
+            "->%s" % result["cloud_status_after"] if "cloud_status_after" in result else "",
+            " — %s" % result["env_problem"] if result.get("env_problem") else ""))
     sys.exit(0 if result["healthy"] else 1)
 
 
