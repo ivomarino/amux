@@ -659,6 +659,58 @@ fn fmt_day_min(ts_ms: i64) -> String {
         .unwrap_or_default()
 }
 
+/// Per-message cap. The total cap below is checked after a push, so one message
+/// larger than the whole budget blows straight through it — and there is such a
+/// message in the live window right now (5,974 KB, sent today).
+const MSG_CAP: usize = 4_000;
+/// Total budget for the assembled message block.
+const MSGS_TOTAL_CAP: usize = 120_000;
+
+/// Assemble the `amux:messages` block: SELECT newest-first (the caller orders
+/// `ts DESC`), RENDER oldest-first. Returns the block and how many messages
+/// reached it.
+///
+/// AF-142. This used to take `ts ASC` and break at the byte cap, so the cap kept
+/// the OLDEST messages and dropped the newest — then said "(older messages
+/// truncated)", asserting the opposite of what it had done. Measured on the live
+/// DB: 512 user messages in the 7-day window, cap reached at message 240, so the
+/// most recent 272 never reached the prompt while the label claimed they were
+/// the ones kept. For a node asking "what am I trying to accomplish", that is
+/// the wrong half of the window by a wide margin.
+///
+/// Same defect the logs endpoint carried until this morning (AF-131): a cap
+/// whose DIRECTION is part of its correctness, quietly taking the end nobody
+/// wants. Pure so both properties are testable without a database.
+pub(crate) fn assemble_messages<I: IntoIterator<Item = (i64, String, String)>>(
+    newest_first: I,
+) -> (String, usize) {
+    let mut lines: Vec<String> = Vec::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+    for (ts_ms, session, text) in newest_first {
+        let line = format!(
+            "[{}] {session}: {}\n",
+            fmt_day_min(ts_ms),
+            cap_str(text.replace('\n', " ").trim(), MSG_CAP)
+        );
+        if used + line.len() > MSGS_TOTAL_CAP {
+            truncated = true;
+            break;
+        }
+        used += line.len();
+        lines.push(line);
+    }
+    let n = lines.len();
+    let mut out = String::with_capacity(used + 64);
+    if truncated {
+        out.push_str("… (older messages beyond this point were truncated)\n\n");
+    }
+    for line in lines.iter().rev() {
+        out.push_str(line);
+    }
+    (out, n)
+}
+
 /// Resolve an `amux:` data source (AMUX-3294). Grammar: `messages[?days=N]`
 /// (default 14, capped at 90). Reads `cmd_history` directly from the run's DB
 /// store and returns the recent user directives as text for the synthesis
@@ -684,7 +736,7 @@ fn resolve_amux_source(ctx: &RunCtx, spec: &str) -> Result<String, MdaiError> {
                     "SELECT ts, COALESCE(session,''), COALESCE(text,'') \
                      FROM cmd_history \
                      WHERE type='user' AND ts >= ?1 AND COALESCE(text,'') <> '' \
-                     ORDER BY ts ASC LIMIT 4000",
+                     ORDER BY ts DESC LIMIT 4000",
                 )
                 .map_err(|e| MdaiError::Io(format!("db prepare: {e}")))?;
             let rows = stmt
@@ -697,19 +749,8 @@ fn resolve_amux_source(ctx: &RunCtx, spec: &str) -> Result<String, MdaiError> {
                 })
                 .map_err(|e| MdaiError::Io(format!("db query: {e}")))?;
             let mut out = String::new();
-            let mut n = 0usize;
-            for (ts_ms, session, text) in rows.flatten() {
-                out.push_str(&format!(
-                    "[{}] {session}: {}\n",
-                    fmt_day_min(ts_ms),
-                    text.replace('\n', " ").trim()
-                ));
-                n += 1;
-                if out.len() > 120_000 {
-                    out.push_str("\n… (older messages truncated)\n");
-                    break;
-                }
-            }
+            let (body, n) = assemble_messages(rows.flatten());
+            out.push_str(&body);
             if n == 0 {
                 return Ok(format!("(no user messages in the last {days} days)"));
             }
@@ -1377,6 +1418,50 @@ mod tests {
             "app.js aborts the run at {}s but CLIENT_RUN_ABORT_S here says {CLIENT_RUN_ABORT_S}s \
              — this constant is a claim about that file and it has gone stale",
             ms / 1000
+        );
+    }
+
+    /// AF-142. Two properties, and the first is the one that was wrong in
+    /// production: when the budget forces a choice, keep the NEWEST messages.
+    #[test]
+    fn the_message_block_keeps_the_newest_and_caps_each_one() {
+        // Caller supplies ts DESC. 400 messages of ~500 bytes each overflows the
+        // 120,000-byte budget, so the cap must bite and choose a side.
+        let rows: Vec<(i64, String, String)> = (0..400)
+            .map(|i| {
+                let ts = 1_700_000_000_000i64 + (i as i64) * 60_000;
+                (ts, "lane".to_string(), format!("m{i:04}-{}", "x".repeat(480)))
+            })
+            .rev() // newest first, as the SQL now returns
+            .collect();
+        let (block, n) = assemble_messages(rows);
+
+        assert!(n > 0 && n < 400, "the cap must actually bite: n={n}");
+        assert!(block.len() <= MSGS_TOTAL_CAP + 200, "over budget: {}", block.len());
+
+        // THE REGRESSION: the newest message must be present and the oldest gone.
+        // Reversed, this test still passes on the broken version — which is why
+        // both halves are asserted, not just "some messages survived".
+        assert!(block.contains("m0399-"), "the NEWEST message must survive the cap");
+        assert!(!block.contains("m0000-"), "the OLDEST must be the one dropped");
+
+        // Rendered oldest-first among those kept, which is what the prompt says.
+        let first = block.find("m0").expect("no message rendered");
+        let newest = block.find("m0399-").expect("newest missing");
+        assert!(first < newest, "kept messages must render oldest-first");
+        assert!(block.starts_with("… (older messages"), "truncation must be announced: {}", &block[..40]);
+
+        // PER-MESSAGE CAP: one message larger than the entire budget must not
+        // blow through it. The old code pushed first and checked after, so a
+        // single 5,974 KB message (there is one in the live window) produced a
+        // ~6MB block from a 120KB cap.
+        let huge = vec![(1_700_000_000_000i64, "lane".into(), "y".repeat(6_000_000))];
+        let (block, n) = assemble_messages(huge);
+        assert_eq!(n, 1, "the huge message should still be included, capped");
+        assert!(
+            block.len() < MSG_CAP + 200,
+            "one oversized message must be capped, not passed through: {}",
+            block.len()
         );
     }
 
