@@ -71,8 +71,17 @@ on:
     types: [completed]
     branches: [main]
 
+# Event-SCOPED group, deliberately: with a single shared group, GitHub keeps at
+# most ONE waiting run, and each new workflow_run auto-deploy evicts whatever is
+# queued — which on 2026-08-22 cancelled two manual recreate dispatches in 30
+# minutes (AMUX-3517). The recreate dispatch is the ONLY path that gets new code
+# into running containers, so it was being starved precisely when the most code
+# was landing. Scoping the group by event_name gives dispatches their own queue
+# slot; actual host mutation stays serialized by the flock every SSH step takes
+# on /var/lock/amux-deploy.lock (two runs may be green concurrently in Actions,
+# but only one touches the host at a time, in whole-step units).
 concurrency:
-  group: deploy-cloud
+  group: deploy-cloud-${{ github.event_name }}
   cancel-in-progress: false
 
 env:
@@ -409,7 +418,7 @@ jobs:
 
       - name: Pull the new image and (re)generate per-workspace compose files
         run: |
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'bash -s' << 'ENDSSH'
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'flock -w 900 /var/lock/amux-deploy.lock bash -s' << 'ENDSSH'
             set -u
             source /etc/amux/gateway.env
             R2_ENDPOINT="https://${CF_ACCOUNT_ID}.r2.cloudflarestorage.com"
@@ -546,7 +555,7 @@ jobs:
 
       - name: Recreate running workspaces and prove the new server answers
         run: |
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'bash -s' << 'ENDSSH'
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'flock -w 900 /var/lock/amux-deploy.lock bash -s' << 'ENDSSH'
             set -u
             WANT=$(docker image inspect -f '{{.Id}}' ghcr.io/mixpeek/amux:latest)
             bad=0
@@ -615,7 +624,7 @@ jobs:
       #   not (a scheme-agnostic check here cannot fail, ethos rule 7).
       - name: Flip the gateway to the https hop (atomic — restores on any failure)
         run: |
-          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'bash -s' << 'ENDSSH'
+          ssh -i ~/.ssh/amux_cloud "root@$CLOUD_HOST" 'flock -w 900 /var/lock/amux-deploy.lock bash -s' << 'ENDSSH'
             set -eu
             LOG=/var/log/amux-gateway.log
             ENV=/etc/amux/gateway.env
