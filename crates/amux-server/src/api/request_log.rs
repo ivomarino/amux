@@ -1054,6 +1054,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/fs/search", methods: ANY },
     RouteEntry { path: "/api/fs/list", methods: ANY },
     RouteEntry { path: "/api/fs/delete", methods: ANY },
+    RouteEntry { path: "/api/fs/resolve", methods: ANY },
     RouteEntry { path: "/api/ls", methods: ANY },
     RouteEntry { path: "/api/autocomplete/dir", methods: ANY },
     // -- uploads

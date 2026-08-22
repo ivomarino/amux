@@ -7874,7 +7874,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.706';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.707';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9077,9 +9077,27 @@ function _resolveOutputPath(p) {
 // Deliberately the browser rather than the file-preview overlay: peek output is
 // most often naming a file so you can go LOOK at it and what is around it, and
 // the browser is reachable from a preview while the reverse costs a round trip.
-function _openPathFromOutput(p) {
+async function _openPathFromOutput(p) {
   if (window.getSelection && String(window.getSelection()) !== '') return;  // a drag-select is not a click
-  const full = _resolveOutputPath(p);
+  let full = _resolveOutputPath(p);
+  // AMUX-3511 (Ethan's screenshots): workers print paths relative to the
+  // root THEY think in (vault root, repo root), not necessarily their cwd —
+  // the blind join turned NYC/Events/x.md from cwd .../Vault/NYC into
+  // .../NYC/NYC/Events and a dead "not a directory". The server can CHECK:
+  // /api/fs/resolve walks cwd then its ancestors and returns the first
+  // spelling that exists. The blind join stays as the offline fallback.
+  try {
+    const raw = String(p || '').replace(/:\d+$/, '');
+    const cwd = (typeof peekSessionDir === 'string' && peekSessionDir) || '';
+    if (!raw.startsWith('/') && cwd) {
+      const r = await fetch(API + '/api/fs/resolve?cwd=' + encodeURIComponent(cwd)
+        + '&rel=' + encodeURIComponent(raw), { headers: _authHeaders() });
+      if (r.ok) {
+        const d = await r.json();
+        if (d && d.resolved) full = d.resolved;
+      }
+    }
+  } catch (e) {}
   const lastSeg = full.slice(full.lastIndexOf('/') + 1);
   const looksLikeFile = /\.[A-Za-z0-9]{1,8}$/.test(lastSeg);
   const dir = looksLikeFile ? (full.slice(0, full.lastIndexOf('/')) || '/') : full;
