@@ -2108,3 +2108,88 @@ FIX: put the observation timestamp in the message, beside the origin-tip timesta
   ("amux-helper — treated as ABSENT, not blind"), so the vocabulary exists.
   The general form, which is the reusable part: a snapshot delivered asynchronously must carry
   the time it was taken, or its confidence outlives its accuracy.
+
+## amux's own debug log is the biggest thing on a disk amux is filing cards about
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-41
+SYMPTOM: `~/.amux/amux.db` is 1.8 GB on a volume with 1.8 GB free at 100% used. dbstat:
+  `_amux_invariant_result` 861 MB + its two indexes 871 MB = 1.73 GB; every other thing
+  amux stores adds up to ~90 MB. 9,420,181 rows over a hardcoded 7-day retention, ~1.72M
+  a day, and almost all of them are a PASS identical to the previous one. Half the write
+  rate is the two-server topology writing every check twice into one DB.
+COST: every rust build on this machine is now cold — the auto-builder's guard cleared its
+  1 GB target cache on each of the last three builds ("DISK LOW: 2GB free (< 8GB)").
+  Free space fell 3.7 GB -> 1.8 GB in two days and the table has not finished growing;
+  steady state is ~2.2 GB. Meanwhile AMUX-30, the card amux filed about the disk, still
+  reads "4.2 GB free" and names caches.
+FIX: retention as an env knob (deviation D4's shape — it is a code constant today), or
+  stop storing unchanged passes and keep transitions + an occurrences counter, which is
+  what `_amux_invariant_incident` already does one table over. Do NOT vacuum: a full copy
+  with 1.8 GB free reaches zero.
+
+## The disk ranker cannot rank a file, so it could never have named the 1.8 GB one
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-42
+SYMPTOM: `disk_candidates()` pushes only entries where `metadata().is_dir()`. Its own
+  cache, `~/.amux/du-sizes.json`, holds 26 entries and all 26 are directories. `amux.db`
+  would rank fourth, above `~/.claude`, and is absent.
+COST: the report meant to say what is eating the volume pointed at ~/Library/Caches,
+  ~/.npm and ~/.cache while the fourth-largest object was amux's own database — for as
+  long as that database has existed. I only found it by running dbstat by hand.
+FIX: push regular files over a size floor from the same read_dir passes; the size is
+  already in the metadata so there is no extra du cost. The lesson worth keeping: AEAB-33
+  taught the ranking to declare the candidates it FAILED on, and that warning can never
+  declare candidates it never GENERATED — after adding a surfacing mechanism, ask what
+  the mechanism itself cannot express.
+
+## I fixed the inner loop of a noisy warning and left the outer one, at 77% of the log
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-45
+SYMPTOM: 1,336 of 1,726 lines in the 24h window are one sentence naming `~/.Trash
+  (du exit 1)`, a condition that cannot change, emitted every autofix tick on each of two
+  servers. I wrote it in AEAB-33, and its own comment says it now fires "ONCE per run ...
+  rather than once per attempt" because the per-attempt spelling "drowned the log it
+  shares with real faults".
+COST: it competed for attention with three real findings in the same window (AEAB-41,
+  AEAB-42, AEAB-43). AEAB-13 recorded the identical shape at the identical ratio — 921 of
+  1004 lines — where it buried a first-ever `database is locked` line during a log review
+  that existed to find exactly that.
+FIX: reuse AEAB-13's tested `stall_log_first_this_bucket` rather than writing a second
+  spelling of it, keyed on the joined path list so a CHANGED skip set still logs
+  immediately. The pattern: a per-run dedupe is not a dedupe if the run is on a timer.
+
+## Two servers on one DB reap each other's live work and halve each other's thresholds
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-43
+SYMPTOM: `reap_orphaned_scans` runs `UPDATE reclaim_scans SET status='interrupted',
+  error='server restarted mid-scan; the scan thread did not survive' WHERE
+  status='running'` — no owner on the row. 8824 boots 10s after 8823 and reaps 8823's
+  healthy scan. Both of the two scans that have ever run say the thread did not survive;
+  both threads logged progress five minutes later, with no restart. And because every
+  terminal write is guarded `AND status='running'`, the true outcome can never be
+  recorded afterwards — it matches zero rows and logs nothing.
+  Separately: `reclaim_skipped` shows ~/Downloads at hits=2 with first_seen and last_seen
+  NINE SECONDS apart, so a threshold documented as "needs 2 such scans" was satisfied by
+  one incident counted twice, and ~/Downloads is now permanently skipped.
+COST: 2 of 2 reclaim scans ever run carry a false cause, on the machine where disk is the
+  live risk. Any hits-based threshold in amux is silently halved the same way.
+FIX: an owner column (pid or per-process boot ulid) on the scan row, reaping only rows
+  whose owner is neither this process nor a live pid. The general form, which is the
+  third entry this week under AEAB-11: any predicate that means "mine" or "twice" is
+  wrong on a shared DB with two writers, and the failures do not look alike from outside.
