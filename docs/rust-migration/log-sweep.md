@@ -221,6 +221,16 @@ fallback when a finding needs row-level inspection.
      Before flagging, look for `DELETE /api/board/` in the lane's writes, the same
      way you look for `POST /api/board` when `updated` is unset.
 
+   - **`POST /api/git/observed-edits` is not work either.** It is the AF-123 Bash
+     hook pair reporting mtimes that moved during a command — fired on EVERY Bash
+     call a lane makes, so a lane that only read files all day still posts dozens of
+     mutating requests. It shipped 2026-08-21 and first appeared in this sweep on
+     08-22, where `mixpeek-finances` came back with 20 "mutating writes", 3 of them
+     this endpoint. Added here BEFORE it produces a false flag rather than after the
+     fourth one, which is what staged-guard and `send` each cost. Same rule, and it
+     now has three instances: **a mutating METHOD is not WORK, and every new
+     hook-driven POST endpoint joins this list on the day it ships.**
+
    - **`POST /api/sessions/<n>/send` and `/api/workers/<n>/send` are not work
      either.** Messaging a peer is a mutating METHOD with no board consequence,
      so a lane whose only write that day was a relay reads as silent. Fourth

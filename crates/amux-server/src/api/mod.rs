@@ -296,7 +296,21 @@ pub fn router(state: AppState) -> Router {
         // .git/hooks/amux-staged-guard swallowed every one of them
         // (`except Exception: return 0`), so every commit on every shared
         // checkout has been unguarded and SILENT about it. See api/git_guard.rs.
-        .route("/api/git/staged-guard", axum::routing::post(git_guard::staged_guard))
+        // AF-133: scope a body limit to THIS route. `paths` is the staged file
+        // list, so the payload scales with the size of the commit, and axum's
+        // 2MB default answered a big staged set with a transport-layer 413 —
+        // 17 of them in ten minutes on 2026-08-22. The hook can only read a 413
+        // as an error and fail open, so cross-session sweep protection was
+        // absent on exactly the LARGEST commits, which are the ones most likely
+        // to sweep a peer's work. Same defect and same fix already reasoned for
+        // branding above: "the handler's own check must answer, not axum's 2MB
+        // default 413". Scoped on the MethodRouter rather than the Router so it
+        // covers this route only and does not silently widen its neighbours.
+        .route(
+            "/api/git/staged-guard",
+            axum::routing::post(git_guard::staged_guard)
+                .layer(axum::extract::DefaultBodyLimit::max(16 * 1024 * 1024)),
+        )
         // AF-123: OBSERVED edit records from the Bash hook pair — mtimes that
         // moved during a command, reported rather than parsed, so a heredoc
         // or an extensionless path cannot hide a write from attribution.
