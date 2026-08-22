@@ -14,7 +14,20 @@ use serde_json::json;
 /// Retention for the append-only evaluation log. Short by design: its purpose
 /// is "is this check still running / when did it last pass", not history.
 /// Incidents are the durable record and are never trimmed here.
+///
+/// Differential (AMUX-3489): a flat 7-day window held 8M rows (~2GB of DB) —
+/// 15 invariants fanned out per-entity write ~13 rows/sec, overwhelmingly
+/// green heartbeats nothing reads past the first minutes. Failures keep the
+/// week (they are what gets grepped after an incident); passes keep an hour,
+/// 12x the 300s stale_checks threshold that is the only consumer of
+/// pass-row age. Flap history lives in _amux_invariant_incident either way.
 const RESULT_RETAIN_SECS: f64 = 7.0 * 86400.0;
+const PASS_RETAIN_SECS: f64 = 3600.0;
+/// Trim cap per write cycle: the first cycle after the differential retention
+/// ships faces a ~7M-row backlog, and deleting it in one transaction would
+/// balloon the WAL past the DB's own size. The monitor cycles constantly, so
+/// a capped trim drains the backlog in hours anyway.
+const TRIM_BATCH_ROWS: i64 = 20_000;
 
 fn now() -> f64 {
     std::time::SystemTime::now()
@@ -114,10 +127,20 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                     )?;
                 }
             }
-            // Opportunistic trim of the evaluation log only.
+            // Opportunistic trim of the evaluation log only. The predicate is
+            // range-bound on ts first so idx_inv_result_ts drives it, and the
+            // rowid-IN shape is because DELETE..LIMIT needs a nonstandard
+            // SQLite build flag.
             let _ = conn.execute(
-                "DELETE FROM _amux_invariant_result WHERE ts < ?1",
-                [ts - RESULT_RETAIN_SECS],
+                "DELETE FROM _amux_invariant_result WHERE rowid IN (
+                    SELECT rowid FROM _amux_invariant_result
+                     WHERE ts < ?2 AND (status = 'pass' OR ts < ?1)
+                     LIMIT ?3)",
+                rusqlite::params![
+                    ts - RESULT_RETAIN_SECS,
+                    ts - PASS_RETAIN_SECS,
+                    TRIM_BATCH_ROWS
+                ],
             );
             Ok(WriteOutcome { applied: true, events: vec![] })
         })
@@ -190,6 +213,19 @@ pub fn latest_per_invariant(store: &SharedStore) -> anyhow::Result<Vec<serde_jso
     Ok(rows)
 }
 
+/// Size of the evaluation log itself: (rows, oldest_age_s). Feeds both
+/// `/api/debug/invariants` and the store.result_log_bounded check (AMUX-3489)
+/// so the meter a human reads and the meter that pages cannot disagree.
+pub fn result_log_stats(store: &SharedStore) -> anyhow::Result<(i64, f64)> {
+    let conn = store.read()?;
+    let (rows, oldest): (i64, Option<f64>) = conn.query_row(
+        "SELECT COUNT(*), MIN(ts) FROM _amux_invariant_result",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok((rows, oldest.map(|t| (now() - t).max(0.0)).unwrap_or(0.0)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +293,49 @@ mod tests {
         let latest = latest_per_invariant(&s).unwrap();
         assert_eq!(latest.len(), 1, "...but it must still be recorded");
         assert_eq!(latest[0]["status"], "unknown");
+    }
+
+    /// AMUX-3489: the differential trim. A 2h-old PASS row (past the 1h pass
+    /// window, inside the 7d fail window) must age out on the next write
+    /// cycle; an equally old FAIL row must survive the week. Without the
+    /// differential this table held 8M rows of green heartbeats.
+    #[tokio::test]
+    async fn old_pass_rows_trim_while_equally_old_fail_rows_survive() {
+        let (s, _d) = store();
+        let old = now() - 7200.0;
+        let _ = s
+            .write_async(move |conn| {
+                for (st, id) in [("pass", "old.pass"), ("fail", "old.fail")] {
+                    conn.execute(
+                        "INSERT INTO _amux_invariant_result
+                           (ts, invariant_id, status, entity_key, expected, observed, evidence, duration_ms)
+                         VALUES (?1, ?2, ?3, '', '', '', '{}', 1)",
+                        rusqlite::params![old, id, st],
+                    )?;
+                }
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+        // Any record() triggers the opportunistic trim.
+        record(&s, vec![InvariantResult::pass("fresh.check")], 1).await;
+
+        let conn = s.read().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT invariant_id FROM _amux_invariant_result ORDER BY invariant_id")
+            .unwrap();
+        let left: Vec<String> = stmt
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(
+            left,
+            vec!["fresh.check".to_string(), "old.fail".to_string()],
+            "stale pass gone, stale fail kept, fresh row kept"
+        );
+
+        let (rows, oldest) = result_log_stats(&s).unwrap();
+        assert_eq!(rows, 2);
+        assert!(oldest >= 7000.0, "oldest_age_s must reflect the surviving fail row, got {oldest}");
     }
 }

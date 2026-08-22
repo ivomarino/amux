@@ -1058,6 +1058,41 @@ pub fn autofix_cards_are_dispatchable(open_unowned: i64, examples: &[String]) ->
 }
 
 // ---------------------------------------------------------------------------
+// 6e. Is the invariant system's OWN evaluation log bounded? (AMUX-3489)
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AMUX-3489, 2026-08-22): `_amux_invariant_result` reached 8M rows
+/// (~2GB of DB) — the 7-day flat retention was working exactly as written
+/// while 15 invariants x per-entity fan-out wrote ~13 green heartbeats a
+/// second. Nothing watched the watcher: the table that exists to make
+/// failures visible was itself growing invisibly, and it surfaced only
+/// because a perf calibration tripped over a 20-minute `.backup`.
+///
+/// The check is a row budget, not a growth ratio, because the healthy state
+/// after differential retention is small and roughly constant (~50k rows);
+/// any sustained excursion past the budget means retention broke or a new
+/// fan-out multiplied the write rate.
+pub fn result_log_bounded(rows: i64, budget: i64, oldest_age_s: f64) -> Vec<InvariantResult> {
+    const ID: &str = "store.result_log_bounded";
+    if rows <= budget {
+        return vec![InvariantResult::pass(ID)];
+    }
+    vec![InvariantResult::fail(
+        ID,
+        format!("evaluation log holds <= {budget} rows (differential retention: pass 1h, fail 7d)"),
+        format!(
+            "{rows} rows in _amux_invariant_result (oldest {:.0}s old) — either the \
+             opportunistic trim in invariants/store.rs stopped running, or a new \
+             per-entity fan-out multiplied the write rate past what the batch cap \
+             drains. A fresh deploy of AMUX-3489 legitimately shows this while the \
+             8M-row backlog drains (~3h); sustained past that, it is real.",
+            oldest_age_s,
+        ),
+    )
+    .evidence(json!({"rows": rows, "budget": budget, "oldest_age_s": oldest_age_s}))]
+}
+
+// ---------------------------------------------------------------------------
 // 6c. Are session reports ATTRIBUTED? (AF-67)
 // ---------------------------------------------------------------------------
 
@@ -2453,5 +2488,21 @@ mod negative_controls {
         // settings file into an API response.
         assert!(the_incident[0].evidence["entries"][0]["command_head"].is_string());
         assert!(healthy[0].evidence["entries"][0]["command_head"].is_null());
+    }
+
+    /// AMUX-3489 cells. The incident specimen (8M rows) must FAIL with the
+    /// numbers in the observed text; the post-retention steady state passes.
+    #[test]
+    fn result_log_within_budget_passes_and_the_incident_specimen_fails() {
+        let ok = result_log_bounded(50_000, 500_000, 3000.0);
+        assert_eq!(ok[0].status, Status::Pass);
+
+        let bad = result_log_bounded(7_993_107, 500_000, 604_800.0);
+        assert_eq!(bad[0].status, Status::Fail, "{:?}", bad[0]);
+        assert!(bad[0].observed.contains("7993107"), "{:?}", bad[0].observed);
+        assert_eq!(bad[0].evidence["budget"], 500_000);
+
+        // Exactly-at-budget is not an excursion.
+        assert_eq!(result_log_bounded(500_000, 500_000, 1.0)[0].status, Status::Pass);
     }
 }

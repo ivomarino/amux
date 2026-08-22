@@ -166,6 +166,11 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // halves reporting success for 11 days).
     out.extend(autofix_dispatchable_check(state));
 
+    // -- 6e. is the invariant system's OWN evaluation log bounded? (AMUX-3489:
+    // 8M rows / ~2GB from a flat 7-day retention on ~13 green rows/sec — the
+    // watcher was the one thing no watcher covered).
+    out.extend(result_log_bounded_check(state));
+
     // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
     // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
     // rate" as its detector but nothing read it; this closes that loop.
@@ -615,6 +620,22 @@ mod report_hook_wiring_tests {
 /// `amux_session` column is the header stamp, and it is the same column the
 /// attribution audit and the send-ledger read. Deriving it from anywhere else
 /// would let the check disagree with the thing it describes.
+/// AMUX-3489. The budget is env-tunable (AMUX_INVARIANT_RESULT_BUDGET) so a
+/// deliberate fan-out increase moves the number in config rather than
+/// re-tuning a constant; 500k sits ~10x above the post-differential-retention
+/// steady state (~50k) and ~16x below the 8M incident specimen.
+fn result_log_bounded_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "store.result_log_bounded";
+    let budget = std::env::var("AMUX_INVARIANT_RESULT_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(500_000);
+    match super::store::result_log_stats(&state.store) {
+        Ok((rows, oldest_age_s)) => checks::result_log_bounded(rows, budget, oldest_age_s),
+        Err(e) => vec![InvariantResult::unknown(ID, format!("could not count the log: {e}"))],
+    }
+}
+
 fn autofix_dispatchable_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.autofix_cards_are_dispatchable";
     let Ok(conn) = state.store.read() else {
