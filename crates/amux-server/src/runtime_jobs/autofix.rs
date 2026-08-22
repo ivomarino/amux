@@ -142,6 +142,16 @@ fn baseline_h() -> f64 {
 fn latency_mult() -> f64 {
     env_f64("AMUX_AUTOFIX_LATENCY_MULT", 3.0).max(1.1)
 }
+/// Absolute floor on the WINDOW p95 before a ratio can file (AMUX-3471). A
+/// pure ratio with no floor filed "/api/prefs p95 2ms — 3.7x its trailing
+/// norm": a 2-millisecond p95 flagged because the baseline was
+/// sub-millisecond. Nobody's capability is degraded by 2ms, and a report a
+/// reader laughs at teaches them to skim the ones that matter — the
+/// threshold-below-baseline instrument defect, ratio edition. The ratio
+/// still discriminates ABOVE the floor; below it, fast-vs-faster is noise.
+fn latency_floor_ms() -> f64 {
+    env_f64("AMUX_AUTOFIX_LATENCY_FLOOR_MS", 250.0).max(0.0)
+}
 /// Sample floor, both sides. Below this a p95 is one request wearing a
 /// percentile — the "filter that matched everything" failure in slow motion.
 fn latency_min_samples() -> i64 {
@@ -628,6 +638,10 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
         let p95_b = rl::percentile_sorted(&base, 0.95);
         let mult = latency_mult();
         if p95_b <= 0.0 || p95_w < p95_b * mult {
+            continue;
+        }
+        // AMUX-3471: a ratio alone files fast-vs-faster noise (2ms at 3.7x).
+        if p95_w < latency_floor_ms() {
             continue;
         }
         let signature = format!("latency|p95|{fam}");
@@ -4031,6 +4045,27 @@ mod tests {
         assert!(ev.contains_key("routed_methods"), "{ev:?}");
         assert!(ev.contains_key("nearest_routes"), "{ev:?}");
         assert!(ev["called_by"].contains("browser"));
+    }
+
+    /// AMUX-3471, rebuilt from the incident's own numbers: /api/prefs at a
+    /// 2ms window p95 over a sub-millisecond baseline is 3.7x — and 2ms is
+    /// not a regression anyone should read about. The ratio must not file
+    /// below the absolute floor; the same ratio ABOVE the floor still files.
+    #[tokio::test]
+    async fn a_fast_family_getting_relatively_slower_is_not_a_finding() {
+        let (st, _d) = state();
+        let now = unix_now();
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/prefs", family: "/api/prefs", status: 200, body: "", worker: "", ua: "curl/8", ms: 0.54 });
+        }
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/prefs", family: "/api/prefs", status: 200, body: "", worker: "", ua: "curl/8", ms: 2.0 });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature == "latency|p95|/api/prefs"),
+            "2ms at 3.7x is fast-vs-faster noise, not a regression: {f:?}"
+        );
     }
 
     /// A p95 over four requests is one request wearing a percentile. Both
