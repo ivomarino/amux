@@ -1206,12 +1206,33 @@ impl GmailClient {
         }
         let truncated = page_token.is_some() && ids.len() >= want;
         ids.truncate(want);
-        let mut out = Vec::with_capacity(ids.len());
-        for m in &ids {
-            let Some(mid) = m.get("id").and_then(Value::as_str) else { continue };
+        // AMUX-3337: per-message metadata fetches run with BOUNDED CONCURRENCY,
+        // not serially. The serial loop was the latency engine behind the
+        // 28s/53s/95s inbox reads the SLA tick ate every 4 hours: N messages
+        // cost N sequential Gmail round-trips, so a routine 20-message scan on
+        // a slow morning was ~30s and the /api/email p95 reached 106s against
+        // an already-chronic 32s baseline. Eight in flight keeps order
+        // (`buffered`, not unordered — callers see newest-first as listed) and
+        // stays far under Gmail's per-user concurrency limits.
+        use futures::stream::{self, StreamExt};
+        let mids: Vec<String> = ids
+            .iter()
+            .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
+            .collect();
+        let fetched: Vec<Option<Value>> = stream::iter(mids)
+        .map(|mid| async move {
             let url =
-                self.metadata_url(mid, &["From", "To", "Subject", "Date", "Message-ID"]);
-            let Ok(full) = self.api(account, "GET", &url, None).await else { continue };
+                self.metadata_url(&mid, &["From", "To", "Subject", "Date", "Message-ID"]);
+            self.api(account, "GET", &url, None).await.ok().map(|full| (mid, full))
+        })
+        .buffered(8)
+        .map(|r| r.map(|(mid, full)| json!({"__mid": mid, "__full": full})))
+        .collect()
+        .await;
+        let mut out = Vec::with_capacity(ids.len());
+        for pair in fetched.into_iter().flatten() {
+            let mid = pair["__mid"].as_str().unwrap_or_default().to_string();
+            let full = pair["__full"].clone();
             let h = header_map(&full);
             let hv = |k: &str| h.get(k).cloned().unwrap_or_default();
             let unread = full
