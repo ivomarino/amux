@@ -197,6 +197,11 @@ fn steering_stale_min() -> f64 {
 }
 /// An invariant must stay breached across at least this many evaluations. A
 /// flapping invariant is noise, and noise is how a board stops being read.
+/// How recent an incident's last failing evaluation must be to mint a card
+/// (AMUX-3486). Default: the detector's own 6h window.
+fn invariant_incident_fresh_s() -> f64 {
+    env_f64("AMUX_AUTOFIX_INCIDENT_FRESH_S", 21_600.0).max(600.0)
+}
 fn invariant_min_occurrences() -> i64 {
     env_i64("AMUX_AUTOFIX_INVARIANT_MIN_OCCURRENCES", 3).max(2)
 }
@@ -1120,15 +1125,27 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
     let min_occ = invariant_min_occurrences();
+    // FRESHNESS (AMUX-3486): "has not self-healed" is only a true claim while
+    // the failure is still being OBSERVED. The pane-agreement probe only
+    // evaluates lanes that painted recently, so a lane that goes quiet leaves
+    // its incident open-stale forever — no pass can ever close it — and the
+    // filer then refiled the same 08-21 specimen eternally: discard re-armed
+    // the idem, the open row refiled it, three cards for one incident in one
+    // day. An incident whose last failing evaluation is older than the window
+    // is "cannot be re-evaluated", a different truth from "still failing";
+    // it stays visible on the debug surface but does not mint cards. A lane
+    // that wakes and fails again refreshes last_seen and files normally.
+    let fresh_cutoff = now - invariant_incident_fresh_s();
     let Ok(mut stmt) = conn.prepare(
         "SELECT invariant_id, entity_key, status, first_seen, last_seen, occurrences, \
                 expected, observed \
          FROM _amux_invariant_incident WHERE resolved_at IS NULL AND status = 'fail' \
+         AND last_seen >= ?1 \
          ORDER BY occurrences DESC LIMIT 200",
     ) else {
         return (out, suppressed);
     };
-    let Ok(rows) = stmt.query_map([], |r| {
+    let Ok(rows) = stmt.query_map([fresh_cutoff], |r| {
         Ok((
             r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
@@ -4162,6 +4179,39 @@ mod tests {
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         assert!(ev["verdict"].contains("Threshold"), "state the threshold: {ev:?}");
         assert!(ev.contains_key("window_samples") && ev.contains_key("baseline_samples"));
+    }
+
+    /// AMUX-3486: an open incident whose last failing evaluation is STALE
+    /// (the entity went quiet, so no pass can ever close it) must not mint a
+    /// card — "has not self-healed" is unfounded when nothing re-evaluates.
+    /// The same incident with a FRESH failure files normally. Without this,
+    /// discard+re-arm refiled the same 08-21 specimen three times in a day.
+    #[tokio::test]
+    async fn a_stale_open_incident_does_not_refile_a_fresh_one_does() {
+        let (st, _d) = state();
+        let now = unix_now();
+        let seed = |entity: &str, last_seen: f64| {
+            let e = entity.to_string();
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_invariant_incident \
+                         (invariant_id, entity_key, status, first_seen, last_seen, occurrences, expected, observed) \
+                         VALUES ('status.agrees_with_pane', ?1, 'fail', ?2, ?3, 3, 'e', 'o')",
+                        rusqlite::params![e, last_seen - 100.0, last_seen],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        seed("quiet-lane", now - 50_000.0); // ~14h stale, unprobeable
+        seed("live-lane", now - 600.0); // failing 10 minutes ago
+        let conn = st.store.read().unwrap();
+        let (f, _) = detect_invariants(&conn, now);
+        let ents: Vec<&str> = f.iter().filter_map(|x| x.evidence.iter().find(|(k, _)| k == "verdict").map(|(_, v)| v.as_str())).collect();
+        let all = ents.join(" | ");
+        assert!(all.contains("live-lane"), "a fresh failure must file: {all}");
+        assert!(!all.contains("quiet-lane"), "a stale open incident must not mint cards: {all}");
     }
 
     /// AMUX-3485 both directions: a run INSIDE an endpoint's design budget
