@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.701';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.702';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18901,7 +18901,7 @@ async function _ensureArchived() {
   if (boardArchived.length && (Date.now() - _archivedAt) < 60000) return;
   _archivedLoading = (async () => {
     try {
-      const r = await fetch(API + '/api/board?archived=1&done_limit=0');
+      const r = await fetch(API + '/api/board?archived=1&done_limit=0&full=1');
       const d = await r.json();
       if (Array.isArray(d)) {
         boardArchived = d.filter(i => i.archived);
@@ -22387,7 +22387,7 @@ function _bqEnsureFullText(items) {
   if (!items.length || items[0].desc !== undefined) return;   // not slim — nothing to do
   if (_bqFullPending || Date.now() - _bqFullAt < 60000) return;
   _bqFullPending = true;
-  fetch(API + '/api/board?archived=0')
+  fetch(API + '/api/board?archived=0&full=1')
     .then(r => (r.ok ? r.json() : null))
     .then(full => {
       if (!Array.isArray(full)) return;
@@ -23312,7 +23312,7 @@ function _boardEnsureFull() {
   const hasText = q && _bqParse(q).text.length > 0;
   if (!hasText || _boardFullLoading || Date.now() - _boardFullTs < 60000) return;
   _boardFullLoading = true;
-  fetch(API + '/api/board?done_limit=0', { headers: _authHeaders() })
+  fetch(API + '/api/board?done_limit=0&full=1', { headers: _authHeaders() })
     .then(r => r.json())
     .then(d => {
       if (Array.isArray(d)) { boardItems = d; _boardFullTs = Date.now(); renderBoard(); _nudgeWorkersOnBoardChange(); }

@@ -640,12 +640,20 @@ impl IssueRow {
     /// the caller's staging order — without one canonical order, replay
     /// verification would report phantom tag divergences on identical sets.
     pub fn snapshot(&self) -> serde_json::Value {
+        self.snapshot_fields(true)
+    }
+
+    /// The one serializer behind [`snapshot`](Self::snapshot) (prose included:
+    /// replay/journal/detail contract, unchanged) and
+    /// [`snapshot_slim`](Self::snapshot_slim) (prose never allocated). Map
+    /// equality in serde_json is key-set equality, so the split cannot change
+    /// what replay verification compares.
+    fn snapshot_fields(&self, with_prose: bool) -> serde_json::Value {
         let mut tags = self.tags.clone();
         tags.sort();
-        serde_json::json!({
+        let mut v = serde_json::json!({
             "id": self.id,
             "title": self.title,
-            "desc": self.desc,
             "status": self.status,
             "session": self.session,
             "shepherd": self.shepherd,
@@ -662,14 +670,29 @@ impl IssueRow {
             "depends_on": self.depends_on,
             "reviewer": self.reviewer,
             "epic": self.epic,
-            "log": self.log,
             "source_ref": self.source_ref,
             "last_verified_at": self.last_verified_at,
             "rev": self.rev,
             "gate": self.gate_criteria(),
             "tags": tags,
             "version": self.version,
-        })
+        });
+        if with_prose {
+            let obj = v.as_object_mut().expect("snapshot_fields is an object");
+            obj.insert("desc".into(), serde_json::json!(self.desc));
+            obj.insert("log".into(), serde_json::json!(self.log));
+        }
+        v
+    }
+
+    /// [`snapshot`](Self::snapshot) without the prose columns (AMUX-3496).
+    /// The slim list used to build the FULL snapshot per row — cloning desc
+    /// and log, 6MB+ across a live list — and then delete both keys. This
+    /// never allocates the prose at all. Both snapshots are the same
+    /// [`snapshot_fields`](Self::snapshot_fields) call, so they cannot drift;
+    /// `snapshot_slim_is_snapshot_minus_prose` pins it anyway.
+    pub fn snapshot_slim(&self) -> serde_json::Value {
+        self.snapshot_fields(false)
     }
 
     /// Bridge into the core [`Task`] so every status change runs through
@@ -1518,6 +1541,36 @@ mod tests {
             depends_on: vec![],
             tags: vec![],
         }
+    }
+
+    /// AMUX-3496 — snapshot_slim must be snapshot minus exactly {desc, log},
+    /// on a row where every optional field is POPULATED (an empty row would
+    /// pass with half the fields missing from both sides). If this fails,
+    /// someone added a field to one serialization path and not the other.
+    #[test]
+    fn snapshot_slim_is_snapshot_minus_prose() {
+        let conn = create_db();
+        conn.execute(
+            "INSERT INTO issues (id, title, desc, status, session, creator, due, created, \
+                                 updated, owner_type, due_time, pinned, gcal_event_id, pos, \
+                                 gate, shepherd, type, archived, depends_on, reviewer, log, \
+                                 rev, source_ref, last_verified_at, version, epic) \
+             VALUES ('F-1','t','prose body','doing','lane','me','2026-09-01', 100, 200, \
+                     'agent','09:00', 1, 'gcal-1', 2.5, '[\"g1\"]', 'shep', 'code', 0, \
+                     '[\"D-1\"]', 'rev-lane', 'log line', 3, 'src-ref', 150, 2, 'E-1')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO issue_tags VALUES ('F-1','b',1.0),('F-1','a',2.0)", []).unwrap();
+        let row = get_issue(&conn, "F-1").unwrap().unwrap();
+        let mut full = row.snapshot();
+        let slim = row.snapshot_slim();
+        // The prose keys exist in full (with real content — the fixture check)
+        // and nowhere in slim.
+        let fo = full.as_object_mut().unwrap();
+        assert_eq!(fo.remove("desc").unwrap(), serde_json::json!("prose body"));
+        assert!(fo.remove("log").unwrap().as_str().is_some());
+        assert_eq!(full, slim, "snapshot_slim drifted from snapshot minus prose");
     }
 
     /// AMUX-3491 — list_issues_capped is an OPTIMIZATION and must be

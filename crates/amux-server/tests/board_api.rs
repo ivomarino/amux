@@ -163,22 +163,25 @@ async fn create_list_detail_lifecycle() {
     assert_eq!(v["creator"], json!("orch"));
 }
 
-// ---- Python-parity list payload: full desc + full log --------------------
+// ---- List payload shapes: slim by default, prose on request --------------
 //
-// The earlier L1 slimming (first-line desc + log_n instead of log) diverged
-// from the Python oracle, whose plain list serves both whole — and the SPA
-// renders `item.desc` and reads `item.log` (folded badge) straight off the
-// LIST payload, so both were silently blank on the Rust dashboard
-// (AMUX-2586 fix #4, measured live 2026-08-09). slim=1 stays the diet.
+// History, because this contract moved TWICE and each move was deliberate.
+// The earlier L1 slimming (first-line desc + log_n) broke the Python-era SPA,
+// which read prose off the LIST payload (AMUX-2586 fix #4) — so the plain
+// list went full-prose. AMUX-2840 then gave slim the derived facts the SPA
+// actually renders, the poll moved to slim=1, and AMUX-3496 flipped the
+// DEFAULT: 1,657 live cards were carrying 6MB of prose to consumers that
+// render three fields. A reader that needs desc/log asks with ?full=1 (or
+// legacy slim=0); `.desc` on a default row is a loud KeyError, not a
+// silently empty string. Detail is unchanged.
 
 #[tokio::test]
-async fn plain_list_serves_full_desc_and_log_slim_stays_the_diet() {
+async fn list_is_slim_by_default_and_serves_prose_only_on_request() {
     let (app, _dir) = app();
     let long_desc = format!("first line {}\nsecond line body", "x".repeat(300));
     let v = create(&app, json!({ "title": "Big desc", "desc": long_desc })).await;
     let id = v["id"].as_str().unwrap().to_string();
-    // Give the card a log line via a desc_append-style PATCH (log is
-    // system-appended); a direct edit note lands in the card's log.
+    // Give the card a log line via a desc-edit PATCH (log is system-appended).
     let (_, _, _) = send(
         &app,
         "PATCH",
@@ -187,26 +190,45 @@ async fn plain_list_serves_full_desc_and_log_slim_stays_the_diet() {
     )
     .await;
 
+    // DEFAULT: slim-shaped — no prose, all four derived facts.
     let (_, _, list) = send(&app, "GET", "/api/board", None).await;
     let item = &list.as_array().unwrap()[0];
-    // Python's plain list: the WHOLE desc, the WHOLE log (string or null),
-    // no desc_truncated / log_n / desc_len keys.
-    assert!(item["desc"].as_str().unwrap().contains("second line"));
-    assert!(item.get("desc_truncated").is_none());
-    assert!(item.get("log_n").is_none());
-    assert!(item.get("desc_len").is_none());
-    assert!(
-        item.get("log").is_some(),
-        "log must be present in the plain list (SPA folded badge reads it)"
-    );
+    assert!(item.get("desc").is_none(), "default list must not carry desc");
+    assert!(item.get("log").is_none(), "default list must not carry log");
+    assert!(item["desc_len"].as_u64().is_some());
+    assert!(item["log_n"].as_u64().is_some());
+    assert!(item["desc_head"].as_str().unwrap().starts_with("first line"));
+    assert!(item.get("folded_n").is_some());
 
-    // slim=1 drops desc AND log, declaring desc_len + log_n instead.
+    // ?full=1: the WHOLE desc, the WHOLE log (string or null), none of the
+    // slim-only keys.
+    for fat in ["/api/board?full=1", "/api/board?slim=0"] {
+        let (_, _, full) = send(&app, "GET", fat, None).await;
+        let item = &full.as_array().unwrap()[0];
+        assert!(
+            item["desc"].as_str().unwrap().contains("second line"),
+            "{fat} must serve full desc"
+        );
+        assert!(item.get("desc_truncated").is_none());
+        assert!(item.get("log_n").is_none());
+        assert!(item.get("desc_len").is_none());
+        assert!(
+            item.get("log").is_some(),
+            "{fat}: log must be present (prose consumers hydrate from it)"
+        );
+    }
+
+    // ?slim=1 explicitly: same diet as the default (the dashboard poll).
     let (_, _, slim) = send(&app, "GET", "/api/board?slim=1", None).await;
     let item = &slim.as_array().unwrap()[0];
     assert!(item.get("desc").is_none());
     assert!(item.get("log").is_none());
     assert!(item["desc_len"].as_u64().is_some());
     assert!(item["log_n"].as_u64().is_some());
+
+    // full=1 beats a stray slim=1 (explicit prose request wins).
+    let (_, _, both) = send(&app, "GET", "/api/board?slim=1&full=1", None).await;
+    assert!(both.as_array().unwrap()[0].get("desc").is_some());
 
     // Detail: the whole desc, as ever.
     let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;

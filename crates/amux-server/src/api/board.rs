@@ -195,7 +195,10 @@ async fn get_contract(
                         complete enumeration; use this or ?status=<s> to defeat the render cap",
                 "limit": "page size, applied AFTER done_limit",
                 "offset": "page offset",
-                "slim": "1 = trimmed item bodies",
+                "slim": "1 = trimmed item bodies (desc_head/desc_len/log_n/folded_n instead of \
+                        prose) — the DEFAULT shape since AMUX-3496",
+                "full": "1 = full prose bodies (desc + log). The default list is slim; a \
+                         reader that needs desc/log must ask (slim=0 also honored)",
             },
             "not_a_filter": {
                 "q / query / search": "REFUSED with 400 — /api/board does not search, it would \
@@ -919,12 +922,14 @@ fn detail_body(row: &IssueRow) -> Value {
 /// `_board_item_stale` flag — set ONLY when true, on both paths (Python's
 /// `_BOARD_SLIM_DROP` is `("desc","log")`; `stale` rides through slim).
 pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
-    let mut v = detail_body(row);
-    let obj = v.as_object_mut().expect("detail_body is an object");
+    // The slim base never allocates the prose it will not ship (AMUX-3496):
+    // this used to build the FULL snapshot (cloning desc+log, 6MB+ across a
+    // live list) and then delete both keys. The derivations below read
+    // row.desc/row.log by reference.
+    let mut v = if slim { row.snapshot_slim() } else { detail_body(row) };
+    let obj = v.as_object_mut().expect("snapshot is an object");
     if slim {
-        obj.remove("desc");
         obj.insert("desc_len".into(), json!(row.desc.chars().count()));
-        obj.remove("log");
         let log_n = row
             .log
             .as_deref()
@@ -1057,6 +1062,15 @@ pub struct ListParams {
     pub all: Option<String>,
     #[serde(default)]
     pub slim: Option<String>,
+    // `?full=1` — the prose escape (AMUX-3496). The DEFAULT list is now
+    // slim-shaped: 1,657 cards carried 5.4MB of desc + 0.7MB of log to
+    // consumers that render three fields, and every derived fact the list
+    // actually needs (desc_head, desc_len, log_n, folded_n, needsyou_note)
+    // already ships. A reader that needs the prose says so; `.desc` on a
+    // default row is now a KeyError, which is loud, not silently empty.
+    // Explicit `slim=0` is honored as full for legacy callers.
+    #[serde(default)]
+    pub full: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -1100,7 +1114,7 @@ pub struct ListParams {
 /// announces the terminal cap. (`q`/`query`/`search` are here because they are
 /// consumed above — refused with a 400 — so they are recognised, not ignored.)
 const RECOGNISED_BOARD_PARAMS: &[&str] = &[
-    "status", "session", "archived", "done_limit", "all", "slim", "limit", "offset", "q", "query",
+    "status", "session", "archived", "done_limit", "all", "slim", "full", "limit", "offset", "q", "query",
     "search",
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
@@ -1186,7 +1200,7 @@ pub async fn list_board(
                 "use_instead": format!("/api/search?q={term}"),
                 "why": "This param was silently ignored until 2026-08-11, so the full board came \
                         back looking like ranked results. Refusing loudly beats answering wrongly.",
-                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "limit", "offset"],
+                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "full", "limit", "offset"],
             })),
         )
             .into_response();
@@ -1256,7 +1270,20 @@ pub async fn list_board(
     let done_limit = p
         .done_limit
         .unwrap_or(if scoped || uncap_all { 0 } else { 100 });
-    let slim = qp_truthy(p.slim.as_deref());
+    // Shape resolution (AMUX-3496): explicit wins, default is slim.
+    //   ?full=1          -> full rows (prose included)
+    //   ?slim=1          -> slim (unchanged, the dashboard poll)
+    //   ?slim=0          -> full (legacy spelling of "not slim", honored)
+    //   neither          -> slim — the default a phone, a CLI, or an ad-hoc
+    //                       curl gets is the small one (mobile-first).
+    let slim = if qp_truthy(p.full.as_deref()) {
+        false
+    } else {
+        match p.slim.as_deref() {
+            Some(s) => qp_truthy(Some(s)),
+            None => true,
+        }
+    };
 
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
@@ -1298,10 +1325,15 @@ pub async fn list_board(
     // denominator-read SHAPE — an unscoped, full-card (non-slim) fetch that did
     // not ask for a bound — so the high-frequency dashboard poll (slim=1) and any
     // explicit ?all=1 / ?done_limit= caller stay silent. grep "board list truncated".
+    // Gate on p.slim.is_none(), not !slim (AMUX-3496): with slim the DEFAULT,
+    // !slim would silence this for exactly the ad-hoc denominator readers it
+    // exists to catch. The high-frequency dashboard poll says slim=1
+    // explicitly and stays silent; a bare curl (now slim-shaped, still
+    // capped) warns.
     if term_total > term_kept
         && !scoped
         && !uncap_all
-        && !slim
+        && p.slim.is_none()
         && p.done_limit.is_none()
     {
         tracing::warn!(
