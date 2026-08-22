@@ -458,6 +458,18 @@ def main():
     shared = [os.path.realpath(os.path.expanduser(p)) for p in
               os.environ.get("AMUX_SHARED_CHECKOUTS", "~/Dev/mixpeek").split(":") if p.strip()]
     mC = re.search(r'-C\s+(\S+)', scrubbed)
+    # AMUX-3462 (MF-703): this hook reads the command TEXT, before the shell
+    # expands it. A -C path spelled with a variable (`git -C $S/wipetest ...`)
+    # therefore cannot be resolved here — the old code realpath'd the raw
+    # token anyway, fabricating a literal '<cwd>/$S/wipetest' that
+    # prefix-matched the shared checkout and produced a refusal naming a repo
+    # that does not exist. Discard the capture and fall back to the documented
+    # cwd inference; the refusal note below names the real cause and the
+    # LITERAL-path escape (which is what actually works).
+    _unexpanded_c = None
+    if mC and re.search(r'[$`]', mC.group(1)):
+        _unexpanded_c = mC.group(1)
+        mC = None
     run_dir = os.path.realpath(os.path.expanduser(mC.group(1))) if mC else os.path.realpath(cwd)
     # WHERE run_dir CAME FROM, said out loud in the refusal (AF-23). Otherwise the
     # message asserts a repo path as FACT, and when the inference is wrong it still
@@ -479,6 +491,12 @@ def main():
                  "see a `cd` inside a compound command. If you meant a different repo, such as "
                  "a scratch clone, re-run as `git -C <path> ... -- <paths>` and the guard will "
                  "evaluate THAT repo instead.)")
+    if _unexpanded_c:
+        _dir_note = (
+            "\n  (The -C path %r contains an UNEXPANDED shell construct — this guard reads the "
+            "command text BEFORE your shell expands it, so it cannot resolve that path; it "
+            "evaluated the session cwd instead. The precise -C escape needs a LITERAL path: "
+            "`git -C /full/path ...` — AMUX-3462.)" % _unexpanded_c)
     # The discard check runs BEFORE the static-scope gate below, and deliberately so.
     # AMUX_SHARED_CHECKOUTS is unset in every session env, in the shell, and in
     # amux-server.py, so `shared` is the hardcoded default ~/Dev/mixpeek — while
@@ -561,7 +579,15 @@ def main():
     # repo root — real data, repo-root paired (AMUX-2337), the same source the
     # discard check above already uses. The list stays as an ADDITIVE override so
     # an explicitly-named root is still guarded even with no cotenants online.
-    if not any(run_dir == s or run_dir.startswith(s + os.sep) for s in shared):
+    _scope_dirs = [run_dir]
+    if _unexpanded_c:
+        # The naive resolution of the unexpanded token — what the old code used
+        # as run_dir outright. Kept ONLY as an extra shared-scope candidate so
+        # this fix never fails open relative to the old behavior: an ABSOLUTE
+        # prefix with a trailing variable (`-C /shared/root/$X reset --hard`)
+        # must stay guarded even when the session cwd is elsewhere.
+        _scope_dirs.append(os.path.realpath(os.path.expanduser(_unexpanded_c)))
+    if not any(d == s or d.startswith(s + os.sep) for d in _scope_dirs for s in shared):
         if not _has_cotenants(run_dir):
             return 0
     amend_why = None

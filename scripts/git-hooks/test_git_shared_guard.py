@@ -96,12 +96,39 @@ def main():
     # scoping: outside the shared root nothing blocks
     cases.append(("non-shared cwd reset", "git reset --hard", tmp, False))
 
+    # AMUX-3462 (MF-703): a -C path spelled with a shell variable cannot be
+    # resolved from command text. The guard must fall back to the cwd
+    # inference (still blocking from a shared cwd), must NOT fabricate a
+    # literal '<cwd>/$S/...' repo in its message, must keep guarding an
+    # absolute shared prefix with a trailing variable even from outside, and
+    # the literal-path escape must keep working.
+    A("unexpanded -C var from shared cwd still blocks", "git -C $S/wipetest reset --hard", True)
+    cases.append(("unexpanded -C var from outside passes",
+                  "git -C $S/wipetest reset --hard", tmp, False))
+    cases.append(("absolute shared -C with trailing var blocks from outside",
+                  f"git -C {work}/$X reset --hard", tmp, True))
+    scratch = os.path.join(tmp, "scratch-clone")
+    os.makedirs(scratch, exist_ok=True)
+    A("literal -C escape still works from shared cwd", f"git -C {scratch} reset --hard", False)
+
     failures = []
     for name, cmd, cwd, expect_block in cases:
         code, err = run_hook(cmd, cwd, work)
         blocked = code == 2
         if blocked != expect_block:
             failures.append(f"{name}: expected {'BLOCK' if expect_block else 'PASS'}, got {'BLOCK' if blocked else 'PASS'}\n  {err.strip()[:200]}")
+
+    # AMUX-3462 message contract: the refusal for an unexpanded -C names the
+    # real cause and the literal-path escape, and never asserts the
+    # fabricated '<cwd>/$S/...' path as the repo.
+    code, err = run_hook("git -C $S/wipetest reset --hard", work, work)
+    if code != 2:
+        failures.append(f"unexpanded -C message case: expected BLOCK, got rc={code}")
+    else:
+        if "UNEXPANDED" not in err:
+            failures.append(f"unexpanded -C refusal must name the cause: {err.strip()[:200]}")
+        if "$S/wipetest' is a SHARED checkout" in err or f"{work}/$S" in err:
+            failures.append(f"refusal asserts a fabricated literal path as the repo: {err.strip()[:200]}")
 
     # unpushed-HEAD amend trio (needs a fresh unpushed commit)
     open(os.path.join(work, "f.txt"), "a").write("2\n")
