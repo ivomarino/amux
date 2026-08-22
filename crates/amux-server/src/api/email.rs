@@ -56,6 +56,9 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/message/{id}/attachments/{attachment_id}", get(message_attachment))
         .route("/search", get(search))
         .route("/log", get(send_log))
+        // AMUX-3510: the human approval half of the external-send gate.
+        .route("/approve/{id}", post(approve))
+        .route("/approvals", get(list_approvals))
         .layer(Extension(ctx))
 }
 
@@ -340,6 +343,59 @@ pub async fn send(
 
     let connected = ctx.client.connected_accounts();
 
+    // EXTERNAL-SEND APPROVAL GATE (AMUX-3510) — before the etiquette guards:
+    // a worker-originated send reaching any non-internal recipient is frozen
+    // for a human, not sent. See email_approval.rs for the incident and the
+    // full contract; the refusal is itself a ledger row so a gated send
+    // nobody approves still left a trace.
+    if let Some(lane) = hdr_worker(&headers) {
+        let home = ctx.client.home().to_path_buf();
+        let externals = crate::api::email_approval::external_recipients(
+            &format!("{to},{cc}"),
+            &crate::api::email_approval::internal_domains(&home),
+            &connected,
+        );
+        if !externals.is_empty()
+            && !crate::api::email_approval::exempt_sessions(&home).contains(&lane.to_lowercase())
+        {
+            let preview = json!({
+                "endpoint": "send", "from": from_acct, "to": to, "cc": cc,
+                "subject": subject,
+                "body": message.chars().take(2000).collect::<String>(),
+                "external_recipients": externals,
+            });
+            let payload = json!({
+                "from": from_acct, "to": to, "cc": cc, "subject": subject,
+                "body": message,
+                "signature": body.get("signature").cloned().unwrap_or(Value::Null),
+                "attachments": body.get("attachments").cloned().unwrap_or(Value::Null),
+            });
+            return match crate::api::email_approval::create_approval(
+                &home, &lane, "send", payload, preview.clone(),
+            ) {
+                Ok(id) => {
+                    email_log(
+                        ctx.client.home(),
+                        json!({
+                            "endpoint": "send", "blocked": "approval_required",
+                            "approval_id": id, "from": from_acct, "to": to,
+                            "subject": subject, "session": lane,
+                        }),
+                    );
+                    tracing::warn!(
+                        session = %lane, approval = %id,
+                        "[email] EXTERNAL send from a worker held for human approval (AMUX-3510)"
+                    );
+                    approval_required_response(&id, preview)
+                }
+                Err(e) => err(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    json!({ "error": format!("could not record the approval request: {e} — NOT sent") }),
+                ),
+            };
+        }
+    }
+
     // NEW-THREAD GUARD (AMUX-1739): a /send to an EXTERNAL recipient with an
     // active thread fragments a customer conversation. Block with the
     // candidate so replying stays the DEFAULT; a new thread requires an
@@ -520,6 +576,70 @@ pub async fn reply(
     };
     if !gmail_from.is_empty() && connected.contains(&gmail_from) {
         let allow_self = body.get("allow_self").map(truthy).unwrap_or(false);
+        // EXTERNAL-SEND APPROVAL GATE (AMUX-3510), the /reply half — STRICTER
+        // by construction, because a reply's recipients are the THREAD's, not
+        // the caller's: the incident's one call reached four people it never
+        // named. Resolve the fan-out first (the same lookup + plan the send
+        // runs), classify, and freeze for a human if anyone external is on it.
+        if let Some(lane) = hdr_worker(&headers) {
+            let home = ctx.client.home().to_path_buf();
+            if !crate::api::email_approval::exempt_sessions(&home).contains(&lane.to_lowercase())
+            {
+                let (r_to, r_cc, r_subject) = match ctx
+                    .client
+                    .resolve_reply_recipients(&gmail_from, &message_id, reply_all, allow_self)
+                    .await
+                {
+                    Ok(v) => v,
+                    Err(e) => return err(StatusCode::BAD_GATEWAY, json!({ "error": e })),
+                };
+                let externals = crate::api::email_approval::external_recipients(
+                    &format!("{r_to},{r_cc}"),
+                    &crate::api::email_approval::internal_domains(&home),
+                    &connected,
+                );
+                if !externals.is_empty() {
+                    let preview = json!({
+                        "endpoint": "reply", "from": gmail_from,
+                        "in_reply_to": message_id, "reply_all": reply_all,
+                        "to": r_to, "cc": r_cc, "subject": r_subject,
+                        "body": reply_body.chars().take(2000).collect::<String>(),
+                        "external_recipients": externals,
+                    });
+                    let payload = json!({
+                        "from": gmail_from, "message_id": message_id,
+                        "body": reply_body, "reply_all": reply_all,
+                        "allow_self": allow_self,
+                        "signature": body.get("signature").cloned().unwrap_or(Value::Null),
+                        "attachments": body.get("attachments").cloned().unwrap_or(Value::Null),
+                    });
+                    return match crate::api::email_approval::create_approval(
+                        &home, &lane, "reply", payload, preview.clone(),
+                    ) {
+                        Ok(id) => {
+                            email_log(
+                                ctx.client.home(),
+                                json!({
+                                    "endpoint": "reply", "blocked": "approval_required",
+                                    "approval_id": id, "from": gmail_from,
+                                    "to": r_to, "cc": r_cc, "in_reply_to": message_id,
+                                    "subject": r_subject, "session": lane,
+                                }),
+                            );
+                            tracing::warn!(
+                                session = %lane, approval = %id,
+                                "[email] EXTERNAL reply from a worker held for human approval (AMUX-3510)"
+                            );
+                            approval_required_response(&id, preview)
+                        }
+                        Err(e) => err(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            json!({ "error": format!("could not record the approval request: {e} — NOT sent") }),
+                        ),
+                    };
+                }
+            }
+        }
         let res = ctx
             .client
             .reply_send(&gmail_from, &message_id, &reply_body, include_sig, reply_all, allow_self, &attachments)
@@ -563,6 +683,150 @@ pub async fn reply(
         };
     }
     refuse_send(&ctx, &headers, "reply", &gmail_from)
+}
+
+/// The refusal every gated send/reply returns (AMUX-3510): the draft comes
+/// BACK with an approval id instead of going out. The worker's next honest
+/// move is spelled out in the body, because the AMUX-2325 lesson is that a
+/// refusal whose escape is unstated gets walked around off-trail.
+fn approval_required_response(id: &str, preview: Value) -> Response {
+    (
+        StatusCode::FORBIDDEN,
+        Json(json!({
+            "ok": false,
+            "code": "approval_required",
+            "approval_id": id,
+            "preview": preview,
+            "why": "external recipients + worker origin: Ethan's rule (2026-08-22) — no email \
+                    to anyone outside the internal domains without explicit per-message human \
+                    approval",
+            "what_to_do": "surface the preview to Ethan (board card or your turn output) and \
+                           STOP — do not resend, do not rephrase, do not approve it yourself. \
+                           A human approves from the dashboard origin: \
+                           POST /api/email/approve/<approval_id> (no X-Amux-Session header). \
+                           The approval expires in 1h and releases exactly this draft.",
+            "expires_in_s": crate::api::email_approval::APPROVAL_TTL_S as i64,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/email/approve/{id} — the human release (AMUX-3510). Refuses any
+/// request carrying a worker origin: a worker approving its own held send is
+/// the exact loop the gate exists to break.
+pub async fn approve(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Some(lane) = hdr_worker(&headers) {
+        tracing::warn!(
+            session = %lane, approval = %id,
+            "[email] a WORKER tried to approve a held external send — refused (AMUX-3510)"
+        );
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "approval must come from a human context — this request carries a \
+                          worker origin. Surface the preview to Ethan instead.",
+                "code": "worker_cannot_approve",
+            }),
+        );
+    }
+    let home = ctx.client.home().to_path_buf();
+    let doc = match crate::api::email_approval::consume(&home, &id) {
+        crate::api::email_approval::Consume::Ready(d) => d,
+        crate::api::email_approval::Consume::Expired => {
+            return err(
+                StatusCode::GONE,
+                json!({ "error": "approval expired (1h) — the worker must request the send again" }),
+            )
+        }
+        crate::api::email_approval::Consume::Gone => {
+            return err(
+                StatusCode::NOT_FOUND,
+                json!({ "error": "no pending approval with that id (already approved, expired, or never existed)" }),
+            )
+        }
+    };
+    let payload = doc.get("payload").cloned().unwrap_or_else(|| json!({}));
+    let session = doc.get("session").and_then(Value::as_str).unwrap_or("").to_string();
+    let endpoint = doc.get("endpoint").and_then(Value::as_str).unwrap_or("").to_string();
+    let p = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("").to_string();
+    let include_sig = payload.get("signature") != Some(&Value::Bool(false));
+    let attachments = match parse_attachments(&payload) {
+        Ok(a) => a,
+        Err(e) => return err(StatusCode::BAD_REQUEST, json!({ "error": e })),
+    };
+    let res = match endpoint.as_str() {
+        "send" => {
+            ctx.client
+                .compose_send(
+                    &p("from"), &p("to"), &p("subject"), &p("body"), &p("cc"),
+                    "", "", "", include_sig, &attachments,
+                )
+                .await
+        }
+        "reply" => {
+            let reply_all = payload.get("reply_all").map(truthy).unwrap_or(false);
+            let allow_self = payload.get("allow_self").map(truthy).unwrap_or(false);
+            ctx.client
+                .reply_send(
+                    &p("from"), &p("message_id"), &p("body"), include_sig,
+                    reply_all, allow_self, &attachments,
+                )
+                .await
+        }
+        other => {
+            return err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({ "error": format!("frozen approval has unknown endpoint {other:?}") }),
+            )
+        }
+    };
+    report_outcome(&ctx.registry, &res.as_ref().map(|_| ()).map_err(Clone::clone));
+    match res {
+        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e, "approval_id": id })),
+        Ok(res) => {
+            // The audit answers "who approved this", not only "which worker
+            // sent it" (autodesk's point 5). The approver is the dashboard
+            // origin; the SESSION on the row stays the worker that authored
+            // the draft, so both halves of the story are on one row.
+            email_log(
+                ctx.client.home(),
+                json!({
+                    "endpoint": endpoint, "via": "gmail", "approved": true,
+                    "approval_id": id, "approved_by": "dashboard (no worker origin)",
+                    "from": p("from"), "to": p("to"),
+                    "subject": p("subject"),
+                    "body_chars": p("body").chars().count(),
+                    "body_preview": p("body").chars().take(240).collect::<String>(),
+                    "id": res.get("id").cloned().unwrap_or(Value::Null),
+                    "thread_id": res.get("thread_id").cloned().unwrap_or(Value::Null),
+                    "session": session,
+                }),
+            );
+            Json(json!({
+                "ok": true, "approved": true, "approval_id": id,
+                "sent_for_session": session,
+                "id": res.get("id").cloned().unwrap_or(Value::Null),
+                "thread_id": res.get("thread_id").cloned().unwrap_or(Value::Null),
+                "to": res.get("to").cloned().unwrap_or(Value::Null),
+            }))
+            .into_response()
+        }
+    }
+}
+
+/// GET /api/email/approvals — pending approvals for the dashboard / a
+/// human's curl. Previews only; the frozen payload stays server-side.
+pub async fn list_approvals(Extension(ctx): Extension<Arc<EmailCtx>>) -> Response {
+    let pending = crate::api::email_approval::list_pending(ctx.client.home());
+    Json(json!({
+        "pending": pending,
+        "approve_with": "POST /api/email/approve/<id> from a human context (no worker origin header)",
+    }))
+    .into_response()
 }
 
 // ---- GET /api/email/inbox -------------------------------------------------
@@ -1144,7 +1408,9 @@ mod tests {
             &app,
             "POST",
             "/api/email/send",
-            Some(json!({ "to": "x@y.co", "subject": "s", "body": "b",
+            // Internal recipient: the AMUX-3510 gate must not preempt the
+            // 501 this test pins (external+worker is gated first by design).
+            Some(json!({ "to": "ops@mixpeek.com", "subject": "s", "body": "b",
                          "from": "other@nowhere.com", "force_new_thread": true })),
             &[("x-amux-session", "gtm-lane")],
         )
@@ -1188,7 +1454,10 @@ mod tests {
             &app,
             "POST",
             "/api/email/send",
-            Some(json!({ "to": "x@customer.com", "subject": "Hi", "body": "hello",
+            // ops@mixpeek.com: INTERNAL, so this stays a plain attributed
+            // send — worker sends to external recipients are the approval
+            // gate's own cells now (AMUX-3510).
+            Some(json!({ "to": "ops@mixpeek.com", "subject": "Hi", "body": "hello",
                          "from": ACCT, "cc": "" })),
             &[("x-amux-session", "tester-session")],
         )
@@ -1206,7 +1475,7 @@ mod tests {
         assert_eq!(log["count"], json!(1));
         assert_eq!(log["log"][0]["session"], json!("tester-session"));
         assert_eq!(log["log"][0]["endpoint"], json!("send"));
-        assert_eq!(log["log"][0]["to"], json!("x@customer.com"));
+        assert_eq!(log["log"][0]["to"], json!("ops@mixpeek.com"));
         // ...and the filter works both ways.
         let (_, none) =
             send_req(&app, "GET", "/api/email/log?session=unattributed", None, &[]).await;
@@ -1296,6 +1565,12 @@ mod tests {
     #[tokio::test]
     async fn reply_happy_path_reports_threading_proof() {
         let home = temp_home();
+        // w1 is EXEMPTED below: derive_reply_plan refuses all-internal
+        // threads by construction, so every worker reply is external-facing
+        // and would hit the AMUX-3510 gate — the exemption keeps this the
+        // plain threading-proof case AND exercises the env knob end to end.
+        std::fs::write(home.path().join("server.env"), "AMUX_EMAIL_EXTERNAL_EXEMPT=w1\n")
+            .unwrap();
         let orig = json!({
             "id": "g1", "threadId": "T1",
             "payload": { "headers": [
@@ -1412,5 +1687,201 @@ mod tests {
             }
             other => panic!("expected Unavailable, got {other:?}"),
         }
+    }
+
+    // ---- AMUX-3510: the external-send approval gate ------------------------
+    //
+    // Ethan's acceptance, in his words: "workers can never send emails to
+    // people without explicit permissions." Each cell is a path that must
+    // HOLD the send, next to the paths that must still flow — a
+    // gate-everything bug and a gate-nothing bug look identical if only one
+    // side is tested.
+
+    #[tokio::test]
+    async fn a_worker_external_send_is_frozen_not_sent() {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            // Deliberately includes a send answer: if the gate leaks, the mock
+            // WOULD answer and the test still fails on the status — the mock
+            // never masks a leak as a transport error.
+            ("GET", "/messages?q=", 200, json!({ "messages": [] })),
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "leak", "threadId": "t" })),
+        ]);
+        let (app, _d, _r) = app_with(http.clone(), home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "hilmar.koch@autodesk.com", "subject": "Update",
+                         "body": "hello", "from": ACCT })),
+            &[("x-amux-session", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{res}");
+        assert_eq!(res["code"], json!("approval_required"));
+        let apr = res["approval_id"].as_str().unwrap().to_string();
+        assert!(crate::api::email_approval::valid_id(&apr));
+        assert_eq!(res["preview"]["external_recipients"][0], json!("hilmar.koch@autodesk.com"));
+        // NOTHING reached the transport.
+        assert!(
+            http.calls.lock().unwrap().iter().all(|(m, u, _)| !(m == "POST" && u.contains("/send"))),
+            "the gate must hold the send, not fire it"
+        );
+        // The hold is visible where a human looks: the approvals list and the
+        // audited email log (a gated send nobody approves must leave a trace).
+        let (_, lst) = send_req(&app, "GET", "/api/email/approvals", None, &[]).await;
+        assert_eq!(lst["pending"][0]["id"], json!(apr));
+        assert_eq!(lst["pending"][0]["session"], json!("autodesk"));
+        let log = crate::integrations::email::read_email_log(home.path(), 1, 50, "");
+        let held = log["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x.get("blocked") == Some(&json!("approval_required")))
+            .expect("the hold must be a ledger row");
+        assert_eq!(held["approval_id"], json!(apr));
+        assert_eq!(held["session"], json!("autodesk"));
+    }
+
+    #[tokio::test]
+    async fn a_human_send_and_an_exempt_lane_still_flow() {
+        // Human context (no worker origin): external sends flow — the
+        // dashboard composer is Ethan himself.
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/messages?q=", 200, json!({ "messages": [] })),
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "m9", "threadId": "t9" })),
+        ]);
+        let (app, _d, _r) = app_with(http, home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "ceo@customer.com", "subject": "Hi", "body": "b",
+                         "from": ACCT, "force_new_thread": true })),
+            &[],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{res}");
+        assert_eq!(res["id"], json!("m9"));
+
+        // Exempt lane (server.env, Ethan's one line): flows with its origin.
+        let home2 = temp_home();
+        std::fs::write(home2.path().join("server.env"), "AMUX_EMAIL_EXTERNAL_EXEMPT=gtm-ticker\n")
+            .unwrap();
+        let http2 = MockHttp::new(vec![
+            ("GET", "/messages?q=", 200, json!({ "messages": [] })),
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "m10", "threadId": "t10" })),
+        ]);
+        let (app2, _d2, _r2) = app_with(http2, home2.path());
+        let (st, res) = send_req(
+            &app2,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "lead@prospect.com", "subject": "Hi", "body": "b",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "gtm-ticker")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{res}");
+    }
+
+    #[tokio::test]
+    async fn approve_is_human_only_one_shot_and_audited() {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "rel1", "threadId": "tr1" })),
+        ]);
+        let (app, _d, _r) = app_with(http, home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "cto@customer.com", "subject": "Q", "body": "draft",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        let apr = res["approval_id"].as_str().unwrap().to_string();
+
+        // A worker cannot approve — its own or anyone's (the exact loop the
+        // gate exists to break).
+        let (st, e) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{apr}"),
+            None,
+            &[("x-amux-session", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN);
+        assert_eq!(e["code"], json!("worker_cannot_approve"));
+
+        // The human release sends the FROZEN draft and audits both halves.
+        let (st, ok) =
+            send_req(&app, "POST", &format!("/api/email/approve/{apr}"), None, &[]).await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        assert_eq!(ok["approved"], json!(true));
+        assert_eq!(ok["id"], json!("rel1"));
+        assert_eq!(ok["sent_for_session"], json!("autodesk"));
+        let log = crate::integrations::email::read_email_log(home.path(), 1, 50, "");
+        let sent = log["log"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|x| x.get("approved") == Some(&json!(true)))
+            .expect("the approved send must be a ledger row");
+        assert_eq!(sent["approval_id"], json!(apr));
+        assert_eq!(sent["session"], json!("autodesk"), "the AUTHOR stays on the row");
+        assert!(sent["approved_by"].as_str().unwrap().contains("dashboard"));
+
+        // One-shot: the same approval cannot release twice.
+        let (st, _) =
+            send_req(&app, "POST", &format!("/api/email/approve/{apr}"), None, &[]).await;
+        assert_eq!(st, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_worker_reply_is_frozen_with_the_threads_resolved_fanout() {
+        // The incident's vector: one reply call, recipients the caller never
+        // named. The preview must carry the RESOLVED fan-out.
+        let home = temp_home();
+        let orig = json!({
+            "id": "g1", "threadId": "T1",
+            "payload": { "headers": [
+                { "name": "Message-ID", "value": "<deal@adsk>" },
+                { "name": "Subject", "value": "Rollout" },
+                { "name": "From", "value": "hilmar.koch@autodesk.com" },
+                { "name": "To", "value": format!("{ACCT}, jonathan.brooks@autodesk.com") },
+            ]},
+        });
+        let http = MockHttp::new(vec![
+            ("GET", "q=rfc822msgid", 200, json!({ "messages": [{ "id": "g1" }] })),
+            ("GET", "/messages/g1", 200, orig),
+            ("POST", "/messages/send", 200, json!({ "id": "leak", "threadId": "T1" })),
+        ]);
+        let (app, _d, _r) = app_with(http.clone(), home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/reply",
+            Some(json!({ "message_id": "<deal@adsk>", "body": "sounds good",
+                         "from": ACCT, "reply_all": true })),
+            &[("x-amux-worker", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{res}");
+        assert_eq!(res["code"], json!("approval_required"));
+        let ext = res["preview"]["external_recipients"].as_array().unwrap();
+        assert_eq!(ext.len(), 2, "both thread participants the caller never named: {ext:?}");
+        assert!(
+            http.calls.lock().unwrap().iter().all(|(m, u, _)| !(m == "POST" && u.contains("/send"))),
+            "the reply must be held, not sent"
+        );
     }
 }

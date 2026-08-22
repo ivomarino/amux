@@ -19,6 +19,7 @@ pub mod connectors;
 pub mod dictation;
 pub mod tts;
 pub mod email;
+pub mod email_approval;
 pub mod file_viewer;
 pub mod files;
 pub mod fs;

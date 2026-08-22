@@ -1099,6 +1099,47 @@ impl GmailClient {
         }
     }
 
+    /// The RESOLVED recipients of a would-be reply, WITHOUT sending
+    /// (AMUX-3510). The approval gate must classify a reply's fan-out
+    /// before anything reaches the wire — the incident's own vector was a
+    /// reply whose one call reached four people the caller never named.
+    /// Runs the same lookup + derive_reply_plan the real send runs, so the
+    /// gate and the send can never disagree about who a reply goes to.
+    pub async fn resolve_reply_recipients(
+        &self,
+        account: &str,
+        rfc822_message_id: &str,
+        reply_all: bool,
+        allow_self: bool,
+    ) -> Result<(String, String, String), String> {
+        let mut orig = self.find_message_by_rfc822(account, rfc822_message_id).await;
+        if orig.is_none() {
+            for acct in self.connected_accounts() {
+                if acct == account {
+                    continue;
+                }
+                if let Some(found) = self.find_message_by_rfc822(&acct, rfc822_message_id).await {
+                    orig = Some(found);
+                    break;
+                }
+            }
+        }
+        let Some(orig) = orig else {
+            return Err("message not found in any connected account — check message_id".into());
+        };
+        let headers = header_map(&orig);
+        let connected = self.connected_accounts();
+        let plan = derive_reply_plan(
+            &headers,
+            rfc822_message_id,
+            account,
+            &connected,
+            reply_all,
+            allow_self,
+        )?;
+        Ok((plan.to, plan.cc, plan.subject))
+    }
+
     /// Python `_gmail_reply_send`: reply in-thread (clean body + signature,
     /// correct In-Reply-To/References/threadId) to the message identified by
     /// its RFC822 Message-ID. Cross-account: a thread living on another
