@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.699';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.700';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16281,7 +16281,24 @@ async function openMdaiNode(path, opts) {
   } catch (e) {}
   await _mdaiLoadHistory();
   if (opts.autorun === false) { _mdaiRender(); }
-  else { await _mdaiRun({ fromOpen: true }); }
+  else {
+    // SHOW THE LAST RESULT FIRST, then refresh behind it (Ethan, 2026-08-22:
+    // "Running the chain… takes forever").
+    //
+    // Measured on Priorities.mdai: 53 runs, `cached:false` on EVERY one, each
+    // 102-115s server-side. The cache cannot help here and it is not broken —
+    // the only source is `amux:messages?days=7`, whose content moves whenever
+    // any lane sends a message, so `inputs_hash` changes between any two runs
+    // on a live fleet. A time-windowed source is uncacheable by construction.
+    //
+    // So every open paid a full model call while the body showed a spinner and
+    // nothing else, for roughly two minutes. The previous output was already
+    // in hand — `_mdaiLoadHistory()` above just fetched it — and was being
+    // thrown away in favour of an empty box. Render it, then let the refresh
+    // land on top: the run is unchanged, only the waiting is.
+    if (_mdaiHist.length) { _mdaiRender(); _mdaiRun({ fromOpen: false }); }
+    else { await _mdaiRun({ fromOpen: true }); }
+  }
 }
 function closeMdaiNode() {
   document.getElementById('mdai-overlay').classList.remove('active');
@@ -16304,6 +16321,12 @@ async function _mdaiRun(opts) {
   opts = opts || {};
   const btn = document.getElementById('mdai-run-btn');
   if (btn) { btn.disabled = true; btn.dataset.label = btn.textContent; btn.textContent = 'Running…'; }
+  // The button label IS the refresh indicator, and it is deliberately the only
+  // one: a background refresh over a rendered result must be visible, or stale
+  // content reads as current. I nearly added a separate #mdai-stale element
+  // here — there is no such element, so the line would have been a silent
+  // no-op under a comment claiming it said something. The button exists and is
+  // already on screen.
   const bodyEl = document.getElementById('mdai-body');
   if (opts.fromOpen && bodyEl) bodyEl.innerHTML = '<div style="padding:18px;color:var(--dim);">Running the chain…</div>';
   try {
