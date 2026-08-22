@@ -44,6 +44,18 @@ msg_file="$1"
 # apart.
 stamp="${AMUX_SESSION:-(human)}"
 
+# Guarantee the final newline BEFORE handing the file to interpret-trailers.
+# On a message file whose last line lacks its terminator, git (measured on
+# 2.39) glues the trailer straight onto that line — subject and trailer
+# become ONE paragraph, the trailer is unparseable, and the push guard then
+# reads the session's own commit as foreign and blocks its push (2026-08-22:
+# a merge commit's stamp rendered as "...'origin/main' Amux-Session: amux"
+# and cost an amend-under-pin dance to ship). No-op on well-formed files;
+# empty files are left alone (nothing to stamp a paragraph onto).
+if [ -s "$msg_file" ] && [ -n "$(tail -c 1 "$msg_file")" ]; then
+  echo >> "$msg_file"
+fi
+
 git interpret-trailers --in-place --if-exists doNothing \
   --trailer "Amux-Session: $stamp" "$msg_file" 2>/dev/null || {
   # Ancient git without interpret-trailers: fall back to a plain paragraph

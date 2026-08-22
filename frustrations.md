@@ -2155,3 +2155,32 @@ FIX: both the count and the oldest-commit age in .claude/session-freshness.sh no
   the builder's own pathspec, with the incident recorded at the site. Verified live on
   the specimen: server at fc62250 with 2 commits upstream, all-commits count 2,
   build-relevant count 0 — silent, correctly.
+
+---
+
+## My own merge commit read as foreign to the push guard: the session stamp fused into the subject on a newline-less message file
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-22
+SESSION: amux
+CARD: AMUX-2872
+SYMPTOM: A routine `git merge origin/main --no-edit` + push got PUSH BLOCKED: "1 commit
+  authored by another session ... (no Amux-Session trailer): d1228ee Merge remote-tracking
+  branch 'origin/main' Amux-Session: amux". The stamp is RIGHT THERE in the guard's own
+  output — fused onto the subject line. Reproduced: `git interpret-trailers` (git 2.39),
+  handed a message file whose last line lacks its trailing newline, glues the trailer
+  directly onto that line instead of opening a new paragraph, so subject+trailer become one
+  paragraph and the trailer parser cannot see it. prepare-commit-msg's own header comment
+  recounts three prior hand-rolled-append failure modes and concludes "git ships the parser
+  that handles all four; stop reimplementing it" — and the shipped parser has a fifth mode.
+COST: a blocked push, then an amend that the shared-checkout guard (correctly) blocked
+  twice more — once for a missing pin, once because the guard cannot evaluate a $VAR pin,
+  needing the literal sha — so shipping one clean merge took four attempts. Worse if
+  unnoticed: every future merge commit by any lane would render untrailered, and the deploy
+  recipe says treat [] as foreign, so routine merges would accumulate as unpushable-looking
+  commits owned by nobody.
+FIX: scripts/git-hooks/prepare-commit-msg now guarantees the file's final newline before
+  invoking interpret-trailers (no-op on well-formed files, empty files left alone);
+  installed via install-hooks.sh, verified on the reproduced specimen plus well-formed and
+  empty cells. The already-pushed ac6f8b3 was repaired by a pinned message-only amend.
