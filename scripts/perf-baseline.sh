@@ -64,9 +64,30 @@ M3=$(measure board "https://localhost:$PORT/api/board" auth)
 M4=$(measure board_full "https://localhost:$PORT/api/board?done_limit=0" auth)
 M5=$(measure workers "https://localhost:$PORT/api/workers" auth)
 RSS_MB=$(ps -o rss= -p "$SERVER_PID" | awk '{print int($1/1024)}')
+# DIRTY (live) heap alongside RSS (AMUX-3488). Measured 2026-08-22: across
+# repeated identical 30MB responses RSS climbed 176->229MB while malloc-dirty
+# sat flat at 30-33MB — RSS retains FREED transient serialization peaks as
+# clean-resident pages (macOS MADV_FREE; reclaimed only under pressure), so
+# it measures allocator weather scaled by payload sizes, which is also the
+# ±28% CI "noise". Dirty is the live heap: the number a LEAK actually moves.
+# Linux: Private_Dirty from smaps_rollup; macOS: the MALLOC rows' DIRTY
+# column summed. Empty when neither works (never fake a 0 — an absent
+# measurement must not read as a tiny heap).
+DIRTY_MB=""
+if [ -r "/proc/$SERVER_PID/smaps_rollup" ]; then
+  DIRTY_MB=$(awk '/^Private_Dirty:/{print int($2/1024)}' "/proc/$SERVER_PID/smaps_rollup")
+elif command -v vmmap >/dev/null 2>&1; then
+  DIRTY_MB=$(vmmap --summary "$SERVER_PID" 2>/dev/null | awk '
+    /^MALLOC/ {
+      v=$4  # DIRTY SIZE column of the region-type table
+      mult = (v ~ /G$/) ? 1024 : (v ~ /K$/) ? 1/1024 : 1
+      gsub(/[KMG]$/, "", v); total += v * mult
+    }
+    END { if (total > 0) print int(total) }')
+fi
 BOARD_BYTES=$(curl -sk -H "Authorization: Bearer $TOKEN" "https://localhost:$PORT/api/board" | wc -c | tr -d ' ')
 
-echo "{ $M1, $M2, $M3, $M4, $M5, \"rss_mb\": $RSS_MB, \"board_default_bytes\": $BOARD_BYTES }"
+echo "{ $M1, $M2, $M3, $M4, $M5, \"rss_mb\": $RSS_MB, \"dirty_mb\": ${DIRTY_MB:-null}, \"board_default_bytes\": $BOARD_BYTES }"
 
 # Target assertions — each CAN fail (ethos 7).
 #
@@ -90,4 +111,15 @@ avg() { echo "$1" | sed 's/.*_avg_ms": \([0-9]*\).*/\1/'; }
 [ "$(avg "$M2")" -lt 50 ] || { echo "FAIL: health >= 50ms"; fail=1; }
 [ "$(avg "$M3")" -lt 200 ] || { echo "FAIL: board >= 200ms"; fail=1; }
 [ "$RSS_MB" -lt "$RSS_MAX_MB" ] || { echo "FAIL: RSS ${RSS_MB}MB >= ${RSS_MAX_MB}MB (ceiling: PERF_RSS_MAX_MB, provenance above)"; fail=1; }
+# The LEAK detector (AMUX-3488): dirty is live heap, so unlike RSS it does
+# not inherit allocator weather — measured 30-45MB today on both a fresh
+# boot and after the battery. 250 is deliberately generous until the first
+# CI (Linux) reading lands; tighten it then. Skipped, loudly, when the
+# platform gave no reading — an absent number is not a passing one.
+DIRTY_MAX_MB="${PERF_DIRTY_MAX_MB:-250}"
+if [ -n "$DIRTY_MB" ]; then
+  [ "$DIRTY_MB" -lt "$DIRTY_MAX_MB" ] || { echo "FAIL: dirty (live) heap ${DIRTY_MB}MB >= ${DIRTY_MAX_MB}MB — unlike RSS this is NOT allocator weather; suspect a real leak or a new resident cache"; fail=1; }
+else
+  echo "NOTE: dirty heap unmeasurable on this platform — the leak gate did not run"
+fi
 [ "$fail" -eq 0 ] && echo "BASELINE PASSED" || exit 1

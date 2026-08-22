@@ -62,6 +62,10 @@ THRESHOLDS: dict[str, tuple[float, str]] = {
     "workers_avg_ms":     (0.10, "RR-0117b: latency +10% fails"),
     "search_avg_ms":      (0.10, "RR-0110: FTS5 query latency"),
     "rss_mb":             (0.20, "RR-0117b: RSS +20% fails"),
+    # Dirty is LIVE heap — the number a leak moves, immune to the freed-page
+    # retention that makes RSS allocator weather (AMUX-3488). Tighter delta
+    # than RSS on purpose: this one is stable enough to hold it.
+    "dirty_mb":           (0.20, "AMUX-3488: live-heap +20% fails — not allocator weather"),
     "binary_bytes":       (0.20, "RR-0117b: binary size +20% growth blocks merge"),
     "board_default_bytes": (0.20, "payload size: a silent 20% growth is a mobile regression (amux is mobile-first)"),
 }
@@ -83,6 +87,10 @@ ABSOLUTE_MAX: dict[str, float] = {
     # so the two spellings of this ceiling cannot drift apart; the anti-creep
     # purpose above survives because the number is again fixed.
     "rss_mb": float(os.environ.get("PERF_RSS_MAX_MB", "280")),
+    # Live-heap ceiling (AMUX-3488): measured 30-45MB on 2026-08-22, fresh
+    # boot and post-battery alike. 250 is generous until the first CI (Linux)
+    # reading lands — tighten it then. Same knob as perf-baseline.sh.
+    "dirty_mb": float(os.environ.get("PERF_DIRTY_MAX_MB", "250")),
 }
 
 # Noise floor. Below this, a percentage is meaningless: 2ms -> 3ms is +50% and
