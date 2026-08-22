@@ -2184,3 +2184,48 @@ FIX: scripts/git-hooks/prepare-commit-msg now guarantees the file's final newlin
   invoking interpret-trailers (no-op on well-formed files, empty files left alone);
   installed via install-hooks.sh, verified on the reproduced specimen plus well-formed and
   empty cells. The already-pushed ac6f8b3 was repaired by a pinned message-only amend.
+
+---
+
+## perf-baseline.sh cannot take its DB copy while anything writes: .backup restarts forever
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-22
+SESSION: amux
+CARD: AMUX-3491
+SYMPTOM: scripts/perf-baseline.sh sat in its first step (sqlite3 .backup of the live
+  2.1GB DB) past a 3-minute and then a 9-minute timeout, leaving orphaned
+  /tmp/amux-perf.* dirs. The backup API restarts from scratch on every source write,
+  and the AMUX-3489 retention trim was landing a delete batch every cycle — so the
+  copy could never finish while the server was draining, which is exactly when you
+  want to measure. A 25s probe confirmed: 655MB copied, still restarting. The same
+  instrument ran fine that morning (pre-drain), so the failure looked like a hang in
+  my change rather than the copy step.
+COST: ~15 minutes of dead timeouts mid-investigation, two orphaned partial copies,
+  and the fresh-boot baseline re-measure for AMUX-3491/3488 pushed behind the drain.
+FIX: the script now uses VACUUM INTO (one WAL read snapshot, immune to writer
+  restarts; 4s where .backup never finished). Layout is compacted vs production —
+  noted in the script, moves the numbers once, on the record.
+
+---
+
+## staged-guard named a co-editing session that never edited the file — ownership inferred from API traffic
+AREA: attribution
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux
+CARD: AMUX-3497
+SYMPTOM: committing board_store.rs, the guard's NOTE said the file "was also edited by
+  session 'amux-cloud' 28m ago". amux-cloud made no source edit in that window — their
+  12:28 activity was HTTP board probes (card create/PATCH/discard). The edit-ownership
+  row behind d.get("shared") attributed a FILE edit to API traffic against the
+  subsystem.
+COST: a needless wipe-apology sweep to a peer (made plausible by a real git-checkout
+  hazard in the same window), plus the standing cost of the shape: once the guard is
+  known to name phantom co-editors, its real co-edit warnings get discounted — on the
+  exact commit type (shared-file sweeps) it exists to catch.
+FIX: open — AMUX-3497 names the direction: the ownership row must carry HOW it knows
+  (tool-edit evidence vs inference), and an inference that cannot distinguish a curl
+  from an Edit cannot carry an ownership claim.

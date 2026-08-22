@@ -19,7 +19,16 @@ WORK="$(mktemp -d /tmp/amux-perf.XXXXXX)"
 PORT=18911
 trap 'kill "$SERVER_PID" 2>/dev/null || true; rm -rf "$WORK"' EXIT
 
-sqlite3 "file:${LIVE_DB}?mode=ro" ".backup '$WORK/amux.db'"
+# VACUUM INTO, not .backup (AMUX-3491, 2026-08-22). The backup API restarts
+# from scratch whenever a writer touches the source, so against a DB under
+# steady write load (the invariant-log trim was landing a batch every cycle)
+# .backup NEVER completes — two runs of this script sat in the copy step past
+# 3 and 9 minute timeouts, while VACUUM INTO finished in 4s: it runs inside
+# one WAL read snapshot, which writers cannot invalidate. Cost of the switch:
+# the copy is COMPACTED, so its page layout is tidier than production's and
+# RSS/latency read marginally flatter — second-order against the growth this
+# instrument tracks, and it moves the numbers ONCE, on the record here.
+sqlite3 "file:${LIVE_DB}?mode=ro" "VACUUM INTO '$WORK/amux.db'"
 
 AMUX_HOME="$WORK" AMUX_DB="$WORK/amux.db" AMUX_RS_PORT=$PORT \
   "${AMUX_RS_BIN:-./target/release/amux-server}" >"$WORK/server.log" 2>&1 &
