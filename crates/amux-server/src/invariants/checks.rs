@@ -64,6 +64,24 @@ fn gateway_owned(path: &str) -> bool {
     })
 }
 
+/// Families whose ABSENCE is a documented product state with a GUARDED caller
+/// (AMUX-3468). `/api/tunnel/*`: the python-era tunnel API was never ported;
+/// the one caller (`amux tunnel`, AF-63) PREFLIGHTS /api/tunnel/status and
+/// prints "not available in this server build" instead of failing blind — so
+/// the census's own why_it_matters ("silent capability loss unless the client
+/// fails loudly") does not apply, and a permanent red here trains readers to
+/// skim the rows that matter (the AF-132 lesson). Entries are prefixes ending
+/// in `/`. The exclusion is SELF-EXPIRING both ways: if the family gets
+/// mounted, the stale entry FAILS the census naming itself for deletion; and
+/// if the guarded caller is ever removed, the call site disappears from the
+/// census with it. Porting-or-removing tunnel is a product call (Ethan's),
+/// tracked on AMUX-3468.
+const CALLER_GUARDED_ABSENT: &[&str] = &["/api/tunnel/"];
+
+fn caller_guarded_absent(path: &str) -> bool {
+    CALLER_GUARDED_ABSENT.iter().any(|p| path.starts_with(p))
+}
+
 pub fn route_callers_have_routes(
     mounted: &[(&str, &[&str])],
     callers: &[CallerPath],
@@ -98,6 +116,29 @@ pub fn route_callers_have_routes(
             if let RouteMatch::MethodNotAllowed(_) = verdict {
                 verdict = RouteMatch::Ok;
             }
+        }
+        // Documented-absent family with a guarded caller: Missing is the
+        // EXPECTED state and passes with the license named; anything else
+        // (the family got mounted, or a verb mismatch) means the exclusion
+        // is STALE and must fail so the entry gets deleted.
+        if caller_guarded_absent(&c.path) {
+            match verdict {
+                RouteMatch::Missing => {
+                    out.push(InvariantResult::pass(ID).entity(format!("{} {}", c.method, c.path)));
+                }
+                _ => out.push(
+                    InvariantResult::fail(
+                        ID,
+                        format!("{} stays in CALLER_GUARDED_ABSENT only while unrouted", c.path),
+                        format!(
+                            "{} now has a mounted route — the CALLER_GUARDED_ABSENT entry is                              STALE; delete it so the census guards this family again",
+                            c.path
+                        ),
+                    )
+                    .entity(format!("{} {}", c.method, c.path)),
+                ),
+            }
+            continue;
         }
         match verdict {
             RouteMatch::Missing => out.push(
@@ -2055,6 +2096,36 @@ mod negative_controls {
         let lanes = vec![LaneReport { name: "solo".into(), report_age_s: Some(999_999.0) }];
         let rs = self_reports_landing(&lanes, 10, 3600.0);
         assert_eq!(rs[0].status, Status::Unknown, "too-small fleet must be Unknown: {rs:?}");
+    }
+
+    /// AMUX-3468 both directions: a guarded-absent family (tunnel, AF-63
+    /// preflight) PASSES while unrouted — a permanent red on a documented
+    /// absence trains skimming — and the exclusion SELF-EXPIRES: mounting the
+    /// family turns the entry itself into the failure. A sibling near-miss
+    /// stays guarded (the over-exclusion hazard the GATEWAY_OWNED comment
+    /// warns about).
+    #[test]
+    fn a_caller_guarded_absent_family_passes_until_it_is_mounted() {
+        let mounted: Vec<(&str, &[&str])> = vec![("/api/board", &["GET"])];
+        let callers = vec![
+            CallerPath { method: "POST".into(), path: "/api/tunnel/start".into(),
+                         source: "amux-cli".into(), interpolated: false, method_known: true },
+            CallerPath { method: "GET".into(), path: "/api/tunnel2/x".into(),
+                         source: "amux-cli".into(), interpolated: false, method_known: true },
+        ];
+        let rs = route_callers_have_routes(&mounted, &callers);
+        let by_ent = |e: &str| rs.iter().find(|r| r.entity_key == e).unwrap();
+        assert_eq!(by_ent("POST /api/tunnel/start").status, Status::Pass,
+                   "documented absence with a preflighting caller must not be a permanent red");
+        assert_eq!(by_ent("GET /api/tunnel2/x").status, Status::Fail,
+                   "a sibling outside the prefix stays guarded");
+        // Mount the family: the exclusion is now stale and must SAY SO.
+        let mounted2: Vec<(&str, &[&str])> =
+            vec![("/api/board", &["GET"]), ("/api/tunnel/start", &["POST"])];
+        let rs2 = route_callers_have_routes(&mounted2, &callers);
+        let row = rs2.iter().find(|r| r.entity_key == "POST /api/tunnel/start").unwrap();
+        assert_eq!(row.status, Status::Fail);
+        assert!(row.observed.contains("STALE"), "{}", row.observed);
     }
 
     /// AF-137 both directions: unowned auto-filed cards must go RED naming
