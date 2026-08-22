@@ -2089,3 +2089,42 @@ FIX: none here — this IS AMUX-1315 (per-lane worktrees), and today is its stro
   argument yet: the workaround everyone reaches for (an isolated worktree to get a stable
   tree) is the proposal itself, applied by hand, per victim, per incident. The count now
   argues for the build.
+
+---
+
+## A mutation that disabled a safety guard performed the unguarded action for real, and the residue poisoned every later local run
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-22
+SESSION: amux-frustrations
+CARD: AF-142
+SYMPTOM: My test `a_missing_working_directory_is_created_not_refused` used a LITERAL RELATIVE
+  path ("some/relative/path-that-does-not-exist") to exercise the branch that refuses relative
+  paths, because a relative path is the only way to reach that branch. While mutation-testing
+  the fix I disabled that very guard (`if !p.is_absolute()` -> `if false`) to confirm the test
+  could fail — and the test then did what the unguarded code says: `create_dir_all` resolved
+  the fixture against the TEST's cwd, the shared checkout, and created it. The mutation was
+  reverted a second later. The directory was not. Residue mtime 09:09; my commit 09:10.
+  From then on `ensure_work_dir` short-circuited on `is_dir()` for that path, so the test
+  asserted a refusal that no longer happened and went red on this machine — while CI, with a
+  fresh checkout every run, stayed green. amux found it blocking an unrelated commit's gate
+  and cleaned it in 67137cc.
+COST: a red test on correct code, discovered by a peer while it blocked THEIR gate, and the
+  failure was neither their code nor mine — it was a file. On a shared checkout the blast
+  radius is every lane, not just the author, and the CI-green/local-red split is the part that
+  makes it expensive: the one instrument everybody trusts is structurally unable to see it,
+  because hermeticity-by-fresh-checkout hides exactly this class.
+FIX: shipped by amux in 67137cc — the fixture clears its own residue before asserting, with
+  the mechanism written down. Recording the two durable halves, because the fix is local and
+  the lessons are not:
+  1. A MUTATION THAT DISABLES A GUARD PERFORMS THE UNGUARDED ACTION. Mutation testing is
+     usually reasoned about as "does the assertion fire", but the mutant runs the real code
+     path with the safety off, and any side effect it has on disk, in a DB or over the network
+     outlives the revert. Before mutating a guard OFF, ask what the code does without it —
+     that is precisely what the guard exists to prevent, so the answer is never nothing.
+  2. A LITERAL RELATIVE PATH IN A FIXTURE IS HERMETIC ONLY ON A FRESH CHECKOUT. CI can never
+     see it fail and a machine with history can never see it pass, which inverts the usual
+     trust relationship between the two. If a test must use a relative path to reach a branch,
+     it owns cleaning up after itself; tempdirs cannot help, because a path under a tempdir is
+     no longer relative.
