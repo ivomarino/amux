@@ -1329,6 +1329,17 @@ pub(crate) fn nearest_routes(path: &str, n: usize) -> Vec<&'static str> {
 
 /// Bound on rows a single analyze/stats call will scan — 14 days of retained
 /// traffic fits comfortably; the cap only exists so no request is unbounded.
+///
+/// A cap's DIRECTION is part of its correctness, not an implementation detail
+/// (AF-131). Both consumers must scan `ORDER BY ts DESC` so the capped slice
+/// is the TRAILING window: with no ORDER BY (stats) and an explicit ASC
+/// (analyze), truncation kept the oldest rows — a "trailing norm" that was
+/// actually days 8-5 fabricated a 6.46x p95 finding (honest: 1.07x), and a
+/// what-is-failing instrument would have dropped the newest errors, the
+/// actionable end. Anything that keys on iteration position (first/last_ts,
+/// sample choice) must be order-independent, or flipping the scan direction
+/// creates the inverse defect — see the min/max and sample_ts rules in the
+/// group assembly.
 const ANALYZE_SCAN_CAP: i64 = 200_000;
 /// Groups returned by /analyze (sorted by count desc before the cut).
 const ANALYZE_GROUP_CAP: usize = 200;
