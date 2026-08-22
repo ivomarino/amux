@@ -7863,7 +7863,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.703';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.704';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -21488,7 +21488,7 @@ async function fetchBoard() {
       // save guard. The edit modal is the one that mattered: it filled its
       // textarea from the list item and saved that back, so flipping this line
       // first would have blanked the description of every card anyone opened.
-      fetch(API + '/api/board?archived=0&slim=1', _boardEtag ? { headers: boardHeaders } : undefined),
+      fetch(API + '/api/board?archived=0&slim=1&quota=1', _boardEtag ? { headers: boardHeaders } : undefined),
       fetch(API + '/api/board/statuses'),
       fetch(API + '/api/board/session-gates'),
     ]);
@@ -26307,6 +26307,8 @@ let _sseRetries = 0;
 let _sseFallback = false;
 let _pollTimer = null;
 
+let _invBoardTimer = null;
+let _invSessTimer = null;
 function connectSSE() {
   if (_sseFallback || _sse) return;
   _sse = new EventSource(_authUrl(API + '/api/events'));
@@ -26326,7 +26328,7 @@ function connectSSE() {
     }
     try {
       const msg = JSON.parse(e.data);
-      if (msg.type === 'workers') {
+      if (msg.type === 'workers' || msg.type === 'sessions') {
         const j = JSON.stringify(msg.payload);
         if (j !== lastSessionsJSON) {
           const firstLoad = !lastSessionsJSON;
@@ -26408,6 +26410,18 @@ function connectSSE() {
           // render a note or a contact.
           if (key === 'journal') {
             if (activeView === 'journal') _journalLoad();
+          }
+          // AMUX-3503: the server no longer pushes full board/sessions lists
+          // over SSE (1,060KB raw per connect + per change); it sends these
+          // keys and the client refetches through the gzipped, ETag'd path.
+          // Coalesced per key so an event burst is one fetch.
+          if (key === 'board') {
+            clearTimeout(_invBoardTimer);
+            _invBoardTimer = setTimeout(fetchBoard, 400);
+          }
+          if (key === 'sessions') {
+            clearTimeout(_invSessTimer);
+            _invSessTimer = setTimeout(fetchSessions, 400);
           }
         }
       } else if (msg.type === 'ping') {
@@ -26533,7 +26547,11 @@ if (window._peekEmbed) {
   // Verified by hand on the stuck page: one fetchSessions() cleared the spinner and
   // rendered the workers immediately — the client was correct, nothing had ever
   // invoked it. The peek-embed branch above already did exactly this.
+  // fetchBoard too (AMUX-3503): the initial board used to arrive as an SSE
+  // full push; the server now sends hello + invalidates only, so a fresh
+  // boot must fetch or it renders the cached board until something changes.
   fetchSessions();
+  fetchBoard();
   connectSSE();
   fetchSchedules().then(() => render());
 }

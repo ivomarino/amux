@@ -199,6 +199,9 @@ async fn get_contract(
                         prose) — the DEFAULT shape since AMUX-3496",
                 "full": "1 = full prose bodies (desc + log). The default list is slim; a \
                          reader that needs desc/log must ask (slim=0 also honored)",
+                "quota": "1 = per-status terminal quotas (verified floor 300; done/discarded \
+                          share done_limit) instead of the lumped cap — the dashboard poll's \
+                          shape (AMUX-3503)",
             },
             "not_a_filter": {
                 "q / query / search": "REFUSED with 400 — /api/board does not search, it would \
@@ -1071,6 +1074,13 @@ pub struct ListParams {
     // Explicit `slim=0` is honored as full for legacy callers.
     #[serde(default)]
     pub full: Option<String>,
+    // `?quota=1` (AMUX-3503) — per-status terminal quotas instead of the
+    // lumped cap: verified keeps its own 300-floor so a bulk-verify stays
+    // visible, done/discarded share done_limit. These were the SSE board
+    // push's semantics; the dashboard poll asks for them here now that it
+    // renders from the fetch path and the full-push is retired.
+    #[serde(default)]
+    pub quota: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -1114,7 +1124,7 @@ pub struct ListParams {
 /// announces the terminal cap. (`q`/`query`/`search` are here because they are
 /// consumed above — refused with a 400 — so they are recognised, not ignored.)
 const RECOGNISED_BOARD_PARAMS: &[&str] = &[
-    "status", "session", "archived", "done_limit", "all", "slim", "full", "limit", "offset", "q", "query",
+    "status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "limit", "offset", "q", "query",
     "search",
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
@@ -1200,7 +1210,7 @@ pub async fn list_board(
                 "use_instead": format!("/api/search?q={term}"),
                 "why": "This param was silently ignored until 2026-08-11, so the full board came \
                         back looking like ranked results. Refusing loudly beats answering wrongly.",
-                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "full", "limit", "offset"],
+                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "limit", "offset"],
             })),
         )
             .into_response();
@@ -1285,6 +1295,7 @@ pub async fn list_board(
         }
     };
 
+    let quota = qp_truthy(p.quota.as_deref());
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
@@ -1293,8 +1304,24 @@ pub async fn list_board(
         // desc+log (~27MB of prose) to ship the ~20% that survive the cap.
         // The doing/review probe below is equivalent on the capped set —
         // those statuses are never terminal, so the cap cannot drop them.
-        let (kept, term_total, term_kept) =
-            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit)?;
+        // ?quota=1 swaps the lumped cap for per-status quotas (AMUX-3503);
+        // quota has no single truncation count, so it reports (0, 0) and
+        // the truncation warn/headers stay silent for it.
+        let (kept, term_total, term_kept) = if quota {
+            (
+                bs::list_issues_quota(
+                    &conn,
+                    &status_f,
+                    &session_f,
+                    archived,
+                    done_limit.max(0) as usize,
+                )?,
+                0,
+                0,
+            )
+        } else {
+            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit)?
+        };
         // The `stale` flag needs the active-session set only when an
         // in-progress card is present (Python computes it in `_load_board`).
         let working = if kept

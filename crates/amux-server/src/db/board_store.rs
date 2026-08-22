@@ -942,6 +942,38 @@ pub fn list_issues_capped(
     archived: ArchivedFilter,
     done_limit: i64,
 ) -> rusqlite::Result<(Vec<IssueRow>, usize, usize)> {
+    let light = light_rows(conn, status_filter, session_filter, archived)?;
+    let (kept_light, term_total, term_kept) =
+        cap_terminal_by(light, done_limit, |r| &r.status, |r| r.updated);
+    Ok((hydrate_light(conn, &kept_light)?, term_total, term_kept))
+}
+
+/// [`list_issues_capped`]'s sibling with [`sse_terminal_quota`] semantics
+/// instead of the lumped cap (AMUX-3503): verified keeps its own 300-floor
+/// quota so a bulk-verify stays visible, done/discarded share `done_limit`.
+/// The dashboard poll uses this (`?quota=1`) now that it renders from the
+/// fetch path rather than the retired SSE full-push.
+pub fn list_issues_quota(
+    conn: &Connection,
+    status_filter: &[String],
+    session_filter: &[String],
+    archived: ArchivedFilter,
+    done_limit: usize,
+) -> rusqlite::Result<Vec<IssueRow>> {
+    let light = light_rows(conn, status_filter, session_filter, archived)?;
+    let kept_light = terminal_quota_by(light, done_limit, |r| &r.status, |r| r.updated);
+    hydrate_light(conn, &kept_light)
+}
+
+/// Pass 1 shared by the capped and quota lists: filter + sort over the
+/// no-prose columns. ONE loader on purpose — two spellings of the filter
+/// canon or the sort would drift exactly the way the predicate rule warns.
+fn light_rows(
+    conn: &Connection,
+    status_filter: &[String],
+    session_filter: &[String],
+    archived: ArchivedFilter,
+) -> rusqlite::Result<Vec<LightRow>> {
     let canon = |s: &str| -> String {
         parse_status(s)
             .map(|st| db_status_spelling(st).to_string())
@@ -985,11 +1017,12 @@ pub fn list_issues_capped(
         light.push(row);
     }
     light.sort_by(|a, b| board_order(a.pinned, a.pos, a.updated, b.pinned, b.pos, b.updated));
-    let (kept_light, term_total, term_kept) =
-        cap_terminal_by(light, done_limit, |r| &r.status, |r| r.updated);
+    Ok(light)
+}
 
-    // Pass 2: hydrate survivors only, preserving pass-1 order. Chunked well
-    // under SQLITE_MAX_VARIABLE_NUMBER's historical floor of 999.
+/// Pass 2: hydrate survivors only, preserving pass-1 order. Chunked well
+/// under SQLITE_MAX_VARIABLE_NUMBER's historical floor of 999.
+fn hydrate_light(conn: &Connection, kept_light: &[LightRow]) -> rusqlite::Result<Vec<IssueRow>> {
     let mut by_id: std::collections::HashMap<String, IssueRow> = std::collections::HashMap::new();
     for chunk in kept_light.chunks(500) {
         let marks = vec!["?"; chunk.len()].join(",");
@@ -1004,9 +1037,7 @@ pub fn list_issues_capped(
             by_id.insert(row.id.clone(), row);
         }
     }
-    let kept: Vec<IssueRow> =
-        kept_light.iter().filter_map(|l| by_id.remove(&l.id)).collect();
-    Ok((kept, term_total, term_kept))
+    Ok(kept_light.iter().filter_map(|l| by_id.remove(&l.id)).collect())
 }
 
 /// The Python `_BOARD_TERMINAL` set for the done_limit cap. NOTE: this is
@@ -1073,15 +1104,31 @@ fn cap_terminal_by<T>(
 /// live 2026-08-09: ~130 cards were verified in bulk and the Rust SSE push
 /// (single lumped 100-cap) showed 9 of them while Python showed 141.
 pub fn sse_terminal_quota(items: Vec<IssueRow>, done_limit: usize) -> Vec<IssueRow> {
+    terminal_quota_by(items, done_limit, |r| &r.status, |r| r.updated)
+}
+
+/// The quota algorithm itself, generic over the two fields it reads — the
+/// same split as [`cap_terminal_by`], for the same reason: the light pass in
+/// [`list_issues_quota`] must run IDENTICAL logic, not a re-derivation.
+/// (AMUX-3503 moved the dashboard's board view from the SSE push onto the
+/// fetch path, so the quota had to follow the data or the 2026-08-09
+/// bulk-verify incident — 141 verified visible on Python, 9 on Rust —
+/// comes back through the front door.)
+fn terminal_quota_by<T>(
+    items: Vec<T>,
+    done_limit: usize,
+    status_of: impl Fn(&T) -> &str,
+    updated_of: impl Fn(&T) -> i64,
+) -> Vec<T> {
     let verified_limit = done_limit.max(300);
     let keep_top = |status_match: &dyn Fn(&str) -> bool, limit: usize| -> std::collections::HashSet<usize> {
         let mut idx: Vec<usize> = items
             .iter()
             .enumerate()
-            .filter(|(_, r)| status_match(&r.status.trim().to_lowercase()))
+            .filter(|(_, r)| status_match(&status_of(r).trim().to_lowercase()))
             .map(|(i, _)| i)
             .collect();
-        idx.sort_by(|a, b| items[*b].updated.cmp(&items[*a].updated));
+        idx.sort_by(|a, b| updated_of(&items[*b]).cmp(&updated_of(&items[*a])));
         idx.into_iter().take(limit).collect()
     };
     let keep_verified = keep_top(&|s: &str| s == "verified", verified_limit);
@@ -1089,7 +1136,7 @@ pub fn sse_terminal_quota(items: Vec<IssueRow>, done_limit: usize) -> Vec<IssueR
     items
         .into_iter()
         .enumerate()
-        .filter(|(i, r)| match r.status.trim().to_lowercase().as_str() {
+        .filter(|(i, r)| match status_of(r).trim().to_lowercase().as_str() {
             "verified" => keep_verified.contains(i),
             "done" | "discarded" => keep_done.contains(i),
             _ => true,
@@ -1642,6 +1689,27 @@ mod tests {
         }
         // The equivalence means nothing if no case ever engaged the cap.
         assert!(cap_engaged_somewhere, "fixture too small: the terminal cap never engaged");
+
+        // AMUX-3503: the QUOTA two-pass must equal quota-over-single-pass the
+        // same way. done_limit=2 engages the done/discarded quota (fixture
+        // holds ~11 such rows) while verified rides its 300-floor untrimmed —
+        // both branches exercised, asserted non-vacuously below.
+        let single_q = sse_terminal_quota(
+            list_issues(&conn, &[], &[], ArchivedFilter::All).unwrap(),
+            2,
+        );
+        let fused_q = list_issues_quota(&conn, &[], &[], ArchivedFilter::All, 2).unwrap();
+        let key = |r: &IssueRow| (r.id.clone(), r.desc.clone(), r.tags.clone(), r.log.clone());
+        assert_eq!(
+            single_q.iter().map(key).collect::<Vec<_>>(),
+            fused_q.iter().map(key).collect::<Vec<_>>(),
+            "quota rows diverged between single-pass and two-pass"
+        );
+        let done_kept =
+            fused_q.iter().filter(|r| matches!(r.status.as_str(), "done" | "discarded")).count();
+        let verified_kept = fused_q.iter().filter(|r| r.status == "verified").count();
+        assert_eq!(done_kept, 2, "the done/discarded quota must have engaged");
+        assert!(verified_kept > 2, "verified must ride its own floor, not the done quota");
         // Nor if the deleted row leaked into either path.
         let (all, _, _) =
             list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 0).unwrap();

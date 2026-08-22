@@ -1,16 +1,23 @@
 //! `/api/events` — SSE (RR-0023/RR-0042, Invariants 35/26).
 //!
-//! Speaks BOTH dialects on one stream:
-//! - Modern: revisioned StateEvents (`{"type":"state",...}`) + gap
-//!   detection (`lagged`) + `hello` carrying the current rev.
-//! - Legacy: the Python dashboard's own event vocabulary —
-//!   `{"type":"board","payload":[...]}` and `{"type":"sessions",
-//!   "payload":[...]}` full-list pushes, coalesced. Without these the SPA
-//!   CONNECTS (so its polling fallback disarms) and then understands
-//!   nothing — strictly worse than no SSE at all, which is exactly what
-//!   the browser-golden run demonstrated. The 10s `{"type":"ping"}`
-//!   keep-alive serves both dialects (the SPA's 18s staleness detector
-//!   feeds on it).
+//! One stream, three event kinds:
+//! - Revisioned StateEvents (`{"type":"state",...}`) + gap detection
+//!   (`lagged`) + `hello` carrying the current rev.
+//! - `{"type":"invalidate","keys":["board"|"sessions",...]}` — the signal
+//!   that replaced the legacy full-list pushes (AMUX-3503). The old dialect
+//!   shipped the ENTIRE board (883KB) + sessions (177KB) on every connect
+//!   and every coalesced change, RAW — CompressionLayer exempts
+//!   text/event-stream — while the client's fetch path was already gzipped
+//!   AND ETag'd, so intermittent mobile paid ~1MB per reconnect for data a
+//!   conditional fetch serves as a 304. Worse, half the push was DEAD: the
+//!   server said `"type":"sessions"`, the client only handled `workers`
+//!   (the AF-10 vocabulary-rename class), so 177KB per push was parsed and
+//!   dropped for weeks. The client now fetches on invalidate through the
+//!   cheap path; a burst of N writes still coalesces to one signal.
+//! - The 10s `{"type":"ping"}` keep-alive (the SPA's 18s staleness detector
+//!   feeds on it, and its `v` drives stale-shell self-reload — which is
+//!   also what migrates an old full-push client off this contract within
+//!   seconds of connecting to a new server).
 
 use super::AppState;
 use axum::extract::State;
@@ -25,11 +32,12 @@ pub async fn events(
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let mut rx = state.store.subscribe();
     let current = state.store.current_rev().map(|r| r.0).unwrap_or(0);
-    let store = state.store.clone();
 
     let stream = async_stream(current, move |yielder: tokio::sync::mpsc::Sender<Event>| async move {
-        // Initial full pushes so a fresh client renders without a poll.
-        push_legacy(&store, &yielder, true, true).await;
+        // No initial snapshot (AMUX-3503): `hello` above carries the rev, and
+        // the client renders from its cache then conditional-fetches — a 304
+        // when nothing changed, 176KB gzipped when something did, versus the
+        // 1,060KB raw this used to push on every (re)connect.
         loop {
             match rx.recv().await {
                 Ok(ev) => {
@@ -44,8 +52,8 @@ pub async fn events(
                     {
                         break; // client went away
                     }
-                    // Legacy dialect: coalesce this event plus everything
-                    // already queued (a burst of N writes = one list push).
+                    // Coalesce this event plus everything already queued:
+                    // a burst of N writes = one invalidate signal.
                     let mut board_dirty = matches!(
                         ev.entity_type,
                         amux_core::revision::EntityType::Task
@@ -67,17 +75,19 @@ pub async fn events(
                                 | amux_core::revision::EntityType::Session
                         );
                     }
-                    if (board_dirty || sessions_dirty)
-                        && !push_legacy(&store, &yielder, board_dirty, sessions_dirty).await
-                    {
-                        break;
+                    if board_dirty || sessions_dirty {
+                        let ev = invalidate_payload(board_dirty, sessions_dirty);
+                        if yielder.send(Event::default().data(ev)).await.is_err() {
+                            break;
+                        }
                     }
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
                     // Backpressure (Invariant 26): a slow client that missed
                     // events is TOLD so, with the count — it must delta-sync,
-                    // not assume continuity. Legacy clients get fresh full
-                    // lists, which IS their recovery.
+                    // not assume continuity. The invalidate makes the SPA
+                    // refetch both lists through the conditional path, which
+                    // IS its recovery.
                     let payload = serde_json::json!({
                         "type": "lagged",
                         "missed": missed,
@@ -89,7 +99,11 @@ pub async fn events(
                     {
                         break;
                     }
-                    if !push_legacy(&store, &yielder, true, true).await {
+                    if yielder
+                        .send(Event::default().data(invalidate_payload(true, true)))
+                        .await
+                        .is_err()
+                    {
                         break;
                     }
                 }
@@ -147,86 +161,23 @@ fn ping_payload() -> &'static str {
     })
 }
 
-/// Push the legacy full-list events. Returns false when the client is gone.
-async fn push_legacy(
-    store: &crate::db::SharedStore,
-    yielder: &tokio::sync::mpsc::Sender<Event>,
-    board: bool,
-    sessions: bool,
-) -> bool {
+/// The invalidate signal (AMUX-3503) — the entire replacement for the legacy
+/// full-list pushes. `keys` uses the SPA's existing invalidate vocabulary
+/// (`msg.keys`, an array), so the event shape predates this change on the
+/// client side. Pure so the contract is pinned by test: this exact JSON is
+/// what app.js parses, and a shape drift here silently stops every refetch.
+fn invalidate_payload(board: bool, sessions: bool) -> String {
+    let mut keys: Vec<&str> = Vec::new();
     if board {
-        let payload = {
-            let s = store.clone();
-            tokio::task::spawn_blocking(move || legacy_board_json(&s))
-                .await
-                .ok()
-                .flatten()
-        };
-        if let Some(json) = payload {
-            let ev = format!("{{\"type\":\"board\",\"payload\":{json}}}");
-            if yielder.send(Event::default().data(ev)).await.is_err() {
-                return false;
-            }
-        }
+        keys.push("board");
     }
     if sessions {
-        let payload = {
-            let s = store.clone();
-            tokio::task::spawn_blocking(move || legacy_sessions_json(&s))
-                .await
-                .ok()
-                .flatten()
-        };
-        if let Some(json) = payload {
-            let ev = format!("{{\"type\":\"sessions\",\"payload\":{json}}}");
-            if yielder.send(Event::default().data(ev)).await.is_err() {
-                return false;
-            }
-        }
+        keys.push("sessions");
     }
-    true
-}
-
-fn legacy_board_json(store: &crate::db::SharedStore) -> Option<String> {
-    let conn = store.read().ok()?;
-    let rows = crate::db::board_store::list_issues(
-        &conn,
-        &[],
-        &[],
-        crate::db::board_store::ArchivedFilter::ActiveOnly,
+    format!(
+        "{{\"type\":\"invalidate\",\"keys\":{}}}",
+        serde_json::to_string(&keys).unwrap_or_else(|_| "[]".into())
     )
-    .ok()?;
-    // Python's SSE board channel (amux-server.py:65222-65249): the
-    // _load_board(100) TERMINAL QUOTAS (verified gets its own 300-floor so
-    // bulk-verifies stay visible), non-archived only, desc slimmed to its
-    // first line — NOT the REST path's lumped cap_terminal(100).
-    let kept = crate::db::board_store::sse_terminal_quota(rows, 100);
-    // Same stale derivation as GET /api/board (a view must share its
-    // mechanism's predicate) — skipped when no in-progress card needs it.
-    let working = if kept
-        .iter()
-        .any(|r| matches!(r.status.as_str(), "doing" | "review"))
-    {
-        crate::api::sessions_legacy::active_python_sessions(&conn)
-    } else {
-        Default::default()
-    };
-    let now = chrono::Utc::now().timestamp();
-    let items: Vec<serde_json::Value> = kept
-        .iter()
-        .map(|r| {
-            crate::api::board::list_body(
-                r,
-                true,
-                crate::api::board::is_stale(r, now, &working),
-            )
-        })
-        .collect();
-    serde_json::to_string(&items).ok()
-}
-
-fn legacy_sessions_json(store: &crate::db::SharedStore) -> Option<String> {
-    crate::api::sessions_legacy::legacy_sessions_array(store).ok()
 }
 
 /// Bridge an async producer into an SSE stream, prefixed with a `hello`
@@ -255,6 +206,32 @@ where
 
 #[cfg(test)]
 mod ping_tests {
+    /// AMUX-3503 — this exact JSON is the ENTIRE replacement for the 1MB
+    /// legacy pushes, and app.js parses it as `msg.keys` (an array). A shape
+    /// drift here silently stops every SSE-driven refetch fleet-wide, so the
+    /// bytes are pinned, not just the semantics. Both-false is the
+    /// cannot-happen guard (callers gate on dirty) — pinned anyway so a
+    /// future caller cannot ship a keyless invalidate the client ignores.
+    #[test]
+    fn invalidate_payload_is_the_exact_shape_the_client_parses() {
+        assert_eq!(
+            super::invalidate_payload(true, true),
+            r#"{"type":"invalidate","keys":["board","sessions"]}"#
+        );
+        assert_eq!(
+            super::invalidate_payload(true, false),
+            r#"{"type":"invalidate","keys":["board"]}"#
+        );
+        assert_eq!(
+            super::invalidate_payload(false, true),
+            r#"{"type":"invalidate","keys":["sessions"]}"#
+        );
+        assert_eq!(
+            super::invalidate_payload(false, false),
+            r#"{"type":"invalidate","keys":[]}"#
+        );
+    }
+
     #[test]
     fn ping_carries_the_embedded_app_ver() {
         let p = super::ping_payload();
