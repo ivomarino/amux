@@ -321,7 +321,19 @@ pub fn build(
         return None;
     }
     let mut msg = sections.join("\n\n");
-    msg.push_str(&format!("\n\n({provenance})"));
+    // AF-135 defect 1: the message timestamped origin's tip but never said
+    // when it OBSERVED the tree, so a snapshot composed before a commit and
+    // delivered at the next turn boundary read as live and named files
+    // already committed minutes earlier. Harmless on the commit branch (a
+    // no-op); on the STALE branch the same lag prescribes `git checkout
+    // origin/main -- <path>` against paths origin does not have, which
+    // deletes them. Stamp the observation so the reader compares it against
+    // their own last commit in one glance.
+    msg.push_str(&format!(
+        "\n\n({provenance}; tree observed {}Z — if you committed AFTER that moment this \
+         nudge predates it: re-run `git status` before acting on any remedy)",
+        chrono::Utc::now().format("%H:%M:%S")
+    ));
     Some(msg)
 }
 
@@ -530,14 +542,33 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
         msg.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
     }
     if !own.shared.is_empty() {
-        let who: BTreeSet<&str> = own.shared.iter().map(|(_, w)| w.as_str()).collect();
-        let paths: Vec<&str> = own.shared.iter().take(4).map(|(p, _)| p.as_str()).collect();
-        msg.push_str(&format!(
-            "\n\nCONTESTED — {} also edited by {}. Stage per-HUNK (`git add -p`), not per-file: \
-             `git add <file>` takes their in-flight hunks too.",
-            paths.join(", "),
-            who.into_iter().collect::<Vec<_>>().join("/")
-        ));
+        // AF-135 defect 2: "(unknown)" is the NO-PEER placeholder from the
+        // server's shared branch (AF-24), not a session name — "also edited
+        // by (unknown)" asserts a co-editor who does not exist, on a line
+        // whose whole argument is that a NAMED peer has in-flight work. Say
+        // the real fact instead.
+        type Row<'a> = Vec<&'a (String, String)>;
+        let (named, unowned): (Row, Row) =
+            own.shared.iter().partition(|(_, w)| w.as_str() != "(unknown)");
+        if !named.is_empty() {
+            let who: BTreeSet<&str> = named.iter().map(|(_, w)| w.as_str()).collect();
+            let paths: Vec<&str> = named.iter().take(4).map(|(p, _)| p.as_str()).collect();
+            msg.push_str(&format!(
+                "\n\nCONTESTED — {} also edited by {}. Stage per-HUNK (`git add -p`), not per-file: \
+                 `git add <file>` takes their in-flight hunks too.",
+                paths.join(", "),
+                who.into_iter().collect::<Vec<_>>().join("/")
+            ));
+        }
+        if !unowned.is_empty() {
+            let paths: Vec<&str> = unowned.iter().take(4).map(|(p, _)| p.as_str()).collect();
+            msg.push_str(&format!(
+                "\n\nCO-EDIT RECORDS, UNATTRIBUTED — {}: edit records beyond yours exist but \
+                 name no session. Not a named co-editor (the no-peer shape, AF-24); stage \
+                 per-hunk (`git add -p`) if you are unsure which hunks are currently yours.",
+                paths.join(", ")
+            ));
+        }
     }
 
     if !own.foreign.is_empty() {

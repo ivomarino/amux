@@ -7820,15 +7820,32 @@ fn pickup_card_id(text: &str) -> Option<String> {
 /// the exact wrong fix gtm-engine's two legs rule out: GE-626 (done 229ms after
 /// the claim, delivered 18.7s later) must DROP, and MS-1188 (still `doing` at
 /// delivery after a 578s wait, closed only afterward) must DELIVER.
-fn pickup_stale_void(guard: &str, text: &str, card_status: Option<&str>) -> Option<String> {
+/// AF-135 second instance (2026-08-22): keyed on OWNERSHIP as well as status.
+/// A pickup for AF-132 was composed while the card was the recipient's, then a
+/// peer reassigned + claimed it; at delivery the card WAS 'doing' — under the
+/// other session — so the status-only check delivered "work it now" for a card
+/// the recipient was not allowed to touch, aimed at a file the owner had 174
+/// uncommitted lines in (AMUX-1315's exact hazard, reachable by following an
+/// amux instruction literally). `card_session: None` (couldn't read, or the
+/// column was empty) DELIVERS — matching the read-failure posture above: a
+/// valid pickup delivered beats one dropped on a transient gap.
+fn pickup_stale_void(
+    guard: &str,
+    text: &str,
+    card_status: Option<&str>,
+    card_session: Option<&str>,
+    recipient: &str,
+) -> Option<String> {
     if !guard.starts_with("board-drive") {
         return None; // not a board-drive delivery — never void a user/inter-session message
     }
     let card = pickup_card_id(text)?; // not a single-card pickup (e.g. a nudge) — deliver
-    if card_status == Some("doing") {
-        None // still the actionable, claimed card — deliver even after a long wait
-    } else {
-        Some(card) // moved off 'doing' (closed/bounced) or gone — void
+    if card_status != Some("doing") {
+        return Some(card); // moved off 'doing' (closed/bounced) or gone — void
+    }
+    match card_session {
+        Some(owner) if owner != recipient => Some(card), // a peer took it — void
+        _ => None, // still the recipient's actionable claimed card — deliver
     }
 }
 
@@ -7897,11 +7914,11 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 // Ok(Some(status)) found · Ok(None) deleted · Err → read failed,
                 // so DO NOT void — delivering a valid pickup beats dropping one on
                 // a transient read error.
-                let live: Option<Option<String>> = match state.store.read() {
+                let live: Option<Option<(String, String)>> = match state.store.read() {
                     Ok(conn) => match conn.query_row(
-                        "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                        "SELECT status, COALESCE(session,'') FROM issues WHERE id=?1 AND deleted IS NULL",
                         rusqlite::params![card_id],
-                        |r| r.get::<_, String>(0),
+                        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
                     ) {
                         Ok(s) => Some(Some(s)),
                         Err(rusqlite::Error::QueryReturnedNoRows) => Some(None),
@@ -7909,10 +7926,14 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     },
                     Err(_) => None,
                 };
-                if let Some(status) = live {
+                if let Some(row) = live {
+                    let status = row.as_ref().map(|(st, _)| st.clone());
+                    let owner = row.as_ref().map(|(_, ow)| ow.clone()).filter(|o| !o.is_empty());
                     // The read succeeded (Some); route the void/deliver decision
                     // through the unit-tested authority so the two never drift.
-                    if pickup_stale_void(&guard, &text, status.as_deref()).is_some() {
+                    if pickup_stale_void(&guard, &text, status.as_deref(), owner.as_deref(), &session)
+                        .is_some()
+                    {
                         let now = now_f64();
                         let delay_s = now - queued_at;
                         let became = status.unwrap_or_else(|| "gone".into());
@@ -13682,34 +13703,52 @@ mod tests {
             "[amux auto-pickup] Claimed board card GE-626 from your queue — work it now.";
         // DROP leg — card closed/moved in the claim->delivery gap.
         assert_eq!(
-            pickup_stale_void("board-drive", pick, Some("done")).as_deref(),
+            pickup_stale_void("board-drive", pick, Some("done"), Some("gtm-engine"), "gtm-engine").as_deref(),
             Some("GE-626"),
             "a card that went done before delivery must be voided"
         );
         assert_eq!(
-            pickup_stale_void("board-drive:reactive", pick, Some("review")).as_deref(),
+            pickup_stale_void("board-drive:reactive", pick, Some("review"), Some("gtm-engine"), "gtm-engine").as_deref(),
             Some("GE-626"),
             "the reactive pickup path voids on the same rule"
         );
         assert_eq!(
-            pickup_stale_void("board-drive", pick, None).as_deref(),
+            pickup_stale_void("board-drive", pick, None, None, "gtm-engine").as_deref(),
             Some("GE-626"),
             "a card that is gone (deleted) at delivery must be voided"
         );
         // DELIVER leg — still the actionable card, however long it waited.
         assert_eq!(
-            pickup_stale_void("board-drive", pick, Some("doing")),
+            pickup_stale_void("board-drive", pick, Some("doing"), Some("gtm-engine"), "gtm-engine"),
             None,
             "a card still 'doing' at delivery MUST deliver — MS-1188's 578s wait does not matter"
         );
+        // AF-135 third leg: 'doing' UNDER A DIFFERENT SESSION voids. The
+        // AF-132 specimen — composed while the card was the recipient's, a
+        // peer reassigned + claimed it before delivery; status-only keying
+        // delivered "work it now" for a card the recipient must not touch
+        // (a second lane into a file with 174 uncommitted lines in flight).
+        assert_eq!(
+            pickup_stale_void("board-drive", pick, Some("doing"), Some("amux"), "amux-frustrations")
+                .as_deref(),
+            Some("GE-626"),
+            "doing under a PEER must void — the imperative would dispatch a stolen card"
+        );
+        // Ownership unreadable at delivery: DELIVER, same posture as the
+        // transient-read-failure rule above the call site.
+        assert_eq!(
+            pickup_stale_void("board-drive", pick, Some("doing"), None, "gtm-engine"),
+            None,
+            "unknown ownership must not drop a valid pickup"
+        );
         // Never void a message that is not a board-drive pickup.
         assert_eq!(
-            pickup_stale_void("user", pick, Some("done")),
+            pickup_stale_void("user", pick, Some("done"), Some("gtm-engine"), "gtm-engine"),
             None,
             "a user/inter-session message is never voided by this guard"
         );
         assert_eq!(
-            pickup_stale_void("board-drive", "advance BDQ-1 or move it — a nudge, no card sentinel", Some("done")),
+            pickup_stale_void("board-drive", "advance BDQ-1 or move it — a nudge, no card sentinel", Some("done"), Some("x"), "x"),
             None,
             "a board-drive NUDGE is not a single-card pickup and must deliver"
         );
