@@ -2582,6 +2582,17 @@ mod tests {
         // RELATIVE and absent: refused. create_dir_all would resolve this
         // against the SERVER's cwd and silently make a directory nobody asked
         // for, so a typo must not succeed.
+        //
+        // HERMETICITY (amux, 2026-08-22): this fixture is a literal relative
+        // path, so it resolves against the TEST's cwd — the shared checkout.
+        // One run of a pre-refusal build created it via create_dir_all, and
+        // the residue then failed every later run on this machine (is_dir()
+        // short-circuits to Ok) while CI's fresh checkout stayed green: a red
+        // test on green code, discovered blocking an unrelated commit's gate.
+        // Clean the residue rather than asserting on it.
+        if std::path::Path::new("some").exists() {
+            std::fs::remove_dir_all("some").expect("clearing fixture residue");
+        }
         match ensure_work_dir("some/relative/path-that-does-not-exist") {
             WorkDirOutcome::Refused(m) => assert!(m.contains("absolute"), "{m}"),
             _ => panic!("a relative path must be refused"),
