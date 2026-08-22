@@ -353,6 +353,13 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
     if !content_type.is_empty() {
         meta.insert("content_type".into(), json!(content_type));
     }
+    // AMUX-3513: an endpoint with requested-wait semantics (browser `wait`
+    // polls up to a caller-chosen budget) declares it via this response
+    // header, and the latency detectors skip the row — a timed-out wait is
+    // the budget the CALLER asked for, not the service getting slower.
+    if let Some(v) = res.headers().get("x-amux-slow-ok").and_then(|v| v.to_str().ok()) {
+        meta.insert("slow_ok".into(), json!(truncate_chars(v, 40)));
+    }
     let req_meta = if meta.is_empty() {
         None
     } else {

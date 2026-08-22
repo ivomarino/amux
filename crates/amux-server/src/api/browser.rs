@@ -910,15 +910,24 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             };
             let started = std::time::Instant::now();
             let deadline = started + Duration::from_millis(timeout_ms);
+            // Declares requested-wait semantics to the request log
+            // (AMUX-3513): a wait's latency is the CALLER's budget, and a
+            // timed-out wait is a 200 at exactly that budget — twelve of
+            // those read as a 7.1x /api/browser p95 regression to the
+            // latency detector, which now skips rows carrying this marker.
+            let slow_ok = [("x-amux-slow-ok", "wait-budget")];
             loop {
                 match cdp.eval(&probe, 10).await {
                     Ok(v) if v.as_bool() == Some(true) => {
-                        return Json(json!({
-                            "ok": true,
-                            "found": what,
-                            "waited_ms": started.elapsed().as_millis() as u64,
-                        }))
-                        .into_response();
+                        return (
+                            slow_ok,
+                            Json(json!({
+                                "ok": true,
+                                "found": what,
+                                "waited_ms": started.elapsed().as_millis() as u64,
+                            })),
+                        )
+                            .into_response();
                     }
                     Ok(_) => {}
                     Err(e) => {
@@ -928,11 +937,14 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                 if std::time::Instant::now() >= deadline {
                     // A timeout is an OUTCOME, not a malformed request: 200
                     // with ok:false, like the CLI shape Python relays.
-                    return Json(json!({
-                        "ok": false,
-                        "error": format!("timed out after {timeout_ms}ms waiting for {what}"),
-                    }))
-                    .into_response();
+                    return (
+                        slow_ok,
+                        Json(json!({
+                            "ok": false,
+                            "error": format!("timed out after {timeout_ms}ms waiting for {what}"),
+                        })),
+                    )
+                        .into_response();
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }

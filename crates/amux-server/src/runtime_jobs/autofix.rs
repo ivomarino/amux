@@ -625,8 +625,15 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
     let min_n = latency_min_samples();
 
     let mut per_family: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    // Rows stamped slow_ok are REQUESTED latency, not service latency
+    // (AMUX-3513): a browser `wait` action polls for up to its caller-chosen
+    // budget and a timed-out wait is a 200 at exactly that budget — twelve of
+    // those raised /api/browser's p95 7.1x and filed a phantom regression.
+    // The endpoint declares the semantics (x-amux-slow-ok response header ->
+    // req_meta.slow_ok); both latency shapes skip what the caller asked for.
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT family, latency_ms, ts FROM _amux_request_log WHERE ts >= ?1 LIMIT 400000",
+        "SELECT family, latency_ms, ts FROM _amux_request_log WHERE ts >= ?1 \
+           AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') LIMIT 400000",
     ) {
         if let Ok(rows) = stmt.query_map(rusqlite::params![b_start], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
@@ -714,7 +721,9 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
     let mut seen: BTreeMap<(String, String), (u64, f64, f64, String)> = BTreeMap::new();
     if let Ok(mut stmt) = conn.prepare(
         "SELECT method, path, latency_ms, ts, status FROM _amux_request_log \
-         WHERE ts >= ?1 AND latency_ms >= ?2 ORDER BY latency_ms DESC LIMIT 2000",
+         WHERE ts >= ?1 AND latency_ms >= ?2 \
+           AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') \
+         ORDER BY latency_ms DESC LIMIT 2000",
     ) {
         if let Ok(rows) = stmt.query_map(rusqlite::params![w_start, outlier_ms()], |r| {
             Ok((
@@ -4237,6 +4246,65 @@ mod tests {
         assert!(ev.contains_key("routed_methods"), "{ev:?}");
         assert!(ev.contains_key("nearest_routes"), "{ev:?}");
         assert!(ev["called_by"].contains("browser"));
+    }
+
+    /// AMUX-3513, rebuilt from the incident's numbers: twelve browser `wait`
+    /// actions timing out at their caller-chosen 5s budget read as a 7.1x
+    /// /api/browser p95 regression. A row stamped slow_ok is REQUESTED
+    /// latency and must not file; the IDENTICAL rows without the stamp must
+    /// still file — dropping the marker check silently kills the control.
+    #[tokio::test]
+    async fn requested_wait_budgets_are_not_a_latency_regression() {
+        let insert_meta = |st: &AppState, ts: f64, ms: f64, meta: Option<&str>| {
+            let m = meta.map(str::to_string);
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                         latency_ms, client_ip, user_agent, amux_session, worker, answered_by, \
+                         req_meta) VALUES (?1,'POST','/api/browser/action','/api/browser',200,?2,\
+                         '127.0.0.1','curl/8','','','native',?3)",
+                        rusqlite::params![ts, ms, m],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let (st, _d) = state();
+        let now = unix_now();
+        // Fast baseline + fast window traffic, plus the wait-budget rows.
+        for i in 0..60 {
+            insert_meta(&st, now - 200_000.0 - i as f64, 6.0, None);
+            insert_meta(&st, now - 300.0 - i as f64, 6.0, None);
+        }
+        for i in 0..40 {
+            insert_meta(
+                &st,
+                now - 100.0 - i as f64,
+                5016.0,
+                Some(r#"{"content_type":"application/json","slow_ok":"wait-budget"}"#),
+            );
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/browser")),
+            "a caller-requested wait budget is not a regression: {f:?}"
+        );
+        // CONTROL — the same rows WITHOUT the marker must file, or the skip
+        // clause is silently matching everything (rule 7).
+        let (st2, _d2) = state();
+        for i in 0..60 {
+            insert_meta(&st2, now - 200_000.0 - i as f64, 6.0, None);
+            insert_meta(&st2, now - 300.0 - i as f64, 6.0, None);
+        }
+        for i in 0..40 {
+            insert_meta(&st2, now - 100.0 - i as f64, 5016.0, None);
+        }
+        let (f2, _) = detect_latency(&st2.store.read().unwrap(), now);
+        assert!(
+            f2.iter().any(|x| x.signature == "latency|p95|/api/browser"),
+            "unmarked 5s rows must still file — the control keeps the skip honest: {f2:?}"
+        );
     }
 
     /// AMUX-3471, rebuilt from the incident's own numbers: /api/prefs at a
