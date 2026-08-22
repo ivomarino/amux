@@ -1566,9 +1566,11 @@ fn du_top(
     // complete one. Whoever acts on this report must see that paths are missing
     // — AND why, since the two reasons have different fixes.
     //
-    // It says it ONCE per run, naming the paths, rather than once per attempt:
-    // the per-attempt spelling reported the same unchanging path thousands of
-    // times and drowned the log it shares with real faults.
+    // It says it once per SKIP SET per hour, naming the paths. It was first
+    // written to say it once per RUN rather than once per attempt, because the
+    // per-attempt spelling reported the same unchanging path thousands of times
+    // and drowned the log it shares with real faults — see the AEAB-45 note
+    // below for why that was only half the fix.
     //
     // The known bias is stated in the message itself rather than left for the
     // reader to infer: `du` time scales with directory size, so the paths that
@@ -1577,23 +1579,43 @@ fn du_top(
     // 3.7G free while the ranking that DID emerge listed only the also-rans. A
     // report saying merely "incomplete" reads as "here are the big ones plus a
     // few we missed", which is closer to the inverse of the truth.
+    // AEAB-45: "once per run" is not a dedupe when the run is on a two-minute
+    // timer. The paragraph above was written when this warning moved from
+    // once-per-ATTEMPT to once-per-RUN, and the inner loop was the only half
+    // that got fixed: the outer one emitted 1,336 identical lines in 24h naming
+    // `~/.Trash (du exit 1)`, a condition that CANNOT change — 77% of the whole
+    // log, competing with three real findings in the same window. AEAB-13
+    // recorded the identical shape at the identical ratio one subsystem over,
+    // which is why the mechanism is shared rather than re-spelled here.
+    //
+    // Keyed on the PATH LIST, not on a bare "disk warned" flag, so a skip set
+    // that GROWS is new information and reports at once inside the same hour.
+    // Keyed separately per REASON, because a budget timeout and a permission
+    // refusal have different fixes and the message says so.
+    let bucket = crate::log_dedupe::hour_bucket(now);
     if !timed_out.is_empty() {
-        tracing::warn!(
-            skipped = timed_out.len(),
-            paths = %timed_out.join(", "),
-            "disk: size ranking is INCOMPLETE — these paths exceeded the du budget. \
-             du time scales with size, so the paths missing here are LIKELIER TO BE \
-             THE LARGEST than the ones ranked below"
-        );
+        let paths = timed_out.join(", ");
+        if crate::log_dedupe::first_this_bucket(&format!("disk-du-budget:{paths}"), bucket) {
+            tracing::warn!(
+                skipped = timed_out.len(),
+                paths = %paths,
+                "disk: size ranking is INCOMPLETE — these paths exceeded the du budget. \
+                 du time scales with size, so the paths missing here are LIKELIER TO BE \
+                 THE LARGEST than the ones ranked below"
+            );
+        }
     }
     if !unreadable.is_empty() {
-        tracing::warn!(
-            skipped = unreadable.len(),
-            paths = %unreadable.join(", "),
-            "disk: size ranking is INCOMPLETE — these paths could not be READ at all \
-             (permissions, e.g. macOS TCC on ~/.Trash). This is NOT a budget problem \
-             and no timeout increase will fix it"
-        );
+        let paths = unreadable.join(", ");
+        if crate::log_dedupe::first_this_bucket(&format!("disk-unreadable:{paths}"), bucket) {
+            tracing::warn!(
+                skipped = unreadable.len(),
+                paths = %paths,
+                "disk: size ranking is INCOMPLETE — these paths could not be READ at all \
+                 (permissions, e.g. macOS TCC on ~/.Trash). This is NOT a budget problem \
+                 and no timeout increase will fix it"
+            );
+        }
     }
     sized.sort_by_key(|r| std::cmp::Reverse(r.bytes));
     sized.truncate(limit);

@@ -8,6 +8,7 @@ pub mod api;
 pub mod backend;
 pub mod config;
 pub mod legacy_port;
+pub mod log_dedupe;
 pub mod db;
 pub mod integrations;
 pub mod invariants;
