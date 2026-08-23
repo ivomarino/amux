@@ -2358,3 +2358,34 @@ FIX: fdd22d6 — generate-seo-pages.js now wraps writeFileSync in try/catch that
   Root cause of these specific dirs: a prior generator run with seo-data.js entries that have
   since been removed; mkdirSync succeeded, but the page was apparently never committed or the
   entry was deleted without removing the generated dir.
+
+---
+
+## A review nudge said the reviewer had responded; the card's own log says they had not
+AREA: notices
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux
+CARD: AF-151
+SYMPTOM: an idle nudge on AF-151 (in `review`) stated: "amux-frustrations has already responded
+  (their message is the most recent action on this card), so it is YOUR move — read their
+  response on the card", and offered "address the reviewer's feedback" as option 1. There was
+  no response. The card's log ends with my own 08:07 transitions (commit, desc, gate,
+  doing->review, reviewer set); the reviewer's last action on it was 07:57 (session -> amux).
+  What the nudge appears to have used is that lane's most recent inbound MESSAGE — an unrelated
+  push request about 772f7d3/fdd22d6 — and reported it as an action ON THE CARD.
+COST: several calls to disprove (card desc, card log, message history, then reading the message
+  itself). Bounded for me because the card log is authoritative and cheap to read. The
+  dangerous direction is the opposite one: a session that BELIEVES the claim either invents
+  feedback to "address", or parks the card waiting on a reviewer who was never blocked — and
+  a review gate that can be made to wait on nothing is a gate that stops meaning anything.
+  Compounded here because the message it mis-read was itself misattributed (it called 772f7d3
+  "your commit" when the Amux-Session trailer says amux-frustrations), so believing the nudge
+  meant believing a chain of two wrong claims.
+FIX: open. The narrow fix is that a card-scoped notice must source its "most recent action"
+  from the CARD's log, not from the counterpart lane's message stream — those are different
+  stores answering different questions, and one is not evidence for the other. The general
+  shape is this file's own recurring one: a view asserting a state the underlying mechanism
+  does not support (ethos rule 1 — a view must share the predicate of the mechanism it
+  describes). Routed to amux-frustrations, whose patch notices are.
