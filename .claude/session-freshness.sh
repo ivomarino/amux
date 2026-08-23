@@ -338,8 +338,47 @@ if command -v curl >/dev/null 2>&1; then
   fi
 fi
 
+# ── Axis 3: is THIS HOOK the current one? (AEAB-46) ─────────────────────────
+#
+# Every axis above lives inside the file most likely to be stale, and this hook
+# is LOADED FROM THE CHECKOUT IT REPORTS ON — so the staler that checkout is, the
+# less this can say about it, and a MISSING axis is indistinguishable from an
+# axis that found nothing. The instrument is subject to the condition it measures.
+#
+# Not hypothetical. On 2026-08-22 a session started in ~/Developer/amux, 1278
+# commits behind, and ran the Aug 5 copy of this file: `grep -c "RUNNING SERVER
+# is"` returns 0 there, so the deploy axis did not exist and the banner never
+# mentioned that the fleet was 23 commits behind. That was found by hand, four
+# hours and five merged PRs into the session. Every axis added since makes it
+# worse, because there is more that can be silently absent.
+#
+# The fetch above already happened, so comparing this file against origin's copy
+# costs nothing extra. Content, not a commit count: a file can be stale without
+# any commit touching it in this checkout's history, and bytes are what decide
+# whether an axis is present.
+self_path="${BASH_SOURCE[0]}"
+if [ -r "$self_path" ] && git -C "$REPO" rev-parse --verify -q origin/main >/dev/null 2>&1; then
+  if upstream_hook="$(git -C "$REPO" show origin/main:.claude/session-freshness.sh 2>/dev/null)" \
+     && [ -n "$upstream_hook" ]; then
+    if ! printf '%s\n' "$upstream_hook" | diff -q - "$self_path" >/dev/null 2>&1; then
+      out+="  - THIS FRESHNESS HOOK is not the one on origin/main"$'\n'
+      out+=$'    axes it does not have cannot warn you, and a missing axis is SILENT —\n'
+      out+=$'    treat everything above as possibly incomplete rather than as all-clear\n'
+      out+="    git -C $REPO diff origin/main -- .claude/session-freshness.sh"$'\n'
+    fi
+  fi
+fi
+
 [ -z "$out" ] && exit 0
 
 printf 'amux freshness — this session may be building on something stale:\n\n%s\n' "$out"
 printf 'Reconcile before starting work, or say so in your first message if you are deliberately not.\n'
+# PROVENANCE FOOTER, printed only when the banner is ALREADY speaking. Silence
+# stays silence — that is the whole reason this hook is worth reading — but any
+# banner now names WHICH copy produced it, so a reader who sees three axes where
+# the current hook has six can tell. That is rule 7's precondition applied to the
+# instrument itself: before believing a negative, confirm the probe could have
+# produced a positive. It also covers the case the axis above cannot: no origin
+# to compare against, offline, or a detached checkout.
+printf '(from %s)\n' "$self_path"
 exit 0
