@@ -482,6 +482,63 @@ lacks "$XMARK" "$out"
 out=$(xcheck_run "$FULLSHA" '{"commit":"0123456","server":"amux-rust"}')
 lacks "$XMARK" "$out"
 
+# ── Axis 3: does the hook notice that IT is not the current one? (AEAB-46) ────
+#
+# Every other axis lives inside this file, so when the file is old a missing axis
+# is indistinguishable from an axis that found nothing. On 2026-08-22 a session
+# ran the Aug 5 copy — `grep -c "RUNNING SERVER is"` returns 0 there — and was
+# never told the fleet was 23 commits behind.
+SELFMARK="THIS FRESHNESS HOOK is not the one on origin/main"
+FOOTMARK="(from "
+
+# A clone whose hook is on origin/main, optionally modified locally afterwards.
+self_run() { # $1 name  $2 "modify" to diverge the local copy
+  local d="$TMP/$1"; rm -rf "$d"
+  git init -q --bare -b main "$d/origin.git"
+  git clone -q "$d/origin.git" "$d/work" 2>/dev/null
+  ( cd "$d/work"
+    git checkout -q -B main
+    mkdir -p .claude; cp "$HOOK" .claude/session-freshness.sh
+    echo seed > seed.txt; git add -A; git commit -qm seed
+    git push -q -u origin main ) >/dev/null 2>&1
+  if [ "${2:-}" = "modify" ]; then
+    printf '\n# a local edit that origin does not have\n' >> "$d/work/.claude/session-freshness.sh"
+  fi
+  ( cd "$d/work"
+    AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+    AMUX_HEALTH_URL="file://$TMP/no-such-health.json" \
+      bash .claude/session-freshness.sh 2>&1 )
+}
+
+# (s) THE CONTROL. Hook identical to origin's: say nothing about itself. An axis
+#     that fires on a current checkout is noise in a banner whose entire value is
+#     that speaking is rare — and it would fire on every session, forever.
+out=$(self_run self_same)
+lacks "$SELFMARK" "$out"
+
+# (t) local copy differs from origin's: say so. This is the Aug-5-copy case, and
+#     the wording has to say that the ABSENCE of axes is the danger, not just
+#     that the file differs.
+out=$(self_run self_diff modify)
+says "$SELFMARK" "$out"
+
+# (u) THE SILENCE PROPERTY, and the one the provenance footer could most easily
+#     break. When nothing is wrong the hook must print NOTHING AT ALL — not even
+#     a footer saying which copy stayed quiet. A SessionStart banner that always
+#     prints one line is a banner people stop reading, which costs every axis
+#     above it.
+out=$(self_run self_silent)
+lacks "$FOOTMARK" "$out"
+if [ -z "$out" ]; then PASS=$((PASS+1)); else
+  FAIL=$((FAIL+1)); echo "FAIL: a fully current checkout must print nothing; got: $out"
+fi
+
+# (v) when the banner DOES speak, it names which copy spoke — so a reader seeing
+#     three axes where the current hook has six can tell the difference between
+#     "all clear" and "this copy has nothing to say about that".
+out=$(self_run self_foot modify)
+says "$FOOTMARK" "$out"
+
 echo
 echo "test-session-freshness: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
