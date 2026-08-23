@@ -1295,6 +1295,16 @@ mod tests {
             let v = Value::Object(form.iter().map(|(k, val)| (k.clone(), json!(val))).collect());
             self.answer("FORM", url, Some(&v))
         }
+        async fn post_raw(
+            &self,
+            url: &str,
+            _b: Option<&str>,
+            _ct: &str,
+            body: String,
+        ) -> Result<(u16, String), String> {
+            let (st, v) = self.answer("RAW", url, Some(&Value::String(body)))?;
+            Ok((st, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+        }
     }
 
     const ACCT: &str = "acct@example.com";

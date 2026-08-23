@@ -487,6 +487,21 @@ pub trait HttpTransport: Send + Sync {
         url: &str,
         form: &[(String, String)],
     ) -> Result<(u16, Value), String>;
+    /// Raw-body POST with a caller-chosen content type, response as TEXT —
+    /// the Gmail batch endpoint (AMUX-3520) speaks multipart/mixed in both
+    /// directions, which the JSON-shaped verbs above cannot carry. Defaulted
+    /// to an ERROR, not a stub success: a transport that never implemented
+    /// it (older test mocks) makes the batch path fall back to single
+    /// fetches loudly rather than pretend a batch happened.
+    async fn post_raw(
+        &self,
+        _url: &str,
+        _bearer: Option<&str>,
+        _content_type: &str,
+        _body: String,
+    ) -> Result<(u16, String), String> {
+        Err("post_raw not implemented by this transport".into())
+    }
 }
 
 /// Production transport (reqwest, 30s timeout — the Python side bounds each
@@ -548,6 +563,93 @@ impl HttpTransport for ReqwestTransport {
         let req = self.client.post(url).form(form);
         to_pair(req.send().await.map_err(|e| e.to_string())?).await
     }
+    async fn post_raw(
+        &self,
+        url: &str,
+        bearer: Option<&str>,
+        content_type: &str,
+        body: String,
+    ) -> Result<(u16, String), String> {
+        let mut req = self.client.post(url).header("content-type", content_type).body(body);
+        if let Some(t) = bearer {
+            req = req.bearer_auth(t);
+        }
+        let res = req.send().await.map_err(|e| e.to_string())?;
+        let status = res.status().as_u16();
+        let text = res.text().await.map_err(|e| e.to_string())?;
+        Ok((status, text))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Gmail batch (AMUX-3520): N metadata GETs in ceil(N/100) HTTP round-trips
+// ---------------------------------------------------------------------------
+//
+// The inbox's per-message fetches are quota-bound at ~12-15s for count=480
+// (8-wide, deliberately under Gmail's 250 units/s). The batch endpoint packs
+// up to 100 sub-requests per multipart/mixed POST, so the same fetch is ~5
+// round-trips. Builder and parser are PURE so every framing cell is testable
+// against canned Google shapes without a transport.
+
+pub(crate) const GMAIL_BATCH_URL: &str = "https://gmail.googleapis.com/batch/gmail/v1";
+pub(crate) const GMAIL_BATCH_BOUNDARY: &str = "amux-gmail-batch";
+
+/// The multipart/mixed request body: one application/http part per sub-path,
+/// Content-IDs `item{i}` in order (Google echoes them back as
+/// `response-item{i}`, which is how out-of-order responses re-align).
+pub(crate) fn batch_request_body(boundary: &str, sub_paths: &[String]) -> String {
+    let mut out = String::new();
+    for (i, p) in sub_paths.iter().enumerate() {
+        out.push_str(&format!(
+            "--{boundary}\r\nContent-Type: application/http\r\nContent-ID: <item{i}>\r\n\r\nGET {p} HTTP/1.1\r\n\r\n"
+        ));
+    }
+    out.push_str(&format!("--{boundary}--\r\n"));
+    out
+}
+
+/// Parse a Google batch response into (item index, embedded status, JSON).
+/// The boundary is SNIFFED from the body's own first `--` line rather than
+/// trusted from a header the caller may not have kept; parts that fail any
+/// step are skipped — the caller's fallback path re-fetches the holes, so a
+/// malformed part degrades to one extra GET, never to a wrong message.
+pub(crate) fn parse_batch_parts(body: &str) -> Vec<(usize, u16, Value)> {
+    let norm = body.replace("\r\n", "\n");
+    let Some(bline) = norm.lines().find(|l| l.starts_with("--")) else { return vec![] };
+    let boundary = bline.trim_end_matches('-').trim();
+    let mut out = Vec::new();
+    for part in norm.split(boundary) {
+        let part = part.trim_matches(['-', '\n', ' ']);
+        if part.is_empty() {
+            continue;
+        }
+        // Content-ID: <response-item{N}> (angle brackets optional).
+        let Some(idx) = part
+            .lines()
+            .find(|l| l.to_ascii_lowercase().starts_with("content-id:"))
+            .and_then(|l| {
+                let tail = l.rsplit("item").next()?;
+                tail.trim_matches(['<', '>', ' ']).parse::<usize>().ok()
+            })
+        else {
+            continue;
+        };
+        // Embedded HTTP status line, then the JSON after its header block.
+        let Some(http_at) = part.find("HTTP/1.1 ") else { continue };
+        let embedded = &part[http_at..];
+        let Some(status) = embedded
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u16>().ok())
+        else {
+            continue;
+        };
+        let Some(blank) = embedded.find("\n\n") else { continue };
+        let json_text = embedded[blank..].trim();
+        let Ok(v) = serde_json::from_str::<Value>(json_text) else { continue };
+        out.push((idx, status, v));
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -798,6 +900,66 @@ impl GmailClient {
     fn metadata_url(&self, id: &str, headers: &[&str]) -> String {
         let hs: String = headers.iter().map(|h| format!("&metadataHeaders={h}")).collect();
         format!("{GMAIL_BASE}/messages/{id}?format=metadata{hs}")
+    }
+
+    /// Best-effort batch metadata fetch (AMUX-3520): up to 100 sub-requests
+    /// per HTTP call. Returns a Vec ALIGNED with `mids`; a hole means that
+    /// part failed (or the whole batch did) and the caller re-fetches it
+    /// through the single-message path, which keeps the 429-retry and
+    /// loud-drop semantics that path already carries.
+    pub async fn batch_metadata(
+        &self,
+        account: &str,
+        mids: &[String],
+        headers: &[&str],
+    ) -> Vec<Option<Value>> {
+        let mut out: Vec<Option<Value>> = vec![None; mids.len()];
+        let Ok(mut token) = self.access_token(account, false).await else { return out };
+        let ct = format!("multipart/mixed; boundary={GMAIL_BATCH_BOUNDARY}");
+        for (chunk_i, chunk) in mids.chunks(100).enumerate() {
+            let base = chunk_i * 100;
+            let subs: Vec<String> = chunk
+                .iter()
+                .map(|id| {
+                    self.metadata_url(id, headers)
+                        .trim_start_matches("https://gmail.googleapis.com")
+                        .to_string()
+                })
+                .collect();
+            let body = batch_request_body(GMAIL_BATCH_BOUNDARY, &subs);
+            let mut resp =
+                self.http.post_raw(GMAIL_BATCH_URL, Some(&token), &ct, body.clone()).await;
+            if matches!(&resp, Ok((401, _))) {
+                if let Ok(t2) = self.access_token(account, true).await {
+                    token = t2;
+                    resp = self.http.post_raw(GMAIL_BATCH_URL, Some(&token), &ct, body).await;
+                }
+            }
+            match resp {
+                Ok((status, text)) if (200..300).contains(&status) => {
+                    for (idx, part_status, v) in parse_batch_parts(&text) {
+                        if (200..300).contains(&part_status) && idx < chunk.len() {
+                            out[base + idx] = Some(v);
+                        }
+                    }
+                }
+                Ok((status, text)) => {
+                    tracing::warn!(
+                        %status,
+                        "gmail batch call failed — falling back to single fetches for {} ids: {}",
+                        chunk.len(),
+                        text.chars().take(200).collect::<String>()
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "gmail batch transport error — falling back to single fetches for {} ids: {e}",
+                        chunk.len()
+                    );
+                }
+            }
+        }
+        out
     }
 
     async fn list_ids(
@@ -1271,15 +1433,34 @@ impl GmailClient {
         // an already-chronic 32s baseline. Eight in flight keeps order
         // (`buffered`, not unordered — callers see newest-first as listed) and
         // stays far under Gmail's per-user concurrency limits.
+        //
+        // AMUX-3520 layered on top: ABOVE the threshold, one batch call per
+        // 100 ids does the bulk (count=480: ~5 round-trips instead of ~60
+        // 8-wide waves), and only the HOLES a batch part failed for go
+        // through the single path — which keeps its 429-retry and loud-drop
+        // semantics load-bearing for exactly the requests that need them.
+        // Below the threshold the single path runs alone, so its test cells
+        // stay pinned to real behavior.
+        const BATCH_THRESHOLD: usize = 20;
+        const META_HEADERS: [&str; 5] = ["From", "To", "Subject", "Date", "Message-ID"];
         use futures::stream::{self, StreamExt};
         let mids: Vec<String> = ids
             .iter()
             .filter_map(|m| m.get("id").and_then(Value::as_str).map(str::to_string))
             .collect();
-        let fetched: Vec<Option<Value>> = stream::iter(mids)
-        .map(|mid| async move {
-            let url =
-                self.metadata_url(&mid, &["From", "To", "Subject", "Date", "Message-ID"]);
+        let batched: Vec<Option<Value>> = if mids.len() > BATCH_THRESHOLD {
+            self.batch_metadata(account, &mids, &META_HEADERS).await
+        } else {
+            vec![None; mids.len()]
+        };
+        let fetched: Vec<Option<(String, Value)>> = stream::iter(
+            mids.into_iter().zip(batched),
+        )
+        .map(|(mid, pre)| async move {
+            if let Some(full) = pre {
+                return Some((mid, full));
+            }
+            let url = self.metadata_url(&mid, &META_HEADERS);
             match self.api(account, "GET", &url, None).await {
                 Ok(full) => Some((mid, full)),
                 Err(e) => {
@@ -1295,13 +1476,10 @@ impl GmailClient {
             }
         })
         .buffered(8)
-        .map(|r| r.map(|(mid, full)| json!({"__mid": mid, "__full": full})))
         .collect()
         .await;
         let mut out = Vec::with_capacity(ids.len());
-        for pair in fetched.into_iter().flatten() {
-            let mid = pair["__mid"].as_str().unwrap_or_default().to_string();
-            let full = pair["__full"].clone();
+        for (mid, full) in fetched.into_iter().flatten() {
             let h = header_map(&full);
             let hv = |k: &str| h.get(k).cloned().unwrap_or_default();
             let unread = full
@@ -1965,6 +2143,18 @@ mod tests {
             );
             self.answer("FORM", url, Some(&v))
         }
+        async fn post_raw(
+            &self,
+            url: &str,
+            _bearer: Option<&str>,
+            _content_type: &str,
+            body: String,
+        ) -> Result<(u16, String), String> {
+            // Scripted like every other verb; the multipart RESPONSE rides in
+            // the script's Value as a plain string.
+            let (st, v) = self.answer("RAW", url, Some(&Value::String(body)))?;
+            Ok((st, v.as_str().map(str::to_string).unwrap_or_else(|| v.to_string())))
+        }
     }
 
     /// Temp home with a synthetic token file. PLACEHOLDER strings only — no
@@ -2229,6 +2419,70 @@ mod tests {
         // Both the 429 and the retry hit the wire.
         let gets = http.calls.lock().unwrap().iter().filter(|(m, u, _)| m == "GET" && u.contains("/messages/g1")).count();
         assert_eq!(gets, 2);
+    }
+
+    /// AMUX-3520 — the framing is the contract: the builder's Content-IDs
+    /// are what re-align Google's out-of-order response parts, and the
+    /// parser must survive exactly the shapes Google sends (CRLF, angle
+    /// brackets, a non-JSON error part) by SKIPPING, never by mis-mapping.
+    #[test]
+    fn batch_multipart_builder_and_parser_round_google_shapes() {
+        let body = batch_request_body("B", &["/gmail/v1/users/me/messages/a?x=1".into(),
+                                             "/gmail/v1/users/me/messages/b?x=1".into()]);
+        assert!(body.contains("--B\r\nContent-Type: application/http\r\nContent-ID: <item0>"));
+        assert!(body.contains("GET /gmail/v1/users/me/messages/b?x=1 HTTP/1.1"));
+        assert!(body.ends_with("--B--\r\n"));
+
+        // Google-style response: parts OUT OF ORDER, one embedded 404, one
+        // garbage part. Only the good parts map, each to its own index.
+        let resp = "--batch_r\r\nContent-Type: application/http\r\nContent-ID: <response-item1>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"id\":\"g1\"}\r\n\r\n--batch_r\r\nContent-Type: application/http\r\nContent-ID: <response-item0>\r\n\r\nHTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":{\"code\":404}}\r\n\r\n--batch_r\r\nContent-ID: <response-item2>\r\n\r\nnot http at all\r\n--batch_r--\r\n";
+        let parts = parse_batch_parts(resp);
+        assert_eq!(parts.len(), 2, "{parts:?}");
+        assert!(parts.contains(&(1, 200, serde_json::json!({"id":"g1"}))));
+        assert!(parts.iter().any(|(i, st, _)| *i == 0 && *st == 404));
+    }
+
+    /// AMUX-3520 end to end: above the threshold ONE batch call does the
+    /// bulk and only the batch's holes go through the single path — which is
+    /// also the cell proving a partial batch cannot lose a message.
+    #[tokio::test]
+    async fn inbox_batches_above_threshold_and_single_fetches_the_holes() {
+        let home = temp_home_with_token("acct@example.com", true);
+        let n = 25usize;
+        let ids: Vec<Value> = (0..n).map(|i| json!({"id": format!("g{i}")})).collect();
+        // Canned RESPONSE multipart: every part except item7 (the hole).
+        let mut resp = String::new();
+        for i in (0..n).rev() {
+            // reverse order on purpose: Content-ID is what re-aligns
+            if i == 7 {
+                continue;
+            }
+            resp.push_str(&format!(
+                "--batch_r\r\nContent-Type: application/http\r\nContent-ID: <response-item{i}>\r\n\r\nHTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{{\"id\":\"g{i}\",\"threadId\":\"T\",\"snippet\":\"s\",\"payload\":{{\"headers\":[{{\"name\":\"Message-ID\",\"value\":\"<m{i}@x>\"}}]}}}}\r\n\r\n"
+            ));
+        }
+        resp.push_str("--batch_r--\r\n");
+        let meta7 = json!({
+            "id": "g7", "threadId": "T", "snippet": "s",
+            "payload": { "headers": [ { "name": "Message-ID", "value": "<m7@x>" } ] },
+        });
+        let http = MockHttp::new(vec![
+            ("GET", "/messages?q=", 200, json!({ "messages": ids })),
+            ("RAW", "/batch/gmail/v1", 200, Value::String(resp)),
+            // ONLY the hole may fall back to a single GET.
+            ("GET", "/messages/g7", 200, meta7),
+        ]);
+        let client = GmailClient::new(http.clone(), home.path().to_path_buf());
+        let res = client.inbox_messages("acct@example.com", n, "", 3.0).await.unwrap();
+        let msgs = res["messages"].as_array().unwrap();
+        assert_eq!(msgs.len(), n, "batch + hole-fallback must deliver every message");
+        assert_eq!(msgs[7]["message_id"], json!("<m7@x>"), "the hole came via fallback, in place");
+        let calls = http.calls.lock().unwrap();
+        let raw_calls = calls.iter().filter(|(m, _, _)| m == "RAW").count();
+        let single_gets =
+            calls.iter().filter(|(m, u, _)| m == "GET" && u.contains("/messages/g")).count();
+        assert_eq!(raw_calls, 1, "one batch round-trip for 25 ids");
+        assert_eq!(single_gets, 1, "only the hole single-fetches: {single_gets}");
     }
 
     #[tokio::test]
