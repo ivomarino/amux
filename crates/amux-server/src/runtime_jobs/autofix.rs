@@ -654,7 +654,21 @@ struct Group {
 /// everything and look identical to a filter that worked.
 fn spans_restart(ts: f64, latency_ms: f64, boot: Option<f64>) -> bool {
     match boot {
-        Some(b) => ts - latency_ms / 1000.0 < b,
+        // BOTH conditions. "Started before boot" alone is not "spanned the boot":
+        // a request that started AND finished before this process started is
+        // simply OLD, and it is legitimate baseline data. I shipped the
+        // one-sided version in d0c034ad and it excluded 213,420 rows within the
+        // hour — a filter matching over half the table, which is the exact
+        // "silently matches everything" trap this file's rule 7 records, in the
+        // code written to fix a different instance of it.
+        //
+        // It was caught by the INFO line I added to make the exclusion
+        // auditable: `excluded=213420` on a defect whose real population was
+        // eleven. Without the count it would have looked like a working filter
+        // and quietly hollowed out the detector's baseline, since this server
+        // restarts ~27 times a day and most of a multi-hour baseline therefore
+        // predates the current boot.
+        Some(b) => ts - latency_ms / 1000.0 < b && ts >= b,
         None => false,
     }
 }
@@ -4359,6 +4373,20 @@ mod tests {
         // decides it, and nothing else does.
         assert!(spans_restart(boot + 10.0, 10_001.0, Some(boot)));
         assert!(!spans_restart(boot + 10.0, 9_999.0, Some(boot)));
+
+        // A row that started AND FINISHED before this boot is OLD, not spanning.
+        // This is the cell that fails against the one-sided predicate I shipped
+        // in d0c034ad, which excluded 213,420 rows in an hour because most of a
+        // multi-hour baseline predates the current boot on a server that
+        // restarts ~27 times a day.
+        assert!(
+            !spans_restart(boot - 3600.0, 6.0, Some(boot)),
+            "a 6ms request an hour BEFORE this boot is ordinary baseline data, not an outage"
+        );
+        assert!(
+            !spans_restart(boot - 1.0, 500.0, Some(boot)),
+            "started and finished before boot — old, not spanning"
+        );
 
         // Unknown boot keeps EVERY row. Excluding on an unknown boundary would
         // drop everything and be indistinguishable from a working filter — the
