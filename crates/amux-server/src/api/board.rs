@@ -120,11 +120,42 @@ async fn get_contract(
             match bs::get_issue(&conn, card_id) {
                 Ok(Some(row)) => {
                     let mut per = serde_json::Map::new();
+                    // SAY WHICH TIER EACH GATE CAME FROM (AMUX-3567). The
+                    // resolved gate was already here; the SOURCE was not, and
+                    // without it nothing surfaces that a worker or group carries
+                    // a custom gate until you trip it. AF-168's reporter learned
+                    // it from a refusal and drew the wrong mechanism from it;
+                    // amux-frustrations found the answering endpoint by grepping
+                    // the resolver.
+                    //
+                    // It varies BY TRANSITION, not just by scope — measured
+                    // 2026-08-23, `group:amux` pins only `verified`,
+                    // `tubescience` only `done`, `amux-cloud` both `review` and
+                    // `verified` — so a per-card summary would be wrong for the
+                    // transitions it did not describe. One entry per status.
+                    //
+                    // Same walk enforcement uses, so the contract and the
+                    // refusal cannot disagree about where a bar came from.
+                    let mut sources = serde_json::Map::new();
+                    let groups = row
+                        .session
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .map(crate::api::session_verbs::lane_groups)
+                        .unwrap_or_default();
                     for &st in &statuses {
                         if let Some(target) = bs::parse_status(st) {
-                            let g = bs::effective_gate_configured(&conn, &row, target);
+                            let (g, src) =
+                                bs::effective_gate_with_source(&conn, &row, target, &groups);
                             if !g.is_empty() {
                                 per.insert(st.to_string(), json!(g));
+                                sources.insert(
+                                    st.to_string(),
+                                    json!({
+                                        "retype_would_change_it": src.retype_would_help(),
+                                        "explain": src.explain(),
+                                    }),
+                                );
                             }
                         }
                     }
@@ -133,6 +164,7 @@ async fn get_contract(
                         "type": row.item_type,
                         "session": row.session,
                         "gates": per,
+                        "gate_sources": sources,
                         "note": "resolved through the SAME precedence enforcement uses \
                                  (card override → worker → group → global → type default) — \
                                  this is the gate a transition will actually be judged by",

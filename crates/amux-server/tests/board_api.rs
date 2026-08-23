@@ -2112,3 +2112,57 @@ async fn the_retype_hint_prints_only_when_retyping_would_actually_help() {
         "the refusal must say WHERE the bar came from instead: {v}"
     );
 }
+
+// ---- AMUX-3567: the contract says WHERE each gate came from ---------------
+
+/// Nothing surfaced that a worker or group carries a custom gate until you
+/// tripped it. The contract already served the RESOLVED gate; it did not say
+/// which tier produced it, so a reader could not tell a type default (which
+/// retyping changes) from a scoped override (which it cannot).
+///
+/// Per TRANSITION, not per card: `group:amux` pins only `verified`,
+/// `tubescience` only `done`. A card-level summary would be wrong for every
+/// transition it did not describe.
+#[tokio::test]
+async fn the_contract_says_which_tier_each_gate_came_from() {
+    let (app, _dir) = app();
+    let card = create(
+        &app,
+        json!({ "title": "plain", "status": "todo", "desc": "artifact: x/y.rs" }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    let (st, _, v) = send(&app, "GET", &format!("/api/board/contract?card={id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    let src = &v["card_effective_gates"]["gate_sources"];
+    assert!(src.is_object(), "the contract must name the source per transition: {v}");
+
+    // A card with no override anywhere resolves from the TYPE, and there the
+    // retype advice is correct — this is the cell that fails if the field is
+    // hardcoded to "scoped".
+    let done = &src["done"];
+    assert_eq!(
+        done["retype_would_change_it"], json!(true),
+        "a type-derived gate IS changed by retyping: {v}"
+    );
+    assert!(done["explain"].as_str().unwrap().contains("TYPE"), "{v}");
+
+    // Now pin the card's own gate and the same transition must flip — the
+    // control that stops this being a constant. A fix that always reported
+    // "type default" passes the assertions above and fails here.
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "gate": ["Something only this card demands"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let (_, _, v2) = send(&app, "GET", &format!("/api/board/contract?card={id}"), None).await;
+    let done2 = &v2["card_effective_gates"]["gate_sources"]["done"];
+    assert_eq!(
+        done2["retype_would_change_it"], json!(false),
+        "a card-scoped gate is NOT changed by retyping, and the contract must say so: {v2}"
+    );
+}
