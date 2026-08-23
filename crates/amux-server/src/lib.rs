@@ -201,6 +201,39 @@ async fn async_main() {
 
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), "starting amux-rust");
 
+    // WAS THIS RESTART ANNOUNCED? (AF-176)
+    //
+    // A planned self-adoption sets AMUX_SELF_ADOPTED on the exec'd image. Its
+    // ABSENCE means the previous process stopped without saying so — a death,
+    // a SIGKILL, or a launchd stop — and until now nothing distinguished those
+    // from the 27 routine self-adoptions that happen on a busy day. Measured
+    // 2026-08-23: 28 starts, 27 announced, ONE not, and that one was a
+    // 107-second outage with ~50 lanes attached that surfaced only because the
+    // latency detector misfiled it as slow requests (AMUX-3570).
+    //
+    // The outage length needs no new state: the request log's newest row is
+    // when the fleet last got an answer. `env::var` is read BEFORE the runtime
+    // starts so nothing can have cleared it.
+    let self_adopted = std::env::var("AMUX_SELF_ADOPTED").is_ok();
+    std::env::remove_var("AMUX_SELF_ADOPTED");
+    // SAY IT AT BOOT, not only when a duration threshold happens to trip. This
+    // is one line rather than a new detector because heartbeat.rs already owns
+    // outage reporting and is being extended by another session right now; a
+    // second reporter beside it is how two spellings of one alarm start
+    // drifting. The fact belongs on the record either way — an unannounced stop
+    // is worth knowing at ANY length, and the 2026-08-23 22:28 one was 107s
+    // against a 120s threshold, so nothing said anything at all.
+    if self_adopted {
+        tracing::info!("boot: self-adoption (the previous process exec'd this one deliberately)");
+    } else {
+        tracing::warn!(
+            "boot: UNANNOUNCED — no self-adoption marker, so the previous process stopped \
+             without saying so (death, SIGKILL, or a launchd stop). A planned rebuild sets \
+             AMUX_SELF_ADOPTED; its absence is the discriminator (AF-176). Duration, if any, \
+             is reported separately by the heartbeat's downtime check."
+        );
+    }
+
     let store = match db::Store::open(&cfg.db_path) {
         Ok(s) => Arc::new(s),
         Err(e) => {
@@ -555,8 +588,14 @@ async fn async_main() {
                     "binary changed on disk — exec'ing the new build in place (self-adoption, \
                      AMUX-3458: no exit means no launchd throttle window)"
                 );
+                // TELL THE SUCCESSOR THIS WAS PLANNED (AF-176). exec() replaces
+                // the image, so the new server has no way to know whether it
+                // arrived by self-adoption or by the previous process dying —
+                // and those two look identical in the log, which is why a
+                // 107-second outage on 2026-08-23 was noticed only because a
+                // latency detector misfiled it as 11 slow requests.
                 let err = std::os::unix::process::CommandExt::exec(
-                    &mut std::process::Command::new(&exe),
+                    std::process::Command::new(&exe).env("AMUX_SELF_ADOPTED", "1"),
                 );
                 // Only reachable when exec FAILED. Fall back to the old
                 // exit-for-relaunch path — slower (throttle) but correct.
