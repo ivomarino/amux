@@ -16,7 +16,49 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      # Full history: the client-version guard below diffs against the push's
+      # base, which a shallow clone cannot reach.
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # AF-148 / AMUX-3524 follow-up: a client JS change that ships WITHOUT a
+      # version bump reaches no browser holding the cached script, and nothing
+      # said so. dashboard_assets.rs pins that APP_VER and CACHE AGREE — but
+      # 25ba8ea changed app.js and bumped NEITHER, so they still agreed and the
+      # test stayed green. The silent shape is worse than a mismatch: the
+      # author's find-and-replace bump no-opped (a peer had already moved the
+      # version), the functional edits in the same pass succeeded, and the
+      # script printed success. Diffing is the only way to see it.
+      - name: Client JS changes carry a version bump (CLAUDE.md, enforced)
+        run: |
+          set -uo pipefail
+          BASE="${{ github.event.pull_request.base.sha || github.event.before }}"
+          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ] \
+             || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
+            echo "no reachable base ($BASE) — first push or force-push; guard SKIPPED, honestly"
+            exit 0
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD -- \
+            crates/amux-dashboard/static/app.js crates/amux-dashboard/static/sw.js)
+          [ -n "$CHANGED" ] || { echo "no client JS in this range — nothing to check"; exit 0; }
+          echo "client JS changed:"; echo "$CHANGED" | sed 's/^/  /'
+          # The VERSION LINES specifically, not the files: a file can change
+          # while its version does not, which is exactly the defect.
+          APP_MOVED=$(git diff "$BASE" HEAD -- crates/amux-dashboard/static/app.js \
+            | grep -c '^[+-].*APP_VER *=' || true)
+          SW_MOVED=$(git diff "$BASE" HEAD -- crates/amux-dashboard/static/sw.js \
+            | grep -c '^[+-].*CACHE *=' || true)
+          if [ "$APP_MOVED" -eq 0 ] || [ "$SW_MOVED" -eq 0 ]; then
+            echo
+            echo "FAIL: client JS shipped without bumping both versions."
+            echo "  APP_VER line changed: $([ "$APP_MOVED" -gt 0 ] && echo yes || echo NO)"
+            echo "  sw.js CACHE changed:  $([ "$SW_MOVED" -gt 0 ] && echo yes || echo NO)"
+            echo "A browser holding the cached script never fetches this change."
+            echo "Bump BOTH (read-then-increment; a literal find-and-replace can"
+            echo "silently no-op when a peer moved the version first - AF-148)."
+            exit 1
+          fi
+          echo "both version lines moved — cached clients will refetch"
       - name: Secret scan (the pre-commit hook, in CI)
         run: |
           set -euo pipefail
