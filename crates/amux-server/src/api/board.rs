@@ -2072,7 +2072,9 @@ fn ack_evidence(actor: &str, criteria: &[String], via: &str) -> Vec<Evidence> {
 /// Acknowledgement was exact string containment, and one criterion in the
 /// `amux` group's `verified` gate reads:
 ///
-///     Peer-reviewed by a DIFFERENT worker in group `amux` (name them)
+/// ```text
+/// Peer-reviewed by a DIFFERENT worker in group `amux` (name them)
+/// ```
 ///
 /// The parenthetical is an INSTRUCTION to the acking agent. Under exact
 /// matching the only ack that passes is the criterion verbatim, "(name them)"
