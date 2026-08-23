@@ -3321,6 +3321,13 @@ pub(crate) async fn steer_enqueue_store(
 ) -> String {
     let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
     let id = msg_id.clone();
+    // The id we RETURN must be the row that actually exists. When a guarded
+    // re-enqueue updates the prior row in place (AMUX-3557) the freshly minted
+    // id is never inserted, and handing it back would give the caller a
+    // message id that matches nothing in the queue — a lookup that answers
+    // "not found" for a message that is sitting there.
+    let effective_id = std::sync::Arc::new(std::sync::Mutex::new(msg_id.clone()));
+    let effective_id_w = effective_id.clone();
     let session = name.to_string();
     let text_s = text.to_string();
     let guard_s = guard.to_string();
@@ -3328,21 +3335,60 @@ pub(crate) async fn steer_enqueue_store(
     let _ = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
-            conn.execute(
-                "DELETE FROM steering_queue WHERE session=?1 AND (text=?2 OR (?3 != '' AND guard=?3))",
-                rusqlite::params![session, text_s, guard_s],
-            )?;
-            conn.execute(
-                "INSERT OR REPLACE INTO steering_queue(id, session, text, queued_at, guard, sender) VALUES(?,?,?,?,?,?)",
-                rusqlite::params![
-                    id,
-                    session,
-                    text_s,
-                    now_f64(),
-                    if guard_s.is_empty() { None } else { Some(guard_s.clone()) },
-                    sender_s
-                ],
-            )?;
+            // A GUARDED RE-ENQUEUE UPDATES IN PLACE AND KEEPS `queued_at`
+            // (AMUX-3557). This was DELETE-then-INSERT, which looks like the
+            // same thing and is not: the new row got `now_f64()`, so a guarded
+            // message RESET ITS OWN AGE on every re-enqueue. Delivery is
+            // `ORDER BY queued_at ASC` — oldest first — so a message that is
+            // re-queued faster than the queue drains can NEVER be the oldest,
+            // and loses to anything else in the queue forever. The guard
+            // written to protect the message is what starved it.
+            //
+            // Measured 2026-08-23 on `backend`: auto-compact re-enqueued 300
+            // times, consecutive gaps of 4 to 117 seconds, because the trigger
+            // re-evaluates on every state report and the condition (pct=7)
+            // cannot clear until the lane actually compacts. 78 of those landed
+            // in a single hour.
+            //
+            // Keeping `queued_at` is also the honest value: the message HAS
+            // been waiting since it was first queued. The newest TEXT wins
+            // because that is the guard's purpose (one pending answer, current
+            // content); the age is not part of the content.
+            let existing: Option<String> = if guard_s.is_empty() {
+                None
+            } else {
+                conn.query_row(
+                    "SELECT id FROM steering_queue WHERE session=?1 AND guard=?2 LIMIT 1",
+                    rusqlite::params![session, guard_s],
+                    |r| r.get(0),
+                )
+                .ok()
+            };
+            if let Some(prior) = existing {
+                conn.execute(
+                    "UPDATE steering_queue SET text=?1, sender=?2 WHERE id=?3",
+                    rusqlite::params![text_s, sender_s, prior],
+                )?;
+                if let Ok(mut g) = effective_id_w.lock() {
+                    *g = prior;
+                }
+            } else {
+                conn.execute(
+                    "DELETE FROM steering_queue WHERE session=?1 AND text=?2",
+                    rusqlite::params![session, text_s],
+                )?;
+                conn.execute(
+                    "INSERT OR REPLACE INTO steering_queue(id, session, text, queued_at, guard, sender) VALUES(?,?,?,?,?,?)",
+                    rusqlite::params![
+                        id,
+                        session,
+                        text_s,
+                        now_f64(),
+                        if guard_s.is_empty() { None } else { Some(guard_s.clone()) },
+                        sender_s
+                    ],
+                )?;
+            }
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
         .await;
@@ -3355,7 +3401,8 @@ pub(crate) async fn steer_enqueue_store(
         "steering",
     )
     .await;
-    msg_id
+    // The row that exists, not the one we minted (AMUX-3557).
+    effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id)
 }
 
 /// py:25236 _send_dedup_seen — idempotency across client retries, persisted
@@ -11805,9 +11852,46 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                          left off.",
                         context_window()
                     );
+                    // HOW LONG HAS IT BEEN PENDING? (AMUX-3557) The trigger
+                    // re-evaluates on every state report and the condition
+                    // cannot clear until the lane actually compacts, so a lane
+                    // that is stuck mid-turn re-fires this forever — measured
+                    // 300 times on `backend`, 78 in one hour. Every one of
+                    // those logged an identical line, and the EVENT beside it
+                    // is deduped into 30-minute buckets, so the ledger showed
+                    // 11 where the truth was 300: a 27x under-report, which is
+                    // why nobody saw it.
+                    //
+                    // The age of the already-pending row is the discriminator
+                    // and it costs nothing: it is persistent (unlike a counter,
+                    // which this process's re-exec would reset — the mistake
+                    // the ethos file records against in-memory scan state), and
+                    // it separates "fired once, will deliver at the next
+                    // boundary" from "this lane has not reached a boundary in
+                    // an hour", which are different problems with different
+                    // owners.
+                    let pending_age_s = {
+                        let sess = name.to_string();
+                        state
+                            .store
+                            .read()
+                            .ok()
+                            .and_then(|c| {
+                                c.query_row(
+                                    "SELECT queued_at FROM steering_queue \
+                                     WHERE session=?1 AND guard='auto-compact' LIMIT 1",
+                                    rusqlite::params![sess],
+                                    |r| r.get::<_, f64>(0),
+                                )
+                                .ok()
+                            })
+                            .map(|q| (now_f64() - q).round() as i64)
+                    };
                     steer_enqueue(state, name, &msg, "auto-compact", "").await;
                     tracing::warn!(
                         session = %name, pct, used, ?action,
+                        pending_age_s = pending_age_s.unwrap_or(0),
+                        already_pending = pending_age_s.is_some(),
                         "auto-compact queued — context low"
                     );
                     emit_event(
@@ -13903,6 +13987,71 @@ mod tests {
             None,
             "a board-drive NUDGE is not a single-card pickup and must deliver"
         );
+    }
+
+    /// AMUX-3557. A guarded re-enqueue must NOT reset the message's age.
+    ///
+    /// Delivery is `ORDER BY queued_at ASC`. The old DELETE-then-INSERT gave
+    /// the replacement row `now_f64()`, so a guarded message re-queued faster
+    /// than the queue drains could never be the oldest and lost to anything
+    /// else in the queue forever — the guard written to protect the message is
+    /// what starved it.
+    ///
+    /// Measured on `backend` the day this was fixed: auto-compact re-enqueued
+    /// 300 times, consecutive gaps of 4 to 117 seconds, because the trigger
+    /// re-evaluates on every state report and the condition cannot clear until
+    /// the lane actually compacts.
+    ///
+    /// The ORDERING assertion is the load-bearing one. Checking only that
+    /// `queued_at` is unchanged would pass against an implementation that keeps
+    /// the timestamp and still hands delivery the wrong row; what the incident
+    /// was actually about is which message comes out first.
+    #[tokio::test]
+    async fn a_guarded_re_enqueue_keeps_its_place_in_the_queue() {
+        let (st, _dir) = state();
+
+        // The guarded message is queued FIRST, so it is the oldest and must
+        // stay first no matter how often it is refreshed.
+        let first = steer_enqueue(&st, "lane", "/compact v1", "auto-compact", "").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        steer_enqueue(&st, "lane", "a peer message", "", "peer").await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // Re-fire the guarded one, as the auto-compact trigger does every few
+        // seconds while the condition holds.
+        let again = steer_enqueue(&st, "lane", "/compact v2", "auto-compact", "").await;
+
+        assert_eq!(
+            again, first,
+            "a guarded re-enqueue must update the EXISTING row, so the id handed back names \
+             a message that is really in the queue"
+        );
+
+        let rows: Vec<(String, String)> = {
+            let conn = st.store.read().unwrap();
+            let mut q = conn
+                .prepare("SELECT id, text FROM steering_queue WHERE session='lane' ORDER BY queued_at ASC")
+                .unwrap();
+            let r = q
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+                .unwrap()
+                .flatten()
+                .collect();
+            r
+        };
+
+        assert_eq!(rows.len(), 2, "the guard must replace, not stack: {rows:?}");
+        assert_eq!(
+            rows[0].0, first,
+            "THE POINT: the refreshed guarded message must still be FIRST out. Resetting \
+             queued_at put it last, forever, behind anything else queued: {rows:?}"
+        );
+        assert_eq!(
+            rows[0].1, "/compact v2",
+            "the newest TEXT wins — the guard's purpose is one pending message with current \
+             content; only the AGE is preserved"
+        );
+        assert_eq!(rows[1].1, "a peer message");
     }
 
     fn state() -> (AppState, tempfile::TempDir) {
