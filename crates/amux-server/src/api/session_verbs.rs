@@ -2800,13 +2800,16 @@ impl Delivery {
     }
 }
 
-/// py:8676 _cmd_hist_record — Messages history, origin-tagged, pruned.
-async fn cmd_hist_record(state: &AppState, session: &str, text: &str, ctype: &str, origin: &str) {
-    // skip_board=false: this wrapper does not pre-strip `[no-board]`, so
-    // title_from_prompt still honours the marker when present (only the send
-    // handler strips it early and must thread the flag explicitly).
-    cmd_hist_record_full(state, session, text, ctype, origin, false, DeliveryMeta::direct()).await
-}
+// `cmd_hist_record` (py:8676 _cmd_hist_record) IS DELETED, not merely unused
+// (AF-159). It was a one-line wrapper hardcoding `DeliveryMeta::direct()`, and
+// its single caller was the STEER branch — so the only thing it ever did in
+// production was record a message that had just been enqueued as though it had
+// been delivered straight to the lane. Fixing that caller left the wrapper
+// with no users and every future caller the same trap, ready to be reached for
+// by name because it is the short one. The recorder that survives
+// (`cmd_hist_record_full`) makes you state the delivery kind, which is the
+// point: there is no longer a spelling of "record this" that quietly asserts
+// direct delivery.
 
 /// A scheduled command that was DELIVERED (py parity: origin = the schedule's
 /// title, so a peek shows scheduled commands distinctly from a human's). Only
@@ -2847,6 +2850,31 @@ impl DeliveryMeta<'_> {
         DeliveryMeta {
             delivery: Some(Delivery::Direct),
             ..Default::default()
+        }
+    }
+
+    /// A message put on the STEERING QUEUE, which has submitted nothing yet
+    /// (AF-159). `queued_at` is when the wait started; `submit_verdict` stays
+    /// None because that is the documented, correct value for a message that
+    /// has not been submitted — the whole point of the column.
+    ///
+    /// This exists because the steer branch used `direct()` for a message it
+    /// had just handed to `steer_enqueue`, so a third of `type='user'` traffic
+    /// was recorded as delivery='direct' with a blank verdict. Measured
+    /// 2026-08-23 over 7 days: 313 confirmed, 144 blank, 18 retried — and the
+    /// 144 were not a hole in the direct path, they were STEERING wearing the
+    /// wrong label. The card that found them concluded "none are steering or
+    /// queued: every one is delivery='direct'", which the label made true and
+    /// the code made false.
+    ///
+    /// That is why the mislabelling matters more than the blank: blank is
+    /// CORRECT for a queued message and WRONG for a direct one, so one label
+    /// made the same value mean two things and neither could be read.
+    pub(crate) fn queued(at_ms: i64) -> Self {
+        DeliveryMeta {
+            delivery: Some(Delivery::Queued),
+            queued_at_ms: Some(at_ms),
+            submit_verdict: None,
         }
     }
 }
@@ -10343,7 +10371,17 @@ async fn steer_mutate(
         let msg_id = steer_enqueue(state, name, &text, guard, &hdr_worker(headers)).await;
         if body.get("record_history").map(py_truthy).unwrap_or(false) {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
-            cmd_hist_record(state, name, &text, "user", email).await;
+            // QUEUED, not direct (AF-159). `steer_enqueue` above put this on the
+            // steering queue; nothing has been submitted to the lane. Recording
+            // it as `direct` with a blank verdict is what made 144 of 479
+            // `type='user'` rows over 7 days unreadable — blank is the CORRECT
+            // value for a queued message and a hole for a direct one, and one
+            // label made it mean both.
+            cmd_hist_record_full(
+                state, name, &text, "user", email, false,
+                DeliveryMeta::queued(now_i64() * 1000),
+            )
+            .await;
             // Autotask/labelling: Python's model-call feature — gap named in
             // the module doc.
         }
@@ -13839,6 +13877,67 @@ mod tests {
     // The column ALIGNMENT, which submit_verdict_of's unit tests cannot catch:
     // the INSERT lists 9 columns and 9 placeholders, and getting that pairing
     // wrong writes the verdict into the wrong column silently. Round-trip a
+    /// AF-159. A message put on the steering queue must NOT be recorded as a
+    /// direct delivery.
+    ///
+    /// The steer branch called a `cmd_hist_record` wrapper that hardcoded
+    /// `DeliveryMeta::direct()` for a message it had just handed to
+    /// `steer_enqueue`. Measured over 7 days of `type='user'` rows: 313
+    /// confirmed, 144 blank, 18 retried — and the 144 blanks were not a hole in
+    /// the direct path, they were STEERING wearing the wrong label. That is
+    /// worse than a blank, because blank is the CORRECT value for a queued
+    /// message and a hole for a direct one, so one label made the same value
+    /// mean two things and the column could not be read for either.
+    ///
+    /// This pins the CONSTRUCTOR rather than the call site because the call
+    /// site is one line in a long handler and the constructor is what any
+    /// future caller reaches for. The wrapper that made the wrong thing easy is
+    /// deleted, so `direct()` can no longer be applied by default.
+    #[tokio::test]
+    async fn a_queued_send_is_never_recorded_as_a_direct_delivery() {
+        let m = DeliveryMeta::queued(4_242);
+        assert!(
+            matches!(m.delivery, Some(Delivery::Queued)),
+            "a queued send must say queued — recording it as direct is AF-159"
+        );
+        assert_eq!(m.queued_at_ms, Some(4_242), "the wait has to start somewhere");
+        assert_eq!(
+            m.submit_verdict, None,
+            "None is CORRECT here: nothing has been submitted yet. The defect was \
+             never the blank, it was the blank arriving under a `direct` label"
+        );
+
+        // And the contrast that makes the label load-bearing.
+        let d = DeliveryMeta::direct();
+        assert!(matches!(d.delivery, Some(Delivery::Direct)));
+        assert_eq!(d.queued_at_ms, None, "a direct send never waited");
+
+        // Round-trip through the real store, because a constructor that is
+        // right and a column that is wrong look identical from here.
+        let (st, _dir) = state();
+        cmd_hist_record_full(&st, "lane-q", "steer me", "user", "", false, DeliveryMeta::queued(7))
+            .await;
+        let (deliv, q_at, verdict) = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT delivery, queued_at, submit_verdict FROM cmd_history ORDER BY id DESC LIMIT 1",
+                [],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<i64>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(deliv.as_deref(), Some("queued"));
+        assert_eq!(q_at, Some(7));
+        assert_eq!(verdict, None);
+    }
+
     // real write through the real store (AMUX-2643).
     #[tokio::test]
     async fn a_recorded_send_round_trips_its_delivery_metadata() {
