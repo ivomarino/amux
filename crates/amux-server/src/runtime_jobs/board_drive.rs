@@ -1146,6 +1146,41 @@ fn reviewer_has_responded(conn: &Connection, card: &str, reviewer: &str) -> Opti
         .ok()
         .flatten()
         .unwrap_or(0);
+    // AF-154: REFUSE RATHER THAN GUESS WHEN THE BOARD SIDE IS BLIND.
+    //
+    // This function is a COMPARISON — did the reviewer's last deliberate board
+    // action outrank everyone else's — and the message timestamp was only ever
+    // a tiebreaker within it. Nothing in the Rust server has written a
+    // kind='board' interaction_log row since 2026-08-09 (792ce1f, the Python
+    // deletion): the sole INSERT is in this module's own #[cfg(test)] block,
+    // and the live table's only surviving kind is 'scope'. Measured in the
+    // live DB: 1136 board rows, every one dated 08-09.
+    //
+    // So on every card created since, rev_ts and other_ts are BOTH 0, the
+    // comparison collapses, and `best > other_ts && best > 0` degenerates into
+    // "has the reviewer ever named this card in a message" — which ANY message
+    // satisfies, including the one ANNOUNCING the card. That is what told a
+    // lane its reviewer had responded when the card's own log said otherwise.
+    //
+    // Both-zero is knowable, so say it instead of guessing. The failure this
+    // trades toward is one extra nudge to a reviewer who answered only by
+    // message; the failure it removes is a review gate waiting on nothing,
+    // which is the one that makes the gate meaningless. When board writes come
+    // back (or this reads the board's own log instead), the branch stops
+    // firing on its own.
+    if rev_ts == 0 && other_ts == 0 {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            tracing::warn!(
+                "[board-drive] interaction_log kind='board' is EMPTY for review cards — \
+                 reviewer-response detection is running blind and now declines to infer a \
+                 response from messages alone (AF-154). Nothing has written that channel \
+                 since the Python server was deleted; a message naming a card is not a \
+                 review action."
+            );
+        }
+        return None;
+    }
     let msg_ts = reviewer_msg_engagement(conn, card, reviewer);
     let best = rev_ts.max(msg_ts);
     if best > other_ts && best > 0 {
@@ -4521,6 +4556,57 @@ mod tests {
     /// `review`, so without this the sweep re-nudges a reviewer whose analysis is
     /// already on the card — and AMUX-2498: the conclusion "the author owes the
     /// next move" must be ACTED on, not thrown away.
+    /// AF-154. The test ABOVE inserts the interaction_log row itself, so it
+    /// manufactures the precondition production has lacked since 2026-08-09
+    /// and is structurally blind to the empty table — it passed for two weeks
+    /// while the function it covers was guessing. This is the cell it could
+    /// not be: NO board row anywhere (the live shape), a message from the
+    /// reviewer that merely NAMES the card, and the demand that the sweep does
+    /// NOT conclude the reviewer responded.
+    #[test]
+    fn a_message_naming_the_card_is_not_a_review_response_when_the_board_channel_is_empty() {
+        let conn = board_db();
+        add_card(&conn, "R-2", "lane", "review", "needs a peer", "SCOPE: x");
+        conn.execute("UPDATE issues SET reviewer='peer' WHERE id='R-2'", []).expect("rev");
+        // The reviewer names the card in a message — an announcement, a
+        // hand-off, a status ping. Not a review action.
+        conn.execute(
+            "INSERT INTO cmd_history (text,type,session,ts,origin) \
+             VALUES ('filed R-2 for you, taking a look later','direct','lane',?1,'peer')",
+            rusqlite::params![chrono::Utc::now().timestamp_millis()],
+        )
+        .expect("seed the reviewer message");
+        // PROVE THE FIXTURE IS REAL before asserting on its absence. My first
+        // cut used .ok() on an INSERT with the wrong column names; it failed
+        // silently, so the assertion below held for the trivial reason that no
+        // message existed — and the mutation check caught it passing against
+        // the pre-fix behaviour. A fixture I built is a claim, not a premise.
+        assert!(
+            reviewer_msg_engagement(&conn, "R-2", "peer") > 0,
+            "fixture broken: the seeded message must be visible to the engagement probe, \
+             or this test asserts nothing"
+        );
+        assert_eq!(
+            reviewer_has_responded(&conn, "R-2", "peer"),
+            None,
+            "with NO board evidence, a message naming the card must not read as a response — \
+             that is what left a review gate waiting on nothing"
+        );
+
+        // CONTROL, or the assertion above passes for a function that always
+        // returns None: the SAME message plus a real board write by the
+        // reviewer must still be detected.
+        conn.execute(
+            "INSERT INTO interaction_log (ts,kind,actor,target,action)              VALUES (?1,'board','peer','R-2','patch')",
+            rusqlite::params![chrono::Utc::now().timestamp_millis()],
+        )
+        .expect("ilog");
+        assert!(
+            reviewer_has_responded(&conn, "R-2", "peer").is_some(),
+            "a real board write by the reviewer must still count"
+        );
+    }
+
     #[test]
     fn a_reviewer_who_already_responded_is_not_renudged_and_the_author_is_told() {
         let conn = board_db();
