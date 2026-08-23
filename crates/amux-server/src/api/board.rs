@@ -2059,6 +2059,54 @@ fn ack_evidence(actor: &str, criteria: &[String], via: &str) -> Vec<Evidence> {
 /// `why_blocked`/`kind`: it cannot be merged flat because core spells the
 /// list `blocked` while the Python contract's `blocked` is the boolean the
 /// CLI-side incident (orch MO-2952) made load-bearing.
+/// Normalize a gate criterion for ACK MATCHING (AF-160 / AMUX-3532).
+///
+/// Acknowledgement was exact string containment, and one criterion in the
+/// `amux` group's `verified` gate reads:
+///
+///     Peer-reviewed by a DIFFERENT worker in group `amux` (name them)
+///
+/// The parenthetical is an INSTRUCTION to the acking agent. Under exact
+/// matching the only ack that passes is the criterion verbatim, "(name them)"
+/// included — so following the instruction inside the criterion is what makes
+/// the ack fail. That is ethos rule 3 exactly, and its practical effect is to
+/// route the criterion carrying the most judgment in the gate toward the two
+/// mechanisms carrying the least: `gate_ack` (acknowledge everything at once,
+/// which per-criterion acks exist to prevent) and `force`.
+///
+/// Two more traps rode along, both of which cost a retry on AF-66: DIFFERENT is
+/// uppercase in the criterion and lowercase in ordinary prose, and `amux` is in
+/// BACKTICKS, so a shell ate them unless escaped and the sent string silently
+/// differed from the one the caller believed they sent.
+///
+/// So: case-fold, drop backticks, drop ONE trailing parenthetical, collapse
+/// whitespace. Exact matching is still tried FIRST at the call site, so nothing
+/// that passes today can stop passing; this only widens.
+///
+/// It cannot make two distinct criteria collide unless they differ ONLY by a
+/// trailing parenthetical or by case, in which case they were already
+/// indistinguishable to a human reading the 409.
+fn ack_norm(s: &str) -> String {
+    let mut t = s.trim().to_lowercase().replace('`', "");
+    if t.ends_with(')') {
+        if let Some(i) = t.rfind('(') {
+            t.truncate(i);
+        }
+    }
+    t.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Does this criterion ASK FOR A NAME? (AF-160)
+///
+/// The marker is the criterion's own words. A gate that says "name them" and
+/// then records no name is not collecting the fact it exists to collect —
+/// measured fleet-wide 2026-08-23: 148 of 1632 live verified cards named a
+/// peer, and 45 of 1381 archived ones. 91% of the board passed this gate with
+/// nothing machine-readable behind it.
+fn criterion_wants_a_name(c: &str) -> bool {
+    c.to_lowercase().contains("name them")
+}
+
 fn gate_409(
     row: &IssueRow,
     eff_gate: &[String],
@@ -2649,8 +2697,15 @@ pub async fn patch_item(
                                 .collect::<Vec<_>>()
                         });
                         if let Some(gc) = &gc {
-                            let missing: Vec<&String> =
-                                eff_gate.iter().filter(|c| !gc.contains(c)).collect();
+                            // Exact FIRST, normalized as a fallback (AF-160):
+                            // widening only, so no ack that passes today stops.
+                            let missing: Vec<&String> = eff_gate
+                                .iter()
+                                .filter(|c| {
+                                    !gc.contains(c)
+                                        && !gc.iter().any(|g| ack_norm(g) == ack_norm(c))
+                                })
+                                .collect();
                             if !missing.is_empty() {
                                 return finish(
                                     &slot_w,
@@ -2977,8 +3032,15 @@ pub async fn patch_item(
                                 .collect::<Vec<_>>()
                         });
                         if let Some(gc) = &gc {
-                            let missing: Vec<&String> =
-                                eff_gate.iter().filter(|c| !gc.contains(c)).collect();
+                            // Exact FIRST, normalized as a fallback (AF-160):
+                            // widening only, so no ack that passes today stops.
+                            let missing: Vec<&String> = eff_gate
+                                .iter()
+                                .filter(|c| {
+                                    !gc.contains(c)
+                                        && !gc.iter().any(|g| ack_norm(g) == ack_norm(c))
+                                })
+                                .collect();
                             if !missing.is_empty() {
                                 return finish(
                                     &slot_w,
@@ -3025,6 +3087,92 @@ pub async fn patch_item(
                                     no_write(),
                                 );
                             }
+                        }
+                    }
+
+                    // A GATE THAT SAYS "NAME THEM" MUST COLLECT THE NAME (AF-160).
+                    //
+                    // Acking the criterion asserts a peer reviewed it. Nothing
+                    // recorded WHO, so the assertion was unfalsifiable and the
+                    // field went unset on 91% of the board (148 of 1632 live
+                    // verified cards named a peer; 45 of 1381 archived). The
+                    // `reviewer` column and `amux board reviewer <id> <who>` /
+                    // `--reviewer` already exist — the gate simply never asked
+                    // for what it was demanding in prose.
+                    //
+                    // THE PREDICATE IS reviewer != THE CARD'S OWNER, NOT
+                    // reviewer != WHOEVER IS TYPING. The first draft of this
+                    // rule (amux-frustrations', corrected by its own author
+                    // before it shipped) compared against the ACTING session,
+                    // which would have refused both real verifications on this
+                    // board within the hour:
+                    //
+                    //   AF-161  owner=amux              reviewer=amux-frustrations  acting=amux-frustrations
+                    //   AF-16   owner=amux-frustrations reviewer=amux               acting=amux
+                    //
+                    // In both, reviewer == acting — and that is the CORRECT
+                    // shape, because criterion 3 says the peer verifies it
+                    // THEMSELVES, so the peer signing off IS the one acting.
+                    // The two cards are mirror images, and a rule derived from
+                    // either alone looks right until the first card pointing
+                    // the other way. Copy the predicate from the case that must
+                    // PASS, not from the case that must fail.
+                    //
+                    // Validated before shipping, against every verified card
+                    // rather than a constructed fixture: admits 147 of 148 live
+                    // (192 of 193 including archived) and refuses exactly one,
+                    // AMUX-2409, where owner and reviewer are both
+                    // amux-homepage. One refusal, and it is the self-review the
+                    // criterion exists to prevent — so the predicate is neither
+                    // uniformly permissive nor uniformly strict on real data.
+                    //
+                    // The escape is walkable with sanctioned tooling ONLY,
+                    // checked by walking it (AMUX-2325): `amux board reviewer
+                    // AF-66 amux` set it in one call, no raw curl, attribution
+                    // intact. Refusing on a gate whose remedy needs a
+                    // hand-rolled PATCH would manufacture the unattributed
+                    // writes this gate system depends on being attributed.
+                    if !force && eff_gate.iter().any(|c| criterion_wants_a_name(c)) {
+                        let reviewer = next.reviewer.as_deref().unwrap_or("").trim().to_string();
+                        let owner = next.session.as_deref().unwrap_or("").trim().to_string();
+                        let bad = if reviewer.is_empty() {
+                            Some("no reviewer is recorded on this card")
+                        } else if !owner.is_empty() && reviewer.eq_ignore_ascii_case(&owner) {
+                            Some("the reviewer is the card's own owner, which is a self-review")
+                        } else {
+                            None
+                        };
+                        if let Some(why) = bad {
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": format!("gate asks you to name the peer, and {why}"),
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": row.id,
+                                        "attempted_status": target_raw,
+                                        "criterion": eff_gate.iter().find(|c| criterion_wants_a_name(c)),
+                                        "reviewer": next.reviewer,
+                                        "owner": next.session,
+                                        "why": "acking \"name them\" without a name is an \
+                                                unfalsifiable assertion — 91% of verified cards \
+                                                carry no peer name at all (AF-160)",
+                                        "how_to_fix": {
+                                            "cli": format!("amux board reviewer {} <peer-session>", row.id),
+                                            "or_in_the_same_call": format!(
+                                                "amux board {} {} --reviewer <peer-session> --checked ...",
+                                                target_raw, row.id
+                                            ),
+                                            "rule": "the reviewer must be a DIFFERENT session from \
+                                                     the card's owner; the peer doing the sign-off \
+                                                     acting on it themselves is correct and expected",
+                                        },
+                                    }),
+                                ),
+                                no_write(),
+                            );
                         }
                     }
 
@@ -4142,6 +4290,47 @@ mod slim_tests {
         // CONTENT, not the first line.
         let padded = IssueRow { desc: "\n\n  \nreal content here".into(), ..Default::default() };
         assert_eq!(list_body(&padded, true, false)["desc_head"], "real content here");
+    }
+
+    /// AF-160 / AMUX-3532. The criterion's OWN INSTRUCTION must be followable.
+    ///
+    /// `Peer-reviewed by a DIFFERENT worker in group `amux` (name them)` told the
+    /// acking agent to supply a name, and exact string matching then rejected any
+    /// ack that supplied one. Every case below is a real string that was sent and
+    /// refused, or a shell-mangled form of one.
+    #[test]
+    fn an_ack_that_follows_the_criterions_own_instruction_is_accepted() {
+        let crit = "Peer-reviewed by a DIFFERENT worker in group `amux` (name them)";
+
+        // The whole point: filling in the parenthetical must MATCH.
+        assert_eq!(ack_norm("Peer-reviewed by a different worker in group amux (amux)"), ack_norm(crit));
+        // Case, which differs between the criterion and ordinary prose.
+        assert_eq!(ack_norm("peer-reviewed by a different worker in group `amux` (name them)"), ack_norm(crit));
+        // Backticks, which a shell eats unless escaped — so the string sent
+        // silently differs from the one the caller believes they sent.
+        assert_eq!(ack_norm("Peer-reviewed by a DIFFERENT worker in group amux (name them)"), ack_norm(crit));
+        // Verbatim still matches, or this would be a migration rather than a widening.
+        assert_eq!(ack_norm(crit), ack_norm(crit));
+
+        // AND IT MUST STILL DISCRIMINATE. Normalization that collapsed distinct
+        // criteria would turn a per-criterion ack into `gate_ack` wearing a
+        // costume — the exact mechanism this gate exists to prevent.
+        let others = [
+            "Functionality change is live and exercised, not just merged",
+            "That peer verified it themselves rather than taking the author's word",
+            "No regression in what it touched",
+        ];
+        for o in others {
+            assert_ne!(ack_norm(o), ack_norm(crit), "{o} must not satisfy the peer criterion");
+        }
+        // Only a TRAILING parenthetical is dropped, never arbitrary text.
+        assert_ne!(ack_norm("Peer-reviewed by a DIFFERENT worker"), ack_norm(crit));
+
+        // And the detector fires on the criterion that asks, not on its neighbours.
+        assert!(criterion_wants_a_name(crit));
+        for o in others {
+            assert!(!criterion_wants_a_name(o));
+        }
     }
 
     /// AF-161. `reviewer` SURVIVES the slim list, and a slim row SAYS it is slim.
