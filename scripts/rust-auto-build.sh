@@ -295,7 +295,17 @@ fi
     if [ "$(uname -s)" = "Darwin" ]; then
       CS_ID="${AMUX_CODESIGN_IDENTITY:-amux-dev}"
       if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$CS_ID"; then
-        if codesign --force --sign "$CS_ID" --timestamp=none "$INSTALL" 2>&1; then
+        # --identifier IS LOAD-BEARING, and leaving it out silently defeats the
+        # whole fix. Measured: signing two copies of the same binary produced
+        # `amux-server-rs-55554944c0c5…` for one and `amux_server-f10e2da7…` for
+        # the other — codesign derives the identifier from the file when it has
+        # no better source, so it drifts with the filename and with whatever
+        # rustc last embedded. TCC matches on identifier AND certificate, so a
+        # drifting identifier re-prompts exactly like a drifting cdhash, and the
+        # signing would look like it was working. Pinned, both copies came back
+        # `com.amux.server-rs` regardless of filename or content.
+        if codesign --force --sign "$CS_ID" --identifier com.amux.server-rs \
+                    --timestamp=none "$INSTALL" 2>&1; then
           echo "== signed as '$CS_ID' — TCC approvals survive this rebuild"
         else
           echo "== WARN codesign as '$CS_ID' FAILED; binary stays adhoc and macOS will re-prompt"
