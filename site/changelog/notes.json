@@ -1,5 +1,23 @@
 [
   {
+    "hash": "4049e8798d1e5604d87383679b6141a545c72f03",
+    "short": "4049e87",
+    "title": "Inbox loads 4x faster with Gmail batch API",
+    "date": "2026-08-22",
+    "type": "perf",
+    "tags": ["email", "gmail", "performance"],
+    "description": "The Gmail inbox now fetches all message metadata in a single batch request rather than one API call per message. Inbox loads with 480 messages now complete in roughly 5 round-trips instead of 480, cutting load time by 4x. The change is transparent — the inbox, thread, and search views work identically."
+  },
+  {
+    "hash": "2b1c408822ddcd3510885ef6144c8855a2fe45c2",
+    "short": "2b1c408",
+    "title": "@-mention any worker in the scheduler command editor",
+    "date": "2026-08-22",
+    "type": "feat",
+    "tags": ["dashboard", "scheduler", "ux"],
+    "description": "The @-worker autocomplete dropdown — previously limited to the message composer — now attaches to any text input, starting with the scheduler command editor. Type @ in a scheduled command to pick a session name from a live fleet list. The correct session name gets inserted without typos, which matters for scheduled commands that run unattended."
+  },
+  {
     "hash": "726ca46ef70d237c4e8084bd15582b23925338eb",
     "short": "726ca46",
     "title": "Weekly disk watchdog warns before caches fill your drive",
