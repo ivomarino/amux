@@ -337,6 +337,84 @@ out=$(unknown_run)
 says "$NEVERMARK" "$out"
 lacks "$BEHINDMARK" "$out"
 
+# ── Axis 2b: installed git hooks vs the checkout (2026-08-23) ───────────────
+#
+# The axis exists because amux already detected this and told nobody: the server
+# logged "OUTDATED HOOK ... Reinstall: scripts/install-hooks.sh" 128 times over 8
+# days, naming 9 session/repo pairs, into server-rs.log. Meanwhile every checkout
+# on the machine had .git/hooks/pre-commit dated Aug 5 and the append-only
+# data-loss guard was not installed at all.
+#
+# Case (i) is the load-bearing control. An axis that fires whenever it can see a
+# hooks directory would "pass" every positive case here and be pure noise in
+# practice — and noise in a SessionStart banner is worse than silence, because
+# the banner's whole value is that speaking is rare.
+HOOKMARK="installed git hooks differ from this checkout"
+
+# A repo with scripts/git-hooks and a real .git/hooks, both populated.
+hooks_repo() { # $1 name
+  local d="$TMP/$1"; rm -rf "$d"
+  git init -q -b main "$d/work"
+  ( cd "$d/work"
+    mkdir -p .claude scripts/git-hooks
+    cp "$HOOK" .claude/session-freshness.sh
+    for h in pre-commit pre-push prepare-commit-msg amux-staged-guard; do
+      printf '#!/bin/sh\n# v1 %s\n' "$h" > "scripts/git-hooks/$h"
+      chmod +x "scripts/git-hooks/$h"
+      cp "scripts/git-hooks/$h" ".git/hooks/$h"
+    done
+    echo seed > seed.txt; git add -A; git commit -qm seed ) >/dev/null 2>&1
+  echo "$d/work"
+}
+hooks_run() { ( cd "$1"; AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+                        bash .claude/session-freshness.sh 2>&1 ); }
+
+# (i) CONTROL — installed hooks identical to the checkout: say NOTHING.
+w=$(hooks_repo hk_same)
+out=$(hooks_run "$w")
+lacks "$HOOKMARK" "$out"
+
+# (j) one installed hook DIFFERS — named, and named specifically.
+w=$(hooks_repo hk_diff)
+printf '#!/bin/sh\n# v0 stale\n' > "$w/.git/hooks/pre-commit"
+out=$(hooks_run "$w")
+says "$HOOKMARK" "$out"
+says "pre-commit" "$out"
+
+# (k) an installed hook is MISSING ENTIRELY. This is the append-only-push-guard
+#     case and it is the one a mtime or version comparison cannot express: there
+#     is no file to be old, and "absent" reads identically to "fine" unless it is
+#     said out loud.
+w=$(hooks_repo hk_missing)
+rm -f "$w/.git/hooks/pre-push"
+out=$(hooks_run "$w")
+says "MISSING" "$out"
+
+# (l) a file in scripts/git-hooks that install-hooks.sh does NOT install must be
+#     IGNORED. Without this the axis nags forever about something whose printed
+#     remedy would not fix it — a warning with no honest exit, which is rule 3.
+w=$(hooks_repo hk_extra)
+printf 'not installed anywhere\n' > "$w/scripts/git-hooks/git-shared-guard.py"
+out=$(hooks_run "$w")
+lacks "$HOOKMARK" "$out"
+
+# (m) IN A WORKTREE. `.git` is a FILE there, so "$REPO/.git/hooks" does not
+#     exist and a hardcoded path reports nothing — silent in exactly the
+#     checkouts AEAB-26 says the guard is already blind in. `git rev-parse
+#     --git-path hooks` resolves to the MAIN repo's hooks dir, which is the one
+#     a worktree actually executes.
+w=$(hooks_repo hk_wt)
+( cd "$w" && git worktree add -q "$TMP/hk_wt_linked" -b wtbranch ) >/dev/null 2>&1
+printf '#!/bin/sh\n# v0 stale\n' > "$w/.git/hooks/pre-commit"
+mkdir -p "$TMP/hk_wt_linked/.claude"
+cp "$HOOK" "$TMP/hk_wt_linked/.claude/session-freshness.sh"
+if [ -f "$TMP/hk_wt_linked/.git" ]; then
+  out=$(hooks_run "$TMP/hk_wt_linked")
+  says "$HOOKMARK" "$out"
+else
+  FAIL=$((FAIL+1)); echo "SETUP BROKEN for (m): .git is not a file, so this is not a worktree"
+fi
+
 echo
 echo "test-session-freshness: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
