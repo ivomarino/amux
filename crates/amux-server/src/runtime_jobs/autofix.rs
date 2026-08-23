@@ -167,7 +167,17 @@ fn latency_min_samples() -> i64 {
 /// The outlier still fires ABOVE the design budget, where it means the
 /// endpoint's own timeout failed to bound the call — the one latency story
 /// on these routes that IS wrong.
-const LONG_BY_DESIGN: &[(&str, f64)] = &[("/api/files/mdai/run", 150_000.0)];
+const LONG_BY_DESIGN: &[(&str, f64)] = &[
+    ("/api/files/mdai/run", 150_000.0),
+    // GET /api/email/inbox (AMUX-3519, third filing in one day on the same
+    // residual): a count=480 metadata fetch is quota-bound at ~12-15s — the
+    // 8-wide concurrency sits deliberately under Gmail's 250 units/s budget
+    // (AMUX-3495), so the duration IS the design. 30s = 2x the worst
+    // measured legitimate run; a single wedged transport call alone blows it
+    // (the per-call reqwest timeout is 30s), so an outlier past the budget
+    // still means what an outlier should: something hung, not something big.
+    ("/api/email/inbox", 30_000.0),
+];
 
 fn design_budget_ms(target: &str) -> f64 {
     LONG_BY_DESIGN
