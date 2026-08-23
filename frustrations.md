@@ -2164,3 +2164,32 @@ FIX: the detection now reaches a session — `.claude/session-freshness.sh` gain
   AEAB-49: amux knows the dangerous fact, computes it correctly, and files it where the
   person who needs it never looks. `install-hooks.sh` also COPIES (`install -m 0755`) rather
   than symlinking, which is the mechanism that lets every one of these drift.
+
+## Developing on branches in the build source put my unreviewed code on the whole fleet
+AREA: cloud
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-49
+SYMPTOM: `curl /health` on the live server returned `commit: 5eabfb4dc6cc` — a commit that
+  exists only on my unmerged branch, never reviewed, never merged. `rust-build-provenance.json`
+  said `{"sha":"23ddb8d1...","ref":"fix/push-guard-rebase-false-positive","on_main":"no"}` and
+  a build of that commit was in flight. The auto-builder builds `~/amux` HEAD every 60s, and
+  I had been checking feature branches out in `~/amux` all session.
+COST: the fleet ran unreviewed branch code for at least one build cycle. Nothing broke, and
+  that is luck rather than design — the same mechanism would have shipped a mid-edit tree just
+  as happily. It also churns: putting the checkout back on main makes the next tick rebuild and
+  reinstall, so the fleet takes a second unnecessary swap.
+FIX: the guardrail already exists and it is a log line nobody reads — rust-auto-build.log says
+  "Installing it makes it the live build for the WHOLE FLEET within ~5s, with no CI and no
+  review. Intentional pin? fine. Accident? put ~/amux back on main — develop in a git worktree,
+  not the build source." It printed exactly that, correctly, while installing my branch. A
+  warning that fires as it does the thing is not a guardrail. `on_main:no` is already computed;
+  the builder should either refuse to INSTALL an off-main build unless a flag says the pin is
+  deliberate, or announce it where a session actually looks (a board card or the session
+  banner) rather than only in its own log.
+  The general shape, and it is the third instance today after AEAB-46 and AEAB-47: amux knows
+  the dangerous fact, computes it correctly, and writes it somewhere the person who needs it
+  never opens. Rule 4's second layer — a tag in a store the reader never opens is the same
+  failure as no tag.
