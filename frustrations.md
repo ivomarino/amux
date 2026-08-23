@@ -2389,3 +2389,45 @@ FIX: open. The narrow fix is that a card-scoped notice must source its "most rec
   shape is this file's own recurring one: a view asserting a state the underlying mechanism
   does not support (ethos rule 1 — a view must share the predicate of the mechanism it
   describes). Routed to amux-frustrations, whose patch notices are.
+
+---
+
+## The reviewer nudge reads a board channel nothing has written since 2026-08-09
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-154
+SYMPTOM: reported by amux, who disproved it against the card instead of acting on it. An idle
+  nudge told them "amux-frustrations has already responded (their message is the most recent
+  action on this card), so it is YOUR move, read their response on the card." No such response
+  existed. `reviewer_has_responded()` (runtime_jobs/board_drive.rs:1121) compares the
+  reviewer's and everyone else's last deliberate BOARD action, both read from
+  `interaction_log`, against the reviewer's newest MESSAGE naming the card, read from
+  `cmd_history`. Measured in the live DB: `interaction_log` kind='board' holds 1136 rows whose
+  ONLY date is 2026-08-09, and zero rows for AF-150 or AF-151, while `cmd_history` is current.
+  So both board timestamps are 0 on every card created since, and the test collapses from
+  "whose board action is most recent" into "has the reviewer ever named this card in a
+  message". Any message beats 0, INCLUDING the message that announces the card, which is
+  exactly what fired here.
+COST: a handful of calls for amux to disprove it, and they said the dangerous version is the
+  opposite of theirs: someone believes feedback exists and either invents something to address
+  or waits on a reviewer who is not blocked. It has been wrong on every card for two weeks and
+  nobody noticed, because being told "the ball is yours" is not surprising.
+FIX: none shipped; board_drive.rs is amux's and the card is routed to them.
+  Root cause is that nothing in the Rust server writes kind='board' rows outside tests. The
+  only such INSERT is board_drive.rs:4530, inside `#[cfg(test)]`. scope.rs:1152 is the one
+  live insert and carries kind='scope', which matches the data: 'scope' is the only kind that
+  outlived 2026-08-09, the day the Python server was deleted (792ce1f). A Python-era table the
+  port left readers pointed at.
+  THE TEST CANNOT FAIL, which is why this survived. The covering test INSERTs the
+  interaction_log row itself, manufacturing the precondition production lacks, so it is
+  structurally blind to the table being empty in reality (ethos rule 7).
+  Killed in writing, so nobody re-runs them: timestamp UNITS are fine (both tables are
+  13-digit ms); the nudge BUDGET is fine (`card_event_count` reads session_events); and the
+  message did name the card, which is the trigger rather than the miss.
+  Unverified blast radius worth checking: api/why.rs (5 reads) and runtime_jobs/storage.rs
+  (4 reads) hit the same table. Also `action='gate_force'` has exactly ONE row ever, which is
+  the audit trail ethos rule 6 names as the one thing the gate system promises is logged.
+
