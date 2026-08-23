@@ -415,6 +415,73 @@ else
   FAIL=$((FAIL+1)); echo "SETUP BROKEN for (m): .git is not a file, so this is not a worktree"
 fi
 
+# ── Axis 1e: provenance vs what the RUNNING SERVER answers (AEAB-50 follow-up) ─
+#
+# Everything else about the running build reads rust-build-provenance.json, which
+# is a CLAIM. /health's `commit` is compiled into the binary that answered and
+# cannot be stale by construction. This axis exists so the reader does not depend
+# on the builder being honest.
+#
+# Driven through AMUX_HEALTH_URL against `file://` fixtures rather than whatever
+# is listening on the machine running the suite — a test whose verdict depends on
+# the host's state is not testing the hook, which this file has already learned
+# once the hard way.
+XMARK="disagree about what is deployed"
+
+xcheck_run() { # $1 prov sha  $2 health json
+  local d="$TMP/xcheck"; rm -rf "$d"; mkdir -p "$d"
+  git init -q --bare -b main "$d/origin.git"
+  git clone -q "$d/origin.git" "$d/work" 2>/dev/null
+  ( cd "$d/work"
+    git checkout -q -B main
+    mkdir -p .claude; cp "$HOOK" .claude/session-freshness.sh
+    echo seed > seed.txt; git add -A; git commit -qm seed
+    git push -q -u origin main ) >/dev/null 2>&1
+  printf '{"sha":"%s","ref":"main","on_main":"yes","built_at":"x"}\n' "$1" > "$d/prov.json"
+  printf '%s\n' "$2" > "$d/health.json"
+  ( cd "$d/work"
+    AMUX_RS_BUILD_PROVENANCE="$d/prov.json" AMUX_HEALTH_URL="file://$d/health.json" \
+      bash .claude/session-freshness.sh 2>&1 )
+}
+
+FULLSHA=0123456789abcdef0123456789abcdef01234567
+
+# (n) THE CONTROL, and the one a wrong comparison fails. /health returns 12 hex
+#     and provenance 40, so an EQUALITY test would fire here — on every real call,
+#     forever. A detector that always fires is the same defect as one that never
+#     can, so this case is the reason the match is a prefix.
+out=$(xcheck_run "$FULLSHA" '{"commit":"0123456789ab","server":"amux-rust"}')
+lacks "$XMARK" "$out"
+
+# (o) genuine disagreement — say so, and name BOTH values. Naming only one leaves
+#     the reader to go find the other, which is the trip this axis exists to save.
+out=$(xcheck_run "$FULLSHA" '{"commit":"deadbeef1234","server":"amux-rust"}')
+says "$XMARK" "$out"
+says "deadbeef1234" "$out"
+says "0123456789ab" "$out"
+
+# (p) no server answering: SILENT. Fails open like everything else here — a
+#     freshness check that shouts because the machine is offline gets deleted.
+out=$(xcheck_run "$FULLSHA" '')
+lacks "$XMARK" "$out"
+
+# (q) WAS an assertion that an absent `commit` field stays silent. REMOVED, and
+#     the reason is worth more than the assertion was: with a prefix match an
+#     empty health value expands to the pattern `*`, which matches everything, so
+#     that case is silent BY CONSTRUCTION and no wrong implementation reachable
+#     from here can make it fire. Mutation-checked — dropping the `-n
+#     "$health_commit"` guard changed nothing, 39 passed. It read as coverage and
+#     was theatre, which rule 7 says is worse than no check because it confers
+#     false confidence. The guard stays in the hook because it states the intent;
+#     the assertion goes because it could not fail. Case (n) already covers the
+#     comparison being wrong.
+
+# (r) a SHORTER health value must still match — the length comes from the health
+#     value, not a hardcoded 12, so the day the server widens or narrows that
+#     field this keeps working instead of failing silently.
+out=$(xcheck_run "$FULLSHA" '{"commit":"0123456","server":"amux-rust"}')
+lacks "$XMARK" "$out"
+
 echo
 echo "test-session-freshness: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
