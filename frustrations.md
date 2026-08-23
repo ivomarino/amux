@@ -2437,3 +2437,41 @@ COST: minutes, and it compounds the entry above: the natural way to check "does 
 FIX: treat `-h`/`--help` in the subcommand slot as a request for the same text `amux help
   board` prints, and echo the verb list in the `unknown subcommand` error rather than only
   naming what was rejected.
+
+## A stale second `amux` CLI shadows the real one on any PATH that puts /usr/local/bin first, and silently ate a card title
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: desktop
+CARD: DESKT-22
+SYMPTOM: `amux board add --stdin <<'EOF' ... EOF` created a card whose TITLE IS THE
+  LITERAL STRING `--stdin`, and threw the real title away. Exit 0, a full JSON card body
+  echoed back, nothing wrong-looking. The identical command an hour earlier had worked
+  and printed `DESKT-21 -> todo`.
+  Cause: there are TWO amux CLIs on this machine.
+    ~/.local/bin/amux -> ~/Dev/amux/amux   (live, tracks the repo, 89 stdin refs)
+    /usr/local/bin/amux                     (standalone POSIX-sh copy, dated Aug 6, NO
+                                             --stdin support anywhere in it)
+  Default login PATH has ~/.local/bin at position 1, so normally you get the live one.
+  I had prepended `/usr/local/bin` to PATH for an unrelated reason (`networksetup` and
+  `ifconfig` are not on the sandboxed default PATH), which silently swapped the CLI
+  under me mid-session. The two calls in this transcript differ ONLY in PATH order.
+  The output shape is the tell nobody would think to look at: the live CLI prints
+  `DESKT-21 -> todo`, the stale one dumps raw JSON. Same verb, same flags, same exit code.
+COST: one card created with a garbage title and its real title destroyed, caught only
+  because I re-read the card afterwards to get its ID. Worse than the lost title: the
+  global CLAUDE.md mandates `--stdin` as the FLEET CONVENTION specifically to stop the
+  shell evaluating backticks and $(...) in titles (AMUX-1888 — a garbled message, a
+  leaked credential, and a stray `git rebase --quit`). On the stale CLI that mandated
+  form silently discards your text, and the natural recovery is to fall back to inline
+  quoting, which walks straight back into AMUX-1888. The safety convention degrades into
+  the hazard it was written to prevent, with no error at any step. That is the
+  AMUX-2140 shape: following the sanctioned instruction exactly is what produces the
+  failure, and it returns success.
+FIX: remove /usr/local/bin/amux — install.sh owns ~/.local/bin and nothing should be
+  shipping a second copy to /usr/local/bin. Belt and braces, since a stale copy can
+  reappear: have `amux` print its own resolved path and repo sha on any parse error, and
+  make an unrecognised leading `--flag` on `board add` a hard error rather than a title.
+  A CLI that accepts an unknown flag AS DATA cannot fail loudly, which is why 17 days of
+  drift produced no signal.
