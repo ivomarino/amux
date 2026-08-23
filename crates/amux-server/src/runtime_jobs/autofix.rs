@@ -177,6 +177,15 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // (the per-call reqwest timeout is 30s), so an outlier past the budget
     // still means what an outlier should: something hung, not something big.
     ("/api/email/inbox", 30_000.0),
+    // POST /api/alert/owner (AMUX-3522, third filing on one mechanism): while
+    // the Messages Automation permission stays missing (MI-4933), the
+    // iMessage breaker re-probes once per 15-min cooldown and that probe IS
+    // a designed 12s TCC-wall wait (AMUX-3492/3500 — stamp verified working;
+    // the filed rows were legitimate probes 61 min apart). 20s = probe plus
+    // a normal email send; past it means a channel actually wedged, which is
+    // the story an outlier should tell about a fire alarm. Delete this row
+    // when the permission is granted and the wall class dies.
+    ("/api/alert/owner", 20_000.0),
 ];
 
 fn design_budget_ms(target: &str) -> f64 {
