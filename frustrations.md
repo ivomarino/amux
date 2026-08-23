@@ -2235,3 +2235,58 @@ FIX: shipped same day (see AMUX-3497 for the sha). Root cause was not command pa
   observed-vs-observed coincidence keeps both claims but the shared row carries
   co_signal naming the ambiguity, which the guard hook prints. Five test cells incl.
   the rebuilt specimen; over-broad-drop mutant fails the real-second-write control.
+
+---
+
+## Three defects in two days where a compound operation reported success from the parts that worked
+AREA: silent-partial
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-150
+SYMPTOM: amux noticed the cluster and it is right, though not quite as "three invisible
+  no-ops" — one of the three is the opposite of a no-op. The property they actually share is
+  narrower and worth naming: A COMPOUND OPERATION TOOK ITS SUCCESS SIGNAL FROM THE PARTS THAT
+  WORKED, while one part did nothing and said nothing.
+    1. 1a7d215 (mine). Mutation-testing a guard, I disabled `if !p.is_absolute()` to prove the
+       test could fail. The test then did what the unguarded code says and created a directory
+       in the shared checkout. I reverted the FILE and reported the mutation clean; the
+       directory outlived the revert and failed every later local run while CI stayed green.
+       The revert succeeded at its visible half.
+    2. 24fc2b4 (mine). A version bump written as a literal find-and-replace — '0.9.701' ->
+       '0.9.702' — matched nothing, because a peer had moved both files to 0.9.708 between my
+       read and my write. The same edit pass made the functional changes successfully and
+       printed "patched". I had asserted on those and not on the bump.
+    3. c207339 (amux). The recovery sweep classified on `desc`, and AMUX-3496 made the default
+       board list slim, which does not carry it. `.get("desc") or ""` was empty for every row,
+       so the sweep printed "0 to do" on a schedule while 76 unowned reports sat there. The
+       FETCH succeeded, and the fetch is what the sweep reported on.
+COST: measured, not estimated. (1) a red test on correct code that a peer hit while it blocked
+  their gate. (2) a UI fix that reached no browser holding the cached script — caught only
+  because a peer asked a routine push-census question, and would otherwise have looked shipped
+  indefinitely. (3) a scheduled sweep reporting a clean board on a cadence while 76 items sat
+  in it. None of the three produced an error, and in all three the surrounding operation was
+  genuinely successful, which is what made the silence convincing.
+FIX: two shipped and one general.
+  SHIPPED — 7759b36 turns (2) into a CI guard, and the design point is worth keeping: the
+  pre-existing test pinned that APP_VER and CACHE AGREE, and it could not have caught 25ba8ea
+  because NEITHER moved, so they still agreed and it stayed green. Agreement was never the
+  invariant; MOVING WHEN THE FILE MOVES is. Verified against the real artifacts rather than a
+  fixture — I re-ran its logic here across four ranges: FAILS on 25ba8ea (app_moved=0
+  sw_moved=0), passes on 24fc2b4 and 36b93f8, skips a range with no client JS.
+  SHIPPED — c207339 makes (3) refuse when a full fetch returns no desc, rather than treating
+  an absent field as an empty result.
+  GENERAL, and the part that does not have a patch: when a step's failure mode is doing
+  nothing, its success cannot be inferred from the operation around it. Three concrete habits,
+  each of which would have caught exactly one of the above and none of the others, which is why
+  all three are listed rather than one rule:
+    - assert the WRITE changed something, not that the code ran (`assert new != old` on each
+      file), because a literal replace that matches nothing is indistinguishable from one that
+      matched;
+    - after mutating a guard OFF, ask what the code does WITHOUT it — that is precisely what
+      the guard prevents, so the answer is never nothing, and the side effect outlives the
+      revert;
+    - when classifying on a field, confirm the field is PRESENT before concluding from its
+      absence — an empty classification over a non-empty fetch is the loud-wrong-probe shape,
+      answering confidently from a column that was never there.
