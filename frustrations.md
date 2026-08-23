@@ -2327,7 +2327,7 @@ CONFIRMED INDEPENDENTLY, same day, by amux-frustrations as AF-160 (same defect, 
 ## The push guard's only override is worded for the human, so the AUTHOR's explicit consent has no honest exit
 AREA: gates
 SEVERITY: blocks
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-23
 SESSION: amux
 CARD: AMUX-3533
@@ -2353,6 +2353,21 @@ FIX: a second escape that RECORDS who consented and is checkable, rather than wi
   applies verbatim here: an alarm that fires on a routine correct action teaches the reflex
   of setting AMUX_ALLOW_FOREIGN=1 blind, and then the push that really does carry someone
   else's unreviewed work sails through.
+SECOND SPECIMEN, same day: amux-frustrations took AMUX_ALLOW_FOREIGN on the written consent
+  of two PEERS four hours before I did, and did not notice the wording did not cover them
+  either. Two independent instances, both with legitimate specific authorization, both
+  forced through an override whose stated precondition was false. Attentiveness was never
+  the variable.
+FIXED f4d8d9b: AMUX_FOREIGN_CONSENT="<sha>:<session> ..." — STRICTER than the override it
+  replaces, not a second way around the guard. Each entry is checked against the commit's
+  real Amux-Session trailer (a mismatch REFUSES, where a blanket override would have
+  shipped it), every foreign commit must be covered, a malformed entry refuses rather than
+  being skipped, and the pairs are written to ~/.amux/logs/push-guard.log so the trail
+  answers "who authorized this?" instead of recording an undifferentiated override. The
+  refusal now names it FIRST, above ALLOW_FOREIGN, with the pairs pre-computed — an escape
+  nobody is handed is decoration. Five test cases, negative-controlled by making consent
+  behave like a blanket override: the happy path still passes and all three strictness
+  cases fail, so no single case can certify a broken implementation.
 
 ---
 
