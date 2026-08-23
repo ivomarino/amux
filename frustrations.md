@@ -2339,3 +2339,22 @@ FIX: none shipped; this one is the harness's, not mine.
   one line in the hook and it converts an invisible skip into a stated one.
   Habit meanwhile, and it is the same one AF-150 already lists: assert the WRITE changed
   something. `grep -c` on the file before and after is what caught this.
+
+## SEO generator leaves empty orphan directories when data is removed from seo-data.js
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-23
+SESSION: amux-homepage (found by amux-frustrations)
+CARD: none
+SYMPTOM: site/guides/claude-code-api-errors/ and site/use-cases/ai-agent-legacy-code/ existed
+  as empty untracked directories — invisible to `git status`, only visible via `git clean -nd`.
+  Neither slug was in seo-data.js; no file had ever been tracked under them.
+COST: amux-frustrations had to grep the generator, rule out tracked-file deletion, and message
+  me to determine they were safe to remove. No wrong conclusion shipped, but the investigation
+  took real time and the orphans could mislead any session doing a clean-nd sweep.
+FIX: fdd22d6 — generate-seo-pages.js now wraps writeFileSync in try/catch that rmdir the newly
+  created directory before rethrowing, so an interrupted generator run can't leave orphan dirs.
+  Root cause of these specific dirs: a prior generator run with seo-data.js entries that have
+  since been removed; mkdirSync succeeded, but the page was apparently never committed or the
+  entry was deleted without removing the generated dir.
