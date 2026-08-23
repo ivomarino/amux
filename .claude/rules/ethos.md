@@ -413,6 +413,28 @@ which cell a partial, contradictory, or mis-shaped reading lands in; if the
 honest answer is "none", the question is missing a cell, and the operator
 following instructions literally will never reach the truthful exit.
 
+**A control that changes the STRING an assertion greps for cannot tell you the
+assertion works** (AF-172, 2026-08-23). Two mutations were run against the same
+cluster-rank cells. One renamed the "AREA CLUSTERS" header; the cell went red, and that
+was cited as proof the cell discriminates. It is not proof. Any grep-based assertion
+goes red when you change the string it greps, INCLUDING one that is mis-specified and
+fails against every implementation. That cell's first draft was exactly that: it counted
+spaces against a `%-16s` field, came up one short, and failed on the CORRECT
+implementation. A wording mutation would have turned that red too and looked like a
+working control. The load-bearing mutation was the other one, ranking solved clusters
+instead of open ones, because it changes what the tool CONCLUDES rather than how it
+phrases it, so only an assertion reading the logic can catch it. Mutate the arithmetic or
+the predicate; a text mutation measures coupling, not correctness.
+
+**And confirm the mutation LANDED before reading the suite's colour.** The same review
+produced the inverse failure minutes later: an attempt to zero the open count used a
+regex that matched NOTHING, the harness printed `count expr found: False`, and the
+still-green suite was read as evidence about the TESTS rather than evidence that the
+mutation had never applied. One sentence away from filing "this feature has no
+discriminating coverage" against cells carrying a proper positive AND negative. An
+unapplied mutation and a test that cannot fail produce the identical green, and the
+mutation is the cheaper of the two to check.
+
 ## 8. Are you deciding something that is the human's to decide?
 
 Getting out of the model's way includes getting out of the user's way.
