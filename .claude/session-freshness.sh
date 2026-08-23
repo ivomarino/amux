@@ -216,6 +216,65 @@ if [ -n "$live_cli" ] && [ -f "$REPO/amux" ]; then
   fi
 fi
 
+# ── Axis 2b: are the INSTALLED GIT HOOKS the ones in this checkout? ──────────
+#
+# Same failure as the CLI axis directly above, one layer down and with worse
+# consequences, because a hook's staleness is INVISIBLE: a missing verb at least
+# prints help, while a missing guard just... does not guard, and looks exactly
+# like nothing being wrong.
+#
+# Measured 2026-08-23. Every checkout on this machine — ~/amux,
+# ~/Developer/amux and ~/Projects/amux-gtm — had `.git/hooks/pre-commit` dated
+# Aug 5, eighteen days old, while `scripts/git-hooks/` was current. `guard_version`
+# appeared 0 times in the installed hooks and 3 times in the repo's. And
+# `.git/hooks/pre-push` never called `append-only-push-guard` at all, so the
+# guard added to stop a stale republish silently reverting pushed entries in
+# frustrations.md (MG-1483, 10 entry-lines lost) had never run here.
+#
+# amux ALREADY KNEW. The server logged
+# "[staged-guard] OUTDATED HOOK: <session> in <repo> sent no guard_version — that
+# hook swallows server errors (`except Exception: return 0`) and printed nothing
+# for the whole 405 window. Reinstall: scripts/install-hooks.sh" — 128 times over
+# 8 days, naming 9 distinct session/repo pairs. Correctly, with the remedy. Into
+# server-rs.log, which nobody tails. That is ethos rule 4's second layer: a tag
+# in a store the reader never opens is the same failure as no tag. This axis
+# moves it to where a session actually looks.
+#
+# CONTENT diff, not `guard_version`, on purpose. The server's detector fires only
+# for hooks too old to send a version at all; a hook that sends one and is
+# otherwise stale is invisible to it. Comparing bytes catches any drift, so this
+# axis is strictly wider than the thing that motivated it rather than a second
+# spelling of it.
+#
+# `git rev-parse --git-path hooks` rather than "$REPO/.git/hooks": in a git
+# WORKTREE `.git` is a file, not a directory, and the naive path does not exist —
+# so a hardcoded one would report nothing in exactly the checkouts AEAB-26 says
+# the guard is already blind in, i.e. it would be silent where it is needed most.
+hooks_dir="$(git -C "$REPO" rev-parse --git-path hooks 2>/dev/null || true)"
+case "$hooks_dir" in /*) : ;; ?*) hooks_dir="$REPO/$hooks_dir" ;; esac
+if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
+  stale_hooks=""
+  for src in "$REPO"/scripts/git-hooks/*; do
+    [ -f "$src" ] || continue
+    name="$(basename "$src")"
+    # post-commit and the shared library are installed under other names or not
+    # at all by install-hooks.sh; only flag what that script actually places, or
+    # this axis nags forever about files it has no remedy for.
+    case "$name" in pre-commit|pre-push|prepare-commit-msg|amux-staged-guard) ;; *) continue ;; esac
+    dst="$hooks_dir/$name"
+    if [ ! -e "$dst" ]; then
+      stale_hooks="${stale_hooks}${stale_hooks:+, }${name} (MISSING)"
+    elif ! diff -q "$src" "$dst" >/dev/null 2>&1; then
+      stale_hooks="${stale_hooks}${stale_hooks:+, }${name}"
+    fi
+  done
+  if [ -n "$stale_hooks" ]; then
+    out+="  - installed git hooks differ from this checkout: ${stale_hooks}"$'\n'
+    out+=$'    a stale guard does not announce itself — it just stops guarding\n'
+    out+="    ./scripts/install-hooks.sh"$'\n'
+  fi
+fi
+
 # The RUNNING server's freshness is the builder's job, not this hook's:
 # com.amux.server-rs-builder rebuilds COMMITTED rust source every 60s and the
 # server self-adopts the new binary. A file diff cannot compare a binary to a

@@ -2133,3 +2133,34 @@ FIX: two shipped and one general.
       answering confidently from a column that was never there.
 
 ---
+
+## Every checkout's git hooks are 18 days stale, and amux has been saying so into a log for 11
+AREA: instruments
+SEVERITY: blocks
+STATUS: half-fixed — detection reaches a session now; the reinstall is the owner's call
+DATE: 2026-08-23
+SESSION: amux-errors-and-bugs
+CARD: AEAB-47
+SYMPTOM: `.git/hooks/pre-commit` is dated Aug 5 22:39 in ~/amux, ~/Developer/amux AND
+  ~/Projects/amux-gtm, while `scripts/git-hooks/` is current. `grep -c guard_version` returns
+  0 in the installed hooks and 3 in the repo's. `.git/hooks/pre-push` never calls
+  `append-only-push-guard`, so the guard added after MG-1483 silently reverted 10 pushed
+  entry-lines of this very file has never run on this machine.
+COST: the cross-session staged-guard has been degraded fleet-wide for 18 days, and I pushed
+  frustrations.md on 2026-08-22 with the data-loss guard absent without knowing. The detector
+  was never the problem: the server logged "OUTDATED HOOK ... Reinstall:
+  scripts/install-hooks.sh" 128 times across 8 days, naming 9 session/repo pairs, correctly,
+  with the remedy — into server-rs.log, which nobody tails.
+FIX: the detection now reaches a session — `.claude/session-freshness.sh` gains a content
+  diff of the installed hooks at SessionStart. Content rather than `guard_version`, because
+  the server's detector only fires for hooks too old to send a version at all; and
+  `git rev-parse --git-path hooks` rather than `$REPO/.git/hooks`, because in a worktree
+  `.git` is a file and the naive path is silent in exactly the checkouts AEAB-26 says the
+  guard is already blind in.
+  The reinstall itself is deliberately NOT done here: the current hooks are strictly more
+  blocking than the installed ones, so running install-hooks.sh changes push behaviour for
+  every other session on this machine.
+  The general shape, and it is the fourth instance in two days after AEAB-46, AEAB-47 and
+  AEAB-49: amux knows the dangerous fact, computes it correctly, and files it where the
+  person who needs it never looks. `install-hooks.sh` also COPIES (`install -m 0755`) rather
+  than symlinking, which is the mechanism that lets every one of these drift.
