@@ -431,6 +431,16 @@ fn stmt_top(conn: &rusqlite::Connection, cutoff: i64) -> anyhow::Result<Vec<Valu
         out.push(json!({
             "source": if trig.is_empty() { "unattributed" } else { trig.as_str() },
             "label": trigger_label(&trig),
+            // `is_background` SHIPS HERE TOO (AMUX-3550). The client filtered
+            // these rows on it and it existed only on `by_source`, so the
+            // predicate `x.is_background !== false` kept 10 of 10 — a filter
+            // that reads as a deliberate exclusion and excludes nothing. Three
+            // of those ten were the human's own typing, listed under "biggest
+            // background sources" on the panel built to tell a customer what
+            // spent their credits BESIDES them. Fixed by making the field the
+            // client already reaches for exist, rather than by teaching the
+            // client a second spelling of it.
+            "is_background": trig != "user",
             "origin": origin,
             "session": session,
             "cost_usd": (usd * 100.0).round() / 100.0,
@@ -551,6 +561,35 @@ mod tests {
         assert!(
             top.iter().any(|r| r["origin"] == "poll the inbox"),
             "the expensive schedule must be NAMED: {v}"
+        );
+
+        // 5. EVERY top_origins row carries `is_background`, and it is correct.
+        //
+        //    AMUX-3550: the client filtered these rows on this field and the
+        //    field existed only on `by_source`, so `x.is_background !== false`
+        //    kept 10 of 10 — a filter that reads as a deliberate exclusion and
+        //    excludes nothing. The panel headed "biggest background sources"
+        //    then listed the human's own typing, on the very screen built to
+        //    tell a customer what spent their credits BESIDES them.
+        //
+        //    Asserting PRESENCE is the load-bearing half. A test that only
+        //    checked the values of rows that happen to have the key would pass
+        //    against the version where no row has it at all.
+        for r in top {
+            assert!(
+                r.get("is_background").map(|b| b.is_boolean()).unwrap_or(false),
+                "every top_origins row must carry a boolean is_background — its ABSENCE is \
+                 what made the client's filter match everything: {r}"
+            );
+        }
+        assert!(
+            top.iter().any(|r| r["source"] == "user" && r["is_background"] == json!(false)),
+            "the human's own row must be present AND flagged not-background, so a consumer \
+             can exclude it: {v}"
+        );
+        assert!(
+            top.iter().any(|r| r["source"] == "schedule" && r["is_background"] == json!(true)),
+            "a schedule's row must be flagged background: {v}"
         );
     }
 

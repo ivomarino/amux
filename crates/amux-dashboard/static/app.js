@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.710';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.711';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -27881,7 +27881,15 @@ async function loadSpendAttribution() {
         + '<span style="font-size:0.74rem;color:var(--dim);white-space:nowrap;">'
         +   usd(x.cost_usd) + ' · ' + (x.turns || 0).toLocaleString() + ' turns</span>'
         + '</div>').join('');
-    const top = (d.top_origins || []).filter(x => x.is_background !== false).slice(0, 4).map(x =>
+    // `=== true`, NOT `!== false` (AMUX-3550). The loose form kept every row
+    // whose `is_background` was ABSENT — which was all of them, because the
+    // field shipped only on by_source. A filter that matches everything reads
+    // as a deliberate exclusion and returns a confident wrong answer; this one
+    // listed the human's own typing under "biggest background sources".
+    // The strict form fails CLOSED: against a server that does not send the
+    // field it shows nothing, which is safer than showing the wrong rows under
+    // a heading that asserts what they are.
+    const top = (d.top_origins || []).filter(x => x.is_background === true).slice(0, 4).map(x =>
         '<div style="display:flex;justify-content:space-between;gap:8px;align-items:baseline;padding:2px 0;">'
         + '<span style="font-size:0.74rem;color:var(--dim);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
         +   esc(x.origin || x.session || '?') + '</span>'
