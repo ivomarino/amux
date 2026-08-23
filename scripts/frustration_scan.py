@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+"""Find frustration signals in Ethan's own messages — deterministically.
+
+Ethan, 2026-08-22: "make a sched that goes thru my messages and infers
+frustration for example repetitive messages, frustration etc what ever you
+think but make sure it has the ability to autofix amux shit that is identified
+from messages."
+
+WHAT THIS DOES AND DELIBERATELY DOES NOT DO
+-------------------------------------------
+It computes CANDIDATES and ranks them. It does not judge them, and it does not
+call a model. Ethos rule 2: repetition is a string comparison and a marker is a
+regex, so paying a model to find them would be spending judgment on arithmetic.
+The judging — "is this actually frustration, and what amux defect is under it"
+— is what the scheduled SESSION does with this output, and that is a real
+judgment call worth a model.
+
+Rule 5, the one that decides whether this is useful in six months: it must
+DISCRIMINATE, not accumulate. A daily list of forty maybe-frustrated messages
+is a log nobody reads. So every signal here is scored, the output is capped,
+and a candidate has to clear a bar to appear at all. If a quiet day prints
+nothing, that is the correct output and the scheduled session should say so.
+
+THE SIGNALS, strongest first. Each is here because it means something specific:
+
+  repeat-after-done   Ethan asked for something whose card is already done or
+                      verified. The strongest signal in the file: it means a
+                      fix shipped and did not reach him, which is a defect in
+                      amux even when the code was right.
+  near-duplicate      He said the same thing twice. Repetition is the clearest
+                      frustration signal there is and it needs no interpreting.
+  rapid-reprompt      A short imperative within 10 minutes of a previous
+                      message to the same lane ("just do it now", "?", "well").
+                      The shape of "you did not do what I asked".
+  marker              Explicit language: still/again/why is/doesn't work/broken,
+                      profanity, "??", "i said". Weakest on its own, which is
+                      why it is scored lowest and never appears alone unless
+                      it is strong.
+
+WHY `type='user' AND origin=''`
+-------------------------------
+That is Ethan and nobody else. Peer relays are type='session' with origin set
+to the sending lane; scheduler fires are type='schedule' with the schedule
+title as origin. Measured 2026-08-22: 509 of his messages in 7 days against
+4,061 lane relays, so getting this filter wrong would drown the signal in the
+fleet talking to itself. `cmd_history.ts` is in MILLISECONDS.
+"""
+import json
+import os
+import re
+import sqlite3
+import sys
+import time
+from collections import defaultdict
+
+DB = os.environ.get("AMUX_DB") or os.path.expanduser("~/.amux/amux.db")
+DAYS = float(os.environ.get("FRUSTRATION_SCAN_DAYS", "3"))
+MAX_OUT = int(os.environ.get("FRUSTRATION_SCAN_MAX", "12"))
+
+# A marker is worth little alone and a lot next to a repeat, which is why these
+# are additive scores rather than a filter.
+MARKERS = [
+    (r"\bstill\b", 2, "still"),
+    (r"\bagain\b", 2, "again"),
+    (r"\bwhy is\b|\bwhy does\b|\bwhy did\b", 2, "why-is"),
+    (r"do(?:es)?n'?t work|not working|isn'?t working", 3, "doesnt-work"),
+    (r"\bbroken\b|\bbroke\b", 2, "broken"),
+    (r"\bi (?:already )?said\b|as i said", 3, "i-said"),
+    (r"\balready\b", 1, "already"),
+    (r"\?\?+", 2, "double-question"),
+    # NOT bare "shit": measured on the real corpus it fires on "the gsuite shit"
+    # and "amux shit", which is how Ethan says "stuff". A marker that matches a
+    # register rather than a mood is noise dressed as signal.
+    (r"\bwtf\b|\bfuck|\bgoddamn|\bffs\b", 3, "profanity"),
+    (r"\byou did ?n'?t\b|\byou never\b", 3, "you-didnt"),
+    (r"\bnothing happen|\bno response\b|\bsilent\b", 2, "no-response"),
+]
+# Short imperatives that mean "you did not do it", as opposed to new work.
+REPROMPT = re.compile(
+    r"^(just do it|do it|continue|go|now|\?+|well\?*|and\?*|status\??|"
+    r"any update|did you|are you)\b",
+    re.I,
+)
+CONTROL = re.compile(
+    r"(?:continue|go ahead|go on|proceed|keep going|yes|yep|ok(?:ay)?|sure|"
+    r"do it|just do it|next|more|status|thanks?|ty|nice|good|perfect|done)"
+    r"[.!]*",
+    re.I,
+)
+TIME_PREFIX = re.compile(r"^\s*\[\d{1,2}:\d{2}\s*(?:AM|PM)\]\s*", re.I)
+ATTACH = re.compile(r"@?/\S*/uploads/\S+")
+WS = re.compile(r"\s+")
+
+
+def normalize(t):
+    """Strip what varies between two utterances of the same request.
+
+    The timestamp prefix and an attachment path are noise for equality: the
+    same complaint sent twice carries two different clock times and, if he
+    re-screenshots, two different upload paths. Leaving either in would make
+    every repeat look unique, which is the failure this whole script exists to
+    avoid.
+    """
+    t = TIME_PREFIX.sub("", t or "")
+    t = ATTACH.sub("", t)
+    return WS.sub(" ", t.lower()).strip()
+
+
+def shingles(s, n=4):
+    w = s.split()
+    return {" ".join(w[i : i + n]) for i in range(max(0, len(w) - n + 1))} or {s}
+
+
+def similarity(a, b):
+    """Jaccard over 4-word shingles. Cheap, and it does not need to be better:
+    the output is a CANDIDATE for a model to judge, so a false pair costs one
+    line of a session's attention and a missed pair costs a signal we already
+    have other routes to."""
+    A, B = shingles(a), shingles(b)
+    if not A or not B:
+        return 0.0
+    return len(A & B) / len(A | B)
+
+
+def main():
+    if not os.path.exists(DB):
+        print(json.dumps({"error": f"no db at {DB}"}))
+        return 2
+    cutoff_ms = int((time.time() - DAYS * 86400) * 1000)
+    conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+    rows = conn.execute(
+        "SELECT id, ts, COALESCE(session,''), text FROM cmd_history "
+        "WHERE type='user' AND COALESCE(origin,'')='' AND ts >= ? "
+        "AND COALESCE(text,'') <> '' ORDER BY ts ASC",
+        (cutoff_ms,),
+    ).fetchall()
+
+    msgs = []
+    for mid, ts, sess, text in rows:
+        norm = normalize(text)
+        if len(norm) < 8:  # "ok", "yes" — not a request, cannot be a repeat
+            continue
+        # CONTROL WORDS ARE NOT REQUESTS. "continue" appeared six times in the
+        # first run as a near-duplicate of itself across three days, which is
+        # exactly the accumulate-not-discriminate failure rule 5 warns about:
+        # true, worthless, and it would have been top of the list every day
+        # forever. They are still eligible for the re-prompt signal, where the
+        # timing is what carries the meaning.
+        if CONTROL.fullmatch(norm):
+            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
+                         "norm": norm, "control": True})
+            continue
+        msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
+                     "norm": norm, "control": False})
+
+    findings = defaultdict(lambda: {"score": 0, "why": [], "msgs": []})
+
+    # 1. NEAR-DUPLICATE — the clearest signal, and it needs no interpreting.
+    real = [m for m in msgs if not m["control"]]
+    for i, a in enumerate(real):
+        for b in real[i + 1 :]:
+            sim = similarity(a["norm"], b["norm"])
+            if sim >= 0.55:
+                gap_s = (b["ts"] - a["ts"]) / 1000
+                # UNDER A MINUTE IS NOT A HUMAN REPEATING THEMSELVES. Two
+                # byte-identical messages seconds apart is amux delivering one
+                # message twice — a delivery defect, not a mood — and calling it
+                # frustration would send someone to read Ethan's tone when the
+                # bug is in send_dedup. Found on the first run: ids 30451/30452,
+                # identical, same second, consecutive ids.
+                if gap_s < 60 and sim > 0.98:
+                    key = f"double-delivery:{a['id']}"
+                    f = findings[key]
+                    f["score"] = max(f["score"], 8)
+                    f["why"].append(
+                        f"IDENTICAL messages {gap_s:.0f}s apart (ids {a['id']}/{b['id']}) — "
+                        "this is a DELIVERY defect, not frustration: check send_dedup and "
+                        "cmd_history.delivery before reading anything into the wording"
+                    )
+                    f["msgs"] = [a, b]
+                    continue
+                key = f"repeat:{a['id']}"
+                f = findings[key]
+                f["score"] = max(f["score"], 6 + int(sim * 4))
+                f["why"].append(
+                    f"repeated request (jaccard {sim:.2f}, {gap_s/3600:.1f}h apart)"
+                )
+                f["msgs"] = [a, b]
+
+    # 2. RAPID RE-PROMPT — a short imperative hard after a previous message to
+    #    the same lane. New work does not arrive that way; chasing does.
+    by_sess = defaultdict(list)
+    for m in msgs:
+        by_sess[m["session"]].append(m)
+    for sess, group in by_sess.items():
+        for i in range(1, len(group)):
+            prev, cur = group[i - 1], group[i]
+            gap_s = (cur["ts"] - prev["ts"]) / 1000
+            if gap_s <= 600 and REPROMPT.match(cur["norm"]) and len(cur["norm"]) < 60:
+                key = f"reprompt:{cur['id']}"
+                f = findings[key]
+                f["score"] = max(f["score"], 5)
+                f["why"].append(f"re-prompt {gap_s:.0f}s after the previous message to {sess}")
+                f["msgs"] = [prev, cur]
+
+    # 3. MARKERS — additive, never sufficient alone unless strong.
+    for m in msgs:
+        hits, sc = [], 0
+        for pat, w, name in MARKERS:
+            if re.search(pat, m["norm"]):
+                hits.append(name)
+                sc += w
+        if not hits:
+            continue
+        key = None
+        for k, f in findings.items():
+            if any(x["id"] == m["id"] for x in f["msgs"]):
+                key = k
+                break
+        if key is None:
+            if sc < 4:  # a lone weak marker is noise, not a finding
+                continue
+            key = f"marker:{m['id']}"
+            findings[key]["msgs"] = [m]
+        findings[key]["score"] += sc
+        findings[key]["why"].append("markers: " + ",".join(hits))
+
+    out = []
+    for key, f in findings.items():
+        first = f["msgs"][0]
+        out.append(
+            {
+                "score": f["score"],
+                "kind": key.split(":")[0],
+                "session": first["session"],
+                "why": sorted(set(f["why"])),
+                "messages": [
+                    {
+                        "id": m["id"],
+                        "when": time.strftime("%m-%d %H:%M", time.localtime(m["ts"] / 1000)),
+                        "session": m["session"],
+                        "text": m["text"][:400],
+                    }
+                    for m in f["msgs"]
+                ],
+            }
+        )
+    out.sort(key=lambda x: -x["score"])
+    print(
+        json.dumps(
+            {
+                "window_days": DAYS,
+                "ethan_messages_scanned": len(msgs),
+                "candidates": len(out),
+                "shown": min(len(out), MAX_OUT),
+                "findings": out[:MAX_OUT],
+                "note": (
+                    "CANDIDATES, not verdicts. Judge each one: is there an amux defect "
+                    "under it, or was this ordinary iteration? An empty list is a real "
+                    "and reportable result."
+                ),
+            },
+            indent=1,
+        )
+    )
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
