@@ -290,10 +290,51 @@ fi
 # server self-adopts the new binary. A file diff cannot compare a binary to a
 # source tree, but /health's `build` hash names exactly which build answers —
 # so report only when the running server looks stale relative to the checkout.
+#
+# AMUX_HEALTH_URL is a seam, not test-only scaffolding: a dev server on another
+# port is a real case, and it is also what lets the cross-check below be tested
+# against a `file://` fixture instead of whatever happens to be listening on the
+# machine running the suite. A check whose verdict depends on the host's state is
+# not testing the hook (the mistake test-session-freshness.sh already made once).
+HEALTH_URL="${AMUX_HEALTH_URL:-https://localhost:8824/health}"
 if command -v curl >/dev/null 2>&1; then
-  hs="$(timeout 5 curl -sk https://localhost:8824/health 2>/dev/null || true)"
+  hs="$(timeout 5 curl -sk "$HEALTH_URL" 2>/dev/null || true)"
   if [ -n "$hs" ] && ! printf '%s' "$hs" | grep -q '"server":"amux-rust"'; then
-    out+="  - https://localhost:8824/health is answering but not as amux-rust — check com.amux.server-rs"$'\n'
+    out+="  - ${HEALTH_URL} is answering but not as amux-rust — check com.amux.server-rs"$'\n'
+  fi
+
+  # ── Axis 1e (AEAB-50 follow-up): does provenance agree with what is RUNNING? ─
+  #
+  # Everything above about the running build reads rust-build-provenance.json,
+  # which is a CLAIM the builder makes. /health's `commit` is compiled into the
+  # binary that answered, so it cannot be stale by construction. That asymmetry
+  # is the whole point: this axis makes the reader independent of the builder
+  # being honest.
+  #
+  # AEAB-50 fixed the builder — the file used to be written BEFORE the build and
+  # nowhere else, so a failed build left it permanently asserting a deploy that
+  # never happened. This catches the same shape from the other side, and it keeps
+  # working for causes nobody predicted: a binary installed by hand, a file
+  # edited, a future regression of exactly that bug. On 2026-08-23 provenance read
+  # 9ef46b1f while both servers answered 23ddb8d1d91d, and nothing said so.
+  #
+  # PREFIX match anchored on the HEALTH value's length, because the two fields are
+  # different widths — /health `commit` is 12 hex, provenance `sha` is 40. An
+  # equality test would report a disagreement on literally every call: a detector
+  # that always fires, which is the same defect as one that never can. A hardcoded
+  # 12 would break silently the day the server widens the field, so the length
+  # comes from the value itself.
+  health_commit=$(printf '%s' "$hs" | sed -n 's/.*"commit":"\([0-9a-f]*\)".*/\1/p')
+  if [ -n "${prov_sha:-}" ] && [ -n "$health_commit" ]; then
+    case "$prov_sha" in
+      "$health_commit"*) : ;;   # agree — say nothing
+      *)
+        out+="  - provenance and the RUNNING SERVER disagree about what is deployed"$'\n'
+        out+="    provenance says ${prov_sha:0:12}; ${HEALTH_URL} answers ${health_commit}"$'\n'
+        out+=$'    /health is compiled into the running binary and cannot be stale — believe it\n'
+        out+=$'    provenance is a claim about the build; a build may be in flight or have failed\n'
+        ;;
+    esac
   fi
 fi
 
