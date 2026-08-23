@@ -3027,6 +3027,22 @@ function render() {
     const taskStale = _taskStaleAge(s);
     const offCached = !!(_peekIndex && _peekIndex[s.name]);
     const taskDim = taskStale && s.task_source === 'board';   // stale board title shown as last resort
+    // AF-148: a lane with no active card falls back to its static DESCRIPTION,
+    // and the payload says so (`task_source: 'desc'`) — but the client only ever
+    // read task_source to dim a STALE BOARD title, so the fallback rendered
+    // identically to a live task: same weight, same colour, no badge.
+    //
+    // Found by the frustration sweep on its first run. Ethan asked tubescience
+    // "what's the status?" three times in 34 hours; that lane has 652 cards, 0
+    // in doing/review, 50 blocked — so the task slot was showing its job
+    // description ("The TubeScience customer account: product requirements…"),
+    // which reads exactly like a current task. He had no way to tell "working on
+    // this" from "no task, here is what this lane is for", so he asked.
+    //
+    // Same discriminator the stale case already uses, applied to the case it
+    // skipped. Not a mood, not a guess: the field was in the payload the whole
+    // time and one consumer read it for one branch.
+    const taskIsDesc = s.task_source === 'desc' && !!s.task_name;
     return `
     <div class="card ${isExp ? 'expanded' : ''}" data-session="${esc(s.name)}" onclick="event.stopPropagation();toggle('${s.name}')">
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
@@ -3110,7 +3126,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
       ${s.dir ? _renderBranchBadge(s.name, s.branch) : ''}
       ${isExp && s.desc ? `<div class="card-desc">${esc(s.desc)}</div>` : ''}
 
-      ${!isExp && s.task_name ? `<div class="card-preview${taskDim ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
+      ${!isExp && s.task_name ? `<div class="card-preview${taskDim || taskIsDesc ? ' task-stale' : ''}" style="font-weight:600;color:var(--text);">${esc(s.task_name)}${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
       ${isExp && s.preview ? `<div class="card-preview">${esc(s.preview)}</div>` : ''}
       ${logSearchMode && _logMatches[s.name] ? (() => {
         const hits = _logMatches[s.name];
@@ -3131,7 +3147,7 @@ ${/* A lane at a limit banner is not WORKING, and a working lane is not
         <button class="btn primary" style="width:100%;" onclick="doStart('${s.name}')">&#x25B6; Start</button>
       </div>` : ''}
       <div class="panel" onclick="event.stopPropagation()">
-        ${isExp && s.task_name ? `<div class="card-task-name${taskDim ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span onclick="event.stopPropagation();editField('${s.name}','task','${esc(s.task_name)}')" style="cursor:pointer;">${esc(s.task_name)}</span>${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}</div>` : ''}
+        ${isExp && s.task_name ? `<div class="card-task-name${taskDim || taskIsDesc ? ' task-stale' : ''}" title="Click the id to open the board card" style="font-weight:600;"><span onclick="event.stopPropagation();editField('${s.name}','task','${esc(s.task_name)}')" style="cursor:pointer;">${esc(s.task_name)}</span>${_taskIdChip(s)}${taskStale ? ` <span class="task-stale-badge">&middot; board ${taskStale}</span>` : ''}${taskIsDesc ? ` <span class="task-stale-badge">&middot; no active card</span>` : ''}</div>` : ''}
         ${isExp && s.running ? `<div class="card-timing">
           ${s.session_created ? `<div class="timing-item"><span class="timing-label">Worker</span><span class="timing-value">${fmtDuration(Math.floor(Date.now()/1000) - s.session_created)}</span></div>` : ''}
           ${s.task_time ? `<div class="timing-item"><span class="timing-label">Task</span><span class="timing-value accent">${esc(s.task_time)}</span></div>` : ''}
