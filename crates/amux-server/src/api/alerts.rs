@@ -775,9 +775,20 @@ async fn post_owner(
     // inbox (self-send). This is why the fire alarm no longer depends on a push
     // subscription he never made or a phone he cleared after the 38-SMS night.
     let email_enabled = effective_env(&home, "AMUX_URGENT_EMAIL").unwrap_or_else(|| "1".into()) != "0";
-    let owner_email = effective_env(&home, "AMUX_OWNER_EMAIL")
-        .filter(|e| !e.trim().is_empty())
-        .or_else(|| crate::integrations::email::connected_accounts_by_freshness_in(&home).into_iter().next());
+    let pinned_email = effective_env(&home, "AMUX_OWNER_EMAIL").filter(|e| !e.trim().is_empty());
+    let owner_email = pinned_email.clone().or_else(|| {
+        crate::integrations::email::connected_accounts_by_freshness_in(&home).into_iter().next()
+    });
+    // SAY WHICH INBOX, AND WHY (AMUX-3524). With AMUX_OWNER_EMAIL unset the
+    // destination is "whichever connected account was refreshed most
+    // recently" — so the SAME alert class lands in different inboxes over
+    // time, and nothing anywhere said so. Measured over 7 days: 9 pages to
+    // info@, 5 to a PERSONAL gmail, 1 to ethan@, which is most of why the
+    // fire alarm felt like noise. The fallback stays (an alarm with no
+    // configured address must still reach someone) but it is no longer
+    // silent: the channels map carries the destination and the reason, and
+    // an unpinned send WARNs where sweeps look.
+    let owner_email_pinned = pinned_email.is_some();
     if !email_enabled {
         out_channels.insert("email".into(), json!("disabled (AMUX_URGENT_EMAIL=0)"));
     } else if owner_email.is_none() {
@@ -792,7 +803,19 @@ async fn post_owner(
             };
             let (ok, detail) = channels.email(to, &subject, &msg).await;
             email_delivered = ok;
-            out_channels.insert("email".into(), json!(if ok { detail } else { format!("failed: {detail}") }));
+            if !owner_email_pinned {
+                tracing::warn!(
+                    destination = %to,
+                    "[urgent-alert] AMUX_OWNER_EMAIL is unset — paged the most recently \
+                     refreshed connected account, so this alert class moves between inboxes. \
+                     Pin one address in server.env (AMUX-3524)."
+                );
+            }
+            let how = if owner_email_pinned { "AMUX_OWNER_EMAIL" } else { "UNPINNED: freshest connected account (set AMUX_OWNER_EMAIL)" };
+            out_channels.insert(
+                "email".into(),
+                json!(if ok { format!("{detail} -> {to} [{how}]") } else { format!("failed: {detail}") }),
+            );
         }
     }
     record_owner_alert(&state, &origin, &session, &msg, &reason, &out_channels, false).await;
@@ -1365,12 +1388,48 @@ mod tests {
         )
         .await;
         assert_eq!(v["delivered_any"], json!(true), "email must deliver the page: {v}");
-        assert_eq!(v["channels"]["email"], json!("email via ethan@example.com"));
         assert!(v.get("fallback").is_none(), "a delivered page must not carry the miss fallback");
+        // AMUX-3524: an UNPINNED destination must SAY it is unpinned and name
+        // the inbox it chose. Silence here is what let one alert class scatter
+        // across three of Ethan's inboxes for a week unnoticed.
+        let ch = v["channels"]["email"].as_str().unwrap_or_default();
+        assert!(ch.contains("ethan@example.com"), "the channel must name the destination: {ch}");
+        assert!(ch.contains("UNPINNED"), "an unset AMUX_OWNER_EMAIL must be stated: {ch}");
         // The mock received the self-send to the connected account.
         let emails = mock.emails.lock().unwrap().clone();
         assert_eq!(emails.len(), 1, "exactly one email attempt");
         assert_eq!(emails[0].0, "ethan@example.com", "owner email defaults to the connected account");
+    }
+
+    /// AMUX-3524 CONTROL — with AMUX_OWNER_EMAIL set, the destination is that
+    /// address and the channel says it was PINNED. Without this cell the
+    /// assertion above passes for a server that shouts UNPINNED unconditionally.
+    #[tokio::test]
+    async fn a_pinned_owner_email_is_used_and_reported_as_pinned() {
+        let dir = tempfile::tempdir().unwrap();
+        let _guard = test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("gmail-tokens")).unwrap();
+        // A connected account that is NOT the pinned address: if the pin were
+        // ignored, the send would go here and the test would catch it.
+        std::fs::write(dir.path().join("gmail-tokens/info@example.com.json"), "{}").unwrap();
+        set_server_env_key(dir.path(), "AMUX_URGENT_PUSH", "0").unwrap();
+        set_server_env_key(dir.path(), "AMUX_OWNER_EMAIL", "pinned@example.com").unwrap();
+        let mock = MockChannels::ok();
+        let app = app(mock.clone());
+        let (_, v) = send(
+            &app,
+            "POST",
+            "/api/alert/owner",
+            &[],
+            Some(json!({ "message": "pinned destination page" })),
+        )
+        .await;
+        let ch = v["channels"]["email"].as_str().unwrap_or_default();
+        assert!(ch.contains("pinned@example.com"), "must page the PINNED address: {ch}");
+        assert!(ch.contains("AMUX_OWNER_EMAIL"), "must report the pin as the source: {ch}");
+        assert!(!ch.contains("UNPINNED"), "a pinned send must not warn unpinned: {ch}");
+        let emails = mock.emails.lock().unwrap().clone();
+        assert_eq!(emails[0].0, "pinned@example.com", "the pin, not the connected account");
     }
 
     /// A FIRE ALARM MUST NOT REPORT SUCCESS HAVING REACHED NOBODY (AMUX-2938).
