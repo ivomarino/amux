@@ -2133,3 +2133,46 @@ FIX: two shipped and one general.
       answering confidently from a column that was never there.
 
 ---
+
+---
+
+## `hook_outdated` reports on the request body, not the hook, and its remedy cannot fix it
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-156
+SYMPTOM: chasing amux's lead that every staged-guard probe returned `hook_outdated: true`,
+  which they read as their installed hook being stale. It is not a staleness signal at all.
+  git_guard.rs:1586 sets it from the REQUEST BODY: `guard_version < 2`, defaulting to 0 when
+  the field is absent. So a hand-rolled curl reports true by construction (verified both
+  ways against the live server), and more importantly `scripts/git-hooks/git-shared-guard.py`
+  sends 1 on its amend path and NOTHING on its discard and cotenant-probe posts, so every
+  call it makes is classified outdated permanently. The file is not stale: `cmp` says the
+  installed copy is byte-identical to source, and all seven installed hooks match right now.
+  Meanwhile `amux-staged-guard` sends GUARD_VERSION = 6 and always passes. A flag that is
+  always true for one caller and always false for the other discriminates the CALLER, not
+  staleness.
+COST: 2,433 `OUTDATED HOOK` WARN lines in ~/.amux/logs/server-rs.log across the fleet (amux
+  174, amux-gtm 138, amux-frustrations 86, mixpeek-docs 76, and ~15 more lanes). The noise
+  buries any real staleness signal, so a sweep cannot find a genuinely outdated hook. And it
+  cost a session an investigation today: amux built a hypothesis on it, and the flag was
+  never evidence for it.
+FIX: none shipped; git_guard.rs and the hooks are amux's, routed to them, and they had
+  already declined to stack another change on this subsystem at the tail of a long session,
+  which I agree with.
+  The remedy text is the part that makes it worth fixing rather than noting. It says
+  "Reinstall: scripts/install-hooks.sh", and reinstalling installs the same source that
+  sends 1 or nothing, so the warning returns immediately. Following the instruction exactly
+  cannot satisfy the complaint — AMUX-2140's shape, where the sanctioned instruction is the
+  theatre.
+  Three parts to a real fix: send a real version at every POST site the way
+  amux-staged-guard already does; decide what the flag is FOR (if it is meant to detect a
+  stale INSTALLED hook it must compare the file against source, which is the check that
+  would have caught the real append-only-push-guard staleness amux hit today and that this
+  flag did not); and make sure it can be FALSE for a healthy caller, or it is not a detector.
+  Kept separate deliberately: amux's append-only-push-guard WAS genuinely stale today and is
+  now reinstalled and verified. That was real. `hook_outdated` did not and could not report
+  it. Two different things that both say "hook" and "outdated".
+
