@@ -34,8 +34,41 @@ jobs:
         run: cargo check --workspace --all-targets
       - name: clippy (deny warnings)
         run: cargo clippy --workspace --all-targets -- -D warnings
-      - name: cargo test (workspace)
-        run: cargo test --workspace
+      # AF-150 (AREA silent-partial). A test fixture created a directory in the
+      # checkout to prove a refusal, the refusal was later removed, and the
+      # residue outlived the run — turning a green test red on every machine
+      # WITH history while CI, freshly checked out, stayed green (67137cc).
+      # CI is the right place to catch it precisely because a fresh checkout
+      # has no history for residue to hide in: this run is the only thing that
+      # could have made it.
+      #
+      # The self-test runs FIRST as a negative control. A guard nobody has
+      # watched fail is a guard nobody should trust — and this one's own
+      # self-test shipped once asserting merely "non-zero", which passed while
+      # carrying the exact bug the control existed to catch (7ca3f68).
+      - name: Tree-residue guard — self-test (negative control)
+        run: bash scripts/test-tree-clean.sh --self-test
+      # Wrapped, not run-after, so the guard cannot drift away from what it
+      # guards. Exit codes (7ca3f68): 0 clean · 3 command SUCCEEDED but left
+      # residue · anything else is the command's own rc, which always wins.
+      #
+      # ADVISORY ON RESIDUE FOR NOW, deliberately: this gates every lane's
+      # push, and a detector that has never been observed silent across real
+      # runs should not block — that is the threshold-below-baseline trap in a
+      # new suit. Only code 3 is downgraded, so a genuine cargo failure still
+      # fails the job. Flip to blocking (delete the `if`) once it has been
+      # quiet for a few days; leaving it advisory forever would make it
+      # decoration.
+      - name: cargo test (workspace) — tree-residue guarded
+        run: |
+          set -uo pipefail
+          bash scripts/test-tree-clean.sh cargo test --workspace
+          rc=$?
+          if [ "$rc" = "3" ]; then
+            echo "::warning title=Tree residue::A test left residue in the checkout. Advisory during the AF-150 trial period; the diff is above. Fix the FIXTURE, not .gitignore."
+            exit 0
+          fi
+          exit $rc
       # AF-74. The `amux` bash CLI is a shipped client with no compiler behind
       # it, and `bash -n` (the pre-commit gate) proves the file PARSES, not that
       # its names resolve. This catches the classes shellcheck CAN see.
