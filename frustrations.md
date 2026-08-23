@@ -2399,3 +2399,41 @@ FIXED e83c9a7: the reviewer is written FIRST, as its own PATCH, exactly as --out
   Verified live both directions (post-fix the reviewer survives the refusal; pre-fix no
   reviewer is recorded at all). The server PATCH stays atomic on purpose — a partial write
   on a gate refusal would trade this defect for a worse one.
+
+## `amux board` has no verb that sets `desc`, so recording findings on a card requires raw curl
+AREA: cli
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: desktop
+CARD: DESKT-21
+SYMPTOM: `amux board desc DESKT-21 --stdin` -> `amux board: unknown subcommand: desc`. The
+  full verb list (`amux help board`) is `done|doing|todo`, `add <title>`, `list`. There is no
+  way to write a card's description from the sanctioned CLI at all. `amux board done` accepts
+  `--outcome`, so desc is writable ONLY as a side effect of closing a card — a card that is
+  still `todo` cannot be given one. The only path left is
+  `curl -X PATCH -d '{"desc":...}' $(amux url)/api/board/<id>`.
+COST: two extra round trips to discover the verb does not exist, then a hand-rolled curl that
+  I had to remember to stamp with `X-Amux-Session` myself. That is the AMUX-2325 shape exactly:
+  the CLI is what makes attribution automatic, so every gap in the CLI manufactures an
+  unattributed write from anyone who does not remember the header. Nothing warns you.
+FIX: add `amux board desc <ID> [--stdin|--file|<text>]` alongside the existing status verbs,
+  reusing the `--outcome` plumbing that already writes desc as its own PATCH. One verb closes
+  the gap for every card state, not just `done`.
+
+## `amux board --help` reports the flag as an unknown SUBCOMMAND instead of printing help
+AREA: cli
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-23
+SESSION: desktop
+CARD: DESKT-21
+SYMPTOM: `amux board --help` -> `amux board: unknown subcommand: --help` (exit 0). Help is
+  reachable only as `amux help board`. `amux board` with no args prints the whole board, so
+  neither of the two things a person reaches for when a verb fails shows the verb list.
+COST: minutes, and it compounds the entry above: the natural way to check "does a `desc` verb
+  exist" is `--help`, and that path answers with a message shaped like a verb error, which
+  reads as though `--help` itself were the mistake rather than as "here are the verbs".
+FIX: treat `-h`/`--help` in the subcommand slot as a request for the same text `amux help
+  board` prints, and echo the verb list in the `unknown subcommand` error rather than only
+  naming what was rejected.
