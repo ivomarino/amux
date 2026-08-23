@@ -88,6 +88,14 @@ pub struct Health {
     /// (DESKT-21): the ENOSPC that took this machine to 741 MB free on
     /// 2026-08-10 was invisible to every amux instrument at the time.
     pub disk: DiskHealth,
+    /// Tailnet reachability and node-key expiry (DESKT-24). Absent until the
+    /// first `tailnet-watch` tick completes — deliberately distinct from a
+    /// present reading whose `state` is `unknown`, which means a tick RAN and
+    /// could not determine the answer. Read from a cache, never sampled here:
+    /// forking the tailscale CLI per /health request would be a probe whose
+    /// cost lands on the endpoint the whole fleet polls.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tailnet: Option<crate::runtime_jobs::tailnet_watch::TailnetHealth>,
 }
 
 #[derive(Serialize)]
@@ -325,6 +333,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
                 .map(|c| c.as_str()),
             mem: mem_health(),
             disk: disk_health(),
+            tailnet: crate::runtime_jobs::tailnet_watch::cached(),
         }),
     )
 }
