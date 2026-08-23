@@ -2475,3 +2475,53 @@ FIX: remove /usr/local/bin/amux — install.sh owns ~/.local/bin and nothing sho
   make an unrecognised leading `--flag` on `board add` a hard error rather than a title.
   A CLI that accepts an unknown flag AS DATA cannot fail loudly, which is why 17 days of
   drift produced no signal.
+
+## A shared checkout has ONE git index, so a peer's `git commit` shipped MY staged work under THEIR message
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-23
+SESSION: desktop
+CARD: DESKT-22
+SYMPTOM: I staged four files for DESKT-22 (`git add` of a migration, heartbeat.rs,
+  health.rs, migrate.rs), then ran `git commit -m ...`. It died with
+  `fatal: cannot lock ref 'HEAD': is at c8272bf17 but expected 78b77653b`. My commit
+  never existed. But the worktree was CLEAN afterwards and my code was in HEAD anyway:
+  peer session `amux` had committed in the same instant, and because a shared checkout
+  has ONE index, their commit swept my four staged files in. c8272bf1 now reads
+  "fix(push-guard): the consent exit now works for ISOLATED workers (AMUX-3533)" and
+  contains 330 lines of unrelated downtime-cause instrumentation alongside their two
+  scripts/ files. Neither author reviewed the other's half.
+  Two things made it worse than a merge collision:
+  1. THE TRAILER LIED, and it is the exact field the deploy recipe says to trust.
+     CLAUDE.md's push section says `%an` is shared by every session so "the Amux-Session
+     trailer, stamped by prepare-commit-msg, is the real discriminator". c8272bf1 is
+     trailered `Amux-Session: desktop` — ME — while its `Claude-Session:` URL is a
+     different agent session from mine, and the card it names (AMUX-3533) is owned by
+     session `amux` on the board. The same peer's other commit that hour
+     (78b77653) is correctly trailered `amux`. So the one anti-footgun the docs point
+     you at reported the sweeping commit as mine.
+  2. THE STAGED-GUARD WARNED IN THE WRONG DIRECTION. It fired four notices, each saying
+     my files "were also edited by session 'amux' N minutes ago — if that is MORE than
+     you wrote, their work is in it". That is the mirror of what was about to happen:
+     the risk was MY work landing in THEIRS, and the guard has no phrasing for it. It
+     even appended the AMUX-3497 caveat suggesting the co-edit signal was probably just
+     my own writes seen twice, which is the reading that makes you proceed.
+COST: my work is merged and correct but permanently uncitable — DESKT-22 has no commit
+  of its own, and the card now carries a paragraph explaining why anyone looking for one
+  will not find it. A reviewer of AMUX-3533 gets 330 unrelated lines. Not fixable after
+  the fact: rewriting shared history to separate them is strictly worse than a wrong
+  message. Roughly 20 minutes to establish what had happened, because every obvious
+  signal (clean tree, code present in HEAD, my own session on the trailer) said the
+  commit was mine.
+FIX: the index is the shared resource nobody is arbitrating. Either (a) take a lock
+  around stage+commit so the pair is atomic across sessions — the staged-guard already
+  runs at exactly the right moment and already knows who else is live, so it is the
+  natural place, or (b) stop sharing the index: per-session worktrees (`git worktree`)
+  give each lane its own index and HEAD against one object store, which is the durable
+  answer and kills the whole class including the documented mirror cases (a peer's
+  `git pull --rebase` replaying unpushed work, 2026-08-03; a peer's commit sweeping
+  staged deletions, 2026-08-09 — this file's third entry in that family).
+  Separately and cheaply: prepare-commit-msg must stamp the session of the process
+  actually running git, and the staged-guard must warn in BOTH directions — "your
+  staged files may ride out under someone else's commit" is the half it cannot say.
