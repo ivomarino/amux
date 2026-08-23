@@ -2092,45 +2092,6 @@ FIX: none here — this IS AMUX-1315 (per-lane worktrees), and today is its stro
 
 ---
 
-## A mutation that disabled a safety guard performed the unguarded action for real, and the residue poisoned every later local run
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-22
-SESSION: amux-frustrations
-CARD: AF-142
-SYMPTOM: My test `a_missing_working_directory_is_created_not_refused` used a LITERAL RELATIVE
-  path ("some/relative/path-that-does-not-exist") to exercise the branch that refuses relative
-  paths, because a relative path is the only way to reach that branch. While mutation-testing
-  the fix I disabled that very guard (`if !p.is_absolute()` -> `if false`) to confirm the test
-  could fail — and the test then did what the unguarded code says: `create_dir_all` resolved
-  the fixture against the TEST's cwd, the shared checkout, and created it. The mutation was
-  reverted a second later. The directory was not. Residue mtime 09:09; my commit 09:10.
-  From then on `ensure_work_dir` short-circuited on `is_dir()` for that path, so the test
-  asserted a refusal that no longer happened and went red on this machine — while CI, with a
-  fresh checkout every run, stayed green. amux found it blocking an unrelated commit's gate
-  and cleaned it in 67137cc.
-COST: a red test on correct code, discovered by a peer while it blocked THEIR gate, and the
-  failure was neither their code nor mine — it was a file. On a shared checkout the blast
-  radius is every lane, not just the author, and the CI-green/local-red split is the part that
-  makes it expensive: the one instrument everybody trusts is structurally unable to see it,
-  because hermeticity-by-fresh-checkout hides exactly this class.
-FIX: shipped by amux in 67137cc — the fixture clears its own residue before asserting, with
-  the mechanism written down. Recording the two durable halves, because the fix is local and
-  the lessons are not:
-  1. A MUTATION THAT DISABLES A GUARD PERFORMS THE UNGUARDED ACTION. Mutation testing is
-     usually reasoned about as "does the assertion fire", but the mutant runs the real code
-     path with the safety off, and any side effect it has on disk, in a DB or over the network
-     outlives the revert. Before mutating a guard OFF, ask what the code does without it —
-     that is precisely what the guard exists to prevent, so the answer is never nothing.
-  2. A LITERAL RELATIVE PATH IN A FIXTURE IS HERMETIC ONLY ON A FRESH CHECKOUT. CI can never
-     see it fail and a machine with history can never see it pass, which inverts the usual
-     trust relationship between the two. If a test must use a relative path to reach a branch,
-     it owns cleaning up after itself; tempdirs cannot help, because a path under a tempdir is
-     no longer relative.
-
----
-
 ## The freshness hook reported the running server "1 behind" for a commit the builder is designed to ignore
 AREA: instruments
 SEVERITY: slows
@@ -2310,40 +2271,6 @@ FIX: two shipped and one general.
 
 ---
 
-## A PreToolUse hook blocks the whole compound command, so its non-git half silently never ran
-AREA: silent-partial
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-23
-SESSION: amux-frustrations
-CARD: AF-151
-SYMPTOM: a fourth instance of AF-150's shape, found the same day, with a different cause and
-  therefore its own entry. I ran one command that (a) rewrote a commit-message file with a
-  heredoc and (b) amended a commit with `-F` that file. The shared-checkout guard hook
-  rejected it for an unrelated reason (no AMUX_AMEND_EXPECT pin). The hook blocks the ENTIRE
-  command, so the heredoc never ran either, which nothing said. I fixed the named complaint,
-  re-ran pinned, and got `rc=0` from an amend that read the STALE file and changed nothing
-  about the message it existed to change.
-COST: one wrong "message corrected" claim, caught only because I greped the operand
-  afterwards rather than trusting the exit code. Anyone whose blocked command mixed a write
-  with a git call inherits stale inputs on the retry, and the retry reports success.
-FIX: SHIPPED by amux, dd4222d (the note) + 11dd22c (it displays the REAL command, not the
-  scrubbed one, after the first version showed `echo   > /tmp/m.txt` for `echo "hello world"
-  > /tmp/m.txt` at the exact moment the reader is choosing what to re-run). Verified by running
-  the hook against the pre-fix artifact, not by reading the diff. Originally filed as the
-  harness's rather than mine:
-  The hook is RIGHT to reject the substitution form: `AMUX_AMEND_EXPECT=$(git log -1
-  --format=%H)` re-derives whatever HEAD is now, so it is not a pin at all, which is exactly
-  what the guard exists to require. The friction is that its refusal is all-or-nothing over a compound command
-  whose other half had no git in it at all, and the block message names only the git reason,
-  so the natural mental model after reading it is "nothing happened", when in fact nothing
-  happened AND that is the problem.
-  Cheapest honest fix: when a blocked command contains shell side effects before the git
-  call, say so in the refusal ("NOTE: the rest of this command did not run either"). That is
-  one line in the hook and it converts an invisible skip into a stated one.
-  Habit meanwhile, and it is the same one AF-150 already lists: assert the WRITE changed
-  something. `grep -c` on the file before and after is what caught this.
-
 ## SEO generator leaves empty orphan directories when data is removed from seo-data.js
 AREA: instruments
 SEVERITY: annoys
@@ -2395,48 +2322,3 @@ FIX: open. The narrow fix is that a card-scoped notice must source its "most rec
   describes). Routed to amux-frustrations, whose patch notices are.
 
 ---
-
-## The reviewer nudge reads a board channel nothing has written since 2026-08-09
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-23
-SESSION: amux-frustrations
-CARD: AF-154
-SYMPTOM: reported by amux, who disproved it against the card instead of acting on it. An idle
-  nudge told them "amux-frustrations has already responded (their message is the most recent
-  action on this card), so it is YOUR move, read their response on the card." No such response
-  existed. `reviewer_has_responded()` (runtime_jobs/board_drive.rs:1121) compares the
-  reviewer's and everyone else's last deliberate BOARD action, both read from
-  `interaction_log`, against the reviewer's newest MESSAGE naming the card, read from
-  `cmd_history`. Measured in the live DB: `interaction_log` kind='board' holds 1136 rows whose
-  ONLY date is 2026-08-09, and zero rows for AF-150 or AF-151, while `cmd_history` is current.
-  So both board timestamps are 0 on every card created since, and the test collapses from
-  "whose board action is most recent" into "has the reviewer ever named this card in a
-  message". Any message beats 0, INCLUDING the message that announces the card, which is
-  exactly what fired here.
-COST: a handful of calls for amux to disprove it, and they said the dangerous version is the
-  opposite of theirs: someone believes feedback exists and either invents something to address
-  or waits on a reviewer who is not blocked. It has been wrong on every card for two weeks and
-  nobody noticed, because being told "the ball is yours" is not surprising.
-FIX: SHIPPED by amux, 9210b66. Both-zero is knowable, so the function now RETURNS None and
-  warns once per process rather than inferring a review response from messages alone. It trades
-  toward one extra nudge to a message-only reviewer, away from a review gate waiting on nothing.
-  The WARN is the half that makes it a class kill: the next reader pointed at a dead channel
-  announces itself instead of answering confidently. Module 73/73, including the original test,
-  which still holds because it inserts its own board row. Diagnosis, for the record:
-  Root cause is that nothing in the Rust server writes kind='board' rows outside tests. The
-  only such INSERT is board_drive.rs:4530, inside `#[cfg(test)]`. scope.rs:1152 is the one
-  live insert and carries kind='scope', which matches the data: 'scope' is the only kind that
-  outlived 2026-08-09, the day the Python server was deleted (792ce1f). A Python-era table the
-  port left readers pointed at.
-  THE TEST CANNOT FAIL, which is why this survived. The covering test INSERTs the
-  interaction_log row itself, manufacturing the precondition production lacks, so it is
-  structurally blind to the table being empty in reality (ethos rule 7).
-  Killed in writing, so nobody re-runs them: timestamp UNITS are fine (both tables are
-  13-digit ms); the nudge BUDGET is fine (`card_event_count` reads session_events); and the
-  message did name the card, which is the trigger rather than the miss.
-  Unverified blast radius worth checking: api/why.rs (5 reads) and runtime_jobs/storage.rs
-  (4 reads) hit the same table. Also `action='gate_force'` has exactly ONE row ever, which is
-  the audit trail ethos rule 6 names as the one thing the gate system promises is logged.
-
