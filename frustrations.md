@@ -2277,6 +2277,23 @@ FIX: two shipped and one general.
   sw_moved=0), passes on 24fc2b4 and 36b93f8, skips a range with no client JS.
   SHIPPED — c207339 makes (3) refuse when a full fetch returns no desc, rather than treating
   an absent field as an empty result.
+  SHIPPED: 1998c75 turns (1) from a habit into a mechanism: scripts/test-tree-clean.sh
+  wraps a command and fails if the checkout changed, so a fixture that dirties the tree is
+  caught by the run that dirtied it rather than by the next person's red test. The design
+  point is the one that nearly went the other way. `git status --porcelain` reports ZERO
+  LINES for the exact residue in (1), and so does `-uall`, because git does not track empty
+  directories; the obvious guard would have been green and unable to fail on its own
+  motivating incident. `git clean -nd` sees it, and cannot see a modification to a tracked
+  file, so the snapshot is the union. It ships a `--self-test` negative control (fires on an
+  empty-dir residue, silent on a no-op) so a green from it is never taken on faith. Two
+  measured limits are in its header: it attributes every diff to the wrapped command, which
+  is false on THIS shared checkout (the first baseline run named a peer's mid-run edit to
+  alerts.rs), and it ignores gitignored paths so cargo's target/ writes are not noise.
+  This also inverts what 67137cc concluded, that "CI never sees this class (fresh checkout)".
+  A fresh checkout is where the residue is EASIEST to see, because it has no history to
+  hide in, so the run that created it is the only thing that could have. Wiring it into
+  .github/workflows/rust.yml is NOT mine to do: that file gates every lane's push. Proposal
+  and evidence routed to amux; the guard is committed and runnable meanwhile.
   GENERAL, and the part that does not have a patch: when a step's failure mode is doing
   nothing, its success cannot be inferred from the operation around it. Three concrete habits,
   each of which would have caught exactly one of the above and none of the others, which is why
@@ -2290,3 +2307,35 @@ FIX: two shipped and one general.
     - when classifying on a field, confirm the field is PRESENT before concluding from its
       absence — an empty classification over a non-empty fetch is the loud-wrong-probe shape,
       answering confidently from a column that was never there.
+
+---
+
+## A PreToolUse hook blocks the whole compound command, so its non-git half silently never ran
+AREA: silent-partial
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-151
+SYMPTOM: a fourth instance of AF-150's shape, found the same day, with a different cause and
+  therefore its own entry. I ran one command that (a) rewrote a commit-message file with a
+  heredoc and (b) amended a commit with `-F` that file. The shared-checkout guard hook
+  rejected it for an unrelated reason (no AMUX_AMEND_EXPECT pin). The hook blocks the ENTIRE
+  command, so the heredoc never ran either, which nothing said. I fixed the named complaint,
+  re-ran pinned, and got `rc=0` from an amend that read the STALE file and changed nothing
+  about the message it existed to change.
+COST: one wrong "message corrected" claim, caught only because I greped the operand
+  afterwards rather than trusting the exit code. Anyone whose blocked command mixed a write
+  with a git call inherits stale inputs on the retry, and the retry reports success.
+FIX: none shipped; this one is the harness's, not mine.
+  The hook is RIGHT to reject the substitution form: `AMUX_AMEND_EXPECT=$(git log -1
+  --format=%H)` re-derives whatever HEAD is now, so it is not a pin at all, which is exactly
+  what the guard exists to require. The friction is that its refusal is all-or-nothing over a compound command
+  whose other half had no git in it at all, and the block message names only the git reason,
+  so the natural mental model after reading it is "nothing happened", when in fact nothing
+  happened AND that is the problem.
+  Cheapest honest fix: when a blocked command contains shell side effects before the git
+  call, say so in the refusal ("NOTE: the rest of this command did not run either"). That is
+  one line in the hook and it converts an invisible skip into a stated one.
+  Habit meanwhile, and it is the same one AF-150 already lists: assert the WRITE changed
+  something. `grep -c` on the file before and after is what caught this.
