@@ -1869,52 +1869,6 @@ FIX: 7ecb766. Position and phase are published per directory BEFORE the syscall 
 
 ---
 
-## The CLI help promised backlog was claimable; the server refused it
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-21
-SESSION: amux
-CARD: AMUX-3450
-SYMPTOM: `amux board --help` has said "Atomically claim a todo/backlog card" since before
-  08-05; `POST /api/board/{id}/claim` 409'd anything not `todo`. Hit live on a real
-  handover: amux-frustrations parked AF-127 in backlog precisely so it would not re-queue
-  to them, wrote "It is claimable — amux board claim AF-127" on the card, and the claim
-  bounced. Two components disagreeing about the same fact, and the disagreeing side was
-  the one peers read when deciding how to hand work over.
-COST: a handover instruction on a card was false at execution time; the claimer burned a
-  round discovering the real contract, and every prior reader of that help line carries
-  the same wrong model.
-FIX: ae73d72. Manual claim accepts backlog via `claim_card_from` (its own CAS on the
-  observed status); auto-pickup stays todo-only, because parking a card mid-race is how
-  an owner defeats a racing pickup, so widening THAT CAS would let pickup steal parked
-  work. Card log says "Claimed from backlog by X" — the auto-pickup wording would be a
-  false statement for a card that was never queue-dispatched. Verified live (probe card:
-  backlog -> claim -> doing, log line exact).
-
-## The claim 409 said "reassign it first" and no sanctioned command could
-AREA: board
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-21
-SESSION: amux
-CARD: AMUX-3450
-SYMPTOM: claiming a card owned by another worker 409'd with "reassign it first" — and the
-  CLI had no reassign verb, so the server's own error directed every follower off the
-  audited path onto a hand-rolled `curl -X PATCH`. Ethos rule 6 verbatim: the documented
-  escape was unwalkable from the sanctioned tooling, on the exact flow (claim) that
-  AMUX-2140 already taught us gets followed literally. I walked it via raw PATCH (with
-  X-Amux-Session, but nothing guarantees the next follower remembers the header).
-COST: one hand-rolled PATCH by this session; unbounded copies of the same by anyone else
-  the error text ever instructed, each one an attribution hole in the exact subsystem the
-  attribution program is hardening.
-FIX: ae73d72. `amux board assign <ID> <worker>` is that PATCH, attributed (X-Amux-Worker)
-  and outcome-surfaced through _board_outcome; the 409 now names the exact invocation
-  (verified live: the error text carries "amux board assign PO-3 amux"). The honest path
-  is now the easy path, which is the only durable fix for this class.
-
----
-
 ## The documented pre-push gate hangs, and the test that hangs cannot fail or say what wedged it
 AREA: instruments
 SEVERITY: blocks
@@ -2011,30 +1965,6 @@ FIX: send the mtime the hook already read — `hits.append({"path": p, "mtime": 
   fires or how often it was wrong. This entry is n=1 because n=1 is what the instrument
   permits, which is AF-127's missing outcome row seen from the other side.
 
-## /health could not answer "does this build contain commit X"
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-21
-SESSION: amux
-CARD: AMUX-3454
-SYMPTOM: `build` is a binary content hash and the documented fallback (AF-82: compare the
-  build's time to the commit's time) fails exactly when two commits land seconds apart —
-  the normal case on a busy shared checkout. The builder adopted dec6eaa in the window
-  before 475d74a landed; the new hash was read as containing both, and a live verification
-  of the second commit ran against a server that did not have it, reporting the old
-  behavior ("stored":0) as if the fix were wrong. Same shape earlier the same day with
-  c30a03ac.
-COST: two wasted verification rounds in one afternoon, plus a second fleet-wide
-  observed-coverage gap opened while the wrong conclusion was being un-drawn.
-FIX: AMUX-3454's sha. build.rs stamps `git rev-parse --short=12 HEAD` into the binary;
-  /health gains `commit`, with `-dirty` when crates/ had uncommitted changes at build time
-  (the builder compiles the working tree, so a bare sha would overclaim) and "unknown"
-  without .git (cloud image). "Is my sha here" is now one jq read instead of a timing
-  argument.
-
----
-
 ## The idle commit-nudge listed three files I had committed four minutes earlier, and carries no observation time
 AREA: instruments
 SEVERITY: annoys
@@ -2089,85 +2019,6 @@ FIX: none here — this IS AMUX-1315 (per-lane worktrees), and today is its stro
   argument yet: the workaround everyone reaches for (an isolated worktree to get a stable
   tree) is the proposal itself, applied by hand, per victim, per incident. The count now
   argues for the build.
-
----
-
-## The freshness hook reported the running server "1 behind" for a commit the builder is designed to ignore
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-22
-SESSION: amux
-CARD: AMUX-2872
-SYMPTOM: After committing 2b7daf4 (workflows + scripts only, nothing under crates/), the
-  SessionStart freshness hook announced "the RUNNING SERVER is 1 commit(s) behind
-  origin/main ... A fix on main is not a fix in prod until then." The builder had done
-  exactly the right thing: its trigger is `git log -1 -- crates/ Cargo.toml Cargo.lock`,
-  and no build-relevant commit had moved. The hook counted `prov_sha..origin/main` with
-  no pathspec, so its verdict and the builder's predicate disagreed about the same fact.
-  Ethos rule 1's exact shape: a view that does not share the predicate of the mechanism
-  it describes, wrong in whichever direction it disagrees.
-COST: one session-start reconcile chase (fetch, rev-list, /health compare) to establish
-  that nothing was stale — small once, but this line fires at EVERY session start of
-  every lane after any docs/scripts/workflow commit, and a staleness banner that cries
-  wolf trains the fleet to skim past the one time it means a fix sat undeployed
-  overnight (the AEAB-32 case it exists for).
-FIX: both the count and the oldest-commit age in .claude/session-freshness.sh now carry
-  the builder's own pathspec, with the incident recorded at the site. Verified live on
-  the specimen: server at fc62250 with 2 commits upstream, all-commits count 2,
-  build-relevant count 0 — silent, correctly.
-
----
-
-## My own merge commit read as foreign to the push guard: the session stamp fused into the subject on a newline-less message file
-AREA: attribution
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-22
-SESSION: amux
-CARD: AMUX-2872
-SYMPTOM: A routine `git merge origin/main --no-edit` + push got PUSH BLOCKED: "1 commit
-  authored by another session ... (no Amux-Session trailer): d1228ee Merge remote-tracking
-  branch 'origin/main' Amux-Session: amux". The stamp is RIGHT THERE in the guard's own
-  output — fused onto the subject line. Reproduced: `git interpret-trailers` (git 2.39),
-  handed a message file whose last line lacks its trailing newline, glues the trailer
-  directly onto that line instead of opening a new paragraph, so subject+trailer become one
-  paragraph and the trailer parser cannot see it. prepare-commit-msg's own header comment
-  recounts three prior hand-rolled-append failure modes and concludes "git ships the parser
-  that handles all four; stop reimplementing it" — and the shipped parser has a fifth mode.
-COST: a blocked push, then an amend that the shared-checkout guard (correctly) blocked
-  twice more — once for a missing pin, once because the guard cannot evaluate a $VAR pin,
-  needing the literal sha — so shipping one clean merge took four attempts. Worse if
-  unnoticed: every future merge commit by any lane would render untrailered, and the deploy
-  recipe says treat [] as foreign, so routine merges would accumulate as unpushable-looking
-  commits owned by nobody.
-FIX: scripts/git-hooks/prepare-commit-msg now guarantees the file's final newline before
-  invoking interpret-trailers (no-op on well-formed files, empty files left alone);
-  installed via install-hooks.sh, verified on the reproduced specimen plus well-formed and
-  empty cells. The already-pushed ac6f8b3 was repaired by a pinned message-only amend.
-
----
-
-## perf-baseline.sh cannot take its DB copy while anything writes: .backup restarts forever
-AREA: instruments
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-22
-SESSION: amux
-CARD: AMUX-3491
-SYMPTOM: scripts/perf-baseline.sh sat in its first step (sqlite3 .backup of the live
-  2.1GB DB) past a 3-minute and then a 9-minute timeout, leaving orphaned
-  /tmp/amux-perf.* dirs. The backup API restarts from scratch on every source write,
-  and the AMUX-3489 retention trim was landing a delete batch every cycle — so the
-  copy could never finish while the server was draining, which is exactly when you
-  want to measure. A 25s probe confirmed: 655MB copied, still restarting. The same
-  instrument ran fine that morning (pre-drain), so the failure looked like a hang in
-  my change rather than the copy step.
-COST: ~15 minutes of dead timeouts mid-investigation, two orphaned partial copies,
-  and the fresh-boot baseline re-measure for AMUX-3491/3488 pushed behind the drain.
-FIX: the script now uses VACUUM INTO (one WAL read snapshot, immune to writer
-  restarts; 4s where .backup never finished). Layout is compacted vs production —
-  noted in the script, moves the numbers once, on the record.
 
 ---
 
