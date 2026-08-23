@@ -2839,8 +2839,15 @@ pub(crate) struct DeliveryMeta<'a> {
     pub delivery: Option<Delivery>,
     pub queued_at_ms: Option<i64>,
     /// AMUX-2643. None means "not verified", NEVER "failed" — the queued path
-    /// has submitted nothing yet, and the deliverer stamps a verdict when it
-    /// lands. Inventing one here would be the mislabelling 0014 exists to end.
+    /// has submitted nothing yet. Inventing one here would be the mislabelling
+    /// 0014 exists to end.
+    ///
+    /// This used to end "and the deliverer stamps a verdict when it lands".
+    /// NOTHING DOES (AMUX-3541): `UPDATE cmd_history` appears twice in this
+    /// crate and both set `card_id`. The claim was made in four places and
+    /// implemented in none, so a queued row's verdict stays None forever. The
+    /// promise is removed rather than softened, because a docstring that
+    /// describes an unbuilt mechanism is what got `delivered_at` believed.
     pub submit_verdict: Option<&'a str>,
 }
 
@@ -3163,6 +3170,41 @@ pub(crate) async fn cmd_hist_record_full(
     let is_user = ctype == "user";
     // Carry the recorded row id out of the write so auto-capture can link the card.
     let msg_row_id = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    // delivered_at IS NOT A COPY OF ts ANY MORE (AMUX-3541).
+    //
+    // Both columns were `now_ms`, unconditionally, on every row. Measured
+    // 2026-08-23 before this change: delivered_at == ts on 3854 of 3854 rows,
+    // max gap 0 — INCLUDING all 40 `delivery='queued'` rows, where a real
+    // delivery time must show a gap, because the entire point of queueing is
+    // waiting for a turn boundary. The column was the insert time wearing a
+    // delivery time's name, and being populated 100% of the time is exactly
+    // what made it believable: AF-159 reasoned "all 144 have delivered_at set,
+    // so these landed" — a correct inference from the name and the docstring,
+    // and false.
+    //
+    // A DIRECT send really was delivered when it was recorded, so `now_ms` is
+    // true there and stays. A QUEUED one has not been delivered, so the honest
+    // value is NULL — and NULL is what makes the missing deliverer COUNTABLE
+    // rather than invisible. Four comments in this file promise "the deliverer
+    // stamps delivered_at when it lands" and nothing does (`UPDATE cmd_history`
+    // appears twice, both setting card_id). Until that is built, queued rows
+    // accumulate with a NULL delivered_at, and
+    //
+    //     SELECT COUNT(*) FROM cmd_history WHERE delivery='queued' AND delivered_at IS NULL
+    //
+    // is a number somebody can watch. Before this change the same defect was
+    // unobservable, because the wrong answer and the right one were the same
+    // bytes.
+    //
+    // Safe to NULL: no client reads this column. app.js's only `delivered_at`
+    // (line 6661, "Sent <ago>") is fed by the steering-history endpoint, whose
+    // separate `steering_history` table IS stamped at real delivery by the
+    // deliverer — which is also where the timestamp for the eventual backfill
+    // will come from.
+    let delivered_at_ms = match meta.delivery {
+        Some(Delivery::Queued) => None,
+        _ => Some(now_ms),
+    };
     let msg_row_id_w = msg_row_id.clone();
     let cap_session = session.clone();
     let cap_text = text.clone();
@@ -3175,7 +3217,7 @@ pub(crate) async fn cmd_hist_record_full(
                  VALUES (?,?,?,?,?,?,?,?,?)",
                 rusqlite::params![
                     text, ctype, session, now_ms, origin,
-                    delivery, queued_at_ms, now_ms, submit_verdict
+                    delivery, queued_at_ms, delivered_at_ms, submit_verdict
                 ],
             )?;
             msg_row_id_w.store(conn.last_insert_rowid(), std::sync::atomic::Ordering::SeqCst);
@@ -3963,7 +4005,8 @@ pub(crate) fn submit_verdict_of(msg: &str) -> Option<&'static str> {
         return Some("confirmed");
     }
     // "queued (steering) — ..." and friends: nothing was submitted yet, so
-    // there is no verdict to record. The deliverer stamps one when it lands.
+    // there is no verdict to record. It stays None: no deliverer stamps one
+    // later, despite what this comment used to promise (AMUX-3541).
     None
 }
 
@@ -11123,8 +11166,10 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         // (type=='steering') reported every QUEUED message as direct. That is
         // precisely the mislabelling this metadata exists to end.
         let deliv = if msg.starts_with("queued") { Delivery::Queued } else { Delivery::Direct };
-        // A queued message's wait starts now; the deliverer stamps
-        // delivered_at when it actually lands.
+        // A queued message's wait starts now. `delivered_at` stays NULL until
+        // something stamps it, and nothing does yet (AMUX-3541) — which is the
+        // point: a NULL that persists is countable, where the old unconditional
+        // copy of `ts` was not.
         let q_at = if deliv == Delivery::Queued { Some(now_i64() * 1000) } else { None };
         // Same source of truth as `deliv`: the send's own outcome, recorded
         // rather than re-inferred later. `verify_submitted` already computed
@@ -13877,6 +13922,55 @@ mod tests {
     // The column ALIGNMENT, which submit_verdict_of's unit tests cannot catch:
     // the INSERT lists 9 columns and 9 placeholders, and getting that pairing
     // wrong writes the verdict into the wrong column silently. Round-trip a
+    /// AMUX-3541. `delivered_at` must not be a copy of the insert time.
+    ///
+    /// Both columns were `now_ms` unconditionally, so delivered_at == ts on
+    /// 3854 of 3854 rows with a max gap of 0 — including every `queued` row,
+    /// where a real delivery time MUST differ because queueing means waiting
+    /// for a turn boundary. A column populated 100% of the time reads as a
+    /// working instrument, which is why AF-159 rested "these 144 landed" on it.
+    ///
+    /// The queued assertion is the load-bearing one. A direct send genuinely
+    /// was delivered at insert, so `Some(ts)` there is true and must stay true
+    /// — asserting only the NULL half would pass against a version that
+    /// blanked the column for everything, which would destroy real information
+    /// rather than stop recording false information.
+    #[tokio::test]
+    async fn delivered_at_is_null_for_a_queued_send_and_set_for_a_direct_one() {
+        let (st, _dir) = state();
+
+        cmd_hist_record_full(&st, "lane-q", "queued one", "user", "", false,
+                             DeliveryMeta::queued(11)).await;
+        let (ts_q, del_q) = last_row(&st);
+        assert_eq!(
+            del_q, None,
+            "a QUEUED message has not been delivered — stamping delivered_at here is \
+             what made the column a copy of ts on every row"
+        );
+        assert!(ts_q > 0, "ts is still recorded; it is delivered_at that must be absent");
+
+        cmd_hist_record_full(&st, "lane-d", "direct one", "user", "", false,
+                             DeliveryMeta::direct()).await;
+        let (ts_d, del_d) = last_row(&st);
+        assert_eq!(
+            del_d, Some(ts_d),
+            "a DIRECT send really was delivered when it was recorded — blanking this too \
+             would throw away true information instead of removing false information"
+        );
+    }
+
+    fn last_row(st: &AppState) -> (i64, Option<i64>) {
+        st.store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT ts, delivered_at FROM cmd_history ORDER BY id DESC LIMIT 1",
+                [],
+                |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?)),
+            )
+            .unwrap()
+    }
+
     /// AF-159. A message put on the steering queue must NOT be recorded as a
     /// direct delivery.
     ///
@@ -15898,7 +15992,8 @@ mod submission_gate_tests {
     fn a_queued_send_has_no_verdict_yet_rather_than_a_false_one() {
         // The queued path has submitted nothing at this point. Recording
         // "confirmed" here would be the exact mislabelling this metadata exists
-        // to end; NULL is the honest value until the deliverer stamps one.
+        // to end; NULL is the honest value, and currently the permanent one —
+        // no deliverer stamps a verdict (AMUX-3541).
         assert_eq!(submit_verdict_of("queued (steering) — will deliver at the next boundary"), None);
         assert_eq!(submit_verdict_of(""), None);
     }
