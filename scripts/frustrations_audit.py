@@ -152,6 +152,49 @@ def overlap(a, b):
     return len(w1 & w2) / min(len(w1), len(w2))
 
 
+# AF-172. THE FILE'S OWN DISCRIMINATOR, READ BY SOMETHING.
+#
+# frustrations.md states the rule in its own header: "a single frustration is a
+# complaint and a cluster is an argument. No one entry proves a subsystem needs
+# rebuilding; three entries sharing an AREA do, and that pattern is invisible
+# unless the entries are counted."
+#
+# Nothing counted them. On 2026-08-23 `instruments` stood at 35 open-or-fixed
+# entries, the loudest ranked signal in the system, and no scheduler, view or
+# nudge consumed it. The rule was written down and never run, which is the shape
+# ethos rule 7 records about rules generally.
+#
+# It lives HERE rather than in a new script on purpose (ethos rule 1: a
+# capability nobody is enrolled in is decoration). The audit already parses AREA,
+# already runs in CI via scripts/test-frustrations-audit.sh, and is already what
+# people run before touching this file. A separate `frustration_clusters.py`
+# would have to be remembered; this cannot be, because it prints on every run.
+#
+# IT REPORTS AND DOES NOT ACT. No card is filed, nothing is prioritised for
+# anyone. 273 board cards were created in the 24h before this was written, and
+# more detectors without a human deciding is ethos rule 5 — it becomes a log, and
+# no gate can govern a log. The OPEN count is what ranks, because a cluster whose
+# entries are all fixed is a solved argument, not a live one.
+def print_cluster_rank(entries, threshold=3):
+    by = {}
+    for e in entries:
+        area = (e.get("AREA") or "").strip() or "(none)"
+        st = (e.get("STATUS") or "").strip().split()[0] if (e.get("STATUS") or "").strip() else ""
+        tot, op = by.get(area, (0, 0))
+        by[area] = (tot + 1, op + (1 if st.startswith("open") else 0))
+    ranked = sorted(by.items(), key=lambda kv: (-kv[1][1], -kv[1][0], kv[0]))
+    argued = [(a, t, o) for a, (t, o) in ranked if o >= threshold]
+    singles = sum(1 for _, (t, _) in by.items() if t == 1)
+    print("  AREA CLUSTERS — %d areas, %d singleton(s); >=%d OPEN is an argument"
+          % (len(by), singles, threshold))
+    if not argued:
+        print("              no AREA has %d open entries — no cluster argues for a rebuild"
+              % threshold)
+    for area, tot, op in argued:
+        print("              %-16s %2d open / %2d total" % (area, op, tot))
+    return argued
+
+
 def main():
     quiet = "--quiet" in sys.argv
     raw = FRUST.read_text()
@@ -160,6 +203,11 @@ def main():
     # A structural drift makes every downstream verdict suspect, so it is
     # reported FIRST rather than buried under 122 lines of per-entry output.
     structure_ok = structure_check(raw, entries)
+    # BEFORE the board fetch, because it does not need one. The first version
+    # printed this only on the board-reachable path, so the one signal that is
+    # pure text parsing went silent exactly when the server was down — and the
+    # test cells caught it, which is the whole reason they exist.
+    print_cluster_rank(entries)
     problems, advisories = [], []
     # AEAB-19, second instance in this same file. `structure_ok` was assigned here
     # and NEVER READ — the drift check printed its finding and had no effect on the

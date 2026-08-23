@@ -29,7 +29,9 @@
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-AUDIT="$(pwd)/scripts/frustrations_audit.py"
+# Overridable so a MUTANT can be run through the same cells (ethos rule 7: a
+# check that cannot fail on the case it was written for is theatre).
+AUDIT="${FRUSTRATIONS_AUDIT:-$(pwd)/scripts/frustrations_audit.py}"
 REAL_FRUST="$(pwd)/frustrations.md"
 PASS=0; FAIL=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
@@ -75,6 +77,19 @@ check_rc() { # label expected actual casedir
 check_says() { # label needle casedir
   if grep -qF "$2" "$TMP/$3/out.txt" 2>/dev/null; then PASS=$((PASS+1));
   else FAIL=$((FAIL+1)); echo "FAIL: $1 — output did not mention '$2'"; fi
+}
+
+# The negative counterpart of check_says. It did NOT exist when the AF-172 cells
+# were written, and calling a missing function under `set -uo pipefail` (no -e)
+# prints "command not found" and CONTINUES, so those cells would have incremented
+# neither PASS nor FAIL: two assertions that could not fail, in a file whose whole
+# subject is assertions that could not fail. Caught by grepping for the helper
+# instead of assuming it.
+check_lacks() { # label needle casedir
+  if grep -qF "$2" "$TMP/$3/out.txt" 2>/dev/null; then
+    FAIL=$((FAIL+1)); echo "FAIL: $1 — output mentioned '$2' and should not have"
+    sed 's/^/      /' "$TMP/$3/out.txt" | head -8
+  else PASS=$((PASS+1)); fi
 }
 
 header() { printf '# frustrations\n\nblurb\n\n---\n\n'; }
@@ -126,5 +141,35 @@ rc=$( run_on realfile < "$REAL_FRUST" )
 check_rc "(e) the repo's own frustrations.md passes (main stays green)" 2 "$rc" realfile
 
 echo
-echo "test-frustrations-audit: $PASS passed, $FAIL failed"
+
+# ── AF-172: the AREA cluster rank ───────────────────────────────────────────
+# frustrations.md's own header says a single frustration is a complaint and a
+# cluster is an argument, and that the pattern is invisible unless the entries
+# are counted. Nothing counted them until now. These cells pin WHAT is counted.
+mk_entry() { # $1 area  $2 status  $3 title
+  printf '## %s\nAREA: %s\nSEVERITY: slows\nSTATUS: %s\nDATE: 2026-08-17\nSESSION: test\nCARD: none\nSYMPTOM: s\nCOST: c\nFIX: f\n\n' "$3" "$1" "$2"
+}
+
+# (cl1) three OPEN in one AREA is an argument and must be named.
+rc=$( { echo "# h"; echo; echo "---"; echo;
+        mk_entry widgets open one; mk_entry widgets open two; mk_entry widgets open three; } | run_on cl1 )
+check_says "cl1: 3 open in one AREA is reported as an argument" "widgets" cl1
+check_says "cl1: and it prints the open/total split" "3 open /  3 total" cl1
+
+# (cl2) THE DISCRIMINATOR. Three entries in one AREA, all FIXED, is a SOLVED
+# argument and must NOT be listed. A rank on TOTAL rather than OPEN would list
+# it, and would keep proposing rebuilds of subsystems already repaired — so this
+# is the cell that fails if the wrong number ranks.
+rc=$( { echo "# h"; echo; echo "---"; echo;
+        mk_entry gadgets fixed one; mk_entry gadgets fixed two; mk_entry gadgets fixed three; } | run_on cl2 )
+check_lacks "cl2: 3 FIXED in one AREA is a solved argument, not a live one" "gadgets" cl2
+
+# (cl3) below threshold stays quiet, or the rank is an alarm that is always on.
+rc=$( { echo "# h"; echo; echo "---"; echo;
+        mk_entry sprockets open one; mk_entry sprockets open two; } | run_on cl3 )
+check_lacks "cl3: 2 open is below threshold and is not reported" "sprockets" cl3
+check_says  "cl3: and it says so rather than printing nothing" "no AREA has 3 open entries" cl3
+
 [ "$FAIL" -eq 0 ] || exit 1
+
+echo "test-frustrations-audit: $PASS passed, $FAIL failed"
