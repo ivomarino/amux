@@ -448,11 +448,64 @@ def _has_cotenants(run_dir):
         return False
 
 
+
+# AF-151 (AREA silent-partial): a block stops the WHOLE Bash call, not just the
+# git verb that tripped it. When the command joined other work to that verb --
+# the reported specimen was a heredoc writing a commit-message file followed by
+# `git commit --amend -F` that file -- the other half is skipped too, and the
+# refusal said nothing about it. The operator fixes the named git complaint,
+# re-runs, and the retry reads a file the heredoc never wrote: rc=0 from an
+# amend that changed nothing. Same family as the rest of AF-150 -- a compound
+# operation whose silent half is invisible because the loud half was answered.
+#
+# DISCRIMINATES, deliberately: a lone `git ...` invocation gets no note (it
+# would be noise on the common case, and a notice that always fires is one
+# nobody reads). Runs on the SCRUBBED command so a heredoc BODY mentioning
+# `&&` cannot manufacture a phantom second half.
+_LAST_CMD = ""
+_SHELL_JOINERS = re.compile(r"&&|\|\||;|\n|(?<!\|)\|(?!\|)")
+
+
+def _skipped_half_note(cmd):
+    """The NOTE text when a blocked command had non-git work, else ''."""
+    if not cmd:
+        return ""
+    # Heredoc TERMINATORS survive the body strip and are not work: without
+    # this, a lone `git commit -F - <<'EOF' ... EOF` reported a skipped
+    # segment called `EOF`, which is both wrong and confusing at exactly the
+    # moment the reader is deciding what to re-run.
+    delims = set(re.findall(r"<<-?\s*['\"]?([A-Za-z_][A-Za-z0-9_]*)", cmd))
+    segments = [seg.strip() for seg in _SHELL_JOINERS.split(_scrub(cmd))]
+    segments = [seg for seg in segments if seg and seg not in delims]
+    if len(segments) < 2:
+        return ""
+    # A segment is "git work" when the verb is git, after leading env
+    # assignments (FOO=bar git ...) which are part of the same invocation.
+    def _is_git(seg):
+        words = seg.split()
+        while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
+            words = words[1:]
+        return bool(words) and words[0] == "git"
+    others = [seg for seg in segments if not _is_git(seg)]
+    if not others:
+        return ""
+    shown = others[0][:80] + ("..." if len(others[0]) > 80 else "")
+    return (
+        "NOTE: the rest of this command did not run either — the block stops the whole "
+        f"Bash call, not just the git verb. Skipped {len(others)} non-git segment(s), "
+        f"first: `{shown}`.\n"
+        "      If a later step reads what an earlier one was supposed to write, re-run "
+        "the WHOLE command after fixing the complaint above; do not re-run only the git "
+        "half against stale state.\n"
+    )
+
 def main():
     data = json.load(sys.stdin)
     if data.get("tool_name") != "Bash":
         return 0
     cmd = (data.get("tool_input") or {}).get("command", "") or ""
+    global _LAST_CMD
+    _LAST_CMD = cmd
     scrubbed = _scrub(cmd)                       # match only real invocations
     cwd = data.get("cwd") or os.getcwd()
     shared = [os.path.realpath(os.path.expanduser(p)) for p in
@@ -689,6 +742,15 @@ if __name__ == "__main__":
     # whole suite reporting green while its tail never executed (AMUX-3407,
     # caught because the PASS line went missing, not because anything failed).
     try:
-        sys.exit(main())
+        _rc = main()
+        # AF-151: one emission point for every block path — the individual
+        # refusals each write their own reason, and none of them knew whether
+        # the caller had joined other work to the git verb.
+        if _rc == 2:
+            try:
+                sys.stderr.write(_skipped_half_note(_LAST_CMD))
+            except Exception:
+                pass  # the note must never turn a clean block into a crash
+        sys.exit(_rc)
     except Exception:
         sys.exit(0)  # fail-open: a guard bug must never break tool calls
