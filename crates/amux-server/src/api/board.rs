@@ -196,7 +196,10 @@ async fn get_contract(
                 "limit": "page size, applied AFTER done_limit",
                 "offset": "page offset",
                 "slim": "1 = trimmed item bodies (desc_head/desc_len/log_n/folded_n instead of \
-                        prose) — the DEFAULT shape since AMUX-3496",
+                        prose) — the DEFAULT shape since AMUX-3496. Slim rows carry \
+                        \"slim\": 1 so a consumer can tell a dropped field from an empty one \
+                        (AF-161: a census read absence as emptiness and was 100% wrong)",
+                "slim_omits": ["desc", "log", "source_ref", "last_verified_at", "due_time", "gate"],
                 "full": "1 = full prose bodies (desc + log). The default list is slim; a \
                          reader that needs desc/log must ask (slim=0 also honored)",
                 "quota": "1 = per-status terminal quotas (verified floor 300; done/discarded \
@@ -1012,9 +1015,39 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
         // full card on demand when the detail panel opens, so these are
         // pure payload waste on the list/SSE path. Keeps depends_on
         // (is:blocked filter) and folded_n (is:folded filter).
-        for k in ["source_ref", "last_verified_at", "reviewer", "due_time", "gate"] {
+        //
+        // `reviewer` USED TO BE IN THIS LIST AND IS NOT ANY MORE (AF-161).
+        // The justification above reasons from ONE consumer — "the SPA never
+        // renders it" — which is true, and false for every other caller. It
+        // cost a real wrong answer on 2026-08-23: amux-frustrations audited
+        // their verified cards off this payload and reported 25 of 25 with no
+        // reviewer. The true figure was 7 named / 18 absent. `.get("reviewer")`
+        // returns None for an ABSENT key exactly as it does for an empty one,
+        // so a removal here is indistinguishable from a card with no reviewer,
+        // and the census was 100% wrong in the direction that looks like a
+        // finding. It is one short, usually-null string per row against a
+        // 4.5MB payload, and it is load-bearing for the one audit anybody runs
+        // over this table. The other four stay dropped: `gate` alone is four
+        // criteria strings per row.
+        //
+        // The prose drops were always SELF-DESCRIBING — desc_head/desc_len/
+        // log_n ship in their place, so a consumer can see the omission. These
+        // five were removed with nothing left behind, which is why the same
+        // discovery has now been made twice, one column at a time (c207339
+        // fixed the caller for `desc`). `slim: 1` below is the general remedy:
+        // a consumer can refuse a slim row instead of reading absence as
+        // emptiness, and `GET /api/board?describe` names exactly what is gone.
+        for k in ["source_ref", "last_verified_at", "due_time", "gate"] {
             obj.remove(k);
         }
+        // SAY THAT THIS ROW IS SLIM. Ten bytes against ~4.5MB, and it is the
+        // only thing that lets a caller tell "the server did not send this"
+        // from "the card does not have one" without knowing the drop list by
+        // heart. The AMUX-3496 comment argues the KeyError on `.desc` is
+        // "loud, not silently empty" — true in the idiom it assumes
+        // (`row["desc"]`) and false in the one every consumer actually
+        // writes (`row.get("desc")`), which returns None and says nothing.
+        obj.insert("slim".into(), json!(1));
     }
     if stale {
         obj.insert("stale".into(), json!(true));
@@ -4109,6 +4142,66 @@ mod slim_tests {
         // CONTENT, not the first line.
         let padded = IssueRow { desc: "\n\n  \nreal content here".into(), ..Default::default() };
         assert_eq!(list_body(&padded, true, false)["desc_head"], "real content here");
+    }
+
+    /// AF-161. `reviewer` SURVIVES the slim list, and a slim row SAYS it is slim.
+    ///
+    /// This test exists at this layer on purpose. `snapshot_slim` already had a
+    /// guard — `snapshot_slim_is_snapshot_minus_prose` — and it passed the whole
+    /// time the bug was live, because the drop happens one layer UP in
+    /// `list_body`, not in the snapshot. A check that pins the wrong layer is
+    /// exactly as green as one that pins the right one, and it certified a
+    /// payload that was snapshot-minus-prose-minus-five-more for weeks.
+    ///
+    /// The cost of the absence was a census reported as 25 of 25 verified cards
+    /// with no reviewer, when the truth was 7 named and 18 absent. `.get()`
+    /// returns None for a removed key and for an empty value alike, so the
+    /// wrong answer arrived looking like a finding.
+    #[test]
+    fn a_slim_row_keeps_the_reviewer_and_declares_that_it_is_slim() {
+        let named = IssueRow {
+            reviewer: Some("amux-frustrations".into()),
+            source_ref: Some("ref".into()),
+            ..Default::default()
+        };
+        let slim = list_body(&named, true, false);
+
+        // The field the census needed, present and correct.
+        assert_eq!(
+            slim["reviewer"], "amux-frustrations",
+            "reviewer must survive the slim list — its absence is what made the audit wrong"
+        );
+        // A row with NO reviewer must still carry the key, or the caller is back
+        // to guessing: absent and null have to be distinguishable from each other
+        // only by the value, never by the key.
+        let anon = IssueRow::default();
+        let slim_anon = list_body(&anon, true, false);
+        assert!(
+            slim_anon.get("reviewer").is_some(),
+            "the key must be present even when null, or absence still reads as emptiness"
+        );
+        assert!(slim_anon["reviewer"].is_null());
+
+        // The self-description, which is the general remedy rather than the
+        // one-column one.
+        assert_eq!(slim["slim"], 1, "a slim row must say so");
+
+        // Still slim: the expensive drops stay dropped, or this test would be
+        // pinning the absence of the optimisation instead of the presence of
+        // the fix.
+        for gone in ["desc", "log", "gate", "source_ref", "last_verified_at", "due_time"] {
+            assert!(
+                slim.get(gone).is_none(),
+                "{gone} must stay out of the slim list — it is the payload diet's whole point"
+            );
+        }
+
+        // And the FULL body is unchanged by any of this: it carries everything,
+        // and it must not sprout a `slim` marker.
+        let full = list_body(&named, false, false);
+        assert_eq!(full["reviewer"], "amux-frustrations");
+        assert!(full.get("desc").is_some());
+        assert!(full.get("slim").is_none(), "a full row must not claim to be slim");
     }
 
     // ---- AMUX-3391: auto-fold the silent capture card into the worker's own ----
