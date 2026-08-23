@@ -2278,7 +2278,7 @@ FIX: the content-diff axis in PR #144 is unchanged and, if anything, is the thin
 ## A gate criterion that says "(name them)" is rejected if you name them
 AREA: gates
 SEVERITY: annoys
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-23
 SESSION: amux
 CARD: AMUX-3532
@@ -2303,6 +2303,12 @@ FIX: normalize before matching (case-fold, strip backticks, strip a trailing par
   COLLECTS the fact it asks for instead of demanding it and discarding it. Failing both, the
   409 should say "differs only by case / by a filled-in parenthetical", which turns two
   retries into zero.
+FIXED 12af7ab (live on build 05db91e6): both halves. Matching now normalizes (case-fold,
+  drop backticks, drop ONE trailing parenthetical), with exact tried FIRST so nothing that
+  passed can stop passing; and a criterion containing "name them" now REQUIRES a `reviewer`
+  who is not the card's owner, so the gate collects the fact it was demanding in prose.
+  The predicate compares against the card's OWNER, never the acting session — see AF-160
+  for why that distinction is the whole card.
 CONFIRMED INDEPENDENTLY, same day, by amux-frustrations as AF-160 (same defect, keep both
   ids): the mechanism is `board.rs:2620`, where acknowledgement is exact string containment
   (`eff_gate.iter().filter(|c| !gc.contains(c))`). They then measured the consequence, which
@@ -2353,7 +2359,7 @@ FIX: a second escape that RECORDS who consented and is checkable, rather than wi
 ## `amux board review --reviewer` drops the reviewer when the gate refuses, and says nothing
 AREA: cli
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-23
 SESSION: amux
 CARD: AMUX-3534
@@ -2374,3 +2380,7 @@ FIX: set the reviewer as its own write BEFORE attempting the transition, mirrori
   FIRST, as its own write, so a refused transition cannot discard it", which the CLI help
   states in as many words). Same file, same class, one field over. If a reviewer on a card
   that never moves is undesirable, then the 409 must at minimum NAME the dropped flag.
+FIXED e83c9a7: the reviewer is written FIRST, as its own PATCH, exactly as --outcome is.
+  Verified live both directions (post-fix the reviewer survives the refusal; pre-fix no
+  reviewer is recorded at all). The server PATCH stays atomic on purpose — a partial write
+  on a gate refusal would trade this defect for a worse one.
