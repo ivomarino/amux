@@ -2025,7 +2025,7 @@ FIX: none here — this IS AMUX-1315 (per-lane worktrees), and today is its stro
 ## staged-guard named a co-editing session that never edited the file — ownership inferred from API traffic
 AREA: attribution
 SEVERITY: annoys
-STATUS: fixed
+STATUS: open
 DATE: 2026-08-22
 SESSION: amux
 CARD: AMUX-3497
@@ -2047,6 +2047,18 @@ FIX: shipped same day (see AMUX-3497 for the sha). Root cause was not command pa
   observed-vs-observed coincidence keeps both claims but the shared row carries
   co_signal naming the ambiguity, which the guard hook prints. Five test cells incl.
   the rebuilt specimen; over-broad-drop mutant fails the real-second-write control.
+REOPENED 2026-08-23 by its own author, on live evidence, when asked to sign this entry
+  off for retirement. Probing GET /api/git/staged-guard for
+  crates/amux-server/src/api/alerts.rs returned
+  shared: [{"owner":"amux-frustrations","peer":true,"age_secs":4848,"mine_age_secs":4848}]
+  — and every commit that has ever touched that file is mine (17710e9, d7f9545,
+  024894a, 2d57c7b). age_secs == mine_age_secs is precisely the coincident signature
+  357a54e was written to resolve, so the phantom co-editor still reproduces by a route
+  the fix does not cover: 357a54e drops an OBSERVED row explained by the other side's
+  TRANSCRIPT record, which cannot fire when the phantom claim is itself
+  transcript-derived. What remains to establish is which mechanism minted that row.
+  Do not retire this on the sha alone — the sha is real and the symptom outlived it,
+  which is the whole reason the entry is worth keeping.
 
 ---
 
