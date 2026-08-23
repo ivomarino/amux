@@ -2525,3 +2525,31 @@ FIX: the index is the shared resource nobody is arbitrating. Either (a) take a l
   Separately and cheaply: prepare-commit-msg must stamp the session of the process
   actually running git, and the staged-guard must warn in BOTH directions — "your
   staged files may ride out under someone else's commit" is the half it cannot say.
+
+---
+## A detector went fully inert and its own debug surface called it "baseline has 0 samples"
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-178
+SYMPTOM: Reviewing AF-175 I found the latency regression detector had stopped working on the
+  running build. The only trace anywhere was in GET /api/debug/autofix:
+    {"detector":"latency","signature":"latency|p95|/api/board",
+     "reason":"baseline has 0 samples (<30) - no trailing norm to compare against yet"}
+  /api/board has 46,825 rows in the baseline period and /api/sessions has 122,848. They are the
+  two busiest families in the system. An upstream filter was excluding 99.75% of rows (213,397
+  of 213,935) and the suppression reported that as an absence of data. The same sentence is
+  emitted for a genuinely quiet endpoint, so a live detector outage is byte-identical to a new
+  install with no traffic yet.
+COST: The regression shape was dead on main and would have stayed dead silently. I only found
+  it because I was reviewing that specific commit; no sweep, no alarm and no invariant could
+  have surfaced it. Checked from two angles before saying so: /api/debug/invariants returns 461
+  invariants and the only autofix-adjacent one is board.autofix_cards_are_dispatchable, and in
+  the source base.len() is compared in exactly one place, the min_samples gate that produces
+  the suppression. Detector health is not checked anywhere.
+FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, all filtered"
+  cannot be confused with "0 rows in the period", and add an invariant that fails when a family
+  with enough rows in the period has an empty baseline. Both values are already in hand at the
+  point of suppression. Detail and acceptance on AF-178.
