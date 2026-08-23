@@ -1666,10 +1666,13 @@ fn backlog_triage_text(
 /// Outstanding non-terminal cards for a session: (blocked_count, done_count,
 /// blocked_cards [(id, title)], done_cards [(id, title)]).
 #[allow(clippy::type_complexity)]
+/// `done` cards carry their REVIEWER (AMUX-3561): whether a card can be moved
+/// toward `verified` by the lane that owns it depends entirely on whether a peer
+/// is named, so the nudge cannot ask honestly without it.
 fn outstanding_work(
     conn: &Connection,
     session: &str,
-) -> (i64, i64, Vec<(String, String)>, Vec<(String, String)>) {
+) -> (i64, i64, Vec<(String, String)>, Vec<(String, String, String)>) {
     let query = |status: &str| -> (i64, Vec<(String, String)>) {
         let count: i64 = conn
             .query_row(
@@ -1695,7 +1698,20 @@ fn outstanding_work(
         (count, cards)
     };
     let (bc, blocked) = query("blocked");
-    let (dc, done) = query("done");
+    let (dc, done_plain) = query("done");
+    let done: Vec<(String, String, String)> = done_plain
+        .into_iter()
+        .map(|(id, title)| {
+            let rv = conn
+                .query_row(
+                    "SELECT COALESCE(reviewer,'') FROM issues WHERE id=?1",
+                    rusqlite::params![id],
+                    |r| r.get::<_, String>(0),
+                )
+                .unwrap_or_default();
+            (id, title, rv.trim().to_string())
+        })
+        .collect();
     (bc, dc, blocked, done)
 }
 
@@ -1706,6 +1722,59 @@ fn outstanding_work(
 ///
 /// Extracted so it can be TESTED. Inline in the scan loop it was unreachable
 /// from a test, which is exactly how the un-terminated version shipped.
+#[cfg(test)]
+mod continue_nudge_ask_tests {
+    use super::continue_nudge_text;
+
+    /// AMUX-3561. The nudge must ask for what its RECIPIENT can do.
+    ///
+    /// It said "verify each in prod or archive if superseded" to a lane that
+    /// cannot verify: the resolved `verified` gate in a reviewing group requires
+    /// a DIFFERENT worker who checked it themselves. Measured 2026-08-23 —
+    /// 3,383 unarchived `done` cards fleet-wide, 141 naming a reviewer, so 96%
+    /// of what this listed could not be advanced by the lane reading it, 25-50
+    /// times a day.
+    ///
+    /// AMUX-2903 narrowed the TRIGGER for exactly this reason and left the
+    /// sentence doing the thing the narrowing was for.
+    #[test]
+    fn the_done_section_asks_for_a_reviewer_when_none_is_named() {
+        let blocked = vec![("B-1".to_string(), "a blocker".to_string())];
+        let done = vec![
+            ("D-1".to_string(), "shipped a thing".to_string(), String::new()),
+            ("D-2".to_string(), "shipped another".to_string(), String::new()),
+        ];
+        let t = continue_nudge_text(1, 2, &blocked, &done);
+
+        assert!(
+            t.contains("amux board reviewer"),
+            "the ONE step the lane can take must be named: {t}"
+        );
+        assert!(t.contains("(no reviewer)"), "each card must say whether it has one: {t}");
+        assert!(
+            !t.contains("verify each in prod"),
+            "it must NOT instruct a verification the recipient cannot perform — that \
+             sentence is the defect: {t}"
+        );
+
+        // AND THE OTHER BRANCH, which is the control: when a reviewer IS named
+        // the ask changes, so this is not just a blanket removal of the verify
+        // instruction. A fix that deleted the sentence unconditionally would
+        // pass the assertions above and fail here.
+        let reviewed = vec![(
+            "D-3".to_string(),
+            "shipped".to_string(),
+            "amux-frustrations".to_string(),
+        )];
+        let t2 = continue_nudge_text(1, 1, &blocked, &reviewed);
+        assert!(t2.contains("reviewer: amux-frustrations"), "name the peer: {t2}");
+        assert!(
+            t2.contains("amux board ask") && !t2.contains("amux board reviewer"),
+            "with a reviewer named, the ask becomes chasing THEM, not naming one: {t2}"
+        );
+    }
+}
+
 fn last_continue_nudge_counts(conn: &Connection, lane: &str) -> Option<(i64, i64)> {
     let raw: Option<String> = conn
         .query_row(
@@ -1726,7 +1795,7 @@ fn continue_nudge_text(
     blocked_count: i64,
     done_count: i64,
     blocked: &[(String, String)],
-    done: &[(String, String)],
+    done: &[(String, String, String)],
 ) -> String {
     let mut sections = Vec::new();
 
@@ -1753,19 +1822,52 @@ fn continue_nudge_text(
     if !done.is_empty() {
         let mut lines: Vec<String> = done
             .iter()
-            .map(|(id, title)| {
+            .map(|(id, title, rv)| {
                 let t: String = title.chars().take(65).collect();
-                format!("  {id} {t}")
+                if rv.is_empty() {
+                    format!("  {id} {t}   (no reviewer)")
+                } else {
+                    format!("  {id} {t}   (reviewer: {rv})")
+                }
             })
             .collect();
         if done_count > done.len() as i64 {
             lines.push(format!("  ... and {} more", done_count - done.len() as i64));
         }
-        sections.push(format!(
-            "{done_count} done card(s) — verify each in prod or archive if \
-             superseded.\n{}",
-            lines.join("\n")
-        ));
+        // ASK FOR WHAT THE RECIPIENT CAN ACTUALLY DO (AMUX-3561).
+        //
+        // This said "verify each in prod or archive if superseded" — an
+        // instruction the lane cannot follow for almost any card it names. The
+        // resolved `verified` gate in a reviewing group requires "Peer-reviewed
+        // by a DIFFERENT worker (name them)" and "That peer verified it
+        // themselves": unsatisfiable by the author BY CONSTRUCTION. Measured
+        // 2026-08-23: 3,383 unarchived `done` cards fleet-wide, 141 naming a
+        // reviewer — 4.2%. So 96% of what this section listed could not be
+        // advanced by the lane reading it, ~25-50 times a day.
+        //
+        // AMUX-2903 already fixed the TRIGGER for this reason and its comment
+        // says the done count "still rides along in the message as context".
+        // It did not ride as context; it rode as an imperative. The trigger was
+        // narrowed and the sentence was left doing the thing the narrowing was
+        // for. Ethos rule 3 survives a fix aimed at its cause if the wording is
+        // not fixed too.
+        //
+        // What a lane CAN do is name the peer, and that is now the ask — which
+        // also produces the exact input the gate requires (12af7ab refuses a
+        // `verified` transition with no reviewer), so the nudge starts feeding
+        // the gate instead of demanding an output the recipient cannot make.
+        let unreviewed = done.iter().filter(|(_, _, rv)| rv.is_empty()).count();
+        let ask = if unreviewed > 0 {
+            format!(
+                "{done_count} done card(s). {unreviewed} of the {} listed name NO reviewer,                  and a card cannot reach `verified` without one — the gate asks for a                  DIFFERENT worker who checked it themselves, which you cannot supply on                  your own. The step that IS yours: name the peer,                  `amux board reviewer <id> <peer-session>`. Archive instead if the work was                  superseded.",
+                done.len()
+            )
+        } else {
+            format!(
+                "{done_count} done card(s), each with a reviewer named — ask them to verify                  (`amux board ask <id>`), or verify the ones where YOU are the named                  reviewer. Archive instead if the work was superseded."
+            )
+        };
+        sections.push(format!("{ask}\n{}", lines.join("\n")));
     }
 
     format!(
