@@ -2313,7 +2313,7 @@ FIX: two shipped and one general.
 ## A PreToolUse hook blocks the whole compound command, so its non-git half silently never ran
 AREA: silent-partial
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-23
 SESSION: amux-frustrations
 CARD: AF-151
@@ -2327,7 +2327,11 @@ SYMPTOM: a fourth instance of AF-150's shape, found the same day, with a differe
 COST: one wrong "message corrected" claim, caught only because I greped the operand
   afterwards rather than trusting the exit code. Anyone whose blocked command mixed a write
   with a git call inherits stale inputs on the retry, and the retry reports success.
-FIX: none shipped; this one is the harness's, not mine.
+FIX: SHIPPED by amux, dd4222d (the note) + 11dd22c (it displays the REAL command, not the
+  scrubbed one, after the first version showed `echo   > /tmp/m.txt` for `echo "hello world"
+  > /tmp/m.txt` at the exact moment the reader is choosing what to re-run). Verified by running
+  the hook against the pre-fix artifact, not by reading the diff. Originally filed as the
+  harness's rather than mine:
   The hook is RIGHT to reject the substitution form: `AMUX_AMEND_EXPECT=$(git log -1
   --format=%H)` re-derives whatever HEAD is now, so it is not a pin at all, which is exactly
   what the guard exists to require. The friction is that its refusal is all-or-nothing over a compound command
@@ -2395,7 +2399,7 @@ FIX: open. The narrow fix is that a card-scoped notice must source its "most rec
 ## The reviewer nudge reads a board channel nothing has written since 2026-08-09
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-23
 SESSION: amux-frustrations
 CARD: AF-154
@@ -2415,7 +2419,12 @@ COST: a handful of calls for amux to disprove it, and they said the dangerous ve
   opposite of theirs: someone believes feedback exists and either invents something to address
   or waits on a reviewer who is not blocked. It has been wrong on every card for two weeks and
   nobody noticed, because being told "the ball is yours" is not surprising.
-FIX: none shipped; board_drive.rs is amux's and the card is routed to them.
+FIX: SHIPPED by amux, 9210b66. Both-zero is knowable, so the function now RETURNS None and
+  warns once per process rather than inferring a review response from messages alone. It trades
+  toward one extra nudge to a message-only reviewer, away from a review gate waiting on nothing.
+  The WARN is the half that makes it a class kill: the next reader pointed at a dead channel
+  announces itself instead of answering confidently. Module 73/73, including the original test,
+  which still holds because it inserts its own board row. Diagnosis, for the record:
   Root cause is that nothing in the Rust server writes kind='board' rows outside tests. The
   only such INSERT is board_drive.rs:4530, inside `#[cfg(test)]`. scope.rs:1152 is the one
   live insert and carries kind='scope', which matches the data: 'scope' is the only kind that
