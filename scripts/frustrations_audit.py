@@ -175,13 +175,19 @@ def overlap(a, b):
 # more detectors without a human deciding is ethos rule 5 — it becomes a log, and
 # no gate can govern a log. The OPEN count is what ranks, because a cluster whose
 # entries are all fixed is a solved argument, not a live one.
-def print_cluster_rank(entries, threshold=3):
+def cluster_counts(entries):
+    """{AREA: (total, open)} — the counting half, so --since can reuse it."""
     by = {}
     for e in entries:
         area = (e.get("AREA") or "").strip() or "(none)"
         st = (e.get("STATUS") or "").strip().split()[0] if (e.get("STATUS") or "").strip() else ""
         tot, op = by.get(area, (0, 0))
         by[area] = (tot + 1, op + (1 if st.startswith("open") else 0))
+    return by
+
+
+def print_cluster_rank(entries, threshold=3):
+    by = cluster_counts(entries)
     ranked = sorted(by.items(), key=lambda kv: (-kv[1][1], -kv[1][0], kv[0]))
     argued = [(a, t, o) for a, (t, o) in ranked if o >= threshold]
     singles = sum(1 for _, (t, _) in by.items() if t == 1)
@@ -195,8 +201,62 @@ def print_cluster_rank(entries, threshold=3):
     return argued
 
 
+
+# AF-173. THE DELTA, WITHOUT A SCHEDULER AND WITHOUT NEW STORAGE.
+#
+# The proposal on AF-173 said the delta needs "a scheduler plus the instruments
+# that already exist". For this instrument it needs neither: frustrations.md is
+# in git, so its history is already recorded and the change is a query.
+#
+# Why that matters more than the convenience: every instrument here reports a
+# LEVEL (81 entries, 25 open in `instruments`, 2,523 nudges), and a level tells
+# you the machine is on. Only the delta answers "did the fixes reduce the
+# friction". Its first run said something a level could not: on 2026-08-23,
+# across ~28 shipped fixes and 11 retired entries, every cluster was flat or
+# GROWING (instruments 22->25, attribution 8->10, cli 3->6). Detection is
+# outpacing repair.
+#
+# READ-ONLY and on demand: no cadence, nothing scheduled, no fleet-wide cost.
+# Whether this is ever reported on a schedule is the owner's call (AF-173 is
+# needs:you for exactly that), and adding another scheduled emitter to a fleet
+# already spending 72% of its plan on background turns is not a decision an
+# agent should make for them.
+def print_cluster_delta(entries, rev):
+    import subprocess
+    r = subprocess.run(["git", "show", f"{rev}:frustrations.md"],
+                       capture_output=True, text=True)
+    if r.returncode != 0 or not r.stdout.strip():
+        # REFUSE rather than print a delta against nothing. An unreadable rev
+        # silently treated as "no entries" would render every open cluster as
+        # pure growth, which is a confident wrong answer in the alarming
+        # direction.
+        print("  DELTA     cannot read frustrations.md at %r — no delta computed" % rev)
+        return None
+    then = cluster_counts(parse(r.stdout))
+    now = cluster_counts(entries)
+    areas = sorted(set(then) | set(now))
+    rows = []
+    for a in areas:
+        t_open = then.get(a, (0, 0))[1]
+        n_open = now.get(a, (0, 0))[1]
+        if t_open or n_open:
+            rows.append((a, t_open, n_open, n_open - t_open))
+    rows.sort(key=lambda r: (-abs(r[3]), -r[2], r[0]))
+    print("  DELTA vs %s — open entries per AREA (+ is growing, which means"
+          " detection is outpacing repair)" % rev)
+    for a, t, n, d in rows:
+        print("              %-16s %2d -> %2d  %+d" % (a, t, n, d))
+    tot = sum(r[2] for r in rows) - sum(r[1] for r in rows)
+    print("              %-16s %+d overall" % ("", tot))
+    return rows
+
+
 def main():
     quiet = "--quiet" in sys.argv
+    since = None
+    if "--since" in sys.argv:
+        i = sys.argv.index("--since")
+        since = sys.argv[i + 1] if i + 1 < len(sys.argv) else None
     raw = FRUST.read_text()
     entries = parse(raw)
     # Before any per-entry finding: does the file's own shape agree with itself?
@@ -208,6 +268,8 @@ def main():
     # pure text parsing went silent exactly when the server was down — and the
     # test cells caught it, which is the whole reason they exist.
     print_cluster_rank(entries)
+    if since:
+        print_cluster_delta(entries, since)
     problems, advisories = [], []
     # AEAB-19, second instance in this same file. `structure_ok` was assigned here
     # and NEVER READ — the drift check printed its finding and had no effect on the

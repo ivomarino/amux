@@ -172,4 +172,37 @@ check_says  "cl3: and it says so rather than printing nothing" "no AREA has 3 op
 
 [ "$FAIL" -eq 0 ] || exit 1
 
+
+# ── AF-173: the --since delta ───────────────────────────────────────────────
+# The delta needs no scheduler and no new storage because frustrations.md is in
+# git. These cells pin the two properties that make it trustworthy: it reports
+# real growth, and it REFUSES on a rev it cannot read rather than treating an
+# unreadable rev as "no entries" — which would render every open cluster as pure
+# growth, a confident wrong answer in the alarming direction.
+dl="$TMP/delta"; mkdir -p "$dl/scripts"; cp "$AUDIT" "$dl/scripts/frustrations_audit.py"
+( cd "$dl" && git init -q -b main . && git config user.email t@t && git config user.name t \
+  && git config commit.gpgsign false ) >/dev/null 2>&1
+{ echo "# h"; echo; echo "---"; echo; mk_entry widgets open one; } > "$dl/frustrations.md"
+( cd "$dl" && git add -A && git commit -qm base ) >/dev/null 2>&1
+BASE=$( cd "$dl" && git rev-parse HEAD )
+{ echo "# h"; echo; echo "---"; echo; mk_entry widgets open one; mk_entry widgets open two; } > "$dl/frustrations.md"
+
+( cd "$dl" && python3 scripts/frustrations_audit.py --since "$BASE" >out.txt 2>&1 )
+# Matched on CONTENT, not on padding: the first version of this cell counted
+# spaces against a %-16s field, got it one short, and failed on a correct
+# implementation. An assertion coupled to column width breaks on any format tweak.
+if grep -qE "widgets +1 -> +2 +\+1" "$dl/out.txt"; then
+  PASS=$((PASS+1)); echo "  ok   — (dl1) --since reports real growth per AREA"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: (dl1) --since did not report widgets 1 -> 2"; sed 's/^/      /' "$dl/out.txt" | head -8
+fi
+
+# (dl2) THE CONTROL. An unreadable rev must REFUSE, not compute against nothing.
+( cd "$dl" && python3 scripts/frustrations_audit.py --since deadbeefdeadbeef >out2.txt 2>&1 )
+if grep -qF "cannot read frustrations.md" "$dl/out2.txt" && ! grep -qF "0 ->  2" "$dl/out2.txt"; then
+  PASS=$((PASS+1)); echo "  ok   — (dl2) an unreadable rev REFUSES instead of showing all-growth"
+else
+  FAIL=$((FAIL+1)); echo "FAIL: (dl2) unreadable rev did not refuse"; sed 's/^/      /' "$dl/out2.txt" | head -8
+fi
+
 echo "test-frustrations-audit: $PASS passed, $FAIL failed"
