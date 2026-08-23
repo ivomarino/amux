@@ -216,6 +216,75 @@ if [ -n "$live_cli" ] && [ -f "$REPO/amux" ]; then
   fi
 fi
 
+# ── Axis 2b: are the INSTALLED GIT HOOKS the ones in this checkout? ──────────
+#
+# Same failure as the CLI axis directly above, one layer down and with worse
+# consequences, because a hook's staleness is INVISIBLE: a missing verb at least
+# prints help, while a missing guard just... does not guard, and looks exactly
+# like nothing being wrong.
+#
+# Measured 2026-08-23. Every checkout on this machine — ~/amux,
+# ~/Developer/amux and ~/Projects/amux-gtm — had `.git/hooks/pre-commit` dated
+# Aug 5, eighteen days old, while `scripts/git-hooks/` was current. `guard_version`
+# appeared 0 times in the installed hooks and 3 times in the repo's. And
+# `.git/hooks/pre-push` never called `append-only-push-guard` at all, so the
+# guard added to stop a stale republish silently reverting pushed entries in
+# frustrations.md (MG-1483, 10 entry-lines lost) had never run here.
+#
+# NOTHING WAS WATCHING FOR THIS, which is the point of the axis and is worth
+# stating precisely, because I first got it wrong. The server does log
+# "[staged-guard] OUTDATED HOOK: <session> in <repo> sent no guard_version ...
+# Reinstall: scripts/install-hooks.sh" — 128 times over 8 days here — and it
+# reads exactly like a file-staleness detector. It is not one. git_guard.rs sets
+# it from the REQUEST BODY:
+#
+#     let guard_version = obj.get("guard_version").as_i64().unwrap_or(0);
+#     let hook_outdated = guard_version < 2;
+#
+# so any caller that omits the field is "outdated" by construction, and
+# git-shared-guard.py omits it on most of its posts. It discriminates the CALLER,
+# not the file (amux-frustrations, AF-156, who found this and were right). Its
+# remedy is also unwalkable — reinstalling installs the same source that omits
+# the field, so the warning returns immediately, which is AMUX-2140's shape.
+#
+# So a CONTENT diff is not a second spelling of that flag; it is the check that
+# did not exist. Bytes are the only thing that can distinguish "this file is not
+# the one in the checkout" from "this caller did not say who it was", and only
+# the first is what a session needs to know at start. I cited that log line as
+# evidence for file staleness before reading the code that emits it — the
+# staleness was real and independently measured (mtimes, and
+# append-only-push-guard absent entirely), but the flag was never evidence for
+# it. A message that names a plausible cause is not a measurement of it.
+#
+# `git rev-parse --git-path hooks` rather than "$REPO/.git/hooks": in a git
+# WORKTREE `.git` is a file, not a directory, and the naive path does not exist —
+# so a hardcoded one would report nothing in exactly the checkouts AEAB-26 says
+# the guard is already blind in, i.e. it would be silent where it is needed most.
+hooks_dir="$(git -C "$REPO" rev-parse --git-path hooks 2>/dev/null || true)"
+case "$hooks_dir" in /*) : ;; ?*) hooks_dir="$REPO/$hooks_dir" ;; esac
+if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
+  stale_hooks=""
+  for src in "$REPO"/scripts/git-hooks/*; do
+    [ -f "$src" ] || continue
+    name="$(basename "$src")"
+    # post-commit and the shared library are installed under other names or not
+    # at all by install-hooks.sh; only flag what that script actually places, or
+    # this axis nags forever about files it has no remedy for.
+    case "$name" in pre-commit|pre-push|prepare-commit-msg|amux-staged-guard) ;; *) continue ;; esac
+    dst="$hooks_dir/$name"
+    if [ ! -e "$dst" ]; then
+      stale_hooks="${stale_hooks}${stale_hooks:+, }${name} (MISSING)"
+    elif ! diff -q "$src" "$dst" >/dev/null 2>&1; then
+      stale_hooks="${stale_hooks}${stale_hooks:+, }${name}"
+    fi
+  done
+  if [ -n "$stale_hooks" ]; then
+    out+="  - installed git hooks differ from this checkout: ${stale_hooks}"$'\n'
+    out+=$'    a stale guard does not announce itself — it just stops guarding\n'
+    out+="    ./scripts/install-hooks.sh"$'\n'
+  fi
+fi
+
 # The RUNNING server's freshness is the builder's job, not this hook's:
 # com.amux.server-rs-builder rebuilds COMMITTED rust source every 60s and the
 # server self-adopts the new binary. A file diff cannot compare a binary to a

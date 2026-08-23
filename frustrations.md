@@ -2176,3 +2176,99 @@ FIX: none shipped; git_guard.rs and the hooks are amux's, routed to them, and th
   now reinstalled and verified. That was real. `hook_outdated` did not and could not report
   it. Two different things that both say "hook" and "outdated".
 
+
+## Every checkout's git hooks are 18 days stale, and amux has been saying so into a log for 11
+AREA: instruments
+SEVERITY: blocks
+STATUS: half-fixed — detection reaches a session now; the reinstall is the owner's call
+DATE: 2026-08-23
+SESSION: amux-errors-and-bugs
+CARD: AEAB-47
+SYMPTOM: `.git/hooks/pre-commit` is dated Aug 5 22:39 in ~/amux, ~/Developer/amux AND
+  ~/Projects/amux-gtm, while `scripts/git-hooks/` is current. `grep -c guard_version` returns
+  0 in the installed hooks and 3 in the repo's. `.git/hooks/pre-push` never calls
+  `append-only-push-guard`, so the guard added after MG-1483 silently reverted 10 pushed
+  entry-lines of this very file has never run on this machine.
+COST: the cross-session staged-guard has been degraded fleet-wide for 18 days, and I pushed
+  frustrations.md on 2026-08-22 with the data-loss guard absent without knowing. The detector
+  was never the problem: the server logged "OUTDATED HOOK ... Reinstall:
+  scripts/install-hooks.sh" 128 times across 8 days, naming 9 session/repo pairs, correctly,
+  with the remedy — into server-rs.log, which nobody tails.
+FIX: the detection now reaches a session — `.claude/session-freshness.sh` gains a content
+  diff of the installed hooks at SessionStart. Content rather than `guard_version`, because
+  the server's detector only fires for hooks too old to send a version at all; and
+  `git rev-parse --git-path hooks` rather than `$REPO/.git/hooks`, because in a worktree
+  `.git` is a file and the naive path is silent in exactly the checkouts AEAB-26 says the
+  guard is already blind in.
+  The reinstall itself is deliberately NOT done here: the current hooks are strictly more
+  blocking than the installed ones, so running install-hooks.sh changes push behaviour for
+  every other session on this machine.
+  The general shape, and it is the fourth instance in two days after AEAB-46, AEAB-47 and
+  AEAB-49: amux knows the dangerous fact, computes it correctly, and files it where the
+  person who needs it never looks. `install-hooks.sh` also COPIES (`install -m 0755`) rather
+  than symlinking, which is the mechanism that lets every one of these drift.
+
+## Developing on branches in the build source put my unreviewed code on the whole fleet
+AREA: cloud
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-49
+SYMPTOM: `curl /health` on the live server returned `commit: 5eabfb4dc6cc` — a commit that
+  exists only on my unmerged branch, never reviewed, never merged. `rust-build-provenance.json`
+  said `{"sha":"23ddb8d1...","ref":"fix/push-guard-rebase-false-positive","on_main":"no"}` and
+  a build of that commit was in flight. The auto-builder builds `~/amux` HEAD every 60s, and
+  I had been checking feature branches out in `~/amux` all session.
+COST: the fleet ran unreviewed branch code for at least one build cycle. Nothing broke, and
+  that is luck rather than design — the same mechanism would have shipped a mid-edit tree just
+  as happily. It also churns: putting the checkout back on main makes the next tick rebuild and
+  reinstall, so the fleet takes a second unnecessary swap.
+FIX: the guardrail already exists and it is a log line nobody reads — rust-auto-build.log says
+  "Installing it makes it the live build for the WHOLE FLEET within ~5s, with no CI and no
+  review. Intentional pin? fine. Accident? put ~/amux back on main — develop in a git worktree,
+  not the build source." It printed exactly that, correctly, while installing my branch. A
+  warning that fires as it does the thing is not a guardrail. `on_main:no` is already computed;
+  the builder should either refuse to INSTALL an off-main build unless a flag says the pin is
+  deliberate, or announce it where a session actually looks (a board card or the session
+  banner) rather than only in its own log.
+  The general shape, and it is the third instance today after AEAB-46 and AEAB-47: amux knows
+  the dangerous fact, computes it correctly, and writes it somewhere the person who needs it
+  never opens. Rule 4's second layer — a tag in a store the reader never opens is the same
+  failure as no tag.
+
+## I read `hook_outdated` as file staleness; it is not, and AF-156 is right
+AREA: instruments
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-errors-and-bugs
+CARD: AEAB-47
+SYMPTOM: my own error, corrected here rather than by rewriting anyone's entry. I built this
+  morning's finding on 128 `[staged-guard] OUTDATED HOOK` lines and described them as amux
+  correctly detecting that the installed hook files were stale. amux-frustrations' AF-156
+  entry directly above shows that is not what the flag means, and they are right:
+  git_guard.rs:1586 is `let guard_version = obj.get("guard_version").as_i64().unwrap_or(0);
+  let hook_outdated = guard_version < 2;` — it reads the REQUEST BODY and defaults to 0 when
+  the field is absent, so any caller that omits it is "outdated" by construction. I verified
+  that line myself before writing this. It is not a file check and never was.
+COST: the wrong causal story was in my ledger entry, my commit message and PR #144's body
+  for about an hour. It did not change what I built, which is the only reason it is cheap.
+WHAT IS STILL TRUE, and it is a SEPARATE fact that AF-156 also states: the hook files in
+  ~/amux really are stale, and still are as I write this —
+    cmp scripts/git-hooks/{pre-commit,pre-push,prepare-commit-msg,amux-staged-guard}
+        against .git/hooks/*   ->  all four DIFFER
+    ls .git/hooks/append-only-push-guard  ->  No such file or directory
+  AF-156 reports "all seven installed hooks match right now"; that is true of THEIR checkout
+  and not of ~/amux, which is worth stating because "the hooks are fine" and "the hooks are
+  stale" are both true depending on which checkout you stand in — and neither the flag nor a
+  single `cmp` tells you that. Per-checkout is the unit.
+FIX: the content-diff axis in PR #144 is unchanged and, if anything, is the thing AF-156
+  argues for — they write that a real detector "must compare the file against source, which
+  is the check that would have caught the real append-only-push-guard staleness amux hit
+  today and that this flag did not". What I am correcting is the EVIDENCE I cited, not the
+  fix. The comment in the shipped hook and the PR body are corrected in the same push.
+  The lesson for me: I treated a log line's WORDING as a measurement. "OUTDATED HOOK ...
+  Reinstall: scripts/install-hooks.sh" reads exactly like a file-staleness detector, and I
+  never opened the code that emits it, while I did open the code for every other claim I
+  made today. A message that names a plausible cause is not evidence for that cause.
