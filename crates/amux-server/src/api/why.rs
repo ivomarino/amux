@@ -622,12 +622,48 @@ fn collect_interactions(conn: &Connection, w: &mut Why, target: &str) -> rusqlit
         .collect::<rusqlite::Result<_>>()?;
     let n = rows.len();
     w.events.extend(rows);
+    // AMUX-3526 / AF-154: a zero here is a claim about the CHANNEL far more
+    // often than about the entity. Nothing has written kind='board' since
+    // 2026-08-09 (792ce1f, the Python deletion) and 'scope' is the only kind
+    // still produced, so for anything created since, this query returns an
+    // empty set — and "no interaction rows target this entity" states that as
+    // a fact about the entity. That is the wrong subject: an explanation
+    // built from a dead source should say the source is dead, not that
+    // nothing happened. Compounded by the reaper — storage.rs sweeps this
+    // table at 14 days, so the surviving 08-09 rows are expiring now, after
+    // which the table is EMPTY and this note would be wrong about everything.
+    let note = if total > 0 {
+        None
+    } else {
+        let (rows_anywhere, newest_ms): (i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM interaction_log",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap_or((0, 0));
+        if rows_anywhere == 0 {
+            Some(
+                "interaction_log is EMPTY — this is a fact about the SOURCE, not about this \
+                 entity. Nothing has written it since the Python server was deleted \
+                 (2026-08-09) and the storage reaper expires what remained."
+                    .to_string(),
+            )
+        } else {
+            let newest = epoch_to_rfc3339(newest_ms / 1000);
+            Some(format!(
+                "no interaction rows target this entity — but the newest row in the whole \
+                 table is {newest}, so this channel is stale and a zero here is weak \
+                 evidence about the entity (AMUX-3526)."
+            ))
+        }
+    };
     w.probe(
         "interaction_log",
         format!("target='{target}' (ts is MILLISECONDS on this table)"),
         n,
         total,
-        (total == 0).then(|| "no interaction rows target this entity".to_string()),
+        note,
     );
     Ok(())
 }
@@ -1420,6 +1456,62 @@ mod tests {
         let d = changed_fields(&a, &b);
         assert_eq!(d.len(), 1, "{d:?}");
         assert_eq!(d[0].0, "status");
+    }
+
+    /// AMUX-3526. A zero from a DEAD source must not be reported as a fact
+    /// about the entity. interaction_log has had no writer since 2026-08-09,
+    /// so "no interaction rows target this entity" was true of the table and
+    /// false as an explanation — and the storage reaper is expiring what
+    /// remains, after which it would be wrong about everything.
+    #[test]
+    fn an_empty_interaction_log_is_reported_as_a_dead_source_not_a_quiet_entity() {
+        let conn = Connection::open_in_memory().expect("db");
+        conn.execute_batch(
+            "CREATE TABLE interaction_log (id INTEGER PRIMARY KEY, ts INTEGER, kind TEXT, \
+             actor TEXT, target TEXT, action TEXT, detail TEXT, ok INTEGER, result TEXT);",
+        )
+        .expect("schema");
+
+        // (a) TABLE COMPLETELY EMPTY — the post-reaper shape.
+        let mut w = Why::new("task", "AMUX-1");
+        collect_interactions(&conn, &mut w, "AMUX-1").expect("collect");
+        let note = format!("{:?}", w.sources);
+        assert!(note.contains("EMPTY"), "must name the SOURCE as empty: {note}");
+        assert!(
+            !note.contains("no interaction rows target this entity"),
+            "must not state a dead channel as a fact about the entity: {note}"
+        );
+
+        // (b) TABLE HAS ROWS, none for this target — the note must say the
+        // channel is STALE and name the newest row, not imply the entity was
+        // quiet. Without this branch the assertion above passes for a probe
+        // that shouts EMPTY unconditionally.
+        conn.execute(
+            "INSERT INTO interaction_log (ts,kind,actor,target,action,detail,ok,result) \
+             VALUES (?1,'board','someone','OTHER-9','patch','',1,'')",
+            rusqlite::params![1786233600000i64],
+        )
+        .expect("seed");
+        let mut w2 = Why::new("task", "AMUX-1");
+        collect_interactions(&conn, &mut w2, "AMUX-1").expect("collect");
+        let note2 = format!("{:?}", w2.sources);
+        assert!(note2.contains("stale"), "a populated-but-old table must read as stale: {note2}");
+        assert!(note2.contains("2026-08-09"), "the note must name the newest row: {note2}");
+
+        // (c) CONTROL — a row that DOES target the entity produces no note at
+        // all, or every explanation would carry a caveat and the caveat would
+        // stop being read.
+        conn.execute(
+            "INSERT INTO interaction_log (ts,kind,actor,target,action,detail,ok,result) \
+             VALUES (?1,'board','someone','AMUX-1','patch','',1,'')",
+            rusqlite::params![1786233600000i64],
+        )
+        .expect("seed2");
+        let mut w3 = Why::new("task", "AMUX-1");
+        collect_interactions(&conn, &mut w3, "AMUX-1").expect("collect");
+        let note3 = format!("{:?}", w3.sources);
+        assert!(!note3.contains("EMPTY"), "a real hit must not be caveated: {note3}");
+        assert!(!note3.contains("stale"), "a real hit must not be caveated: {note3}");
     }
 
     #[test]
