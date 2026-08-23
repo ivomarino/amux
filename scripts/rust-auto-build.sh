@@ -260,6 +260,52 @@ fi
     install -m 0755 "$HOME/.amux/rust-build-target/release/amux-server" "$INSTALL"
     echo "$head" > "$STAMP"
     echo "== installed; running server will self-adopt within 5s"
+    # STABLE CODE IDENTITY, or say why there is not one (AMUX-3527).
+    #
+    # cargo/rustc emit a LINKER-SIGNED ADHOC binary: `Signature=adhoc`,
+    # `TeamIdentifier=not set`. macOS TCC has no stable identity to key an
+    # approval to for such a binary, so it keys on the cdhash — a content hash
+    # of the executable. This script replaces that executable on every commit
+    # that touches crates/: 743 times between 2026-08-09 and 08-23, ~53 a day.
+    # Each replacement is therefore a program macOS has never seen, and every
+    # approval the human granted the previous one is void.
+    #
+    # What that looks like from outside: the "amux-server-rs would like to
+    # access data from other apps" dialog, forever, several times a day, with
+    # clicking Allow having no lasting effect — because the thing that was
+    # allowed no longer exists. Ethan reported it as getting the prompt "a
+    # billion times" and asked to just allow it; the honest answer is that
+    # allowing CANNOT stick until the identity is stable, which is this block.
+    # (The read that trips it is `~/Library/Application Support/Google/Chrome/
+    # Local State` in integrations/browser.rs — another app's data directory,
+    # which is exactly the service the dialog names.)
+    #
+    # Signing is OPT-IN and silent-by-absence on purpose: this script is the
+    # deploy path for the whole fleet, so the change must be incapable of
+    # stopping an install. Every command below is guarded, it runs AFTER the
+    # stamp is written and the success line is printed, and with no identity
+    # present the behaviour is byte-for-byte what it was — plus one line saying
+    # so, because "adhoc, and that is why the prompt is back" is precisely the
+    # fact that was nowhere in any log while the prompt fired daily for weeks.
+    #
+    # Creating the identity is a KEYCHAIN action and therefore the human's:
+    #   Keychain Access ▸ Certificate Assistant ▸ Create a Certificate…
+    #     name: amux-dev   type: Self Signed Root   Code Signing
+    # then it is picked up here automatically on the next build.
+    if [ "$(uname -s)" = "Darwin" ]; then
+      CS_ID="${AMUX_CODESIGN_IDENTITY:-amux-dev}"
+      if security find-identity -v -p codesigning 2>/dev/null | grep -qF "$CS_ID"; then
+        if codesign --force --sign "$CS_ID" --timestamp=none "$INSTALL" 2>&1; then
+          echo "== signed as '$CS_ID' — TCC approvals survive this rebuild"
+        else
+          echo "== WARN codesign as '$CS_ID' FAILED; binary stays adhoc and macOS will re-prompt"
+        fi
+      else
+        echo "== WARN binary is ADHOC-signed (no '$CS_ID' codesigning identity): macOS treats" \
+             "every rebuild as a new program, so TCC re-prompts and 'Allow' cannot stick." \
+             "Create the identity (see AMUX-3527) or set AMUX_CODESIGN_IDENTITY."
+      fi
+    fi
   else
     echo "== BUILD FAILED for $head — running server keeps the last good build"
     echo "-- diagnostics (every error, with context) ---------------------------"
