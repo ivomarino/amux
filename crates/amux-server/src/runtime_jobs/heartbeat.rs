@@ -226,6 +226,33 @@ fn requests_between(conn: &rusqlite::Connection, from: f64, to: f64) -> Option<i
 
 static BOOT_GAP: OnceLock<Option<Gap>> = OnceLock::new();
 
+/// WALL-CLOCK MOMENT THIS PROCESS STARTED (AF-175).
+///
+/// The latency detector needs it to tell a slow request from one whose CLOCK
+/// SPANNED A RESTART. On 2026-08-23 it filed "11 requests to GET /api/sessions
+/// exceeded 10s, worst 62.0s" for a window in which the server was not running:
+/// the dashboard polled every 5s across a 107-second outage, every connection
+/// completed shortly after the server came back, and each one recorded wall time
+/// since it started. The signature was unmistakable in hindsight — nine requests
+/// completing 5s apart with latencies falling by exactly 5s — and /api/board's
+/// real p50 is 0.3ms.
+///
+/// A OnceLock rather than a parameter threaded through four call sites: this is
+/// a property of the process, not of any caller, and the module that already
+/// owns "when did this server start" is this one.
+static BOOT_AT: OnceLock<f64> = OnceLock::new();
+
+/// When this process started, if it has been recorded yet.
+///
+/// `None` before `record_boot` runs and in any test that never called it —
+/// deliberately distinct from a timestamp, because a consumer must be able to
+/// tell "the server has not said" from "the server started at T". A filter that
+/// treated the absence as 0 would exclude nothing and look identical to one that
+/// worked, which is the failure this whole card is about.
+pub fn boot_at() -> Option<f64> {
+    BOOT_AT.get().copied()
+}
+
 /// The outage that preceded THIS boot, if there was one. `None` also means
 /// "not measured yet" on a process that never called [`record_boot`], which is
 /// why `/health` reports it as an absent field rather than a zero.
@@ -309,6 +336,10 @@ pub fn record_boot(store: &Store, port: u16) -> Option<Gap> {
     // one thing this module exists to make visible. The predicate is BORROWED
     // from the spawn path rather than re-derived here — a view that re-invents
     // the filter of the mechanism it describes is how the two drift.
+    // Stamped BEFORE the isolation early-return: an isolated server must not
+    // write the fleet's heartbeat row, but it is still a process with a start
+    // time, and its own latency detector needs to know it (AF-175).
+    let _ = BOOT_AT.set(crate::runtime_jobs::registry::unix_now());
     if let Some(reason) = crate::runtime_jobs::fleet_isolation_reason(JOB) {
         tracing::info!(
             switch = %reason,

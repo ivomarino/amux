@@ -636,6 +636,29 @@ struct Group {
 /// The percentile is `rl::percentile_sorted` — the same nearest-rank function
 /// `/api/logs/stats` reports, so a card and the endpoint can never quote
 /// different p95s for the same window.
+/// Did this request's clock span the start of this process? (AF-175)
+///
+/// `latency_ms` is wall time from arrival to completion. A request that ARRIVED
+/// before the current process started and completed after it came up measured
+/// the outage, not the endpoint — which is how a 107-second restart was filed
+/// as "11 requests exceeded 10s, worst 62.0s" on 2026-08-23.
+///
+/// A pure function rather than an inline comparison so the decision is testable
+/// without a process-global boot time, and so a control can mutate the LOGIC
+/// (flip the comparison) rather than a string. A string-matching control cannot
+/// tell "the assertion works" from "the assertion is mis-specified and fails on
+/// everything" — amux-frustrations' point, from a cell of theirs whose first
+/// draft failed on a correct implementation.
+///
+/// `boot == None` keeps every row: excluding on an unknown boundary would drop
+/// everything and look identical to a filter that worked.
+fn spans_restart(ts: f64, latency_ms: f64, boot: Option<f64>) -> bool {
+    match boot {
+        Some(b) => ts - latency_ms / 1000.0 < b,
+        None => false,
+    }
+}
+
 pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let w_start = now - window_h() * 3600.0;
     let b_start = now - baseline_h() * 3600.0;
@@ -657,13 +680,48 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
         if let Ok(rows) = stmt.query_map(rusqlite::params![b_start], |r| {
             Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?))
         }) {
+            // A REQUEST WHOSE CLOCK SPANS A RESTART IS NOT A SLOW REQUEST
+            // (AF-175). `latency_ms` is wall time from arrival to completion,
+            // so a request that arrived before this process started and
+            // completed after it came up records the OUTAGE, not the endpoint.
+            //
+            // 2026-08-23 filed "11 requests to GET /api/sessions exceeded 10s,
+            // worst 62.0s" for a window in which the server was not running.
+            // The dashboard polled every 5s across a 107-second outage; nine
+            // requests completed 5s apart with latencies falling by exactly 5s,
+            // which is a queue drain, not eleven independent slow requests.
+            // /api/board's real p50 is 0.3ms.
+            //
+            // Same class as AMUX-3513's `slow_ok` exclusion directly above: the
+            // number is real and it is not measuring the endpoint.
+            //
+            // `None` means the process never recorded a boot — every row is
+            // kept, because excluding on an unknown boundary would silently
+            // drop everything and look exactly like a filter that worked.
+            let boot = crate::runtime_jobs::heartbeat::boot_at();
+            let mut spanned_restart = 0usize;
             for (fam, ms, ts) in rows.flatten() {
+                if spans_restart(ts, ms, boot) {
+                    spanned_restart += 1;
+                    continue;
+                }
                 let e = per_family.entry(fam).or_default();
                 if ts >= w_start {
                     e.0.push(ms);
                 } else {
                     e.1.push(ms);
                 }
+            }
+            if spanned_restart > 0 {
+                // Say it, or the exclusion is indistinguishable from there
+                // being nothing to exclude — and a detector that quietly drops
+                // rows is the one nobody can audit.
+                tracing::info!(
+                    excluded = spanned_restart,
+                    boot_at = boot.unwrap_or(0.0),
+                    "latency: ignored request(s) whose clock spans this process's start — \
+                     wall time across a restart is not service time (AF-175)"
+                );
             }
         }
     }
@@ -4265,6 +4323,48 @@ mod tests {
         assert!(ev.contains_key("routed_methods"), "{ev:?}");
         assert!(ev.contains_key("nearest_routes"), "{ev:?}");
         assert!(ev["called_by"].contains("browser"));
+    }
+
+    /// AF-175, rebuilt from the incident's own numbers. The 2026-08-23 restart
+    /// was at 22:28:05Z and the dashboard had been polling /api/board every 5s
+    /// since 22:26:18; nine requests completed 5s apart with latencies falling
+    /// by exactly 5s. Those are one outage, not nine slow requests.
+    ///
+    /// EVERY ASSERTION HERE IS A LOGIC CASE, not a wording one. A control that
+    /// mutates a string proves only that the assertion READS the output — and
+    /// cannot tell a working assertion from one mis-specified so badly it fails
+    /// on a correct implementation. Flip the comparison in `spans_restart` and
+    /// the first two cells invert; nothing about the phrasing changes.
+    #[test]
+    fn a_request_whose_clock_spans_the_restart_is_not_a_slow_request() {
+        let boot = 1_787_524_085.0; // 22:28:05Z
+
+        // The real specimen: arrived 22:27:21, completed 22:28:19, 58.4s.
+        // Arrival precedes boot, so it measured the outage.
+        assert!(
+            spans_restart(boot + 14.0, 58_400.0, Some(boot)),
+            "a request that arrived before this process started measured the outage"
+        );
+
+        // THE CONTROL THAT MATTERS. A genuinely slow request AFTER the boot must
+        // still count, or the filter is excluding everything and looks identical
+        // to one that works. 58 seconds is not exempt because it is large; it is
+        // exempt only because its clock crossed the boundary.
+        assert!(
+            !spans_restart(boot + 3600.0, 58_400.0, Some(boot)),
+            "a 58s request that STARTED well after boot is a real regression and must file"
+        );
+
+        // The boundary itself, both sides: one millisecond of arrival either way
+        // decides it, and nothing else does.
+        assert!(spans_restart(boot + 10.0, 10_001.0, Some(boot)));
+        assert!(!spans_restart(boot + 10.0, 9_999.0, Some(boot)));
+
+        // Unknown boot keeps EVERY row. Excluding on an unknown boundary would
+        // drop everything and be indistinguishable from a working filter — the
+        // failure this whole card is about, one layer up.
+        assert!(!spans_restart(boot + 14.0, 58_400.0, None));
+        assert!(!spans_restart(0.0, 999_999.0, None));
     }
 
     /// AMUX-3513, rebuilt from the incident's numbers: twelve browser `wait`
