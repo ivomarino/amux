@@ -81,7 +81,22 @@ def rearm_hook_is_live():
 
 
 def open_unowned_reports():
-    rows = api("GET", "/api/board")
+    # ?full=1 is REQUIRED, not decoration (AMUX-3496 regression, found
+    # 2026-08-23): the default board list went slim, so `desc` stopped
+    # shipping — and this function identifies auto-filed cards by a string
+    # INSIDE desc. With .get("desc") returning None for every row, the
+    # filter skipped everything and the sweep reported "0 to do" while 76
+    # unowned reports sat on the board. A no-op that prints success is
+    # worse than a crash.
+    rows = api("GET", "/api/board?full=1")
+    if rows and not any("desc" in r for r in rows):
+        # The instrument, not the board: refuse rather than report a clean
+        # sweep computed from fields that are not there (ethos rule 7).
+        raise SystemExit(
+            "REFUSING: /api/board?full=1 returned rows with no `desc` field — "
+            "this sweep classifies on desc, so a filtered result here would be "
+            "a false all-clear. Check the list payload shape before re-running."
+        )
     out = []
     for r in rows:
         if r.get("session"):
