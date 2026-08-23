@@ -486,10 +486,22 @@ def _skipped_half_note(cmd):
         while words and re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", words[0]):
             words = words[1:]
         return bool(words) and words[0] == "git"
-    others = [seg for seg in segments if not _is_git(seg)]
+    others = [(i, seg) for i, seg in enumerate(segments) if not _is_git(seg)]
     if not others:
         return ""
-    shown = others[0][:80] + ("..." if len(others[0]) > 80 else "")
+    # AF-153: DECIDE on the scrubbed text (that is what stops a heredoc body
+    # manufacturing a phantom half) but DISPLAY the original. Scrubbing blanks
+    # quoted content, so `echo "hello world" > /tmp/m.txt` rendered as
+    # `echo   > /tmp/m.txt` — a command with its content removed, shown at the
+    # exact moment the reader is deciding what to re-run. Split the ORIGINAL
+    # the same way and show the segment at the same index; if the two do not
+    # line up (an unbalanced quote, say), fall back to the scrubbed text rather
+    # than show a mismatched segment, which would be worse than a blanked one.
+    raw_segments = [seg.strip() for seg in _SHELL_JOINERS.split(cmd)]
+    raw_segments = [seg for seg in raw_segments if seg and seg not in delims]
+    idx, scrubbed_seg = others[0]
+    display = raw_segments[idx] if len(raw_segments) == len(segments) else scrubbed_seg
+    shown = display[:80] + ("..." if len(display) > 80 else "")
     return (
         "NOTE: the rest of this command did not run either — the block stops the whole "
         f"Bash call, not just the git verb. Skipped {len(others)} non-git segment(s), "
