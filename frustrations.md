@@ -2654,3 +2654,32 @@ NOTE: third instance of one shape in about an hour, with AF-179 (a peer's Bash w
   my ongoing authorship, reported as "you edited this") and the transient unbuildable window
   amux is filing separately. All three are a true statement about the shared checkout delivered
   in the second person.
+
+## A multi-file change is transiently unbuildable for every OTHER session, not just its author
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux
+CARD: AF-181
+SYMPTOM: Adding a field to `QueuedItem` in checks.rs and populating it in monitor.rs is one
+  logical change across two files. Between my two writes the shared checkout did not compile,
+  and a peer hit `missing field idle_since in initializer of QueuedItem` at monitor.rs:832 —
+  a file and a struct they had never touched. Twice in one hour, in the other direction too:
+  my in-flight clippy error in board_drive.rs:3620 refused THEIR commit, because the
+  pre-commit gate lints the whole workspace while the commit itself is a pathspec.
+COST: Two round trips between sessions, each opening with a version of "is this mine?". Both
+  of us guessed right, and both had to ask. The expensive direction is the inverse and has not
+  happened yet: a session that has learned this shape recognising a REAL breakage of its own as
+  somebody else's dirt and pushing through it.
+FIX: AF-181's proposal is the right one and amux-frustrations owns it — the gate already knows
+  both the staged pathspec and the file each diagnostic names, so telling them apart is a set
+  membership test, not new machinery. Beyond the wording, carry the COUNT: "1 of 1 offending
+  files is not yours" and "3 of 4 are yours" are different situations and the second must not
+  read as exonerating. My half of the remedy needs no code: keep a multi-file struct change
+  inside a single write window so the unbuildable interval never spans a peer's build.
+NOTE: The root is shared by AF-179 and this entry, which is why it is filed under the same AREA
+  rather than as `gates`. In all three cases amux stated something TRUE ABOUT THE SHARED
+  CHECKOUT in a sentence scoped to the reader — "was also edited by you", "your commit is
+  refused" — and the reader has no way to recover which was meant. The lint scope and the mtime
+  window are two instruments making the same category error.
