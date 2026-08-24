@@ -3202,6 +3202,30 @@ if not delivered:
     fb = d.get('fallback') or 'no channel delivered — post to the board and say so in your turn output'
     sys.stderr.write(fb + '\n')
     sys.exit(3)
+# PARTIAL IS NOT DELIVERED (AMUX-3619). The zero-channel case above has been
+# handled since AMUX-3151; the case that was not is SOME channels failing, which
+# printed a bare 'alert delivered' while push and SMS were both dead. Measured
+# 2026-08-24 on a real disk escalation: 1 of 3 channels reached anything, and the
+# line led with the word 'delivered'. The per-channel detail was always in the
+# string; what was wrong is that the SUMMARY reported the best outcome instead of
+# the worst, which is the one-output-two-states shape on the fire alarm itself.
+failed = [k for k, v in ch.items() if str(v).lower().startswith(('error', 'failed', 'not '))]
+# An UNPINNED destination is a delivery that may not have reached the OWNER: the
+# server falls back to the freshest connected account, which can change without
+# anyone touching alert config. Not a failure, and not a clean success either.
+unpinned = [k for k, v in ch.items() if 'UNPINNED' in str(v)]
+if failed:
+    sys.stderr.write('ALERT ONLY PARTLY DELIVERED — %d of %d channel(s) FAILED (%s): %s\n'
+                     % (len(failed), len(ch), ', '.join(failed), detail))
+    if unpinned:
+        sys.stderr.write('and %s has no pinned destination (set AMUX_OWNER_EMAIL) — it went to '
+                         'whichever account connected most recently\n' % ', '.join(unpinned))
+    sys.stderr.write('The owner may not have been reached. Say so in your turn output rather '
+                     'than treating this as paged.\n')
+    sys.exit(0)
+if unpinned:
+    sys.stderr.write('alert delivered, but %s has no pinned destination (set AMUX_OWNER_EMAIL)\n'
+                     % ', '.join(unpinned))
 print('alert delivered →', detail)
 "
 }
