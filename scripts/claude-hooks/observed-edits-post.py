@@ -16,11 +16,29 @@
 import json
 import os
 import ssl
+import subprocess
 import sys
 import time
 import urllib.request
 
 PRUNE = {".git", "node_modules", "target", ".venv", "__pycache__", ".next", "dist"}
+
+
+def _derive_session_from_tmux():
+    """Fallback identity for MR-43: $AMUX_SESSION can be empty inside a lane
+    that IS running in its amux-launched pane (spawn always injects it —
+    session_verbs.rs — so this is loss in-process, not absence at launch).
+    Scoped to amux- prefixed panes, so a human's own tmux session (or no tmux
+    at all) still resolves to "" and takes the existing no-op path. Mirrors
+    the PRE half's helper of the same name — kept duplicated rather than
+    imported since every hook here is a standalone TRACKED SOURCE file.
+    """
+    try:
+        name = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+    return name[len("amux-"):] if name.startswith("amux-") else ""
 MAX_PATHS = 80
 FIND_BUDGET_S = 1.5
 
@@ -110,6 +128,8 @@ def log_line(home, session, text):
 
 def main():
     session = (os.environ.get("AMUX_SESSION") or "").strip()
+    if not session:
+        session = _derive_session_from_tmux()
     if not session:
         return
     home = os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux")

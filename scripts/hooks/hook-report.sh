@@ -11,6 +11,19 @@
 # the state anyway with tokens omitted. A liveness report is worth more than a
 # token count, and this must never be the reason a hook fails.
 STATE="${1:-idle}"; SRC="${2:-stop-hook}"
+DERIVED=0
+if [ -z "$AMUX_SESSION" ]; then
+  # MR-43: the var can go missing INSIDE a lane that IS running in its
+  # amux-launched pane (spawn always injects it — session_verbs.rs — so this
+  # is loss in-process, not absence at launch). Recover it from tmux so the
+  # lane is not invisible to its own liveness report, and flag the recovery
+  # in the body so /api/logs/analyze can count how often this happens instead
+  # of a human noticing a lane that silently never reported.
+  TNAME=$(tmux display-message -p '#S' 2>/dev/null)
+  case "$TNAME" in
+    amux-*) export AMUX_SESSION="${TNAME#amux-}"; DERIVED=1 ;;
+  esac
+fi
 [ -n "$AMUX_SESSION" ] || exit 0
 IN=$(cat 2>/dev/null)
 E="$HOME/.amux/endpoint.json"
@@ -104,6 +117,11 @@ if not out.get("model") or not out.get("tokens"):
 print(json.dumps(out))
 ' "$STATE" "$SRC" 2>/dev/null)
 [ -n "$BODY" ] || BODY="{\"state\":\"$STATE\",\"source\":\"$SRC\"}"
+# Surgery, not a third JSON encoder: BODY is always a flat object ending in
+# "}" (python's json.dumps above, or the fallback literal on this same line),
+# so appending before the final brace is safe and avoids a second place this
+# script can break on stdin shape (MR-43).
+[ "$DERIVED" = "1" ] && BODY="${BODY%\}}, \"amux_session_derived\": true}"
 # X-Amux-Session stamps the write server-side (AMUX-1768). report_post's own
 # comment names its absence as the standing residual: "the shipped hooks send no
 # header, so an UNSTAMPED write is still accepted". This IS the shipped hook.

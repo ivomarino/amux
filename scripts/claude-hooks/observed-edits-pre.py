@@ -11,10 +11,29 @@
 # "Bash"). Fail-open always: a hook that can block Bash fleet-wide must never
 # have a failure mode of its own.
 import os
+import subprocess
 import sys
+
+
+def _derive_session_from_tmux():
+    """Fallback identity for MR-43: $AMUX_SESSION can be empty inside a lane
+    that IS running in its amux-launched pane (spawn always injects it —
+    session_verbs.rs — so this is loss in-process, not absence at launch).
+    Scoped to amux- prefixed panes, so a human's own tmux session (or no tmux
+    at all) still resolves to "" and takes the existing no-op path.
+    """
+    try:
+        name = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+    return name[len("amux-"):] if name.startswith("amux-") else ""
+
 
 try:
     session = (os.environ.get("AMUX_SESSION") or "").strip()
+    if not session:
+        session = _derive_session_from_tmux()
     if session:
         state = os.path.join(
             os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),

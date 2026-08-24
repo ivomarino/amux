@@ -42,7 +42,23 @@ msg_file="$1"
 # amux session names are [a-z0-9-] (see sanitize_session_name), so no lane can
 # ever be called "(human)" and a reader needs no lookup table to tell them
 # apart.
-stamp="${AMUX_SESSION:-(human)}"
+#
+# MR-43: before falling all the way to "(human)", try recovering a lane's own
+# identity from the tmux pane it is actually running in — $AMUX_SESSION can go
+# missing IN-PROCESS (spawn always injects it, session_verbs.rs) without the
+# lane having stopped being a lane. Scoped to amux- prefixed panes ONLY, so
+# this cannot touch the human case above: a human's own shell is never in one,
+# so it still falls through to "(human)" exactly as before. Not weakening the
+# exemption, only correcting which of the three causes (paragraph above) this
+# commit actually was.
+stamp="$AMUX_SESSION"
+if [ -z "$stamp" ]; then
+  _mr43_tname="$(tmux display-message -p '#S' 2>/dev/null)"
+  case "$_mr43_tname" in
+    amux-*) stamp="${_mr43_tname#amux-}" ;;
+  esac
+fi
+stamp="${stamp:-(human)}"
 
 # Guarantee the final newline BEFORE handing the file to interpret-trailers.
 # On a message file whose last line lacks its terminator, git (measured on

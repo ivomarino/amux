@@ -36,6 +36,22 @@ CC_HOME="${CC_HOME:-$HOME/.amux}"
 CC_SESSIONS="$CC_HOME/sessions"
 CC_DEFAULTS="$CC_HOME/defaults.env"
 
+# MR-43: recover AMUX_SESSION from the tmux pane name when it is empty inside
+# a lane that IS running in its amux-launched pane (spawn always injects it —
+# session_verbs.rs — so this is loss in-process, not absence at launch).
+# Fixed ONCE here rather than at each of this script's 30+ AMUX_SESSION call
+# sites, so every X-Amux-Session/X-Amux-Worker header downstream benefits
+# without a separate edit per site. Scoped to amux- prefixed panes: a human's
+# own tmux session (or no tmux at all) leaves AMUX_SESSION exactly as unset as
+# before this.
+if [[ -z "${AMUX_SESSION:-}" ]]; then
+  _mr43_tname="$(tmux display-message -p '#S' 2>/dev/null || true)"
+  if [[ "$_mr43_tname" == amux-* ]]; then
+    export AMUX_SESSION="${_mr43_tname#amux-}"
+  fi
+  unset _mr43_tname
+fi
+
 # ── Colors (disabled when not a tty or TERM is dumb) ────────────────────────
 if [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
   BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
