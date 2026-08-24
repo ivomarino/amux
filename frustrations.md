@@ -2923,6 +2923,9 @@ COST: 186 seconds of fleet-wide downtime, self-inflicted, on a shared server ~50
   already recorded as applied and an applied migration never runs again. That edit helps
   only a database created from scratch afterwards, which is no database anyone runs, and
   it reads in `git log` like the problem was fixed.
+  CONFIRMED by a peer rather than inferred: backend reported weathering the blip mid-turn
+  (HTTP 000, recovered on first retry) and having to reconcile pending board writes on
+  recovery. No data lost, but a peer paid for it and had no way to know why.
 FIX: 66d34250. Two halves. (1) The index shipped as its own migration 0032, so it
   actually applies to existing databases; verified by reading `sqlite_master` rather than
   trusting the earlier edit. (2) The instrument that was missing: `apply_all` logged
