@@ -2774,3 +2774,34 @@ FIX: 67474428 — the suite sets AMUX_NO_SELF_ADOPT=1. The capability already ex
   in CI: the prediction is zero `binary changed on disk` lines in the next e2e job and no
   ERR_CONNECTION_REFUSED failures, and if they persist the env is not reaching the server through
   serve-head.sh.
+
+## A peer's mid-edit fails MY test run, and a rerun is the only way to tell
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-24
+SESSION: amux
+CARD: AF-182
+SYMPTOM: `cargo test -p amux-server --lib` returned "1284 passed; 1 failed" twice tonight,
+  hours apart, and BOTH times the failure vanished on an immediate rerun with no change to my
+  tree (1282/0, then 1285/0). The suite prints the count in the tail but the failing test name
+  scrolls past in ~1290 lines, so the first thing you see is a number, not a name. On the
+  second occurrence I read the tail, saw the count, and committed and pushed before registering
+  the `1 failed` beside it.
+COST: A commit message (d237f886) that states "1284 lib tests" for a run that was not clean.
+  Caught and corrected on the card within minutes, but the message is pushed and wrong, and the
+  correction lives somewhere the next reader of that commit will not look. The expensive
+  direction has not happened yet: a session learning this shape and re-running past a REAL
+  failure because "it is probably a peer".
+FIX: The shipped half of AF-182 — lint-blame partitioning offenders into yours / a peer's
+  in-flight work / already-broken-on-HEAD — is exactly the discriminator this needs, and it
+  currently runs only in the pre-commit hook. A `scripts/cargo-blame.sh test` wrapper that pipes
+  a failing run through the same analysis with STAGED empty would answer "is this mine" in one
+  line instead of a rerun. amux-frustrations proposed that wrapper for `check`/`clippy`; this is
+  the same gap for `test`, and the test case is worse because the signal is a count rather than
+  a compiler error naming a file.
+NOTE: This is the transient-unbuildable half of AF-182 that I own, showing up in a form I had
+  not predicted. My entry there described the window as breaking a peer's BUILD. It also breaks
+  a peer's TEST RUN, where there is no filename in the output to attribute — you get an
+  arithmetic difference between two numbers and no clue whose edit caused it. e6077bcb fixed the
+  commit path; neither of us has fixed the ad-hoc path, and this is the second cost from it.
