@@ -1,5 +1,32 @@
 [
   {
+    "hash": "1ad1e7744d9bebaefd6dd0e568bea886cfb8081b",
+    "short": "1ad1e77",
+    "title": "Board tasks now record when they closed",
+    "date": "2026-08-24",
+    "type": "feat",
+    "tags": ["board", "analytics"],
+    "description": "Every board card now stores a closed_at timestamp the moment its status moves to done or verified. This makes sprint analytics queryable without exporting: you can ask 'what did each agent close this week?' and get a precise answer rather than inferring closure from activity logs."
+  },
+  {
+    "hash": "f5c6af7632190b4a7cb8d30d3783c24346e8145f",
+    "short": "f5c6af7",
+    "title": "Board audit trail: which permission layer allowed each transition",
+    "date": "2026-08-24",
+    "type": "feat",
+    "tags": ["board", "governance"],
+    "description": "Board status transitions now record which permission layer approved the move — agent-auto, human-review, or force-override — alongside the actor and timestamp. Engineering managers and team leads can audit the board history and know not just what changed but under which authorization. No additional configuration required."
+  },
+  {
+    "hash": "978645c01affccddd99b667479c09b09cdf248a0",
+    "short": "978645c",
+    "title": "CLI no longer hangs when the server is unreachable",
+    "date": "2026-08-24",
+    "type": "fix",
+    "tags": ["cli", "reliability"],
+    "description": "Previously, running an amux CLI command against a server that was down or unreachable would hang indefinitely — the shell prompt never returned until you killed the process. The CLI now detects a failed connection immediately, prints a clear error with the server address and how to restart it, and exits with a non-zero status. Scripts and CI jobs that call amux commands will no longer stall silently on a down server."
+  },
+  {
     "hash": "4049e8798d1e5604d87383679b6141a545c72f03",
     "short": "4049e87",
     "title": "Inbox loads 4x faster with Gmail batch API",
