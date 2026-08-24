@@ -448,6 +448,9 @@ pub struct AutofixReport {
     pub already_filed: Vec<String>,
     pub suppressed: Vec<(String, String, String)>,
     pub quiet_noted: Vec<(String, String)>,
+    /// (card, "resolved"|"stopped being checkable") — cards told that the
+    /// incident behind them is gone (AMUX-3574).
+    pub resolved_noted: Vec<(String, String)>,
     pub errors: Vec<String>,
     pub took_ms: f64,
 }
@@ -3323,7 +3326,43 @@ pub async fn autofix_tick_with_ci(
 
     for f in to_file {
         match file_finding(state, &f).await {
-            Ok(Some(card)) => rep.filed.push((card, f.signature.clone())),
+            Ok(Some(card)) => {
+                // LINK THE INCIDENT TO THE CARD IT MINTED (AMUX-3574).
+                //
+                // `_amux_invariant_incident.board_issue` has existed all along,
+                // is SELECTed by `live_incidents`, and is rendered on
+                // /api/debug/invariants — and nothing ever wrote it. Measured:
+                // 0 of 224 incidents carry a link. A column the schema
+                // promises, the debug surface displays, and no code populates
+                // is ethos rule 6: grep for what the docstring promises.
+                //
+                // The cost is concrete and repeated. Three cards were
+                // auto-filed to this lane in one evening (AMUX-3572, 3574,
+                // 3575) describing conditions that had ALREADY self-healed,
+                // each costing an investigation to establish that nothing was
+                // wrong. The incident knew it had resolved; it just had no way
+                // to say which card to tell.
+                //
+                // Written here rather than inside file_finding because this is
+                // where the card id and the signature are both in hand, and
+                // the signature is the only thing that maps back to
+                // (invariant_id, entity_key).
+                if let Some((inv, entity)) = invariant_signature_parts(&f.signature) {
+                    let (c, i, e) = (card.clone(), inv, entity);
+                    let _ = state
+                        .store
+                        .write_async(move |conn| {
+                            conn.execute(
+                                "UPDATE _amux_invariant_incident SET board_issue=?1 \
+                                 WHERE invariant_id=?2 AND entity_key=?3",
+                                rusqlite::params![c, i, e],
+                            )?;
+                            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                        })
+                        .await;
+                }
+                rep.filed.push((card, f.signature.clone()));
+            }
             Ok(None) => rep.already_filed.push(f.signature.clone()),
             Err(e) => rep.errors.push(format!("{}: {e}", f.signature)),
         }
@@ -3392,6 +3431,10 @@ pub async fn autofix_tick_with_ci(
         break; // ONE per tick. See the cap note above.
     }
 
+    match note_resolved_incidents(state).await {
+        Ok(v) => rep.resolved_noted = v,
+        Err(e) => rep.errors.push(format!("note_resolved_incidents: {e}")),
+    }
     match note_quiet_signatures(state, now, ci_runs).await {
         Ok(v) => rep.quiet_noted = v,
         Err(e) => rep.errors.push(format!("quiet sweep: {e}")),
@@ -3410,6 +3453,26 @@ pub async fn autofix_tick_with_ci(
 /// The dedupe row and the card are written in the SAME transaction as the
 /// card: if the insert fails, no idem row is left claiming a card that does
 /// not exist, and if the idem row exists the card does too.
+/// Split an invariant finding's signature into `(invariant_id, entity_key)`.
+///
+/// The shape is `invariant|<invariant_id>|<entity_key>`, and the entity may
+/// itself contain `|`, so the split is bounded to 3 parts rather than greedy.
+/// Returns None for every other detector's signature, which is what keeps the
+/// incident link scoped to findings that actually have an incident.
+///
+/// A rollup finding names several entities and its signature is not this shape,
+/// so it links nothing — correctly: there is no single incident to point at,
+/// and guessing one would attach the card to an arbitrary member.
+fn invariant_signature_parts(sig: &str) -> Option<(String, String)> {
+    let mut it = sig.splitn(3, '|');
+    match (it.next(), it.next(), it.next()) {
+        (Some("invariant"), Some(inv), Some(ent)) if !inv.is_empty() && !ent.is_empty() => {
+            Some((inv.to_string(), ent.to_string()))
+        }
+        _ => None,
+    }
+}
+
 async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<String>> {
     // PER-TENANT CLOUD: do not drop the server's own health/ops findings onto a
     // customer's board (AMUX-3014). Off by env in the cloud image; on locally
@@ -3502,6 +3565,132 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
     let created = created_id.lock().ok().and_then(|g| g.clone());
     Ok(created)
 }
+
+///
+/// Noted, never acted on — same rule as `note_quiet_signatures` above, and for
+/// the same reason: the card belongs to whoever holds it, and closing it is
+/// their judgment (ethos rule 8). A resolved incident is much stronger evidence
+/// than silence, but "the condition is gone" and "the work on this card is
+/// done" are different claims, and only the holder can make the second.
+///
+/// The cost this pays for is measured. Three cards were auto-filed to one lane
+/// in a single evening (AMUX-3572, AMUX-3574, AMUX-3575) describing conditions
+/// that had already healed, and each cost a full investigation to establish
+/// that nothing was wrong. In every case the incident row KNEW — `resolved_at`
+/// was set, sometimes a minute before the pickup notice went out — and had no
+/// way to say which card to tell, because `board_issue` was never written.
+///
+/// Exactly-once via the same `session_events.idem` mechanism, so a resolved
+/// incident cannot re-nag on every tick.
+async fn note_resolved_incidents(state: &AppState) -> anyhow::Result<Vec<(String, String)>> {
+    struct Note {
+        card: String,
+        what: String,
+        line: String,
+        idem: String,
+    }
+    let candidates: Vec<Note> = {
+        let conn = state.store.read()?;
+        let mut stmt = conn.prepare(
+            "SELECT i.board_issue, i.invariant_id, i.entity_key, i.status, i.resolved_at \
+               FROM _amux_invariant_incident i \
+               JOIN issues c ON c.id = i.board_issue \
+              WHERE i.resolved_at IS NOT NULL \
+                AND i.board_issue != '' \
+                AND c.status NOT IN ('done','verified','discarded') \
+                AND c.archived = 0 \
+              LIMIT 50",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, f64>(4)?,
+                ))
+            })?
+            .flatten()
+            .collect::<Vec<_>>();
+        rows.into_iter()
+            .map(|(card, inv, entity, status, at)| {
+                // The terminal status matters and is carried verbatim. `pass`
+                // means it healed; `unknown` means the check STOPPED BEING ABLE
+                // TO RUN, which is not the same claim and must not read as one
+                // (AMUX-3575).
+                let what = if status == "unknown" {
+                    "stopped being checkable"
+                } else {
+                    "resolved"
+                };
+                let line = format!(
+                    "[amux autofix] the incident behind this card has {what}: `{inv}` on \
+                     `{entity}` last evaluated {status} at {}. This card was filed \
+                     automatically from that incident and nothing has re-checked whether the \
+                     WORK here is still needed — that call is yours, not mine. Re-check with \
+                     GET /api/debug/invariants (latest_per_invariant), where a PASS is visible; \
+                     /api/health/invariants reports failures only, so it cannot tell a healed \
+                     check from one that never ran.",
+                    chrono::DateTime::from_timestamp(at as i64, 0)
+                        .map(|t| {
+                            t.with_timezone(&chrono::Local)
+                                .format("%Y-%m-%d %H:%M")
+                                .to_string()
+                        })
+                        .unwrap_or_else(|| "an unknown time".into()),
+                );
+                let idem = format!("autofix-inv-resolved:{card}:{inv}:{entity}");
+                Note { card, what: what.to_string(), line, idem }
+            })
+            .collect()
+    };
+
+    let mut noted: Vec<(String, String)> = Vec::new();
+    for Note { card, what, line, idem } in candidates {
+        let already = {
+            let conn = state.store.read()?;
+            conn.query_row(
+                "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
+                rusqlite::params![idem],
+                |_| Ok(()),
+            )
+            .is_ok()
+        };
+        if already {
+            continue;
+        }
+        let c2 = card.clone();
+        let i2 = idem.clone();
+        state
+            .store
+            .write_async(move |conn| {
+                use rusqlite::OptionalExtension;
+                let existing: Option<String> = conn
+                    .query_row("SELECT log FROM issues WHERE id=?1", rusqlite::params![c2], |r| {
+                        r.get(0)
+                    })
+                    .optional()?
+                    .flatten();
+                let hhmm = chrono::Local::now().format("%H:%M").to_string();
+                let log = bs::append_log(existing.as_deref(), &hhmm, &line);
+                conn.execute(
+                    "UPDATE issues SET log=?1 WHERE id=?2",
+                    rusqlite::params![log, c2],
+                )?;
+                conn.execute(
+                    "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
+                     VALUES (?1, '', 'autofix.inv_resolved', ?2, ?3, 'autofix')",
+                    rusqlite::params![unix_now(), json!({"card": c2}).to_string(), i2],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await?;
+        noted.push((card, what));
+    }
+    Ok(noted)
+}
+
 
 /// "Stopped happening" is NOTED, never acted on.
 ///
@@ -3713,6 +3902,12 @@ async fn debug_autofix(axum::extract::State(state): axum::extract::State<AppStat
             "already_filed": r.already_filed,
             "suppressed": r.suppressed.iter()
                 .map(|(k, s, why)| json!({"detector": k, "signature": s, "reason": why}))
+                .collect::<Vec<_>>(),
+            // Visible on /api/debug/autofix, or the notes go out and nothing
+            // records that they did — the exact shape AF-180 closed one
+            // detector over (ethos rule 4: will they see it where they look).
+            "resolved_noted": r.resolved_noted.iter()
+                .map(|(c, w)| json!({"card": c, "what": w}))
                 .collect::<Vec<_>>(),
             "quiet_noted": r.quiet_noted.iter()
                 .map(|(c, w)| json!({"card": c, "what": w})).collect::<Vec<_>>(),
@@ -4996,6 +5191,113 @@ mod tests {
         assert!(hit.title.contains("27.0s"), "the number belongs in the title: {}", hit.title);
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         assert!(ev["verdict"].contains("not a percentile shift"));
+    }
+
+    /// AMUX-3574 end to end: a card whose incident has resolved gets TOLD, and
+    /// is left exactly where it was.
+    ///
+    /// Three cards were auto-filed to one lane in a single evening describing
+    /// conditions that had already healed, each costing a full investigation to
+    /// establish nothing was wrong. The incident row knew — `resolved_at` was
+    /// set, once a minute before the pickup notice went out — and had no way to
+    /// say which card to tell, because `board_issue` was never written by
+    /// anything. 0 of 224 incidents carried a link.
+    ///
+    /// The `unknown` control is load-bearing. A check that STOPPED BEING ABLE
+    /// TO RUN is not a check that passed, and a note claiming the condition
+    /// "resolved" when it merely became unmeasurable would be the same false
+    /// reassurance one layer up (AMUX-3575).
+    #[tokio::test]
+    async fn a_resolved_incident_tells_its_card_and_never_closes_it() {
+        for (status, expect_word) in [("pass", "resolved"), ("unknown", "stopped being checkable")]
+        {
+            let (st, _d) = state();
+            let card = "AF-9001";
+            let (s2, c2) = (status.to_string(), card.to_string());
+            st.store
+                .write_async(move |conn| {
+                    conn.execute(
+                        "INSERT INTO issues (id,title,status,session,created,updated,archived) \
+                         VALUES (?1,'filed by autofix','todo','amux',0,0,0)",
+                        rusqlite::params![c2],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO _amux_invariant_incident \
+                           (invariant_id, entity_key, status, first_seen, last_seen, occurrences, \
+                            expected, observed, evidence, resolved_at, board_issue) \
+                         VALUES ('schema.timestamp_units_declared','waitlist.ts',?1,1.0,2.0,19, \
+                                 '','','{}',3.0,?2)",
+                        rusqlite::params![s2, c2],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .await
+                .unwrap();
+
+            let noted = note_resolved_incidents(&st).await.unwrap();
+            assert_eq!(noted.len(), 1, "the card must be told ({status})");
+            assert_eq!(noted[0].0, card);
+            assert_eq!(noted[0].1, expect_word, "the terminal status must not be paraphrased");
+
+            let (log, st_after): (Option<String>, String) = {
+                let conn = st.store.read().unwrap();
+                conn.query_row(
+                    "SELECT log, status FROM issues WHERE id=?1",
+                    rusqlite::params![card],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap()
+            };
+            let log = log.unwrap_or_default();
+            assert!(log.contains(expect_word), "the log line must say WHICH terminal state: {log}");
+            assert_eq!(
+                st_after, "todo",
+                "NOTED, never acted on — closing someone's card because the condition healed is \
+                 an agent deciding their work is done (ethos rule 8)"
+            );
+
+            // Exactly-once: a second tick must not re-nag.
+            let again = note_resolved_incidents(&st).await.unwrap();
+            assert!(again.is_empty(), "a resolved incident must not re-nag every tick");
+        }
+    }
+
+    /// AMUX-3574: the signature parser, which is what maps a filed card back
+    /// onto the incident that produced it.
+    ///
+    /// The negative cases are the point. Every other detector's signature also
+    /// contains `|`, so a lax parser would link non-invariant findings to
+    /// incidents that do not exist and write `board_issue` onto nothing (or
+    /// worse, onto the wrong row).
+    #[test]
+    fn only_an_invariant_signature_maps_to_an_incident() {
+        assert_eq!(
+            invariant_signature_parts("invariant|queue.has_live_consumer|amux"),
+            Some(("queue.has_live_consumer".into(), "amux".into()))
+        );
+        // An entity may itself contain `|` — the split is bounded at 3, so the
+        // whole remainder is the entity rather than being truncated.
+        assert_eq!(
+            invariant_signature_parts("invariant|route.callers_have_routes|GET /api/x|y"),
+            Some(("route.callers_have_routes".into(), "GET /api/x|y".into()))
+        );
+
+        // CONTROLS: other detectors' signatures must not match.
+        for sig in [
+            "5xx|500|POST|/api/quiet|/api/quiet",
+            "latency|p95|/api/board",
+            "dead-route|404|GET|/api/auth",
+            "invariant|only-two-parts",
+            "invariant||amux",
+            "invariant|id|",
+            "",
+        ] {
+            assert_eq!(
+                invariant_signature_parts(sig),
+                None,
+                "non-invariant or malformed signature must not map to an incident: {sig:?}"
+            );
+        }
     }
 
     /// Silence is evidence, not a verdict. The card must be ANNOTATED and left
