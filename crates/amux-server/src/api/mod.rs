@@ -419,6 +419,26 @@ pub fn router(state: AppState) -> Router {
     // protected as canonical ones.
     let app = aliases::alias_layer(app);
 
+    // A 405 MUST SAY SO IN ITS BODY (AF-211).
+    //
+    // axum's method-not-allowed is `405` + `allow:` + a ZERO-LENGTH body, which
+    // is correct HTTP and invisible to every recipe in this repo: CLAUDE.md's
+    // documented idiom is `curl -sk <url>`, with no `-i`, so a wrong method
+    // prints nothing at all. Measured 2026-08-24 on `GET /api/git/staged-guard`
+    // (POST-only): zero bytes out, and the natural reading of silence is "no
+    // such endpoint" rather than "wrong verb". That is the empty-grep shape in
+    // ethos rule 7, produced by the server instead of by the prober — and the
+    // answer was sitting in a header the idiom never shows.
+    //
+    // Wrapped rather than added per-route so it covers routes nobody has
+    // written yet; a `method_not_allowed_fallback` on the builder would apply
+    // only to what was registered before the call, which is the same
+    // exemption-list trap as ethos rule 1.
+    //
+    // Synthesizes ONLY into an empty body: a handler that returned its own 405
+    // with prose knows more than this layer does and must not be overwritten.
+    let app = app.layer(axum::middleware::from_fn(explain_method_not_allowed));
+
     // Transparent gzip compression for every response whose client sends
     // Accept-Encoding: gzip. Board slim drops from 690KB to 162KB,
     // sessions from 149KB to 21KB, and the SPA shell from 215KB to 46KB.
@@ -429,6 +449,65 @@ pub fn router(state: AppState) -> Router {
     // with the RAW path the client sent. Never blocks or fails a request
     // (rows ride a bounded channel to the single-writer store).
     request_log::layer(app, store_for_reqlog)
+}
+
+/// Give an empty 405 a body that names the verb it wanted (AF-211).
+///
+/// The `allow` header is already correct — this renders it where `curl -sk`
+/// will actually show it, so "wrong method" stops being indistinguishable from
+/// "no such route". Same reason `/api/logs/analyze` annotates 405s with
+/// `routed_methods`: that endpoint had to exist because the response itself
+/// could not say it.
+async fn explain_method_not_allowed(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, StatusCode};
+    use axum::response::IntoResponse;
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    let res = next.run(req).await;
+    if res.status() != StatusCode::METHOD_NOT_ALLOWED {
+        return res;
+    }
+    // Content-Length 0 is what axum's own method fallback emits. Anything else
+    // is a handler's deliberate body and is left alone.
+    let empty = res
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false);
+    if !empty {
+        return res;
+    }
+    let allow = res
+        .headers()
+        .get(header::ALLOW)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let (parts, _) = res.into_parts();
+    let body = serde_json::json!({
+        "ok": false,
+        "error": format!(
+            "{method} is not allowed on {path} — this route accepts {}",
+            if allow.is_empty() { "a different method".into() } else { allow.clone() }
+        ),
+        "allow": allow,
+        "method": method.as_str(),
+        "path": path,
+        "hint": "GET /api/debug/routes lists every path with the methods it accepts",
+    });
+    let mut res = (parts.status, axum::Json(body)).into_response();
+    // Preserve `allow`, which the reconstruction above drops and which is the
+    // half a correct HTTP client reads.
+    if let Ok(v) = axum::http::HeaderValue::from_str(&allow) {
+        if !allow.is_empty() {
+            res.headers_mut().insert(header::ALLOW, v);
+        }
+    }
+    res
 }
 
 // ---------------------------------------------------------------------------
