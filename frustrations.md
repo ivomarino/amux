@@ -2691,3 +2691,51 @@ FIX: scripts/mutate.sh — mutate by EXACT STRING, revert by the inverse exact s
   implementation — ethos.md and CLAUDE.md ask for mutation testing repeatedly and neither
   says how to do it without a whole-file write. That is why this is `shared-checkout` and
   not "amux's mistake".
+
+## Every amux-launched Chrome opens with the yellow "unsupported command-line flag" infobar
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: mixpeek-research
+CARD: MR-38
+SYMPTOM: Ethan's screenshot at 15:40: "You are using an unsupported command-line flag:
+  --ignore-certificate-errors-spki-list=... Stability and security will suffer." across the top
+  of every window the amux browser opens. The SPKI pin is on Chrome's kBadFlags list
+  (chrome/browser/ui/startup/bad_flags_prompt.cc:107), so the bar has been on every launch since
+  the pin shipped. Nothing in amux could see it: it is browser chrome, not page content, and no
+  verb screenshots that, so the only detector was a human looking at the window.
+COST: every human-facing browser session since the pin shipped read as broken or unsafe to the
+  person looking at it, until Ethan screenshotted it. About 90 minutes across two lanes to land,
+  most of it the shared-checkout dance (the peer's whole-file write dropped two of three edits
+  once; see the entry above at "Mutation testing's obvious harness is a whole-file write").
+FIX: 9f4e6971. --test-type on the launch line: chromium infobar_utils.cc:173 returns before
+  ShowBadFlagsPrompt for a test-harness launch (ChromeDriver passes it on every session);
+  --enable-automation would also work but adds its own "controlled by automated test software"
+  bar. Flags extracted into chrome_launch_args() and launch_args_tests pins "bad flag =>
+  --test-type" with a control that the pin is really present; mutation-checked red without the
+  flag. NOT confirmed on screen from this lane: screencapture is refused for a tmux shell (no
+  Screen Recording grant), so the visual check is Ethan's next launch. Already-running Chromes
+  keep the bar until relaunched.
+
+## A main lane with no $AMUX_SESSION in its env is invisible to the staged-guard's edit records
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-24
+SESSION: mixpeek-research
+CARD: MR-43
+SYMPTOM: This lane runs in tmux session `amux-mixpeek-research` (amux-launched), yet
+  $AMUX_SESSION is empty in its shell. In one task that meant: `amux board add` would have
+  created an unattributed card, the prepare-commit-msg trailer would have been empty, and the
+  staged-guard's cross-session check said "you have no edit record on this path in the last
+  360m" for a file this lane had edited three times in the previous ten minutes, because the
+  PostToolUse edit-record hook reports under the same empty variable. Its verdict then named
+  the peer as the sole editor and blocked the commit. The three subagent entries earlier in this
+  file (SESSION: "... no $AMUX_SESSION in env") are the same shape one level down.
+COST: two refused commits and about 5 minutes, plus a guard verdict that was wrong about who
+  edited the file; every CLI call needed AMUX_SESSION exported by hand from the tmux name.
+FIX: derive the session from the tmux session name (`tmux display-message -p '#S'`, strip the
+  `amux-` prefix) in the edit-record hook and the CLI when the variable is empty, and say in
+  the guard verdict when that fallback was used. Plus a WARN in the lane-launch path when a lane
+  starts without the variable, so /api/logs/analyze can count these instead of a human noticing.
