@@ -3029,7 +3029,29 @@ mod tests {
             1,
             "the spanning row must be gone and the genuinely slow one must remain: {outliers:?}"
         );
-        assert_eq!(outliers[0]["ts"], json!(now - 10.0), "the survivor is the one after boot");
+        // IDENTIFY the survivor, do not bit-compare it. `assert_eq!` on a
+        // serde_json f64 is an equality of BITS, and this one crosses a JSON
+        // encode/decode boundary: the endpoint emits `now - 10.0` through ryu
+        // and the test parses the text back. That round trip came back one ULP
+        // high on a GitHub runner on 2026-08-24 (1787580761.0102837 vs
+        // ...835 — 2.4e-7 apart at this magnitude, which is exactly 1 ULP) and
+        // failed the run. It reproduces on no local run in 150.
+        //
+        // The bit-equality was never the claim. The claim is WHICH ROW
+        // SURVIVED, and the candidates are 183 seconds apart at the closest
+        // (the baselines sit at now-200..now-193, the spanning specimen at
+        // now-280). A millisecond window is five orders of magnitude tighter
+        // than it needs to be to discriminate, and it stops the test asserting
+        // a property of serde_json's float parser instead of a property of
+        // this endpoint.
+        let got = outliers[0]["ts"].as_f64().expect("outlier ts is a number");
+        assert!(
+            (got - (now - 10.0)).abs() < 1e-3,
+            "the survivor is the one after boot: got {got}, want {}, off by {}s ({:?})",
+            now - 10.0,
+            got - (now - 10.0),
+            outliers[0]
+        );
 
         // THE EXCLUSION IS PUBLISHED, NOT SILENT. A detector that quietly drops
         // rows is one nobody can audit (AF-178), and a zero here is what tells a
