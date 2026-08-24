@@ -135,8 +135,8 @@ if (capped.length) ok(h.includes('capped'), 'a capped source says so (' + capped
 const untimed = (d.timeline || []).some(t => t.ordering && t.ordering !== 'timestamped');
 ok(untimed === h.includes('bd-lin-untimed'),
    'untimed badge presence matches the data (' + untimed + ') — otherwise it invents a chronology');
-ok(h.includes('AMUX-2393 part 3'),
-   'states that authorisation scope per action is NOT covered yet');
+ok(h.includes('AMUX-3607') && h.includes('authz:'),
+   'states WHICH actions carry an authorisation trail and which do not');
 ok(!/<script|onerror=/i.test(h), 'payload text cannot inject markup');
 
 console.log('\n' + pass + ' passed, ' + fail + ' failed');

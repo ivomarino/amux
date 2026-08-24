@@ -406,32 +406,191 @@ pub fn effective_gate_with_source(
     target: TaskStatus,
     groups: &std::collections::BTreeSet<String>,
 ) -> (Vec<String>, GateSource) {
-    let over = row.gate_criteria();
-    if !over.is_empty() {
-        return (over, GateSource::Card);
+    let t = effective_gate_trail(conn, row, target, groups);
+    (t.criteria, t.source)
+}
+
+/// One tier of the gate precedence, recorded AS CONSULTED (AMUX-3607).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GateLayer {
+    /// `card` | `worker` | `group` | `column` | `type_default`.
+    pub layer: &'static str,
+    /// Which worker, which group, which type — the identity of the scope that
+    /// was asked, so a reader can go look at the same row.
+    pub scope: Option<String>,
+    /// `applied` | `outranked` | `silent` | `not_applicable`.
+    ///
+    /// `outranked` is the load-bearing one and the reason this type exists.
+    /// Under the old early-returning walk it was UNOBSERVABLE: when the card
+    /// override won, nothing ever asked the worker layer, so a layer that held
+    /// a real gate and a layer that held nothing were the same absence. An
+    /// authorisation trail that cannot say "this rule existed and lost" answers
+    /// "what applied" but not "why was this allowed", which is the question.
+    pub verdict: &'static str,
+    /// What this layer WOULD have imposed. Present on `outranked` too, because
+    /// the rejected rule is the content of the answer, not context for it.
+    pub criteria: Vec<String>,
+}
+
+/// The whole precedence walk, with every tier's verdict.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct GateTrail {
+    pub criteria: Vec<String>,
+    #[serde(skip)]
+    pub source: GateSource,
+    /// Highest precedence first, always all five tiers.
+    pub layers: Vec<GateLayer>,
+}
+
+impl GateTrail {
+    /// The trail as ONE line for `issues.log` (AMUX-3607).
+    ///
+    /// Goes on the card's own append-only history rather than into a new store,
+    /// deliberately. That log is where the transition is already recorded, it is
+    /// not reaped, `/api/why` already reads it, and the History tab already
+    /// renders it — so the authorisation record lands where someone asking "why
+    /// was this allowed" is already looking, instead of in a table they would
+    /// have to know to open. Ethos rule 4's second layer: a tag in a store the
+    /// reader never opens is the same failure as no tag.
+    ///
+    /// Compact and greppable on purpose. `grep 'authz:' ` finds every
+    /// authorisation decision on a card; `grep 'outranked'` finds every one
+    /// where a rule existed and lost, which is the question the winning layer
+    /// alone cannot answer.
+    ///
+    /// The count is the number of criteria that tier held, so a reader can tell
+    /// an outranked tier with a real bar from one with a trivial one without
+    /// the line carrying every criterion string.
+    pub fn log_line(&self) -> String {
+        let parts: Vec<String> = self
+            .layers
+            .iter()
+            .map(|l| {
+                let name = match (&l.scope, l.layer) {
+                    // The card tier's scope is the card's own id, which the log
+                    // line already lives on — repeating it is noise.
+                    (_, "card") | (_, "column") | (None, _) => l.layer.to_string(),
+                    (Some(s), "type_default") => format!("type:{s}"),
+                    (Some(s), n) => format!("{n}:{s}"),
+                };
+                match l.verdict {
+                    "silent" => format!("{name}=silent"),
+                    "not_applicable" => format!("{name}=n/a"),
+                    v => format!("{name}={v}({})", l.criteria.len()),
+                }
+            })
+            .collect();
+        format!("authz: {}", parts.join(" "))
     }
-    if let Some(session) = row.session.as_deref().filter(|s| !s.is_empty()) {
-        if let Some(g) = scoped_gate(conn, session, target) {
-            return (g, GateSource::Worker(session.to_string()));
-        }
-        let mut merged: Vec<String> = Vec::new();
+}
+
+/// THE precedence walk. `effective_gate_with_source` is a projection of this,
+/// deliberately, so there is one implementation and not two spellings to keep in
+/// step (the duplication this file's own `KNOWN_TYPES` comment warns about, and
+/// the shape ethos rule 1's corollary names: a view that re-derives its
+/// predicate instead of sharing it drifts the moment either side changes).
+///
+/// It no longer early-returns. That costs, measured 2026-08-24 before writing
+/// it rather than after: `session_gates` holds 4 rows behind a PK autoindex on
+/// (session, status) and `statuses` holds 7, so consulting every tier is a
+/// handful of trivial indexed probes. The early return was saving nothing worth
+/// the blindness it caused.
+pub fn effective_gate_trail(
+    conn: &rusqlite::Connection,
+    row: &IssueRow,
+    target: TaskStatus,
+    groups: &std::collections::BTreeSet<String>,
+) -> GateTrail {
+    let session = row.session.as_deref().filter(|s| !s.is_empty());
+
+    // Consult everything FIRST, decide after. Interleaving the two is what made
+    // "consulted and empty" and "never asked" indistinguishable.
+    let card = row.gate_criteria();
+    let worker = session.and_then(|s| scoped_gate(conn, s, target));
+    let mut group_merged: Vec<String> = Vec::new();
+    let mut group_hits: Vec<String> = Vec::new();
+    if session.is_some() {
         for group in groups {
             if let Some(list) = scoped_gate(conn, &format!("group:{group}"), target) {
+                group_hits.push(group.clone());
                 for c in list {
-                    if !merged.contains(&c) {
-                        merged.push(c);
+                    if !group_merged.contains(&c) {
+                        group_merged.push(c);
                     }
                 }
             }
         }
-        if !merged.is_empty() {
-            return (merged, GateSource::Group(groups.iter().cloned().collect::<Vec<_>>().join(", ")));
-        }
     }
-    if let Some(cfg) = configured_gate(conn, target) {
-        return (cfg, GateSource::Column);
-    }
-    (effective_gate(row, target), GateSource::TypeDefault)
+    let column = configured_gate(conn, target);
+    // `default_gates_for`, NOT `effective_gate`: the latter returns the CARD
+    // OVERRIDE when one exists, so using it here made the type tier report the
+    // card's criteria as its own — a tier claiming a rule it does not hold, in
+    // the one record meant to say which rule came from where. Caught by
+    // asserting the audit line as a whole string; a substring check would have
+    // passed. Equivalent for the WINNER, which reaches this tier only when the
+    // override is empty and the two agree by definition.
+    let type_default = default_gates_for(&row.item_type, target);
+
+    let (criteria, source, winner) = if !card.is_empty() {
+        (card.clone(), GateSource::Card, "card")
+    } else if let Some(g) = worker.clone() {
+        (g, GateSource::Worker(session.unwrap_or("").to_string()), "worker")
+    } else if !group_merged.is_empty() {
+        (
+            group_merged.clone(),
+            GateSource::Group(groups.iter().cloned().collect::<Vec<_>>().join(", ")),
+            "group",
+        )
+    } else if let Some(c) = column.clone() {
+        (c, GateSource::Column, "column")
+    } else {
+        (type_default.clone(), GateSource::TypeDefault, "type_default")
+    };
+
+    // `held` = this tier actually had a rule. A tier that held one and did not
+    // win was OUTRANKED; one that held nothing was SILENT and could never have
+    // applied. Same row count, opposite meanings.
+    let layer = |name: &'static str, scope: Option<String>, held: Option<Vec<String>>| -> GateLayer {
+        let (verdict, criteria) = match held {
+            _ if name == winner => ("applied", criteria.clone()),
+            Some(c) => ("outranked", c),
+            None => ("silent", vec![]),
+        };
+        GateLayer { layer: name, scope, verdict, criteria }
+    };
+
+    let layers = vec![
+        layer("card", Some(row.id.clone()), (!card.is_empty()).then_some(card)),
+        // A card with no session has no worker or group tier to consult at all.
+        // Reporting that as `silent` would claim an empty answer from a scope
+        // nobody asked, which is the same over-claim one layer along.
+        match session {
+            Some(s) => layer("worker", Some(s.to_string()), worker),
+            None => GateLayer {
+                layer: "worker",
+                scope: None,
+                verdict: "not_applicable",
+                criteria: vec![],
+            },
+        },
+        match session {
+            Some(_) => layer(
+                "group",
+                (!group_hits.is_empty()).then(|| group_hits.join(", ")),
+                (!group_merged.is_empty()).then_some(group_merged),
+            ),
+            None => GateLayer {
+                layer: "group",
+                scope: None,
+                verdict: "not_applicable",
+                criteria: vec![],
+            },
+        },
+        layer("column", None, column),
+        layer("type_default", Some(row.item_type.clone()), Some(type_default)),
+    ];
+
+    GateTrail { criteria, source, layers }
 }
 
 /// Which tier of the precedence produced a card's gate for one transition.
@@ -2328,6 +2487,129 @@ mod configured_gate_tests {
 
     fn groups(names: &[&str]) -> std::collections::BTreeSet<String> {
         names.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// AMUX-3607. The trail must record every tier CONSULTED, not only the
+    /// winner, and must separate a tier that HELD a rule and lost from one that
+    /// held nothing.
+    ///
+    /// That distinction is the whole feature. Under the old early-returning
+    /// walk `outranked` was structurally unobservable: when the card override
+    /// won, nothing ever asked the worker layer, so "a worker gate existed and
+    /// was overridden" and "no worker gate exists" were the same silence. A
+    /// trail that only names the winner answers "what applied" and cannot
+    /// answer "why was this allowed", which is the question Ethan's directive
+    /// actually asks.
+    ///
+    /// One fixture, every verdict, because the claim is that the four are TOLD
+    /// APART. Asserting `applied` alone would pass against a trail that labels
+    /// every other tier identically, which is the version worth catching.
+    #[test]
+    fn the_trail_says_which_layers_lost_and_which_had_nothing_to_say() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        // A worker gate AND a group gate both exist and both LOSE to the card
+        // override. Under the old walk neither was ever read.
+        scope_gate(&c, "backend", "done", r#"["worker rule"]"#);
+        scope_gate(&c, "group:ops", "done", r#"["group rule"]"#);
+        let row = row_for("backend", "code", Some(r#"["card rule"]"#));
+
+        let t = effective_gate_trail(&c, &row, TaskStatus::Done, &groups(&["ops"]));
+        assert_eq!(t.criteria, vec!["card rule"], "the winner must not change");
+        assert_eq!(t.source, GateSource::Card);
+
+        let by = |n: &str| t.layers.iter().find(|l| l.layer == n).expect("every tier is present");
+        assert_eq!(t.layers.len(), 5, "all five tiers, always: {:?}", t.layers);
+
+        assert_eq!(by("card").verdict, "applied");
+        assert_eq!(by("card").criteria, vec!["card rule"]);
+
+        // THE POINT. Both held a real rule and lost, and the rule they held is
+        // reported — a rejected rule is the content of the answer to "why not
+        // something else", not context for it.
+        assert_eq!(by("worker").verdict, "outranked");
+        assert_eq!(by("worker").criteria, vec!["worker rule"]);
+        assert_eq!(by("worker").scope.as_deref(), Some("backend"), "name the scope so it can be re-read");
+        assert_eq!(by("group").verdict, "outranked");
+        assert_eq!(by("group").criteria, vec!["group rule"]);
+        assert_eq!(by("group").scope.as_deref(), Some("ops"));
+
+        // Consulted, held nothing: could never have applied. Different fact,
+        // different word.
+        assert_eq!(by("column").verdict, "silent");
+        assert!(by("column").criteria.is_empty());
+
+        // The type default always holds something, so it is outranked here
+        // rather than silent.
+        assert_eq!(by("type_default").verdict, "outranked");
+        assert!(!by("type_default").criteria.is_empty());
+
+        // A SESSIONLESS card never had a worker or group tier to ask. Calling
+        // that `silent` would report an empty answer from a scope nobody
+        // queried, which is the same over-claim one layer along.
+        let mut orphan = row_for("backend", "code", None);
+        orphan.session = None;
+        let t2 = effective_gate_trail(&c, &orphan, TaskStatus::Done, &groups(&["ops"]));
+        let by2 = |n: &str| t2.layers.iter().find(|l| l.layer == n).unwrap();
+        assert_eq!(by2("worker").verdict, "not_applicable");
+        assert_eq!(by2("group").verdict, "not_applicable");
+        assert_eq!(by2("type_default").verdict, "applied", "with no scope the type default wins");
+    }
+
+    /// The one-line audit form. Asserted as a WHOLE STRING rather than by
+    /// substring: this line is the permanent authorisation record on the card,
+    /// and a substring check passes against a version that silently drops a
+    /// tier, which is the one failure that matters here.
+    #[test]
+    fn the_audit_line_names_every_tier_and_its_verdict() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "backend", "done", r#"["worker rule"]"#);
+        scope_gate(&c, "group:ops", "done", r#"["g1","g2"]"#);
+        let row = row_for("backend", "code", Some(r#"["card rule"]"#));
+        let t = effective_gate_trail(&c, &row, TaskStatus::Done, &groups(&["ops"]));
+        assert_eq!(
+            t.log_line(),
+            "authz: card=applied(1) worker:backend=outranked(1) group:ops=outranked(2) \
+column=silent type:code=outranked(2)"
+        );
+
+        // The permissive case must still produce a line. "Nothing required this,
+        // at any tier" is an authorisation answer; a trail that only appeared
+        // when something blocked would make the permissive case the invisible
+        // one, which is backwards for an audit record.
+        let plain = row_for("nobody", "chore", None);
+        let t2 = effective_gate_trail(&c, &plain, TaskStatus::Backlog, &groups(&[]));
+        let line = t2.log_line();
+        assert!(line.starts_with("authz: "), "{line}");
+        assert_eq!(line.matches('=').count(), 5, "all five tiers, always: {line}");
+        assert!(line.contains("card=silent"), "{line}");
+    }
+
+    /// `effective_gate_with_source` is a PROJECTION of the trail, not a second
+    /// walk. Pinned because two spellings of a precedence is exactly the
+    /// duplication this file warns about elsewhere, and the failure mode is
+    /// silent: they agree until one is edited.
+    #[test]
+    fn the_summary_and_the_trail_cannot_disagree_about_the_winner() {
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "backend", "done", r#"["worker rule"]"#);
+        scope_gate(&c, "group:ops", "verified", r#"["group rule"]"#);
+        for (row, target) in [
+            (row_for("backend", "code", Some(r#"["card"]"#)), TaskStatus::Done),
+            (row_for("backend", "code", None), TaskStatus::Done),
+            (row_for("backend", "code", None), TaskStatus::Verified),
+            (row_for("backend", "investigation", None), TaskStatus::Review),
+        ] {
+            let t = effective_gate_trail(&c, &row, target, &groups(&["ops"]));
+            let (crit, src) = effective_gate_with_source(&c, &row, target, &groups(&["ops"]));
+            assert_eq!((crit, src), (t.criteria.clone(), t.source.clone()), "{target:?}");
+            // And the applied layer must be the one the source names.
+            let applied: Vec<&str> =
+                t.layers.iter().filter(|l| l.verdict == "applied").map(|l| l.layer).collect();
+            assert_eq!(applied.len(), 1, "exactly one tier applies: {applied:?}");
+        }
     }
 
     /// AMUX-3567 REVIEW (amux-frustrations): the SOURCE at every rung.

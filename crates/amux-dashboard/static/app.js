@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.715';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.716';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24467,10 +24467,20 @@ function _bdLineageHtml(d, id) {
   //    flag) but is not PERSISTED with the action, so no trail can answer it
   //    yet. Stating that in the view is the point: a lineage panel that simply
   //    omitted authorisation would read as though authorisation were covered.
-  h += '<div class="bd-lin-note bd-lin-todo">Authorisation scope per action is NOT in this'
-    + ' trail yet (AMUX-2393 part 3). The layers are resolved at read time but not persisted'
-    + ' with the action, so which scope permitted each step cannot be answered from the logs'
-    + ' today.</div>';
+  // AMUX-3607 landed the board-transition half of part 3, so this notice no
+  // longer says "not covered" — it says WHAT is covered. Deleting it outright
+  // would have been the over-claim: the directive is "every action a worker
+  // takes" and only board transitions carry a trail today, so a reader seeing
+  // authz lines on a card would reasonably assume the same holds for scope
+  // writes and messages. Naming the boundary is the honest version, and it is
+  // worded to name the card so it cannot outlive the remaining gap.
+  h += '<div class="bd-lin-note bd-lin-todo">Authorisation trail: board status'
+    + ' transitions record which permission layer allowed them, every tier, on'
+    + ' the card log (look for <code>authz:</code> lines above &mdash;'
+    + ' <code>outranked</code> means a rule existed at that tier and lost).'
+    + ' Other actions a worker takes (scope writes, messages, session starts) do'
+    + ' NOT carry one yet, so their absence here is unrecorded rather than'
+    + ' unrestricted (AMUX-3607).</div>';
   return h;
 }
 

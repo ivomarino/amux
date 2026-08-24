@@ -106,10 +106,12 @@ test.describe('board card lineage tab', () => {
       ).toHaveCount(zero.length);
     }
 
-    // Part 3 of the requirement has no substrate, and the panel says so. A
-    // lineage view that silently omitted authorisation would read as though
-    // authorisation were covered.
-    await expect(panel).toContainText('AMUX-2393 part 3');
+    // AMUX-3607 gave part 3 a substrate for board transitions and only those.
+    // The panel must state the BOUNDARY, not disappear: a reader seeing authz
+    // lines on a card would otherwise assume scope writes and messages carry
+    // one too, and their absence would read as unrestricted rather than
+    // unrecorded.
+    await expect(panel).toContainText('AMUX-3607');
 
     // THE LAYOUT ASSERTION, and the reason this is a browser test rather than
     // an extension of the render-logic script. Nothing inside the panel may
