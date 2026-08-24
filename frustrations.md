@@ -2661,3 +2661,33 @@ NARROWED 2026-08-24 to the VOCABULARY half. The re-nag is fixed; the lying statu
   because they filtered `cargo test -- a_reviewer_who_has_written` and matched one cell of
   five. Naming the target before searching for it — the same instrument error this entry is
   about, made while checking the fix for it.
+
+---
+## Mutation testing's obvious harness is a whole-file write, which reverts a peer mid-edit
+AREA: shared-checkout
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3670
+SYMPTOM: `cp $F /tmp/orig ; <mutate> ; <test> ; cp /tmp/orig $F` — the natural way to
+  satisfy this repo's "mutate the predicate and confirm it LANDED" rule. The restore is a
+  WHOLE-FILE write, indistinguishable from `git checkout -- $F` to a concurrent peer. At
+  15:45 it reverted mixpeek-research's in-flight `fn chrome_launch_args` out of
+  browser.rs while KEEPING the call site that had arrived inside my mutate/restore
+  window, so `cargo check` failed with E0425 for both lanes. Twice, because the harness
+  ran twice.
+COST: A peer lost work and had to re-apply; browser.rs was uncompilable for both of us
+  for ~4 minutes. The number that matters is not this incident: the same harness had run
+  about a dozen times that day across five files, and every one was a chance to do this to
+  somebody. It had simply not collided until a peer edited the same file at the same
+  minute.
+FIX: scripts/mutate.sh — mutate by EXACT STRING, revert by the inverse exact string, so
+  only the mutated bytes are ever written and a peer editing any other part of the file is
+  untouched. Refuses a target that is absent (0 occurrences) or ambiguous (>1), which is
+  the same discipline the rule already asks for: an unapplied mutation and a test that
+  cannot fail produce the identical green, and the mutation is the cheaper one to check.
+  The deeper point is that the REPO'S OWN RULE pushed everyone toward the unsafe
+  implementation — ethos.md and CLAUDE.md ask for mutation testing repeatedly and neither
+  says how to do it without a whole-file write. That is why this is `shared-checkout` and
+  not "amux's mistake".
