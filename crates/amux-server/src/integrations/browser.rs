@@ -531,17 +531,78 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
     true
 }
 
+/// Every LIVE Chrome holding this exact `--user-data-dir`, from the OS.
+///
+/// `browser-running.json` records ONE pid, so every reconcile built on it can
+/// clear at most one orphan — and since AMUX-3184 detached Chrome into its own
+/// process group (so it survives the builder's re-exec, which is the whole
+/// point), each start/restart cycle can strand another. They accumulate
+/// silently, and Chrome's user-data-dir is single-instance: the second and
+/// later ones show the user "Something went wrong when opening your profile.
+/// Some features may be unavailable."
+///
+/// Measured 2026-08-24 from Ethan's report: FIVE live Chromes on
+/// `playwright-auth/profile`, ports 58242, 63713, 53913, 53402 and 60005, plus
+/// a sixth on `profiles/netsuite`. The state file named one of them.
+///
+/// So ask the OS, which knows all of them, instead of a handle we remembered.
+/// Scoped hard: an EXACT match on the flag value, and only inside amux-owned
+/// dirs — the user's own Chrome must never be a candidate.
+fn live_chromes_on_dir(home: &Path, target_dir: &Path) -> Vec<u32> {
+    if !is_amux_owned(home, target_dir) {
+        return Vec::new();
+    }
+    let flag = format!("--user-data-dir={}", target_dir.display());
+    let out = match std::process::Command::new("ps").args(["-ax", "-o", "pid=,command="]).output() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(?e, "browser: could not list processes to find profile co-tenants");
+            return Vec::new();
+        }
+    };
+    pids_on_dir(&String::from_utf8_lossy(&out.stdout), &flag)
+}
+
+/// Pure half of [`live_chromes_on_dir`], so the matching rule is testable
+/// without a live `ps` and without live Chromes to kill.
+fn pids_on_dir(ps_output: &str, flag: &str) -> Vec<u32> {
+    ps_output
+        .lines()
+        // EXACT ARG MATCH, NOT `contains`. `playwright-auth/profile` is a
+        // PREFIX of `playwright-auth/profiles/netsuite`, so a substring test on
+        // the flag makes the DEFAULT profile match every named one — measured
+        // before shipping, on the live machine: `contains` found 9 processes on
+        // the default dir INCLUDING the `netsuite` browser holding a staged
+        // login, while the exact rule finds 7 and leaves netsuite alone. A
+        // launch on `default` would have killed every other profile's browser,
+        // which is a far worse bug than the one being fixed.
+        //
+        // Tokenising on whitespace is safe HERE and only here: the
+        // `is_amux_owned` gate in the caller means the dir is under `~/.amux`,
+        // which has no spaces. The user's own Chrome dirs do ("Application
+        // Support") and are excluded by that same gate.
+        .filter(|l| l.split_whitespace().any(|tok| tok == flag))
+        // Helper processes carry `--type=renderer` and friends and die with
+        // their parent; killing them individually is noise at best.
+        .filter(|l| !l.split_whitespace().any(|t| t.starts_with("--type=")))
+        .filter_map(|l| l.split_whitespace().next()?.parse::<u32>().ok())
+        .collect()
+}
+
 /// Before launching, make sure no Chrome from a PRIOR server process still holds
 /// `target_dir`. The in-memory RUNNING registry does not survive the builder's
 /// re-exec, so a live orphan is invisible to `start()`, and a second Chrome on
 /// the same `--user-data-dir` delegates to that orphan and exits 0 before binding
-/// any debug port ("Chrome exited 0 before CDP came up", AMUX-3207). Two cases,
-/// both closed here so the launch never delegates:
+/// any debug port ("Chrome exited 0 before CDP came up", AMUX-3207). Three cases,
+/// all closed here so the launch never delegates:
 ///   - orphan with LIVE CDP: adopt it into RUNNING, so start()'s replace-check
 ///     stops it by pid (the reported incident: pid 54237, CDP 53470, still alive).
 ///   - orphan whose CDP has WEDGED: adopt cannot speak to it and clears the file,
 ///     but the process still owns the dir. Kill it by the pid the running-file
 ///     recorded, or the next launch delegates to a zombie forever.
+///   - CO-TENANTS THE STATE FILE NEVER NAMED (AMUX-3669): the file records one
+///     pid, and detached Chrome survives a re-exec, so earlier launches strand
+///     browsers nothing remembers. [`live_chromes_on_dir`] asks the OS instead.
 async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // Snapshot the persisted pid/dir BEFORE adopt, which clears the file on dead CDP.
     let persisted = std::fs::read_to_string(running_state_path(home))
@@ -577,6 +638,40 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
                 clear_running(home);
             }
         }
+    }
+
+    // THE ONES THE STATE FILE NEVER KNEW ABOUT (AMUX-3669).
+    //
+    // Everything above reconciles the ONE pid we persisted. Detached Chrome
+    // survives a server re-exec, so earlier launches strand co-tenants the file
+    // no longer names, and a launch onto a dir another Chrome already holds
+    // gets Chrome's profile-lock modal instead of a working browser.
+    //
+    // Runs LAST and unconditionally, including after `adopt_if_orphaned`
+    // returned early — the adopted one is a legitimate tenant and is excluded
+    // by pid, but its co-tenants are not.
+    let adopted = running_snapshot().map(|(_, _, _, pid)| pid).unwrap_or(0);
+    let strays: Vec<u32> =
+        live_chromes_on_dir(home, target_dir).into_iter().filter(|p| *p != adopted).collect();
+    for pid in &strays {
+        tracing::warn!(
+            pid, dir = %target_dir.display(),
+            "browser: killing a stray Chrome co-tenant on this profile — two Chromes on one \
+             user-data-dir is what shows the user 'Something went wrong when opening your \
+             profile' (AMUX-3669)"
+        );
+        let _ = tokio::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().await;
+    }
+    if !strays.is_empty() {
+        // Counted, not just logged: a silent cleanup cannot tell anyone the
+        // leak is still happening, and the leak is the actual defect. This is
+        // the number to watch — it should trend to zero once nothing strands.
+        tracing::warn!(
+            count = strays.len(), dir = %target_dir.display(),
+            "browser: profile had {} stray co-tenant(s) before launch — each one was a \
+             corrupted-profile modal waiting to happen",
+            strays.len()
+        );
     }
 }
 
@@ -1918,6 +2013,52 @@ mod tests {
     // All tests run against TEMP dirs only — never the live Chrome profiles
     // (repo rule: tests must not touch real profile contents), and never
     // launch Chrome except the #[ignore]d gated tests at the bottom.
+
+    /// AMUX-3669, from Ethan's report and the live `ps` output that explained
+    /// it. Five Chromes were sharing one `--user-data-dir`, which is
+    /// single-instance in Chrome, so all but the lock holder showed
+    /// "Something went wrong when opening your profile."
+    ///
+    /// The dangerous half is the CONTROL, and it caught a bug in the first
+    /// draft of this function before it shipped: `playwright-auth/profile` is a
+    /// PREFIX of `playwright-auth/profiles/netsuite`, so a `contains` test on
+    /// the flag matched 9 processes on the live machine including the netsuite
+    /// browser holding a staged login. Cleaning the DEFAULT profile would have
+    /// killed every NAMED profile's browser.
+    #[test]
+    fn stray_cotenants_match_the_dir_exactly_and_never_a_longer_one() {
+        // Verbatim shape of `ps -ax -o pid=,command=` on this machine.
+        let ps = "\
+29637 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=58242 --user-data-dir=/h/.amux/playwright-auth/profile --no-first-run
+35866 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=63713 --user-data-dir=/h/.amux/playwright-auth/profile --no-first-run
+35459 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=59100 --user-data-dir=/h/.amux/playwright-auth/profiles/netsuite --no-first-run
+40001 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper --type=renderer --user-data-dir=/h/.amux/playwright-auth/profile
+  871 /Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app/Contents/MacOS/remoting_agent_process_broker";
+
+        let default_dir = pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profile");
+        assert_eq!(
+            default_dir,
+            vec![29637, 35866],
+            "the default profile's co-tenants, and NOT profiles/netsuite: {default_dir:?}"
+        );
+        assert!(
+            !default_dir.contains(&35459),
+            "a longer path that merely STARTS with this one is a different profile — killing \
+             it would take out another session's staged login"
+        );
+        assert!(!default_dir.contains(&40001), "helper processes die with their parent");
+        assert!(!default_dir.contains(&871), "unrelated processes are not candidates");
+
+        // The named profile finds only its own, which is the same rule read
+        // from the other side.
+        assert_eq!(
+            pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profiles/netsuite"),
+            vec![35459]
+        );
+
+        // A dir nobody is on is empty, not everything.
+        assert!(pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profiles/nope").is_empty());
+    }
 
     /// EVERY live-Chrome test must hold this for its whole body.
     ///
