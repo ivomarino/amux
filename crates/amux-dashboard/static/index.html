@@ -1821,9 +1821,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       <button class="board-detail-tab" id="bd-tab-edit" onclick="boardDetailTab('edit')">Edit</button>
       <button class="board-detail-tab active" id="bd-tab-preview" onclick="boardDetailTab('preview')">Preview</button>
       <button class="board-detail-tab" id="bd-tab-history" onclick="boardDetailTab('history')">History<span id="bd-hist-n" class="bd-hist-n"></span></button>
+      <button class="board-detail-tab" id="bd-tab-lineage" onclick="boardDetailTab('lineage')">Lineage</button>
     </div>
     <textarea id="bd-desc" class="board-detail-desc-input" placeholder="Add notes, description, or context... (supports Markdown)"></textarea>
     <div id="bd-log" class="board-detail-log" style="display:none"></div>
+    <div id="bd-lineage" class="board-detail-lineage" style="display:none"></div>
     <div id="bd-preview" class="board-detail-preview md-content" style="display:none;"></div>
     <div class="board-detail-meta" id="bd-meta"></div>
   </div>
