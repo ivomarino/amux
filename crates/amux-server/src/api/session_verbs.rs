@@ -3332,7 +3332,7 @@ pub(crate) async fn steer_enqueue(
     text: &str,
     guard: &str,
     sender: &str,
-) -> Option<String> {
+) -> Result<String, &'static str> {
     steer_enqueue_store(&state.store, name, text, guard, sender).await
 }
 
@@ -3354,7 +3354,7 @@ pub(crate) async fn steer_enqueue_store(
     text: &str,
     guard: &str,
     sender: &str,
-) -> Option<String> {
+) -> Result<String, &'static str> {
     // REFUSE A PERMANENT BLOCK HERE, not in the handlers (AF-188).
     //
     // `steer_mutate` and `auto_deliver` each refused archived targets; this
@@ -3376,17 +3376,18 @@ pub(crate) async fn steer_enqueue_store(
     // without the attribute this would have been a refusal any future producer
     // could drop silently. CI denies warnings, so every one of the 18 call
     // sites now says out loud what it does with a refusal.
-    if lane_is_archived(name) {
+    if let Some(reason) = permanently_blocked(name) {
         // Stable token so a sweep can COUNT these without a human noticing
         // first — the same /api/logs/analyze WARN sweep that found the bug.
         tracing::warn!(
-            steer_refused_archived = name,
+            steer_refused = name,
+            reason = reason,
             guard = guard,
             sender = sender,
             chars = text.chars().count(),
-            "steer_enqueue refused: '{name}' is archived, so this message would never drain.              Not queued. Un-archiving is a human's call (ethos rule 8)."
+            "steer_enqueue refused: '{name}' is {reason}, so this message would never drain. Not queued."
         );
-        return None;
+        return Err(reason);
     }
     let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
     let id = msg_id.clone();
@@ -3471,7 +3472,7 @@ pub(crate) async fn steer_enqueue_store(
     )
     .await;
     // The row that exists, not the one we minted (AMUX-3557).
-    Some(effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id))
+    Ok(effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id))
 }
 
 /// py:25236 _send_dedup_seen — idempotency across client retries, persisted
@@ -4618,15 +4619,21 @@ pub(crate) async fn deliver_automated(
     // permanently-blocked target, so this is terminal — reporting it as
     // "queued" would be the exact false belief this whole path exists to stop.
     match steer_enqueue(state, name, text, guard, "").await {
-        Some(queue_id) => AutoDelivery {
+        Ok(queue_id) => AutoDelivery {
             message: format!("queued (steering) — delivers to '{name}' at its next turn boundary"),
             submitted: None,
             submission: "deferred",
             queue_id: Some(queue_id),
             refused: false,
         },
-        None => AutoDelivery {
-            message: block_reason_explain("archived", name),
+        // The REASON the enqueue gave, not a hardcoded one. This branch said
+        // `"archived"` unconditionally, so widening the refusal to cover
+        // no-env-file would have told a caller who mistyped a lane name that the
+        // lane "is archived" — a false statement about a lane that does not
+        // exist (amux-frustrations, reviewing AF-188; it was the blocker that
+        // made this more than a one-line change).
+        Err(reason) => AutoDelivery {
+            message: block_reason_refused(reason, name),
             submitted: Some(false),
             submission: "refused",
             queue_id: None,
@@ -7891,6 +7898,66 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
 /// wrong: "queued" on its own is the string that manufactured the false belief,
 /// and replacing it with a bare reason code would leave the sender to guess
 /// whether waiting helps. For these reasons it does not.
+/// Is this lane blocked PERMANENTLY, and by what? (AF-188, widened on review.)
+///
+/// Two of `lane_block_reason`'s three are permanent. `not-running` is what the
+/// queue exists for and must never be refused.
+///
+/// `no-env-file` was originally left queuing on the argument that refusing it
+/// "turns a typo into a dropped message". amux-frustrations overturned that on
+/// review and the objection inverts on inspection: the refusal is not silent —
+/// it returns the reason, WARNs with a stable token, and the send path answers
+/// `refused: true` with a sentence that leads with "CHECK THE NAME". So a
+/// mistyped send now tells the sender at the moment they can still fix it,
+/// instead of parking a row nobody sees until a sweep. The typo case is the
+/// strongest case for refusing, not the weakest, because it is the only one
+/// where the sender is present.
+///
+/// Measured rather than argued, both ways: of 13 "steering queue stuck" reports
+/// in the autofix backlog, 7 were lanes with NO env file (deleted test lanes)
+/// and 2 were archived. And no producer anywhere does create-then-send — the
+/// case the exception protected does not exist in this codebase.
+pub(crate) fn permanently_blocked(name: &str) -> Option<&'static str> {
+    if !env_path(name).exists() {
+        return Some("no-env-file");
+    }
+    if parse_env(name).get("CC_ARCHIVED") == Some("1") {
+        return Some("archived");
+    }
+    None
+}
+
+/// The sentence for a message that was REFUSED and never stored (AF-188).
+///
+/// Split from [`block_reason_explain`] because that one is written for a message
+/// sitting IN the queue behind a permanent block, and every arm of it says "The
+/// message is stored". Reusing it on a refusal asserts we kept something while
+/// keeping nothing — which `steer_mutate` was already doing before this split,
+/// in a response whose own `hint` said "Nothing was queued" three lines later.
+/// One body, two contradictory claims.
+///
+/// The two reasons get DIFFERENT leads on purpose. `archived` cannot be reached
+/// by a typo, so the lane really is the subject. `no-env-file` is the only block
+/// a mistyped name produces, so it leads with the name. That distinction is the
+/// one I argued should live in the DISPOSITION; the review's answer was to keep
+/// it and move it into the WORDING, which is right: refuse both, explain them
+/// differently.
+pub(crate) fn block_reason_refused(reason: &str, name: &str) -> String {
+    match reason {
+        "no-env-file" => format!(
+            "NOT SENT — no worker called '{name}' exists, so there is nothing to deliver to. \
+             CHECK THE NAME first; if the name is right, create the worker and send again. \
+             Nothing was queued, so nothing is sitting undelivered."
+        ),
+        "archived" => format!(
+            "NOT SENT — '{name}' is archived and nothing wakes an archived lane, so this message \
+             could never be delivered. Un-archiving is a human's call. Nothing was queued, so \
+             nothing is sitting undelivered."
+        ),
+        other => format!("NOT SENT — '{name}' is not deliverable ({other}). Nothing was queued."),
+    }
+}
+
 pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
     match reason {
         "no-env-file" => format!(
@@ -10587,7 +10654,11 @@ async fn steer_mutate(
                 StatusCode::CONFLICT,
                 json!({
                     "ok": false,
-                    "error": block_reason_explain("archived", name),
+                    // The refusal wording, not the queued-behind-a-block wording
+                    // (AF-188). This said "The message is stored" while the
+                    // `hint` three lines below said "Nothing was queued" — one
+                    // body, two contradictory claims about the same message.
+                    "error": block_reason_refused("archived", name),
                     "blocked_reason": "archived",
                     "deliverable": false,
                     "hint": "Un-archive the worker first if this message should reach it — \
@@ -10605,7 +10676,29 @@ async fn steer_mutate(
             answers_visible_picker(&text, &pane)
         };
         let guard = if picker_answer { "selector-answer" } else { "" };
-        let msg_id = steer_enqueue(state, name, &text, guard, &hdr_worker(headers)).await;
+        // The enqueue can REFUSE (AF-188). Unwrapping the Result into the
+        // response body serialized it as {"Ok": "steer-..."}, so `id` stopped
+        // being a string and every consumer reading `v["id"].as_str()` got None
+        // — caught by `file_backed_verbs_roundtrip_hermetically`, which is the
+        // only test that drives this endpoint end to end.
+        //
+        // A refusal here is not reachable today (the archived pre-check above
+        // catches the one case this path can hit), but it must not become a
+        // silent 200 with a null id if that pre-check is ever removed.
+        let msg_id = match steer_enqueue(state, name, &text, guard, &hdr_worker(headers)).await {
+            Ok(id) => id,
+            Err(reason) => {
+                return jresp(
+                    StatusCode::CONFLICT,
+                    json!({
+                        "ok": false,
+                        "error": block_reason_refused(reason, name),
+                        "blocked_reason": reason,
+                        "deliverable": false,
+                    }),
+                )
+            }
+        };
         if body.get("record_history").map(py_truthy).unwrap_or(false) {
             let email = headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
             // QUEUED, not direct (AF-159). `steer_enqueue` above put this on the
@@ -14169,13 +14262,37 @@ mod tests {
         );
         assert!(!lane_is_archived("stopped"));
 
-        let refused = steer_enqueue(&st, "dead", "never deliverable", "", "amux").await;
-        assert!(refused.is_none(), "an archived target must be refused, not queued: {refused:?}");
+        // Both PERMANENT blocks refuse, and each names ITS OWN reason. The
+        // reason is load-bearing: `auto_deliver` renders it, and hardcoding
+        // "archived" there would tell a caller who mistyped a lane name that a
+        // nonexistent lane is archived.
+        assert_eq!(
+            steer_enqueue(&st, "dead", "never deliverable", "", "amux").await,
+            Err("archived"),
+            "an archived target must be refused, naming archived"
+        );
+        assert_eq!(
+            steer_enqueue(&st, "nosuchlane", "typo", "", "amux").await,
+            Err("no-env-file"),
+            "a name that matches no worker must be refused, naming no-env-file — a typo is the \
+             ONE case where the sender is present to fix it"
+        );
 
         let queued = steer_enqueue(&st, "stopped", "waits for a wake", "", "amux").await;
         assert!(
-            queued.is_some(),
+            queued.is_ok(),
             "a stopped-but-live lane MUST still queue — that is what the queue is for"
+        );
+
+        // The refusal wording must not claim it stored something.
+        for r in ["archived", "no-env-file"] {
+            let m = block_reason_refused(r, "x");
+            assert!(m.contains("Nothing was queued"), "{r}: {m}");
+            assert!(!m.contains("message is stored"), "{r} must not claim storage: {m}");
+        }
+        assert!(
+            block_reason_refused("no-env-file", "x").contains("CHECK THE NAME"),
+            "the typo case leads with the name, which is the whole reason refusing beats queuing"
         );
 
         // And nothing landed in the table for the archived lane. The returned
@@ -14190,6 +14307,50 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(rows, vec!["stopped".to_string()], "only the deliverable one is in the queue: {rows:?}");
+    }
+
+    /// What a sender reads on a permanent block, and WHERE that is decided.
+    ///
+    /// Both cases refuse and neither queues, which is the property that matters.
+    /// The wording differs by path, and that is the finding this cell records
+    /// rather than papers over: `deliver_automated` pre-checks BOTH permanent
+    /// conditions inline before it ever reaches the enqueue, so the reason
+    /// threaded out of `steer_enqueue_store` is not what this caller renders.
+    ///
+    /// I found that by mutation. Hardcoding the reason back into
+    /// `deliver_automated`'s Err branch left the whole suite green — because
+    /// that branch is UNREACHABLE from here, not because the test was weak. The
+    /// blocker amux-frustrations named is real and the fix is right, and it is
+    /// also currently unobservable, which is a different sentence from the one I
+    /// nearly wrote.
+    ///
+    /// The structural half is on the card: these conditions are now checked in
+    /// FIVE places (twice inline here, once in `steer_mutate`, once in
+    /// `permanently_blocked`), and this change added the chokepoint without
+    /// removing the copies. Collapsing them is what makes the threaded reason
+    /// live.
+    #[tokio::test]
+    async fn a_permanently_blocked_target_is_refused_and_nothing_is_queued() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("dead.env"), "CC_DIR=/tmp\nCC_ARCHIVED=\"1\"\n").unwrap();
+
+        for (lane, must_say) in [("dead", "archived"), ("amux-clod", "not a registered session")] {
+            let r = deliver_automated(&st, lane, "x", "").await;
+            assert!(r.refused, "{lane} must refuse: {}", r.message);
+            assert!(r.message.contains(must_say), "{lane}: {}", r.message);
+            assert!(r.queue_id.is_none(), "{lane}: nothing may be queued behind a permanent block");
+        }
+
+        // The queue really is empty — the assertion above is about the RETURN,
+        // this one is about the row that used to become immortal.
+        let conn = st.store.read().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT count(*) FROM steering_queue", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(n, 0, "a refused send must leave no row behind");
     }
 
     /// AMUX-3557. A guarded re-enqueue must NOT reset the message's age.
@@ -14212,11 +14373,19 @@ mod tests {
     #[tokio::test]
     async fn a_guarded_re_enqueue_keeps_its_place_in_the_queue() {
         let (st, _dir) = state();
+        // AF-188 widened the enqueue to refuse a target with no env file, so
+        // this fixture has to register the lane it sends to. Before, it queued
+        // for a lane that never existed — which is the shape the widening is
+        // meant to stop, and the reason three tests broke here rather than one.
+        let _g = crate::api::settings::test_env::set_home(_dir.path());
+        let sessions = _dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("lane.env"), "CC_DIR=/tmp\n").unwrap();
 
         // The guarded message is queued FIRST, so it is the oldest and must
         // stay first no matter how often it is refreshed.
         let first = steer_enqueue(&st, "lane", "/compact v1", "auto-compact", "").await
-            .expect("a non-archived lane must still queue");
+            .expect("a registered, non-archived lane must still queue");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         let _ = steer_enqueue(&st, "lane", "a peer message", "", "peer").await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
@@ -14224,7 +14393,7 @@ mod tests {
         // Re-fire the guarded one, as the auto-compact trigger does every few
         // seconds while the condition holds.
         let again = steer_enqueue(&st, "lane", "/compact v2", "auto-compact", "").await
-            .expect("a non-archived lane must still queue");
+            .expect("a registered, non-archived lane must still queue");
 
         assert_eq!(
             again, first,
