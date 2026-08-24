@@ -2901,3 +2901,40 @@ FIX: The close time exists, but only inside `log` as formatted prose (``05:08` s
   nobody downstream can tell. Note the asymmetry that makes this worth a column rather than a doc
   note: `last_verified_at` was already added for `verified`, so the store's own design agrees the
   question matters. It just answers it for one status out of seven.
+
+## A migration's COST is invisible to the test suite and to the logs, so a backfill took the server down for 186s
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3609
+SYMPTOM: Migration 0031 backfilled `issues.closed_at` from `_amux_state_events` with a
+  correlated subquery. `_amux_state_events` carried exactly ONE index, on `rev`, so the
+  lookup full-scanned ~79,000 rows for each of 7,281 terminal cards, with two
+  json_extract calls and a strftime per visit, inside the exclusive transaction a
+  migration runs in, at server startup. /health returned nothing for 186 seconds. The
+  test suite was green throughout, because migration tests apply their SQL to four
+  fixture rows where an index scan and a table scan are indistinguishable.
+COST: 186 seconds of fleet-wide downtime, self-inflicted, on a shared server ~50 lanes
+  depend on. Every session's `curl $AMUX_URL/...` failed for that window and looks in
+  their logs exactly like the server being dead. Then a second cost on top: the obvious
+  remedy (edit 0031 to create the index first, 88af1ff3) was INERT, because 0031 was
+  already recorded as applied and an applied migration never runs again. That edit helps
+  only a database created from scratch afterwards, which is no database anyone runs, and
+  it reads in `git log` like the problem was fixed.
+FIX: 66d34250. Two halves. (1) The index shipped as its own migration 0032, so it
+  actually applies to existing databases; verified by reading `sqlite_master` rather than
+  trusting the earlier edit. (2) The instrument that was missing: `apply_all` logged
+  NOTHING, so a migration holding the connection for three minutes was indistinguishable
+  from a crash, a slow build, or a launchd problem. Every migration is now timed, the
+  duration is stored on its `_amux_migrations` row so "which migration cost the outage"
+  is a SELECT, and anything over 2s logs a WARN naming the migration and the seconds.
+NOTE: The generalisable part is not "index your subqueries". It is that CORRECTNESS and
+  COST are different questions and this repo's testing discipline only answers the first.
+  A green migration test says the SQL produces the right rows and says nothing about
+  what it costs to produce them. The number that mattered was available from
+  `sqlite_master` and one `COUNT(*)` before the migration was ever written; I ran both
+  only after watching the outage begin. For any migration that touches the live board,
+  the cheap precondition is: how many rows does this scan, and is there an index for the
+  predicate it scans on.
