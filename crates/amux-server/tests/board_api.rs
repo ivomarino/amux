@@ -2253,6 +2253,65 @@ async fn the_desc_shrink_refusal_shows_how_to_append_not_just_the_field_name() {
         "the authorship branch must show the shape too — it is the one a REVIEWER reads,          and reviewers are who guessed the path: {err2:?}"
     );
     assert_eq!(v2["append_example"]["method"], json!("PATCH"), "{v2}");
+
+    // AF-191: THE TWO SPECIMENS THE NUMERIC FLOORS LET THROUGH, end to end, so
+    // this pins the WRITE SITE and not only the predicate. Both were reproduced
+    // against the running server on scratch cards and both returned
+    // `applied: true` with the owner's text gone.
+    //
+    // (a) a LONGER replacement. The old rule required a 200-char net LOSS, and
+    // this one grows, so nothing fired while every character was destroyed.
+    let grew = create(
+        &app,
+        json!({ "title": "owned", "status": "todo", "session": "lane-a",
+                "desc": "their line one\ntheir line two\ntheir line three" }),
+    )
+    .await;
+    let gid = grew["id"].as_str().unwrap().to_string();
+    let (st3, _, v3) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{gid}"),
+        Some(json!({ "desc": "TOTALLY DIFFERENT CONTENT, and noticeably longer than what it \
+                             replaced, which is the point of this case." })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st3, StatusCode::CONFLICT, "a LONGER replacement destroys just as much: {v3}");
+    assert_eq!(v3["rule"], json!("authorship"), "{v3}");
+
+    // (b) a SHORT card. The old rule required `before >= 200`; amux-cloud's
+    // reported incident was 54 chars replaced by 17.
+    let small = create(
+        &app,
+        json!({ "title": "owned", "status": "todo", "session": "lane-a",
+                "desc": "their whole one-line description here" }),
+    )
+    .await;
+    let sid = small["id"].as_str().unwrap().to_string();
+    let (st4, _, v4) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{sid}"),
+        Some(json!({ "desc": "mine now" })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st4, StatusCode::CONFLICT, "a SHORT desc is not exempt: {v4}");
+
+    // CONTROL, and it carries the weight: a peer editing ONE line of a
+    // multi-line write-up keeps the rest and must still pass, or the guard
+    // becomes a refusal met during ordinary work, which is how a safety
+    // property turns into a reflexive ack.
+    let (st5, _, v5) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{gid}"),
+        Some(json!({ "desc": "their line one\ntheir line TWO (typo fixed)\ntheir line three" })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st5, StatusCode::OK, "a typo fix that keeps the other lines must pass: {v5}");
 }
 
 /// AMUX-3567 REVIEW (amux-frustrations): the same answer for the WORKER tier,

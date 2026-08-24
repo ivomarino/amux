@@ -239,7 +239,7 @@ async fn get_contract(
         "recovering_a_clobbered_desc": {
             "where": "_amux_state_events rows carry the FULL pre-mutation card snapshot in                       their payload, so a description overwritten by a PATCH is recoverable                       without any backup",
             "how": "find the row for the mutation (by card id and timestamp) and read the                     snapshot out of its payload",
-            "prevention": "PATCH refuses two acts and the refusal body names which via `rule`: SIZE — a replace dropping a strict majority of a desc of 500+ chars, any writer; and AUTHORSHIP — a replace by a DIFFERENT session that drops 200+ chars of the card owner's prose without keeping it, at ANY magnitude (AF-180 was 36% and destroyed a peer review just as thoroughly). Both escape via desc_shrink_ack. To ADD rather than replace — almost always what a reviewer means — send PATCH /api/board/<id> {\"desc_append\": \"your note\"}. `desc_append` is a FIELD in the PATCH body, not a sub-path: POST /api/board/<id>/desc-append is NOT routed and a lane guessed it twice on 2026-08-24 (AF-187)",
+            "prevention": "PATCH refuses two acts and the refusal body names which via `rule`: SIZE — a replace dropping a strict majority of a desc of 500+ chars, any writer; and AUTHORSHIP — a replace by a DIFFERENT session in which NONE of the card owner's lines survive, at any magnitude and in either direction. Length is not the test: a 54-char desc replaced by 17 chars and a 264-char desc replaced by 392 both destroyed everything and both passed the old size floors (AF-191). Both escape via desc_shrink_ack. To ADD rather than replace — almost always what a reviewer means — send PATCH /api/board/<id> {\"desc_append\": \"your note\"}. `desc_append` is a FIELD in the PATCH body, not a sub-path: POST /api/board/<id>/desc-append is NOT routed and a lane guessed it twice on 2026-08-24 (AF-187)",
             "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head and \"slim\": 1). An ABSENT field is not an empty                                  one, and .get(\"desc\") returns None either way — read                                  desc_len, or GET the single card",
         },
         "list": {
@@ -2359,7 +2359,7 @@ pub(crate) fn desc_replace_destroys_peer_prose(
     if lines.peek().is_none() {
         return false;
     }
-    !lines.any(|l| new.contains(l))
+    !lines.any(|l| new.contains(l)) && old.chars().count().saturating_sub(new.chars().count()) >= 200
 }
 
 pub async fn patch_item(
@@ -4588,14 +4588,25 @@ mod slim_tests {
         // Mirrors the predicates at the write site. If those change, this must
         // change with them and deliberately.
         let size = |before: usize, after: usize| before >= 500 && after * 2 < before;
-        let authorship = |owner: &str, writer: &str, old: &str, new: &str| {
-            let before = old.chars().count();
-            let after = new.chars().count();
-            let cross = !writer.is_empty() && !owner.is_empty() && owner != writer;
-            cross && before >= 200 && !new.contains(old.trim())
-                && before.saturating_sub(after) >= 200
+        // THE SHIPPED PREDICATE, not a restatement of it. This used to be a
+        // closure mirroring the write site, with a comment asking the next
+        // editor to keep the two in step by hand — which is testing a paraphrase
+        // (ethos rule 7), and is how the two numeric floors below stayed wrong
+        // for weeks with this test green beside them.
+        let authorship = desc_replace_destroys_peer_prose;
+        // Multi-LINE, because a desc is prose and the rule now asks whether any
+        // of the owner's lines survive. A single 3000-character run of 'x' is
+        // not a description, and building the controls out of one is the
+        // fixture-domain error ethos rule 7 names: it cannot express "one line
+        // was edited and the rest were not", which is the whole distinction
+        // between a typo fix and a clobber.
+        let text = |n: usize| {
+            let mut out = String::new();
+            for i in 0..n.div_ceil(60) {
+                out.push_str(&format!("line {i} of the owner's write-up, about sixty chars.\n"));
+            }
+            out
         };
-        let text = |n: usize| "x".repeat(n);
 
         // -- the real incidents ------------------------------------------------
         // mvs-infra / MI-4746: 4082 chars of merge evidence -> a short note.
@@ -4605,12 +4616,32 @@ mod slim_tests {
         // rule misses it; that miss is the entire reason AMUX-3576 exists.
         assert!(!size(3055, 1958), "36% is under the size bar — this is the gap, stated");
         assert!(
-            authorship("amux-frustrations", "amux", &text(3055), &text(1958)),
+            authorship("amux-frustrations", "amux", &text(3055), "my replacement note"),
             "a reviewer replacing the author's prose must be refused at ANY magnitude"
         );
 
         // AF-179: the same act at 46%, which the live guard already refused.
-        assert!(authorship("amux-frustrations", "amux", &text(4573), &text(2103)));
+        assert!(authorship("amux-frustrations", "amux", &text(4573), "shorter note"));
+
+        // AF-191, the two live specimens the numeric floors let through. Both
+        // were reproduced against the running server on scratch cards, and both
+        // returned `applied: true` with the owner's text gone.
+        assert!(
+            authorship("amux-cloud", "amux", "their whole one-line description", "17 chars ok"),
+            "amux-cloud's specimen: a 54-char desc replaced by 17. The old `before >= 200` \
+             floor let it through, and the friction it reported is a peer destroying a SHORT \
+             card, which is most cards"
+        );
+        assert!(
+            authorship(
+                "amux-frustrations",
+                "amux-cloud",
+                &text(264),
+                &format!("{}{}", "TOTALLY DIFFERENT CONTENT. ".repeat(14), "and longer.")
+            ),
+            "my specimen: a LONGER replacement destroys everything and lost zero characters \
+             net, so the old delta floor could never fire on it"
+        );
 
         // -- CONTROLS: every one of these is legitimate --------------------------
         let orig = text(3000);
@@ -4631,19 +4662,24 @@ mod slim_tests {
             !authorship("", "amux", &text(3055), &text(1958)),
             "nor on an ownerless card"
         );
-        // A typo fix on a peer's card: different text, nearly no loss.
-        let typo_fixed = format!("{}y", text(2999));
+        // A typo fix on a peer's card: one line edited, the rest untouched.
+        // THIS is the control the net-loss floor was standing in for, and it
+        // still passes without a threshold, because the other lines survive.
+        let typo_fixed = text(3000).replacen("about sixty chars.", "about sixty charz.", 1);
         assert!(
             !authorship("amux-frustrations", "amux", &text(3000), &typo_fixed),
-            "correcting a peer's typo loses nothing and must pass"
-        );
-        assert!(
-            !authorship("amux-frustrations", "amux", &text(150), &text(10)),
-            "a very short desc is below the floor — not worth a refusal"
+            "correcting a typo in ONE line of a peer's write-up leaves the rest and must pass"
         );
         assert!(
             !authorship("amux-frustrations", "amux", &text(3000), &text(2900)),
-            "trimming 100 chars off a peer's card is under the net-loss floor"
+            "trimming a peer's card while keeping most of their lines must pass"
+        );
+        // THE FLOOR THAT IS GONE, asserted in its new direction so removing it
+        // cannot be quietly undone. A short desc used to be exempt at any cost;
+        // it is amux-cloud's incident.
+        assert!(
+            authorship("amux-frustrations", "amux", "one short line of theirs", "mine instead"),
+            "a SHORT desc is not exempt any more — 54 chars was the reported incident"
         );
 
         // -- the size rule's own controls, unchanged ----------------------------
