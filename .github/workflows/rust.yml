@@ -136,6 +136,16 @@ jobs:
       - name: runtime smoke -- board status-update refuses flag-shaped prose (MHC-377 data loss)
         run: bash scripts/test-cli-status-update-flags.sh
 
+      # AF-195. The guard refuses a commit whose staged bytes are not the bytes
+      # on disk, and must NOT refuse `git commit -a` or `git commit -- <path>`,
+      # which resolve through a temporary index built FROM the working tree.
+      # That second half is a claim about git's behaviour rather than about our
+      # code, so it needs a real repo and a real `git commit` — reading the hook
+      # cannot settle it, and getting it wrong makes the guard fire on every
+      # ordinary commit, which is how a guard becomes a thing people bypass.
+      - name: runtime smoke -- staged-guard refuses an index that is not the worktree (AF-195)
+        run: bash scripts/test-index-worktree-divergence.sh
+
   e2e:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
     # browser against the real server + real extracted dashboard.
