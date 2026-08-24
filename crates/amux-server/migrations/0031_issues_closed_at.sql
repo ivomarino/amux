@@ -51,6 +51,20 @@
 -- NULL and is skipped by the WHERE, so an unparseable timestamp leaves the
 -- column NULL rather than writing a wrong date — the loud direction stays the
 -- default.
+-- INDEX FIRST, and it is load-bearing rather than tidy. `_amux_state_events`
+-- carried exactly ONE index (on `rev`), so a correlated lookup by entity is a
+-- full scan of ~79,000 rows. The backfill below touches 7,281 terminal cards,
+-- which without this is ~576 million row visits with two json_extract calls and
+-- a strftime on each, inside the exclusive transaction a migration runs in, at
+-- server startup. That is not a slow query, it is an outage.
+--
+-- It also fixes a hot path that was already paying the same cost: `/api/why`
+-- selects `WHERE entity_type = ?1 AND entity_id = ?2` on every lineage load and
+-- was full-scanning the journal every time. Surfacing that trail on the card
+-- (AMUX-2393, 68d54aaf) is what made it hot.
+CREATE INDEX IF NOT EXISTS idx_amux_state_events_entity
+    ON _amux_state_events(entity_type, entity_id);
+
 UPDATE issues
    SET closed_at = (
         SELECT CAST(MAX(strftime('%s', e.at)) AS INTEGER)
