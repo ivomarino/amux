@@ -612,14 +612,46 @@ pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Optio
         let want = v.trim().trim_matches('"').trim_matches('\'');
         match lookup(k) {
             Some(got) if got == want => out.push(InvariantResult::pass(ID).entity(k)),
-            Some(_) => out.push(
-                InvariantResult::fail(ID, format!("{k} = (server.env value)"), format!("{k} = (different process value)"))
+            // TWO STATES BEHIND ONE SYMPTOM, with opposite remedies (AMUX-3612).
+            // Drift alone used to be the whole message, so a reader could not
+            // tell a value that WILL self-heal on the next redeploy from one
+            // that never will, and the invariant read as chronic noise.
+            //
+            // `AMUX_ENV_FROM_FILE` names the keys this server exported from
+            // server.env, carried across the self-adoption exec. If the drifting
+            // key is in it, the refresh mechanism is broken and that is a real
+            // defect. If it is absent, this process lineage predates the marker:
+            // its exports are indistinguishable from launchd's own environment,
+            // they are deliberately left alone, and no amount of redeploying
+            // clears them because self-adoption re-execs with the inherited env.
+            Some(_) => {
+                let ours = lookup(crate::config::ENV_FROM_FILE_MARKER)
+                    .unwrap_or_default()
+                    .split(',')
+                    .any(|m| m.trim() == k);
+                let (class, remedy) = if ours {
+                    ("config-drift-despite-refresh",
+                     "this key IS marked as server-exported, so ServerConfig::load should have \
+                      refreshed it on the last boot and did not — a real defect in the refresh path")
+                } else {
+                    ("config-drift-unmarked-lineage",
+                     "this process lineage predates AMUX_ENV_FROM_FILE, so the value is pinned \
+                      until a REAL restart: `launchctl kickstart -k gui/$(id -u)/com.amux.server-rs`. \
+                      Redeploying will not clear it — self-adoption re-execs with the inherited env")
+                };
+                out.push(
+                    InvariantResult::fail(
+                        ID,
+                        format!("{k} = (server.env value)"),
+                        format!("{k} = (different process value) — {remedy}"),
+                    )
                     .entity(k)
                     .evidence(json!({
-                        "key": k, "class": "config-drift",
+                        "key": k, "class": class, "server_exported": ours, "remedy": remedy,
                         "note": "values intentionally omitted — server.env holds credentials",
                     })),
-            ),
+                )
+            }
             None => out.push(
                 InvariantResult::fail(ID, format!("{k} present in process env"), format!("{k} unset in process env"))
                     .entity(k)
@@ -2290,6 +2322,50 @@ mod negative_controls {
         let failed: Vec<_> = rs.iter().filter(|r| r.status == Status::Fail).collect();
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].entity_key, "AMUX_RS_SCHEDULER");
+    }
+
+    /// AMUX-3612. Drift alone was one output covering two states with OPPOSITE
+    /// remedies: a value that will self-heal on the next redeploy, and one that
+    /// never will because self-adoption re-execs with the inherited env. Both
+    /// used to read as "different process value" and the invariant looked like
+    /// chronic noise.
+    ///
+    /// Both arms asserted together on the same drift, because the claim is
+    /// precisely that the two are TOLD APART — pinning one alone would pass
+    /// against a version that prints the same sentence for both.
+    #[test]
+    fn drift_says_whether_a_restart_is_required_or_the_refresh_itself_broke() {
+        let envf = "MARKED=want\nUNMARKED=want\n";
+        let rs = config_env_reaches_process(envf, &|k| match k {
+            "MARKED" | "UNMARKED" => Some("stale".into()),
+            // Only MARKED is claimed as server-exported.
+            crate::config::ENV_FROM_FILE_MARKER => Some("MARKED,SOMETHING_ELSE".into()),
+            _ => None,
+        });
+        let get = |k: &str| rs.iter().find(|r| r.entity_key == k).expect("a result per key");
+
+        let marked = get("MARKED");
+        assert_eq!(marked.status, Status::Fail);
+        assert_eq!(marked.evidence["class"], "config-drift-despite-refresh");
+        assert!(
+            marked.observed.contains("refreshed it on the last boot and did not"),
+            "a marked key that drifted means the refresh path is broken: {}",
+            marked.observed
+        );
+
+        let unmarked = get("UNMARKED");
+        assert_eq!(unmarked.status, Status::Fail);
+        assert_eq!(unmarked.evidence["class"], "config-drift-unmarked-lineage");
+        assert!(
+            unmarked.observed.contains("launchctl kickstart"),
+            "an unmarked key must name the ONLY thing that clears it: {}",
+            unmarked.observed
+        );
+        assert!(
+            unmarked.observed.contains("Redeploying will not clear it"),
+            "and must say the obvious remedy does not work, which is the part that cost the time: {}",
+            unmarked.observed
+        );
     }
 
     /// Quoted values must not be reported as drift — a value read with its
