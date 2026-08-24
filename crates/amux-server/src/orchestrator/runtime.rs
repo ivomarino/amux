@@ -2196,6 +2196,20 @@ mod adherence_tests {
     #[tokio::test]
     async fn a_deictic_prompt_flags_its_card_and_asks_the_worker_to_rewrite_it() {
         let store = store();
+        // AF-188 made the shared enqueue REFUSE a target with no session env
+        // file, so a worker that exists only as a store row is now undeliverable
+        // and the ask below silently never queues. `seed_worker` writes the row;
+        // it has never written the file, which did not matter until the enqueue
+        // started asking. Register it.
+        //
+        // This is the fourth fixture the widening caught and the first that was
+        // NOT in session_verbs — which is why it survived my post-change suite
+        // run and went red in CI instead. A change to a chokepoint reaches every
+        // caller's tests, including the ones in modules you did not open.
+        let _home = tempfile::tempdir().unwrap();
+        let _g = crate::api::settings::test_env::set_home(_home.path());
+        std::fs::create_dir_all(_home.path().join("sessions")).unwrap();
+        std::fs::write(_home.path().join("sessions/alpha.env"), "CC_DIR=/tmp\n").unwrap();
         let w = seed_worker(&store, 7, "alpha");
         let protocol = Arc::new(MockProtocol::new());
         protocol.register(w.clone(), AgentState::Idle);
