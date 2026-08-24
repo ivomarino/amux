@@ -603,6 +603,22 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
     (out, suppressed)
 }
 
+/// Per-family latency samples WITH the counts that produced them (AF-178).
+///
+/// `win`/`base` are what survived filtering; `win_raw`/`base_raw` are how many
+/// rows the detector actually looked at. Keeping both is the whole point: a
+/// family with 46,825 baseline rows and zero survivors and a family with no
+/// traffic at all used to render as the identical sentence, "baseline has 0
+/// samples (<30)", so a dead detector wore a quiet endpoint's clothes and its
+/// own debug surface certified it as normal operation.
+#[derive(Default)]
+struct FamilySamples {
+    win: Vec<f64>,
+    base: Vec<f64>,
+    win_raw: usize,
+    base_raw: usize,
+}
+
 #[derive(Default)]
 struct Group {
     count: u64,
@@ -674,13 +690,35 @@ fn spans_restart(ts: f64, latency_ms: f64, boot: Option<f64>) -> bool {
 }
 
 pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
+    detect_latency_at(conn, now, crate::runtime_jobs::heartbeat::boot_at())
+}
+
+/// [`detect_latency`] with the boot boundary passed in rather than read from the
+/// process (AF-178).
+///
+/// The boundary lives in a `OnceLock` that is set once per process and cannot be
+/// set twice, so with only the public entry point a test can exercise the
+/// filter's TRUE branch exactly once per test binary, and doing so leaks into
+/// every other test in the file. That is not a seam, it is a coin flip on test
+/// order — and the filter's true branch is precisely the code path that
+/// deleted 213,397 rows on 2026-08-23.
+///
+/// The wrapper above is the only production caller and adds nothing, so a test
+/// through this function is a test of the shipped path, not of a paraphrase of
+/// it (rule 7: the fixture has to flow through the code where the defect would
+/// be introduced).
+pub(crate) fn detect_latency_at(
+    conn: &Connection,
+    now: f64,
+    boot: Option<f64>,
+) -> (Vec<Finding>, Vec<Suppressed>) {
     let w_start = now - window_h() * 3600.0;
     let b_start = now - baseline_h() * 3600.0;
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
     let min_n = latency_min_samples();
 
-    let mut per_family: BTreeMap<String, (Vec<f64>, Vec<f64>)> = BTreeMap::new();
+    let mut per_family: BTreeMap<String, FamilySamples> = BTreeMap::new();
     // Rows stamped slow_ok are REQUESTED latency, not service latency
     // (AMUX-3513): a browser `wait` action polls for up to its caller-chosen
     // budget and a timed-out wait is a 200 at exactly that budget — twelve of
@@ -712,46 +750,111 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
             // `None` means the process never recorded a boot — every row is
             // kept, because excluding on an unknown boundary would silently
             // drop everything and look exactly like a filter that worked.
-            let boot = crate::runtime_jobs::heartbeat::boot_at();
             let mut spanned_restart = 0usize;
+            let mut considered = 0usize;
             for (fam, ms, ts) in rows.flatten() {
-                if spans_restart(ts, ms, boot) {
+                considered += 1;
+                // COUNT THE ROW BEFORE DECIDING ITS FATE (AF-178). The entry is
+                // taken unconditionally so a family whose rows are ALL filtered
+                // still exists in the map with its pre-filter counts. Under the
+                // old shape it vanished from `per_family` entirely and produced
+                // no suppression at all — the quietest way for a detector to
+                // stop working.
+                let spanned = spans_restart(ts, ms, boot);
+                if spanned {
                     spanned_restart += 1;
-                    continue;
                 }
                 let e = per_family.entry(fam).or_default();
                 if ts >= w_start {
-                    e.0.push(ms);
+                    e.win_raw += 1;
+                    if !spanned {
+                        e.win.push(ms);
+                    }
                 } else {
-                    e.1.push(ms);
+                    e.base_raw += 1;
+                    if !spanned {
+                        e.base.push(ms);
+                    }
                 }
             }
-            if spanned_restart > 0 {
-                // Say it, or the exclusion is indistinguishable from there
-                // being nothing to exclude — and a detector that quietly drops
-                // rows is the one nobody can audit.
-                tracing::info!(
-                    excluded = spanned_restart,
-                    boot_at = boot.unwrap_or(0.0),
-                    "latency: ignored request(s) whose clock spans this process's start — \
-                     wall time across a restart is not service time (AF-175)"
+            // UNCONDITIONAL, INCLUDING ZERO (AF-178). This line used to print
+            // only when something was excluded, which made "the filter ran and
+            // dropped nothing" and "no tick happened" byte-identical silences.
+            // That cost a real measurement the same night it shipped: the
+            // corrected two-sided predicate could not be confirmed, three
+            // attempts running, because its success state emitted nothing and
+            // this server is replaced faster than the ~2-minute tick. An
+            // instrument that only speaks when the news is bad cannot tell you
+            // it is working.
+            tracing::info!(
+                considered,
+                excluded = spanned_restart,
+                boot_at = boot.unwrap_or(0.0),
+                "latency: scanned request rows; excluded those whose clock spans this \
+                 process's start — wall time across a restart is not service time (AF-175)"
+            );
+            if considered >= 400_000 {
+                // The query's LIMIT is binding, so the sample is a silent,
+                // unordered truncation of the period rather than the period.
+                // A cap's direction is part of its correctness (AF-131) and
+                // this one has no ORDER BY, so which rows survive is arbitrary.
+                tracing::warn!(
+                    considered,
+                    "latency: row cap reached — the p95 window is a TRUNCATED, unordered \
+                     sample of the period and the percentiles below are not the period's"
                 );
             }
         }
     }
-    for (fam, (mut win, mut base)) in per_family {
+    // AF-178: families whose rows were ALL filtered away. Collected here rather
+    // than judged inline because one card naming every affected family is a
+    // report, and one card per family is a backlog (rule 5).
+    let mut collapsed: Vec<(String, &'static str, usize)> = Vec::new();
+    for (fam, fs) in per_family {
+        // A SIDE WITH PLENTY OF ROWS AND NO SURVIVORS IS A DETECTOR OUTAGE, not
+        // a quiet endpoint. Nothing legitimately discards 100% of a busy
+        // family's rows: `slow_ok` is excluded in SQL and never reaches this
+        // count, so everything measured here was dropped by a predicate in the
+        // loop above. Named honestly: this catches in-loop filters, and would
+        // NOT catch an over-broad clause added to the query itself, because
+        // that lowers `*_raw` in step. If you add a WHERE clause, add its
+        // counterpart here.
+        if fs.win_raw >= min_n as usize && fs.win.is_empty() {
+            collapsed.push((fam.clone(), "window", fs.win_raw));
+        }
+        if fs.base_raw >= min_n as usize && fs.base.is_empty() {
+            collapsed.push((fam.clone(), "baseline", fs.base_raw));
+        }
+        let (mut win, mut base) = (fs.win, fs.base);
         if (win.len() as i64) < min_n {
             continue; // Not enough traffic to say anything. Not a suppression:
                       // there is no candidate here, only silence.
         }
         if (base.len() as i64) < min_n {
+            // SAY WHAT WAS THERE BEFORE THE FILTER (AF-178). "baseline has 0
+            // samples" is true of a brand-new install and true of a detector
+            // whose input was just deleted by a bad predicate, and only the
+            // second is a bug report. The pre-filter count is the whole
+            // difference and it is already in hand.
+            let reason = if fs.base_raw == 0 {
+                format!(
+                    "no rows at all in the {:.0}h baseline period — no trailing norm to \
+                     compare against yet",
+                    baseline_h()
+                )
+            } else {
+                format!(
+                    "baseline has {} of {} rows in the period after filtering (<{min_n}) — \
+                     {} were excluded before the percentile",
+                    base.len(),
+                    fs.base_raw,
+                    fs.base_raw - base.len()
+                )
+            };
             suppressed.push(sup(
                 DetectorKind::Latency,
                 &format!("latency|p95|{fam}"),
-                &format!(
-                    "baseline has {} samples (<{min_n}) — no trailing norm to compare against yet",
-                    base.len()
-                ),
+                &reason,
             ));
             continue;
         }
@@ -804,6 +907,61 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
             ),
             owner: None,
             count: win.len() as u64,
+            last_ts: now,
+        });
+    }
+
+    // AF-178: THE DETECTOR REPORTS ITS OWN BLINDNESS.
+    //
+    // Filed as an ordinary Finding so it rides the pipeline that already turns
+    // a detector's output into a board card — no new mechanism, and the
+    // signature carries the affected families so a DIFFERENT collapse is
+    // different news while the same one stays idempotent.
+    //
+    // The incident this exists for: d0c034ad shipped a one-sided restart filter
+    // that excluded 213,397 of 213,935 rows. Every family's baseline went to
+    // zero, the latency regression shape could not fire at all, and the only
+    // trace was two suppressions reading "baseline has 0 samples (<30)" for the
+    // two busiest families in the system. It was found by a human reading that
+    // specific commit. Nothing in amux could have surfaced it, which is the
+    // half that makes a fix a class kill rather than one bug.
+    if !collapsed.is_empty() {
+        let mut fams: Vec<&str> = collapsed.iter().map(|(f, _, _)| f.as_str()).collect();
+        fams.sort_unstable();
+        fams.dedup();
+        let discarded: usize = collapsed.iter().map(|(_, _, n)| *n).sum();
+        let detail = collapsed
+            .iter()
+            .map(|(f, side, n)| format!("{f} {side}: 0 of {n} rows survived"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        out.push(Finding {
+            kind: DetectorKind::Latency,
+            signature: format!("latency|input-collapsed|{}", fams.join(",")),
+            title: format!(
+                "latency detector is blind on {} — every row filtered out ({discarded} discarded)",
+                fams.join(", ")
+            ),
+            evidence: vec![
+                ("verdict".into(), format!(
+                    "{} famil{} had at least {min_n} request rows in the period and ZERO of them \
+                     survived filtering, so no percentile can be computed and no regression can \
+                     be filed for them. This is a detector outage, not a quiet endpoint: the \
+                     rows exist and something in detect_latency discarded all of them. Look at \
+                     the most recently changed predicate in that function.",
+                    fams.len(),
+                    if fams.len() == 1 { "y" } else { "ies" },
+                )),
+                ("families".into(), fams.join(", ")),
+                ("rows_discarded".into(), discarded.to_string()),
+                ("detail".into(), detail),
+                ("min_samples".into(), min_n.to_string()),
+            ],
+            recheck: "curl -sk \"$AMUX_URL/api/debug/autofix\" | python3 -c \"import json,sys; \
+                      d=json.load(sys.stdin)['last']; print([s for s in d['suppressed'] \
+                      if s['detector']=='latency'])\"".into(),
+            owner: None,
+            count: collapsed.len() as u64,
             last_ts: now,
         });
     }
@@ -4393,6 +4551,148 @@ mod tests {
         // failure this whole card is about, one layer up.
         assert!(!spans_restart(boot + 14.0, 58_400.0, None));
         assert!(!spans_restart(0.0, 999_999.0, None));
+    }
+
+    /// AF-178. A DETECTOR THAT CANNOT SEE MUST SAY SO.
+    ///
+    /// On 2026-08-23 a one-sided restart filter (d0c034ad) excluded 213,397 of
+    /// 213,935 rows. Every family's baseline went to zero, the regression shape
+    /// could not fire at all, and the single trace anywhere in the system was
+    /// two suppressions reading "baseline has 0 samples (<30)" for /api/board
+    /// and /api/sessions — which have 46,825 and 122,848 rows in the period and
+    /// are the busiest families there are. That sentence is also what a
+    /// brand-new install emits, so a dead detector wore a quiet endpoint's
+    /// clothes and `/api/debug/autofix` certified it as normal.
+    ///
+    /// Both halves are asserted here: the alarm fires, AND the suppression
+    /// carries the pre-filter count that separates the two states.
+    ///
+    /// THE CONTROL IS A LOGIC MUTATION. The second half runs the identical
+    /// fixture with `boot = None`, which changes what the filter CONCLUDES and
+    /// changes no string anywhere. Flip `spans_restart`'s comparison and the
+    /// two halves swap; nothing about the wording moves.
+    #[tokio::test]
+    async fn a_baseline_deleted_by_a_filter_is_an_alarm_not_a_quiet_suppression() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // A boot inside the baseline period. Sixty baseline rows ARRIVE before
+        // it and COMPLETE after it, which is the real restart-spanning shape.
+        let boot = now - 100_000.0;
+        for i in 0..60 {
+            log_row(&st, Row { ts: boot + i as f64, method: "GET", path: "/api/collapse", family: "/api/collapse", status: 200, body: "", worker: "", ua: "curl/8", ms: 200_000.0 });
+        }
+        // Ordinary window traffic, well after the boot: never spanning.
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/collapse", family: "/api/collapse", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+        }
+
+        let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, Some(boot));
+        let hit = f
+            .iter()
+            .find(|x| x.signature.starts_with("latency|input-collapsed"))
+            .unwrap_or_else(|| panic!("a family with 60 baseline rows and 0 survivors is a detector outage and must file: {f:?}"));
+        assert!(hit.signature.contains("/api/collapse"), "the card must name the family: {}", hit.signature);
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        assert_eq!(ev["rows_discarded"], "60", "state how many rows were thrown away: {ev:?}");
+        assert!(ev["detail"].contains("0 of 60"), "state both counts: {ev:?}");
+
+        // And the suppression must no longer be sayable by a quiet endpoint.
+        let sup_txt = s
+            .iter()
+            .find(|x| x.signature == "latency|p95|/api/collapse")
+            .map(|x| x.reason.clone())
+            .unwrap_or_default();
+        assert!(
+            sup_txt.contains("0 of 60"),
+            "the suppression must carry the PRE-filter count, or it reads as sparse data: {sup_txt:?}"
+        );
+
+        // CONTROL — same rows, no boot boundary, so the filter keeps everything.
+        // No alarm, and no suppression at all, which is what proves the 60
+        // baseline rows really survived rather than the alarm being unreachable.
+        let (f2, s2) = detect_latency_at(&st.store.read().unwrap(), now, None);
+        assert!(
+            !f2.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            "nothing was filtered, so there is no collapse to report: {f2:?}"
+        );
+        assert!(
+            !s2.iter().any(|x| x.signature == "latency|p95|/api/collapse"),
+            "a 60-row baseline needs no suppression — if this fires the rows were dropped: {s2:?}"
+        );
+    }
+
+    /// AF-178, the other side of the discrimination: an endpoint that is simply
+    /// NEW must not be described as if something ate its rows. If both states
+    /// produced the same sentence the alarm above would be worthless, since the
+    /// whole defect was that one sentence covered both.
+    #[tokio::test]
+    async fn an_endpoint_with_no_history_reads_differently_from_one_that_was_filtered() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // Window traffic only. Nothing in the baseline period at all.
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/fresh", family: "/api/fresh", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+        }
+        // A second family with a real, thin, unfiltered baseline.
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/thin", family: "/api/thin", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+        }
+        for i in 0..5 {
+            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/thin", family: "/api/thin", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+        }
+
+        let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, None);
+        assert!(
+            !f.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            "no rows were discarded, so nothing collapsed: {f:?}"
+        );
+        let fresh = s.iter().find(|x| x.signature == "latency|p95|/api/fresh")
+            .map(|x| x.reason.clone()).unwrap_or_default();
+        assert!(
+            fresh.contains("no rows at all"),
+            "a family with no history must say so plainly: {fresh:?}"
+        );
+        assert!(
+            !fresh.contains("filtering"),
+            "nothing was filtered here — saying so is the confusion this card exists to end: {fresh:?}"
+        );
+        let thin = s.iter().find(|x| x.signature == "latency|p95|/api/thin")
+            .map(|x| x.reason.clone()).unwrap_or_default();
+        assert!(
+            thin.contains("5 of 5"),
+            "a thin but intact baseline must show kept AND considered: {thin:?}"
+        );
+    }
+
+    /// AF-175 AT THE SHIPPED-PATH LEVEL, which is the layer the incident
+    /// actually happened at. `spans_restart`'s own cells pin the predicate;
+    /// this one pins `detect_latency`, because the 213,397-row deletion was
+    /// only visible once the predicate met a real 72-hour baseline.
+    ///
+    /// This server restarts ~27 times a day, so almost every baseline row
+    /// predates the current boot. Under the one-sided predicate that shipped in
+    /// d0c034ad every row here is discarded and the assertions below both fail.
+    #[tokio::test]
+    async fn a_baseline_older_than_this_boot_is_ordinary_data_not_an_outage() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The real shape: the process started seconds ago; all history is older.
+        let boot = now - 10.0;
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/hist", family: "/api/hist", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+        }
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/hist", family: "/api/hist", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+        }
+        let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, Some(boot));
+        assert!(
+            !f.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            "a 6ms row from before this boot never spanned anything and must be kept: {f:?}"
+        );
+        assert!(
+            !s.iter().any(|x| x.signature == "latency|p95|/api/hist"),
+            "120 intact rows need no suppression — this firing means the baseline was eaten: {s:?}"
+        );
     }
 
     /// AMUX-3513, rebuilt from the incident's numbers: twelve browser `wait`
