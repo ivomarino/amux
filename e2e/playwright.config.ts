@@ -131,6 +131,29 @@ export default defineConfig({
       // "rejects a bad token" assertion is a check that cannot pass — it was
       // read as an auth regression on 2026-08-09 when the code was correct.
       AMUX_RS_NO_LOOPBACK_BYPASS: '1',
+      // SELF-ADOPTION OFF, or the suite restarts its own servers mid-run.
+      //
+      // Three servers start here (desktop, mobile, ios-safari) and each is a
+      // `cargo run` that rebuilds into the SAME target dir. Every rebuild
+      // rewrites `target/debug/amux-server`, and a running server watches that
+      // path and exec's itself when it changes — the local dev-loop feature
+      // where the builder swaps the binary underneath you. In CI it means
+      // starting server #2 knocks over server #1, and starting #3 knocks over
+      // both, each for the ~10s a cold start takes.
+      //
+      // Measured on PR 148's run 32671387493: three `binary changed on disk —
+      // exec'ing the new build in place` lines at 22:46:34, 22:47:33 and
+      // 22:47:34, each immediately after a sibling target's build finished, and
+      // four tests failing `net::ERR_CONNECTION_REFUSED at
+      // https://localhost:18823/` while 228 passed. The failures land on
+      // whichever specs happen to navigate during a re-exec, so they move run to
+      // run and read as flakes — and they blocked an outside contributor's PR
+      // for a reason that had nothing to do with their change.
+      //
+      // AMUX_NO_SELF_ADOPT already existed (AEAB-52). The one place that most
+      // needed it was not enrolled, which is this repo's rule-1 shape: a
+      // capability that exists and does not reach the caller.
+      AMUX_NO_SELF_ADOPT: '1',
     },
   })),
 });
