@@ -2805,3 +2805,36 @@ NOTE: This is the transient-unbuildable half of AF-182 that I own, showing up in
   a peer's TEST RUN, where there is no filename in the output to attribute — you get an
   arithmetic difference between two numbers and no clue whose edit caused it. e6077bcb fixed the
   commit path; neither of us has fixed the ad-hoc path, and this is the second cost from it.
+
+## Discarding a spurious autofix card refiles it, so doing the right thing loops
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3591
+SYMPTOM: One server hang filed the identical card four times — AMUX-3581 (01:12), 3589 (01:26),
+  3591 (01:35), 3594 (01:55) — same signature byte for byte, same 19 rows, zero new information.
+  Each filing was triggered by the previous one being DISCARDED. Discarding an auto-filed report
+  deletes its dedupe idem to re-arm the detector (board.rs, AF-137), which is correct for a
+  CONDITION whose refile should require the condition to be live again. The 5xx signature carried
+  no occurrence identity, so "recurrence" meant "any 5xx on that path still inside the 6h window"
+  and the same historical rows kept qualifying.
+COST: Four lane-turns, three of them mine, each a full scope-and-decide cycle on a card that was
+  never a defect. Worse than the count: every round was a worker doing exactly the right thing.
+  Judging a spurious report and discarding it is the sanctioned disposition, and it was the thing
+  driving the loop.
+FIX: 01b4cf53 — occurrence identity in the 5xx signature plus `5xx|` added to the re-arm skip,
+  mirroring what AMUX-3472 already did for latency outliers. Same rows re-scanned now mint the
+  same signature; a genuinely new 5xx mints a new one and files regardless, pinned by a control
+  so this does not trade a refile loop for a detector that goes silent after one discard.
+NOTE: Two things worth more than the bug. First, I diagnosed it WRONG twice — assumed discard
+  caused it, then talked myself out of it because `already_filed` reads a durable idem and never
+  checks card status, and wrote that up as a dead hypothesis. Both readings missed that the
+  discard does not bypass the dedupe, it DELETES it, in a file I had not grepped. The comment
+  naming the hook was in code I had already read that night (autofix.rs:1185). It took a THIRD
+  filing to make me look instead of reason. Second, the correct DISPOSITION changed with the
+  deploy state: with the fix merged but not running (builder dead since 00:01, AMUX-3585),
+  discarding still loops, so AMUX-3594 was closed `done` instead — the re-arm hook fires only on
+  the discard transition. Nothing in the card, the gate or the idle nudge can tell you that, and
+  the nudge's own option 5 recommends the action that restarts the loop.
