@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.714';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.715';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24420,6 +24420,13 @@ function _bdLineageHtml(d, id) {
         + (capped ? '<span class="bd-lin-cap">capped'
             + (d.per_source_cap ? ' at ' + esc(String(d.per_source_cap)) : '') + '</span>' : '')
         + (s.query ? '<span class="bd-lin-dim">' + esc(String(s.query)) + '</span>' : '')
+        // The endpoint attaches a `note` to a source whenever the row count
+        // alone would mislead — a reaped journal whose floor postdates the card,
+        // events that record THAT something changed but not into what, or the
+        // receipt that says a trail really is complete. Dropping it recreated
+        // the exact defect one layer up that the note exists to prevent: the
+        // panel looked careful and printed a number with no caveat attached.
+        + (s.note ? '<div class="bd-lin-srcnote">' + esc(String(s.note)) + '</div>' : '')
         + '</div>';
     });
     h += '</div>';

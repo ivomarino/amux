@@ -5584,6 +5584,12 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 .bd-lin-rows { font-variant-numeric: tabular-nums; color: var(--dim); }
 .bd-lin-cap { color: #d29922; font-size: 0.68rem; border: 1px solid rgba(210,153,34,0.4); border-radius: 4px; padding: 0 4px; }
 .bd-lin-dim { color: var(--dim); opacity: 0.75; font-size: 0.70rem; word-break: break-word; min-width: 0; }
+/* flex-basis:100% forces the note onto its own row inside the wrapping
+   .bd-lin-src line. These notes are full sentences (a reaped-journal horizon
+   runs to ~250 chars), so sharing a row with the table name and row count would
+   push past 375px — which the lineage e2e spec asserts against. */
+.bd-lin-srcnote { flex: 0 0 100%; min-width: 0; color: var(--dim); opacity: 0.85; font-size: 0.68rem;
+  line-height: 1.4; word-break: break-word; overflow-wrap: anywhere; padding-left: 2px; }
 .bd-lin-tl { display: flex; flex-direction: column; }
 .bd-lin-line { display: flex; gap: 8px; padding: 5px 0; border-top: 1px solid var(--border, rgba(255,255,255,0.07)); min-width: 0; }
 .bd-lin-when { flex: 0 0 96px; color: var(--dim); font-size: 0.68rem; font-variant-numeric: tabular-nums; }

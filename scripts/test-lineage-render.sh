@@ -114,6 +114,20 @@ if (zero.length) {
 ok((d.sources || []).every(s => !s.query || h.includes(String(s.query).slice(0, 20))),
    'every source shows the predicate it ran');
 
+// A source NOTE is the endpoint saying the row count alone would mislead: a
+// reaped journal whose floor postdates the card, events that record THAT
+// something changed but not into what, or the receipt that a trail really is
+// complete. The panel rendered `query` and dropped `note` for its first two
+// commits — which is the same defect one layer up that the note exists to
+// prevent, and it looked fine because the numbers were all correct.
+const noted = (d.sources || []).filter(s => s.note);
+if (noted.length) {
+  ok(noted.every(s => h.includes(String(s.note).slice(0, 40))),
+     'every source NOTE is rendered (' + noted.length + ') — a caveat the API attached and the panel drops is a number with no caveat');
+} else {
+  console.log('  --   no source on this card carries a note; that assertion is not exercised');
+}
+
 // Truncation must be visible: silent capping reads as complete coverage.
 const capped = (d.sources || []).filter(s => s.rows_total > s.rows);
 if (capped.length) ok(h.includes('capped'), 'a capped source says so (' + capped.length + ')');
