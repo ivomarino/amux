@@ -68,16 +68,25 @@ test.describe('board card lineage tab', () => {
     // whose row for the creation had not landed when the panel loaded, so the
     // "no journal rows" gap was true then and false by the time the test asked.
     //
-    // The subscription must be armed BEFORE the navigation or the response is
+    // The listener must be armed BEFORE the navigation or the response is
     // already past. Nothing here weakens the check: the payload compared is the
     // exact bytes the renderer received, which is strictly closer to the claim
     // than a second sample of a moving target.
-    const whyResponse = page.waitForResponse(
-      r => r.url().includes(`/api/why/task/${encodeURIComponent(card)}`) && r.status() === 200,
-      { timeout: 30_000 },
-    );
+    //
+    // COLLECT ALL OF THEM AND TAKE THE LAST, rather than resolving on the first.
+    // `_bdRenderLineage` re-fetches on every open of the tab and renders
+    // whatever lands, guarded only by `_bdLineageFor !== id` — which drops a
+    // response for a DIFFERENT card and lets every same-card response through.
+    // So the DOM holds the last one to resolve, and first-match would be the
+    // wrong ordinal exactly when there is more than one, which is the case this
+    // race is made of.
+    const whyBodies: Promise<unknown>[] = [];
+    page.on('response', r => {
+      if (r.url().includes(`/api/why/task/${encodeURIComponent(card)}`) && r.status() === 200) {
+        whyBodies.push(r.json().catch(() => null));
+      }
+    });
     await page.goto(`/#issue=${encodeURIComponent(card)}:lineage`);
-    const why = await (await whyResponse).json();
 
     // The deep link is half the feature: a tab reachable only by tapping cannot
     // be linked, quoted in a nudge, or driven by the simulator rig.
@@ -98,8 +107,18 @@ test.describe('board card lineage tab', () => {
     // Whatever the endpoint reported must survive into the DOM. Compared
     // against the live payload captured above rather than a fixture, so this
     // fails if the renderer starts dropping things the endpoint still sends.
+    // Resolved as LATE as possible, after the panel has stopped loading, so the
+    // array holds every response the render could have come from.
+    type WhyPayload = { gaps?: string[]; sources?: { rows: number }[] };
+    const bodies = (await Promise.all(whyBodies)).filter(Boolean) as WhyPayload[];
+    expect(
+      bodies.length,
+      'the panel must have fetched /api/why at least once, or there is nothing to compare against',
+    ).toBeGreaterThan(0);
+    const why = bodies[bodies.length - 1];
+
     const gaps: string[] = why.gaps ?? [];
-    const zero = (why.sources ?? []).filter((s: { rows: number }) => !s.rows);
+    const zero = (why.sources ?? []).filter(s => !s.rows);
 
     // THE SPEC MUST NOT PASS VACUOUSLY. `toHaveCount(0)` against an empty
     // payload is zero compared with zero — it holds just as well against a
