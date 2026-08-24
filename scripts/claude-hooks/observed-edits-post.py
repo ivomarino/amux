@@ -94,6 +94,12 @@ def is_pure_read_command(cmd):
     return saw
 
 
+# How many paths a single report names in the log. The count is authoritative
+# and the tail says how many were elided, so a wide walk cannot flood the file
+# while still leaving the claim auditable (AF-179).
+LOG_PATHS = 12
+
+
 def log_line(home, session, text):
     try:
         with open(os.path.join(home, "hooks", "state", "observed-edits.log"), "a") as fh:
@@ -184,7 +190,17 @@ def main():
         outcome = "sent"
     except Exception as e:
         outcome = f"send-failed:{e.__class__.__name__}"
-    log_line(home, session, f"n={len(hits)} {outcome}")
+    # LOG WHAT WAS CLAIMED, NOT ONLY HOW MANY (AF-179). This said `n=3 sent`,
+    # so the log built to verify this hook by what it WROTE could not say what
+    # it wrote. When the guard named a session as co-editor of a file it had
+    # never opened, the only way to establish which report carried the claim was
+    # to reconstruct it from file mtimes by hand. A count is not an audit trail.
+    # Paths are repo-relative and capped so a wide walk cannot flood the log;
+    # the count stays authoritative and the tail says how many were elided.
+    _rel = [os.path.relpath(h["path"], cwd) for h in hits]
+    _shown = _rel[:LOG_PATHS]
+    _more = "" if len(_rel) <= LOG_PATHS else f" +{len(_rel) - LOG_PATHS} more"
+    log_line(home, session, f"n={len(hits)} {outcome} paths={','.join(_shown)}{_more}")
 
 
 try:

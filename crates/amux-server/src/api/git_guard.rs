@@ -1374,6 +1374,30 @@ pub(crate) fn classify(
                 // co-edit signal may be one write seen through two sessions'
                 // Bash windows — say so, instead of asserting a co-editor the
                 // reader will go apologize to. Old hooks ignore unknown keys.
+                //
+                // AF-179 WIDENS THE GATE AND STOPS IT DECIDING. The conjunct
+                // below used to be `coincident`, a 5-SECOND window, and that
+                // encodes exactly one story: two sessions observed ONE write.
+                // It cannot express the story that actually produces a wrong
+                // name — one session's ONGOING AUTHORSHIP, sampled once by a
+                // peer's long Bash window. Measured on the reported specimen:
+                // amux authored scripts/token-baseline.py until ~20:29 and
+                // committed at 20:30; amux-frustrations' `cargo test` walk had
+                // sampled it at 20:10 and filed an observed record. The gap was
+                // ~1000s against a 5s margin, 200x over, so the caveat stayed
+                // silent and the guard asserted a co-editor who had never opened
+                // the file. The two clocks drift apart in proportion to how long
+                // the real author kept working, so the hedge was LEAST able to
+                // fire exactly where the false attribution is most confusing.
+                //
+                // The fix is not a wider window. Picking a window at all is the
+                // tell that we are guessing (ethos rule 7), and the server
+                // genuinely cannot resolve observed-vs-observed — the comment on
+                // case (d) in the tests has said so all along. So stop deciding
+                // and state PROVENANCE, which is a fact: an observed claim is an
+                // mtime that moved during that session's Bash command, not a
+                // write that session recorded. The skew now only picks WORDING;
+                // it no longer gates whether the reader is told anything.
                 let coincident = hit
                     .map(|(_, tts)| {
                         inp.mine
@@ -1382,13 +1406,28 @@ pub(crate) fn classify(
                             .unwrap_or(false)
                     })
                     .unwrap_or(false);
-                if hit.is_some() && coincident && inp.theirs_observed_only.contains(ap) {
-                    row.as_object_mut().expect("shared row is an object").insert(
-                        "co_signal".into(),
-                        json!("observed mtime coinciding with your own edit — possibly one \
-                               write seen through two sessions' Bash windows, not a real \
-                               co-editor (AMUX-3497)"),
-                    );
+                if hit.is_some() && inp.theirs_observed_only.contains(ap) {
+                    let gap = hit.and_then(|(_, tts)| inp.mine.get(ap).map(|m| m - tts));
+                    let signal = match (coincident, gap) {
+                        (true, _) => "observed mtime coinciding with your own edit — possibly \
+                             one write seen through two sessions' Bash windows, not a real \
+                             co-editor (AMUX-3497)"
+                            .to_string(),
+                        (false, Some(g)) if g > 0.0 => format!(
+                            "OBSERVED claim, not a recorded write: that session's Bash command \
+                             saw this file's mtime move. Your own record is {}s NEWER, so their \
+                             sample may be a snapshot of YOUR ongoing authorship rather than an \
+                             edit of theirs (AF-179)",
+                            g as i64
+                        ),
+                        (false, _) => "OBSERVED claim, not a recorded write: that session's \
+                             Bash command saw this file's mtime move under the repo, which on a \
+                             shared checkout includes writes it did not make (AF-179)"
+                            .to_string(),
+                    };
+                    row.as_object_mut()
+                        .expect("shared row is an object")
+                        .insert("co_signal".into(), json!(signal));
                 }
                 v.shared.push(row);
             }
@@ -2663,6 +2702,84 @@ mod tests {
         let v = classify(&[pair("t.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.shared.len(), 1);
         assert!(v.shared[0].get("co_signal").is_none(), "{:?}", v.shared[0]);
+    }
+
+    /// AF-179, rebuilt from the reported specimen's own numbers.
+    ///
+    /// amux committed `scripts/token-baseline.py`, a file they wrote from
+    /// scratch, and the guard told them it "was also edited by session
+    /// 'amux-frustrations' 6m ago". That session never opened it: a two-minute
+    /// `cargo test` had walked the repo and filed an OBSERVED record for every
+    /// mtime that moved inside its window, including the real author's.
+    ///
+    /// The hedge that exists for this (AMUX-3497) stayed silent, because it was
+    /// gated on the two timestamps agreeing within RECENCY_SKEW_MARGIN_S. The
+    /// author kept writing until ~20:29 and the peer's walk had sampled at
+    /// 20:10, so the gap was ~1000s against a 5s margin. The longer the real
+    /// author works, the further apart the clocks, so the hedge was least able
+    /// to fire exactly where the wrong name is hardest to dismiss.
+    ///
+    /// THE CONTROL IS THE SECOND HALF AND IT IS A LOGIC CONTROL: a peer claim
+    /// from a TRANSCRIPT still carries no marker, because a transcript records
+    /// who wrote it and there is nothing to hedge. Widening the gate to "any
+    /// observed-only peer claim" must not widen it to firsthand ones.
+    #[test]
+    fn a_long_authorship_sampled_by_a_peers_bash_window_is_marked_as_observed() {
+        // The specimen: I authored at t=2029, their walk sampled me at t=2010.
+        let mut g = GuardInputs::default();
+        let mut mine = HashMap::new();
+        mine.insert("/repo/token-baseline.py".to_string(), 2029.0);
+        let mut peer = HashMap::new();
+        peer.insert("/repo/token-baseline.py".to_string(), 2010.0);
+        apply_observed(&mut g, &mine, &[("amux-frustrations".to_string(), peer)]);
+        let v = classify(&[pair("token-baseline.py")], 2100.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        let sig = v.shared[0]["co_signal"].as_str().unwrap_or("");
+        assert!(
+            sig.contains("AF-179"),
+            "a 19s gap is 4x the 5s skew margin and the old gate said nothing here: {:?}",
+            v.shared[0]
+        );
+        assert!(
+            sig.contains("OBSERVED claim, not a recorded write"),
+            "state the PROVENANCE — that is the fact, where 'is this a real co-editor' is a \
+             guess the server cannot make: {sig:?}"
+        );
+        assert!(
+            sig.contains("NEWER"),
+            "my record is newer than their sample, which is the direction that says they \
+             sampled MY authorship: {sig:?}"
+        );
+
+        // The same shape at the real specimen's distance, ~1000s, must also
+        // speak. A window-based gate gets quieter as the gap grows; provenance
+        // does not depend on the gap at all.
+        let mut g = GuardInputs::default();
+        let mut mine = HashMap::new();
+        mine.insert("/repo/token-baseline.py".to_string(), 3010.0);
+        let mut peer = HashMap::new();
+        peer.insert("/repo/token-baseline.py".to_string(), 2010.0);
+        apply_observed(&mut g, &mine, &[("amux-frustrations".to_string(), peer)]);
+        let v = classify(&[pair("token-baseline.py")], 3100.0, 3600.0, &g);
+        assert!(
+            v.shared[0]["co_signal"].as_str().unwrap_or("").contains("1000s NEWER"),
+            "quote the real gap so the reader can weigh it: {:?}",
+            v.shared[0]
+        );
+
+        // CONTROL — a peer's TRANSCRIPT claim carries no marker, at any gap.
+        // The transcript says who wrote it; hedging it would teach readers to
+        // ignore the hedge on the claims that are genuinely ambiguous.
+        let mut g = peer_wrote("t.rs", "alice", 1000.0);
+        g.mine.insert("/repo/t.rs".into(), 3000.0);
+        g.mine_firsthand.insert("/repo/t.rs".into());
+        let v = classify(&[pair("t.rs")], 4000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert!(
+            v.shared[0].get("co_signal").is_none(),
+            "a firsthand peer claim is not ambiguous and must not be hedged: {:?}",
+            v.shared[0]
+        );
     }
 
     /// AMUX-3128 FIRING PATH: a read-only command must not mint an inferred edit,
