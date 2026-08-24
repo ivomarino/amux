@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.717';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.718';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -12364,7 +12364,11 @@ function openCmdHistoryModal(scopeSession) {
   // Drop the previous open's window/counts — they were fetched for a different
   // scope, and reusing them would show one session's rows under another's
   // heading until the refetch lands.
+  // Reset the PAGE cursor too (AF-213), not just the rows. Leaving _cmdHistOffset
+  // set would make the next open's first fetch start mid-history under a heading
+  // that says it is showing the newest.
   _cmdHistRows = null; _cmdHistCounts = null;
+  _cmdHistRaw = []; _cmdHistOffset = 0; _cmdHistDone = false;
   _populateCmdHistorySessions(_ctx);
   _renderCmdHistoryList();
   // History is server-side, but this page only pulled it once at load — a
@@ -12410,24 +12414,53 @@ let _cmdHistRows = null;      // server window for the CURRENT kind+session, or 
 // out of 2783 — the human messages had been crowded out of the window by
 // session and schedule traffic before the filter ever ran.
 let _cmdHistCounts = null;    // true per-kind totals from the server
-async function _cmdHistFetch() {
+// PAGINATED, like the other two /api/history consumers (AF-213). This asked for
+// `limit=500` in ONE shot with no offset — 852 KB global, 454 KB session-scoped,
+// on every open and on every kind/session change. `_messagesLoad` and the peek
+// Messages tab have both paged at 200 for a while; this surface kept the flat
+// fetch and was the odd one out of the three the comment above already counted.
+//
+// Accumulates the RAW newest-first pages and reverses once at the end. The
+// server returns newest-first and `_cmdHistRows` is held oldest-first (the
+// renderer flips it), so appending a page of OLDER rows to the reversed array
+// would interleave them backwards.
+const _CMDHIST_PAGE = 200;
+let _cmdHistRaw = [];      // accumulated pages, newest-first, pre-merge
+let _cmdHistOffset = 0;
+let _cmdHistDone = false;
+let _cmdHistLoading = false;
+
+async function _cmdHistFetch(more) {
+  if (_cmdHistLoading) return;
+  if (more && _cmdHistDone) return;
+  _cmdHistLoading = true;
+  if (!more) { _cmdHistRaw = []; _cmdHistOffset = 0; _cmdHistDone = false; }
   const sess = document.getElementById('cmd-history-session-filter')?.value || '';
   const qsess = sess ? '&session=' + encodeURIComponent(sess) : '';
-  let u = API + '/api/history?limit=500' + qsess;
+  let u = API + '/api/history?limit=' + _CMDHIST_PAGE + '&offset=' + _cmdHistOffset + qsess;
   if (_cmdHistKind !== 'all') u += '&kind=' + encodeURIComponent(_cmdHistKind);
   try {
     const [r, rc] = await Promise.all([
       fetch(u, { headers: _authHeaders() }),
-      fetch(API + '/api/history?counts=1' + qsess, { headers: _authHeaders() }),
+      // Totals are for the CHIPS and must stay unpaged — a tally of the loaded
+      // page would read 0 for every kind not on it.
+      _cmdHistOffset === 0
+        ? fetch(API + '/api/history?counts=1' + qsess, { headers: _authHeaders() })
+        : Promise.resolve(null),
     ]);
     if (r.ok) {
       const rows = (await r.json()).map(_msgNorm);
-      _cmdHistRows = _mergeUnechoed(rows.reverse(), sess);
+      _cmdHistDone = rows.length < _CMDHIST_PAGE;
+      _cmdHistOffset += rows.length;
+      _cmdHistRaw = _cmdHistRaw.concat(rows);
+      _cmdHistRows = _mergeUnechoed(_cmdHistRaw.slice().reverse(), sess);
     }
-    if (rc.ok) _cmdHistCounts = await rc.json();
+    if (rc && rc.ok) _cmdHistCounts = await rc.json();
   } catch(e) { /* keep whatever we had; render falls back to the shared cache */ }
+  _cmdHistLoading = false;
   _renderCmdHistoryList();
 }
+function _cmdHistMore() { _cmdHistFetch(true); }
 function _cmdHistSetKind(k) { _cmdHistKind = k; _renderCmdHistoryList(); _cmdHistFetch(); }
 function _cmdHistRenderChips(items) {
   const bar = document.getElementById('cmd-history-filter');
@@ -12477,7 +12510,18 @@ function _renderCmdHistoryList() {
   // Was a second hand-maintained copy of the row markup, which is why this
   // list and the peek/Messages tabs showed the same rows with different
   // badges, no card chip and no search highlighting (AMUX-2334).
-  list.innerHTML = filtered.map(e => _cmdHistItemHTML(e, _msgCtxHistory())).join('');
+  // LOAD MORE (AF-213). Only when the server window is what we are showing —
+  // the shared global cache has no offset to continue from, and offering the
+  // button there would page a list this function is not driving.
+  const _more = (_cmdHistRows && !_cmdHistDone)
+    ? '<div style="padding:12px;text-align:center;">'
+      + '<button class="btn" onclick="_cmdHistMore()" '
+      + 'style="min-height:44px;min-width:44px;padding:10px 18px;">'
+      + (_cmdHistLoading ? 'Loading…' : 'Load older messages') + '</button>'
+      + '<div style="color:var(--dim);font-size:0.75rem;margin-top:6px;">showing '
+      + _cmdHistRaw.length + '</div></div>'
+    : '';
+  list.innerHTML = filtered.map(e => _cmdHistItemHTML(e, _msgCtxHistory())).join('') + _more;
 }
 // ── Peek Messages tab: the message history, scoped to the open session ──
 // One entry → its card HTML (same look as the Message-history modal). Kept as a

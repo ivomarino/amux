@@ -30,7 +30,7 @@ use super::AppState;
 use crate::db::{PendingEvent, WriteOutcome};
 use amux_core::revision::{EntityType, MutationKind};
 use axum::extract::{Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
@@ -234,11 +234,42 @@ fn flag(v: &Option<String>) -> bool {
     v.as_deref().map(|s| !s.is_empty()).unwrap_or(false)
 }
 
+/// Default page, and the CEILING no caller can exceed (AF-213).
+///
+/// `limit` was unclamped: `?limit=100000` served all 8,920 rows at 19 MB, and
+/// nothing in the endpoint, the client, or the logs would have said so. The
+/// dashboard's own three consumers ask for 200, 200 and 500, so a 500 ceiling
+/// changes no existing caller's result and makes the 19 MB response
+/// unreachable — the fault is closed at the API rather than in whichever client
+/// happened to ask politely.
+const HISTORY_DEFAULT_LIMIT: i64 = 500;
+const HISTORY_MAX_LIMIT: i64 = 500;
+
 async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>) -> Response {
     let store = state.store.clone();
+    // CLAMPED OUT HERE, and the request is told. A truncated list that says
+    // nothing reads as data rather than as truncation — the same failure
+    // `board_contract_filters.rs` records, where a lane auditing its own board
+    // got 100 rows fleet-wide with nothing in the body saying so and was one
+    // step from reporting "only 4 done cards exist". So an over-limit request
+    // gets `X-Amux-Limit-Clamped` naming the ceiling, and a WARN, so the next
+    // occurrence is visible in the logs without anyone going to look.
+    let requested_limit: i64 = p
+        .limit
+        .as_deref()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(HISTORY_DEFAULT_LIMIT);
+    let limit = requested_limit.clamp(1, HISTORY_MAX_LIMIT);
+    let was_clamped = requested_limit > HISTORY_MAX_LIMIT;
+    if was_clamped {
+        tracing::warn!(
+            requested = requested_limit, served = limit,
+            "GET /api/history limit clamped — a caller asked for a full-table read; \
+             page with &offset= instead"
+        );
+    }
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<Value> {
         let conn = store.read()?;
-        let limit: i64 = p.limit.as_deref().and_then(|s| s.parse().ok()).unwrap_or(500);
         let offset: i64 = p.offset.as_deref().and_then(|s| s.parse().ok()).unwrap_or(0);
         let session = p.session.clone().unwrap_or_default();
 
@@ -380,7 +411,15 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
     })
     .await;
     match joined {
-        Ok(Ok(v)) => Json(v).into_response(),
+        Ok(Ok(v)) => {
+            let mut resp = Json(v).into_response();
+            if was_clamped {
+                if let Ok(hv) = HeaderValue::from_str(&limit.to_string()) {
+                    resp.headers_mut().insert("x-amux-limit-clamped", hv);
+                }
+            }
+            resp
+        }
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
     }
@@ -676,6 +715,44 @@ mod tests {
         let texts: Vec<&str> =
             page.as_array().unwrap().iter().map(|r| r["text"].as_str().unwrap()).collect();
         assert_eq!(texts, vec!["cron fire", "session relay"]);
+
+        // AF-213: `limit` IS CLAMPED, and an over-limit request is TOLD.
+        //
+        // The row count cannot discriminate here — the fixture has 5 rows and
+        // the ceiling is 500, so "asked for 100000, got 5" holds just as well
+        // against no clamp at all. The header is the only observable that
+        // separates them, which is why the assertion is on the header and the
+        // control below is a request that must NOT carry it.
+        //
+        // Measured on the live store before the clamp: ?limit=100000 served all
+        // 8,920 rows, 19 MB, silently.
+        {
+            let over = axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/history?limit=100000")
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(over).await.unwrap();
+            assert_eq!(
+                res.headers().get("x-amux-limit-clamped").and_then(|v| v.to_str().ok()),
+                Some("500"),
+                "an over-limit request must be told the ceiling it was cut to — a silent \
+                 truncation reads as data, not as truncation"
+            );
+
+            // CONTROL: a request inside the ceiling must NOT claim it was clamped.
+            // Without this, a handler that stamps the header unconditionally passes.
+            let ok = axum::http::Request::builder()
+                .method("GET")
+                .uri("/api/history?limit=2")
+                .body(Body::empty())
+                .unwrap();
+            let res2 = app.clone().oneshot(ok).await.unwrap();
+            assert!(
+                res2.headers().get("x-amux-limit-clamped").is_none(),
+                "a request within the ceiling must not be labelled clamped"
+            );
+        }
 
         // counts=1: true totals per kind + all, ignoring limit.
         let (_, counts) = send(&app, "GET", "/api/history?counts=1&limit=1", None).await;
