@@ -5,6 +5,7 @@
 //! negative controls can inject failures without a live fleet; this module is
 //! the only place that touches the world.
 
+use std::collections::BTreeSet;
 use super::{checks, store, Confidence, InvariantResult};
 use crate::api::AppState;
 use serde_json::json;
@@ -888,8 +889,21 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
             InvariantResult::unknown(REACH, "store unreadable"),
         ];
     };
+    // The prefixes THIS instance mints, read off the board rather than
+    // hardcoded, so a new lane's prefix needs no edit here. An id whose prefix
+    // is absent from every card we own belongs to another amux install.
+    let local_prefixes: BTreeSet<String> = conn
+        .prepare("SELECT DISTINCT substr(id, 1, instr(id,'-')-1) FROM issues WHERE instr(id,'-')>1")
+        .and_then(|mut st| {
+            st.query_map([], |r| r.get::<_, String>(0)).map(|it| it.flatten().collect())
+        })
+        .unwrap_or_default();
     let mut rows: Vec<checks::LedgerRow> = Vec::new();
+    let mut cardless: Vec<(usize, String)> = Vec::new();
     for (line, title, file_status, session, cards) in entries {
+        if cards.is_empty() {
+            cardless.push((line, title.clone()));
+        }
         for card in cards {
             // `deleted IS NULL` only: an ARCHIVED card is still readable and
             // still carries its status, and filtering it out here would report a
@@ -913,7 +927,12 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
         }
     }
     let mut out = checks::frustration_ledger_agrees_with_board(&rows, source);
-    out.extend(checks::frustration_cards_are_reachable(&rows, source));
+    out.extend(checks::frustration_cards_are_reachable(
+        &rows,
+        &cardless,
+        &local_prefixes,
+        source,
+    ));
     out
 }
 

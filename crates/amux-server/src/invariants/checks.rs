@@ -2172,48 +2172,133 @@ pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) ->
     }))]
 }
 
-/// INCIDENT (AF-191, same sweep): 15 entries carry a `CARD:` id that does not
-/// exist on this board at all — 13 `AEAB-NN` from a lane that no longer runs and
-/// whose cards live on a different install's board, plus one from a contributor's
-/// WSL2 machine and one deleted card.
+/// The `AF-191` in `AF-191-1` is not a card id; the prefix is everything before
+/// the first `-` that is followed by digits.
+fn card_prefix(id: &str) -> &str {
+    id.rsplit_once('-').map_or(id, |(p, _)| p)
+}
+
+/// INCIDENT (AF-191, same sweep): entries carry a `CARD:` id that does not exist
+/// on this board at all. `.claude/rules/frustrations.md` says "Link the card. A
+/// frustration without a `CARD:` is a complaint; with one it is a work item
+/// someone can pick up." Those entries HAVE the field, so the rule reads
+/// satisfied while the link resolves to nothing — the rule-6 shape.
 ///
-/// `.claude/rules/frustrations.md` says "Link the card. A frustration without a
-/// `CARD:` is a complaint; with one it is a work item someone can pick up." Every
-/// one of these HAS a CARD field, so the rule reads satisfied, and none of them
-/// is pickable from here. That is the rule-6 shape: the promise is in the doc and
-/// the thing it promises is not reachable.
+/// SPLIT BY PREFIX, and this is the whole design (amux, 2026-08-24, who
+/// classified all 13 by hand before suggesting it). The first version failed on
+/// every unresolvable id and 12 of 13 were `AEAB-NN` from a lane whose board is
+/// a different install entirely. Nobody here can fix those, they arrive again
+/// every time an off-board lane appends, and a permanent red for a reason nobody
+/// can act on is exactly how the other failures stop being read — ethos rule 1's
+/// "a threshold below the baseline is not a detector", one level up.
 ///
-/// It reports rather than files, because filing a local card for someone else's
-/// entry decides that their report is now this board's work (rule 8).
-pub fn frustration_cards_are_reachable(rows: &[LedgerRow], source: &str) -> Vec<InvariantResult> {
+/// So the discriminator is whether THIS INSTANCE MINTS THE PREFIX, read off the
+/// board's own ids rather than a hardcoded list, so a new lane's prefix works
+/// with no edit here:
+///
+/// - foreign prefix (`AEAB-`): context. Named in the message and the evidence so
+///   it is visible, never a failure.
+/// - LOCAL prefix, absent id: a genuine dangling reference, and the case the
+///   check exists for. `AMUX-40` reads local and resolvable and is neither — it
+///   is a live id on a contributor's own amux whose prefix collides with ours,
+///   and it arrived in a commit citing it. amux hit the same class from the
+///   other side the same day: a 2026-08-10 entry cites `AMUX-2701`, which here
+///   is an unrelated route invariant, and the finding sat correct and untracked
+///   for fourteen days because its handle pointed somewhere else.
+/// - NO card id at all: a complaint by the rule's own definition. This is also
+///   where a STRUCTURE BREAK lands — a `## ` heading committed with no field
+///   block turns up here by name instead of being silently dropped from the
+///   ledger or misreported as a status disagreement (amux's caution, from the
+///   51 minutes main's `checks` job was red for exactly that reason).
+///
+/// It reports rather than files: filing a local card for someone else's entry
+/// decides their report is now this board's work (rule 8).
+pub fn frustration_cards_are_reachable(
+    rows: &[LedgerRow],
+    cardless_lines: &[(usize, String)],
+    local_prefixes: &BTreeSet<String>,
+    source: &str,
+) -> Vec<InvariantResult> {
     const ID: &str = "frustrations.cards_are_reachable";
-    let missing: Vec<&LedgerRow> = rows.iter().filter(|r| r.card_status.is_none()).collect();
-    if missing.is_empty() {
-        return vec![InvariantResult::pass(ID)
-            .evidence(json!({"entries": rows.len(), "source": source}))];
+    let mut dangling: Vec<&LedgerRow> = Vec::new();
+    let mut foreign: Vec<&LedgerRow> = Vec::new();
+    for r in rows.iter().filter(|r| r.card_status.is_none()) {
+        if local_prefixes.contains(card_prefix(&r.card)) {
+            dangling.push(r);
+        } else {
+            foreign.push(r);
+        }
     }
-    let shown: Vec<String> =
-        missing.iter().take(5).map(|r| format!("L{}:{}", r.line, r.card)).collect();
+    let foreign_ev: Vec<_> = foreign
+        .iter()
+        .map(|r| json!({"line": r.line, "card": r.card, "session": r.session}))
+        .collect();
+    let base = json!({
+        "entries": rows.len(),
+        "source": source,
+        "foreign_prefix": foreign_ev,
+        "foreign_prefix_note": "another amux install mints these; not actionable here",
+    });
+    if dangling.is_empty() && cardless_lines.is_empty() {
+        return vec![InvariantResult::pass(ID).evidence(base)];
+    }
+    let mut observed = String::new();
+    if !dangling.is_empty() {
+        let shown: Vec<String> =
+            dangling.iter().take(5).map(|r| format!("L{}:{}", r.line, r.card)).collect();
+        observed.push_str(&format!(
+            "{} entry/entries name a LOCAL-prefix card that is not on this board ({}). The \
+             prefix is one this instance mints, so the id reads resolvable and is not — a \
+             dangling handle, or a collision with another amux instance that uses the same \
+             prefix. Re-file the content under a local id rather than trusting the reference. ",
+            dangling.len(),
+            shown.join(", "),
+        ));
+    }
+    if !cardless_lines.is_empty() {
+        let shown: Vec<String> =
+            cardless_lines.iter().take(5).map(|(l, t)| format!("L{l}:{}", &t[..t.len().min(40)]))
+                .collect();
+        observed.push_str(&format!(
+            "{} entry/entries carry NO card id at all ({}) — a complaint by the rule's own \
+             definition, and where a broken entry STRUCTURE lands too. ",
+            cardless_lines.len(),
+            shown.join(", "),
+        ));
+    }
+    if !foreign.is_empty() {
+        observed.push_str(&format!(
+            "{} further entry/entries name a FOREIGN prefix ({}) — another amux install mints \
+             those and nobody here can resolve or fix them, so they are context in the evidence, \
+             not a failure. ",
+            foreign.len(),
+            foreign
+                .iter()
+                .map(|r| card_prefix(&r.card))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+    }
+    observed.push_str(&format!("Ledger read from: {source}."));
     vec![InvariantResult::fail(
         ID,
-        "every frustrations.md CARD id resolves to a card on this board".to_string(),
-        format!(
-            "{} entry/entries name a card that is not on this board ({}). The rule says a \
-             frustration with a CARD is a work item someone can pick up — these have the field \
-             and are pickable by nobody here, so the rule reads satisfied while the link goes \
-             nowhere. File a local card carrying the entry, or record on the entry which board \
-             owns it. Ledger read from: {}.",
-            missing.len(),
-            shown.join(", "),
-            source,
-        ),
+        "every frustrations.md entry carries a card id, and every LOCAL-prefix id resolves on \
+         this board"
+            .to_string(),
+        observed,
     )
     .evidence(json!({
         "entries": rows.len(),
         "source": source,
-        "missing": missing.iter().map(|r| json!({
+        "dangling_local": dangling.iter().map(|r| json!({
             "line": r.line, "card": r.card, "session": r.session, "title": r.title
         })).collect::<Vec<_>>(),
+        "cardless": cardless_lines.iter().map(|(l, t)| json!({"line": l, "title": t}))
+            .collect::<Vec<_>>(),
+        "foreign_prefix": foreign_ev,
+        "foreign_prefix_note": "another amux install mints these; not actionable here",
     }))]
 }
 
@@ -2287,19 +2372,74 @@ mod negative_controls {
         );
     }
 
-    /// AF-191: 15 entries name a card that is not on this board, so
-    /// `.claude/rules/frustrations.md`'s "with a CARD it is a work item someone
-    /// can pick up" reads satisfied while the link resolves to nothing.
+    /// AF-191, in the shape amux's hand classification produced: an id whose
+    /// prefix THIS instance mints and which is absent is a dangling reference
+    /// and must go RED (`AMUX-40` reads local and resolvable and is neither —
+    /// it is a colliding id on a contributor's own amux). An id whose prefix is
+    /// minted somewhere else (`AEAB-`) is context: 12 of the 13 were that, and
+    /// failing on them is a permanent red nobody here can act on, which is how
+    /// the rest of the failures stop being read.
     #[test]
-    fn a_ledger_entry_naming_an_offboard_card_is_detected() {
+    fn only_a_local_prefix_that_is_absent_is_a_dangling_reference() {
+        let local: BTreeSet<String> =
+            ["AF", "AMUX", "AC"].iter().map(|s| s.to_string()).collect();
         let ok = vec![lrow(10, "AF-1", "open", Some("todo"))];
-        assert_eq!(frustration_cards_are_reachable(&ok, "worktree")[0].status, Status::Pass);
+        assert_eq!(
+            frustration_cards_are_reachable(&ok, &[], &local, "worktree")[0].status,
+            Status::Pass
+        );
 
-        let bad = vec![lrow(2180, "AEAB-47", "open", None), lrow(2995, "AMUX-40", "fixed", None)];
-        let r = frustration_cards_are_reachable(&bad, "worktree");
+        // Foreign prefix ONLY: context, not a failure — but still NAMED.
+        let foreign = vec![lrow(2180, "AEAB-47", "open", None), lrow(2225, "AEAB-49", "open", None)];
+        let rf = frustration_cards_are_reachable(&foreign, &[], &local, "worktree");
+        assert_eq!(rf[0].status, Status::Pass, "{:?}", rf[0].observed);
+        assert_eq!(
+            rf[0].evidence["foreign_prefix"].as_array().map(Vec::len),
+            Some(2),
+            "a foreign-prefix entry must still be visible in the evidence"
+        );
+
+        // A LOCAL prefix that is absent IS the failure, and the foreign ones
+        // ride along as context in the same message.
+        let mixed = vec![
+            lrow(2180, "AEAB-47", "open", None),
+            lrow(2995, "AMUX-40", "fixed", None),
+        ];
+        let r = frustration_cards_are_reachable(&mixed, &[], &local, "worktree");
         assert_eq!(r[0].status, Status::Fail);
-        assert!(r[0].observed.contains("AEAB-47"), "{}", r[0].observed);
-        assert!(r[0].observed.contains("2 entry"), "counts them: {}", r[0].observed);
+        assert!(r[0].observed.contains("AMUX-40"), "names the dangling id: {}", r[0].observed);
+        assert!(r[0].observed.contains("1 entry"), "counts the dangling: {}", r[0].observed);
+        assert!(r[0].observed.contains("AEAB"), "keeps foreign as context: {}", r[0].observed);
+        assert!(
+            !r[0].observed.contains("2 entry/entries name a LOCAL"),
+            "a foreign id must not be counted as dangling: {}",
+            r[0].observed
+        );
+    }
+
+    /// amux's caution, 2026-08-24: main's `checks` job was red for 51 minutes
+    /// because a `## ` heading was committed with no field block, and a ledger
+    /// check that inherits the same parser would report a structure break as a
+    /// ledger DISAGREEMENT and send the next reader after the wrong thing.
+    /// A card-less entry gets its own named condition instead — which is also
+    /// what the rule already says ("a frustration without a CARD is a
+    /// complaint").
+    #[test]
+    fn an_entry_with_no_card_is_named_as_a_complaint_not_a_disagreement() {
+        let local: BTreeSet<String> = ["AF"].iter().map(|s| s.to_string()).collect();
+        let r = frustration_cards_are_reachable(
+            &[],
+            &[(1200, "a heading with no field block".to_string())],
+            &local,
+            "worktree",
+        );
+        assert_eq!(r[0].status, Status::Fail);
+        assert!(r[0].observed.contains("NO card id"), "{}", r[0].observed);
+        assert!(r[0].observed.contains("L1200"), "names the line: {}", r[0].observed);
+        // And it must NOT be reported by the status check, which is the whole
+        // point of separating them.
+        let agree = frustration_ledger_agrees_with_board(&[], "worktree");
+        assert_eq!(agree[0].status, Status::Pass);
     }
 
     /// The parser is the load-bearing half: if it silently reads zero entries
