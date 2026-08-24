@@ -207,13 +207,33 @@ fi
 # ── Axis 2: does what is INSTALLED match this checkout? ──────────────────────
 # The repo copy is the source; install.sh copies it. Editing the repo alone
 # changes nothing that a session or the dashboard actually executes.
+# EVERY copy, not just the winner (DESKT-22). `command -v` answers "which amux
+# does THIS shell run", and the mechanism this axis describes is "which amux does
+# a SESSION run" — which depends on that session's PATH, not on mine. A stale
+# copy sitting in /usr/local/bin is invisible here whenever ~/.local/bin happens
+# to come first, and shadows the real one for any lane ordered the other way.
+# Measured 2026-08-24: /usr/local/bin/amux was an 18-day-old copy while this
+# axis reported clean, because ~/.local/bin won on this session's PATH.
+# The view must share the predicate of the mechanism it claims to describe.
 live_cli="$(command -v amux 2>/dev/null || true)"
-if [ -n "$live_cli" ] && [ -f "$REPO/amux" ]; then
-  if ! diff -q "$REPO/amux" "$live_cli" >/dev/null 2>&1; then
-    out+="  - installed CLI differs from this checkout: ${live_cli}"$'\n'
-    out+="    an unknown verb there may print help and exit 0 — a silent no-op"$'\n'
-    out+="    cp \"$REPO/amux\" \"$live_cli\""$'\n'
-  fi
+if [ -f "$REPO/amux" ]; then
+  seen_cli=""
+  for cand in $(command -v -a amux 2>/dev/null || true) /usr/local/bin/amux "$HOME/.local/bin/amux"; do
+    [ -f "$cand" ] || continue
+    case " $seen_cli " in *" $cand "*) continue ;; esac
+    seen_cli="$seen_cli $cand"
+    diff -q "$REPO/amux" "$cand" >/dev/null 2>&1 && continue
+    if [ "$cand" = "$live_cli" ]; then
+      out+="  - installed CLI differs from this checkout: ${cand}  (THIS is the one you run)"$'\n'
+      out+="    an unknown verb there may print help and exit 0 — a silent no-op"$'\n'
+      out+="    cp \"$REPO/amux\" \"$cand\""$'\n'
+    else
+      out+="  - a SHADOWING amux copy differs from this checkout: ${cand}"$'\n'
+      out+="    your PATH runs ${live_cli:-none} instead, so it is inert HERE and not"$'\n'
+      out+="    for a lane whose PATH orders those directories the other way"$'\n'
+      out+="    cp \"$REPO/amux\" \"$cand\"   # or remove it, if nothing should install there"$'\n'
+    fi
+  done
 fi
 
 # ── Axis 2b: are the INSTALLED GIT HOOKS the ones in this checkout? ──────────
