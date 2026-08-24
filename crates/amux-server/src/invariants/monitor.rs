@@ -815,7 +815,13 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
 
     let mut items: Vec<checks::QueuedItem> = Vec::with_capacity(rows.len());
     for (session, queued_at) in rows {
-        let idle = reports[&session]["state"].as_str() == Some("idle");
+        let report = &reports[&session];
+        let idle = report["state"].as_str() == Some("idle");
+        // The report's own timestamp IS when the lane went idle: the Stop hook
+        // writes the row at the end of the turn and nothing rewrites it until
+        // the next state change, so `ts` on an idle report is the moment of the
+        // busy->idle transition (AMUX-3572).
+        let idle_since = if idle { report["ts"].as_f64() } else { None };
         // block_reason is the SAME predicate the delivery loop gates on
         // (session_verbs::lane_block_reason), so the check cannot disagree with
         // the mechanism about ROUTABILITY either, which is the missing half that
@@ -829,6 +835,7 @@ async fn steering_queue_check(state: &AppState) -> Vec<InvariantResult> {
             queued_at,
             target_idle: idle,
             block_reason,
+            idle_since,
         });
     }
 

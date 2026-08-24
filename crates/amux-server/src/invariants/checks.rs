@@ -532,21 +532,65 @@ pub fn queue_has_live_consumer(
             }
             // A live consumer sitting IDLE with an old item in front of it is
             // the original producer-without-consumer incident: it is not draining.
+            // A live consumer sitting IDLE with an old item in front of it is
+            // the original producer-without-consumer incident: it is not
+            // draining.
+            //
+            // AMUX-3572: measure that against WHEN IT WENT IDLE, not against
+            // when the row was queued. Those are different clocks, and this
+            // check's own `expected` string names the first one ("within 300s
+            // of the target going idle") while the code used the second. For a
+            // lane whose turns routinely exceed 300s the age is already past
+            // the threshold before it goes idle, so the check fired on the
+            // instant of every busy->idle transition and cleared as soon as
+            // delivery ran seconds later. That produced 629 occurrences for
+            // one lane and an auto-filed card describing an incident that had
+            // already healed, which cost a session an investigation. A queue
+            // behind a lane that was busy the whole time is the queue WORKING.
+            //
+            // `idle_since` missing while `target_idle` is true means the report
+            // carried no timestamp: fall back to the queued clock rather than
+            // passing, so a genuinely stuck consumer is never silently excused.
             None if it.target_idle => {
-                out.push(
-                    InvariantResult::fail(
-                        ID,
-                        format!("queued item delivered within {stale_after_s:.0}s of the target going idle"),
-                        format!("undelivered for {age:.0}s while target is IDLE"),
-                    )
-                    .entity(&it.target)
-                    .evidence(json!({
-                        "target": it.target, "age_s": age, "queue": it.queue,
-                        "class": "producer-without-consumer",
-                        "incident": "steering queue had 3 producers and no consumer; auto-pickup \
-                                     died with the python retirement",
-                    })),
-                );
+                let idle_for = it
+                    .idle_since
+                    .map(|s| now - s.max(it.queued_at))
+                    .unwrap_or(age);
+                if idle_for <= stale_after_s {
+                    // Idle, but not for long enough to have drained yet.
+                    out.push(InvariantResult::pass(ID).entity(&it.target));
+                } else {
+                    out.push(
+                        InvariantResult::fail(
+                            ID,
+                            format!(
+                                "queued item delivered within {stale_after_s:.0}s of the target going idle"
+                            ),
+                            format!(
+                                "undelivered for {idle_for:.0}s of IDLE time \
+                                 (queued {age:.0}s ago)"
+                            ),
+                        )
+                        .entity(&it.target)
+                        .evidence(json!({
+                            "target": it.target, "queue": it.queue,
+                            // Both clocks, always, so the next occurrence says
+                            // which one it tripped on without anyone re-deriving
+                            // it from the source (ethos rule 4).
+                            "age_s": age,
+                            "idle_for_s": idle_for,
+                            "idle_since": it.idle_since,
+                            "measured_against": if it.idle_since.is_some() {
+                                "idle_since"
+                            } else {
+                                "queued_at (report carried no timestamp)"
+                            },
+                            "class": "producer-without-consumer",
+                            "incident": "steering queue had 3 producers and no consumer; auto-pickup \
+                                         died with the python retirement",
+                        })),
+                    );
+                }
             }
             // A deep queue behind a BUSY worker (routable, not idle) is correct.
             None => out.push(InvariantResult::pass(ID).entity(&it.target)),
@@ -570,6 +614,11 @@ pub struct QueuedItem {
     /// Without it the check could not tell an unroutable ghost from an
     /// idle-but-lagging consumer (AMUX-3084 / AMUX-3111).
     pub block_reason: Option<String>,
+    /// When the target last REPORTED itself idle, if it is idle now. The idle
+    /// branch below measures against this rather than against `queued_at`,
+    /// because those are different clocks and only one of them matches what the
+    /// check claims to test (AMUX-3572).
+    pub idle_since: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -2076,6 +2125,7 @@ mod negative_controls {
             queued_at: 0.0,
             target_idle: true,
             block_reason: None,
+            idle_since: None,
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0); // 2h6m, the real age
         assert!(rs.iter().any(|r| r.status == Status::Fail), "must detect the dead consumer");
@@ -2096,6 +2146,7 @@ mod negative_controls {
             queued_at,
             target_idle: false,
             block_reason: Some(reason.into()),
+            idle_since: None,
         };
         // Inside the reaper's deadline: sanctioned wait, pass.
         let rs = queue_has_live_consumer(&[mk("no-env-file", 6_000.0)], 7_560.0, 300.0, 3_600.0);
@@ -2130,6 +2181,7 @@ mod negative_controls {
             queued_at: 0.0,
             target_idle: true, // carries a stale, never-decaying idle report (AMUX-2646)
             block_reason: Some("no-env-file".into()),
+            idle_since: None,
         }];
         // Post-AMUX-3473: the ghost still fails, but only PAST the reaper's
         // deadline (2h6m old vs a 1h deadline here), and the class names the
@@ -2302,11 +2354,62 @@ mod negative_controls {
             queued_at: 0.0,
             target_idle: false, // mid-turn: queueing is the POINT
             block_reason: None,
+            idle_since: None,
         }];
         let rs = queue_has_live_consumer(&items, 7_560.0, 300.0, 3_600.0);
         assert!(
             rs.iter().all(|r| r.status == Status::Pass),
             "a deep queue behind a busy worker is correct, not a fault"
+        );
+    }
+
+    /// AMUX-3572, rebuilt from the incident's own artifact rather than from the
+    /// case that is easy to construct. The recorded observed string was
+    /// "undelivered for 308s while target is IDLE" against a 300s threshold, on
+    /// a lane whose turns routinely run past 300s. So the age had already
+    /// cleared the threshold while the lane was legitimately BUSY, and the
+    /// check fired on the instant of the busy->idle transition, then cleared
+    /// once delivery ran seconds later: 629 occurrences and an auto-filed card
+    /// for an incident that had already healed.
+    ///
+    /// The pair is the point. Both rows are idle with an identically-aged item;
+    /// only the time spent idle differs. A check that reads `queued_at` cannot
+    /// separate them and fails both.
+    #[test]
+    fn idle_is_measured_from_when_the_lane_went_idle_not_from_queued_at() {
+        let now = 1_000_000.0;
+        let mk = |idle_since: f64| QueuedItem {
+            queue: "steering".into(),
+            target: "amux".into(),
+            queued_at: now - 308.0, // the incident's own age
+            target_idle: true,
+            block_reason: None,
+            idle_since: Some(idle_since),
+        };
+
+        // Just went idle after a long turn: the queue has had 5s to drain.
+        let rs = queue_has_live_consumer(&[mk(now - 5.0)], now, 300.0, 3_600.0);
+        assert!(
+            rs.iter().all(|r| r.status == Status::Pass),
+            "a lane 5s into being idle has not failed to drain; this is the false \
+             positive that filed AMUX-3572"
+        );
+
+        // CONTROL: same item age, but idle the whole time. Still a real wedge.
+        let rs = queue_has_live_consumer(&[mk(now - 308.0)], now, 300.0, 3_600.0);
+        assert!(
+            rs.iter().any(|r| r.status == Status::Fail),
+            "a lane idle for the item's whole life IS the producer-without-consumer \
+             incident and must still fail"
+        );
+
+        // A report with no timestamp must not become an excuse: fall back to the
+        // queued clock so a stuck consumer is never silently passed.
+        let no_ts = QueuedItem { idle_since: None, ..mk(0.0) };
+        let rs = queue_has_live_consumer(&[no_ts], now, 300.0, 3_600.0);
+        assert!(
+            rs.iter().any(|r| r.status == Status::Fail),
+            "missing idle_since must degrade to the old behaviour, not to a pass"
         );
     }
 
