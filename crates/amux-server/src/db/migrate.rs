@@ -876,3 +876,300 @@ mod guard_tests {
     // class AMUX-2675 was about; merging removes it by construction instead of
     // adding another lock that the next test must remember to take.
 }
+
+/// AF-193 / AMUX-3609: a migration's COST, which the rest of the suite cannot express.
+///
+/// 0031 backfilled `issues.closed_at` with a correlated subquery over
+/// `_amux_state_events`, which carried exactly one index, on `rev`. It
+/// full-scanned ~79,000 rows for each of 7,281 terminal cards, inside the
+/// exclusive transaction a migration runs in, at server startup, and the server
+/// was unreachable for 186 seconds. Every test was green throughout, because
+/// migration tests apply their SQL to four fixture rows — and on four rows an
+/// index scan and a table scan are indistinguishable. Correctness and cost are
+/// different questions and the suite only ever answered the first.
+///
+/// WHY THE PLAN AND NOT A ROW COUNT. The obvious fix is a fixture with realistic
+/// row counts, and it is the wrong one: it needs a threshold, the threshold has
+/// to be guessed, and a migration that is 10x too slow on 79,000 rows still
+/// passes on whatever number gets picked. Ethos rule 7 — prefer the
+/// structurally-absent signal over the tuned parameter. `EXPLAIN QUERY PLAN`
+/// answers the actual question at any table size, in microseconds, on an empty
+/// database.
+///
+/// THE RULE: inside a CORRELATED subquery, every table access must use an index.
+/// A correlated subquery runs once per outer row, so an unindexed access there is
+/// O(outer x inner) by construction — that is the shape that took the server
+/// down, and it is a property of the SQL, not of how much data happens to exist.
+/// A `SCAN` at the top level is left alone: one pass over the table being
+/// updated is unavoidable and is O(n) once.
+///
+/// MEASURED, not assumed, because the obvious matcher does not work. The plan
+/// prints the ALIAS, not the table name, so a check that greps for
+/// `_amux_state_events` finds nothing and passes on the incident itself:
+///
+///   without the index:  `--SEARCH e
+///   with the index:     `--SEARCH e USING INDEX idx_amux_state_events_entity
+///
+/// Note also that it is SEARCH in both cases. A `SCAN` vs `SEARCH` check — the
+/// other obvious one — is green on the specimen too. The discriminator is the
+/// presence of USING INDEX, and nothing else in that output separates the two.
+#[cfg(test)]
+mod cost_tests {
+    use super::*;
+
+    /// An EXPLAIN QUERY PLAN row: (id, parent, detail).
+    ///
+    /// `Err` means "not explainable here", which is NOT the same as "costs
+    /// nothing" and must never quietly become a pass. Trigger bodies split out
+    /// of a CREATE TRIGGER reference `new.*` and cannot prepare standalone, so
+    /// this cannot hard-fail — instead `explained` below counts what actually
+    /// got checked, and a named statement pins that the check reached the one
+    /// that caused the outage.
+    fn plan(conn: &Connection, stmt: &str) -> Option<Vec<(i64, i64, String)>> {
+        let mut s = conn.prepare(&format!("EXPLAIN QUERY PLAN {stmt}")).ok()?;
+        let rows = s
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(3)?))
+            })
+            .ok()?
+            .flatten()
+            .collect::<Vec<_>>();
+        Some(rows)
+    }
+
+    /// Table accesses that run inside a CORRELATED subquery without an index.
+    fn unindexed_correlated_access(rows: &[(i64, i64, String)]) -> Vec<String> {
+        let parent_of = |id: i64| rows.iter().find(|r| r.0 == id).map(|r| r.1);
+        let detail_of = |id: i64| rows.iter().find(|r| r.0 == id).map(|r| r.2.clone());
+        let mut bad = Vec::new();
+        for (_, parent, d) in rows {
+            let is_access = d.starts_with("SCAN ") || d.starts_with("SEARCH ");
+            let indexed = d.contains("USING INDEX")
+                || d.contains("USING COVERING INDEX")
+                || d.contains("USING INTEGER PRIMARY KEY")
+                || d.contains("USING ROWID SEARCH");
+            if !is_access || indexed {
+                continue;
+            }
+            let mut cur = *parent;
+            let mut hops = 0;
+            while cur != 0 && hops < 32 {
+                let Some(p) = detail_of(cur) else { break };
+                if p.contains("CORRELATED") {
+                    bad.push(d.clone());
+                    break;
+                }
+                cur = parent_of(cur).unwrap_or(0);
+                hops += 1;
+            }
+        }
+        bad
+    }
+
+    /// Statements a migration body executes, minus comments and DDL.
+    fn dml(sql: &str) -> Vec<String> {
+        let stripped: String = sql
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        stripped
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| {
+                let u = s.to_uppercase();
+                u.starts_with("UPDATE ")
+                    || u.starts_with("DELETE ")
+                    || u.starts_with("INSERT ")
+                    || u.starts_with("SELECT ")
+                    || u.starts_with("WITH ")
+                    || u.starts_with("REPLACE ")
+            })
+            .collect()
+    }
+
+    fn squash(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// Every migration, applied in order, with each one's DML plan-checked
+    /// against the schema THAT MIGRATION LEAVES BEHIND — previous migrations
+    /// plus its own DDL, and nothing from later ones.
+    ///
+    /// Checking against the FINAL schema would be vacuous for exactly the
+    /// incident: 0032 adds the index 0031 needed, so a final-schema check reads
+    /// 0031 as fine no matter what 0031 does.
+    #[test]
+    fn no_migration_runs_an_unindexed_correlated_subquery() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _amux_migrations (
+                version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                applied_at TEXT NOT NULL, duration_ms INTEGER);",
+        )
+        .unwrap();
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut explained = 0usize;
+        let mut saw_the_0031_backfill = false;
+
+        for m in MIGRATIONS {
+            let tx = conn.transaction().unwrap();
+            apply_one(&tx, m.sql).unwrap_or_else(|e| panic!("{} failed to apply: {e}", m.name));
+            tx.execute(
+                "INSERT INTO _amux_migrations (version, name, applied_at) VALUES (?1, ?2, 'test')",
+                rusqlite::params![m.version, m.name],
+            )
+            .unwrap();
+            tx.commit().unwrap();
+
+            for stmt in dml(m.sql) {
+                let Some(rows) = plan(&conn, &stmt) else { continue };
+                explained += 1;
+                let sq = squash(&stmt);
+                if sq.starts_with("UPDATE issues SET closed_at") {
+                    saw_the_0031_backfill = true;
+                }
+                for bad in unindexed_correlated_access(&rows) {
+                    offenders.push(format!(
+                        "{}: `{}` runs once per outer row with no index\n    statement: {}",
+                        m.name,
+                        bad,
+                        sq.chars().take(200).collect::<String>()
+                    ));
+                }
+            }
+        }
+
+        // VACUITY GUARDS. This check silently passed on the real incident during
+        // development because every statement failed to prepare and the helper
+        // returned "nothing to see". A count alone is weak, so the statement
+        // that caused the outage is pinned BY NAME: if 0031's backfill ever
+        // stops being reached, this fails instead of going quietly green.
+        assert!(
+            explained >= 5,
+            "only {explained} statements were explainable — the check is not reaching the SQL \
+             it claims to check"
+        );
+        assert!(
+            saw_the_0031_backfill,
+            "0031's `UPDATE issues SET closed_at ...` was never explained. That is the statement \
+             that held the database for 186 seconds, and this check exists to see it."
+        );
+
+        assert!(
+            offenders.is_empty(),
+            "a migration would full-scan a table once per outer row, which is how 0031 held \
+             the database for 186 seconds at startup. Create the index BEFORE the backfill, \
+             in the same migration.\n\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    /// The ordering variant the plan check cannot see.
+    ///
+    /// `apply_one` hands the plain SQL to `execute_batch`, so statements run in
+    /// FILE ORDER. An index created after the backfill that needs it produces
+    /// exactly the same final schema and exactly the same 186 seconds. The plan
+    /// check above is blind to it — it explains against the finished migration,
+    /// by which time the index exists either way.
+    ///
+    /// ONLY THE READ SIDE. An index on the table the DML WRITES is a different
+    /// thing and belongs after: building `issues(closed_at)` once the backfill
+    /// has populated it is correct practice, and cheaper than maintaining the
+    /// index through the update. 0031 does exactly that, so a rule of "no
+    /// CREATE INDEX after any DML" fires on the CORRECT file — measured, it did.
+    /// What must come first is an index on a table the statement READS, which is
+    /// the one that turns into a scan per outer row.
+    #[test]
+    fn a_migration_creates_its_read_side_indexes_before_the_dml_that_needs_them() {
+        fn indexed_table(stmt_upper: &str) -> Option<String> {
+            let on = stmt_upper.find(" ON ")? + 4;
+            let rest = stmt_upper[on..].trim_start();
+            let end = rest.find(['(', ' ', '\n']).unwrap_or(rest.len());
+            Some(rest[..end].trim().trim_matches('"').to_string())
+        }
+        fn written_table(stmt_upper: &str) -> Option<String> {
+            let rest = stmt_upper.strip_prefix("UPDATE ")?;
+            let end = rest.find([' ', '\n']).unwrap_or(rest.len());
+            Some(rest[..end].trim().trim_matches('"').to_string())
+        }
+
+        let mut bad = Vec::new();
+        for m in MIGRATIONS {
+            let body: String = m
+                .sql
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("--"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            // (offset, table written) for each DML seen so far.
+            let mut dml_seen: Vec<(usize, Option<String>)> = Vec::new();
+            let mut offset = 0usize;
+            for raw in body.split(';') {
+                let t = raw.trim().to_uppercase();
+                if t.starts_with("UPDATE ") || t.starts_with("DELETE ") || t.starts_with("WITH ") {
+                    dml_seen.push((offset, written_table(&t)));
+                }
+                if t.starts_with("CREATE INDEX") || t.starts_with("CREATE UNIQUE INDEX") {
+                    if let Some(idx_table) = indexed_table(&t) {
+                        for (d_off, written) in &dml_seen {
+                            if offset > *d_off && written.as_deref() != Some(idx_table.as_str()) {
+                                bad.push(format!(
+                                    "{}: CREATE INDEX on {} appears AFTER a statement that reads \
+                                     it — same final schema, same outage",
+                                    m.name, idx_table
+                                ));
+                            }
+                        }
+                    }
+                }
+                offset += raw.len() + 1;
+            }
+        }
+        assert!(bad.is_empty(), "{}", bad.join("\n"));
+    }
+
+    /// NEGATIVE CONTROL, built from the incident rather than from a convenient
+    /// shape: 0031's own UPDATE, against the schema it actually met on
+    /// 2026-08-24 — `_amux_state_events` with its single index on `rev`.
+    ///
+    /// 88af1ff3 edited 0031 to create the index first, so the checks above now
+    /// pass on a fresh database, and a check that passes has told you nothing
+    /// until you have seen it fail on the thing it was written for.
+    #[test]
+    fn the_real_0031_specimen_without_its_index_is_caught() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _amux_state_events (rev INTEGER, entity_type TEXT, entity_id TEXT,
+                                              mutation TEXT, at TEXT);
+             CREATE INDEX idx_rev ON _amux_state_events(rev);
+             CREATE TABLE issues (id TEXT, status TEXT, closed_at INTEGER);",
+        )
+        .unwrap();
+
+        let backfill = "UPDATE issues SET closed_at = (
+                SELECT CAST(MAX(strftime('%s', e.at)) AS INTEGER)
+                  FROM _amux_state_events e
+                 WHERE e.entity_type = 'task' AND e.entity_id = issues.id)
+             WHERE status IN ('done','verified','discarded') AND closed_at IS NULL";
+
+        let before = unindexed_correlated_access(&plan(&conn, backfill).expect("explainable"));
+        assert!(
+            !before.is_empty(),
+            "the check did not fire on the statement that caused the outage — it cannot fail, \
+             so its green tells you nothing"
+        );
+
+        conn.execute_batch(
+            "CREATE INDEX idx_amux_state_events_entity
+                 ON _amux_state_events(entity_type, entity_id);",
+        )
+        .unwrap();
+        let after = unindexed_correlated_access(&plan(&conn, backfill).expect("explainable"));
+        assert!(
+            after.is_empty(),
+            "the index that fixed the incident does not clear the check: {after:?}"
+        );
+    }
+}
