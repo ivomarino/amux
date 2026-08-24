@@ -132,6 +132,9 @@ impl RequestLogger {
                 if sweep {
                     since_sweep = 0;
                 }
+                // AF-175: the boot of the process writing this batch. Constant
+                // within a process, so read once here.
+                let boot = crate::runtime_jobs::heartbeat::boot_at();
                 let res = store
                     .write_async(move |conn| {
                         {
@@ -139,8 +142,8 @@ impl RequestLogger {
                                 "INSERT INTO _amux_request_log \
                                  (ts, method, path, family, status, latency_ms, client_ip, \
                                   user_agent, amux_session, worker, req_bytes, resp_bytes, \
-                                  answered_by, error_body, req_meta) \
-                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                                  answered_by, error_body, req_meta, boot_at) \
+                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                             )?;
                             for r in &batch {
                                 stmt.execute(rusqlite::params![
@@ -159,7 +162,13 @@ impl RequestLogger {
                                     r.answered_by,
                                     r.error_body,
                                     r.req_meta,
-                                ])?;
+                                                                    // AF-175: WHICH PROCESS logged this row.
+                                    // Read once per batch below rather than
+                                    // per row — it cannot change inside a
+                                    // process, and re-reading it per row would
+                                    // imply it could.
+                                    boot,
+])?;
                             }
                         }
                         if sweep {

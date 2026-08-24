@@ -171,6 +171,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0029_steering_history_source",
         sql: include_str!("../../migrations/0029_steering_history_source.sql"),
     },
+    Migration {
+        version: 30,
+        name: "0030_request_log_boot_at",
+        sql: include_str!("../../migrations/0030_request_log_boot_at.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
