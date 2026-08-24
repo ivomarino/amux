@@ -2716,3 +2716,34 @@ NOTE: this is AMUX-1768's class one layer up. browser.rs:104-113 removed the SER
   The client-side constant survived the fix. Fourth member of the 2026-08-23 misattribution
   cluster with AF-179 and AF-182; the other three name a WRONG owner, which is recoverable, and
   this one names none.
+
+## Acking a peer's card with a desc PATCH silently destroys their write-up
+AREA: board
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-23
+SESSION: amux
+CARD: AMUX-3576
+SYMPTOM: The documented way to record an outcome before a gate transition is to write `desc`
+  first. `desc` REPLACES. Acking three of amux-frustrations' review cards destroyed their
+  write-ups: AF-178 4070 -> 1613, AF-182 5018 -> 2152, AF-180 3055 -> 1958. Nothing at write
+  time said anything was lost. The board HAD computed the delta all along — it writes
+  "desc -2457 chars" into a History line, where only someone reading the card afterwards
+  finds it.
+COST: ~6400 characters of a peer's reasoning across three cards, restored only because
+  `_amux_state_events` carries full pre-mutation snapshots (ids 78469, 78822, 78791). mvs-infra
+  hit the identical thing hours earlier on MI-4746 and lost 4082 chars of merge evidence. Two
+  sessions, one evening, same field.
+FIX: 91648fbc refuses a replace that drops a strict majority of a desc of 500+ chars, with
+  `desc_shrink_ack` to override and a pointer to `desc_append`. c7826ed2 documents the recovery
+  path in the board contract, because a recovery nobody knows about is one nobody uses.
+  AMUX-3576 carries the remaining gap: the guard keys on SIZE, so AF-180 at 36% would have
+  slipped under it even had it been live. Authorship is the honest axis — a non-owner replacing
+  prose on someone else's card is a different act from the owner trimming their own, and the
+  board knows both facts at write time.
+NOTE: The guard's first production catch was ITS OWN AUTHOR. It refused me 409 on AF-179 an hour
+  after I shipped it, doing the exact thing it was written to prevent, having written the commit
+  message that explains why `desc_append` exists. Knowing the failure mode, having just fixed it,
+  and having documented it did not stop me repeating it three times. That is ethos rule 6's
+  "a rule you have written down is not a rule you run" with a same-day specimen, and it is the
+  argument for why this had to become a refusal rather than a convention.
