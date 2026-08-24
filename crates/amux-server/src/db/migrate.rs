@@ -181,6 +181,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0031_issues_closed_at",
         sql: include_str!("../../migrations/0031_issues_closed_at.sql"),
     },
+    Migration {
+        version: 32,
+        name: "0032_state_events_entity_index",
+        sql: include_str!("../../migrations/0032_state_events_entity_index.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -367,7 +372,12 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
         "CREATE TABLE IF NOT EXISTS _amux_migrations (
             version    INTEGER PRIMARY KEY,
             name       TEXT NOT NULL,
-            applied_at TEXT NOT NULL
+            applied_at TEXT NOT NULL,
+            -- Fresh databases get this from the start; existing ones get it
+            -- from 0032's ADDCOL. Both paths, because CREATE TABLE IF NOT
+            -- EXISTS is a no-op against a table that already exists and would
+            -- silently leave every deployed database without the column.
+            duration_ms INTEGER
         );",
     )?;
     for m in MIGRATIONS {
@@ -381,13 +391,42 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
         if already {
             continue;
         }
+        // TIME EVERY MIGRATION. This function used to log nothing, so 0031
+        // holding the connection for 186 seconds on 2026-08-24 was
+        // indistinguishable from a crash, a slow build, or a launchd problem:
+        // the only symptom anyone could see was /health not answering. A
+        // migration is the one startup step that can take arbitrarily long
+        // while looking exactly like a dead process.
+        let started = std::time::Instant::now();
         let tx = conn.transaction()?;
         apply_one(&tx, m.sql)?;
+        let ms = started.elapsed().as_millis() as i64;
         tx.execute(
             "INSERT INTO _amux_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
             rusqlite::params![m.version, m.name, chrono::Utc::now().to_rfc3339()],
         )?;
+        // Best-effort: the column arrives in 0032, so every migration before it
+        // on an existing database has nowhere to put this. Failing to RECORD a
+        // duration must never fail the migration itself, and the tracing line
+        // below carries the number regardless.
+        let _ = tx.execute(
+            "UPDATE _amux_migrations SET duration_ms = ?1 WHERE version = ?2",
+            rusqlite::params![ms, m.version],
+        );
         tx.commit()?;
+        // WARN, not INFO, above a threshold a human would notice as downtime.
+        // 2s is well above every migration here except the one that caused the
+        // outage, so this fires on the shape that matters and stays quiet
+        // otherwise.
+        if ms >= 2_000 {
+            tracing::warn!(
+                migration = m.name, duration_ms = ms,
+                "migration held the database for {:.1}s — the server is unreachable for this whole period",
+                ms as f64 / 1000.0
+            );
+        } else {
+            tracing::info!(migration = m.name, duration_ms = ms, "migration applied");
+        }
     }
     Ok(())
 }
@@ -621,6 +660,28 @@ mod tests {
     /// ADDCOLs after, so a backfill died on `no such column` — with nothing in
     /// the mechanism hinting at the ordering. Nobody hit it because every
     /// ADDCOL migration until then only added.
+    /// The timing instrument itself must be able to fail. `apply_all` logged
+    /// nothing until 0031 held the database for 186 seconds and the only visible
+    /// symptom was /health not answering; an instrument added in response to
+    /// that, and never checked, would be the same defect with more code.
+    #[test]
+    fn every_migration_records_how_long_it_held_the_database() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all(&mut conn).unwrap();
+        let missing: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _amux_migrations WHERE duration_ms IS NULL", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            missing, 0,
+            "on a fresh database every migration must record its duration, or the next \
+             outage is a forensic exercise again"
+        );
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _amux_migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n as usize, super::MIGRATIONS.len(), "and every migration must be recorded at all");
+    }
+
     #[test]
     fn addcol_can_be_used_by_the_same_migration() {
         let conn = Connection::open_in_memory().unwrap();
