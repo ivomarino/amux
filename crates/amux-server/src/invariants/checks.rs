@@ -1977,6 +1977,247 @@ pub fn alert_channel_can_deliver(s: &AlertChannelState) -> Vec<InvariantResult> 
 }
 
 // ---------------------------------------------------------------------------
+// 11. The frustrations.md ledger agrees with the board (AF-191)
+// ---------------------------------------------------------------------------
+
+/// One parsed `frustrations.md` entry, joined against its card.
+///
+/// `card_status` is `None` when the `CARD:` id is not on THIS board — which is
+/// not the same as "no card": the entry claims a link and the link resolves to
+/// nothing a reader here can open.
+#[derive(Debug, Clone)]
+pub struct LedgerRow {
+    pub line: usize,
+    pub card: String,
+    /// The first word of `STATUS:` — entries carry qualifiers
+    /// ("open (the live deviation is fixed…)") that must not change the class.
+    pub file_status: String,
+    pub session: String,
+    pub title: String,
+    pub card_status: Option<String>,
+}
+
+/// `frustrations.md` is a fixed-field file precisely so it can be counted; this
+/// is the counter. Entries start at a column-0 `## ` heading AFTER the `---`
+/// that closes the header, because the header's own template is indented two
+/// spaces on purpose (an instrument that measures itself is the bug that file
+/// exists to record). Field lines are column-0 `NAME: value`; the FIRST
+/// occurrence wins, so a superseding `NOTE:` paragraph cannot silently rewrite
+/// the entry's class.
+pub fn parse_frustration_entries(md: &str) -> Vec<(usize, String, String, String, Vec<String>)> {
+    let mut out = Vec::new();
+    let mut started = false;
+    let mut cur: Option<(usize, String, String, String, Vec<String>)> = None;
+    for (i, line) in md.lines().enumerate() {
+        if !started {
+            if line.trim() == "---" {
+                started = true;
+            }
+            continue;
+        }
+        if let Some(t) = line.strip_prefix("## ") {
+            if let Some(e) = cur.take() {
+                out.push(e);
+            }
+            cur = Some((i + 1, t.trim().to_string(), String::new(), String::new(), Vec::new()));
+            continue;
+        }
+        let Some(e) = cur.as_mut() else { continue };
+        if let Some(v) = line.strip_prefix("STATUS:") {
+            if e.2.is_empty() {
+                e.2 = v.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+            }
+        } else if let Some(v) = line.strip_prefix("SESSION:") {
+            if e.3.is_empty() {
+                e.3 = v.trim().to_string();
+            }
+        } else if let Some(v) = line.strip_prefix("CARD:") {
+            if e.4.is_empty() {
+                e.4 = extract_card_ids(v);
+            }
+        }
+    }
+    if let Some(e) = cur.take() {
+        out.push(e);
+    }
+    out
+}
+
+/// `AF-191`, `AMUX-3618`, `AC-227` — uppercase-and-hyphen prefix, `-`, digits.
+/// Deliberately tolerant of the surrounding prose (`CARD: AF-69 (investigation)`)
+/// because the field is free-form and always has been.
+fn extract_card_ids(s: &str) -> Vec<String> {
+    let b: Vec<char> = s.chars().collect();
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while i < b.len() {
+        if !b[i].is_ascii_uppercase() {
+            i += 1;
+            continue;
+        }
+        if i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == '-') {
+            i += 1;
+            continue;
+        }
+        let mut j = i;
+        while j < b.len() && (b[j].is_ascii_uppercase() || b[j] == '-') {
+            j += 1;
+        }
+        // need at least PREFIX- then a digit
+        if j > i + 1 && b[j - 1] == '-' && j < b.len() && b[j].is_ascii_digit() {
+            let mut k = j;
+            while k < b.len() && b[k].is_ascii_digit() {
+                k += 1;
+            }
+            if k == b.len() || !b[k].is_ascii_alphanumeric() {
+                let id: String = b[i..k].iter().collect();
+                if !out.contains(&id) {
+                    out.push(id);
+                }
+            }
+            i = k;
+            continue;
+        }
+        i = j.max(i + 1);
+    }
+    out
+}
+
+/// Statuses that mean the card is CLOSED. `discarded` counts: a discarded card
+/// is a decision that the work will not happen, which is an answer.
+pub const CLOSED_CARD_STATUSES: [&str; 3] = ["done", "verified", "discarded"];
+
+/// INCIDENT (AF-191, 2026-08-24): `grep '^STATUS: open' frustrations.md` is that
+/// file's OWN documented primary grep — its header says the greps are what make
+/// a cluster countable, and the whole argument for the file is that "one
+/// frustration is a complaint and a cluster is an argument". It reported 78 open
+/// entries. 52 of them had a card that was already `done` or `verified`. The
+/// ledger and the board are two independent stores of the same fact and nothing
+/// kept them in step, so the view that decides what to fix next was wrong by
+/// two thirds — ethos rule 4 (a tag in a store the reader never opens) and rule
+/// 1's view/mechanism rule (a view must share the predicate of the mechanism it
+/// claims to describe).
+///
+/// BOTH DIRECTIONS, because they are different failures with different costs:
+///
+/// - `open` entry, closed card: the file overstates the backlog. Cheap-looking,
+///   and it is the one that actually bit — 52 entries of noise around 26 real
+///   ones.
+/// - `fixed` entry, open card: the file understates it, and this is the
+///   PROTOCOL violation AC-227 reports in its own body. Somebody who was not the
+///   author marked that entry `fixed` while the card sat in `review`; the author
+///   flipped it back and wrote "whoever marked this entry fixed was NOT the
+///   author — which is the one thing this protocol is supposed to make
+///   impossible". A closed entry over an open card is exactly that fingerprint.
+///
+/// It does NOT propose reconciling either side automatically. The entries belong
+/// to the sessions that hit the friction and closing someone's report on their
+/// behalf is ethos rule 8 — and AC-227 is the standing proof that a card reading
+/// `done` does not mean the friction is gone. The check names the rows; their
+/// authors decide.
+pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) -> Vec<InvariantResult> {
+    const ID: &str = "frustrations.ledger_agrees_with_board";
+    let closed = |s: &str| CLOSED_CARD_STATUSES.contains(&s);
+    let mut stale_open: Vec<&LedgerRow> = Vec::new();
+    let mut premature_fixed: Vec<&LedgerRow> = Vec::new();
+    for r in rows {
+        let Some(cs) = r.card_status.as_deref() else { continue };
+        if r.file_status == "open" && closed(cs) {
+            stale_open.push(r);
+        } else if r.file_status != "open" && !r.file_status.is_empty() && !closed(cs) {
+            premature_fixed.push(r);
+        }
+    }
+    let ev = |v: &[&LedgerRow]| {
+        v.iter()
+            .map(|r| {
+                json!({"line": r.line, "card": r.card, "file_status": r.file_status,
+                       "card_status": r.card_status, "session": r.session, "title": r.title})
+            })
+            .collect::<Vec<_>>()
+    };
+    if stale_open.is_empty() && premature_fixed.is_empty() {
+        return vec![InvariantResult::pass(ID)
+            .evidence(json!({"entries": rows.len(), "source": source}))];
+    }
+    let ex = |v: &[&LedgerRow]| {
+        v.iter().take(4).map(|r| format!("L{}:{}", r.line, r.card)).collect::<Vec<_>>().join(", ")
+    };
+    vec![InvariantResult::fail(
+        ID,
+        "every frustrations.md entry's STATUS agrees with its CARD's status on this board"
+            .to_string(),
+        format!(
+            "{} entry/entries disagree with their card. {} say STATUS: open over a CLOSED card \
+             ({}) — `grep '^STATUS: open'` is the file's own documented primary grep and it \
+             overstates the live backlog by that much. {} claim fixed over an OPEN card ({}) — \
+             that is the AC-227 fingerprint: an entry closed by somebody who was not its author. \
+             Do NOT reconcile either side automatically: the entries belong to the sessions that \
+             hit the friction, and a card reading `done` is not proof the friction is gone \
+             (AC-227's card was `done` and only its documentation half had shipped). Route each \
+             row to its SESSION for sign-off. Ledger read from: {}.",
+            stale_open.len() + premature_fixed.len(),
+            stale_open.len(),
+            ex(&stale_open),
+            premature_fixed.len(),
+            ex(&premature_fixed),
+            source,
+        ),
+    )
+    .evidence(json!({
+        "entries": rows.len(),
+        "source": source,
+        "stale_open": ev(&stale_open),
+        "premature_fixed": ev(&premature_fixed),
+    }))]
+}
+
+/// INCIDENT (AF-191, same sweep): 15 entries carry a `CARD:` id that does not
+/// exist on this board at all — 13 `AEAB-NN` from a lane that no longer runs and
+/// whose cards live on a different install's board, plus one from a contributor's
+/// WSL2 machine and one deleted card.
+///
+/// `.claude/rules/frustrations.md` says "Link the card. A frustration without a
+/// `CARD:` is a complaint; with one it is a work item someone can pick up." Every
+/// one of these HAS a CARD field, so the rule reads satisfied, and none of them
+/// is pickable from here. That is the rule-6 shape: the promise is in the doc and
+/// the thing it promises is not reachable.
+///
+/// It reports rather than files, because filing a local card for someone else's
+/// entry decides that their report is now this board's work (rule 8).
+pub fn frustration_cards_are_reachable(rows: &[LedgerRow], source: &str) -> Vec<InvariantResult> {
+    const ID: &str = "frustrations.cards_are_reachable";
+    let missing: Vec<&LedgerRow> = rows.iter().filter(|r| r.card_status.is_none()).collect();
+    if missing.is_empty() {
+        return vec![InvariantResult::pass(ID)
+            .evidence(json!({"entries": rows.len(), "source": source}))];
+    }
+    let shown: Vec<String> =
+        missing.iter().take(5).map(|r| format!("L{}:{}", r.line, r.card)).collect();
+    vec![InvariantResult::fail(
+        ID,
+        "every frustrations.md CARD id resolves to a card on this board".to_string(),
+        format!(
+            "{} entry/entries name a card that is not on this board ({}). The rule says a \
+             frustration with a CARD is a work item someone can pick up — these have the field \
+             and are pickable by nobody here, so the rule reads satisfied while the link goes \
+             nowhere. File a local card carrying the entry, or record on the entry which board \
+             owns it. Ledger read from: {}.",
+            missing.len(),
+            shown.join(", "),
+            source,
+        ),
+    )
+    .evidence(json!({
+        "entries": rows.len(),
+        "source": source,
+        "missing": missing.iter().map(|r| json!({
+            "line": r.line, "card": r.card, "session": r.session, "title": r.title
+        })).collect::<Vec<_>>(),
+    }))]
+}
+
+// ---------------------------------------------------------------------------
 // Negative controls (AMUX-2624). Each proves the check DETECTS the real bug.
 // ---------------------------------------------------------------------------
 
@@ -1984,6 +2225,161 @@ pub fn alert_channel_can_deliver(s: &AlertChannelState) -> Vec<InvariantResult> 
 mod negative_controls {
     use super::*;
     use crate::invariants::Status;
+
+    // -- AF-191: the frustrations ledger vs the board -----------------------
+
+    fn lrow(line: usize, card: &str, file_status: &str, card_status: Option<&str>) -> LedgerRow {
+        LedgerRow {
+            line,
+            card: card.into(),
+            file_status: file_status.into(),
+            session: "amux-cloud".into(),
+            title: "t".into(),
+            card_status: card_status.map(str::to_string),
+        }
+    }
+
+    /// AF-191 rebuilt from the sweep's own artifact: an entry reading
+    /// `STATUS: open` over a `done` card is the state that made
+    /// `grep '^STATUS: open'` report 78 when 26 were live, and the INVERSE —
+    /// a `fixed` entry over a card still in `review` — is the AC-227
+    /// fingerprint of somebody who was not the author closing the report.
+    /// Both must go red; agreement must pass, or the check is the permanent
+    /// red that trains skimming.
+    #[test]
+    fn a_ledger_entry_that_disagrees_with_its_card_is_detected_in_both_directions() {
+        let agree = vec![
+            lrow(10, "AF-1", "open", Some("doing")),
+            lrow(20, "AF-2", "fixed", Some("verified")),
+            lrow(30, "AF-3", "fixed", Some("discarded")),
+        ];
+        let ok = frustration_ledger_agrees_with_board(&agree, "worktree");
+        assert_eq!(ok[0].status, Status::Pass, "{ok:?}");
+
+        let stale = vec![lrow(47, "AC-227", "open", Some("done"))];
+        let r = frustration_ledger_agrees_with_board(&stale, "worktree");
+        assert_eq!(r[0].status, Status::Fail);
+        assert!(r[0].observed.contains("L47:AC-227"), "names the row: {}", r[0].observed);
+        assert!(r[0].observed.contains("primary grep"), "names WHY it matters: {}", r[0].observed);
+
+        let premature = vec![lrow(99, "AC-227", "fixed", Some("review"))];
+        let r2 = frustration_ledger_agrees_with_board(&premature, "worktree");
+        assert_eq!(r2[0].status, Status::Fail);
+        assert!(r2[0].observed.contains("AC-227 fingerprint"), "{}", r2[0].observed);
+        assert!(
+            r2[0].observed.contains("Do NOT reconcile"),
+            "carries the rule-8 caution: {}",
+            r2[0].observed
+        );
+        // A qualifier on STATUS must not change the class: the file really does
+        // carry "open (the live deviation is fixed; the hazard is not)".
+        let qualified = vec![lrow(1514, "AEAB-12", "open", Some("done"))];
+        assert_eq!(
+            frustration_ledger_agrees_with_board(&qualified, "worktree")[0].status,
+            Status::Fail
+        );
+        // An unresolvable card belongs to the OTHER check, not this one.
+        let absent = vec![lrow(2995, "AMUX-40", "fixed", None)];
+        assert_eq!(
+            frustration_ledger_agrees_with_board(&absent, "worktree")[0].status,
+            Status::Pass,
+            "an absent card is cards_are_reachable's finding, not a status disagreement"
+        );
+    }
+
+    /// AF-191: 15 entries name a card that is not on this board, so
+    /// `.claude/rules/frustrations.md`'s "with a CARD it is a work item someone
+    /// can pick up" reads satisfied while the link resolves to nothing.
+    #[test]
+    fn a_ledger_entry_naming_an_offboard_card_is_detected() {
+        let ok = vec![lrow(10, "AF-1", "open", Some("todo"))];
+        assert_eq!(frustration_cards_are_reachable(&ok, "worktree")[0].status, Status::Pass);
+
+        let bad = vec![lrow(2180, "AEAB-47", "open", None), lrow(2995, "AMUX-40", "fixed", None)];
+        let r = frustration_cards_are_reachable(&bad, "worktree");
+        assert_eq!(r[0].status, Status::Fail);
+        assert!(r[0].observed.contains("AEAB-47"), "{}", r[0].observed);
+        assert!(r[0].observed.contains("2 entry"), "counts them: {}", r[0].observed);
+    }
+
+    /// The parser is the load-bearing half: if it silently reads zero entries
+    /// BOTH checks pass and the instrument is the theatre it exists to prevent.
+    /// So it is pinned against the real file's shape — the two-space-indented
+    /// template inside the header must NOT count (the header says so in as many
+    /// words), a superseding NOTE must not rewrite the entry's STATUS, and a
+    /// `CARD:` field with prose around the id must still yield the id.
+    #[test]
+    fn the_ledger_parser_skips_the_header_template_and_takes_the_first_field() {
+        let md = concat!(
+            "# amux frustrations\n\n",
+            // A COLUMN-0 heading in the header — the real file has one
+            // ("## Format — fixed fields so this greps"). Only the `---` guard
+            // keeps it out; the column-0 rule cannot.
+            "## Format — fixed fields so this greps\n",
+            "STATUS: not-an-entry\n",
+            "CARD: AF-0\n\n",
+            "```\n",
+            "  ## <one-line title>\n",
+            "  STATUS: <open|fixed>\n",
+            "  CARD: <ID>\n",
+            "```\n\n",
+            "---\n",
+            "## first real entry\n",
+            // Indented, and BEFORE the real STATUS, so only the column-0 rule
+            // can keep it from winning the first-field-wins race.
+            "  ## an indented heading inside an entry body is not a new entry\n",
+            "  STATUS: fixed\n",
+            "STATUS: open\n",
+            "SESSION: amux-cloud\n",
+            "CARD: AC-297 helps with this\n",
+            "SYMPTOM: x\n\n",
+            "NOTE: superseded\n",
+            "STATUS: fixed\n\n",
+            "## second real entry\n",
+            "STATUS: open (the live deviation is fixed; the hazard is not)\n",
+            "SESSION: amux\n",
+            "CARD: AF-114, AF-115 and AMUX-40\n",
+        );
+        let es = parse_frustration_entries(md);
+        assert_eq!(
+            es.len(),
+            2,
+            "nothing before the `---` and no indented heading may parse as an entry: {es:?}"
+        );
+        assert_eq!(es[0].1, "first real entry");
+        assert_eq!(
+            es[0].2, "open",
+            "the first COLUMN-0 STATUS wins — not an indented one in the body, not the \
+             superseding NOTE's"
+        );
+        assert_eq!(es[0].4, vec!["AC-297".to_string()]);
+        assert_eq!(es[1].2, "open", "a qualifier must not change the class");
+        assert_eq!(
+            es[1].4,
+            vec!["AF-114".to_string(), "AF-115".to_string(), "AMUX-40".to_string()]
+        );
+    }
+
+    /// The parser runs against the REAL file in-tree, so a format change that
+    /// silently zeroes it fails here rather than turning both checks green.
+    /// Bounds only — the count moves every time anyone appends.
+    #[test]
+    fn the_real_frustrations_file_still_parses() {
+        const MD: &str = include_str!("../../../../frustrations.md");
+        let es = parse_frustration_entries(MD);
+        assert!(es.len() > 40, "parsed only {} entries from the real file", es.len());
+        assert!(
+            es.iter().filter(|e| !e.4.is_empty()).count() * 10 >= es.len() * 9,
+            "at least 90% of entries must yield a card id; got {} of {}",
+            es.iter().filter(|e| !e.4.is_empty()).count(),
+            es.len()
+        );
+        assert!(
+            es.iter().all(|e| e.2 == "open" || e.2 == "fixed" || e.2 == "half-fixed"),
+            "unexpected STATUS values: {:?}",
+            es.iter().map(|e| &e.2).collect::<BTreeSet<_>>()
+        );
+    }
 
     /// AMUX-3203, rebuilt from the incident artifact: both channels ENABLED with
     /// no destination (0 subs, empty phone) is the disconnected fire alarm that

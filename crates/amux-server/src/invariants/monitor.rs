@@ -170,6 +170,13 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(autofix_dispatchable_check(state));
     out.extend(card_type_vocabulary_check(state));
 
+    // -- 6f. does the frustrations LEDGER agree with the board? (AF-191).
+    // `grep '^STATUS: open' frustrations.md` is that file's own documented
+    // primary grep and it reported 78 while 52 of those entries had a card
+    // already done or verified. The ledger and the cards were two stores of one
+    // fact with nothing between them.
+    out.extend(frustration_ledger_check(state));
+
     // -- 6e. is the invariant system's OWN evaluation log bounded? (AMUX-3489:
     // 8M rows / ~2GB from a flat 7-day retention on ~13 green rows/sec — the
     // watcher was the one thing no watcher covered).
@@ -823,6 +830,91 @@ fn card_type_vocabulary_check(state: &AppState) -> Vec<InvariantResult> {
         Ok(offenders) => checks::card_types_are_in_vocabulary(&offenders),
         Err(e) => vec![InvariantResult::unknown(ID, format!("could not read card types: {e}"))],
     }
+}
+
+/// AF-191. Joins `frustrations.md` against the board so the ledger's own
+/// primary grep cannot silently drift from what the cards say.
+///
+/// SOURCE ORDER, and it is the whole reason this is not a plain `include_str!`:
+/// `frustrations.md` deploys on COMMIT, not on binary rebuild. The builder only
+/// rebuilds when `crates/` or `Cargo.*` move, so a baked copy goes stale on
+/// every ledger-only commit and the check would then fire on the healthy state —
+/// the identical trap AF-132 already caught in the git-guard check above.
+/// Worktree first (that is what a `grep` in this checkout sees, which is what
+/// the file's header promises), then `HEAD`, then the baked copy as the no-repo
+/// fallback (cloud image). Which one was used rides in the message and the
+/// evidence of every evaluation, because "the report records WHICH source last
+/// wrote it" is the only thing that distinguishes a stale read from a real
+/// disagreement.
+fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
+    const AGREE: &str = "frustrations.ledger_agrees_with_board";
+    const REACH: &str = "frustrations.cards_are_reachable";
+    const BAKED: &str = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../frustrations.md"
+    ));
+    let repo = crate::api::self_update::repo_dir();
+    let (md, source) = repo
+        .as_ref()
+        .and_then(|d| {
+            std::fs::read_to_string(d.join("frustrations.md")).ok().map(|s| (s, "worktree"))
+        })
+        .or_else(|| {
+            let dir = repo.as_ref()?;
+            let out = std::process::Command::new("git")
+                .args(["-C", &dir.to_string_lossy(), "show", "HEAD:frustrations.md"])
+                .output()
+                .ok()?;
+            out.status
+                .success()
+                .then(|| (String::from_utf8_lossy(&out.stdout).into_owned(), "HEAD"))
+        })
+        .unwrap_or_else(|| (BAKED.to_string(), "baked-at-build"));
+
+    let entries = checks::parse_frustration_entries(&md);
+    if entries.is_empty() {
+        // Zero entries makes BOTH checks pass vacuously, which is the exact
+        // theatre this module forbids. An empty ledger is either a drained file
+        // or a broken parse and nothing here can tell them apart, so say so.
+        let msg = format!("parsed 0 entries from {source} ({} bytes)", md.len());
+        return vec![
+            InvariantResult::unknown(AGREE, msg.clone()),
+            InvariantResult::unknown(REACH, msg),
+        ];
+    }
+    let Ok(conn) = state.store.read() else {
+        return vec![
+            InvariantResult::unknown(AGREE, "store unreadable"),
+            InvariantResult::unknown(REACH, "store unreadable"),
+        ];
+    };
+    let mut rows: Vec<checks::LedgerRow> = Vec::new();
+    for (line, title, file_status, session, cards) in entries {
+        for card in cards {
+            // `deleted IS NULL` only: an ARCHIVED card is still readable and
+            // still carries its status, and filtering it out here would report a
+            // live link as broken — the archived-filter trap ethos rule 1 logs
+            // five instances of.
+            let st: Option<String> = conn
+                .query_row(
+                    "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                    [&card],
+                    |r| r.get::<_, String>(0),
+                )
+                .ok();
+            rows.push(checks::LedgerRow {
+                line,
+                card,
+                file_status: file_status.clone(),
+                session: session.clone(),
+                title: title.clone(),
+                card_status: st,
+            });
+        }
+    }
+    let mut out = checks::frustration_ledger_agrees_with_board(&rows, source);
+    out.extend(checks::frustration_cards_are_reachable(&rows, source));
+    out
 }
 
 fn autofix_dispatchable_check(state: &AppState) -> Vec<InvariantResult> {
