@@ -286,11 +286,27 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   B1=$(curl -sk $AMUX_URL/health | python3 -c 'import json,sys;print(json.load(sys.stdin)["build"])')
   [ "$B0" = "$B1" ] || echo "INVALID: build moved $B0 -> $B1 — you measured two different servers"
   ```
-  `build` is a content hash of the running binary, so it discriminates a code change, not
+  `build` is a content hash of the running binary, so it discriminates a BINARY change, not
   merely a bounce (`pid`/`uptime_s` catch the bounce). On 2026-08-08 this cost a session
   a published wrong conclusion: a filtered-board hang (AMUX-2562) was measured, blamed on
   a restart, and "disproved" by a re-measurement that had silently run against the FIXED
   build. The instrument was already there and nobody was routed to it.
+
+  **A binary change is not the same as a code change, and this line used to say it was.**
+  Measured 2026-08-24: the builder ran twice against the IDENTICAL source commit
+  (`d55b7a63` both times, per `~/.amux/logs/rust-auto-build.log`) and produced
+  `eed60bb32f8c2907` then `b17aefd24ed87a3d`, with `/health`'s `commit` reading
+  `2b428975472c` throughout. The build is not reproducible, so `build` moving proves a
+  rebuild happened and proves nothing about whether the SOURCE moved.
+
+  For the bracket above that is the safe direction — it can only reject a measurement that
+  was actually fine. Reach for `commit` when the question is "did the code change under me",
+  and for `build` when it is "am I still talking to the same process image". Inferring source
+  movement from `build` alone is invalid, and this bit in the same exchange in which someone
+  read a `build` hash as a `commit` sha (`git cat-file -t` finds no object for a build hash —
+  that is the one-command check). Note also that `pid` is STABLE across an adopt, because
+  self-adoption is a re-exec in place, so anyone watching `pid`/`uptime_s` sees continuity
+  while the binary changes underneath.
 - **For a pre-fix specimen, use `<your-sha>^` — NEVER `HEAD~1`.** Every fix here is
   supposed to be checked against the code it fixed (ethos rule 7), so this recipe gets
   reached for constantly, and on a shared checkout it is wrong the moment another lane

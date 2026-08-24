@@ -330,12 +330,36 @@ code as broken or missing:
 - an env value read straight out of a file with its quotes still attached, so `[ -d ]`
   reported an existing directory as missing
 - a latency measured across a server restart, which makes any number meaningless
+- `git log -S'TIMESTAMP_COLUMNS'` returning nothing while `git diff` plainly showed the
+  added row — the pickaxe reports commits where the COUNT of the string changed, and
+  adding a row inside an existing const does not change how many times the const's name
+  appears. Structurally invisible to `-S`, obvious to `-G`
 
 The three that generalise past "be careful": **name the target before you search for
 it** (which of the 28 selects? which of the two branches?), **bound a positional window
 on the CODE, not on however much prose precedes it**, and **when you built the broken
 fixture yourself, verify it is actually broken** — "I broke it" is a claim, not a
 premise, and it fails silently because everything looks like it ran.
+
+The `-S` case earns its own line because it is the first of these answerable BEFORE
+running anything, and that is the direction to push: *would a positive change the COUNT
+of this string, or only the lines around it?* If only the lines, `-S` cannot answer and
+`-G` is the tool. Every other instance above needed a second instrument to disagree in
+front of you, and "I happened to notice two instruments disagreeing" is not a habit — it
+is luck. A precondition you can state in advance is.
+
+**The fixture must live in the same DOMAIN as the defect, not merely exhibit its shape.**
+The mutation-strength rule above says to mutate the arithmetic rather than the wording;
+this is its companion, and it is the one that lets a green suite coexist with a live bug.
+AF-161: the board's slim payload dropped a column in `list_body`, one layer ABOVE the
+snapshot that `snapshot_slim_is_snapshot_minus_prose` pins — a real property, correctly
+asserted, in a place the shipped path does not flow through. Nothing about READING that
+test reveals which layer it holds. So ask where the defect would be INTRODUCED and confirm
+your fixture flows through that code rather than an ancestor of it. Corollary for the
+opposite error: when you assert a failure will be LOUD, name the idiom that makes it loud
+and check it is the one your callers write — `row["desc"]` raises and `row.get("desc")`
+returns `None`, and the safety argument was made for the first while every consumer wrote
+the second.
 
 The tell that beats all of them: a red test on code you just verified by hand, or a
 clean result you did not expect. Both mean the instrument is a candidate before the code
