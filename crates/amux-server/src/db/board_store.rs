@@ -2084,6 +2084,94 @@ mod configured_gate_tests {
         names.iter().map(|s| s.to_string()).collect()
     }
 
+    /// AMUX-3567 REVIEW (amux-frustrations): the SOURCE at every rung.
+    ///
+    /// The gate VALUES were covered rung by rung; the tier that produced them
+    /// was not, anywhere. Measured by mutation on the shipped tree: making
+    /// `retype_would_help` return true for `Worker` AND `Group` left the entire
+    /// `-p amux-server` suite green (1264 passed, the one failure an unrelated
+    /// env-dependent alerts cell). So the advice "retyping will not change it"
+    /// could invert for the two tiers the whole feature exists to surface and
+    /// nothing would go red.
+    ///
+    /// That matters because the WRONG answer here is the incident: AF-168's
+    /// reporter retyped TUBES-2053 on a worker-scoped gate, watched it not
+    /// re-derive, and concluded the override was pinned per-card. Worker and
+    /// Group are exactly the rungs that were never asserted.
+    ///
+    /// One test for the whole ladder rather than five, because the property is
+    /// a mapping and the interesting failure is two rungs agreeing when they
+    /// should differ.
+    #[test]
+    fn the_gate_source_names_the_tier_that_won_at_every_rung() {
+        // TYPE DEFAULT — nothing configured anywhere.
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        let (_, src) = effective_gate_with_source(
+            &c, &row_for("backend", "code", None), TaskStatus::Done, &groups(&[]));
+        assert_eq!(src, GateSource::TypeDefault);
+        assert!(src.retype_would_help(), "the type default is the ONE rung retyping moves");
+        assert!(src.explain().contains("TYPE"), "{}", src.explain());
+
+        // COLUMN — an operator-authored gate on the status itself.
+        let c = conn_with(Some(r#"["Global column rule"]"#), Some(1));
+        add_session_gates(&c);
+        let (g, src) = effective_gate_with_source(
+            &c, &row_for("backend", "code", None), TaskStatus::Done, &groups(&[]));
+        assert_eq!(g, vec!["Global column rule"]);
+        assert_eq!(src, GateSource::Column);
+        assert!(!src.retype_would_help(), "retyping cannot clear a column gate");
+
+        // GROUP — the worker has none, a group does. This rung and the next are
+        // the ones the mutation proved uncovered.
+        let c = conn_with(None, None);
+        add_session_gates(&c);
+        scope_gate(&c, "group:ops", "done", r#"["Group rule"]"#);
+        let (g, src) = effective_gate_with_source(
+            &c, &row_for("backend", "code", None), TaskStatus::Done, &groups(&["ops"]));
+        assert_eq!(g, vec!["Group rule"]);
+        assert_eq!(src, GateSource::Group("ops".into()));
+        assert!(!src.retype_would_help(), "a GROUP gate ignores the item type: {}", src.explain());
+        assert!(src.explain().contains("GROUP scope"), "{}", src.explain());
+        assert!(src.explain().contains("session-gates"), "point at the endpoint that answers it: {}", src.explain());
+
+        // WORKER — beats the group, and names the worker so the reader can go
+        // look. This is TUBES-2053's shape exactly.
+        scope_gate(&c, "backend", "done", r#"["Worker rule"]"#);
+        let (g, src) = effective_gate_with_source(
+            &c, &row_for("backend", "code", None), TaskStatus::Done, &groups(&["ops"]));
+        assert_eq!(g, vec!["Worker rule"]);
+        assert_eq!(src, GateSource::Worker("backend".into()));
+        assert!(!src.retype_would_help(), "a WORKER gate ignores the item type: {}", src.explain());
+        assert!(src.explain().contains("`backend`"), "name the worker, or the reader cannot go look: {}", src.explain());
+
+        // CARD — beats everything above it.
+        let (g, src) = effective_gate_with_source(
+            &c,
+            &row_for("backend", "code", Some(r#"["Only this card"]"#)),
+            TaskStatus::Done,
+            &groups(&["ops"]),
+        );
+        assert_eq!(g, vec!["Only this card"]);
+        assert_eq!(src, GateSource::Card);
+        assert!(!src.retype_would_help());
+
+        // AND THE DISCRIMINATOR THE MUTATION EXPOSED: exactly one rung says yes.
+        // Asserted as a set so a future rung cannot be added silently on the
+        // wrong side of it.
+        let yes = [
+            GateSource::Card,
+            GateSource::Worker("w".into()),
+            GateSource::Group("g".into()),
+            GateSource::Column,
+            GateSource::TypeDefault,
+        ]
+        .iter()
+        .filter(|s| s.retype_would_help())
+        .count();
+        assert_eq!(yes, 1, "retyping moves the type default and nothing else");
+    }
+
     /// The whole ladder in one specimen: worker, group and global all
     /// configured, worker wins ("worker takes priority over all").
     #[test]

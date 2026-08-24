@@ -2166,3 +2166,74 @@ async fn the_contract_says_which_tier_each_gate_came_from() {
         "a card-scoped gate is NOT changed by retyping, and the contract must say so: {v2}"
     );
 }
+
+/// AMUX-3567 REVIEW (amux-frustrations): the same answer for the WORKER tier,
+/// which is the tier the card is named after and the one the original cell
+/// skipped. It went type-default -> card-override, so `GateSource::Worker` was
+/// never produced by any HTTP test; a mutation making `retype_would_help`
+/// return true for Worker and Group left the whole suite green.
+///
+/// TUBES-2053's shape exactly: a card owned by a worker that carries its own
+/// `done` gate. Retyping it does nothing, and reading the contract must say so
+/// BEFORE the transition is refused, which is the entire point of the card.
+#[tokio::test]
+async fn the_contract_names_a_worker_scoped_gate_before_you_trip_it() {
+    let (app, _dir) = app();
+    let card = create(
+        &app,
+        json!({
+            "title": "owned by a worker with its own bar",
+            "status": "todo",
+            "session": "tubes-like",
+            "desc": "artifact: x/y.rs",
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // BEFORE: nothing is scoped, so the gate is the type's and retyping helps.
+    let (_, _, v0) = send(&app, "GET", &format!("/api/board/contract?card={id}"), None).await;
+    assert_eq!(
+        v0["card_effective_gates"]["gate_sources"]["done"]["retype_would_change_it"],
+        json!(true),
+        "with nothing scoped the gate is the type's: {v0}"
+    );
+
+    // Give that worker a `done` gate through the endpoint the SPA uses.
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        "/api/board/session-gates",
+        Some(json!({ "worker": "tubes-like", "status": "done", "gate": ["Worker-scoped bar"] })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    // AFTER: same card, same transition, and the advice must invert.
+    let (_, _, v1) = send(&app, "GET", &format!("/api/board/contract?card={id}"), None).await;
+    let done = &v1["card_effective_gates"]["gate_sources"]["done"];
+    assert_eq!(
+        done["retype_would_change_it"], json!(false),
+        "a worker-scoped gate ignores the item type — this is what AF-168's reporter \
+         was not told, and they concluded the override was pinned per-card: {v1}"
+    );
+    let explain = done["explain"].as_str().unwrap_or("");
+    assert!(
+        explain.contains("tubes-like") && explain.contains("WORKER"),
+        "name the worker and the tier, or the reader cannot go look: {explain:?}"
+    );
+    assert_eq!(
+        v1["card_effective_gates"]["gates"]["done"],
+        json!(["Worker-scoped bar"]),
+        "and the resolved gate itself must be the worker's: {v1}"
+    );
+
+    // A DIFFERENT transition on the SAME card stays type-derived. This is the
+    // per-transition claim the commit message makes, and without this cell a
+    // per-card summary would pass every assertion above.
+    let review = &v1["card_effective_gates"]["gate_sources"]["review"];
+    assert_eq!(
+        review["retype_would_change_it"], json!(true),
+        "only `done` was pinned — the other transitions are still the type's: {v1}"
+    );
+}
