@@ -712,3 +712,37 @@ NOTE: The generalisable part is not "index your subqueries". It is that CORRECTN
   predicate it scans on.
 
 ---
+
+## The idle commit-nudge listed three files I had committed four minutes earlier, and carries no observation time
+VALIDATED: amux-frustrations | FIXED, both halves of this entry's own FIX, and verified BY VARIANT rather than by sample — applying amux's AMUX-3572 lesson from the same afternoon (a live-firing sample is evidence the mechanism RUNS, not that it COVERS ITS DOMAIN). (1) OBSERVATION TIMESTAMP: commit_nudge.rs:333 appends '(<provenance>; tree observed <HH:MM:SS>Z — if you committed AFTER that moment this nudge predates it: re-run git status before acting on any remedy)'. It sits on the COMMON path, after sections.join and the is_empty early return, so EVERY emitted message carries it regardless of which branch produced it — checked rather than assumed, because a stamp on one branch would have looked identical from the code that adds it. (2) ATTRIBUTION: the '(unknown)' co-editor name is gone from the CONTESTED line. The shared set is now PARTITIONED (commit_nudge.rs:552) into named vs unowned, and the four ownership variants each say something honest and distinct — named: 'CONTESTED — <paths> also edited by <who>'; unowned: 'CO-EDIT RECORDS, UNATTRIBUTED — edit records beyond yours exist but name no session. Not a named co-editor (the no-peer shape, AF-24)'; unknown: 'whose OWNERSHIP IS UNKNOWN — no session has an edit record for <x>'; foreign: its own branch. That is exactly what the FIX asked ('either resolve the co-editor's name or say the edit records are unattributed') and it reuses the vocabulary distinction the entry pointed at. Self-validated: amux-frustrations is the originating session.
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-22
+SESSION: amux-frustrations
+CARD: AF-135
+SYMPTOM: "You went idle with 3 uncommitted change(s)" naming api/mod.rs, log-sweep.md and
+  tests/staged_guard_body_limit.rs. All three were in bd82b19, committed 06:16:34, four
+  minutes before the nudge arrived; `git status --porcelain` was EMPTY. Its own direction
+  test agrees there was nothing to do — `git log HEAD..origin/main -- <path>` prints nothing
+  for all three and `origin/main..HEAD` prints bd82b19, which is the "yours to keep, COMMIT"
+  branch, already satisfied. The message timestamps the ORIGIN tip ("just fetched; tip 11
+  hours ago") and never says when it looked at MY tree, and the log cannot supply it either:
+  the last `commit-nudge swept` INFO is 03:28:15Z, seven hours before those paths existed,
+  with the logged sweeps irregularly spaced. Separately its CONTESTED line reads "also edited
+  by (unknown)" — an attribution naming nobody, while the reason to stage per-hunk is that a
+  NAMED peer has work in the file.
+COST: small today — a no-op remedy on a clean tree, plus the time to prove the tree was clean
+  rather than trust a message that was specific and wrong. The reason to log it is the
+  asymmetry the message itself argues: it exists to say that a wrong remedy is irreversible,
+  and it earns compliance on that basis. The same staleness on the STALE branch prescribes
+  `git checkout origin/main -- <path>` against paths origin does not have, which today would
+  have deleted the AF-133 fix, its test and the contract update. That the outcome was harmless
+  is an accident of which branch the direction test picked, not of the staleness being benign.
+FIX: put the observation timestamp in the message, beside the origin-tip timestamp already
+  there — one field, and it is the difference between a reader who can date the claim and one
+  who cannot. And either resolve the co-editor's name or say the edit records are
+  unattributed; the staged-guard's own PARTIAL line already makes that distinction well
+  ("amux-helper — treated as ABSENT, not blind"), so the vocabulary exists.
+  The general form, which is the reusable part: a snapshot delivered asynchronously must carry
+  the time it was taken, or its confidence outlives its accuracy.
