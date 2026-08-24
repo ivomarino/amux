@@ -1563,6 +1563,34 @@ impl Envelope {
 /// hunting (ethos rule 7).
 static OUTDATED_WARNED: Mutex<Option<HashMap<String, f64>>> = Mutex::new(None);
 
+/// Is the caller a PRE-RUST git hook, or merely a different modern client?
+///
+/// `guard_version` alone cannot answer this, and treating it as if it could
+/// produced a fleet-wide false warning. `scripts/git-hooks/git-shared-guard.py`
+/// is a Claude Code PreToolUse hook — a different component with its own
+/// lifecycle — and it POSTs `{session, dir, paths, op: "discard"}` to this
+/// endpoint without a `guard_version`. So every lane running a CURRENT git hook
+/// (GUARD_VERSION 6) was told hourly that its hook was outdated.
+///
+/// The remedy the warning prints made it worse rather than merely noisy:
+/// "Reinstall: scripts/install-hooks.sh" reinstalls the GIT hooks, which were
+/// already current, so a lane following the instruction exactly saw no change
+/// and the warning returned within the hour. A warning whose sanctioned remedy
+/// cannot satisfy it is the AMUX-2140 shape, and it accused the wrong component
+/// besides.
+///
+/// `op` is the discriminator the payload already carries. A pre-rust hook sends
+/// NEITHER field; every modern client sends at least `op`. Keying on that fixes
+/// the whole class rather than one client, which matters because the next
+/// non-git-hook caller of this endpoint would otherwise join the warning too.
+///
+/// Measured 2026-08-24 before the fix: 9 distinct (lane, checkout) pairs warned
+/// per hour, indefinitely, including this checkout whose hook was byte-identical
+/// to the tracked source.
+fn hook_is_outdated(guard_version: i64, has_explicit_op: bool) -> bool {
+    guard_version < 2 && !has_explicit_op
+}
+
 fn warn_outdated_hook(session: &str, dir: &str) {
     let now = now_epoch();
     let key = format!("{session}\u{1}{dir}");
@@ -1617,13 +1645,13 @@ pub async fn staged_guard_inner(
     let session: String =
         if origin.is_empty() { get_str("session") } else { origin }.chars().take(64).collect();
     let wd_raw = get_str("dir");
+    let op_raw = get_str("op");
     let op: String = {
-        let o = get_str("op");
-        if o.is_empty() { "commit".into() } else { o.chars().take(24).collect() }
+        if op_raw.is_empty() { "commit".into() } else { op_raw.chars().take(24).collect() }
     };
     let guard_version =
         obj.and_then(|o| o.get("guard_version")).and_then(Value::as_i64).unwrap_or(0);
-    let hook_outdated = guard_version < 2;
+    let hook_outdated = hook_is_outdated(guard_version, !op_raw.is_empty());
     if hook_outdated {
         warn_outdated_hook(&session, &wd_raw);
     }
@@ -2780,6 +2808,39 @@ mod tests {
             "a firsthand peer claim is not ambiguous and must not be hedged: {:?}",
             v.shared[0]
         );
+    }
+
+    /// A CURRENT hook was told hourly that it was outdated, and the remedy
+    /// could not fix it (log sweep, 2026-08-24).
+    ///
+    /// `git-shared-guard.py` is a Claude Code PreToolUse hook, not a git hook,
+    /// and it POSTs `{session, dir, paths, op: "discard"}` here with no
+    /// `guard_version`. Keying "outdated" on that field alone made every lane
+    /// running GUARD_VERSION 6 look pre-rust: 9 distinct (lane, checkout) pairs
+    /// warned per hour, including this checkout, whose hook was byte-identical
+    /// to the tracked source.
+    ///
+    /// THE SPECIMEN IS THE SECOND CELL. The first is the control: a genuinely
+    /// pre-rust hook sends neither field and must STILL warn, or the fix has not
+    /// narrowed the warning, it has deleted it.
+    #[test]
+    fn a_modern_client_without_guard_version_is_not_an_outdated_git_hook() {
+        // CONTROL — neither field: a real pre-rust hook. Must still warn.
+        assert!(
+            hook_is_outdated(0, false),
+            "a hook sending neither op nor guard_version is the case this warning exists for"
+        );
+        // THE SPECIMEN — git-shared-guard.py: op present, no guard_version.
+        assert!(
+            !hook_is_outdated(0, true),
+            "a client that sends `op` is modern; accusing it names the wrong component and \
+             prescribes a reinstall that cannot change anything"
+        );
+        // A current git hook: both fields.
+        assert!(!hook_is_outdated(6, true));
+        // And version alone is still sufficient, so a future client that sends a
+        // version but no op is not swept back in.
+        assert!(!hook_is_outdated(2, false));
     }
 
     /// AMUX-3128 FIRING PATH: a read-only command must not mint an inferred edit,
