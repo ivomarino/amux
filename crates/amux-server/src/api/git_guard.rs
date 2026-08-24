@@ -221,6 +221,31 @@ async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
 /// Authorship is by the Amux-Session TRAILER, not `%an` — every lane on this
 /// machine commits as the same person, so `%an` cannot discriminate (CLAUDE.md
 /// deploy section).
+/// Is the NEWEST commit touching `path` the owner's own? (AMUX-3677)
+///
+/// Answers "is the owner's work in local HEAD", which is the question neither
+/// `owner_committed_since` (defeated by a peer refreshing the owner's mtime
+/// record) nor `LandedOnOrigin` (unreachable on a lane ahead of origin) can
+/// answer on a checkout with unpushed commits.
+///
+/// Deliberately the NEWEST commit and not merely "any commit of theirs": if a
+/// peer has committed this path since, the owner's bytes may have been changed
+/// or reverted by that commit, and only the owner can judge it.
+async fn owner_owns_newest_commit(dir: &str, path: &str, owner: &str) -> Option<String> {
+    let out = git_out(
+        dir,
+        &["log", "-1", "--format=%h%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
+    )
+    .await?;
+    let mut it = out.trim().split('\t');
+    let sha = it.next()?.trim();
+    let who = it.next().unwrap_or("").trim();
+    // An UNTRAILERED commit is not the owner's for this purpose. Reading a
+    // missing trailer as a match would hand out receipts on anyone's commit,
+    // which is the loud-to-quiet direction this guard must not take.
+    (!sha.is_empty() && !owner.is_empty() && who == owner).then(|| sha.to_string())
+}
+
 pub(crate) async fn owner_committed_since(
     dir: &str,
     path: &str,
@@ -339,9 +364,46 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
 /// Decide between the three. Content-in-HEAD is checked with `git diff HEAD`,
 /// which answers "are these bytes committed by ANYONE" — the question the
 /// trailer-only check could not ask.
-pub(crate) async fn path_fate(dir: &str, path: &str, owner: &str, edit_age_secs: i64) -> PathFate {
+pub(crate) async fn path_fate(
+    dir: &str,
+    path: &str,
+    owner: &str,
+    edit_age_secs: i64,
+    provenance: &str,
+) -> PathFate {
     if let Some(sha) = owner_committed_since(dir, path, owner, edit_age_secs).await {
         return PathFate::SettledByOwner(sha);
+    }
+    // AN INFERRED RECORD IS NOT EVIDENCE THE OWNER WROTE ANYTHING (AMUX-3677).
+    //
+    // `owner_committed_since` asks whether the owner's commit is newer than the
+    // EDIT that triggered this notice. For an `inferred` record that operand is
+    // an mtime which moved during one of the owner's Bash commands — and a
+    // PEER'S WRITE PRODUCES EXACTLY THAT. So the committing peer refreshes the
+    // victim's record past the victim's own commit, and the check that should
+    // have said "settled" misses.
+    //
+    // The rescue below cannot fire either: `LandedOnOrigin` needs the bytes to
+    // match origin/main, and on a lane with unpushed commits — this repo, most
+    // of the time, 44 commits deep while the push was blocked — that arm is
+    // unreachable by construction. AMUX-3445 added it for the MIRROR lane, a
+    // graft-push checkout whose local HEAD never advances; the lane whose HEAD
+    // is AHEAD had no equivalent.
+    //
+    // Specimen, 2026-08-24 16:00: `browser.rs` reported "differs from HEAD and
+    // you have no commit for it; the WORK ITSELF is at risk" to amux, whose
+    // 02197674 was the newest commit on that path, twenty minutes old, with a
+    // clean worktree.
+    //
+    // So: if the owner's record is INFERRED and the newest commit touching the
+    // path is the OWNER'S OWN, their work is in HEAD and the current dirt
+    // belongs to the committer. `firsthand` is deliberately excluded — a real
+    // recorded edit newer than the owner's commit IS at risk, and that is the
+    // direction this must never get wrong.
+    if provenance == "inferred" {
+        if let Some(sha) = owner_owns_newest_commit(dir, path, owner).await {
+            return PathFate::SettledByOwner(sha);
+        }
     }
     // Empty `git diff HEAD -- path` means the working tree matches HEAD, i.e.
     // whatever was written is committed — by someone.
@@ -2180,7 +2242,7 @@ pub async fn staged_guard_inner(
                 let mut lines: Vec<String> = Vec::new();
                 let mut n_at_risk = 0usize;
                 for (pth, age, prov) in paths.iter().take(10) {
-                    let fate = path_fate(&wd, pth, &owner, *age).await;
+                    let fate = path_fate(&wd, pth, &owner, *age, prov).await;
                     let (line, at_risk) = victim_path_line(pth, &fate, prov);
                     if at_risk {
                         n_at_risk += 1;
@@ -2593,12 +2655,12 @@ mod tests {
         // and "absorbed into <sha> under `bob`" ADDRESSED TO BOB reads as
         // someone having taken work that nobody took. edit_age=0 forces
         // owner_committed_since to miss, which is the live mechanism.
-        match path_fate(&d, "absorbed.txt", "bob", 0).await {
+        match path_fate(&d, "absorbed.txt", "bob", 0, "firsthand").await {
             PathFate::SettledByOwner(_) => {}
             other => panic!("your own commit is settled, never an absorption: {other:?}"),
         }
 
-        match path_fate(&d, "absorbed.txt", "alice", 3600).await {
+        match path_fate(&d, "absorbed.txt", "alice", 3600, "firsthand").await {
             PathFate::AbsorbedBy(_, who) => assert_eq!(who, "bob",
                 "must name WHO absorbed it, so the victim knows where the reasoning went"),
             other => panic!("expected AbsorbedBy, got {other:?} — this is the cry-wolf case"),
@@ -2606,13 +2668,13 @@ mod tests {
 
         // alice's work that is NOT in HEAD: genuinely at risk.
         std::fs::write(dir.path().join("atrisk.txt"), "uncommitted\n").unwrap();
-        assert_eq!(path_fate(&d, "atrisk.txt", "alice", 3600).await, PathFate::AtRisk);
+        assert_eq!(path_fate(&d, "atrisk.txt", "alice", 3600, "firsthand").await, PathFate::AtRisk);
 
         // and a file alice committed herself stays settled.
         std::fs::write(dir.path().join("mine.txt"), "alice\n").unwrap();
         git(&["add", "mine.txt"]);
         git(&["commit", "-q", "-m", "alice\n\nAmux-Session: alice"]);
-        assert!(matches!(path_fate(&d, "mine.txt", "alice", 3600).await,
+        assert!(matches!(path_fate(&d, "mine.txt", "alice", 3600, "firsthand").await,
                          PathFate::SettledByOwner(_)));
 
         // AMUX-3445, the graft-push shape: backend's work landed on ORIGIN via
@@ -2643,13 +2705,13 @@ mod tests {
         // exactly this state and asserted the receipt, which is the proof the
         // amendment was needed.)
         assert_eq!(
-            path_fate(&d, "grafted.txt", "backend", 3600).await,
+            path_fate(&d, "grafted.txt", "backend", 3600, "firsthand").await,
             PathFate::AtRisk,
             "stale staged blob under origin-identical worktree is the revert-in-waiting"
         );
         // Receipt only when BOTH trees match origin: stage the origin bytes.
         git(&["add", "grafted.txt"]);
-        match path_fate(&d, "grafted.txt", "backend", 3600).await {
+        match path_fate(&d, "grafted.txt", "backend", 3600, "firsthand").await {
             PathFate::LandedOnOrigin(sha) => {
                 assert!(!sha.is_empty(), "the receipt must carry origin's sha")
             }
@@ -2658,7 +2720,85 @@ mod tests {
         // Control: worktree differing from BOTH HEAD and origin is the real
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
-        assert_eq!(path_fate(&d, "grafted.txt", "backend", 0).await, PathFate::AtRisk);
+        assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+    }
+
+    /// AMUX-3677, rebuilt from the notice's own text and the repo state that
+    /// produced it.
+    ///
+    /// A peer commits a path; their write refreshes the victim's INFERRED
+    /// (Bash+mtime) record past the victim's own commit, so
+    /// `owner_committed_since` misses. The path is dirty, so `LandedOnOrigin`
+    /// is consulted — and on a lane with unpushed commits it can never match.
+    /// Result: "the WORK ITSELF is at risk" about work in local HEAD.
+    ///
+    /// The fixture deliberately has NO `origin/main` at all, which is the
+    /// strongest form of "ahead of origin" and makes the old rescue path
+    /// provably unavailable rather than merely unlikely.
+    #[tokio::test]
+    async fn an_inferred_record_over_the_owners_own_newest_commit_is_settled_not_at_risk() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // alice commits the file — this is the work the notice claims is at risk.
+        std::fs::write(dir.path().join("shared.rs"), "alice's work\n").unwrap();
+        git(&["add", "shared.rs"]);
+        git(&["commit", "-q", "-m", "alice's change\n\nAmux-Session: alice"]);
+
+        // bob is mid-commit: the path is dirty against HEAD right now.
+        std::fs::write(dir.path().join("shared.rs"), "alice's work\nbob's line\n").unwrap();
+
+        // PREMISE, asserted so neither arm below is vacuously green: the path
+        // IS dirty, and alice's commit IS the newest on it.
+        assert!(
+            git_out(&d, &["diff", "HEAD", "--name-only", "--", "shared.rs"])
+                .await
+                .map(|o| !o.trim().is_empty())
+                .unwrap_or(false),
+            "fixture must be dirty, or AtRisk is never reached"
+        );
+        assert!(owner_owns_newest_commit(&d, "shared.rs", "alice").await.is_some());
+
+        // TREATMENT: alice's record is INFERRED — an mtime that moved when bob
+        // wrote. edit_age 0 makes `owner_committed_since` certainly miss, which
+        // is what the peer's refresh does in the real case.
+        match path_fate(&d, "shared.rs", "alice", 0, "inferred").await {
+            PathFate::SettledByOwner(sha) => assert!(!sha.is_empty()),
+            other => panic!("inferred record over alice's own newest commit must be settled: {other:?}"),
+        }
+
+        // CONTROL 1, AND THE ONE THAT MATTERS. A FIRSTHAND record is a real
+        // recorded edit of alice's that is NOT in her commit — genuinely at
+        // risk. Trading a false alarm for a missed one is the only way this
+        // change can do harm, so it is asserted rather than reasoned about.
+        assert!(
+            matches!(path_fate(&d, "shared.rs", "alice", 0, "firsthand").await, PathFate::AtRisk),
+            "a recorded edit newer than the owner's commit must STILL be at risk"
+        );
+
+        // CONTROL 2: if the newest commit is a PEER's, alice's bytes may have
+        // been changed by it and only she can judge — no receipt.
+        git(&["add", "shared.rs"]);
+        git(&["commit", "-q", "-m", "bob's change\n\nAmux-Session: bob"]);
+        std::fs::write(dir.path().join("shared.rs"), "alice's work\nbob's line\nmore\n").unwrap();
+        assert!(
+            owner_owns_newest_commit(&d, "shared.rs", "alice").await.is_none(),
+            "alice no longer owns the newest commit"
+        );
+
+        // CONTROL 3: an UNTRAILERED commit is nobody's. Reading a missing
+        // trailer as a match would hand out receipts on any commit at all.
+        std::fs::write(dir.path().join("other.rs"), "x\n").unwrap();
+        git(&["add", "other.rs"]);
+        git(&["commit", "-q", "-m", "no trailer here"]);
+        assert!(owner_owns_newest_commit(&d, "other.rs", "alice").await.is_none());
+        assert!(owner_owns_newest_commit(&d, "other.rs", "").await.is_none());
     }
 
     #[tokio::test]
