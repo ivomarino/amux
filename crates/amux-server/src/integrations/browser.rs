@@ -667,6 +667,79 @@ fn chrome_stderr_tail(path: &Path) -> String {
     format!(" (chrome stderr: {tail})")
 }
 
+/// Chrome's `kBadFlags` (chrome/browser/ui/startup/bad_flags_prompt.cc) that
+/// this launcher could ever pass. Any of them puts the yellow "You are using an
+/// unsupported command-line flag ... Stability and security will suffer."
+/// infobar across the top of every window UNLESS the launch also declares
+/// itself a test harness — see `chrome_launch_args`. Kept as data so the test
+/// pinning that invariant cannot drift from the flags actually passed.
+#[cfg(test)]
+const CHROME_BAD_FLAGS: [&str; 2] =
+    ["--ignore-certificate-errors", "--ignore-certificate-errors-spki-list"];
+
+/// Every flag Chrome is launched with, in order, as ONE list. Pure in its
+/// inputs so the invariants between flags can be tested without spawning a
+/// Chrome (`launch_args_tests`); `start()` feeds it straight to the Command.
+fn chrome_launch_args(
+    port: u16,
+    target: &LaunchTarget,
+    headless: bool,
+    spki: Option<&str>,
+    url: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", target.user_data_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        // --test-type: the SPKI pin below is on Chrome's kBadFlags list, so every
+        // launch opened with the "unsupported command-line flag" infobar across
+        // the window (Ethan's screenshot, 2026-08-24, MR-38). Chrome skips ALL of
+        // its startup infobars for a launch that declares itself a test harness:
+        // chrome/browser/ui/startup/infobar_utils.cc returns before
+        // ShowBadFlagsPrompt when `kTestType || IsAutomationEnabled()`.
+        // --test-type is the right one of the two: --enable-automation also
+        // skips the bad-flags bar but adds its own "Chrome is being controlled by
+        // automated test software" bar, and this is a browser a human logs into.
+        // ChromeDriver passes `--test-type=webdriver` on every session for the
+        // same reason. It changes nothing about what the pin permits — the pin
+        // is still the only certificate exemption. Passed unconditionally rather
+        // than only alongside the pin, so a future bad flag added here inherits
+        // the suppression instead of re-introducing the banner.
+        "--test-type".to_string(),
+    ];
+    // AMUX-3508: same profile dirs, no window — the logins made headfully in
+    // the amux Browser UI ride along, which is the whole point of profiles
+    // being durable. `new` headless shares the profile format with headful
+    // Chrome (the old --headless did not persist everything).
+    if headless {
+        args.push("--headless=new".to_string());
+    }
+    // amux serves its own dashboard over a SELF-SIGNED cert, so without this the
+    // one site this browser most needs to reach — amux itself — lands on
+    // chrome-error://chromewebdata/ and every subsequent verb runs against the
+    // error page. Dogfooding: the browser primitive could not browse the product
+    // that ships it.
+    //
+    // Deliberately SPKI-PINNED to amux's own key rather than the blanket
+    // --ignore-certificate-errors. This profile (~/.amux/playwright-auth/profile)
+    // holds real logged-in sessions for third-party sites; globally disabling
+    // certificate validation there would expose those cookies to any MITM on the
+    // network. The pin excuses exactly one public key and leaves validation fully
+    // intact for everything else — including, importantly, still rejecting a
+    // DIFFERENT bad cert on localhost.
+    if let Some(spki) = spki {
+        args.push(format!("--ignore-certificate-errors-spki-list={spki}"));
+    }
+    if let Some(pd) = &target.profile_directory {
+        args.push(format!("--profile-directory={pd}"));
+    }
+    if !url.trim().is_empty() {
+        args.push(url.trim().to_string());
+    }
+    args
+}
+
 /// Launch Chrome on a profile. Cleans stale locks first (amux-owned dirs
 /// only — see module docs), waits for the CDP HTTP endpoint to answer so a
 /// returned port is a WORKING port, and records the child for stop().
@@ -727,39 +800,8 @@ pub async fn start(
     // Chrome and the next server process adopts it, as designed.
     #[cfg(unix)]
     cmd.process_group(0);
-    cmd.arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--user-data-dir={}", target.user_data_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check");
-    // AMUX-3508: same profile dirs, no window — the logins made headfully in
-    // the amux Browser UI ride along, which is the whole point of profiles
-    // being durable. `new` headless shares the profile format with headful
-    // Chrome (the old --headless did not persist everything).
-    if headless {
-        cmd.arg("--headless=new");
-    }
-    // amux serves its own dashboard over a SELF-SIGNED cert, so without this the
-    // one site this browser most needs to reach — amux itself — lands on
-    // chrome-error://chromewebdata/ and every subsequent verb runs against the
-    // error page. Dogfooding: the browser primitive could not browse the product
-    // that ships it.
-    //
-    // Deliberately SPKI-PINNED to amux's own key rather than the blanket
-    // --ignore-certificate-errors. This profile (~/.amux/playwright-auth/profile)
-    // holds real logged-in sessions for third-party sites; globally disabling
-    // certificate validation there would expose those cookies to any MITM on the
-    // network. The pin excuses exactly one public key and leaves validation fully
-    // intact for everything else — including, importantly, still rejecting a
-    // DIFFERENT bad cert on localhost.
-    if let Some(spki) = amux_cert_spki_b64(home) {
-        cmd.arg(format!("--ignore-certificate-errors-spki-list={spki}"));
-    }
-    if let Some(pd) = &target.profile_directory {
-        cmd.arg(format!("--profile-directory={pd}"));
-    }
-    if !url.trim().is_empty() {
-        cmd.arg(url.trim());
-    }
+    let spki = amux_cert_spki_b64(home);
+    cmd.args(chrome_launch_args(port, &target, headless, spki.as_deref(), url));
     // Capture Chrome's stderr so a launch failure is DIAGNOSABLE. It used to go
     // to /dev/null, so "CDP never answered" could not distinguish a crash (a bad
     // flag, a locked profile, no display) from a slow start — the exact failure
@@ -2300,6 +2342,70 @@ mod tests {
         }
         let report = stop(home.path()).await;
         assert!(report.stopped);
+    }
+}
+
+#[cfg(test)]
+mod launch_args_tests {
+    use super::*;
+
+    fn owned_target() -> LaunchTarget {
+        LaunchTarget {
+            user_data_dir: PathBuf::from("/tmp/amux-launch-args-test/profile"),
+            profile_directory: None,
+        }
+    }
+
+    fn is_bad(arg: &str) -> bool {
+        CHROME_BAD_FLAGS.iter().any(|b| arg == *b || arg.starts_with(&format!("{b}=")))
+    }
+
+    /// MR-38: a kBadFlags entry without --test-type is the "unsupported
+    /// command-line flag" infobar on every window. The CONTROL assertion comes
+    /// first: if the pin is not actually in the list, the invariant is vacuous
+    /// and this test pins nothing (ethos rule 7 — say what a positive looks
+    /// like before believing the negative).
+    #[test]
+    fn bad_flags_never_launch_without_test_type() {
+        let args = chrome_launch_args(1234, &owned_target(), false, Some("PIN="), "");
+        let bad: Vec<&String> = args.iter().filter(|a| is_bad(a)).collect();
+        assert_eq!(bad.len(), 1, "control: the SPKI pin must be in the list: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "--test-type"),
+            "a kBadFlags entry is passed without --test-type — Chrome will show the \
+             unsupported-flag infobar (chrome/browser/ui/startup/infobar_utils.cc): {args:?}"
+        );
+        // --enable-automation would suppress the same bar but add its own
+        // "controlled by automated test software" bar; it must not creep in.
+        assert!(!args.iter().any(|a| a == "--enable-automation"), "{args:?}");
+    }
+
+    /// An unreadable cert means NO pin — never a blanket bypass in its place.
+    #[test]
+    fn no_pin_means_no_bad_flag_at_all() {
+        let args = chrome_launch_args(1234, &owned_target(), false, None, "");
+        assert!(!args.iter().any(|a| is_bad(a)), "{args:?}");
+    }
+
+    /// Shape Chrome depends on: the URL is the LAST positional, headless is
+    /// `new`, a Chrome-dir profile gets --profile-directory, and the debug port
+    /// and user-data-dir are the exact values the caller resolved.
+    #[test]
+    fn shape_is_what_chrome_expects() {
+        let t = LaunchTarget {
+            user_data_dir: PathBuf::from("/Users/x/Library/Application Support/Google/Chrome"),
+            profile_directory: Some("Profile 11".into()),
+        };
+        let args = chrome_launch_args(4321, &t, true, Some("PIN="), "  https://example.com/  ");
+        assert_eq!(args[0], "--remote-debugging-port=4321");
+        assert_eq!(args[1], "--user-data-dir=/Users/x/Library/Application Support/Google/Chrome");
+        assert!(args.contains(&"--headless=new".to_string()), "{args:?}");
+        assert!(args.contains(&"--profile-directory=Profile 11".to_string()), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("https://example.com/"), "url is trimmed and last");
+        // An empty url adds no positional at all (Chrome would open a blank
+        // window for "" — and the last arg must then be a flag).
+        let none = chrome_launch_args(4321, &t, false, None, "   ");
+        assert!(none.last().unwrap().starts_with("--"), "{none:?}");
     }
 }
 
