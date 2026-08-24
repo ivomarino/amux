@@ -1518,15 +1518,29 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             // what was failing. Every auto-filed invariant card shipped a
             // re-check that reported CLEAN unconditionally, as its own first
             // instruction — the AMUX-2140 shape, where following the sanctioned
-            // step exactly is what produces the wrong answer. Verified against
-            // the live endpoint: it returns {checks, confidence, failures,
-            // live_incidents, note, unknowns}, and failure rows carry
-            // `invariant_id`, not `id`.
+            // step exactly is what produces the wrong answer.
+            //
+            // AMUX-3574: this used to query /api/health/invariants and print
+            // "clean now" on an empty result, which is the one claim it CANNOT
+            // make. That endpoint reports FAILURES ONLY, so a check that healed
+            // and a check that was never evaluated in this build return the
+            // identical empty list. Running this recipe on AMUX-3572 is exactly
+            // what cost a session an investigation: it said clean, and
+            // establishing whether that meant healed or never-ran took a second
+            // endpoint and a direct read of the incident table.
+            //
+            // /api/debug/invariants is the only surface where a PASS is
+            // visible, so it can separate all four states a reader needs:
+            // pass, fail, unknown (stopped being checkable), and ABSENT (never
+            // evaluated — which reads as health and is the dangerous one).
             recheck: format!(
-                "curl -sk \"$AMUX_URL/api/health/invariants\" | python3 -c \"import json,sys; \
-                 d=json.load(sys.stdin); f=[r for r in (d.get('failures') or []) \
-                 if r.get('invariant_id')=='{id}']; \
-                 print('FAILING:', len(f), f[:3] if f else 'clean now')\""
+                "curl -sk \"$AMUX_URL/api/debug/invariants\" | python3 -c \"import json,sys; \
+                 d=json.load(sys.stdin); \
+                 r=[x for x in (d.get('latest_per_invariant') or []) \
+                 if x.get('invariant_id')=='{id}']; \
+                 print('NOT EVALUATED in this build — absence is not health') if not r \
+                 else [print(x['status'].upper(), x.get('entity',''), x.get('observed','')) \
+                 for x in r]\""
             ),
             owner: None,
             count: filing.len() as u64,
@@ -1566,15 +1580,29 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             // what was failing. Every auto-filed invariant card shipped a
             // re-check that reported CLEAN unconditionally, as its own first
             // instruction — the AMUX-2140 shape, where following the sanctioned
-            // step exactly is what produces the wrong answer. Verified against
-            // the live endpoint: it returns {checks, confidence, failures,
-            // live_incidents, note, unknowns}, and failure rows carry
-            // `invariant_id`, not `id`.
+            // step exactly is what produces the wrong answer.
+            //
+            // AMUX-3574: this used to query /api/health/invariants and print
+            // "clean now" on an empty result, which is the one claim it CANNOT
+            // make. That endpoint reports FAILURES ONLY, so a check that healed
+            // and a check that was never evaluated in this build return the
+            // identical empty list. Running this recipe on AMUX-3572 is exactly
+            // what cost a session an investigation: it said clean, and
+            // establishing whether that meant healed or never-ran took a second
+            // endpoint and a direct read of the incident table.
+            //
+            // /api/debug/invariants is the only surface where a PASS is
+            // visible, so it can separate all four states a reader needs:
+            // pass, fail, unknown (stopped being checkable), and ABSENT (never
+            // evaluated — which reads as health and is the dangerous one).
             recheck: format!(
-                "curl -sk \"$AMUX_URL/api/health/invariants\" | python3 -c \"import json,sys; \
-                 d=json.load(sys.stdin); f=[r for r in (d.get('failures') or []) \
-                 if r.get('invariant_id')=='{id}']; \
-                 print('FAILING:', len(f), f[:3] if f else 'clean now')\""
+                "curl -sk \"$AMUX_URL/api/debug/invariants\" | python3 -c \"import json,sys; \
+                 d=json.load(sys.stdin); \
+                 r=[x for x in (d.get('latest_per_invariant') or []) \
+                 if x.get('invariant_id')=='{id}']; \
+                 print('NOT EVALUATED in this build — absence is not health') if not r \
+                 else [print(x['status'].upper(), x.get('entity',''), x.get('observed','')) \
+                 for x in r]\""
             ),
             owner: None,
             count: occ as u64,
@@ -5259,6 +5287,49 @@ mod tests {
             // Exactly-once: a second tick must not re-nag.
             let again = note_resolved_incidents(&st).await.unwrap();
             assert!(again.is_empty(), "a resolved incident must not re-nag every tick");
+        }
+    }
+
+    /// AMUX-3574: an invariant card's re-check must query the surface that can
+    /// answer it.
+    ///
+    /// This asserts on a STRING, which is usually the weak kind of test (a text
+    /// mutation measures coupling, not correctness — AF-172). It is load-bearing
+    /// here because the ENDPOINT IS the defect: /api/health/invariants reports
+    /// FAILURES ONLY, so it returns the identical empty result for a check that
+    /// healed and one that was never evaluated, and the old recipe printed
+    /// "clean now" for both. Measured against the live server:
+    ///
+    ///   old, real invariant:  FAILING: 0 clean now
+    ///   old, invented name:   FAILING: 0 clean now
+    ///
+    /// Byte-identical for a healthy check and a nonexistent one. Anything a card
+    /// tells an agent to run must itself be exercised (AMUX-2140), and this one
+    /// was not.
+    #[test]
+    fn an_invariant_recheck_asks_the_surface_where_a_pass_is_visible() {
+        // Drives the real grouping path, per invariant_findings' own note.
+        let f = invariant_findings(&[inv_row("schema.timestamp_units_declared", "waitlist.ts", 19)]);
+        assert!(!f.is_empty(), "precondition: a finding must be produced to inspect");
+        for finding in &f {
+            assert!(
+                finding.recheck.contains("/api/debug/invariants"),
+                "the re-check must ask /api/debug/invariants — the only surface where a PASS \
+                 is visible: {}",
+                finding.recheck
+            );
+            assert!(
+                !finding.recheck.contains("/api/health/invariants"),
+                "and must NOT ask the failures-only surface, which cannot tell a healed check \
+                 from one that never ran: {}",
+                finding.recheck
+            );
+            assert!(
+                finding.recheck.contains("NOT EVALUATED"),
+                "an absent invariant must be reported as absent, not as clean — silence \
+                 reading as health is the whole defect: {}",
+                finding.recheck
+            );
         }
     }
 
