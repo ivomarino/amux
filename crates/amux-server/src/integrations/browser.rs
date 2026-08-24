@@ -799,17 +799,32 @@ fn describe_cdp_probe(
 /// caller's message is merely shorter.
 fn preserve_failed_stderr(path: &Path) -> String {
     let Some(dir) = path.parent() else { return String::new() };
-    // MILLISECONDS, not seconds. The first draft stamped seconds and its own
-    // test caught the consequence immediately: two retries inside one second
-    // mint the same filename, so the second copy OVERWRITES the first and the
-    // function silently does the exact thing it exists to prevent. Not a corner
-    // case either — the exit-0 delegation path fails in 1.5 to 3 seconds, so
-    // back-to-back retries land in one second routinely.
+    // A WALL CLOCK IS NOT A UNIQUENESS SOURCE, and this function learned it
+    // twice from its own test. Draft one stamped SECONDS: two retries inside one
+    // second minted the same name, the copy overwrote the previous failure, and
+    // the function silently did the exact thing it exists to prevent (the exit-0
+    // delegation path fails in 1.5 to 3s, so that is routine). Draft two moved to
+    // MILLISECONDS and the same assertion failed again, because two calls in a
+    // unit test land in one millisecond just as happily.
+    //
+    // Any finer clock is the same bet at a smaller scale. So the stamp is for
+    // humans and for sorting, and the SEQUENCE is what guarantees uniqueness:
+    // probe until the name is free. Zero-padded so lexicographic order still
+    // matches chronological order within a millisecond, which the prune below
+    // relies on.
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    let kept = dir.join(format!("amux-chrome-launch.failed-{stamp}.stderr"));
+    let base = format!("amux-chrome-launch.failed-{stamp}");
+    let mut kept = dir.join(format!("{base}-000.stderr"));
+    let mut seq = 0u32;
+    // Bounded: 1000 failures inside one millisecond is not a state worth looping
+    // for, and overwriting the last name beats spinning in a launch path.
+    while kept.exists() && seq < 999 {
+        seq += 1;
+        kept = dir.join(format!("{base}-{seq:03}.stderr"));
+    }
     if std::fs::copy(path, &kept).is_err() {
         return String::new();
     }
