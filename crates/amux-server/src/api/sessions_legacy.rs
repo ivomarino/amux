@@ -350,6 +350,37 @@ fn preview_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)>
     CACHE.get_or_init(|| std::sync::Mutex::new((0.0, BTreeMap::new())))
 }
 
+/// Sessions in `tmux list-panes -a -F '#{session_name}:#{pane_dead}'` output
+/// whose panes are ALL dead (AMUX-2644).
+///
+/// Pure so the decision is testable without a tmux server, and so a control can
+/// mutate the LOGIC rather than a string — the same reason `spans_restart` is a
+/// function rather than an inline comparison.
+///
+/// EMPTY INPUT YIELDS AN EMPTY SET, which is the fail-open contract the caller
+/// depends on: unreadable output must exclude NOTHING. A liveness filter that
+/// can empty the fleet is worse than the bug it fixes, and this card's own probe
+/// warning records what that looks like — "48 of 48 running lanes have no tmux
+/// session", absurd on its face and entirely an artifact.
+///
+/// A session with one dead pane and one live pane is LIVE. Partial death is not
+/// death, and treating it as such would evict working lanes that happen to have
+/// a finished side pane.
+fn sessions_with_all_panes_dead(stdout: &str) -> std::collections::BTreeSet<String> {
+    let mut live: std::collections::BTreeMap<String, bool> = std::collections::BTreeMap::new();
+    for l in stdout.lines() {
+        // rsplit_once: a session name may contain ':', the flag cannot, so the
+        // LAST separator is the field boundary.
+        let Some((name, dead)) = l.trim().rsplit_once(':') else { continue };
+        if name.is_empty() {
+            continue;
+        }
+        let is_live = dead.trim() != "1";
+        *live.entry(name.to_string()).or_insert(false) |= is_live;
+    }
+    live.into_iter().filter(|(_, any_live)| !*any_live).map(|(n, _)| n).collect()
+}
+
 /// One `tmux list-sessions` line -> (name, last-painted, created).
 ///
 /// Pulled out of `load` so the ACTIVITY RULE is testable without a tmux
@@ -484,11 +515,52 @@ impl FleetSignals {
             ),
             _ => {}
         }
+        // A SESSION WHOSE PANES ARE ALL DEAD HOSTS NOTHING (AMUX-2644).
+        //
+        // amux sets `remain-on-exit on` at spawn (backend/tmux.rs:208,
+        // session_verbs.rs:5993) so a finished or failed command leaves a DEAD
+        // PANE behind and its exit status stays observable, instead of the
+        // whole session vanishing. That is deliberate and worth keeping. The
+        // consequence nobody carried through to here: `list-sessions` still
+        // lists such a session, so a worker whose pane died AT LAUNCH landed in
+        // `running`, `agent_running` returned true at its first branch (a dead
+        // pane is not "shell only"), and the lane reported running:true/idle
+        // forever. It looks alive and it is a corpse.
+        //
+        // backend/tmux.rs has known how to see this since it was written — it
+        // reads `#{pane_dead}` via list-panes for exactly this reason — and the
+        // fleet listing never asked. One tmux call, not one per session, so the
+        // cost is a second subprocess rather than N.
+        //
+        // FAILS OPEN, and that is the load-bearing half. If the query fails,
+        // returns nothing, or tmux is absent, EVERY session stays in `running`.
+        // Dropping the fleet on an unreadable probe is the failure this card's
+        // own probe warning records: the obvious measurement reported "48 of 48
+        // running lanes have no tmux session", which was absurd on its face and
+        // entirely an artifact. A liveness filter that can empty the fleet is
+        // worse than the bug it fixes.
+        let all_panes_dead = std::process::Command::new("tmux")
+            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"])
+            .output()
+            .map(|o| sessions_with_all_panes_dead(&String::from_utf8_lossy(&o.stdout)))
+            .unwrap_or_default();
+        if !all_panes_dead.is_empty() {
+            tracing::warn!(
+                target: "sessions",
+                count = all_panes_dead.len(),
+                sessions = %all_panes_dead.iter().take(10).cloned().collect::<Vec<_>>().join(","),
+                "tmux sessions whose panes are ALL DEAD — excluded from running \
+                 (remain-on-exit keeps the session after the command exits; AMUX-2644)"
+            );
+        }
         if let Ok(o) = tmux_out {
             for l in String::from_utf8_lossy(&o.stdout).lines() {
                 let Some((n, a, c)) = parse_list_sessions_line(l) else {
                     continue;
                 };
+                if all_panes_dead.contains(n) {
+                    continue;
+                }
                 running.insert(n.to_string());
                 if let Some(ts) = a {
                     activity.insert(n.to_string(), ts);
@@ -2896,6 +2968,65 @@ mod tests {
     /// but an `active` report 57s old means an agent IS running (the exact
     /// ai-video-editor case). The scrape is the fallback; ignoring the report is
     /// what showed a working lane as stopped.
+    #[test]
+    fn a_session_whose_panes_are_all_dead_is_not_running() {
+        use std::collections::BTreeSet;
+        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
+
+        // THE INCIDENT: a worker whose pane died at launch. remain-on-exit keeps
+        // the session, so list-sessions still lists it and the lane read
+        // running:true/idle forever.
+        assert_eq!(
+            sessions_with_all_panes_dead("amux-corpse:1\n"),
+            set(&["amux-corpse"]),
+            "a session with only a dead pane hosts nothing"
+        );
+
+        // CONTROLS — each of these must be KEPT, and they are why this is not
+        // just `contains(\"1\")`.
+        assert!(
+            sessions_with_all_panes_dead("amux-alive:0\n").is_empty(),
+            "a live pane is a live session"
+        );
+        assert!(
+            sessions_with_all_panes_dead("amux-mixed:1\namux-mixed:0\n").is_empty(),
+            "PARTIAL DEATH IS NOT DEATH — a lane with a finished side pane is still working, \
+             and evicting it would take healthy lanes down with the corpses"
+        );
+
+        // FAIL OPEN. Unreadable or absent output must exclude NOTHING. This is
+        // the half that matters: a liveness filter which can empty the fleet is
+        // worse than the bug it fixes, and this card's own probe warning
+        // records what that looks like — "48 of 48 running lanes have no tmux
+        // session", absurd on its face and entirely an artifact.
+        for junk in ["", "\n\n", "garbage with no colon", ":1", "\n"] {
+            assert!(
+                sessions_with_all_panes_dead(junk).is_empty(),
+                "unreadable pane output must exclude nothing, got something for {junk:?}"
+            );
+        }
+
+        // A session name containing ':' still parses — the flag cannot contain
+        // one, so the LAST separator is the boundary.
+        assert_eq!(
+            sessions_with_all_panes_dead("weird:name:1\n"),
+            set(&["weird:name"]),
+            "split on the last ':', not the first"
+        );
+
+        // Realistic fleet shape: many live, one corpse.
+        let mut fleet = String::new();
+        for i in 0..49 {
+            fleet.push_str(&format!("amux-lane{i}:0\n"));
+        }
+        fleet.push_str("amux-deadlane:1\n");
+        assert_eq!(
+            sessions_with_all_panes_dead(&fleet),
+            set(&["amux-deadlane"]),
+            "exactly one corpse in a 50-session fleet — not zero, and NOT all 50"
+        );
+    }
+
     #[test]
     fn agent_running_honours_a_fresh_active_self_report_over_a_shell_scrape() {
         let mut s = signals();
