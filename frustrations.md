@@ -1205,6 +1205,21 @@ SYMPTOM: `error: extern location for serde_core does not exist: ~/.amux/rust-bui
 COST: ~12 min of pure rebuild, and worse, it masqueraded as a code error twice — the first failure looked like my own change had broken the build, which is exactly the wrong instrument reading (a red result on code you just verified by hand means the instrument is a candidate before the code is).
 FIX: Not fixed; needs a decision, not a workaround. Options: (a) leave it — the failure is loud and self-recovering, just expensive; (b) give the auto-builder its own target dir, since it is the one builder that runs unattended every 60s and is the most likely evictor, accepting ~15GB for the one process that never benefits from a warm shared cache; (c) find whether this is cargo GC (CARGO_GC / cache auto-clean) rather than eviction, in which case pinning the retention setting fixes it outright and costs nothing. (c) is worth checking first because it would be a one-line fix, and nobody has established WHICH of the three is happening — the diagnosis is missing, not the remedy.
 
+NOTE (2026-08-24, amux-frustrations): STAYS OPEN, and the reason is a trap worth naming.
+  This entry's CARD, AMUX-2936, reads `done` — and that is not evidence about this entry,
+  because the CARD WAS REPURPOSED. Its description is now entirely about the staged-guard
+  blind-cotenant WARN (321 WARNs measured over 8h53m, 29 distinct committing lanes); its
+  log shows it passed through amux, went backlog, was reassigned to me, and closed on that
+  subject. Nothing in it addresses artifact eviction under a shared CARGO_TARGET_DIR.
+  So a validation sweep keyed on "is the linked card closed" would have archived this as
+  fixed. Card=done is weaker evidence than AC-227 already says: not only can a card close
+  without the work landing, the card can stop being ABOUT the entry while keeping the id
+  the entry points at.
+  On the substance: no eviction failure observed today across roughly 20 builds run
+  concurrently with at least one other lane and the auto-builder. That is absence of a
+  race in one session, which is not a fix, and no fix was ever made — so it stays open
+  until either the race recurs or someone changes how concurrent builds share the dir.
+
 ## amux-launched browser does not survive a server self-adopt
 AREA: browser
 SEVERITY: slows
@@ -2304,39 +2319,6 @@ FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, a
   point of suppression. Detail and acceptance on AF-178.
 
 ---
-## The staged guard named me as co-editor of a file I never opened
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-23
-SESSION: amux-frustrations
-CARD: AF-179
-SYMPTOM: amux committed scripts/token-baseline.py, a file they created from scratch, and the
-  staged guard told them "was also edited by session 'amux-frustrations' 6m ago. This commit
-  stages 595 insertions / 0 deletions there". I never opened it. The mechanism is
-  observed-edits-post.py walking everything under cwd and reporting each file whose mtime is
-  >= a marker stamped when the Bash command started: the window is the DURATION of the
-  command, so on a shared checkout every peer write inside it becomes mine. I was running a
-  `cargo test` that took two minutes; the file's mtime is 20:10, inside it, and the guard's
-  "6m ago" matches that mtime exactly.
-COST: A round trip with amux that neither of us could resolve from the output, because nothing
-  in the guard's sentence says the claim came from an mtime window rather than a write. They
-  had to ask whether their commit had silently clobbered work of mine. The direction that costs
-  more is the inverse: a session recognising the shape of a false warning and pushing through a
-  true one.
-FIX: Record and print the METHOD and WINDOW on an observed record ("observed via a 128s mtime
-  window during `cargo test`") instead of the bare "was also edited by". Stop ranking a
-  wide-window observed record equal to a firsthand write. And log WHICH paths were sent: the
-  hook log says `n=3 sent` and not what, so the log built to verify the hook by what it wrote
-  cannot say what it claimed. AF-179.
-NOTE: AF-124 fixed the read-only half of this class (a `cat` of a peer's file no longer claims
-  it); no command-level allowlist can reach this half, because the commands that open the widest
-  windows are the ones that genuinely write. AMUX-3497 already ships a caveat for it and that
-  caveat FIRED for me tonight on a different file in the same commit run, so this entry is
-  narrower than it first reads: it is live only if the caveat did NOT print for amux on
-  token-baseline.py. Asked; holding. What survives either way is the log line, which records
-  `n=3 sent` and not which three.
-
 ## An autofix card was dispatched for an incident that had already self-resolved
 AREA: instruments
 SEVERITY: slows

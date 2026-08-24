@@ -453,3 +453,37 @@ NOTE: The mechanism is `git add <path>` staging the FILE, and it is INTRA-FILE, 
   Instance five today, and the first to cost a red commit. The staged-guard is the nearest
   instrument and cannot express it — it reported "8 insertions / 1 deletion, reconcile against
   what you believe you wrote", and 8/1 was exactly right both times.
+
+## The staged guard named me as co-editor of a file I never opened
+VALIDATED: amux-frustrations | FIXED, all three parts of the entry's own FIX, verified against the shipping code and LIVE OUTPUT rather than the commit log. (1) METHOD is printed: the guard fired on me twice today and said 'Co-edit signal caveat: OBSERVED claim, not a recorded write: that session's Bash command saw this file's mtime move. Your own record is 471s NEWER, so their sample may be a snapshot of YOUR ongoing authorship rather than an edit of theirs (AF-179)'. (2) observed is no longer ranked equal to a firsthand write — it is labelled as a caveat under the claim. (3) PATHS are logged, not just a count: scripts/claude-hooks/observed-edits-post.py LOG_PATHS=12, whose comment cites this entry verbatim ('This said n=3 sent, so the log built to verify this hook by what it WROTE could not say what it wrote'). THE COST IS DEMONSTRABLY GONE: the entry's cost was 'a round trip with amux that neither of us could resolve from the output'. When it fired on me today I resolved it in one read, with no round trip, because the caveat named the alternative reading. Self-validated: amux-frustrations is the originating session.
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-179
+SYMPTOM: amux committed scripts/token-baseline.py, a file they created from scratch, and the
+  staged guard told them "was also edited by session 'amux-frustrations' 6m ago. This commit
+  stages 595 insertions / 0 deletions there". I never opened it. The mechanism is
+  observed-edits-post.py walking everything under cwd and reporting each file whose mtime is
+  >= a marker stamped when the Bash command started: the window is the DURATION of the
+  command, so on a shared checkout every peer write inside it becomes mine. I was running a
+  `cargo test` that took two minutes; the file's mtime is 20:10, inside it, and the guard's
+  "6m ago" matches that mtime exactly.
+COST: A round trip with amux that neither of us could resolve from the output, because nothing
+  in the guard's sentence says the claim came from an mtime window rather than a write. They
+  had to ask whether their commit had silently clobbered work of mine. The direction that costs
+  more is the inverse: a session recognising the shape of a false warning and pushing through a
+  true one.
+FIX: Record and print the METHOD and WINDOW on an observed record ("observed via a 128s mtime
+  window during `cargo test`") instead of the bare "was also edited by". Stop ranking a
+  wide-window observed record equal to a firsthand write. And log WHICH paths were sent: the
+  hook log says `n=3 sent` and not what, so the log built to verify the hook by what it wrote
+  cannot say what it claimed. AF-179.
+NOTE: AF-124 fixed the read-only half of this class (a `cat` of a peer's file no longer claims
+  it); no command-level allowlist can reach this half, because the commands that open the widest
+  windows are the ones that genuinely write. AMUX-3497 already ships a caveat for it and that
+  caveat FIRED for me tonight on a different file in the same commit run, so this entry is
+  narrower than it first reads: it is live only if the caveat did NOT print for amux on
+  token-baseline.py. Asked; holding. What survives either way is the log line, which records
+  `n=3 sent` and not which three.
