@@ -2739,3 +2739,35 @@ FIX: derive the session from the tmux session name (`tmux display-message -p '#S
   `amux-` prefix) in the edit-record hook and the CLI when the variable is empty, and say in
   the guard verdict when that fallback was used. Plus a WARN in the lane-launch path when a lane
   starts without the variable, so /api/logs/analyze can count these instead of a human noticing.
+
+## The drift-detector protecting mixpeek's git guard is itself blind to staleness
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-24
+SESSION: mixpeek-research
+CARD: MR-44
+SYMPTOM: Landing MR-43 (tmux-derived $AMUX_SESSION fallback) required running
+  `install-hooks.sh --all` to propagate the fix. It reported mixpeek's
+  `.githooks/amux-staged-guard` as "diverges from canonical but carries every
+  canonical feature — left untouched", the correct, safe verdict for a
+  deliberate local merge. It is not one: mixpeek's copy is GUARD_VERSION = 4
+  against a canonical of 9, missing ~215 lines including AF-127 outcome
+  reporting and the AF-195 index/worktree divergence check. The staleness
+  check greps the canonical's single `guard-features` token (AMUX-2946) as a
+  bare substring anywhere in the target file; mixpeek's v4 copy happens to
+  contain that literal string at line 75 in an unrelated comment about retired
+  ports, so the check reads "feature present" when the actual AMUX-2946
+  feature never landed there. This is the exact MG-1485 dark-guard shape the
+  mechanism exists to catch, undetected by the mechanism itself, in the one
+  checkout that matters most for daily commits.
+COST: not measured directly — the cost is whatever the missing ~5 versions of
+  protection would have caught and did not (AF-195's index/worktree check in
+  particular: mixpeek is a shared checkout where that class of bug already
+  happened once, per its own header).
+FIX: two separate fixes. (1) Upgrade mixpeek/.githooks/amux-staged-guard and
+  prepare-commit-msg from v4 to v9 — a real merge, commit in that repo. (2)
+  Make the drift-token check itself resistant to this: require the token
+  match to come from a comment-anchored form, or compare GUARD_VERSION
+  numerically in addition to/instead of grepping tokens. Otherwise the next
+  stale copy hides the same way. Neither started; MR-44.
