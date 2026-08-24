@@ -2381,6 +2381,55 @@ fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
             v.push(std::path::Path::new(&h).join(p));
         }
     }
+    // BUILD TREES IN THE SESSIONS' OWN CHECKOUTS (AMUX-3665).
+    //
+    // The `/private/tmp` branch above says it catches "build trees, wherever
+    // sessions put them", and it did when per-session scratch target dirs were
+    // the convention. CLAUDE.md retired those (they filled this volume once
+    // already: ~37 trees at 10-15GB), so the strays that remain are in the
+    // CHECKOUT — and a checkout is in none of the roots above.
+    //
+    // Measured 2026-08-24, on the report that motivated this: 23 GB sat in
+    // /Users/ethan/Dev/amux/target while the ranking listed 47 GB of ~/.amux
+    // and named nothing bigger. It is gitignored, so `git status` cannot show
+    // it either. The largest single reclaimable thing on the volume was
+    // unrankable BY CONSTRUCTION — not skipped for budget, not skipped for
+    // permissions, simply never a candidate.
+    //
+    // This is the THIRD instance of the pattern the two comments above already
+    // name (AEAB-42: files were not candidates; AEAB-33: the failure warning
+    // can only report candidates that were GENERATED). Both fixes were one
+    // layer inside the generator. This one is the generator's ROOTS, which is
+    // the layer neither could see. After adding a surfacing mechanism, ask what
+    // the mechanism itself cannot express — and then ask it again about the
+    // answer you just gave.
+    //
+    // The sessions' `CC_DIR` is the right source rather than a hardcoded
+    // `~/Dev/*`: it is where the fleet ACTUALLY works, it is already a
+    // primitive amux owns, and it needs no new configuration to be correct on
+    // a machine laid out differently. Deduped, because most of the fleet shares
+    // one checkout.
+    let mut seen: std::collections::BTreeSet<std::path::PathBuf> = Default::default();
+    if let Ok(rd) = std::fs::read_dir(home.join("sessions")) {
+        for e in rd.flatten() {
+            if e.path().extension().and_then(|x| x.to_str()) != Some("env") {
+                continue;
+            }
+            let cfg = crate::config::parse_env_file(&e.path());
+            let Some(dir) = cfg.get("CC_DIR").map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            for sub in ["target", "node_modules"] {
+                let p = std::path::Path::new(dir).join(sub);
+                // `is_dir` and not merely `exists`: a checkout without a build
+                // tree must not become a candidate that `du` then fails on,
+                // which would spend the ranking's budget reporting nothing.
+                if p.is_dir() && seen.insert(p.clone()) {
+                    v.push(p);
+                }
+            }
+        }
+    }
     v
 }
 
@@ -4683,6 +4732,69 @@ mod tests {
         assert!(has("big.db"), "a 2MB file above a 1MB floor must be a candidate: {got:?}");
         assert!(has("a-directory"), "directories must STILL be candidates: {got:?}");
         assert!(!has("small.txt"), "a file below the floor is noise, not a candidate: {got:?}");
+    }
+
+    /// AMUX-3665, rebuilt from the report that motivated it.
+    ///
+    /// The disk ranking listed 47 GB of `~/.amux` and named nothing bigger,
+    /// while 23 GB sat in the shared checkout's own `target/` — gitignored, so
+    /// `git status` could not show it either. The largest reclaimable thing on
+    /// the volume was unrankable by construction, because the candidate roots
+    /// were `~/.amux`, `/private/tmp/*target*` and five `$HOME` caches, and a
+    /// checkout is in none of them.
+    ///
+    /// The fixture builds a fake sessions dir with a `CC_DIR` pointing at a
+    /// checkout, which is the seam that generates the candidate.
+    #[test]
+    fn a_build_tree_in_a_session_checkout_is_a_candidate() {
+        let _g = du_env_lock();
+        let home = tempfile::tempdir().unwrap();
+        let checkout = tempfile::tempdir().unwrap();
+        std::fs::create_dir(checkout.path().join("target")).unwrap();
+        std::fs::create_dir(checkout.path().join("node_modules")).unwrap();
+        // A SECOND checkout with no build tree: the negative control. Pushing a
+        // non-existent path would spend the ranking's budget on a `du` that
+        // reports nothing, which reads as "measured, found nothing" rather than
+        // "never existed".
+        let bare = tempfile::tempdir().unwrap();
+
+        std::fs::create_dir(home.path().join("sessions")).unwrap();
+        std::fs::write(
+            home.path().join("sessions/lane-a.env"),
+            format!("CC_DIR={}\n", checkout.path().display()),
+        )
+        .unwrap();
+        // Two lanes on the SAME checkout: the fleet shares one, and the same
+        // path listed twice would double-count it in the ranking.
+        std::fs::write(
+            home.path().join("sessions/lane-b.env"),
+            format!("CC_DIR={}\n", checkout.path().display()),
+        )
+        .unwrap();
+        std::fs::write(
+            home.path().join("sessions/lane-c.env"),
+            format!("CC_DIR={}\n", bare.path().display()),
+        )
+        .unwrap();
+        // A lane with no CC_DIR at all must not crash or contribute.
+        std::fs::write(home.path().join("sessions/lane-d.env"), "CC_TAGS=amux\n").unwrap();
+
+        let got = disk_candidates(home.path());
+
+        let want_target = checkout.path().join("target");
+        let want_modules = checkout.path().join("node_modules");
+        assert!(got.contains(&want_target), "the checkout's build tree must rank: {got:?}");
+        assert!(got.contains(&want_modules), "node_modules too: {got:?}");
+        assert_eq!(
+            got.iter().filter(|p| **p == want_target).count(),
+            1,
+            "two lanes sharing a checkout must not list it twice: {got:?}"
+        );
+        assert!(
+            !got.iter().any(|p| p.starts_with(bare.path())),
+            "a checkout with no build tree must contribute NO candidate, not a \
+             path that du will fail on: {got:?}"
+        );
     }
 
     /// The floor is a POLICY knob, not a constant (deviation D4). If the env
