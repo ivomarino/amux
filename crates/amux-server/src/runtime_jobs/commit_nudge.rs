@@ -953,6 +953,37 @@ fn demote_settled_shared(own: &mut Ownership, settled: &BTreeSet<String>) {
 /// [`drop_paths_identical_to_origin`] refreshed earlier in the same tick, so it
 /// MUST run after that filter. It does not fetch again.
 ///
+/// How many lines the WORKTREE copy of `p` has that `origin/main`'s copy does
+/// not. `None` when either side is unreadable — absence of an answer, never
+/// zero, because zero is the permission to prescribe a destructive restore.
+///
+/// Line-set rather than diff-hunk: the paths this guards are append-only ledgers
+/// (`frustrations.md` and friends), where entries are appended and occasionally
+/// MOVED to a companion archive. A hunk-based comparison reports a move as a
+/// change on both sides; a set comparison asks the only question that matters
+/// here, which is whether any content would be DESTROYED by taking origin's copy.
+///
+/// Blank and whitespace-only lines are dropped so that reflowing cannot
+/// manufacture novelty, and the comparison is over a set so that reordering
+/// cannot either. Both directions of that choice are conservative: they can only
+/// make the difference SMALLER, and a smaller difference is what unlocks the
+/// downgrade — so the caller pairs this with `Some(0)` only, never with a
+/// threshold.
+async fn worktree_lines_absent_from_origin(dir: &str, p: &str) -> Option<usize> {
+    let origin = tokio::process::Command::new("git")
+        .args(["-C", dir, "show", &format!("origin/main:{p}")])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())?;
+    let origin = String::from_utf8_lossy(&origin.stdout);
+    let theirs: std::collections::HashSet<&str> =
+        origin.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+
+    let mine = tokio::fs::read_to_string(std::path::Path::new(dir).join(p)).await.ok()?;
+    Some(mine.lines().map(str::trim).filter(|l| !l.is_empty()).filter(|l| !theirs.contains(l)).count())
+}
+
 /// When it cannot classify a path (git error, no origin/main ref) it treats the
 /// path as ordinary work, never STALE, so a failure degrades to today's
 /// behaviour rather than inventing a revert warning.
@@ -1051,8 +1082,58 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
                     o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty()
                 })
                 .unwrap_or(false);
+            // 3c. …but `git log origin/main..HEAD` counts commits BY SHA, and a
+            //     commit already upstream under a DIFFERENT sha (cherry-pick,
+            //     rebase, graft-push replay) sits in that range permanently —
+            //     the duplicate-sha case the Deploy section of CLAUDE.md
+            //     documents for `origin/main..main`. On a graft-push checkout
+            //     EVERY path reads local_ahead, so DIVERGED fired for paths that
+            //     were merely STALE and the safe restore was withheld
+            //     (reported by mixpeek-frustrations, 2026-08-24).
+            //
+            //     The discriminator has to be CONTENT, because sha identity is
+            //     exactly what a replay destroys. The remedy under discussion
+            //     (`git checkout origin/main -- <path>`) overwrites the
+            //     WORKTREE, so restore-safety is precisely "does the worktree
+            //     hold lines origin does not". Zero means there is nothing here
+            //     to lose whatever the sha arithmetic said.
+            //
+            //     ONE-SIDED ON PURPOSE. It can only ever DOWNGRADE diverged to
+            //     stale, and only on a positive finding (a readable pair, and an
+            //     empty difference). Any error, unreadable side or non-empty
+            //     difference leaves the DIVERGED verdict standing, so the
+            //     failure mode stays "warned too loudly" rather than "prescribed
+            //     a restore that ate committed work" — which is the incident
+            //     this whole cell exists for.
             if local_ahead {
-                fresh.diverged.push(p.clone());
+                match worktree_lines_absent_from_origin(dir, p).await {
+                    Some(0) => {
+                        // Downgrade, and SAY SO. A verdict that silently changes
+                        // class is the one nobody can audit later: STALE-because-
+                        // downgraded and STALE-outright would otherwise be
+                        // byte-identical in the log, and this is the arm that
+                        // prescribes a destructive remedy.
+                        tracing::info!(
+                            target: "autofix",
+                            path = %p,
+                            dir = %dir,
+                            "commit-nudge: DIVERGED downgraded to STALE — local commits exist \
+                             on this path but contribute no lines origin lacks (replayed or \
+                             cherry-picked upstream), so the restore is safe"
+                        );
+                        fresh.stale.push(p.clone());
+                    }
+                    other => {
+                        tracing::info!(
+                            target: "autofix",
+                            path = %p,
+                            dir = %dir,
+                            novel_lines = ?other,
+                            "commit-nudge: DIVERGED stands — content differs in both directions"
+                        );
+                        fresh.diverged.push(p.clone());
+                    }
+                }
             } else {
                 fresh.stale.push(p.clone());
             }
@@ -2056,6 +2137,116 @@ mod tests {
         assert_eq!(fresh.same, s(&["same.txt"]), "identical-to-origin must be SAME");
         assert_eq!(fresh.stale, s(&["stale.txt"]), "origin-ahead-on-path must be STALE");
         assert_eq!(fresh.edited, s(&["edited.txt"]), "differs, origin unmoved, must be EDITED");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// A GRAFT-PUSH CHECKOUT MUST NOT READ AS DIVERGED (reported by
+    /// mixpeek-frustrations, 2026-08-24).
+    ///
+    /// `git log origin/main..HEAD -- <path>` counts commits BY SHA, and a commit
+    /// already upstream under a different sha — cherry-picked, rebased, replayed
+    /// by a graft push — sits in that range permanently. On such a checkout every
+    /// path reads local-ahead, so DIVERGED fired for paths that were merely
+    /// STALE, and the safe restore was withheld from the one file class that
+    /// most needs it: the append-only ledgers.
+    ///
+    /// Both cells run against the SAME repo so the control is not a different
+    /// world. `replayed.md` is the specimen (local commits exist, worktree
+    /// contributes no line origin lacks -> STALE); `truly-diverged.md` holds one
+    /// line origin has never seen -> DIVERGED stands. Without the second, a
+    /// downgrade that fired unconditionally would pass the first — the
+    /// matches-everything filter that looks identical to a correct one from the
+    /// rows alone.
+    #[tokio::test]
+    async fn a_replayed_commit_downgrades_diverged_to_stale_but_real_divergence_stands() {
+        let tmp = std::env::temp_dir().join(format!("amux-graft-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (bare, work, peer) = (tmp.join("origin.git"), tmp.join("work"), tmp.join("peer"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        std::fs::write(work.join("replayed.md"), "entry A\n").unwrap();
+        std::fs::write(work.join("truly-diverged.md"), "entry A\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "base"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // LOCAL commits entry B on both paths. These commits never reach origin
+        // under this sha — the graft-push shape.
+        std::fs::write(work.join("replayed.md"), "entry A\nentry B\n").unwrap();
+        std::fs::write(work.join("truly-diverged.md"), "entry A\nentry B\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "local: entry B"]);
+
+        // A peer lands entry B AND entry C from the base — so origin's copy is a
+        // SUPERSET of the local content, reached by different commits.
+        std::process::Command::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap()])
+            .arg(&peer)
+            .output()
+            .unwrap();
+        git(&peer, &["config", "user.email", "t@t"]);
+        git(&peer, &["config", "user.name", "t"]);
+        std::fs::write(peer.join("replayed.md"), "entry A\nentry B\nentry C\n").unwrap();
+        std::fs::write(peer.join("truly-diverged.md"), "entry A\nentry B\nentry C\n").unwrap();
+        git(&peer, &["add", "-A"]);
+        git(&peer, &["commit", "-m", "peer: entries B and C"]);
+        git(&peer, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin"]);
+
+        // Worktree: the specimen carries only content origin already has. The
+        // control carries one line origin has never seen.
+        std::fs::write(work.join("replayed.md"), "entry A\nentry B\n").unwrap();
+        std::fs::write(
+            work.join("truly-diverged.md"),
+            "entry A\nentry B\nentry LOCAL-ONLY\n",
+        )
+        .unwrap();
+
+        let dir = work.to_str().unwrap();
+
+        // PREMISE CHECK, not decoration: both paths must read local-ahead BY SHA,
+        // or this test proves nothing about the downgrade — it would just be
+        // exercising the ordinary STALE path. "I built the specimen" is a claim,
+        // not a premise.
+        for p in ["replayed.md", "truly-diverged.md"] {
+            let ahead = std::process::Command::new("git")
+                .args(["-C", dir, "log", "--oneline", "origin/main..HEAD", "--", p])
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&ahead.stdout).trim().is_empty(),
+                "{p} is not local-ahead by sha, so the DIVERGED arm is never reached and this \
+                 test is vacuous"
+            );
+        }
+
+        let fresh = freshness_from_repo(dir, &s(&["replayed.md", "truly-diverged.md"])).await;
+
+        assert_eq!(
+            fresh.stale,
+            s(&["replayed.md"]),
+            "a path whose local commits contribute no line origin lacks is STALE, not DIVERGED — \
+             the restore is safe and withholding it is the reported bug"
+        );
+        assert_eq!(
+            fresh.diverged,
+            s(&["truly-diverged.md"]),
+            "a path holding a line origin has never seen must STAY DIVERGED — a downgrade that \
+             fires unconditionally passes the specimen above and destroys real work"
+        );
         let _ = std::fs::remove_dir_all(&tmp);
     }
 }
