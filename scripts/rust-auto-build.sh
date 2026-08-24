@@ -47,6 +47,18 @@ head=$(git -C "$REPO" log -1 --format=%H -- crates/ Cargo.toml Cargo.lock 2>/dev
 last=$(cat "$STAMP" 2>/dev/null || echo "")
 [ "$head" = "$last" ] && exit 0
 
+# The sha that will actually be BUILT — the worktree below is created from
+# `rev-parse HEAD`. `$head` is a different thing: the last commit that touched
+# the build inputs, used as the rebuild stamp key. They differ routinely on a
+# checkout where lanes land work a minute apart, so no log line may print the
+# stamp key as if it were what got built.
+#
+# Computed HERE, before the lock, rather than at first use: the two SKIP lines
+# below name a sha, and they run before the build begins. Having them print
+# `$head` was the same defect in its cheapest form — a contention log that
+# names a commit which is not the one the winning process is building.
+built_sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "$head")
+
 # ── SINGLE-INSTANCE LOCK (AMUX-2927) ────────────────────────────────────────
 # Two invocations — the 60s launchd cycle and a human running this by hand —
 # built 68d7114 simultaneously and one died with E0432 on a half-evicted
@@ -70,12 +82,12 @@ if ! mkdir "$LOCK" 2>/dev/null; then
     # Log the contention rather than exiting silently: a skip that leaves no
     # trace is indistinguishable from a cycle that found nothing to do, and
     # THAT ambiguity is what made this bug take three occurrences to spot.
-    echo "== $(date '+%F %T') SKIP $head — build already running (pid $owner)" >> "$LOG"
+    echo "== $(date '+%F %T') SKIP $built_sha — build already running (pid $owner)" >> "$LOG"
     exit 0
   fi
   echo "== $(date '+%F %T') breaking stale lock (pid ${owner:-unknown} is gone)" >> "$LOG"
   rm -rf "$LOCK"
-  mkdir "$LOCK" 2>/dev/null || { echo "== $(date '+%F %T') SKIP $head — lost the lock race" >> "$LOG"; exit 0; }
+  mkdir "$LOCK" 2>/dev/null || { echo "== $(date '+%F %T') SKIP $built_sha — lost the lock race" >> "$LOG"; exit 0; }
 fi
 LOCK_HELD=1
 echo $$ > "$LOCK/pid"
@@ -113,11 +125,6 @@ if git -C "$REPO" merge-base --is-ancestor HEAD main 2>/dev/null \
   on_main=yes
 fi
 head_ref=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo "?")
-# The sha reported is the one actually BUILT — the worktree below is created from
-# `rev-parse HEAD`. `$head` is a different thing: the last commit that touched the
-# build inputs, used as the rebuild stamp key. Reporting the stamp key here would
-# name a commit that is not what is running.
-built_sha=$(git -C "$REPO" rev-parse HEAD 2>/dev/null || echo "$head")
 # A file rather than only a log line, because ~/.amux/logs/rust-auto-build.log is
 # not somewhere anyone looks — a tag in a store the reader never opens is the same
 # failure as no tag. The SessionStart freshness hook reads this and says it at the
@@ -160,7 +167,20 @@ if [ "${AMUX_RS_BUILD_PROVENANCE_ONLY:-}" = "1" ]; then
 fi
 
 {
-  echo "== $(date '+%F %T') building $head (was: ${last:-none})"
+  # BUILT sha first, trigger second, and both LABELLED. This line printed `$head`
+  # — the stamp key, i.e. the last commit that touched the build inputs — which
+  # is exactly what the comment at `built_sha` above forbids, because the
+  # worktree is created from `rev-parse HEAD` and those two commits differ
+  # routinely on a checkout where lanes land work a minute apart. On 2026-08-24
+  # it logged `building d55b7a63` twice while the binaries stamped
+  # AMUX_BUILD_COMMIT=2b428975, and a peer reading this line used it as evidence
+  # that two same-source builds had compiled different trees — nearly disproving
+  # a correct non-reproducibility finding with a sha this script had disclaimed
+  # forty lines earlier. The comment was right and the code contradicted it,
+  # which is the shape where reading EITHER one alone leaves you confident and
+  # wrong. The trigger is still worth printing; it just may not pose as the
+  # thing that got built.
+  echo "== $(date '+%F %T') building $built_sha (trigger: $head, previous stamp: ${last:-none})"
   if [ "$on_main" != "yes" ]; then
     echo "== !! OFF-MAIN: $built_sha is on '$head_ref', which is not contained in main."
     echo "==    Installing it makes it the live build for the WHOLE FLEET within ~5s,"
