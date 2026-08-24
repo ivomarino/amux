@@ -2167,6 +2167,94 @@ async fn the_contract_says_which_tier_each_gate_came_from() {
     );
 }
 
+/// AF-187: the refusal names `desc_append` and must SHOW it, not just say it.
+///
+/// A lane POSTed /api/board/BACKE-3531/desc-append twice, 33s apart, and got 404
+/// both times. That path is not routed and should not be — `desc_append` is a
+/// PATCH field. But the guess is not careless: this API's board resource has six
+/// real POST sub-paths (archive, restore, status-request, status-update, claim),
+/// so a bare field name reads as a path here.
+///
+/// ASSERTING ON THE TEXT IS CORRECT IN THIS ONE CASE. The general rule is that a
+/// text mutation measures coupling rather than correctness — but that holds when
+/// the string is incidental to the thing under test. Here the refusal body IS
+/// the product: its whole job is to be readable and copyable. So the artifact
+/// under test is the text, and mutating it is the right instrument.
+///
+/// The structured half is the part a machine can use, and it is asserted
+/// separately so the test does not rest on prose alone.
+#[tokio::test]
+async fn the_desc_shrink_refusal_shows_how_to_append_not_just_the_field_name() {
+    let (app, _dir) = app();
+    let long = "x".repeat(900);
+    let card = create(&app, json!({ "title": "long desc", "status": "todo", "desc": long })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // A replace dropping a strict majority of a 500+ char desc trips the SIZE rule.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "desc": "tiny" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "a 900 -> 4 char replace must be refused: {v}");
+    assert_eq!(v["kind"], json!("desc_shrink_blocked"), "{v}");
+
+    // THE MACHINE-READABLE HALF: a caller can build the request without prose.
+    let ex = &v["append_example"];
+    assert_eq!(ex["method"], json!("PATCH"), "{v}");
+    assert_eq!(ex["path"], json!(format!("/api/board/{id}")), "{v}");
+    assert!(
+        ex["body"]["desc_append"].is_string(),
+        "the example body must carry the FIELD, or it does not show the shape: {v}"
+    );
+
+    // THE PROSE HALF: the sentence a human reads must carry the shape too, since
+    // that is the half that got guessed as a path.
+    let err = v["error"].as_str().unwrap_or("");
+    assert!(err.contains("desc_append"), "still name the field — it is what a reader greps: {err:?}");
+    assert!(
+        err.contains(&format!("/api/board/{id}")) || err.contains("in place of"),
+        "the sentence must show the invocation, not just the name: {err:?}"
+    );
+
+    // CONTROL: the bare field name stays where a machine already looked for it.
+    // Replacing it with the example would break every existing consumer.
+    assert_eq!(v["append_instead"], json!("desc_append"), "{v}");
+    assert_eq!(v["ack_field"], json!("desc_shrink_ack"), "{v}");
+
+    // THE OTHER BRANCH, and it is here because a mutation caught its absence.
+    // The block above trips the SIZE rule (a lane shrinking its own desc). The
+    // AUTHORSHIP rule is a different string on a different path, and dropping
+    // the shape from it left this test GREEN — a cell that could not fail on
+    // half the feature it claimed to cover.
+    let owned = create(
+        &app,
+        json!({ "title": "owned", "status": "todo", "session": "lane-a",
+                "desc": "y".repeat(900) }),
+    )
+    .await;
+    let oid = owned["id"].as_str().unwrap().to_string();
+    let (st2, _, v2) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{oid}"),
+        Some(json!({ "desc": "my review note" })),
+        &[("X-Amux-Session", "lane-b")],
+    )
+    .await;
+    assert_eq!(st2, StatusCode::CONFLICT, "a peer replacing the owner's prose must refuse: {v2}");
+    assert_eq!(v2["rule"], json!("authorship"), "this must be the OTHER branch: {v2}");
+    let err2 = v2["error"].as_str().unwrap_or("");
+    assert!(err2.contains("desc_append"), "{err2:?}");
+    assert!(
+        err2.contains("not a sub-path"),
+        "the authorship branch must show the shape too — it is the one a REVIEWER reads,          and reviewers are who guessed the path: {err2:?}"
+    );
+    assert_eq!(v2["append_example"]["method"], json!("PATCH"), "{v2}");
+}
+
 /// AMUX-3567 REVIEW (amux-frustrations): the same answer for the WORKER tier,
 /// which is the tier the card is named after and the one the original cell
 /// skipped. It went type-default -> card-override, so `GateSource::Worker` was

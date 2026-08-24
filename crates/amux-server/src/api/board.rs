@@ -239,7 +239,7 @@ async fn get_contract(
         "recovering_a_clobbered_desc": {
             "where": "_amux_state_events rows carry the FULL pre-mutation card snapshot in                       their payload, so a description overwritten by a PATCH is recoverable                       without any backup",
             "how": "find the row for the mutation (by card id and timestamp) and read the                     snapshot out of its payload",
-            "prevention": "PATCH refuses two acts and the refusal body names which via `rule`: SIZE — a replace dropping a strict majority of a desc of 500+ chars, any writer; and AUTHORSHIP — a replace by a DIFFERENT session that drops 200+ chars of the card owner's prose without keeping it, at ANY magnitude (AF-180 was 36% and destroyed a peer review just as thoroughly). Both escape via desc_shrink_ack. Use desc_append to add to a description rather than replacing it — that is almost always what a reviewer means",
+            "prevention": "PATCH refuses two acts and the refusal body names which via `rule`: SIZE — a replace dropping a strict majority of a desc of 500+ chars, any writer; and AUTHORSHIP — a replace by a DIFFERENT session that drops 200+ chars of the card owner's prose without keeping it, at ANY magnitude (AF-180 was 36% and destroyed a peer review just as thoroughly). Both escape via desc_shrink_ack. To ADD rather than replace — almost always what a reviewer means — send PATCH /api/board/<id> {\"desc_append\": \"your note\"}. `desc_append` is a FIELD in the PATCH body, not a sub-path: POST /api/board/<id>/desc-append is NOT routed and a lane guessed it twice on 2026-08-24 (AF-187)",
             "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head and \"slim\": 1). An ABSENT field is not an empty                                  one, and .get(\"desc\") returns None either way — read                                  desc_len, or GET the single card",
         },
         "list": {
@@ -2546,9 +2546,10 @@ pub async fn patch_item(
                                         "refusing to replace {owner_now}'s description on \
                                          {id_w} — you are {caller_lane}, and this drops \
                                          {} of their {before} characters without keeping what \
-                                         was there. Use desc_append to add your note below \
-                                         theirs; that is almost always what a reviewer or a \
-                                         commenter means. If you really do mean to replace \
+                                         was there. To add your note below theirs — almost always \
+                                         what a reviewer or a commenter means — resend as \
+                                         PATCH /api/board/{id_w} with \"desc_append\": \"your \
+                                         note\". It is a FIELD, not a sub-path. If you really do mean to replace \
                                          their text, resend with desc_shrink_ack: true.",
                                         before - after
                                     )
@@ -2559,8 +2560,10 @@ pub async fn patch_item(
                                          note that the list OMITS `desc` (it ships \
                                          desc_len/desc_head and slim:true) — an absent field is \
                                          not an empty one. Re-read GET /api/board/{id_w} first. \
-                                         To append instead, use desc_append. If the replace is \
-                                         intended, resend with desc_shrink_ack: true.",
+                                         To append instead, resend with \"desc_append\": \
+                                         \"your text\" in place of \"desc\" — a FIELD, not a \
+                                         sub-path. If the replace is intended, resend with \
+                                         desc_shrink_ack: true.",
                                         before - after
                                     )
                                 },
@@ -2575,6 +2578,16 @@ pub async fn patch_item(
                                 "desc_len_after": after,
                                 "ack_field": "desc_shrink_ack",
                                 "append_instead": "desc_append",
+                                // The NAME alone reads as a path on an API whose board
+                                // resource has six POST sub-paths (archive, restore,
+                                // status-request, status-update, claim). Ship the shape
+                                // beside it so a caller can copy a working request out of
+                                // the refusal (AF-187, and AMUX-2325 one endpoint over).
+                                "append_example": {
+                                    "method": "PATCH",
+                                    "path": format!("/api/board/{id_w}"),
+                                    "body": {"desc_append": "your text"},
+                                },
                             }),
                             ),
                             no_write(),
@@ -3162,9 +3175,10 @@ pub async fn patch_item(
                         .filter(|s| !s.is_empty())
                         .map(crate::api::session_verbs::lane_groups)
                         .unwrap_or_default();
-                    let (eff_gate, gate_source) =
-                        bs::effective_gate_with_source(conn, &next, target, &groups);
-                    let gate_src = Some(gate_source);
+                    let gate_trail = bs::effective_gate_trail(conn, &next, target, &groups);
+                    let authz_line = gate_trail.log_line();
+                    let eff_gate = gate_trail.criteria.clone();
+                    let gate_src = Some(gate_trail.source.clone());
                     let gates = bs::core_gates(&eff_gate, target);
                     let target_raw = bs::status_to_db(target, &next.status);
 
@@ -3495,6 +3509,17 @@ pub async fn patch_item(
                                 format!("{actor_name}: {from_raw} -> {target_raw}")
                             };
                             next.log = Some(bs::append_log(next.log.as_deref(), &stamp, &line));
+                            // AMUX-3607, Ethan's 2026-08-05 directive: every
+                            // action a worker takes is logged WITH the
+                            // permission scope that allowed it, each layer
+                            // individually. Written on EVERY transition,
+                            // including the ones no layer gated — "nothing
+                            // required this, at any tier" is an authorisation
+                            // answer, not an absence of one, and a trail that
+                            // only appears when something blocked would make
+                            // the permissive case the invisible case.
+                            next.log =
+                                Some(bs::append_log(next.log.as_deref(), &stamp, &authz_line));
                             next.status = target_raw.clone();
                             next.version = i64::try_from(updated.version).unwrap_or(next.version + 1);
                             status_event = Some((from_raw, target_raw));
