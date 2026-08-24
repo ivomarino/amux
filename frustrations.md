@@ -2799,3 +2799,33 @@ FIX: `ln -sfn`, in both branches of the axis, with the reason stated inline so i
   The generalisable half: a detector that names a remedy owes the same scrutiny to the
   REMEDY as to the check. This one could fail, fired correctly, and still closed the loop
   back onto itself.
+
+## "CDP never answered within 30s" printed with `DevTools listening on <that port>` in its own message
+AREA: browser
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3689
+SYMPTOM: Six `POST /api/browser/start` 502s from `primer`, ~30.3s each: "Chrome (pid
+  63351) is running but CDP on port 60005 never answered within 30s". The chrome stderr
+  pasted into the SAME error body reads `DevTools listening on
+  ws://127.0.0.1:60005/devtools/browser/e9edcb66-...`, stamped about three seconds into a
+  thirty second wait. So CDP came up, on the exact port named, and amux polled it for
+  another 27 seconds while reporting silence. The wait loop discarded every poll outcome,
+  so connection-refused, a 1s timeout, a 403 and a 500 all produced that one sentence.
+COST: The cause is still unknown and is now unknowable for these six, because the second
+  half compounds it: the stderr path is opened with `File::create`, which truncates, and a
+  failing caller always retries — so five of the six stderr files were destroyed by the
+  retries before anyone looked, leaving a 600-char tail as the entire record of the
+  incident. Roughly 40 minutes to establish only that the message was false. An
+  investigator who trusted it would have spent that time on Chrome's startup, which is the
+  half that was working.
+FIX: 6d179755. `describe_cdp_probe` names which of {refused, poll timeout, HTTP status}
+  the last poll got, the bail reports it with the attempt count, a WARN carries the same
+  fields so a sweep sees the class, and a failed launch's stderr is copied to
+  `amux-chrome-launch.failed-<ms>.stderr` (newest 5 kept) where the retry cannot reach it.
+  The generalisable half, and it is not "log more": the artifact you need MOST when a
+  failure repeats was being deleted BY the fact that it repeated. A truncating diagnostic
+  file is fine for a one-shot failure and actively hostile for a retried one, and nothing
+  about `File::create` reads as a data-loss decision at the call site.
