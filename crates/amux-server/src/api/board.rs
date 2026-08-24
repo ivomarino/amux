@@ -275,7 +275,20 @@ async fn get_contract(
             // gone green and been WRONG — it would document a query param that does
             // not exist and that axum silently drops, which is the exact defect that
             // test was written to catch. Keep `filters` strictly name -> description.
-            "slim_omits": ["desc", "log", "source_ref", "last_verified_at", "due_time", "gate"],
+            // SERIALIZED FROM THE CONST, not restated. This was a hardcoded
+            // literal of the same six fields while `SLIM_OMITS` (the list the
+            // slim writer actually removes) sat 800 lines below it — two
+            // definitions of one fact, in one file, neither referencing the
+            // other, and already textually divergent: the literal was in a
+            // different ORDER, so a diff of the two would not have looked like
+            // a duplicate.
+            //
+            // I introduced the second one myself, in d3cc2179, in the commit
+            // that closed AF-161's class. The contract's copy landed hours
+            // earlier at 64a9cb7d and I never grepped for it. That is the whole
+            // failure mode AF-161 names — one fact, two spellings, drift is a
+            // matter of time — reintroduced by the fix for it.
+            "slim_omits": SLIM_OMITS,
             "not_a_filter": {
                 "q / query / search": "REFUSED with 400 — /api/board does not search, it would \
                                        return the entire board. Use /api/search?q=",

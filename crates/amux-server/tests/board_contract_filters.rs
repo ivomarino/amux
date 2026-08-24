@@ -260,3 +260,110 @@ async fn the_contract_publishes_the_type_list_the_cli_reads() {
          `amux board add --help` will fall back instead of listing the types"
     );
 }
+
+/// Spin the real router once and return (contract, full_row, slim_row) for a card
+/// this test creates, so the contract's claim can be checked against the payload
+/// that actually ships rather than against another copy of the same list.
+async fn contract_and_rows() -> (Value, Value, Value) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("slim-omits-test.db")).unwrap();
+    let state = AppState {
+        store: std::sync::Arc::new(store),
+        started: std::time::Instant::now(),
+        build_hash: "test".into(),
+        auth_token: None,
+    };
+    let app = router(state);
+    let get = |uri: String, method: &'static str, body: Body| {
+        let app = app.clone();
+        async move {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method(method)
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(body)
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let bytes = axum::body::to_bytes(res.into_body(), 1 << 20).await.unwrap();
+            serde_json::from_slice::<Value>(&bytes).unwrap()
+        }
+    };
+
+    let created = get(
+        "/api/board".into(),
+        "POST",
+        Body::from(r#"{"title":"slim omits probe","desc":"a body long enough to be dropped"}"#),
+    )
+    .await;
+    let id = created["id"].as_str().expect("created card must have an id").to_string();
+
+    let contract = get("/api/board/contract".into(), "GET", Body::empty()).await;
+    // `full=1`, NOT the bare list: the list is ALREADY slim by default, so
+    // comparing `?all=1` against `?all=1&slim=1` is one payload against itself.
+    // The vacuity guard below caught exactly that on the first run of this cell.
+    let full = get("/api/board?all=1&full=1".into(), "GET", Body::empty()).await;
+    let slim = get("/api/board?all=1&slim=1".into(), "GET", Body::empty()).await;
+
+    let pick = |v: &Value| -> Value {
+        v.as_array()
+            .expect("list payload must be an array")
+            .iter()
+            .find(|r| r["id"] == id.as_str())
+            .expect("the created card must be in the list")
+            .clone()
+    };
+    let (f, sl) = (pick(&full), pick(&slim));
+    (contract, f, sl)
+}
+
+/// The contract's `slim_omits` must name exactly what the slim payload drops.
+///
+/// It cannot be checked against `SLIM_OMITS` from here — that const is
+/// `pub(crate)` — and checking it against another hand-written list would just
+/// be a third copy. So both sides are RUNTIME values off the shipped router:
+/// what the contract claims, and what the two payloads actually differ by.
+///
+/// WHY THIS EXISTS. `slim_omits` was a hardcoded literal in the contract
+/// (64a9cb7d) while the list the slim writer actually removes lived 800 lines
+/// below it as `SLIM_OMITS` (d3cc2179) — two definitions of one fact in one
+/// file, neither referencing the other, and already in DIFFERENT ORDER, so they
+/// did not even read as duplicates side by side. The second was introduced by
+/// the commit closing AF-161's class, which is the same one-fact-two-spellings
+/// failure AF-161 is about. The contract now serializes the const; this cell is
+/// what stops the literal coming back.
+#[tokio::test]
+async fn the_contract_names_exactly_what_the_slim_payload_drops() {
+    let (contract, full, slim) = contract_and_rows().await;
+
+    let claimed: std::collections::BTreeSet<String> = contract["list"]["slim_omits"]
+        .as_array()
+        .expect("the contract must publish slim_omits under `list`")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+
+    let full_keys: std::collections::BTreeSet<String> =
+        full.as_object().unwrap().keys().cloned().collect();
+    let slim_keys: std::collections::BTreeSet<String> =
+        slim.as_object().unwrap().keys().cloned().collect();
+    let actual: std::collections::BTreeSet<String> =
+        full_keys.difference(&slim_keys).cloned().collect();
+
+    // Guard against a vacuous pass: if slim dropped nothing, both sides could be
+    // empty and this would hold against a payload with no diet at all.
+    assert!(
+        !actual.is_empty(),
+        "the slim payload dropped NOTHING, so this comparison is empty-vs-empty and \
+         would pass against a slim mode that does not slim"
+    );
+    assert_eq!(
+        actual, claimed,
+        "the contract's slim_omits must equal what the payloads actually differ by. \
+         Left is reality, right is the contract's claim — a field in one and not the \
+         other is a consumer being told the wrong thing about what it may trust."
+    );
+}
