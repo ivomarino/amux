@@ -869,6 +869,17 @@ pub(crate) fn apply_observed(
         })
         .collect();
     for (p, ts) in mine_keep {
+        // PROVENANCE FOR MY OWN CLAIM (AMUX-3662), the mirror of
+        // `theirs_observed_only` below. Transcript rows are all loaded before
+        // this runs, so `mine_firsthand` at this point means "I have a RECORDED
+        // write here" — anything else is an mtime my Bash window caught, which
+        // on a shared checkout includes writes I did not make.
+        //
+        // Checked BEFORE the insert, or the insert three lines down would make
+        // every observed row look firsthand and mark nothing.
+        if !inputs.mine_firsthand.contains(&p) {
+            inputs.mine_observed_only.insert(p.clone());
+        }
         let slot = inputs.mine.entry(p.clone()).or_insert(0.0);
         if ts > *slot {
             *slot = ts;
@@ -1226,6 +1237,29 @@ pub(crate) struct GuardInputs {
     /// a co-edit signal knows what it claims, so a phantom co-editor is
     /// labeled as possibly your own write seen twice instead of asserted.
     pub theirs_observed_only: HashSet<String>,
+    /// abs realpath where the REQUESTING session's own claim is an OBSERVED
+    /// (mtime) row rather than a transcript record (AMUX-3662).
+    ///
+    /// The mirror of `theirs_observed_only`, and its absence was the bug. The
+    /// guard tracked provenance for the PEER's claim and not for the reader's,
+    /// so `mine_age_secs` rendered identically whether it came from a write
+    /// this session recorded or from an mtime that moved during one of its Bash
+    /// commands. On a shared checkout those are very different facts.
+    ///
+    /// Live specimen 2026-08-24: probing `api/board.rs` returned
+    /// `age_secs: 455, mine_age_secs: 455, owner: amux-frustrations` with no
+    /// signal of any kind. The PEER's claim was real (commit 8575cc6f touched
+    /// that file at 12:18:08); MY only contact was `sed -n '2270,2300p'`, a
+    /// read. The equal ages are the tell of one write seen twice, and the
+    /// response presented both claims in the same shape, so which one was
+    /// inferred was not recoverable from the output.
+    ///
+    /// That symmetry is worse than a missing warning, because it gets read in
+    /// whichever direction the reader already leans: the day before, the same
+    /// signature was read as "the peer is a phantom co-editor" and cost a
+    /// wipe-apology sweep to an innocent peer. On this specimen the phantom was
+    /// the reader's own.
+    pub mine_observed_only: HashSet<String>,
     /// abs realpath whose WINNING owner's latest record is a restore
     /// (MG-1484): an edit record without authored content. Drives the
     /// `provenance` field on foreign verdicts so the victim notice never
@@ -1367,6 +1401,29 @@ pub(crate) fn classify(
                     // owner to stage per-hunk sends them into a needless
                     // git add -p over zero hunks of their own.
                     "mine_age_secs": inp.mine.get(ap).map(|ts| (now - ts).max(0.0) as i64),
+                    // SAY WHERE EACH CLAIM CAME FROM (AMUX-3662). `mine_age_secs`
+                    // used to render identically for a write this session
+                    // RECORDED and an mtime that merely moved during one of its
+                    // Bash commands, and only the peer's side ever carried a
+                    // provenance marker. Two claims, same shape, one of them
+                    // inferred and no way to tell which — so the equal-age
+                    // coincidence gets read in whichever direction the reader
+                    // already leans.
+                    //
+                    // Stated as a fact rather than a verdict: this does not
+                    // decide who wrote the file, it says how each side knows.
+                    "mine_provenance": if !inp.mine.contains_key(ap) {
+                        "none"
+                    } else if inp.mine_observed_only.contains(ap) {
+                        "observed"
+                    } else {
+                        "transcript"
+                    },
+                    "their_provenance": if inp.theirs_observed_only.contains(ap) {
+                        "observed"
+                    } else {
+                        "transcript"
+                    },
                     "has_unstaged_changes": is_dirty,
                 });
                 // AMUX-3497, rule-4 half: when the peer's claim is an OBSERVED
@@ -1945,6 +2002,8 @@ pub async fn staged_guard_inner(
     let inputs = GuardInputs {
         mine: mine.paths,
         mine_firsthand: mine_fh.paths.keys().cloned().collect(),
+        // Filled by apply_observed, same as theirs_observed_only below.
+        mine_observed_only: HashSet::new(),
         theirs,
         theirs_firsthand: theirs_fh,
         theirs_observed_only: HashSet::new(), // filled by apply_observed
@@ -2730,6 +2789,87 @@ mod tests {
         let v = classify(&[pair("t.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.shared.len(), 1);
         assert!(v.shared[0].get("co_signal").is_none(), "{:?}", v.shared[0]);
+    }
+
+    /// AMUX-3662, rebuilt from the live specimen rather than a convenient shape.
+    ///
+    /// Probing `api/board.rs` returned `age_secs: 455, mine_age_secs: 455,
+    /// owner: amux-frustrations` and no signal of any kind. Their claim was
+    /// REAL (commit 8575cc6f touched that file at 12:18:08); my only contact
+    /// was `sed -n '2270,2300p'`, a read. So the phantom was MINE — and
+    /// `co_signal` correctly stayed silent, because it only fires when the
+    /// PEER's claim is observed.
+    ///
+    /// Both claims rendered in the same shape, which is worse than a missing
+    /// warning: the day before, the identical equal-age signature was read as
+    /// "the peer is the phantom" and cost a wipe-apology sweep to an innocent
+    /// peer. A symmetric instrument answering an asymmetric question gets read
+    /// whichever way the reader already leans.
+    #[test]
+    fn a_shared_row_says_whether_each_side_recorded_the_write_or_only_saw_the_mtime() {
+        // THE SPECIMEN. Peer wrote it for real (transcript); I only observed
+        // the mtime move during a command that merely READ the file. The skew
+        // is deliberately wider than RECENCY_SKEW_MARGIN_S so my echo is NOT
+        // dropped — that drop is a different rule with its own cells above, and
+        // this one is about what the reader is told when a claim survives.
+        let mut g = peer_wrote("board.rs", "amux-frustrations", 1000.0);
+        let mut my_echo = HashMap::new();
+        my_echo.insert("/repo/board.rs".to_string(), 1600.0);
+        apply_observed(&mut g, &my_echo, &[]);
+        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert_eq!(
+            v.shared[0]["mine_provenance"], "observed",
+            "my claim came from an mtime, and the row must say so: {:?}",
+            v.shared[0]
+        );
+        assert_eq!(
+            v.shared[0]["their_provenance"], "transcript",
+            "their claim IS a recorded write: {:?}",
+            v.shared[0]
+        );
+
+        // CONTROL 1: the exact inverse must read the exact opposite way.
+        let mut g = GuardInputs::default();
+        g.mine.insert("/repo/board.rs".into(), 1000.0);
+        g.mine_firsthand.insert("/repo/board.rs".into());
+        let mut peer_obs = HashMap::new();
+        peer_obs.insert("/repo/board.rs".to_string(), 1600.0);
+        apply_observed(&mut g, &HashMap::new(), &[("bob".to_string(), peer_obs)]);
+        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert_eq!(
+            v.shared[0]["mine_provenance"], "transcript",
+            "a write I RECORDED must never read as inferred: {:?}",
+            v.shared[0]
+        );
+        assert_eq!(v.shared[0]["their_provenance"], "observed", "{:?}", v.shared[0]);
+
+        // CONTROL 2, AND IT IS THE LOAD-BEARING ONE. I hold a transcript record
+        // AND my own Bash window also caught the mtime — the ordinary case when
+        // you edit a file and then run anything that touches the tree.
+        //
+        // Control 1 does not reach it: with no observed row of mine, the
+        // marking loop never runs for that path, so a mutation that marks
+        // EVERYTHING observed still leaves it empty and Control 1 passes. That
+        // mutation survived the first draft of this test, which is the whole
+        // reason this case exists — a field hardcoded to "observed" would tell
+        // every author their own recorded work is an inference, and nothing
+        // above would have gone red.
+        let mut g = peer_wrote("board.rs", "bob", 1500.0);
+        g.mine.insert("/repo/board.rs".into(), 1000.0);
+        g.mine_firsthand.insert("/repo/board.rs".into());
+        let mut my_own_echo = HashMap::new();
+        my_own_echo.insert("/repo/board.rs".to_string(), 1010.0);
+        apply_observed(&mut g, &my_own_echo, &[]);
+        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert_eq!(
+            v.shared[0]["mine_provenance"], "transcript",
+            "a transcript record OUTRANKS my own mtime echo of the same write — \
+             seeing your own edit land is not a second, weaker claim: {:?}",
+            v.shared[0]
+        );
     }
 
     /// AF-179, rebuilt from the reported specimen's own numbers.

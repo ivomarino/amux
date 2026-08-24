@@ -37,12 +37,12 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
-# (`grep -L 'GUARD_VERSION = 7' */.git/hooks/amux-staged-guard`), so a tracked
+# (`grep -L 'GUARD_VERSION = 8' */.git/hooks/amux-staged-guard`), so a tracked
 # file that changed without moving this number makes every stale installed copy
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 7
+GUARD_VERSION = 8
 
 
 def amux_base_url():
@@ -590,6 +590,30 @@ def main():
         # transcript co-edits; old servers never send it.
         if f.get("co_signal"):
             w("  Co-edit signal caveat: %s\n" % f.get("co_signal"))
+        # AMUX-3662: say how EACH side knows, not just the peer's side.
+        #
+        # `co_signal` above only fires when the PEER's claim is observed, so the
+        # inverse case — their claim is a recorded write and YOURS is an mtime
+        # your Bash window caught — printed no marker at all. Both ages rendered
+        # identically and the reader had no way to tell which claim was
+        # inferred. Measured 2026-08-24 on `api/board.rs`: equal ages, peer's
+        # claim real (commit 8575cc6f), mine a `sed` that only READ the file.
+        #
+        # Printed only when the two DISAGREE, because that is the case the
+        # reader cannot resolve; two transcript claims need no annotation and a
+        # line on every row is a line nobody reads. Absent on old servers, which
+        # is why it is a .get with a default rather than an index.
+        _mp, _tp = f.get("mine_provenance"), f.get("their_provenance")
+        if _mp and _tp and _mp != _tp:
+            if _mp == "observed":
+                w("  Provenance: THEIR claim is a recorded write; YOURS is an mtime your "
+                  "own Bash command saw move, which on a shared checkout includes writes "
+                  "you did not make. Before concluding they are a phantom co-editor, check "
+                  "whether the phantom is yours (AMUX-3662).\n")
+            else:
+                w("  Provenance: YOUR claim is a recorded write; THEIRS is an mtime their "
+                  "Bash command saw move — possibly your own write, seen from their "
+                  "window (AMUX-3662).\n")
     # THE BELT (AMUX-2443 / AF-19 residual / AC-297 — three sightings, one gap):
     # staged paths with NO edit record from ANY session in the window were
     # invisible to both classifications above, and a plain commit ships them
