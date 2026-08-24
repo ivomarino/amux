@@ -114,16 +114,44 @@ pub async fn record(store: &SharedStore, results: Vec<InvariantResult>, duration
                     if changed > 0 && occ == 1 {
                         opened_w.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
-                } else if r.status == Status::Pass {
+                } else if r.status == Status::Pass || r.status == Status::Unknown {
                     // A pass RESOLVES the matching live incident. Deliberately
                     // not a DELETE: "broke at 09:14, healed at 09:51" is a real
                     // signal, and deleting the row erases the flap.
+                    //
+                    // UNKNOWN RESOLVES IT TOO, and records itself as `unknown`
+                    // rather than `pass` so the row still says what happened
+                    // (AMUX-3575). Unknown is what a check reports when it STOPS
+                    // BEING ABLE TO RUN — the table it reads went empty, the
+                    // probe's target disappeared. Before this, only Pass
+                    // resolved, so a fail -> unknown transition left the
+                    // incident open FOREVER: nothing could clear it, and no
+                    // action by anyone would.
+                    //
+                    // The specimen: `schema.timestamp_units_declared` opened on
+                    // waitlist.ts while its unit was undeclared, 7aaa2a32
+                    // declared it, and the verdict moved fail -> unknown ("no
+                    // rows to check the unit against") rather than fail -> pass,
+                    // because `waitlist` has zero rows and NO WRITER anywhere in
+                    // the Rust codebase. It can never have rows, so it could
+                    // never pass, so the incident could never resolve — and it
+                    // auto-filed a card for a condition no action can satisfy,
+                    // which is ethos rule 3.
+                    //
+                    // Keeping it open is the worse failure, not the safer one:
+                    // 22 of 24 open incidents measured on 2026-08-23 had no
+                    // evaluation in over 24h, and an open list that is 94% dead
+                    // trains people to skim past the two that are real.
+                    // Distinguishing the terminal state is what keeps this
+                    // honest — "ended unknown" is not a claim that it healed.
+                    let end_status =
+                        if r.status == Status::Pass { "pass" } else { "unknown" };
                     conn.execute(
                         "UPDATE _amux_invariant_incident
-                            SET resolved_at = ?3, status = 'pass'
+                            SET resolved_at = ?3, status = ?4
                           WHERE invariant_id = ?1 AND entity_key = ?2
                             AND resolved_at IS NULL",
-                        rusqlite::params![r.invariant_id, r.entity_key, ts],
+                        rusqlite::params![r.invariant_id, r.entity_key, ts, end_status],
                     )?;
                 }
             }
@@ -284,6 +312,69 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    /// AMUX-3575: a check that stops being ABLE to run must not leave a
+    /// permanently-open incident.
+    ///
+    /// The specimen, rebuilt from the live one: `schema.timestamp_units_declared`
+    /// opened on `waitlist.ts` while its unit was undeclared; 7aaa2a32 declared
+    /// it, and the verdict went fail -> UNKNOWN ("no rows to check the unit
+    /// against") rather than fail -> pass, because `waitlist` has zero rows and
+    /// no writer anywhere. It can never pass, so under the old rule the incident
+    /// could never resolve, and it auto-filed a card for a condition no action
+    /// satisfies.
+    ///
+    /// The control is the half that keeps this honest: resolving on unknown must
+    /// NOT record it as a pass. "Stopped being checkable" and "healed" are
+    /// different facts and the row has to keep saying which.
+    #[tokio::test]
+    async fn an_unknown_resolves_an_incident_without_claiming_it_healed() {
+        let (s, _d) = store();
+        let res = |st: &str| {
+            let mut r = InvariantResult::new("schema.timestamp_units_declared", match st {
+                "fail" => Status::Fail,
+                "pass" => Status::Pass,
+                _ => Status::Unknown,
+            });
+            r.entity_key = "waitlist.ts".into();
+            r
+        };
+
+        record(&s, vec![res("fail")], 0).await;
+        let (status, resolved): (String, Option<f64>) = s
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_at FROM _amux_invariant_incident \
+                 WHERE entity_key='waitlist.ts'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "fail", "precondition: the incident must actually be open");
+        assert!(resolved.is_none(), "precondition: and unresolved");
+
+        record(&s, vec![res("unknown")], 0).await;
+        let (status, resolved): (String, Option<f64>) = s
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT status, resolved_at FROM _amux_invariant_incident \
+                 WHERE entity_key='waitlist.ts'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            resolved.is_some(),
+            "an unknown must clear the incident — otherwise a check that stops being able \
+             to run stays open forever and nobody can action it"
+        );
+        assert_eq!(
+            status, "unknown",
+            "and it must NOT be recorded as a pass: 'stopped being checkable' is not 'healed'"
+        );
     }
 
     /// AEAB-44. `latest_per_invariant` returns the newest BATCH for each
