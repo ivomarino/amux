@@ -97,6 +97,7 @@ pub mod ids {
     pub const SCAN: &str = "terminal-scan";
     pub const BOOTSTRAP: &str = "session-bootstrap";
     pub const COMMIT_NUDGE: &str = "commit-nudge";
+    pub const COMMIT_MENTION_NOTES: &str = "commit-mention-notes";
     pub const SELF_ADOPT: &str = "self-adoption";
     // The PeriodicTask ids below are NOT referenced by any spawn site — they
     // register themselves through `spawn_periodic_every` under the name their
@@ -128,6 +129,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::SCAN,
     ids::BOOTSTRAP,
     ids::COMMIT_NUDGE,
+    ids::COMMIT_MENTION_NOTES,
     ids::SELF_ADOPT,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
@@ -306,6 +308,22 @@ pub const CATALOG: &[Doc] = &[
         name: "Pane-size repair",
         purpose: "Restores a worker's tmux window width after a peek shrank it to the reader's viewport.",
         env: NO_ENV,
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::COMMIT_MENTION_NOTES,
+        name: "Commit-mention notes",
+        purpose: "Tells an open card, once, that a merged commit names it. NOTED, never closed — a \
+                  mention is not proof of completion, since commits also reference cards for \
+                  context, partial work and reverts. Hourly rather than on the autofix tick \
+                  because the scan shells out to git across every repo behind an open card and \
+                  measured ~11s.",
+        env: &[EnvControl {
+            var: "AMUX_COMMIT_MENTION_TICK_S",
+            effect: "seconds between scans (floor 60)",
+            off: None,
+        }],
         pref: None,
         detail: None,
     },
