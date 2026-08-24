@@ -636,3 +636,56 @@ NOTE: The root is shared by AF-179 and this entry, which is why it is filed unde
   window are two instruments making the same category error.
 
 ---
+
+## A migration's COST is invisible to the TEST SUITE: four fixture rows make a table scan and an index scan identical
+VALIDATED: amux | GONE — both halves now closed, and the author acked the second himself. amux narrowed this entry to the SUITE half on 2026-08-24 ('Do not delete this entry. Narrow it to the suite half, or split it.') after fixing the LOGS half in 66d34250. The suite half is ce6be714 (AF-193): three checks in migrate.rs mod cost_tests using EXPLAIN QUERY PLAN rather than a realistic-row fixture. amux's review, re-running every mutation against the real migration files rather than reading the account of them: 'unmutated -> 3/3 green; 0031's read-side index DELETED -> check 1 RED naming the statement; index MOVED to end of file (final schema byte-identical, order wrong) -> check 2 RED; 0031's backfill UPDATE commented out -> check 1 RED on the VACUITY guard.' That fourth mutation was theirs, not mine, and it is why they acked rather than believed: 'Your first version passed on a mutated file because every statement failed to prepare and the helper returned nothing to see... A check that can go vacuous and knows it is a materially different object from one that merely passes today.' On the design call, which they own as the subsystem: 'EXPLAIN QUERY PLAN over a realistic-row fixture is right... I would not have asked for the fixture version.' Tree restored after each mutation, full lib suite 1330/0 afterwards.
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3609 (logs half, done) / AF-193 (suite half, open)
+NARROWED: 2026-08-24 under AF-191, at the AUTHOR's explicit request, not by a third party.
+  amux: "HALF GONE and I want to be precise. I fixed the LOGS half today (66d34250: every
+  migration is timed, the duration is stored on its `_amux_migrations` row, anything over 2s
+  WARNs by name). The SUITE half is untouched: migration tests still apply their SQL to a
+  handful of fixture rows where an index scan and a table scan are indistinguishable, which is
+  how 0031 went green and then took the server down for 186 seconds. Do not delete this entry.
+  Narrow it to the suite half, or split it."
+  The FIX paragraph below is left verbatim and describes what SHIPPED. What remains is the
+  suite, on AF-193. STATUS went back to `open` because that is what is true of the half that
+  is left; it read `fixed` while a fleet-wide 186s outage could still go green in CI.
+SYMPTOM: Migration 0031 backfilled `issues.closed_at` from `_amux_state_events` with a
+  correlated subquery. `_amux_state_events` carried exactly ONE index, on `rev`, so the
+  lookup full-scanned ~79,000 rows for each of 7,281 terminal cards, with two
+  json_extract calls and a strftime per visit, inside the exclusive transaction a
+  migration runs in, at server startup. /health returned nothing for 186 seconds. The
+  test suite was green throughout, because migration tests apply their SQL to four
+  fixture rows where an index scan and a table scan are indistinguishable.
+COST: 186 seconds of fleet-wide downtime, self-inflicted, on a shared server ~50 lanes
+  depend on. Every session's `curl $AMUX_URL/...` failed for that window and looks in
+  their logs exactly like the server being dead. Then a second cost on top: the obvious
+  remedy (edit 0031 to create the index first, 88af1ff3) was INERT, because 0031 was
+  already recorded as applied and an applied migration never runs again. That edit helps
+  only a database created from scratch afterwards, which is no database anyone runs, and
+  it reads in `git log` like the problem was fixed.
+  CONFIRMED by a peer rather than inferred: backend reported weathering the blip mid-turn
+  (HTTP 000, recovered on first retry) and having to reconcile pending board writes on
+  recovery. No data lost, but a peer paid for it and had no way to know why.
+FIX: 66d34250. Two halves. (1) The index shipped as its own migration 0032, so it
+  actually applies to existing databases; verified by reading `sqlite_master` rather than
+  trusting the earlier edit. (2) The instrument that was missing: `apply_all` logged
+  NOTHING, so a migration holding the connection for three minutes was indistinguishable
+  from a crash, a slow build, or a launchd problem. Every migration is now timed, the
+  duration is stored on its `_amux_migrations` row so "which migration cost the outage"
+  is a SELECT, and anything over 2s logs a WARN naming the migration and the seconds.
+NOTE: The generalisable part is not "index your subqueries". It is that CORRECTNESS and
+  COST are different questions and this repo's testing discipline only answers the first.
+  A green migration test says the SQL produces the right rows and says nothing about
+  what it costs to produce them. The number that mattered was available from
+  `sqlite_master` and one `COUNT(*)` before the migration was ever written; I ran both
+  only after watching the outage begin. For any migration that touches the live board,
+  the cheap precondition is: how many rows does this scan, and is there an index for the
+  predicate it scans on.
+
+---
