@@ -113,45 +113,6 @@ PARTIAL, re-measured 2026-08-10 by amux-cloud on a throwaway card:
   the delta. Observable, not prevented — so the entry stays.
 
 
-## Assignment notices arrive for cards that were deleted a second after being created
-AREA: notices
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-07
-SESSION: amux-cloud
-CARD: AC-284 (absent from this board) / AF-192 (local card, filed 2026-08-24 at amux-cloud's request under AF-191)
-SYMPTOM: "New board task assigned: AC-284 — [scratch] foreign-owned archive guard probe —
-  delete me. Run `amux board claim AC-284` to take it." The card had already been deleted.
-  `GET /api/board/AC-284` returned {"error": "item not found"}; the row showed
-  created 11:22:51, deleted 11:22:52 — a ONE-SECOND lifetime. AC-285 repeated it within
-  the hour. Both were another session's archive-guard probes, correctly cleaned up by
-  their author; the notice simply outlived them.
-COST: Two probes each to establish the work did not exist, and the wrong instinct is the
-  expensive one — the notice names a specific command to run, so the natural response is
-  to run it rather than to doubt the card. It reads as work somebody dropped, which is a
-  thing you chase, not a thing you dismiss.
-FIX: `2af1f43` — _notify_session_of_task now re-reads the row immediately before sending
-  and stays quiet if the card was deleted, archived, or reassigned in the window between
-  the notified-flag flip and delivery, logging which of the three so the skip is
-  distinguishable from silence. Verified against both real specimens plus a live control
-  that must still notify.
-NOTE: this path never had a delivery-time guard to forget — it calls send_text directly
-  and so was outside the _steer_enqueue guard framework entirely, which is why the AC-252
-  audit of "every caller that asserts a fact" did not reach it. That audit enumerated
-  _steer_enqueue call sites, which is the wrong frame: the question is not "which callers
-  of this function assert facts" but "which NOTICES assert facts", and one of them uses a
-  different transport. An audit scoped to a function name cannot find the instance that
-  does not call it — the same shape as a view that re-derives its filter instead of
-  sharing the mechanism's, which is the root already recorded on AC-256.
-
-REOPENED 2026-08-09 by amux-frustrations on COUNTER-EVIDENCE from amux-cloud, the
-  originating session, during the frustrations.md validation sweep. They received
-  "New board task assigned: AC-311 ... Run `amux board claim AC-311`" for a card that did
-  not exist (hard-deleted), and isolated it with a control: AC-310 resolved fine and the
-  unfiltered board topped out at AC-310, so the probe could have found the card if it
-  existed. AC-312 exists because of this recurrence. So either the fix is narrower than
-  this entry claims or it regressed — the entry was marked fixed and the class is live.
-
 ## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
 AREA: attribution
 SEVERITY: blocks
@@ -2810,62 +2771,3 @@ FIX: an owner column (pid or per-process boot ulid) on the scan row, reaping onl
   whose owner is neither this process nor a live pid. The general form, which is the
   third entry this week under AEAB-11: any predicate that means "mine" or "twice" is
   wrong on a shared DB with two writers, and the failures do not look alike from outside.
-
-## A green test suite EXPIRES through the shared index, and the commit ships red
-AREA: attribution
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-24
-SESSION: amux-frustrations
-CARD: AF-195
-SYMPTOM: I ran `cargo test -p amux-server --test board_api`: 37 passed, 0 failed. I committed.
-  c971756b shipped RED. Its message says "Both numeric floors are gone" and its diff adds one
-  back: `!lines.any(|l| new.contains(l)) && old.chars()...saturating_sub(...) >= 200` — the exact
-  AMUX-3576 defect, restored one commit after amux committed its removal. amux ran the same suite
-  minutes later and got board_api.rs:2280, left 200 right 409. BOTH RESULTS WERE TRUE when taken.
-  The floor arrived through the index between my run and my commit.
-COST: A red commit on shared main under a message asserting the opposite of its own diff, and the
-  local builder deploys on COMMIT, so it was live. Fixed forward in c4ba5096. The expensive half
-  is the precedent: "verify before you commit" assumes a green result describes the tree you are
-  about to commit, and here it described a tree with a shelf life.
-FIX: The pre-commit hook runs the tests for the crates the STAGED BLOBS touch and refuses red.
-  A convention ("re-run in the same breath as the commit") decays; a gate does not. REJECTED:
-  per-lane `git stash` discipline, which trades this for a worse class.
-NOTE: The mechanism is `git add <path>` staging the FILE, and it is INTRA-FILE, which is the part
-  the existing AF-182 entries do not reach. ac7b9e33 — amux's AMUX-3633 autofix commit — carries
-  my entire 56-line `desc_replace_destroys_peer_prose` with its doc comment; their own hunk was
-  1400 lines away in the same file. `git log -S'fn desc_replace_destroys_peer_prose'` returns one
-  commit and it is theirs. There is no pathspec that means "my hunks": the path is the same path
-  and both lanes legitimately own an edit in it. amux's formulation, which is right and still not
-  the floor: a pathspec protects the COMMITTER from absorbing another's file, does nothing for the
-  STAGER whose work is absorbed, and neither reaches a same-file co-edit in different regions.
-  Instance five today, and the first to cost a red commit. The staged-guard is the nearest
-  instrument and cannot express it — it reported "8 insertions / 1 deletion, reconcile against
-  what you believe you wrote", and 8/1 was exactly right both times.
-
-## The board's slim list omits six fields and only two of them say so
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-24
-SESSION: amux-frustrations
-CARD: AF-200
-SYMPTOM: I read `desc` off `GET /api/board?all=1`, got `None`, and concluded `amux board add
-  --desc-file` had silently created AF-195 with an empty body. It had not: the card carried 1809
-  characters the whole time. The list payload has no `desc` key at all. I then spent three probe
-  cards (AF-196/197/198) bisecting a CLI defect that did not exist.
-COST: ~15 minutes and three junk cards, chasing a false defect in the wrong subsystem. The near
-  miss is the real cost: I was one step from "fixing" `--desc-file`, which works correctly.
-FIX: `slim` currently serializes as `1` — it says something was omitted, not what. Make it
-  ENUMERATE: `"slim": ["desc","due_time","gate","last_verified_at","log","source_ref"]`. Then a
-  consumer can assert on the field it wants instead of reading absence as emptiness, and a
-  seventh omitted field cannot be added without a test noticing.
-NOTE: This is AF-161's own predicted next occurrence, arriving on schedule. That entry ended with
-  "the fix that ends the class is to make the payload SELF-DESCRIBING about what it omits, so a
-  consumer can refuse instead of reading absence as emptiness — rather than restoring one column
-  and waiting for the next report." What shipped was self-description for `desc` (`desc_head`,
-  `desc_len`) and `log` (`log_n`), and a bare `slim: 1` for the rest. So `gate`,
-  `last_verified_at`, `due_time` and `source_ref` are still omitted with no signal whatsoever —
-  and `gate` is the one that governs transitions, `last_verified_at` the one a `verified` audit
-  reads. AF-161 was the `reviewer` column; this is the same defect two columns over, in the half
-  of the fix that was not finished.
