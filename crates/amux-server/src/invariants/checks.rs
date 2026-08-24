@@ -429,15 +429,70 @@ pub fn reviewer_is_independent(cards: &[(String, String, String)]) -> Vec<Invari
 /// glaring in the data, so the check belongs where the data is.
 ///
 /// This table is the DECLARATION. A column absent from it is a failure, not a
-/// pass — adding a table with a bare `ts` should force its author to say which
-/// unit it is, which is the only durable fix short of renaming the columns.
+/// pass — adding a timestamp column should force its author to say which unit it
+/// is, which is the only durable fix short of renaming every column.
+///
+/// SCOPE, STATED BECAUSE AN UNSTATED EXEMPTION IS THE RULE-1 TRAP. amux caught
+/// this in review: the first draft keyed on columns literally named `ts`, which
+/// saw 15 of the 44 numeric timestamp columns in this schema and silently
+/// exempted the other 29 — including `cmd_history.queued_at` and
+/// `cmd_history.delivered_at`, two of the five MILLISECOND columns that are the
+/// entire point of the check. A reader trusting the table would have assumed it
+/// was exhaustive over timestamps rather than over one spelling of them.
+///
+/// So the filter is now: a column named `ts`, `*_ts`, `*_at`, `time` or
+/// `timestamp`, whose DECLARED TYPE is numeric. Text columns are out of scope on
+/// purpose — an ISO-8601 string says its own unit, which is exactly the property
+/// the numeric ones lack. Declared type rather than a sampled value, so an empty
+/// table is still in scope.
 pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
-    // (table, column, is_millis)
+    // (table, column, is_millis) — MEASURED against the live database, not read
+    // off the migrations. 44 numeric timestamp columns; 5 are milliseconds and
+    // they are the whole trap.
+    ("_amux_invariant_incident", "resolved_at", false),
+    ("_amux_invariant_result", "ts", false),
+    ("_amux_media_jobs", "created_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
+    ("_amux_media_jobs", "updated_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
     ("_amux_request_log", "ts", false),
-    ("session_events", "ts", false),
-    ("token_ledger", "ts", false),
+    ("cmd_history", "delivered_at", true),
+    ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),
+    ("dictation_history", "ts", true),
+    ("guard_verdicts", "outcome_ts", false),
+    ("guard_verdicts", "ts", false),
     ("interaction_log", "ts", true),
+    ("issue_files", "added_at", false),
+    ("issue_tags", "added_at", false),
+    ("issues", "last_verified_at", false),
+    ("layout_presets", "created_at", false),
+    ("logs", "ts", false),
+    ("mdai_runs", "ts", false),
+    ("org", "created_at", false),
+    ("org_invites", "created_at", false),
+    ("org_invites", "expires_at", false),
+    ("org_invites", "used_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
+    ("org_members", "joined_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
+    ("owner_alerts", "ts", false),
+    ("proxies", "created_at", false),
+    ("reclaim_quarantine", "created_at", false),
+    ("reclaim_quarantine", "purged_at", false),
+    ("reclaim_scans", "finished_at", false),
+    ("reclaim_scans", "started_at", false),
+    ("schedule_audit", "ts", false),
+    ("schedule_runs", "ran_at", false),
+    ("search_docs", "updated_at", false),
+    ("send_dedup", "ts", false),
+    ("server_downtime", "up_at", false),
+    ("server_heartbeat", "beat_at", false),
+    ("session_events", "ts", false),
+    ("share_tokens", "created_at", false),
+    ("share_tokens", "expires_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
+    ("status_scope", "added_at", false),
+    ("steering_history", "delivered_at", false),
+    ("steering_history", "queued_at", false),
+    ("steering_queue", "queued_at", false),
+    ("token_ledger", "ts", false),
+    ("waitlist", "ts", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
 ];
 
 /// Does each declared timestamp column actually hold what readers assume?
@@ -2973,11 +3028,73 @@ mod negative_controls {
         // CONTROL ON THE WINDOW: it must be loose enough not to fire on ordinary
         // old rows, or the check becomes noise and stops being read. Ten years
         // back and a year ahead both pass under the correct unit.
+        //
+        // This also answers the false-failure amux warned about in review: a
+        // recency-based detector would classify `interaction_log` UNKNOWN or
+        // FAILED because its newest row is 5.5 days old. Under a ten-year window
+        // 5.5 days is nowhere near the edge, and it cannot be, because the error
+        // being detected is a factor of 1000 and the window is a factor of ~3600
+        // wide. A table nobody has written to recently is still checkable.
         let oldrow = timestamp_units_are_what_readers_assume(
             &[("_amux_request_log.ts".into(), Some(now - 86_400.0 * 3_000.0))],
             &[],
             now,
         );
         assert_eq!(oldrow[0].status, Status::Pass, "a 3000-day-old row is old, not mis-united: {oldrow:?}");
+    }
+
+    /// AF-184 REVIEW (amux): the declaration must cover timestamps, not one
+    /// SPELLING of them.
+    ///
+    /// The first draft keyed on columns literally named `ts`. Measured against
+    /// the live schema afterwards: 44 numeric timestamp columns exist and the
+    /// `ts` spelling covers only 15 of them. Five columns are milliseconds and
+    /// TWO of those five are `_at`-named, so the narrow filter was blind to 40%
+    /// of the exact thing the check exists to catch. That is the rule-1
+    /// exemption shape, where narrowing does not make a thing cheap, it makes it
+    /// invisible, and it was caught in review rather than by the check.
+    ///
+    /// The first draft of THIS cell then asserted "three of the five", which is
+    /// wrong, and it failed against correct code until I recounted. Left in the
+    /// history rather than tidied away: a red test on code you just verified
+    /// means the instrument is the candidate before the code is.
+    ///
+    /// Pinned here so a future narrowing of the filter fails loudly instead of
+    /// silently shrinking what the invariant can see.
+    #[test]
+    fn the_declaration_covers_the_millisecond_columns_a_ts_only_filter_would_miss() {
+        let ms: Vec<String> = TIMESTAMP_COLUMNS
+            .iter()
+            .filter(|(_, _, is_ms)| *is_ms)
+            .map(|(t, c, _)| format!("{t}.{c}"))
+            .collect();
+        for name in [
+            "cmd_history.queued_at",
+            "cmd_history.delivered_at",
+            "cmd_history.ts",
+            "interaction_log.ts",
+            "dictation_history.ts",
+        ] {
+            assert!(
+                ms.contains(&name.to_string()),
+                "{name} is MILLISECONDS in the live schema and must be declared: {ms:?}"
+            );
+        }
+        assert_eq!(
+            ms.iter().filter(|n| n.ends_with("_at")).count(),
+            2,
+            "two of the five millisecond columns are `_at`-named — that is why the \
+             filter cannot key on `ts` alone: {ms:?}"
+        );
+        // No duplicate declarations: a column declared twice with different
+        // units would make the lookup order-dependent and quietly authoritative.
+        let mut names: Vec<String> = TIMESTAMP_COLUMNS
+            .iter()
+            .map(|(t, c, _)| format!("{t}.{c}"))
+            .collect();
+        let before = names.len();
+        names.sort();
+        names.dedup();
+        assert_eq!(before, names.len(), "a column is declared twice");
     }
 }

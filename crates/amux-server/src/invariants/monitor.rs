@@ -428,17 +428,35 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
                 let Ok(mut cs) = conn.prepare(&format!("PRAGMA table_info(\"{t}\")")) else {
                     continue;
                 };
-                let cols: Vec<String> = match cs.query_map([], |r| r.get::<_, String>(1)) {
-                    Ok(rows) => rows.flatten().collect(),
-                    Err(_) => continue,
-                };
+                // (name, declared type)
+                let cols: Vec<(String, String)> =
+                    match cs.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?))) {
+                        Ok(rows) => rows.flatten().collect(),
+                        Err(_) => continue,
+                    };
                 {
-                    for c in cols {
-                        // `ts` exactly, or a `_ts` suffix. Deliberately NOT `*_at`:
-                        // those are overwhelmingly ISO strings here, and a check
-                        // that fires on every one of them would be noise nobody
-                        // reads, which is worse than not checking.
-                        if c == "ts" || c.ends_with("_ts") {
+                    for (c, ty) in cols {
+                        // NAME *AND* TYPE. The first draft keyed on `ts` alone,
+                        // which exempted THREE of the five millisecond columns in
+                        // this schema — a check written to catch the unit trap
+                        // could not see most of it (amux caught this in review;
+                        // it is the rule-1 exemption shape, where the narrowing
+                        // does not make it cheap, it makes it invisible).
+                        //
+                        // Type filters out ISO-8601 text columns, which are out
+                        // of scope because a string says its own unit — the exact
+                        // property the numeric ones lack. DECLARED type, not a
+                        // sampled value, so an empty table stays in scope.
+                        let name_matches = c == "ts"
+                            || c.ends_with("_ts")
+                            || c.ends_with("_at")
+                            || c == "time"
+                            || c == "timestamp";
+                        let up = ty.to_ascii_uppercase();
+                        let numeric = ["INT", "REAL", "NUM", "FLOA", "DOUB"]
+                            .iter()
+                            .any(|k| up.contains(k));
+                        if name_matches && numeric {
                             found.push((t.clone(), c));
                         }
                     }
