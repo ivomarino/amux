@@ -166,6 +166,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0028_downtime_cause",
         sql: include_str!("../../migrations/0028_downtime_cause.sql"),
     },
+    Migration {
+        version: 29,
+        name: "0029_steering_history_source",
+        sql: include_str!("../../migrations/0029_steering_history_source.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

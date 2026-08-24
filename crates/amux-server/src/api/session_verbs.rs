@@ -2703,6 +2703,13 @@ fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     // (AMUX-3110; migration 0024 carries the same ADDCOL for migrated DBs,
     // this covers a DB bootstrapped through this legacy path).
     let _ = conn.execute("ALTER TABLE steering_history ADD COLUMN outcome TEXT", []);
+    // WHICH JOB PRODUCED IT (AMUX-3562). steering_queue has carried guard/sender
+    // for a while and history dropped both at delivery — i.e. discarded the
+    // producer at exactly the moment the row became the evidence. Migration 0029
+    // carries the same ADDCOLs for migrated DBs; this covers a DB bootstrapped
+    // through this legacy path.
+    let _ = conn.execute("ALTER TABLE steering_history ADD COLUMN guard TEXT", []);
+    let _ = conn.execute("ALTER TABLE steering_history ADD COLUMN sender TEXT", []);
     Ok(())
 }
 
@@ -3287,6 +3294,27 @@ pub(crate) async fn cmd_hist_record_full(
             }
         }
     }
+}
+
+/// The producer of a queued row: `(guard, sender)`, read straight off
+/// `steering_queue` before the row is deleted (AMUX-3562).
+///
+/// ONE reader, called by every path that moves a row into history, because
+/// there are six of them and a per-site copy is how five stay right and one
+/// silently stops carrying the producer — the shape this file already documents
+/// under AMUX-2956. Call it BEFORE the `DELETE`, in the same transaction.
+///
+/// Returns `(None, None)` when the row is gone, which is the honest answer and
+/// matches a legacy row that predates the columns. It cannot fail loudly here:
+/// history must be written even when the source lookup misses, or an
+/// instrumentation gap would start dropping the record itself.
+fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, Option<String>) {
+    conn.query_row(
+        "SELECT guard, sender FROM steering_queue WHERE id=?1",
+        [id],
+        |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<String>>(1)?)),
+    )
+    .unwrap_or((None, None))
 }
 
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
@@ -8134,11 +8162,12 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                             .store
                             .write_async(move |conn| {
                                 ensure_fleet_tables(conn)?;
-                                conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                                let (src_guard, src_sender) = steer_row_source(conn, &id2);
+                conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
                                 conn.execute(
-                                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
-                                     VALUES(?,?,?,?,?)",
-                                    rusqlite::params![id2, sess2, hist_text, queued_at, now],
+                                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
+                                     VALUES(?,?,?,?,?,?,?)",
+                                    rusqlite::params![id2, sess2, hist_text, queued_at, now, src_guard, src_sender],
                                 )?;
                                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                             })
@@ -8231,11 +8260,15 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     .store
                     .write_async(move |conn| {
                         ensure_fleet_tables(conn)?;
-                        conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                        let (src_guard, src_sender) = steer_row_source(conn, &id2);
+                conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
                         conn.execute(
-                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome) \
-                             VALUES(?,?,?,?,?,?)",
-                            rusqlite::params![id2, sess2, text2, queued_at, now_f64(), format!("dead:{dead2}")],
+                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                             VALUES(?,?,?,?,?,?,?,?)",
+                            rusqlite::params![
+                                id2, sess2, text2, queued_at, now_f64(),
+                                format!("dead:{dead2}"), src_guard, src_sender
+                            ],
                         )?;
                         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                     })
@@ -8291,16 +8324,19 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     .store
                     .write_async(move |conn| {
                         ensure_fleet_tables(conn)?;
-                        conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                        let (src_guard, src_sender) = steer_row_source(conn, &id2);
+                conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
                         conn.execute(
-                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
-                             VALUES(?,?,?,?,?)",
+                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
+                             VALUES(?,?,?,?,?,?,?)",
                             rusqlite::params![
                                 id2,
                                 sess2,
                                 format!("[VOIDED: picker gone] {}", redact_secrets(&text2)),
                                 queued_at,
-                                now_f64()
+                                now_f64(),
+                                src_guard,
+                                src_sender
                             ],
                         )?;
                         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
@@ -8359,11 +8395,12 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                         |r| r.get(0),
                     )
                     .unwrap_or_else(|_| now_f64());
+                let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
-                     VALUES(?,?,?,?,?)",
-                    rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64()],
+                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
+                     VALUES(?,?,?,?,?,?,?)",
+                    rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), src_guard, src_sender],
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -8764,11 +8801,12 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
                     |r| r.get(0),
                 )
                 .unwrap_or_else(|_| now_f64());
-            conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+            let (src_guard, src_sender) = steer_row_source(conn, &id2);
+                conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
             conn.execute(
-                "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) \
-                 VALUES(?,?,?,?,?)",
-                rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64()],
+                "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
+                 VALUES(?,?,?,?,?,?,?)",
+                rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), src_guard, src_sender],
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
@@ -10360,6 +10398,11 @@ async fn steer_mutate(
             .write_async(move |conn| {
                 ensure_fleet_tables(conn)?;
                 let mut sent_row: Option<(String, f64)> = None;
+                // AMUX-3562: this path reads the row itself rather than calling
+                // steer_row_source, because it already has a SELECT here and a
+                // second one would be a second spelling of the same lookup. Same
+                // rule though — read BEFORE the DELETE.
+                let mut sent_src: (Option<String>, Option<String>) = (None, None);
                 let removed: i64;
                 if !id2.is_empty() {
                     sent_row = conn
@@ -10369,6 +10412,7 @@ async fn steer_mutate(
                             |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)),
                         )
                         .ok();
+                    sent_src = steer_row_source(conn, &id2);
                     removed = conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])? as i64;
                 } else if include_system {
                     removed = conn.execute("DELETE FROM steering_queue WHERE session=?", [&session])? as i64;
@@ -10387,8 +10431,12 @@ async fn steer_mutate(
                 if let Some((text, queued_at)) = sent_row.filter(|_| sent) {
                     let hid = id2.clone();
                     conn.execute(
-                        "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at) VALUES(?,?,?,?,?)",
-                        rusqlite::params![hid, session, redact_secrets(&text), queued_at, now_f64()],
+                        "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
+                         VALUES(?,?,?,?,?,?,?)",
+                        rusqlite::params![
+                            hid, session, redact_secrets(&text), queued_at, now_f64(),
+                            sent_src.0, sent_src.1
+                        ],
                     )?;
                 }
                 // Smuggle the count through WriteReply.applied? No — recompute
@@ -14470,6 +14518,103 @@ mod tests {
     /// so this is the only place the emission is proven to fire. Induces the error
     /// by dropping the table the check reads, then asserts the delivered=true
     /// check-failed event landed AND the row was not voided.
+    /// AMUX-3562. Every path that moves a row into `steering_history` must
+    /// carry its PRODUCER, and there are six of them.
+    ///
+    /// This is a source-level check on purpose. A behavioural test proves ONE
+    /// path carries the guard; it says nothing about the other five, and the
+    /// failure mode this fix exists to prevent is precisely "five stay right
+    /// and one silently stops" — which is how the columns came to be dropped in
+    /// the first place. Six hand-kept copies of an INSERT is the AMUX-2956
+    /// shape, and the only check that can fail on it reads all six.
+    ///
+    /// It also fails on a SEVENTH insert added later without the columns, which
+    /// a behavioural test over today's paths cannot do.
+    #[test]
+    fn every_steering_history_insert_carries_the_producer() {
+        let src = include_str!("session_verbs.rs");
+        let mut seen = 0;
+        for (i, _) in src.match_indices("INSERT OR REPLACE INTO steering_history(") {
+            let rest = &src[i..];
+            let end = rest.find(')').expect("an INSERT names its columns");
+            let cols = &rest[..end];
+            // Skip this test's OWN search literal, which matches and has no
+            // column list. Found by the check failing on itself, which is at
+            // least the honest failure mode: a self-matching probe that PASSED
+            // would have been counted as a seventh verified insert.
+            if !cols.contains("id, session") {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                cols.contains("guard") && cols.contains("sender"),
+                "a steering_history INSERT drops the producer — attribution silently \
+                 reverts to regexing the message text (AMUX-3562). Columns: {cols}"
+            );
+        }
+        // Without this the assertion above is vacuous the day someone renames
+        // the statement: zero matches, zero failures, green.
+        assert!(seen >= 6, "expected to inspect at least 6 history inserts, saw {seen}");
+    }
+
+    /// The behavioural half: a guard set at enqueue must still be readable in
+    /// history after the row leaves the queue. The source check above cannot
+    /// see a params list that binds the wrong variable, and this cannot see a
+    /// path it does not exercise, so both are needed.
+    ///
+    /// Uses the VOID path rather than plain delivery, because that is what is
+    /// reachable here: with no live tmux, `steer_deliver_tick` correctly leaves
+    /// an ordinary row queued, so a delivery-based test would assert on a row
+    /// that never moved. The void path writes history without a terminal, and
+    /// it is also the harder case — it rewrites the text, so a params list that
+    /// carried the producer positionally would break here first.
+    #[tokio::test]
+    async fn a_row_leaving_the_queue_keeps_the_guard_it_was_enqueued_with() {
+        let (st, _dir) = state();
+        let now = now_f64();
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                // Card left 'doing', so the pickup is stale and gets voided.
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, session, created, updated) \
+                     VALUES ('AMUX-8','t','done','lane-v',0,0)",
+                    [],
+                )?;
+                let stale =
+                    "[amux auto-pickup] Claimed board card AMUX-8 from your queue - work it now.";
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard, sender) \
+                     VALUES('v1','lane-v',?1,?2,'board-drive','')",
+                    rusqlite::params![stale, now - 20.0],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+
+        steer_deliver_tick(&st).await;
+
+        let conn = st.store.read().unwrap();
+        // Assert the row LANDED before asserting anything about its columns:
+        // `.unwrap_or(None)` on the guard alone cannot tell "never left the
+        // queue" from "left it with a null guard", and those are opposite bugs.
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM steering_history WHERE id='v1'", [], |r| r.get(0))
+            .unwrap_or(0);
+        assert_eq!(n, 1, "precondition: the row must reach history at all before its \
+                          producer column means anything");
+        let guard: Option<String> = conn
+            .query_row("SELECT guard FROM steering_history WHERE id='v1'", [], |r| r.get(0))
+            .unwrap_or(None);
+        assert_eq!(
+            guard.as_deref(),
+            Some("board-drive"),
+            "the producer set at enqueue must survive into history — dropping it is what \
+             forced every injection audit through prefix regexes"
+        );
+    }
+
     #[tokio::test]
     async fn a_read_error_at_the_stale_check_signals_and_still_delivers() {
         let (st, _dir) = state();
