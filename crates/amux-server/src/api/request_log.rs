@@ -1329,6 +1329,14 @@ pub fn normalize_target(path: &str) -> String {
 /// times, `gate` 25, `commit-mentions` 12, `--help` 11 — against real card ids
 /// at 4 and 5. Records that are genuinely missing are missing one at a time;
 /// a route collision hammers one constant string.
+///
+/// All four of those top literals were real collisions, and three had ALREADY
+/// been fixed by mounting the route (`session-gates`, `commit-mentions`) or
+/// guarding the caller (`--help`); their newest hits are 14, 14 and 9 days old,
+/// against `gate` at 12 minutes. So the signal is 4 for 4 on the live log, and
+/// the three stale ones are the useful control: this ranks by a literal's
+/// share of its group, not by recency, so a fixed collision keeps showing until
+/// it ages out of the window. Read `last` before filing anything from it.
 fn param_literals_of(path: &str) -> Vec<String> {
     let Some(e) = best_route(path) else { return Vec::new() };
     let want = path.split('?').next().unwrap_or(path);
