@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.718';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.719';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -33319,14 +33319,45 @@ async function _bwLoadProfiles() {
     const cur = sel.value;
     // Rebuild: Auto (empty) + registered profiles + real Chrome profiles
     sel.innerHTML = '<option value="">Auto profile</option>';
-    (d.profiles || []).forEach(p => {
+    // SAVED PROFILES FIRST (AMUX-3670, Ethan: "i have saved profiles in amux
+    // browser… i want it to be simple").
+    //
+    // This listed every DIRECTORY under playwright-auth/profiles, flat and in
+    // one style. Measured 2026-08-24: 48 entries, of which 4 are registered in
+    // `profiles.json` — the ones actually saved via the Save button. The other
+    // 44 are scratch left by tests and probes (`rawtest-13181`,
+    // `resolver-test`, `godmode-verify`, `anonymous-1776924814739`…), and they
+    // rendered identically to the real ones. Picking your own saved login meant
+    // finding it among 92% noise.
+    //
+    // Split, never FILTERED: an unregistered dir may still hold a login
+    // somebody staged without pressing Save, and silently hiding it would lose
+    // real work (it is the user's data, not ours to judge). They move below a
+    // separator and keep their names.
+    const all = d.profiles || [];
+    const saved = all.filter(p => p.registered);
+    const scratch = all.filter(p => !p.registered);
+    const opt = (p, icon) => {
       const o = document.createElement('option');
       o.value = p.name;
       const doms = (p.domains || []).join(', ');
-      o.textContent = '🔓 ' + p.name + (doms ? ' — ' + doms : '');
+      // The LABEL is what the user typed when saving, so it is the best name to
+      // show; the directory name stays alongside because it is what the API and
+      // AMUX_PROFILE take.
+      const lbl = (p.label || '').trim();
+      o.textContent = icon + ' ' + (lbl ? lbl + ' (' + p.name + ')' : p.name)
+                    + (doms ? ' — ' + doms : '');
       if (doms) o.title = doms;
-      sel.appendChild(o);
-    });
+      return o;
+    };
+    saved.forEach(p => sel.appendChild(opt(p, '⭐')));
+    if (saved.length && scratch.length) {
+      const sep = document.createElement('option');
+      sep.disabled = true;
+      sep.textContent = '─── unsaved / scratch profiles (' + scratch.length + ') ───';
+      sel.appendChild(sep);
+    }
+    scratch.forEach(p => sel.appendChild(opt(p, '🔓')));
     (d.chrome_profiles || []).forEach(p => {
       const o = document.createElement('option');
       o.value = p; o.textContent = '🌐 ' + p;

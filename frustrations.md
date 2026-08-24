@@ -2669,7 +2669,7 @@ SEVERITY: blocks
 STATUS: fixed
 DATE: 2026-08-24
 SESSION: amux
-CARD: AMUX-3670
+CARD: AMUX-3671
 SYMPTOM: `cp $F /tmp/orig ; <mutate> ; <test> ; cp /tmp/orig $F` — the natural way to
   satisfy this repo's "mutate the predicate and confirm it LANDED" rule. The restore is a
   WHOLE-FILE write, indistinguishable from `git checkout -- $F` to a concurrent peer. At
