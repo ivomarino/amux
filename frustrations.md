@@ -2661,7 +2661,7 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-23
 SESSION: amux
-CARD: AF-181
+CARD: AF-182
 SYMPTOM: Adding a field to `QueuedItem` in checks.rs and populating it in monitor.rs is one
   logical change across two files. Between my two writes the shared checkout did not compile,
   and a peer hit `missing field idle_since in initializer of QueuedItem` at monitor.rs:832 —
@@ -2672,7 +2672,7 @@ COST: Two round trips between sessions, each opening with a version of "is this 
   of us guessed right, and both had to ask. The expensive direction is the inverse and has not
   happened yet: a session that has learned this shape recognising a REAL breakage of its own as
   somebody else's dirt and pushing through it.
-FIX: AF-181's proposal is the right one and amux-frustrations owns it — the gate already knows
+FIX: AF-182's proposal is the right one and amux-frustrations owns it — the gate already knows
   both the staged pathspec and the file each diagnostic names, so telling them apart is a set
   membership test, not new machinery. Beyond the wording, carry the COUNT: "1 of 1 offending
   files is not yours" and "3 of 4 are yours" are different situations and the second must not
