@@ -200,7 +200,56 @@ fn already_filed(conn: &rusqlite::Connection, scan_id: &str) -> bool {
     .is_ok()
 }
 
+/// Say out loud, hourly, when free space is low.
+///
+/// # Why this is here and not where you would expect
+///
+/// The disk verdict already existed in two places and NEITHER produced a log
+/// line as the disk fell. `/health` carries `disk.state` and is polled
+/// constantly, but /health SERVES a field, it does not log. `metrics.rs` logs,
+/// but `collect_system_metrics` only runs when something requests
+/// /api/metrics, and nothing polls that.
+///
+/// Measured on 2026-08-24: the volume fell from 144 GB to 13 GB overnight and
+/// sat at 100% capacity, and `server-rs.log` contains ZERO warnings across the
+/// whole fall. The one match in the file is the old pre-fix line, emitted the
+/// previous evening because a human happened to curl the endpoint by hand.
+///
+/// That is the second time this exact gap has been found in two days, and the
+/// first fix (caea1945) corrected the THRESHOLD while leaving the cadence
+/// alone — its own commit message diagnosed the cadence problem and then did
+/// not fix it. So the log line belongs on something that already ticks whether
+/// or not anyone is looking. This job runs hourly, which is frequent enough to
+/// catch an overnight fall and far too slow to be noise.
+fn report_disk_pressure() {
+    let h = crate::api::health::disk_health();
+    let Some(free) = h.free_gb else {
+        tracing::warn!(job = JOB, "disk pressure UNKNOWN — the volume could not be read");
+        return;
+    };
+    match h.state {
+        "critical" => tracing::warn!(
+            job = JOB,
+            free_gb = free,
+            state = "critical",
+            "DISK CRITICALLY LOW — under 25 GB free. Builds and DB writes will start \
+             failing. Check APFS local snapshots first (`tmutil listlocalsnapshots /`): \
+             they pin blocks from deleted files, so deleting things frees `du` and not \
+             `df` until they are thinned (DESKT-25)"
+        ),
+        "warn" => tracing::warn!(
+            job = JOB,
+            free_gb = free,
+            state = "warn",
+            "disk headroom low — under 75 GB free, with runway to act. On 2026-08-24 \
+             this volume fell 144 GB -> 13 GB in a night (DESKT-25)"
+        ),
+        _ => tracing::debug!(job = JOB, free_gb = free, state = h.state, "disk"),
+    }
+}
+
 async fn tick(state: AppState) {
+    report_disk_pressure();
     let (scans, running) = {
         let Ok(conn) = state.store.read() else { return };
         let running: i64 = conn
