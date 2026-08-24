@@ -407,6 +407,123 @@ pub fn reviewer_is_independent(cards: &[(String, String, String)]) -> Vec<Invari
     out
 }
 
+/// WHICH UNIT IS EACH `ts` COLUMN IN? (AF-184)
+///
+/// Five tables in this schema carry a column literally named `ts` and they use
+/// TWO different units, with nothing in the name to say which:
+///
+///     SECONDS       _amux_request_log.ts, session_events.ts, token_ledger.ts
+///     MILLISECONDS  cmd_history.ts, interaction_log.ts
+///
+/// This has now cost four separate sessions. Two on one evening wrote
+/// `datetime(ts,'unixepoch')` against `interaction_log` and compared to a
+/// seconds cutoff, so the filter was ~1000x too small and matched the entire
+/// table — one of them nearly reported the whole historical backlog as post-fix
+/// regressions (recorded in ethos rule 7). On 2026-08-23 amux read
+/// `_amux_request_log.ts` as milliseconds from the other direction and got
+/// "496040 hours ago", and was one absurd value away from filing two cards
+/// against already-fixed bugs.
+///
+/// The tell that saved that one was the VALUE, not a review. That is the whole
+/// argument for checking it here: a unit error is invisible in the code and
+/// glaring in the data, so the check belongs where the data is.
+///
+/// This table is the DECLARATION. A column absent from it is a failure, not a
+/// pass — adding a table with a bare `ts` should force its author to say which
+/// unit it is, which is the only durable fix short of renaming the columns.
+pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
+    // (table, column, is_millis)
+    ("_amux_request_log", "ts", false),
+    ("session_events", "ts", false),
+    ("token_ledger", "ts", false),
+    ("cmd_history", "ts", true),
+    ("interaction_log", "ts", true),
+];
+
+/// Does each declared timestamp column actually hold what readers assume?
+///
+/// `observed` is `(table.column, MAX(value))` — `None` when the table is empty,
+/// which is UNKNOWN and not a pass: an empty table is an absence of evidence and
+/// reporting it as green is the silence-reads-as-health failure this repo has a
+/// rule about.
+///
+/// `undeclared` is any timestamp-shaped column the schema has and
+/// [`TIMESTAMP_COLUMNS`] does not. Those fail: an undeclared unit is exactly the
+/// state that produced every incident above.
+pub fn timestamp_units_are_what_readers_assume(
+    observed: &[(String, Option<f64>)],
+    undeclared: &[String],
+    now: f64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "schema.timestamp_units_declared";
+    // Generous: a year ahead for clock skew, ten years back for old rows. The
+    // discriminator is 1000x, so the window does not need to be tight — and a
+    // tight one would be a tuned parameter guarding a factor-of-1000 error.
+    const AHEAD: f64 = 86_400.0 * 365.0;
+    const BEHIND: f64 = 86_400.0 * 3_650.0;
+    let mut out = Vec::new();
+    for name in undeclared {
+        out.push(
+            InvariantResult::fail(
+                ID,
+                format!("{name}: unit declared in TIMESTAMP_COLUMNS"),
+                "timestamp-shaped column with no declared unit — say whether it is seconds or \
+                 milliseconds, because the column name cannot"
+                    .to_string(),
+            )
+            .entity(name),
+        );
+    }
+    for (name, max) in observed {
+        let declared = TIMESTAMP_COLUMNS
+            .iter()
+            .find(|(t, c, _)| format!("{t}.{c}") == *name)
+            .map(|(_, _, ms)| *ms);
+        let Some(is_millis) = declared else { continue };
+        let Some(v) = *max else {
+            out.push(
+                InvariantResult::unknown(ID, format!("{name} is empty — no rows to check the unit against"))
+                    .entity(name),
+            );
+            continue;
+        };
+        let as_declared = if is_millis { v / 1000.0 } else { v };
+        if as_declared <= now + AHEAD && as_declared >= now - BEHIND {
+            out.push(InvariantResult::pass(ID).entity(name));
+            continue;
+        }
+        // NAME THE OTHER READING. "out of range" sends the reader to the clock;
+        // "this is seconds, not milliseconds" sends them to the one line that is
+        // wrong. The whole incident is that the two are indistinguishable
+        // without doing this arithmetic.
+        let other = if is_millis { v } else { v / 1000.0 };
+        let other_fits = other <= now + AHEAD && other >= now - BEHIND;
+        out.push(
+            InvariantResult::fail(
+                ID,
+                format!(
+                    "{name} holds {} (declared)",
+                    if is_millis { "milliseconds" } else { "seconds" }
+                ),
+                format!(
+                    "MAX = {v:.0}, which under the declared unit is {:.0} hours from now{}",
+                    (now - as_declared) / 3600.0,
+                    if other_fits {
+                        format!(
+                            " — it fits as {} instead. Either the declaration or the writer is wrong.",
+                            if is_millis { "SECONDS" } else { "MILLISECONDS" }
+                        )
+                    } else {
+                        String::new()
+                    }
+                ),
+            )
+            .entity(name),
+        );
+    }
+    out
+}
+
 pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<InvariantResult> {
     const ID: &str = "config.env_reaches_process";
     let mut out = Vec::new();
@@ -2789,5 +2906,78 @@ mod negative_controls {
 
         // Exactly-at-budget is not an excursion.
         assert_eq!(result_log_bounded(500_000, 500_000, 1.0)[0].status, Status::Pass);
+    }
+
+    /// AF-184. The unit error is invisible in the code and glaring in the data,
+    /// which is the whole reason this check reads the data.
+    ///
+    /// Both real incidents are cells here, in the two directions they happened:
+    /// `interaction_log` (ms) read as seconds, which made a filter ~1000x too
+    /// small and matched the entire table; and `_amux_request_log` (s) read as
+    /// ms, which produced "496040 hours ago" and was one absurd value away from
+    /// two cards filed against already-fixed bugs.
+    #[test]
+    fn a_ts_column_in_the_wrong_unit_is_named_with_the_reading_that_fits() {
+        let now = 1_787_533_773.0;
+
+        // Correct on both sides of the declaration: nothing to say but PASS.
+        let ok = timestamp_units_are_what_readers_assume(
+            &[
+                ("_amux_request_log.ts".into(), Some(now - 1.0)),
+                ("cmd_history.ts".into(), Some((now - 1.0) * 1000.0)),
+            ],
+            &[],
+            now,
+        );
+        assert!(ok.iter().all(|r| r.status == Status::Pass), "{ok:?}");
+        assert_eq!(ok.len(), 2, "every declared column reports, not just the bad ones");
+
+        // A SECONDS column holding milliseconds. The failure must name
+        // MILLISECONDS, because "out of range" sends the reader to the clock and
+        // the fitting reading sends them to the one wrong line.
+        let bad = timestamp_units_are_what_readers_assume(
+            &[("_amux_request_log.ts".into(), Some(now * 1000.0))],
+            &[],
+            now,
+        );
+        assert_eq!(bad[0].status, Status::Fail, "{bad:?}");
+        assert!(bad[0].observed.contains("MILLISECONDS"), "name the reading that fits: {:?}", bad[0].observed);
+
+        // And the mirror, which is the incident from the other direction.
+        let bad2 = timestamp_units_are_what_readers_assume(
+            &[("cmd_history.ts".into(), Some(now))],
+            &[],
+            now,
+        );
+        assert_eq!(bad2[0].status, Status::Fail, "{bad2:?}");
+        assert!(bad2[0].observed.contains("SECONDS"), "{:?}", bad2[0].observed);
+
+        // AN EMPTY TABLE IS UNKNOWN, NOT PASS. An absence of evidence rendered
+        // as green is the silence-reads-as-health failure, and it would hide a
+        // wrong declaration on any table that has not been written to yet.
+        let empty = timestamp_units_are_what_readers_assume(
+            &[("token_ledger.ts".into(), None)],
+            &[],
+            now,
+        );
+        assert_eq!(empty[0].status, Status::Unknown, "{empty:?}");
+
+        // An UNDECLARED timestamp column fails. This is the half that keeps
+        // working as the schema grows: a sixth table with a bare `ts` inherits
+        // the trap silently, and only a check that goes red makes its author
+        // state the unit.
+        let undecl = timestamp_units_are_what_readers_assume(&[], &["new_table.ts".into()], now);
+        assert_eq!(undecl[0].status, Status::Fail, "{undecl:?}");
+        assert!(undecl[0].entity_key.contains("new_table"), "{:?}", undecl[0]);
+
+        // CONTROL ON THE WINDOW: it must be loose enough not to fire on ordinary
+        // old rows, or the check becomes noise and stops being read. Ten years
+        // back and a year ahead both pass under the correct unit.
+        let oldrow = timestamp_units_are_what_readers_assume(
+            &[("_amux_request_log.ts".into(), Some(now - 86_400.0 * 3_000.0))],
+            &[],
+            now,
+        );
+        assert_eq!(oldrow[0].status, Status::Pass, "a 3000-day-old row is old, not mis-united: {oldrow:?}");
     }
 }

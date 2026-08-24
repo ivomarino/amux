@@ -90,6 +90,9 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // -- 5. is the report control plane up? (2026-08-13 fleet-wide outage)
     out.extend(self_reports_check(state));
 
+    // -- 5b. do the `ts` columns hold what their readers assume? (AF-184)
+    out.extend(timestamp_units_check(state));
+
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
     // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
     // time — these scripts deploy on COMMIT (install), not on binary rebuild, so
@@ -400,6 +403,80 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
 ///
 /// Cost is bounded by `capture_panes`, which probes only lanes that painted
 /// inside the contradiction window: 4 of 63 on the fleet this was measured on.
+/// Gather what [`checks::timestamp_units_are_what_readers_assume`] needs (AF-184).
+///
+/// Two halves, and the second is the one that keeps working as the schema grows:
+/// the MAX of every DECLARED timestamp column, and the names of any
+/// timestamp-shaped column the schema has that the declaration does not.
+///
+/// The undeclared half is why this reads the live schema instead of a fixed
+/// list. Five tables here name a column `ts` and use two different units; a
+/// sixth added tomorrow would inherit the trap silently, and the only thing that
+/// makes an author state the unit is a check that goes red until they do.
+fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "schema.timestamp_units_declared";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    // Every column whose name looks like a wall-clock stamp, across every table.
+    let mut found: Vec<(String, String)> = Vec::new();
+    if let Ok(mut stmt) =
+        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    {
+        if let Ok(tables) = stmt.query_map([], |r| r.get::<_, String>(0)) {
+            for t in tables.flatten() {
+                let Ok(mut cs) = conn.prepare(&format!("PRAGMA table_info(\"{t}\")")) else {
+                    continue;
+                };
+                let cols: Vec<String> = match cs.query_map([], |r| r.get::<_, String>(1)) {
+                    Ok(rows) => rows.flatten().collect(),
+                    Err(_) => continue,
+                };
+                {
+                    for c in cols {
+                        // `ts` exactly, or a `_ts` suffix. Deliberately NOT `*_at`:
+                        // those are overwhelmingly ISO strings here, and a check
+                        // that fires on every one of them would be noise nobody
+                        // reads, which is worse than not checking.
+                        if c == "ts" || c.ends_with("_ts") {
+                            found.push((t.clone(), c));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if found.is_empty() {
+        // The schema read failed or matched nothing. Not a pass: an empty result
+        // from a query that should always find `_amux_request_log.ts` means the
+        // instrument is broken, not that the schema is clean.
+        return vec![InvariantResult::unknown(
+            ID,
+            "no timestamp-shaped columns found — the schema read failed, this is not a clean bill",
+        )];
+    }
+    let declared: std::collections::HashSet<String> = checks::TIMESTAMP_COLUMNS
+        .iter()
+        .map(|(t, c, _)| format!("{t}.{c}"))
+        .collect();
+    let mut undeclared: Vec<String> = found
+        .iter()
+        .map(|(t, c)| format!("{t}.{c}"))
+        .filter(|n| !declared.contains(n))
+        .collect();
+    undeclared.sort();
+    let mut observed: Vec<(String, Option<f64>)> = Vec::new();
+    for (t, c, _) in checks::TIMESTAMP_COLUMNS {
+        let max: Option<f64> = conn
+            .query_row(&format!("SELECT MAX(\"{c}\") FROM \"{t}\""), [], |r| r.get(0))
+            .ok()
+            .flatten();
+        observed.push((format!("{t}.{c}"), max));
+    }
+    let now = crate::runtime_jobs::registry::unix_now();
+    checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now)
+}
+
 fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "status.agrees_with_pane";
     let Ok(conn) = state.store.read() else {
