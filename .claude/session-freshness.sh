@@ -223,15 +223,26 @@ if [ -f "$REPO/amux" ]; then
     case " $seen_cli " in *" $cand "*) continue ;; esac
     seen_cli="$seen_cli $cand"
     diff -q "$REPO/amux" "$cand" >/dev/null 2>&1 && continue
+    # SYMLINK, NOT `cp`. This block used to prescribe a copy, which fixes the
+    # report and rebuilds the hazard: a copy is stale again the next time anyone
+    # edits ./amux, and that is exactly how the specimen below came to exist.
+    # ~/.local/bin/amux has been a symlink since install.sh created it, so the
+    # copy was also the only one of the two that could drift.
+    #
+    # Measured 2026-08-24: /usr/local/bin/amux was an Aug-6 227-line STUB that
+    # knew two verbs and defaulted AMUX_URL to https://localhost:8822, the
+    # retired port that no longer answers (AMUX-3046). A lane resolving it got
+    # connection-refused on every call, or help-and-exit-0 on any verb outside
+    # send/board. Eighteen days, reported by nobody.
     if [ "$cand" = "$live_cli" ]; then
       out+="  - installed CLI differs from this checkout: ${cand}  (THIS is the one you run)"$'\n'
       out+="    an unknown verb there may print help and exit 0 — a silent no-op"$'\n'
-      out+="    cp \"$REPO/amux\" \"$cand\""$'\n'
+      out+="    ln -sfn \"$REPO/amux\" \"$cand\"   # a symlink cannot go stale; a copy can"$'\n'
     else
       out+="  - a SHADOWING amux copy differs from this checkout: ${cand}"$'\n'
       out+="    your PATH runs ${live_cli:-none} instead, so it is inert HERE and not"$'\n'
       out+="    for a lane whose PATH orders those directories the other way"$'\n'
-      out+="    cp \"$REPO/amux\" \"$cand\"   # or remove it, if nothing should install there"$'\n'
+      out+="    ln -sfn \"$REPO/amux\" \"$cand\"   # or remove it, if nothing should install there"$'\n'
     fi
   done
 fi
