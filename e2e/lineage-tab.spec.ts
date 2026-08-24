@@ -56,7 +56,28 @@ test.describe('board card lineage tab', () => {
     const card = (await created.json()).id as string;
     expect(card, 'created card must have an id').toBeTruthy();
 
+    // CAPTURE THE PANEL'S OWN RESPONSE, rather than re-asking the endpoint
+    // afterwards (AMUX-3648).
+    //
+    // The assertions below are "the renderer rendered everything it was given".
+    // Re-fetching to build the expectation asks a DIFFERENT question — "does the
+    // DOM match what the endpoint says NOW" — and on a card created two seconds
+    // earlier those diverge, because the card is still settling. It failed
+    // exactly that way on 2026-08-24: the panel rendered 3 gaps and the later
+    // fetch reported 2, because `_amux_state_events` is a delta-sync journal
+    // whose row for the creation had not landed when the panel loaded, so the
+    // "no journal rows" gap was true then and false by the time the test asked.
+    //
+    // The subscription must be armed BEFORE the navigation or the response is
+    // already past. Nothing here weakens the check: the payload compared is the
+    // exact bytes the renderer received, which is strictly closer to the claim
+    // than a second sample of a moving target.
+    const whyResponse = page.waitForResponse(
+      r => r.url().includes(`/api/why/task/${encodeURIComponent(card)}`) && r.status() === 200,
+      { timeout: 30_000 },
+    );
     await page.goto(`/#issue=${encodeURIComponent(card)}:lineage`);
+    const why = await (await whyResponse).json();
 
     // The deep link is half the feature: a tab reachable only by tapping cannot
     // be linked, quoted in a nudge, or driven by the simulator rig.
@@ -74,10 +95,9 @@ test.describe('board card lineage tab', () => {
     // a plausible trail and never reaches the caveats has been misled by layout.
     await expect(panel.locator('.bd-lin-vlabel')).toHaveCount(1);
 
-    // Whatever the endpoint reports must survive into the DOM. Compare against
-    // the API rather than a fixture, so this fails if the renderer starts
-    // dropping things the endpoint still sends.
-    const why = await (await request.get(`/api/why/task/${encodeURIComponent(card)}`, { headers: auth })).json();
+    // Whatever the endpoint reported must survive into the DOM. Compared
+    // against the live payload captured above rather than a fixture, so this
+    // fails if the renderer starts dropping things the endpoint still sends.
     const gaps: string[] = why.gaps ?? [];
     const zero = (why.sources ?? []).filter((s: { rows: number }) => !s.rows);
 
