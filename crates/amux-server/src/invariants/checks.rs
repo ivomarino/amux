@@ -456,6 +456,13 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("_amux_media_jobs", "created_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
     ("_amux_media_jobs", "updated_at", false), // UNVERIFIED: no rows yet; seconds is the convention every sibling follows
     ("_amux_request_log", "ts", false),
+    // AF-175's boot column: which process wrote the row. Same unit as `ts` by
+    // construction — it is `heartbeat::boot_at()`, the same clock — and the
+    // one-sided restart predicate depends on `boot_at <= ts` holding, so a unit
+    // mismatch here would not merely mislead a reader, it would silently
+    // exclude or admit the wrong rows. Verified against 174 live rows: 0 with
+    // boot_at > ts, and the magnitude is 1.78e9 (seconds), not 1.78e12.
+    ("_amux_request_log", "boot_at", false),
     ("cmd_history", "delivered_at", true),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),
