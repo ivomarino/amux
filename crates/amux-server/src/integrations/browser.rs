@@ -762,6 +762,77 @@ fn chrome_stderr_tail(path: &Path) -> String {
     format!(" (chrome stderr: {tail})")
 }
 
+/// What one CDP readiness poll actually got (AMUX-3689).
+///
+/// Pure and separate from the wait loop so the distinction it exists to draw can
+/// be tested without spawning a Chrome. The distinction: **Chrome answering with
+/// a status we reject is not Chrome being silent**, and the loop reported both
+/// as "never answered within 30s" while the stderr quoted in the same message
+/// said `DevTools listening on ws://127.0.0.1:<the very port>`. An investigator
+/// reading "never answered" goes looking at Chrome's startup; an investigator
+/// reading "HTTP 403" goes looking at what amux asked for.
+fn describe_cdp_probe(
+    outcome: &Result<reqwest::Response, reqwest::Error>,
+    http: &str,
+) -> String {
+    match outcome {
+        Ok(r) => format!("HTTP {} from {http}/json/version", r.status()),
+        Err(e) if e.is_connect() => "connection refused (nothing listening)".into(),
+        Err(e) if e.is_timeout() => "no response within the 1s poll timeout".into(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+/// Keep a FAILED launch's stderr where the retry cannot destroy it (AMUX-3689).
+///
+/// `start()` opens the stderr path with `File::create`, which truncates. So the
+/// diagnostic for a failure is deleted by the next attempt on the same profile,
+/// and a caller that fails always retries. `primer` hit the CDP timeout six
+/// times on 2026-08-24 and only the last one's file survived, leaving the 600
+/// char tail already pasted into the error as the entire record of the incident.
+/// That is the artifact you need MOST of when a failure repeats, destroyed by
+/// the fact that it repeated.
+///
+/// Copies rather than renames, because Chrome is still running and still holds
+/// the descriptor. Best-effort throughout: a browser launch must not fail
+/// because a diagnostic copy failed, so every error here returns "" and the
+/// caller's message is merely shorter.
+fn preserve_failed_stderr(path: &Path) -> String {
+    let Some(dir) = path.parent() else { return String::new() };
+    // MILLISECONDS, not seconds. The first draft stamped seconds and its own
+    // test caught the consequence immediately: two retries inside one second
+    // mint the same filename, so the second copy OVERWRITES the first and the
+    // function silently does the exact thing it exists to prevent. Not a corner
+    // case either — the exit-0 delegation path fails in 1.5 to 3 seconds, so
+    // back-to-back retries land in one second routinely.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let kept = dir.join(format!("amux-chrome-launch.failed-{stamp}.stderr"));
+    if std::fs::copy(path, &kept).is_err() {
+        return String::new();
+    }
+    // Bounded, or a profile that fails all day fills the disk with its own
+    // evidence. Newest 5 by name, which sorts by the millisecond stamp above.
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let mut old: Vec<_> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("amux-chrome-launch.failed-"))
+            })
+            .collect();
+        old.sort();
+        while old.len() > 5 {
+            let _ = std::fs::remove_file(old.remove(0));
+        }
+    }
+    format!(" Full stderr kept at {}.", kept.display())
+}
+
 /// Chrome's `kBadFlags` (chrome/browser/ui/startup/bad_flags_prompt.cc) that
 /// this launcher could ever pass. Any of them puts the yellow "You are using an
 /// unsupported command-line flag ... Stability and security will suffer."
@@ -925,6 +996,27 @@ pub async fn start(
     //    debugging port, so give a live Chrome up to 30s before giving up.
     let http = format!("http://127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // ONE CLIENT, not one per poll. This loop runs ~120 times in a 30s wait and
+    // built a fresh `reqwest::Client` on every pass, each of which allocates a
+    // connection pool, a TLS config, and on macOS reads the system proxy
+    // settings through SystemConfiguration. Nothing here needs a new client.
+    let probe = reqwest::Client::new();
+    // WHAT THE LAST POLL ACTUALLY GOT (AMUX-3689). The loop discarded every
+    // outcome, so connection-refused, a timeout, a 403 and a 500 all produced
+    // the identical "CDP never answered within 30s".
+    //
+    // That is not merely vague, it can be FALSE, and the specimen proves it: on
+    // 2026-08-24 `primer` hit this six times, and the stderr embedded in the very
+    // same message reads `DevTools listening on ws://127.0.0.1:60005/...` for the
+    // port the message says never answered. CDP came up ~3s in and amux polled
+    // it for another 27s. "Never answered" and "answered with a status I did not
+    // accept" send an investigator to opposite places, and this could not say
+    // which had happened.
+    let mut attempts: u32 = 0;
+    // Deliberately uninitialised: every path that READS it assigns it first, in
+    // the same iteration. A placeholder here would be a value that can never be
+    // observed, i.e. a state the message could claim and never mean.
+    let mut last_probe: String;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             // A CLEAN exit (status 0) before CDP is the delegation signature: the
@@ -953,20 +1045,35 @@ pub async fn start(
                 chrome_stderr_tail(&stderr_path)
             );
         }
-        match reqwest::Client::new()
+        attempts += 1;
+        let outcome = probe
             .get(format!("{http}/json/version"))
             .timeout(std::time::Duration::from_secs(1))
             .send()
-            .await
-        {
+            .await;
+        match outcome {
             Ok(r) if r.status().is_success() => break,
-            _ if std::time::Instant::now() > deadline => {
-                anyhow::bail!(
-                    "Chrome (pid {pid:?}) is running but CDP on port {port} never answered within 30s{}",
-                    chrome_stderr_tail(&stderr_path)
-                );
+            other => {
+                last_probe = describe_cdp_probe(&other, &http);
+                if std::time::Instant::now() > deadline {
+                    // WARN so a log sweep sees the CLASS, not just this instance
+                    // (/api/logs/analyze groups the 502 but cannot read a
+                    // free-text error body for the discriminator).
+                    tracing::warn!(
+                        ?pid, port, attempts, last_probe = %last_probe,
+                        stderr = %stderr_path.display(),
+                        "browser: CDP wait timed out (AMUX-3689)"
+                    );
+                    let kept = preserve_failed_stderr(&stderr_path);
+                    anyhow::bail!(
+                        "Chrome (pid {pid:?}) is running but CDP on port {port} did not become \
+                         usable within 30s. Last of {attempts} polls: {last_probe}.{}{}",
+                        kept,
+                        chrome_stderr_tail(&stderr_path)
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
         }
     }
 
@@ -2049,6 +2156,107 @@ mod tests {
     // All tests run against TEMP dirs only — never the live Chrome profiles
     // (repo rule: tests must not touch real profile contents), and never
     // launch Chrome except the #[ignore]d gated tests at the bottom.
+
+    /// AMUX-3689: an ANSWERED poll and a SILENT one must not read the same.
+    ///
+    /// THE SPECIMEN, and it is why this is a test rather than a comment: on
+    /// 2026-08-24 `primer` got six `POST /api/browser/start` 502s at ~30.3s each
+    /// saying "CDP on port 60005 never answered within 30s", with
+    /// `DevTools listening on ws://127.0.0.1:60005/devtools/browser/e9edcb66-...`
+    /// in the stderr embedded in the same message. Chrome had answered on that
+    /// port about three seconds in. The message was not vague, it was wrong, and
+    /// it sends an investigator to Chrome's startup instead of to the poll.
+    ///
+    /// The connect case is a REAL error object, produced by dialling a port
+    /// nothing listens on, rather than a hand-built stand-in: `reqwest::Error`
+    /// has no public constructor, and a stand-in would be testing my model of
+    /// `is_connect()` rather than `is_connect()`.
+    #[tokio::test]
+    async fn an_answered_cdp_poll_never_reads_as_silence() {
+        let answered: Result<reqwest::Response, reqwest::Error> =
+            Ok(axum::http::Response::builder().status(403).body("").unwrap().into());
+        let d = describe_cdp_probe(&answered, "http://127.0.0.1:60005");
+        assert!(d.contains("403"), "the STATUS is the whole discriminator: {d}");
+        assert!(
+            !d.to_lowercase().contains("never answered")
+                && !d.to_lowercase().contains("refused"),
+            "a 403 is Chrome answering — calling it silence is the AMUX-3689 defect: {d}"
+        );
+
+        // Port 1 on loopback: privileged, unbound, refuses immediately.
+        let refused = reqwest::Client::new()
+            .get("http://127.0.0.1:1/json/version")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await;
+        assert!(refused.is_err(), "premise: nothing may be listening on 127.0.0.1:1");
+        let d = describe_cdp_probe(&refused, "http://127.0.0.1:1");
+        assert!(
+            d.contains("refused") || d.contains("connection"),
+            "a genuinely silent port must say so, or the two cells above collapse: {d}"
+        );
+    }
+
+    /// AMUX-3689: a retry must not destroy the previous failure's stderr.
+    ///
+    /// `start()` opens the stderr path with `File::create`, which truncates, and
+    /// a failing caller always retries. `primer` failed six times and five of the
+    /// six stderr files were overwritten before anyone looked, leaving a 600-char
+    /// tail as the whole record. The artifact you need most when a failure
+    /// REPEATS was being deleted by the fact that it repeated.
+    #[test]
+    fn a_failed_launch_keeps_its_stderr_and_the_pile_stays_bounded() {
+        let dir = std::env::temp_dir().join(format!("amux-stderr-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("amux-chrome-launch.stderr");
+
+        std::fs::write(&live, "first failure\nDevTools listening on ws://127.0.0.1:1/x\n").unwrap();
+        let note = preserve_failed_stderr(&live);
+        assert!(note.contains("failed-"), "the message must NAME the kept file: {note:?}");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("amux-chrome-launch.failed-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let body = std::fs::read_to_string(dir.join(&kept[0])).unwrap();
+        assert!(body.contains("DevTools listening"), "the COPY must hold the evidence: {body:?}");
+
+        // Simulate the retry that used to erase it: truncate the live file and
+        // preserve again. The first failure's copy must survive.
+        std::fs::write(&live, "second failure\n").unwrap();
+        preserve_failed_stderr(&live);
+        assert!(
+            std::fs::read_to_string(dir.join(&kept[0])).unwrap().contains("DevTools listening"),
+            "the retry erased the first failure's evidence, which is the whole bug"
+        );
+
+        // BOUNDED: a profile that fails all day must not fill the disk with its
+        // own evidence. Written directly rather than by repeated calls so the
+        // prune is tested on a known set rather than on however many distinct
+        // millisecond stamps the loop happened to produce.
+        for i in 0..9 {
+            std::fs::write(dir.join(format!("amux-chrome-launch.failed-{:010}.stderr", i)), "x")
+                .unwrap();
+        }
+        std::fs::write(&live, "another\n").unwrap();
+        preserve_failed_stderr(&live);
+        let n = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("amux-chrome-launch.failed-")
+            })
+            .count();
+        assert_eq!(n, 5, "the pile must be pruned to the newest 5, found {n}");
+
+        // A MISSING file must be silent, not a panic: a launch may fail before
+        // the stderr file is ever created, and a browser start must never fail
+        // because its diagnostic copy failed.
+        assert_eq!(preserve_failed_stderr(&dir.join("nope.stderr")), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// AMUX-3669, from Ethan's report and the live `ps` output that explained
     /// it. Five Chromes were sharing one `--user-data-dir`, which is
