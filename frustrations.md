@@ -2747,3 +2747,30 @@ NOTE: The guard's first production catch was ITS OWN AUTHOR. It refused me 409 o
   and having documented it did not stop me repeating it three times. That is ethos rule 6's
   "a rule you have written down is not a rule you run" with a same-day specimen, and it is the
   argument for why this had to become a refusal rather than a convention.
+
+---
+## The e2e suite restarts its own servers mid-run, and blames whichever specs were mid-navigation
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-185
+SYMPTOM: PR 148 (an outside contributor's) was red with e2e 4 failed / 228 passed, every failure
+  `net::ERR_CONNECTION_REFUSED at https://localhost:18823/`, and nothing anywhere said why. The
+  suite starts three servers (desktop/mobile/ios-safari), each a `cargo run` rebuilding into the
+  SAME target dir; every rebuild rewrites target/debug/amux-server, and a running server watches
+  that path and exec's itself. Run 32671387493's log has three `binary changed on disk —
+  exec'ing the new build in place` lines, each right after a sibling target's build finished,
+  each costing ~10s of refused connections while the suite drove that server.
+COST: A contributor's PR blocked on a red check that was never theirs, with no way to tell from
+  the PR. Because the victims are chosen by timing they move run to run, so no spec is reliably
+  guilty and the whole thing reads as flakiness rather than a defect with a cause. That is the
+  same misattribution shape as AF-179 and AF-182: a true statement about the environment
+  delivered as a statement about the thing under test.
+FIX: 67474428 — the suite sets AMUX_NO_SELF_ADOPT=1. The capability already existed (AEAB-52)
+  and its own doc comment says what it is for, "a test harness pins its build on purpose"; the
+  one harness in this repo that pins its build was not enrolled. Rule 1 exactly. Not yet proven
+  in CI: the prediction is zero `binary changed on disk` lines in the next e2e job and no
+  ERR_CONNECTION_REFUSED failures, and if they persist the env is not reaching the server through
+  serve-head.sh.
