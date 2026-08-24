@@ -2359,7 +2359,14 @@ pub(crate) fn desc_replace_destroys_peer_prose(
     if lines.peek().is_none() {
         return false;
     }
-    !lines.any(|l| new.contains(l)) && old.chars().count().saturating_sub(new.chars().count()) >= 200
+    // No floor. A re-added `&& old.len() - new.len() >= 200` is the exact defect
+    // AMUX-3576 was filed about, and it came back through the shared index on
+    // 2026-08-24 (AF-182): this line was floorless in ac7b9e33 and had the floor
+    // again by c971756b, whose own message said both floors were gone. If you are
+    // about to add a threshold here, read `the_desc_shrink_refusal_shows_how_to_
+    // append_not_just_the_field_name` first — the LONGER-replacement case has a
+    // net loss of zero and is the one a floor cannot see.
+    !lines.any(|l| new.contains(l))
 }
 
 pub async fn patch_item(
