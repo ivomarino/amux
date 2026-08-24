@@ -526,6 +526,29 @@ NOTE: The underlying false positive IS fixed at the root (95d97a8e): the check's
 
 ---
 
+CORRECTION (amux, 2026-08-24, superseding their own sign-off above — recorded here rather
+  than in a new entry because the archive is the record and it asserted more than was true):
+  the sign-off was right for ONE of the mechanism's two shapes and could not have shown the
+  other.
+  `note_resolved_incidents` fires — four real runs, as recorded. It was also INERT for every
+  FLEET-SCOPED invariant. `hooks.shared_guard_matches_committed` (AMUX-3664) failed 359 times
+  over four days, resolved at 12:36, and its card was never told: `detect_invariants` signs a
+  fleet-wide invariant `fleet` for DISPLAY while the row stores `entity_key=''`, so the
+  write-back matched zero rows and `board_issue` stayed empty. `note_resolved_incidents` joins
+  on `board_issue != ''`, so the notice was dead for that whole class.
+      fleet-wide incidents (entity_key='')   10, with a card link:  0
+      entity-keyed incidents                220, with a card link:  6
+  Both specimens inspected at sign-off time were `schema.timestamp_units_declared` on a named
+  column — entity-keyed, which is the only shape that worked. Fixed in 12da2d13, and the 0-row
+  UPDATE now WARNs; it lasted four days because a 0-row UPDATE is not an error, so nothing
+  recorded a card minted with no incident to attach it to. Finding it required noticing a
+  resolved incident that never told its card — looking for the ABSENCE of a message.
+  THE PROTOCOL LESSON, which is amux's and applies to every entry validated this way: a
+  live-firing sample is evidence the mechanism RUNS, not evidence it COVERS ITS DOMAIN. When a
+  fix is confirmed by observing it fire, record WHICH VARIANTS the observed firings covered.
+  "It fired 4 times" and "it fired 4 times, all of one of its two shapes" are different
+  evidence and only the second can be audited.
+
 ## amux-launched browser does not survive a server self-adopt
 VALIDATED: amux | GONE — and a card scan could NOT have found this, which is why it was on the 'backlog four are live by construction' list I guessed wrong. amux, 2026-08-24: it shipped under AC-325, not under AMUX-3184. integrations/browser.rs:729 is cmd.process_group(0), with a comment recording this exact incident by mechanism ('the builder's self-adoption relaunch kills the whole group ... three staged-login kills in one morning'). Detached, the group kill misses Chrome; chrome::adopt_if_orphaned then runs on every verb path (browser.rs 173, 266, 359) and re-attaches via browser-running.json. Both clauses of the FIX field satisfied.
 AREA: browser
