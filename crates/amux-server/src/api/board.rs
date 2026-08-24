@@ -2306,6 +2306,62 @@ pub async fn clear_done(State(state): State<AppState>, headers: HeaderMap) -> Re
     }
 }
 
+/// Does replacing `old` with `new` DESTROY prose that belongs to another lane?
+/// (AMUX-3576, floors removed under AF-191.)
+///
+/// Extracted so the write site and its test share ONE definition. The test used
+/// to restate the predicate with a comment asking the next editor to keep them
+/// in step by hand, which is a paraphrase of the shipped code rather than the
+/// shipped code — the exact shape ethos rule 7 warns about, and the reason the
+/// two floors below could be wrong for weeks with a green test beside them.
+///
+/// SURVIVAL, NOT SIZE. The rule declares itself to be about destruction and used
+/// to gate on `before >= 200` and a 200-character NET LOSS. Both of the acts it
+/// names walked straight through:
+///
+///   amux-cloud, reproduced on scratch AC-391 (2026-08-24): a peer PATCH
+///   replaced their 54-char desc with 17 chars. 54 < 200, no rule fired,
+///   `applied: true`.
+///
+///   amux-frustrations, reproduced on scratch AF-194 the same day: a peer PATCH
+///   replaced a 264-char desc with 392 chars of unrelated text. The net loss was
+///   ZERO because it GREW, no rule fired, `applied: true`, every character gone.
+///
+/// A length delta cannot express content destruction: a longer replacement
+/// destroys exactly as much as a shorter one. So the question is whether any of
+/// the owner's LINES survive verbatim. Nothing to tune, and it separates the two
+/// cases the floors were reaching for — a peer fixing a typo in one line of a
+/// multi-line write-up leaves the rest intact and passes, while a wholesale
+/// replace takes every line with it at any magnitude, in either direction.
+///
+/// THE COST, stated rather than discovered later: for a SINGLE-LINE desc there
+/// is no other line to survive, so any cross-lane replace of it is refused —
+/// including a genuine typo fix. That is amux-cloud's incident exactly, the
+/// escape is one field (`desc_shrink_ack`) that the refusal prints, and
+/// `desc_append` is there to add instead. A peer silently destroying a
+/// one-sentence card is the worse trade.
+pub(crate) fn desc_replace_destroys_peer_prose(
+    owner: &str,
+    writer: &str,
+    old: &str,
+    new: &str,
+) -> bool {
+    let owner = owner.trim();
+    let writer = writer.trim();
+    if owner.is_empty() || writer.is_empty() || owner == writer {
+        return false;
+    }
+    let old_trimmed = old.trim();
+    if old_trimmed.is_empty() || new.contains(old_trimmed) {
+        return false;
+    }
+    let mut lines = old.lines().map(str::trim).filter(|l| !l.is_empty()).peekable();
+    if lines.peek().is_none() {
+        return false;
+    }
+    !lines.any(|l| new.contains(l))
+}
+
 pub async fn patch_item(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -2510,22 +2566,50 @@ pub async fn patch_item(
                     // `!d.contains(old)` is what makes it about DESTRUCTION
                     // rather than size: any append, or any rewrite that keeps
                     // what was there, passes untouched however much it adds.
-                    // The net-loss floor then spares a typo fix or a small
-                    // correction on a peer's card, which lose nearly nothing.
                     //
                     // I am the specimen. I destroyed ~6400 characters across
                     // AF-178, AF-180 and AF-182 while acking reviews, having
                     // shipped the size rule an hour earlier and written the
                     // commit message explaining why desc_append exists.
+                    //
+                    // THE TWO NUMERIC FLOORS ARE GONE (AF-191, 2026-08-24), and
+                    // they were the whole remaining hole. This rule declares
+                    // itself to be about destruction and then gated itself on
+                    // `before >= 200` and a 200-character NET LOSS, so both of
+                    // the acts it names walked straight through:
+                    //
+                    //   amux-cloud, reproduced on scratch AC-391: a peer PATCH
+                    //   replaced their 54-char desc with 17 chars. 54 < 200, so
+                    //   no rule fired. Destroyed, silently, `applied: true`.
+                    //
+                    //   me, reproduced on scratch AF-194: a peer PATCH replaced
+                    //   a 264-char desc with 392 chars of unrelated text. Net
+                    //   loss ZERO because it GREW, so no rule fired. Every
+                    //   character of the original gone, `applied: true`.
+                    //
+                    // A length delta cannot express content destruction — a
+                    // longer replacement destroys exactly as much as a shorter
+                    // one — and this is the file's own preference, stated eight
+                    // lines up: "a comparison rather than a threshold, so it can
+                    // be exact instead of tuned". The floors were the tuned part
+                    // and they were tuned against the wrong quantity.
+                    //
+                    // WHAT REPLACES THEM, with no threshold at all: did the
+                    // owner's prose SURVIVE? Take the longest line they wrote —
+                    // the most substantial single thing on the card — and ask
+                    // whether it is still present. Nothing to tune, and it
+                    // separates the two cases the floors were reaching for:
+                    //   - a peer fixing a typo in a multi-line desc leaves the
+                    //     longest line intact, so it passes as before;
+                    //   - a wholesale replace takes the anchor with it, at any
+                    //     magnitude and in either direction.
+                    // For a single-line desc the anchor IS the desc, so a peer
+                    // replacing it is refused. That is amux-cloud's incident
+                    // exactly, and the escape is one field (`desc_shrink_ack`)
+                    // which the refusal prints, or `desc_append` to add instead.
                     let owner_now = row.session.clone().unwrap_or_default().trim().to_string();
-                    let cross_lane = !caller_lane.is_empty()
-                        && !owner_now.is_empty()
-                        && owner_now != caller_lane;
-                    let old_trimmed = next.desc.trim();
-                    let destroys_peer_prose = cross_lane
-                        && before >= 200
-                        && !d.contains(old_trimmed)
-                        && before.saturating_sub(after) >= 200;
+                    let destroys_peer_prose =
+                        desc_replace_destroys_peer_prose(&owner_now, &caller_lane, &next.desc, &d);
                     if !acked && !forced && (destroys_peer_prose || (before >= 500 && after * 2 < before)) {
                         return finish(
                             &slot_w,
@@ -2544,14 +2628,15 @@ pub async fn patch_item(
                                 "error": if destroys_peer_prose {
                                     format!(
                                         "refusing to replace {owner_now}'s description on \
-                                         {id_w} — you are {caller_lane}, and this drops \
-                                         {} of their {before} characters without keeping what \
-                                         was there. To add your note below theirs — almost always \
-                                         what a reviewer or a commenter means — resend as \
-                                         PATCH /api/board/{id_w} with \"desc_append\": \"your \
-                                         note\". It is a FIELD, not a sub-path. If you really do mean to replace \
-                                         their text, resend with desc_shrink_ack: true.",
-                                        before - after
+                                         {id_w} — you are {caller_lane}, and none of their \
+                                         {before} characters survive it (their longest line is \
+                                         gone). Length is not the test and this refusal fires \
+                                         whether your text is shorter or longer. To add your \
+                                         note below theirs — almost always what a reviewer or a \
+                                         commenter means — resend as PATCH /api/board/{id_w} \
+                                         with \"desc_append\": \"your note\". It is a FIELD, \
+                                         not a sub-path. If you really do mean to replace their \
+                                         text, resend with desc_shrink_ack: true."
                                     )
                                 } else {
                                     format!(
@@ -3686,9 +3771,26 @@ pub async fn patch_item(
                     // signature, zero new information, a lane-turn each round.
                     // A NEW 5xx mints a new signature and files regardless of
                     // this idem, so keeping it loses nothing.
+                    // AMUX-3633 adds `invariant|` on the SAME reasoning, and it
+                    // makes the sentence above literally true rather than nearly
+                    // so. "Their refile requires the condition to be live AGAIN"
+                    // was the intent; what the code did was refile while it was
+                    // merely STILL live. For a long-running known breach those
+                    // are different: the ledger invariant shipped at 14573a02
+                    // filed AMUX-3631, a worker discarded it as owned work, and
+                    // the re-arm refiled AMUX-3633 within the hour at 20
+                    // evaluations — byte-identical, zero new information, one
+                    // lane-turn per round. The same loop 5xx had.
+                    //
+                    // The signature now carries the incident's `first_seen`, so
+                    // a recovery-then-refail opens a new `_amux_invariant_incident`
+                    // row, mints a NEW signature and files regardless of this
+                    // idem. "Live again" keeps its signal; "still live" stops
+                    // costing a turn.
                     .filter(|s| {
                         !s.starts_with("autofix:latency|outlier|")
                             && !s.starts_with("autofix:5xx|")
+                            && !s.starts_with("autofix:invariant|")
                     })
                 {
                     let n = conn.execute(

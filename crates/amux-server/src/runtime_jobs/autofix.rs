@@ -1681,7 +1681,13 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             // Keyed on the INVARIANT, not an entity — so the rollup dedupes
             // against itself as entities come and go, rather than re-filing
             // every time the set changes by one.
-            signature: format!("invariant|{id}|ROLLUP"),
+            //
+            // EPISODE IDENTITY (AMUX-3633), the same shape AMUX-3472 gave
+            // outliers and AMUX-3591 gave 5xx. `first_seen` is the start of the
+            // current UNBROKEN failing run: `_amux_invariant_incident` rows are
+            // per-episode and get a `resolved_at` when the invariant recovers,
+            // so a recovery-then-refail opens a NEW row with a NEW first_seen.
+            signature: format!("invariant|{id}|ROLLUP|{}", first_seen as i64),
             title: format!("invariant {id} failing across {n} entities — one fault, not {n} tasks"),
             evidence: vec![
                 ("verdict".into(), format!(
@@ -1739,7 +1745,8 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
 
     for (id, entity, _status, first, last, occ, expected, observed) in flat {
         let sig_entity = if entity.is_empty() { "fleet".to_string() } else { entity.clone() };
-        let signature = format!("invariant|{id}|{sig_entity}");
+        // Episode identity, same reason as the ROLLUP arm above (AMUX-3633).
+        let signature = format!("invariant|{id}|{sig_entity}|{}", first as i64);
         if occ < min_occ {
             suppressed.push(sup(
                 DetectorKind::InvariantBreach,
@@ -3683,8 +3690,25 @@ pub async fn autofix_tick_with_ci(
 fn invariant_signature_parts(sig: &str) -> Option<(String, String)> {
     let mut it = sig.splitn(3, '|');
     match (it.next(), it.next(), it.next()) {
-        (Some("invariant"), Some(inv), Some(ent)) if !inv.is_empty() && !ent.is_empty() => {
-            Some((inv.to_string(), ent.to_string()))
+        (Some("invariant"), Some(inv), Some(rest)) if !inv.is_empty() && !rest.is_empty() => {
+            // STRIP THE EPISODE SUFFIX (AMUX-3633). The signature gained a
+            // trailing `|<first_seen epoch>` so a judged breach stays judged
+            // for as long as it is the SAME unbroken failure. The entity may
+            // itself contain `|` (route invariants name `GET /api/x|y`), so the
+            // split above is bounded at 3 and the timestamp would otherwise be
+            // absorbed into the entity — silently breaking the incident link
+            // this function exists to make, for every invariant card.
+            //
+            // Only a trailing field that is a BARE EPOCH is stripped. An entity
+            // whose last `|`-part happens to be numeric is not a thing today,
+            // and if it ever is, this mis-links one card rather than dropping
+            // the timestamp into every one.
+            let ent = match rest.rsplit_once('|') {
+                Some((head, tail))
+                    if !head.is_empty() && tail.parse::<i64>().is_ok() => head,
+                _ => rest,
+            };
+            (!ent.is_empty()).then(|| (inv.to_string(), ent.to_string()))
         }
         _ => None,
     }
@@ -5812,6 +5836,38 @@ mod tests {
         }
     }
 
+    /// AMUX-3633: the signature carries an EPISODE suffix, and the parser must
+    /// strip it or the incident link breaks for every invariant card.
+    ///
+    /// The entity itself may contain `|` (route invariants name
+    /// `GET /api/x|y`), and the split is bounded at 3, so a naive parse absorbs
+    /// the timestamp into the entity and silently mis-keys the link. That is
+    /// invisible: the card still files, it just points at no incident.
+    #[test]
+    fn the_episode_suffix_is_stripped_and_a_piped_entity_survives_it() {
+        // Plain entity + episode.
+        assert_eq!(
+            invariant_signature_parts("invariant|queue.has_live_consumer|amux|1787569200"),
+            Some(("queue.has_live_consumer".into(), "amux".into()))
+        );
+        // Entity that CONTAINS a pipe, plus the episode. Both must survive.
+        assert_eq!(
+            invariant_signature_parts("invariant|route.callers_have_routes|GET /api/x|y|1787569200"),
+            Some(("route.callers_have_routes".into(), "GET /api/x|y".into()))
+        );
+        // No episode suffix (a pre-3633 signature, or a rollup shape): unchanged.
+        assert_eq!(
+            invariant_signature_parts("invariant|queue.has_live_consumer|amux"),
+            Some(("queue.has_live_consumer".into(), "amux".into()))
+        );
+        // CONTROL: a NON-numeric trailing field is part of the entity, not an
+        // episode. Without this the stripper would eat a real entity segment.
+        assert_eq!(
+            invariant_signature_parts("invariant|route.callers_have_routes|GET /api/x|y"),
+            Some(("route.callers_have_routes".into(), "GET /api/x|y".into()))
+        );
+    }
+
     /// Silence is evidence, not a verdict. The card must be ANNOTATED and left
     /// exactly where it was — an auto-close here would be an agent deciding a
     /// bug was fixed because nobody hit it (ethos rule 8).
@@ -6335,7 +6391,21 @@ mod tests {
             .collect();
         let f = invariant_findings(&rows);
         assert_eq!(f.len(), 1, "64 entities of ONE invariant must produce ONE card, got {}", f.len());
-        assert!(f[0].signature.ends_with("|ROLLUP"), "keyed on the invariant, not an entity");
+        // Keyed on the INVARIANT, not an entity. AMUX-3633 appended an episode
+        // suffix, so this can no longer be an `ends_with` — asserted as the
+        // ROLLUP marker plus the property the suffix exists for, rather than
+        // relaxed to a substring that would pass against either shape.
+        let sig = &f[0].signature;
+        assert!(
+            sig.starts_with("invariant|route.callers_have_routes|ROLLUP|"),
+            "keyed on the invariant, not an entity: {sig}"
+        );
+        let episode = sig.rsplit('|').next().unwrap_or("");
+        assert!(
+            episode.parse::<i64>().is_ok() && !episode.is_empty(),
+            "the episode suffix must be a bare epoch second, got {episode:?} — without it a \
+             judged breach refiles on every scan while the SAME failure run continues"
+        );
         assert!(f[0].title.contains("64 entities"), "the count belongs in the title: {}", f[0].title);
         // The entity list must SURVIVE into the card — rolling up must not
         // destroy the information the 64 cards carried, or this trades an
