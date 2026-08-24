@@ -209,7 +209,21 @@ fn rfc3339_to_epoch(s: &str) -> Option<i64> {
 /// in the system: revisioned, ordered, and (since migration 0008) carrying the
 /// post-mutation snapshot, so a transition can be stated as `field: a -> b`
 /// rather than "something changed".
-fn collect_state_events(conn: &Connection, w: &mut Why, entity_tag: &str, entity_id: &str) -> rusqlite::Result<()> {
+///
+/// `created_epoch` is the entity's own birth time, and it is what makes the
+/// retention horizon expressible. The journal is REAPED — 14 days by default
+/// (`AMUX_STATE_EVENTS_RETAIN_DAYS`, `runtime_jobs/storage.rs`) — so its floor
+/// is a MOVING horizon, not the beginning of time. Pass `None` only when the
+/// entity genuinely has no creation timestamp; passing it means the difference
+/// between "here is this card's history" and "here is the surviving tail of
+/// it", which have identical shapes and opposite meanings.
+fn collect_state_events(
+    conn: &Connection,
+    w: &mut Why,
+    entity_tag: &str,
+    entity_id: &str,
+    created_epoch: Option<i64>,
+) -> rusqlite::Result<()> {
     let q = format!("entity_type='{entity_tag}' AND entity_id=?");
     let total: usize = conn.query_row(
         "SELECT COUNT(*) FROM _amux_state_events WHERE entity_type = ?1 AND entity_id = ?2",
@@ -295,28 +309,82 @@ fn collect_state_events(conn: &Connection, w: &mut Why, entity_tag: &str, entity
         }
     }
 
-    let note = if total == 0 {
+    // The journal's floor. Reported as a DATE, not only as a rev: a rev number
+    // is unfalsifiable to a reader — it cannot be compared against anything they
+    // know — while a date can be held against the card in front of them.
+    let floor: Option<(i64, String)> = conn
+        .query_row("SELECT MIN(rev), MIN(at) FROM _amux_state_events", [], |r| {
+            Ok(match (r.get::<_, Option<i64>>(0)?, r.get::<_, Option<String>>(1)?) {
+                (Some(rev), Some(at)) => Some((rev, at)),
+                _ => None,
+            })
+        })
+        .unwrap_or(None);
+    let predates_floor = match (created_epoch, floor.as_ref()) {
+        (Some(c), Some((_, at))) => rfc3339_to_epoch(at).is_some_and(|f| c < f),
+        _ => false,
+    };
+
+    // A GAP is a hole in the evidence; a receipt is not. Both are reported, but
+    // only the holes go in `gaps`, or the field stops meaning anything.
+    let (gap_note, extra) = if total == 0 {
         // Distinguish "nothing ever happened" from "the journal does not go
         // back that far", which are different answers with the same row count.
-        let first_rev: Option<i64> = conn
-            .query_row("SELECT MIN(rev) FROM _amux_state_events", [], |r| r.get(0))
-            .unwrap_or(None);
-        Some(match first_rev {
-            Some(r) => format!(
-                "no journal events for this entity; the journal's oldest retained rev is {r}, so anything before it is not enumerable"
-            ),
-            None => "the state-event journal is empty on this database".to_string(),
-        })
-    } else if payloadless > 0 {
-        Some(format!(
-            "{payloadless} of {n} events carry no post-mutation snapshot (pre-migration-0008 rows, or a write site that does not journal payloads) — those lines can say THAT the entity changed, not into what"
-        ))
+        (
+            Some(match &floor {
+                Some((r, at)) => format!(
+                    "no journal events for this entity; the journal is reaped and retains only from {at} (rev {r}), so anything before that is not enumerable"
+                ),
+                None => "the state-event journal is empty on this database".to_string(),
+            }),
+            None,
+        )
+    } else if predates_floor {
+        // THE CASE THIS FUNCTION USED TO MISS, and the common one. The zero-row
+        // arm above has always been careful; every other arm treated the rows it
+        // got as the entity's whole history. For anything older than the
+        // retention window that is false in the most misleading available way:
+        // the trail renders, it is internally consistent, and it silently begins
+        // partway through. A card created in June and closed in July shows its
+        // last fortnight of touches and reads as though that is all that ever
+        // happened to it.
+        let (r, at) = floor.as_ref().expect("predates_floor implies a floor");
+        (
+            Some(format!(
+                "these {n} events are the surviving TAIL of this entity's journal, not its history: the journal retains only from {at} (rev {r}) and this entity predates that floor. Everything older was reaped (AMUX_STATE_EVENTS_RETAIN_DAYS, default 14d) and is not recoverable from here"
+            )),
+            None,
+        )
     } else {
-        None
+        // A receipt: the entity was born inside the retained window, so for once
+        // the journal really is complete. Worth stating — without it, a reader
+        // who has learned to distrust the horizon cannot tell a complete trail
+        // from a truncated one, and the fix for the silent case would make every
+        // trail equally suspect.
+        (
+            None,
+            floor.as_ref().map(|(_, at)| {
+                format!("journal retained from {at}; this entity postdates that floor, so its journal history is complete")
+            }),
+        )
     };
-    if let Some(nt) = &note {
+    let payload_note = (payloadless > 0).then(|| format!(
+        "{payloadless} of {n} events carry no post-mutation snapshot (pre-migration-0008 rows, or a write site that does not journal payloads) — those lines can say THAT the entity changed, not into what"
+    ));
+    // The payloadless caveat used to be an `else if`, so it was SUPPRESSED on
+    // the zero-row arm and would now be suppressed on the truncation arm too.
+    // Two independent caveats about the same source are two caveats.
+    if let Some(nt) = &gap_note {
         w.gap(format!("_amux_state_events: {nt}"));
     }
+    if let Some(nt) = &payload_note {
+        w.gap(format!("_amux_state_events: {nt}"));
+    }
+    let note = match (gap_note, payload_note, extra) {
+        (Some(a), Some(b), _) => Some(format!("{a}. {b}")),
+        (Some(a), None, _) | (None, Some(a), _) => Some(a),
+        (None, None, e) => e,
+    };
     w.probe("_amux_state_events", q, n, total, note);
     Ok(())
 }
@@ -517,7 +585,7 @@ fn why_task(conn: &Connection, id: &str) -> rusqlite::Result<Value> {
     }
     w.probe("issues.log", format!("id='{id}'"), log_lines.len().min(PER_SOURCE_CAP), log_lines.len(), log_note);
 
-    collect_state_events(conn, &mut w, "task", id)?;
+    collect_state_events(conn, &mut w, "task", id, Some(created))?;
     collect_requests(conn, &mut w, &format!("/api/board/{id}%"), &format!("card {id}"))?;
 
     // Turn ledger: which agent turns claimed this task.
@@ -696,7 +764,11 @@ fn why_worker(conn: &Connection, key: &str) -> rusqlite::Result<Value> {
     w.subject = json!({"kind": "worker", "id": id, "display_name": name, "cwd": cwd, "provider": provider, "backend": backend});
     w.probe("_amux_workers", format!("id/display_name/alias = '{key}'"), 1, 1, None);
 
-    collect_state_events(conn, &mut w, "worker", &id)?;
+    // `_amux_workers` records no creation time, so the truncation caveat cannot
+    // be computed for a worker and the journal's floor is reported without a
+    // verdict about it. Stating the limit rather than passing a guess: a
+    // fabricated birth time would turn "unknown" into a confident "complete".
+    collect_state_events(conn, &mut w, "worker", &id, None)?;
 
     // Sessions: every time this worker was actually running.
     let total: usize = conn
@@ -854,6 +926,9 @@ fn why_command(conn: &Connection, id: &str) -> rusqlite::Result<Value> {
     w.found = true;
     w.subject = json!({"kind": "command", "id": id, "worker_id": worker_id, "state": state});
     w.probe("_amux_commands", format!("id='{id}'"), 1, 1, None);
+    // Read before the move: `queued_at` is RFC3339 TEXT here (not the millis that
+    // `cmd_history.ts` carries), and it is this command's birth time.
+    let queued_epoch = rfc3339_to_epoch(&queued_at);
     w.events.push(command_event(id.to_string(), command, state, queued_at, attempts));
     w.events.push(WhyEvent {
         at: None,
@@ -865,7 +940,7 @@ fn why_command(conn: &Connection, id: &str) -> rusqlite::Result<Value> {
         source: json!({"table": "_amux_commands", "id": id}),
         ordering: "append-order",
     });
-    collect_state_events(conn, &mut w, "command", id)?;
+    collect_state_events(conn, &mut w, "command", id, queued_epoch)?;
     collect_worker_turns(conn, &mut w, &worker_id)?;
     w.gap(
         "commands carry no per-attempt history table: `_amux_commands.state` holds only the CURRENT state, so intermediate transitions of this command are not recoverable — the state-event journal is the only place a transition could have been recorded".to_string(),
@@ -921,7 +996,7 @@ fn why_schedule(conn: &Connection, id: &str) -> rusqlite::Result<Value> {
     });
     collect_schedule_runs(conn, &mut w, id)?;
     collect_schedule_audit(conn, &mut w, id)?;
-    collect_state_events(conn, &mut w, "schedule", id)?;
+    collect_state_events(conn, &mut w, "schedule", id, Some(created))?;
     collect_requests(conn, &mut w, &format!("/api/schedules/{id}%"), &format!("schedule {id}"))?;
     Ok(w.finish())
 }
