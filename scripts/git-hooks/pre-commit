@@ -277,7 +277,29 @@ if echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
     echo "cargo clippy passed (test targets + lints)."
   else
     echo "clippy not installed - falling back to cargo check (lints NOT enforced)" >&2
-    cargo check --workspace --all-targets --quiet
+    # SAME BLAME ANALYSIS AS THE CLIPPY BRANCH ABOVE (AF-182 follow-up).
+    #
+    # This branch had the identical defect the branch above just fixed, sitting
+    # immediately beside it: a peer's uncommitted work refuses your commit and
+    # nothing says it is theirs. It matters MORE here, not less. The failure
+    # that reaches this branch is a COMPILE error rather than a lint, and the
+    # incident that motivated AF-182 was exactly that — a transient
+    # checks.rs/monitor.rs window where a struct gained a field in one file and
+    # its initializer had not been updated in the other yet, which is what a
+    # multi-file change looks like from a peer's build for the seconds between
+    # two writes. Attribution being available or not must not depend on whether
+    # a toolchain component happens to be installed.
+    #
+    # lint-blame parses `--> file:line` spans, which rustc emits in the same
+    # form clippy does, so an E0063 partitions exactly like a lint denial.
+    if ! _check_out=$(cargo check --workspace --all-targets --quiet 2>&1); then
+      printf '%s\n' "$_check_out" >&2
+      # Same guarantee as above: the aid runs after the raw output, its failure
+      # is swallowed, and the exit is unconditional.
+      CLIPPY_OUT="$_check_out" STAGED="$STAGED" \
+        python3 "$ROOT/scripts/git-hooks/lint-blame.py" >&2 || true
+      exit 1
+    fi
     echo "cargo check passed (including test targets)."
   fi
 fi
