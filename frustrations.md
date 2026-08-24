@@ -2210,6 +2210,8 @@ FIX: the detection now reaches a session — `.claude/session-freshness.sh` gain
 
 ## Developing on branches in the build source put my unreviewed code on the whole fleet
 AREA: cloud
+## amux's own debug log is the biggest thing on a disk amux is filing cards about
+AREA: instruments
 SEVERITY: blocks
 STATUS: open
 DATE: 2026-08-22
@@ -2978,3 +2980,130 @@ NOTE: the instrument was RIGHT and I read past it. The guard printed the inserti
   Third time today I have named the confirming-result blind spot and the first time it shipped
   something. Same axis as amux's migration-cost entry: our discipline answers CORRECTNESS and
   does not answer WHAT ACTUALLY SHIPS.
+## `amux board done` printed nothing for two minutes: an unreachable server HANGS the CLI instead of failing it
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-23
+SESSION: tsukimiya (WSL2)
+CARD: AMUX-40
+SYMPTOM: verifying that the freshly-installed bash CLI carried AEAB-36's fix, I ran
+  `AMUX_API=https://localhost:1 amux board done <id> --outcome "probe"` — the exact recipe
+  AEAB-36's own comment names as its deterministic reproduction ("Reproduced deterministically
+  with AMUX_API pointed at a dead port: one warning line, exit 7, no transition"). It printed
+  no warning and no error. It printed nothing at all, for the full 2 minutes until the calling
+  harness SIGTERMed it (exit 143). `bash -x` put it on the connect: `curl -sk -X PATCH ...
+  https://localhost:1/api/board/<id>` and no further trace. Re-run against an unresolvable
+  HOST (`https://amux-probe.invalid`, curl exit 6) the AEAB-36 die() fired perfectly, naming
+  both lost facts. Two shapes of "server unreachable", and the CLI could only report the one
+  that fails fast: on this machine a dead localhost port DROPS the SYN rather than refusing it
+  (`curl --max-time 5` → exit 28 on both :1 and :8899), and not one of the CLI's 41 curl call
+  sites had a `--connect-timeout` — 33 carried no timeout at all and 8 carried only `-m`, which
+  still hung for its whole budget because `-m` caps the transfer and is not the connect knob.
+COST: ~15 minutes chasing a "the fix did not install" theory against a CLI that was byte-identical
+  to the checkout, and the wrong conclusion was one step away: the probe AEAB-36 documents as its
+  own reproduction was the probe that silently failed to reproduce it. The general shape is worse
+  than the minutes — the failure mode this hides is exactly the one AEAB-36 was written for
+  ("the server happened to be restarting to adopt a new build"), i.e. every lane in the fleet
+  during every builder swap, and what they see is not an error but a wedged terminal.
+FIX: shipped on this branch. Two halves, because a fast failure that nothing records is still
+  invisible fleet-wide:
+  1. One `_curl` wrapper injects `--connect-timeout` (default 5s, `AMUX_CURL_CONNECT_TIMEOUT`)
+     and every call site routes through it. Not 41 edits: 41 of 41 sites forgot the flag, so the
+     rule has to be structural, and `tests/cli_curl_timeout_guard.rs` fails the build when a
+     curl invocation neither goes through `_curl` nor names the flag itself. The guard was run
+     against the UNFIXED file first and listed all 41 invocation sites — a guard that has never
+     failed is a guard nobody has checked.
+  2. On a transport failure `_curl` writes a breadcrumb (curl exit, method, and the URL with its
+     query string stripped — scheme, host and path, never the body, never the headers) and the
+     next invocation that CAN reach the server POSTs the backlog
+     to `/api/client-debug?kind=cli-transport-failure`. This is the only way the class becomes
+     sweepable: a request that never arrives cannot appear in the request log, so
+     `/api/logs/analyze` sees a hang and "nobody ran anything" as the same silence. Verified
+     end-to-end — 4.7s failure with AEAB-36's message, breadcrumb written, flushed on the next
+     command, readable back from `GET /api/client-debug` and durable as the INFO line in
+     server-rs.log. The flush ROTATES the file (`mv`) and deletes the snapshot only on a 2xx, so
+     what it deletes is exactly what it delivered. The first cut of it did not: it posted the
+     newest 200 lines and then cleared the whole file, so a backlog of 250 lost rows 1-50 unsent
+     while the truncate reported success — this same class one layer down, caught in review by
+     esteininger. Measured both ways against a local collector: old = server saw 200 of 250 and
+     the file was emptied; new = server saw 250 of 250, and on a non-2xx the snapshot goes back
+     with nothing delivered and nothing lost.
+CARD: AEAB-41
+SYMPTOM: `~/.amux/amux.db` is 1.8 GB on a volume with 1.8 GB free at 100% used. dbstat:
+  `_amux_invariant_result` 861 MB + its two indexes 871 MB = 1.73 GB; every other thing
+  amux stores adds up to ~90 MB. 9,420,181 rows over a hardcoded 7-day retention, ~1.72M
+  a day, and almost all of them are a PASS identical to the previous one. Half the write
+  rate is the two-server topology writing every check twice into one DB.
+COST: every rust build on this machine is now cold — the auto-builder's guard cleared its
+  1 GB target cache on each of the last three builds ("DISK LOW: 2GB free (< 8GB)").
+  Free space fell 3.7 GB -> 1.8 GB in two days and the table has not finished growing;
+  steady state is ~2.2 GB. Meanwhile AMUX-30, the card amux filed about the disk, still
+  reads "4.2 GB free" and names caches.
+FIX: retention as an env knob (deviation D4's shape — it is a code constant today), or
+  stop storing unchanged passes and keep transitions + an occurrences counter, which is
+  what `_amux_invariant_incident` already does one table over. Do NOT vacuum: a full copy
+  with 1.8 GB free reaches zero.
+
+## The disk ranker cannot rank a file, so it could never have named the 1.8 GB one
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-42
+SYMPTOM: `disk_candidates()` pushes only entries where `metadata().is_dir()`. Its own
+  cache, `~/.amux/du-sizes.json`, holds 26 entries and all 26 are directories. `amux.db`
+  would rank fourth, above `~/.claude`, and is absent.
+COST: the report meant to say what is eating the volume pointed at ~/Library/Caches,
+  ~/.npm and ~/.cache while the fourth-largest object was amux's own database — for as
+  long as that database has existed. I only found it by running dbstat by hand.
+FIX: push regular files over a size floor from the same read_dir passes; the size is
+  already in the metadata so there is no extra du cost. The lesson worth keeping: AEAB-33
+  taught the ranking to declare the candidates it FAILED on, and that warning can never
+  declare candidates it never GENERATED — after adding a surfacing mechanism, ask what
+  the mechanism itself cannot express.
+
+## I fixed the inner loop of a noisy warning and left the outer one, at 77% of the log
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-45
+SYMPTOM: 1,336 of 1,726 lines in the 24h window are one sentence naming `~/.Trash
+  (du exit 1)`, a condition that cannot change, emitted every autofix tick on each of two
+  servers. I wrote it in AEAB-33, and its own comment says it now fires "ONCE per run ...
+  rather than once per attempt" because the per-attempt spelling "drowned the log it
+  shares with real faults".
+COST: it competed for attention with three real findings in the same window (AEAB-41,
+  AEAB-42, AEAB-43). AEAB-13 recorded the identical shape at the identical ratio — 921 of
+  1004 lines — where it buried a first-ever `database is locked` line during a log review
+  that existed to find exactly that.
+FIX: reuse AEAB-13's tested `stall_log_first_this_bucket` rather than writing a second
+  spelling of it, keyed on the joined path list so a CHANGED skip set still logs
+  immediately. The pattern: a per-run dedupe is not a dedupe if the run is on a timer.
+
+## Two servers on one DB reap each other's live work and halve each other's thresholds
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux-errors-and-bugs
+CARD: AEAB-43
+SYMPTOM: `reap_orphaned_scans` runs `UPDATE reclaim_scans SET status='interrupted',
+  error='server restarted mid-scan; the scan thread did not survive' WHERE
+  status='running'` — no owner on the row. 8824 boots 10s after 8823 and reaps 8823's
+  healthy scan. Both of the two scans that have ever run say the thread did not survive;
+  both threads logged progress five minutes later, with no restart. And because every
+  terminal write is guarded `AND status='running'`, the true outcome can never be
+  recorded afterwards — it matches zero rows and logs nothing.
+  Separately: `reclaim_skipped` shows ~/Downloads at hits=2 with first_seen and last_seen
+  NINE SECONDS apart, so a threshold documented as "needs 2 such scans" was satisfied by
+  one incident counted twice, and ~/Downloads is now permanently skipped.
+COST: 2 of 2 reclaim scans ever run carry a false cause, on the machine where disk is the
+  live risk. Any hits-based threshold in amux is silently halved the same way.
+FIX: an owner column (pid or per-process boot ulid) on the scan row, reaping only rows
+  whose owner is neither this process nor a live pid. The general form, which is the
+  third entry this week under AEAB-11: any predicate that means "mine" or "twice" is
+  wrong on a shared DB with two writers, and the failures do not look alike from outside.
