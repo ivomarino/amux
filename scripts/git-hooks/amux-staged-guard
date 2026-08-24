@@ -471,12 +471,47 @@ def main():
     if _unc:
         _up = ", ".join((f.get("path") or "") for f in _unc[:6]) \
               + ((" (+%d more)" % (len(_unc) - 6)) if len(_unc) > 6 else "")
+        # AMUX-3560: WHETHER THIS SHIPS THEM IS KNOWABLE, so stop guessing.
+        #
+        # `git commit` with no pathspec commits THE INDEX, which on a shared
+        # checkout is one index shared by every session — so a peer staging
+        # files makes them yours to commit, silently, with the diff stat the
+        # only place it shows. c8272bf1 was meant to carry two files and carried
+        # six, four of them another session's in-flight work, and it took that
+        # session's name in the trailer too.
+        #
+        # `git commit -- <paths>` builds the commit from HEAD plus those paths
+        # and never reads the shared index, so unclaimed entries in it are
+        # irrelevant. Git tells a hook which form it is: with a pathspec it
+        # builds a TEMPORARY index and points GIT_INDEX_FILE at
+        # `.git/next-index-<pid>.lock`; without one, GIT_INDEX_FILE is
+        # `.git/index` (or unset). Verified both ways before relying on it.
+        #
+        # So the warning becomes a BLOCK for the form that actually ships them,
+        # and stays a warning for the form that cannot. This enforces what
+        # CLAUDE.md already requires ("`git commit -- <paths>` pathspec form
+        # always") rather than asking people to remember it — a rule that only
+        # asks you to remember is the shape ethos rule 6 warns about, and this
+        # repo has the incident to prove it.
+        _idx = os.environ.get("GIT_INDEX_FILE") or ""
+        _whole_index = (not _idx) or os.path.basename(_idx) == "index"
+        if _whole_index and os.environ.get("AMUX_ALLOW_UNCLAIMED") not in ("1", "true", "yes"):
+            w("\namux staged-guard: COMMIT BLOCKED — this commit takes the WHOLE "
+              "SHARED INDEX, which holds staged paths no session has an edit "
+              "record for:\n\n    " + _up + "\n\n"
+              "  On a shared checkout the index belongs to everyone, so a peer "
+              "staging a file makes it yours to commit. Scope the commit to your "
+              "own paths and the shared index is never read:\n\n"
+              "      git commit -m \"...\" -- <your paths>\n\n"
+              "  Or unstage what is not yours:  git restore --staged -- <path>\n"
+              "  If you have checked and they ARE yours from earlier, "
+              "AMUX_ALLOW_UNCLAIMED=1 proceeds.\n")
+            return 1
         w("amux staged-guard: UNCLAIMED STAGED PATHS — no edit record from ANY "
           "session in the window: " + _up + "\n"
-          "  If these are yours from earlier, fine. If you do not recognize one, "
-          "a peer staged it before the window and a plain commit ships it under "
-          "YOUR name. Commit path-scoped (git commit -- <your paths>) or "
-          "unstage (git restore --staged -- <path>).\n")
+          "  This commit is path-scoped, so the shared index is not what gets "
+          "committed and these do not ride along. Noted because if you did not "
+          "stage them, a peer did.\n")
     # AMUX-3446: staged ADDED lines the committer's OWN firsthand edit content
     # cannot account for — the one ownership signal that survives peer-record
     # expiry (7797e45 swept a peer's table row silently because their records
