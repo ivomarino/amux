@@ -2587,3 +2587,38 @@ NOTE: AF-124 fixed the read-only half of this class (a `cat` of a peer's file no
   narrower than it first reads: it is live only if the caveat did NOT print for amux on
   token-baseline.py. Asked; holding. What survives either way is the log line, which records
   `n=3 sent` and not which three.
+
+## An autofix card was dispatched for an incident that had already self-resolved
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux
+CARD: AMUX-3572
+SYMPTOM: AMUX-3572 was auto-picked-up and handed to me as live work: "Invariant
+  `queue.has_live_consumer` has been failing for amux across 629 evaluations and has not
+  self-healed." The incident row said otherwise. `_amux_invariant_incident` for
+  (queue.has_live_consumer, amux) read `status=pass, resolved_at=1787530412`, which is
+  2026-08-23 20:33 — roughly a minute BEFORE the pickup notice reached me. The card's text
+  and the store disagreed about the present tense, and only the card was delivered.
+COST: A full investigation of a healed incident. I read the check, the monitor, the filer and
+  the incident table, and formed and killed two hypotheses, before establishing that the thing
+  I was sent to diagnose had stopped happening before I was asked. The card does carry a
+  re-check recipe and it is the first thing I ran, but it queries `/api/health/invariants`,
+  which reports FAILURES ONLY — so a resolved incident and an invariant that was never
+  evaluated return the identical empty result, and the recipe cannot distinguish "fixed" from
+  "absent". Establishing it had genuinely resolved needed `/api/debug/invariants` plus a direct
+  read of the incident table, neither of which the card names.
+FIX: The filer already writes `resolved_at` on the incident row. When an incident resolves,
+  say so on the card it minted: annotate it, or move it out of the pickup queue, or at minimum
+  have the pickup notice read the incident's CURRENT status rather than the text frozen at
+  filing time. And point the card's re-check recipe at `/api/debug/invariants`
+  (`latest_per_invariant`), which is the only surface where a PASS is visible — a re-check that
+  cannot tell green from absent is the ethos rule 7 shape, embedded in the remediation advice
+  itself.
+NOTE: The underlying false positive IS fixed at the root (95d97a8e): the check's `expected`
+  string promised "within 300s of the target going idle" while the code measured
+  `now - queued_at`, so any lane with turns over 300s tripped it at every busy->idle transition
+  and cleared seconds later. That is what generated 629 occurrences. This entry is the OTHER
+  half and is not fixed: a card outliving its incident is independent of which detector filed
+  it, and the next self-healing incident will be dispatched exactly the same way.
