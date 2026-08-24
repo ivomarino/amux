@@ -654,6 +654,51 @@ fn card_event_count(conn: &Connection, etype: &str, card: &str, since: f64) -> i
     .unwrap_or(0)
 }
 
+/// How many times this exact card has been advance-nudged while sitting in
+/// this exact status, and when the most recent one was (AMUX-3563).
+///
+/// The status is part of the key on purpose: a card that MOVED has responded to
+/// the nudge, and the streak should start over rather than punish the card for
+/// its history. `advance.nudged` already records the status at nudge time
+/// (module header, line 67), so this needs no new write.
+fn advance_streak(conn: &Connection, card: &str, status: &str, since: f64) -> (i64, f64) {
+    conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(ts), 0) FROM session_events \
+         WHERE type='advance.nudged' AND ts > ?1 AND data LIKE ?2 \
+         AND json_extract(data, '$.status') = ?3",
+        rusqlite::params![since, format!("%\"{card}\"%"), status],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap_or((0, 0.0))
+}
+
+/// py `AMUX_ADVANCE_BACKOFF_MAX_S` — the ceiling on the doubling below.
+fn advance_backoff_max_s() -> f64 {
+    env_i64("AMUX_ADVANCE_BACKOFF_MAX_S", 6 * 3600) as f64
+}
+
+/// The gap this card must have had since its last nudge, given how many times
+/// it has already been nudged in this status.
+///
+/// AMUX-3563. The per-card budget (3 per 24h) is a COUNT WITH NO SPACING, and
+/// measured over 7 days that is the whole defect: TUBES-2063 spent its entire
+/// 24h budget in 40 MINUTES and then went silent for 23 hours, which is the
+/// worst of both — a burst that reads as nagging, then a gap long enough that
+/// the card is effectively forgotten. 28 (lane, card) pairs were nudged 3+
+/// times and account for 30% of all idle-holding injections, while 147 of 212
+/// pairs were nudged exactly once and are the nudge WORKING.
+///
+/// So this must not touch the first nudge. It only stretches the gap before
+/// each REPEAT: 15m, 30m, 1h, 2h, 4h, then the cap. A lane that answers the
+/// first prompt never encounters it.
+fn advance_required_gap_s(streak: i64) -> f64 {
+    if streak <= 0 {
+        return ADVANCE_COOLDOWN_S;
+    }
+    let doubled = ADVANCE_COOLDOWN_S * 2f64.powi(streak.min(8) as i32);
+    doubled.min(advance_backoff_max_s())
+}
+
 /// The lane's most recent nudge of ANY shape. Python kept this in memory
 /// (`_advance_last`) on a process that re-execs many times a day; deriving it
 /// from the durable event log is the same bound that actually survives.
@@ -2148,13 +2193,51 @@ pub fn select_advance(
     }
     let day_ago = now - 86400.0;
     let mut chosen: Option<(String, String)> = None;
+    // AMUX-3563: why the skip reasons below are worded per-candidate rather than
+    // as one count. A lane skipped for "budget-spent" and a lane skipped for
+    // "still inside the backoff gap" are different states with different
+    // remedies, and the only place either is visible is this string.
+    let mut backoff_skips: Vec<String> = Vec::new();
+    // The streak is measured since the card last MOVED, so a 24h lookback would
+    // reset it nightly and let a genuinely stuck card be re-nudged forever at
+    // the base interval. Bounded at 14d so a long-dead event log cannot make the
+    // gap grow without limit.
+    let streak_since = now - 14.0 * 86400.0;
     for (id, status) in &cands {
-        if card_event_count(conn, "advance.nudged", id, day_ago) < budget {
-            chosen = Some((id.clone(), status.clone()));
-            break;
+        if card_event_count(conn, "advance.nudged", id, day_ago) >= budget {
+            continue;
         }
+        let (streak, last_ts) = advance_streak(conn, id, status, streak_since);
+        let need = advance_required_gap_s(streak);
+        let since_last = now - last_ts;
+        if streak > 0 && last_ts > 0.0 && since_last < need {
+            backoff_skips.push(format!(
+                "{id} in '{status}': nudged {streak}x already, last {:.0}m ago, next not before \
+                 {:.0}m",
+                since_last / 60.0,
+                need / 60.0
+            ));
+            continue;
+        }
+        chosen = Some((id.clone(), status.clone()));
+        break;
     }
     let Some((card_id, status)) = chosen else {
+        // Two distinct exhaustion states, named separately. Folding them into
+        // one "budget-spent" would say the prompt was repeated to death when in
+        // fact it is deliberately waiting, and the operator's next move differs:
+        // budget-spent means the card needs a human or a retype, backoff means
+        // it will come round on its own.
+        if !backoff_skips.is_empty() {
+            return Advance::None {
+                reason: "backoff",
+                detail: format!(
+                    "all {} candidate(s) held by repeat-backoff — {}",
+                    cands.len(),
+                    backoff_skips.join("; ")
+                ),
+            };
+        }
         return Advance::None {
             reason: "budget-spent",
             detail: format!(
@@ -3500,6 +3583,93 @@ mod tests {
                 "unreadable nudge state must re-arm, not suppress (data={bad:?})"
             );
         }
+    }
+
+    /// AMUX-3563, built from the 7-day specimen rather than a convenient one.
+    ///
+    /// The measured defect: the per-card budget is 3 per 24h with NO SPACING,
+    /// so TUBES-2063 spent all three in 42 MINUTES and then went silent for 23
+    /// hours. Meanwhile 147 of 212 (lane, card) pairs were nudged exactly once,
+    /// which is the nudge working and must not change.
+    ///
+    /// The controls are the point. A backoff that also delays the FIRST nudge
+    /// would look like a bigger win in the aggregate and would be a regression:
+    /// it is the repeats that are waste, and the first prompt is the product.
+    #[test]
+    fn repeat_nudges_back_off_without_delaying_the_first() {
+        // The first nudge is never held, at any streak-0 state.
+        assert_eq!(
+            advance_required_gap_s(0),
+            ADVANCE_COOLDOWN_S,
+            "the first nudge about a card must not be delayed — 147 of 212 pairs \
+             in the specimen were nudged exactly once and that IS the feature"
+        );
+
+        // Repeats stretch: 15m, 30m, 1h, 2h...
+        assert_eq!(advance_required_gap_s(1), 30.0 * 60.0);
+        assert_eq!(advance_required_gap_s(2), 60.0 * 60.0);
+        assert!(
+            advance_required_gap_s(3) > advance_required_gap_s(2),
+            "each repeat must cost more than the last, or this is a flat cooldown \
+             wearing a backoff's name"
+        );
+
+        // TUBES-2063's actual burst: 3 nudges inside 42 minutes. The second one
+        // arrived 21 minutes in, which clears the flat 15m cooldown and is
+        // exactly why the flat cooldown did not stop it.
+        // The precondition is deliberately a compile-time assert: if the base
+        // cooldown is ever raised past the recorded burst spacing, this specimen
+        // stops demonstrating anything and the build should say so rather than
+        // the test quietly continuing to pass for the wrong reason. `const`
+        // form because clippy correctly rejects a runtime assert on constants.
+        const BURST_GAP_S: f64 = 21.0 * 60.0; // TUBES-2063's actual 2nd nudge
+        const _: () = assert!(BURST_GAP_S > ADVANCE_COOLDOWN_S);
+        assert!(
+            BURST_GAP_S < advance_required_gap_s(1),
+            "the 2nd nudge of the recorded burst must now be held; the burst \
+             cleared the old flat cooldown, which is why it happened at all"
+        );
+
+        // And it is bounded: a card nudged forever cannot push the gap to
+        // infinity and effectively mute itself.
+        let capped = advance_required_gap_s(40);
+        assert_eq!(capped, advance_backoff_max_s(), "the doubling must hit its cap");
+    }
+
+    /// The streak is keyed on STATUS, so a card that MOVED starts over. Without
+    /// this the backoff punishes a card for history it has already answered, and
+    /// a lane that acts on the nudge gets a longer wait as its reward.
+    #[test]
+    fn moving_the_card_resets_the_backoff_streak() {
+        let conn = Connection::open_in_memory().expect("memdb");
+        conn.execute_batch(
+            "CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
+                session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT,
+                idem TEXT, source TEXT NOT NULL DEFAULT '');",
+        )
+        .expect("schema");
+        for ts in [100.0, 200.0, 300.0] {
+            conn.execute(
+                "INSERT INTO session_events (ts, session, type, data) \
+                 VALUES (?1,'me','advance.nudged',?2)",
+                rusqlite::params![ts, r#"{"issue":"TUBES-2063","status":"doing"}"#],
+            )
+            .expect("insert");
+        }
+
+        let (streak, last) = advance_streak(&conn, "TUBES-2063", "doing", 0.0);
+        assert_eq!(streak, 3, "three nudges in 'doing' is a streak of three");
+        assert_eq!(last, 300.0, "and the most recent one is what the gap measures from");
+
+        // CONTROL: the same card in a different status has no history. This is
+        // what proves the status filter EXCLUDES rather than matching every row
+        // — an unbounded match and a correct one are identical from a count.
+        let (moved, _) = advance_streak(&conn, "TUBES-2063", "review", 0.0);
+        assert_eq!(moved, 0, "moving the card must reset the streak to zero");
+
+        // CONTROL: a different card is unaffected.
+        let (other, _) = advance_streak(&conn, "TUBES-9999", "doing", 0.0);
+        assert_eq!(other, 0, "the streak must be per-card, not per-status-globally");
     }
 
     /// AMUX-2825's non-negotiable constraint, which fe44d61 did not implement:
