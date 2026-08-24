@@ -2941,3 +2941,40 @@ NOTE: The generalisable part is not "index your subqueries". It is that CORRECTN
   only after watching the outage begin. For any migration that touches the live board,
   the cheap precondition is: how many rows does this scan, and is there an index for the
   predicate it scans on.
+
+---
+## A commit that compiles in the author's tree can be unbuildable AS A COMMIT
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-24
+SESSION: amux-frustrations
+CARD: AF-190
+SYMPTOM: My 53ae4b8b was the tip of origin/main and did not compile. Staging
+  crates/amux-server/src/api/board.rs took ~16 lines of a peer's in-flight AMUX-3607 wiring that
+  were sitting in the same FILE, including a call to `effective_gate_trail` whose definition was
+  in board_store.rs — still uncommitted in their tree, so not in mine.
+  `git show 53ae4b8b:crates/amux-server/src/db/board_store.rs | grep -c effective_gate_trail` -> 0,
+  while board.rs at that same commit calls it. Main was unbuildable until their f5c6af76 landed.
+COST: A broken tip on origin/main. CI runs per-tip so it went green, but a bisect through that
+  range still breaks, and per-commit CI would have gone red on someone else's PR. My clean local
+  `cargo check` and the pre-commit gate both passed, correctly: they check the TREE, which
+  contained the peer's definition. Nothing anywhere builds the COMMIT.
+FIX: The pathspec form CLAUDE.md mandates does not reach this — the peer's work was in the same
+  file as mine, so file-granular staging takes it regardless. Two things that would:
+  (a) The staged-guard already knows both facts it needs. It told me "34 insertions / 9 deletions
+      — if that is MORE than you wrote, their work is in it", and 5 of those 34 were the peer's.
+      It could also say: "you are committing board.rs, which a peer co-edited, and board_store.rs
+      is DIRTY and NOT in this commit" — a staged/dirty cross-reference, from data it already has.
+  (b) Build the COMMIT rather than the tree: a detached worktree at HEAD with its own target
+      dir, checked before the commit is pushed. MEASURED rather than guessed — 40.6s on the next
+      commit (be397da2), not the cold build I first wrote here, because cargo keys on content and
+      the dependency tree is unchanged between commits.
+  (a) is instant and names the hazard in words; (b) is the only thing that PROVES it. Not
+  alternatives: do (a) first, and make (b) opt-in (AMUX_VERIFY_COMMIT=1) before it is a default,
+  since the pre-commit gate already pays ~14s for clippy and this roughly triples it.
+NOTE: the instrument was RIGHT and I read past it. The guard printed the insertion count and the
+  exact question, and the number looked about right for my change so I did not reconcile it.
+  Third time today I have named the confirming-result blind spot and the first time it shipped
+  something. Same axis as amux's migration-cost entry: our discipline answers CORRECTNESS and
+  does not answer WHAT ACTUALLY SHIPS.
