@@ -412,8 +412,22 @@ def _has_cotenants(run_dir):
     guard that blocks when the server is down would wedge every lane."""
     try:
         import urllib.request, ssl
+        # `op` IS REQUIRED, and its absence here is what kept AF-156 alive
+        # after the server-side fix. git_guard.rs `hook_is_outdated` is
+        # `guard_version < 2 && !has_explicit_op`, and its doc comment justifies
+        # keying on `op` with "every modern client sends at least `op`" — a
+        # premise this file's own third POST contradicted, 170 lines below the
+        # path that fix was written for.
+        #
+        # Measured 2026-08-24: 212 OUTDATED HOOK WARNs AFTER the fix landed at
+        # 79e9c89c 06:12, including this checkout at 16:23:51 with a hook
+        # byte-identical to source. The warning's printed remedy is "Reinstall:
+        # scripts/install-hooks.sh", which reinstalls hooks that were already
+        # current — so a lane following it exactly sees no change and the
+        # warning returns within the hour (the AMUX-2140 shape, and the reason
+        # the server-side comment calls it worse than merely noisy).
         body = json.dumps({"session": os.environ.get("AMUX_SESSION", ""),
-                           "dir": run_dir, "paths": []}).encode()
+                           "dir": run_dir, "paths": [], "op": "cotenant-probe"}).encode()
         req = urllib.request.Request(
             amux_base_url() + "/api/git/staged-guard",
             data=body, method="POST",

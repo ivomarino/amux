@@ -192,7 +192,46 @@ def main():
     if dec({"foreign": [{"path": "a.rs"}]}) and "ABSORB" not in dec({"foreign": [{"path": "a.rs"}]}):
         failures.append("decision refusal must name the absorption hazard")
 
-    total = len(cases) + len(trio) + len(quad) + len(matrix)
+    # AF-156: EVERY POST to /api/git/staged-guard must carry `op`.
+    #
+    # The server decides whether a caller is a pre-rust hook with
+    # `guard_version < 2 && !has_explicit_op` (git_guard.rs `hook_is_outdated`),
+    # and its doc comment justifies that by asserting "every modern client sends
+    # at least `op`". This file is the client that premise is about, and its
+    # cotenant probe sent NEITHER field — so the fix landed at 79e9c89c 06:12 on
+    # 2026-08-24 and 212 OUTDATED HOOK WARNs followed it, including one naming
+    # this checkout at 16:23:51 whose hook was byte-identical to source.
+    #
+    # Parsed from the AST, not grepped: a grep for `"op"` is satisfied by the
+    # two bodies that already had it while a third omits it, which is exactly
+    # how this survived. Keyed on `paths`, which every staged-guard body carries
+    # and nothing else here does.
+    import ast as _ast
+    _src = _ast.parse(open(HOOK).read())
+    _bodies = 0
+    for _n in _ast.walk(_src):
+        if not (isinstance(_n, _ast.Call) and isinstance(_n.func, _ast.Attribute)
+                and _n.func.attr == "dumps" and _n.args
+                and isinstance(_n.args[0], _ast.Dict)):
+            continue
+        _keys = [k.value for k in _n.args[0].keys
+                 if isinstance(k, _ast.Constant) and isinstance(k.value, str)]
+        if "paths" not in _keys:
+            continue
+        _bodies += 1
+        if "op" not in _keys:
+            failures.append(
+                f"staged-guard POST body at line {_n.lineno} sends no `op` "
+                f"(keys: {_keys}) — the server will class it a pre-rust hook and "
+                f"warn hourly that a current hook is outdated (AF-156)")
+    # Vacuity guard: if the walk matched nothing, the loop above passes against
+    # a file that sends no `op` anywhere.
+    if _bodies < 3:
+        failures.append(
+            f"found only {_bodies} staged-guard POST bodies — the AST walk is not "
+            f"reaching them, so the `op` check above is vacuous")
+
+    total = len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:
