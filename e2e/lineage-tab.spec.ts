@@ -80,6 +80,27 @@ test.describe('board card lineage tab', () => {
     // So the DOM holds the last one to resolve, and first-match would be the
     // wrong ordinal exactly when there is more than one, which is the case this
     // race is made of.
+    //
+    // WHAT THIS SPEC CANNOT PROVE ABOUT ITS OWN FIX, measured 2026-08-24.
+    //
+    // Mutating the comparison back to a second `request.get` leaves this spec
+    // GREEN, 5 runs out of 5. A probe capturing both samples and diffing them
+    // reported DIVERGED=false every time, panel and later fetch each reading 2
+    // gaps and 3 empty sources. The window the 3-vs-2 failure came through does
+    // not open on this box today.
+    //
+    // So do not read a green run as evidence that this comparison is the right
+    // one, and do not read a surviving mutation as evidence the fix was
+    // pointless. The argument is structural rather than empirical: there is now
+    // exactly ONE sample of a moving target and it is the one the renderer
+    // consumed, so no timing can revive the class. Pre-fix code that is only
+    // SOMETIMES wrong cannot be made to go red on demand, which is the whole
+    // reason the window was closed by construction instead of narrowed.
+    //
+    // Also measured: exactly ONE /api/why response arrives per run, so the
+    // last-not-first ordinal below is currently unexercised. It stays because
+    // `_bdRenderLineage` re-fetches on every tab open and a second opener makes
+    // it load-bearing, not because anything here tests it.
     const whyBodies: Promise<unknown>[] = [];
     page.on('response', r => {
       if (r.url().includes(`/api/why/task/${encodeURIComponent(card)}`) && r.status() === 200) {
