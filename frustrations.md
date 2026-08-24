@@ -1522,6 +1522,33 @@ FIX: Derive both from ONE table. A view must share the predicate of the mechanis
 
 ---
 
+NOTE (2026-08-24, amux-frustrations — author): STILL LIVE, reproduced in two commands, and the
+  card reads `verified`.
+    contract  GET /api/board/contract -> investigation.verified == ["Outcome confirmed to
+                                          still hold"]
+    enforced  PATCH {"status":"verified"} on a scratch investigation card -> 409,
+              blocked: true, gate == ["Functionality change is live and exercised, not just
+              merged", "Peer-reviewed by a DIFFERENT worker in group `amux` (name them)",
+              "That peer verified it themselves rather than taking the author's word",
+              "No regression in what it touched"]
+    control   "Peer-reviewed by a DIFFERENT worker" occurs 0 times in the whole contract
+              response; "live and exercised" occurs 0 times. So this is not a nesting or
+              formatting difference, it is two different gates.
+  Unchanged from the 2026-08-20 report in every particular.
+  THE CARD SAYS `verified`. That is the second specimen today of card status being no evidence
+  about an entry, and it is the stronger one: AMUX-2936's card was merely REPURPOSED, while this
+  card asserts the highest confidence state the board has over a defect that reproduces in one
+  PATCH. Whatever was verified, it was not this.
+  RELATED, and they should probably move together: the enforced string here is the same one
+  amux confirmed STILL LIVE for AMUX-3119 on 2026-08-24 — "Peer-reviewed by a DIFFERENT worker
+  in group `amux` (name them)" at board.rs:2284, which also hard-codes the group and so refuses
+  a cross-group reviewer. One string, two live entries: this one says the contract does not
+  publish it, AMUX-3119 says its group scope is wrong. Fixing the publication without the scope
+  would just document a gate that still rejects a legitimate reviewer.
+  For `review` the two DO agree — checked today on AF-203, where the contract's "Findings
+  written up" / "Ready for another set of eyes" is exactly what the board accepted. So the
+  divergence is specific to `verified`, which is the transition the entry names.
+
 ## A wedged disk scan could not say whether the walk or the database was stuck
 AREA: instruments
 SEVERITY: slows
