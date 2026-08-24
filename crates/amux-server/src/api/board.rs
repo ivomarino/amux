@@ -1291,6 +1291,98 @@ fn qp_truthy(v: Option<&str>) -> bool {
 /// `-Terminal-Returned`) — a silent cap manufactured wrong absence claims
 /// twice in one week (AC-291, AC-301), so the two counts come from
 /// `cap_terminal` itself, never re-derived from list lengths.
+/// Who tripped the terminal-cap warning? (AEAB-54)
+///
+/// Returns `(user_agent, session)`, both always printable so the log line has no
+/// empty fields. Split out from the warn site so the FALLBACKS are testable —
+/// an attribution that silently degrades to blanks is the failure it exists to
+/// prevent.
+///
+/// The UA is capped at 60 chars: a browser UA is ~130 and would push the useful
+/// part of the line off the end, while the discriminating prefix
+/// (`curl/8.7.1`, `Mozilla/5.0 (iPhone...`) is in the first few.
+fn truncation_caller(headers: &HeaderMap) -> (String, String) {
+    let ua = headers
+        .get("user-agent")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.chars().take(60).collect::<String>())
+        .unwrap_or_else(|| "(none)".into());
+    let sess = headers
+        .get("x-amux-session")
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.is_empty())
+        .unwrap_or("(unattributed)")
+        .to_string();
+    (ua, sess)
+}
+
+#[cfg(test)]
+mod truncation_caller_tests {
+    use super::truncation_caller;
+    use axum::http::HeaderMap;
+
+    fn h(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            m.insert(
+                axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap(),
+                axum::http::HeaderValue::from_str(v).unwrap(),
+            );
+        }
+        m
+    }
+
+    /// THE CASE THAT MOTIVATED THIS. Every one of the 39 calls that tripped the
+    /// gate in 24h on 2026-08-24 was `curl/8.7.1` with NO session header — the
+    /// gate selects for ad-hoc consumers, and an ad-hoc consumer is exactly the
+    /// one that never sets attribution. So the UA has to carry the answer, and
+    /// the missing session must read as a stated fact rather than a blank.
+    #[test]
+    fn an_unattributed_curl_is_still_identified_by_its_user_agent() {
+        let (ua, sess) = truncation_caller(&h(&[("user-agent", "curl/8.7.1")]));
+        assert_eq!(ua, "curl/8.7.1");
+        assert_eq!(sess, "(unattributed)", "an absent session must not render as empty");
+    }
+
+    /// A worker tripping this is the serious case — the one worth chasing — so
+    /// the session must survive when it IS present.
+    #[test]
+    fn a_session_is_reported_when_present() {
+        let (_, sess) = truncation_caller(&h(&[
+            ("user-agent", "curl/8.7.1"),
+            ("x-amux-session", "amux-errors-and-bugs"),
+        ]));
+        assert_eq!(sess, "amux-errors-and-bugs");
+    }
+
+    /// Neither field may ever come back empty: an empty field in a structured
+    /// log reads as "no value recorded", which is indistinguishable from the
+    /// attribution never having been added at all.
+    #[test]
+    fn nothing_is_ever_blank_even_with_no_headers() {
+        let (ua, sess) = truncation_caller(&HeaderMap::new());
+        assert_eq!(ua, "(none)");
+        assert_eq!(sess, "(unattributed)");
+        // Present-but-empty is a distinct path from absent, and both must be
+        // handled — a client CAN send `X-Amux-Session:` with no value.
+        let (ua, sess) = truncation_caller(&h(&[("user-agent", ""), ("x-amux-session", "")]));
+        assert_eq!(ua, "(none)");
+        assert_eq!(sess, "(unattributed)");
+    }
+
+    /// The cap keeps the line readable. A real iPhone Safari UA is ~130 chars
+    /// and would push `hidden=`/`terminal_total=` off the end of the line.
+    #[test]
+    fn a_long_user_agent_is_capped_but_keeps_its_discriminating_prefix() {
+        let long = "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 \
+                    (KHTML, like Gecko) Version/26.6 Mobile/15E148 Safari/604.1";
+        let (ua, _) = truncation_caller(&h(&[("user-agent", long)]));
+        assert_eq!(ua.chars().count(), 60);
+        assert!(ua.starts_with("Mozilla/5.0 (iPhone"), "the prefix is what identifies it: {ua}");
+    }
+}
+
 pub async fn list_board(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1485,11 +1577,29 @@ pub async fn list_board(
         && p.slim.is_none()
         && p.done_limit.is_none()
     {
+        // AEAB-54: NAME THE CALLER. Without it the line says somebody may be
+        // miscounting and gives the reader nothing to check — and the whole
+        // point of the comment above is that the next lane "leaves a greppable
+        // trace", which a trace with no subject only half does.
+        //
+        // user-agent FIRST, and that ordering is the finding rather than a
+        // style choice. Measured 2026-08-24: all 39 calls that tripped this gate
+        // in 24h carried `curl/8.7.1` and an EMPTY x-amux-session — because the
+        // gate selects for ad-hoc consumers, and an ad-hoc consumer is precisely
+        // the one that never sets the session header. Attributing on session
+        // alone would have printed an empty field 39 times out of 39: a fix that
+        // looks like one and changes nothing.
+        //
+        // Session is still reported when present, because a WORKER tripping this
+        // is the more serious case and is the one worth chasing.
+        let (ua, sess) = truncation_caller(&headers);
         tracing::warn!(
             target: "board",
             hidden = term_total - term_kept,
             terminal_total = term_total,
             terminal_returned = term_kept,
+            caller_ua = %ua,
+            caller_session = %sess,
             "board list truncated {} terminal card(s) to the render cap — a caller reading the \
              plain /api/board as a 'done' denominator sees a partial set. Use ?all=1 or \
              ?status=done for the full set (AMUX-3154).",
