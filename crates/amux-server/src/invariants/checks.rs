@@ -412,8 +412,10 @@ pub fn reviewer_is_independent(cards: &[(String, String, String)]) -> Vec<Invari
 /// Five tables in this schema carry a column literally named `ts` and they use
 /// TWO different units, with nothing in the name to say which:
 ///
-///     SECONDS       _amux_request_log.ts, session_events.ts, token_ledger.ts
-///     MILLISECONDS  cmd_history.ts, interaction_log.ts
+/// ```text
+/// SECONDS       _amux_request_log.ts, session_events.ts, token_ledger.ts
+/// MILLISECONDS  cmd_history.ts, interaction_log.ts
+/// ```
 ///
 /// This has now cost four separate sessions. Two on one evening wrote
 /// `datetime(ts,'unixepoch')` against `interaction_log` and compared to a
@@ -2533,6 +2535,59 @@ mod negative_controls {
             rs.iter().all(|r| r.status == Status::Pass),
             "a deep queue behind a busy worker is correct, not a fault"
         );
+    }
+
+    /// An INDENTED block in a doc comment is a Markdown code block, so rustdoc
+    /// compiles it as Rust and `cargo test --doc` fails on it (AMUX-3577).
+    ///
+    /// This turned main red for three consecutive commits. It slipped through
+    /// every local gate because the routine everyone here runs is
+    /// `cargo test -p amux-server --lib`, and `--lib` DOES NOT RUN DOCTESTS —
+    /// so the tree was green locally and red in CI, which reads as a CI problem
+    /// rather than a source one. Putting the check in the lib suite is the
+    /// point: it has to fail where people actually look.
+    ///
+    /// The rule is precise, and the precision is what keeps it from crying
+    /// wolf. An indented block is only a code block when a BLANK doc line
+    /// precedes it; otherwise it is a lazy paragraph continuation and is
+    /// harmless. This file contains one of each, which is why only one failed.
+    #[test]
+    fn no_doc_comment_indents_a_block_into_an_accidental_doctest() {
+        for (path, src) in [
+            ("invariants/checks.rs", include_str!("checks.rs")),
+            ("invariants/monitor.rs", include_str!("monitor.rs")),
+        ] {
+            let lines: Vec<&str> = src.lines().collect();
+            let mut fenced = false;
+            for (i, line) in lines.iter().enumerate() {
+                let t = line.trim_start();
+                if t.starts_with("/// ```") || t.starts_with("//! ```") {
+                    fenced = !fenced;
+                    continue;
+                }
+                if fenced {
+                    continue;
+                }
+                let Some(body) = t.strip_prefix("///").or_else(|| t.strip_prefix("//!")) else {
+                    continue;
+                };
+                // Four spaces of body after the marker is the code-block trigger.
+                if !body.starts_with("    ") || body.trim().is_empty() {
+                    continue;
+                }
+                let prev = i
+                    .checked_sub(1)
+                    .map(|j| lines[j].trim_start())
+                    .unwrap_or("");
+                let prev_is_blank_doc = prev == "///" || prev == "//!";
+                assert!(
+                    !prev_is_blank_doc,
+                    "{path}:{} indents a block after a blank doc line — rustdoc will compile it \
+                     as Rust and `cargo test --doc` will fail. Fence it as ```text instead.\n  {line}",
+                    i + 1
+                );
+            }
+        }
     }
 
     /// AMUX-3572, rebuilt from the incident's own artifact rather than from the
