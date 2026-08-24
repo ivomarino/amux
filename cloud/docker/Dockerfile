@@ -56,6 +56,23 @@ COPY amux ./amux
 # so the next scripts/ include_str! does not re-break it; build-stage only (the
 # content is baked into the binary, the runtime stage needs none of it).
 COPY scripts scripts
+# frustrations.md IS A BUILD INPUT — the THIRD instance of this exact class
+# (AMUX-3033/AMUX-2936 for scripts/, and `amux` above before that). AF-191 added
+#   crates/amux-server/src/invariants/checks.rs:
+#     const MD: &str = include_str!("../../../../frustrations.md");
+# so cargo cannot compile amux-server without it. Missing here the build dies
+# with `couldn't read .../frustrations.md: No such file`, and it stays LATENT
+# until a deploy actually runs the build — rust CI compiles from the full
+# checkout, where the file is present.
+#
+# `dockerfile_copies_every_external_include_str_input` catches it before the
+# deploy does, which is why this was a red `check` on main rather than a broken
+# image. That test is the whole reason this is a one-line fix and not an
+# incident; the comments above record the two times it was an incident.
+#
+# Build-stage only: the content is baked into the binary by include_str!, so the
+# runtime stage needs none of it.
+COPY frustrations.md frustrations.md
 
 # --release is REQUIRED, not a preference. `rust-embed` is built without the
 # `debug-embed` feature, so a DEBUG binary reads the dashboard from
