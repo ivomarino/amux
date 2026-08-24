@@ -448,6 +448,8 @@ async fn async_main() {
     // exists. If every worker in the fleet is dead, the cards still get filed
     // and wait. Noticing is infrastructure; fixing is work.
     drop(runtime_jobs::autofix::spawn(state.clone()));
+    // AMUX-3579: enrol /api/board/commit-mentions, which had zero consumers.
+    drop(runtime_jobs::commit_mention_notes::spawn(state.clone()));
 
     // STORAGE RETENTION (AMUX-2700). Seven append-only tables and three cache
     // directories had no retention at all — not leaking, just working as

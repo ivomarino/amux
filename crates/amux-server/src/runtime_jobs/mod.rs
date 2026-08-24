@@ -49,6 +49,7 @@
 
 pub mod autofix;
 pub mod board_drive;
+pub mod commit_mention_notes;
 pub mod commit_nudge;
 pub mod disk_watch;
 pub mod ghost_rescue;
