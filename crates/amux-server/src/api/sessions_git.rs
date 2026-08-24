@@ -72,7 +72,38 @@ async fn git_toplevel(dir: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// ONE REFRESH AT A TIME (AMUX-3684). The TTL bounds how OFTEN the work runs;
+/// this bounds how MANY run at once, and without it the second number was the
+/// number of clients polling.
+///
+/// A `tokio::sync::Mutex` because it is held across the `.await` on the git
+/// fan-out below; the std one would block the runtime thread.
+static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 pub async fn sessions_git(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+    if let Some(v) = cached() {
+        return (StatusCode::OK, Json(v));
+    }
+
+    // CACHE STAMPEDE (AMUX-3684). The TTL made this cheap on a HIT and did
+    // nothing about a MISS: every concurrent request that arrived while the
+    // entry was expired ran the whole thing independently — `build_array` over
+    // ~120 sessions plus a `git rev-parse` per distinct checkout.
+    //
+    // Measured 2026-08-24, and the log makes it unarguable. Slow requests
+    // arrive in tight groups of FOUR at the same second, 30 seconds apart:
+    //   15:54:15  2463 2510 2372 2142 ms
+    //   15:54:45  1905 1923 1793 1693 ms
+    //   15:59:03  2300 1984 1939 1769 ms
+    // Four dashboard clients, one TTL expiry, four full recomputes — and only
+    // one of them was needed. Over 6h that is 707 of 1723 requests (41%) taking
+    // over a second, max 20.2s, on an endpoint the dashboard polls constantly.
+    //
+    // So: the first miss does the work, the rest WAIT and serve its result. The
+    // re-check after acquiring is what makes them cheap rather than merely
+    // serialised — without it the losers would each still do the full work,
+    // just politely one after another, which is slower than the stampede.
+    let _refresh = REFRESH.lock().await;
     if let Some(v) = cached() {
         return (StatusCode::OK, Json(v));
     }
@@ -148,6 +179,86 @@ pub async fn sessions_git(State(state): State<AppState>) -> (StatusCode, Json<Va
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-3684. Four concurrent misses must produce ONE recompute, not four.
+    ///
+    /// The specimen, from the request log: slow requests arrived in groups of
+    /// four at the same second, 30s apart — four dashboard clients, one TTL
+    /// expiry, four full recomputes of `build_array` + a git call per checkout.
+    /// Only one was needed.
+    ///
+    /// WHAT THIS COVERS, AND WHAT IT DOES NOT. It drives the real `REFRESH` and
+    /// `cached()` statics, so the single-flight PATTERN is genuinely exercised
+    /// — including the double-check, which is the part that makes the losers
+    /// cheap rather than merely serialised.
+    ///
+    /// It does NOT drive `sessions_git()` itself: the handler needs an
+    /// `AppState` with a populated store and shells out to git, so the body is
+    /// stubbed by a counter. That means this cell CANNOT go red if the handler
+    /// stops calling the pattern. Verified by mutation, not assumed: deleting
+    /// the handler's re-check leaves this green.
+    ///
+    /// Said out loud because a cell named for a stampede reads as if it guards
+    /// the endpoint, and this repo keeps finding tests that pin a real property
+    /// one layer above where the defect would be introduced. The handler's use
+    /// of the pattern is currently held by review alone; closing that needs the
+    /// single-flight extracted behind a seam the test can call, which is
+    /// tracked on AMUX-3684 rather than done here.
+    #[tokio::test]
+    async fn a_stampede_of_misses_recomputes_once() {
+        *CACHE.lock().unwrap() = None;
+        let computes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+        let one = |computes: std::sync::Arc<std::sync::atomic::AtomicUsize>| async move {
+            // Exactly the handler's shape: check, take the lock, CHECK AGAIN.
+            if cached().is_some() {
+                return;
+            }
+            let _g = REFRESH.lock().await;
+            if cached().is_some() {
+                return;
+            }
+            computes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            tokio::time::sleep(Duration::from_millis(40)).await; // the git fan-out
+            *CACHE.lock().unwrap() = Some((Instant::now(), json!({"a": 1})));
+        };
+
+        let hs: Vec<_> = (0..4).map(|_| tokio::spawn(one(computes.clone()))).collect();
+        for h in hs {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            computes.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "four concurrent misses must recompute ONCE — the other three exist to \
+             serve the winner's result, not to queue behind it"
+        );
+        assert!(cached().is_some(), "and the result must be cached for the next caller");
+        *CACHE.lock().unwrap() = None;
+    }
+
+    /// CONTROL: single-flight must not become a permanent lock. After the entry
+    /// expires, the NEXT caller has to be able to recompute — a mutex that
+    /// serialised forever while the cache stayed stale would pass the cell
+    /// above and freeze the branch map, which is the failure the TTL exists to
+    /// prevent.
+    #[tokio::test]
+    async fn the_refresh_lock_is_released_so_a_later_miss_still_recomputes() {
+        *CACHE.lock().unwrap() = None;
+        {
+            let _g = REFRESH.lock().await;
+            *CACHE.lock().unwrap() = Some((
+                Instant::now() - CACHE_TTL - Duration::from_secs(1),
+                json!({"stale": true}),
+            ));
+        } // lock dropped here
+        assert!(cached().is_none(), "premise: the entry is expired");
+        // The lock must be acquirable again, or every later miss deadlocks.
+        let g = tokio::time::timeout(Duration::from_secs(2), REFRESH.lock()).await;
+        assert!(g.is_ok(), "REFRESH was never released — later misses would hang");
+        drop(g);
+        *CACHE.lock().unwrap() = None;
+    }
 
     // The cache must actually expire — a TTL that never lets go turns a live
     // branch map into a frozen one, and the failure is invisible (the payload
