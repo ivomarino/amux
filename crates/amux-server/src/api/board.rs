@@ -152,6 +152,15 @@ async fn get_contract(
                                 sources.insert(
                                     st.to_string(),
                                     json!({
+                                        // AMUX-3573: `source`/`scope` are for a
+                                        // client that BRANCHES on the tier; the
+                                        // prose below is for a human reading a
+                                        // refusal. Both, because parsing the
+                                        // sentence is the alternative and it is
+                                        // the kind of coupling that breaks on a
+                                        // wording change nobody connects to it.
+                                        "source": src.token(),
+                                        "scope": src.scope(),
                                         "retype_would_change_it": src.retype_would_help(),
                                         "explain": src.explain(),
                                     }),

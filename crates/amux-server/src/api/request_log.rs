@@ -1314,6 +1314,36 @@ pub fn normalize_target(path: &str) -> String {
         .join("/")
 }
 
+/// The literal values sitting where the matched route declares a `{param}`.
+///
+/// AMUX-3573, and the specimen is this repo's own: the SPA asked
+/// `/api/board/gate?item=...` for two years' worth of gate dialogs. That path IS
+/// routed — `/api/board/{id}` matches it — so `route.callers_have_routes` passed
+/// the whole time while every request 404'd inside the handler looking for a
+/// card named "gate", and the client silently fell back to a resolver its own
+/// comment calls wrong. A static segment colliding with a param route is
+/// invisible to any check that asks "does a route match this".
+///
+/// The discriminator is the literal itself, and it is not a heuristic. Measured
+/// over the live log: 404s under `/api/board/` carried `session-gates` 2281
+/// times, `gate` 25, `commit-mentions` 12, `--help` 11 — against real card ids
+/// at 4 and 5. Records that are genuinely missing are missing one at a time;
+/// a route collision hammers one constant string.
+fn param_literals_of(path: &str) -> Vec<String> {
+    let Some(e) = best_route(path) else { return Vec::new() };
+    let want = path.split('?').next().unwrap_or(path);
+    e.path
+        .split('/')
+        .zip(want.split('/'))
+        .filter(|(decl, _)| decl.starts_with('{') || decl.starts_with(':'))
+        // A wildcard tail (`{*verb}`) can swallow several segments and the zip
+        // only lines up the first, so it is skipped rather than reported half
+        // right — a partial literal would read as a collision that is not one.
+        .filter(|(decl, lit)| !decl.contains('*') && !lit.is_empty())
+        .map(|(_, lit)| lit.to_string())
+        .collect()
+}
+
 /// The methods actually mounted where `path` dispatches (`["*"]` = any), or
 /// empty when no route claims the path at all.
 pub(crate) fn routed_methods_at(path: &str) -> Vec<&'static str> {
@@ -1401,6 +1431,14 @@ struct ErrGroup {
     method: String,
     status: i64,
     family: String,
+    /// AMUX-3573. How often each LITERAL value appeared where `normalize_target`
+    /// wrote a `{param}`. A 404 on `/api/board/{id}` is two completely different
+    /// bugs depending on this: many DISTINCT ids is someone asking for records
+    /// that are gone, one REPEATED literal is a static path colliding with the
+    /// param route and never reaching a handler. Normalizing is what makes this
+    /// log readable and it is also what fused those two, so the discriminator
+    /// has to be kept alongside the group rather than recovered from it.
+    param_literals: std::collections::HashMap<String, u64>,
 }
 
 /// GET /api/logs/analyze?since_h=24 — the diagnosis endpoint. Groups every
@@ -1479,6 +1517,7 @@ async fn analyze(
                 method,
                 status,
                 family,
+                param_literals: std::collections::HashMap::new(),
             });
             g.count += 1;
             // min/max, never positional: the scan is newest-first now
@@ -1486,6 +1525,11 @@ async fn analyze(
             // group's OLDEST hit as its most recent.
             g.first_ts = g.first_ts.min(ts);
             g.last_ts = g.last_ts.max(ts);
+            if g.param_literals.len() < 200 {
+                for lit in param_literals_of(&path) {
+                    *g.param_literals.entry(lit).or_insert(0) += 1;
+                }
+            }
             if g.clients.len() < 1000 {
                 g.clients.insert(ident);
             }
@@ -1534,6 +1578,34 @@ async fn analyze(
                 v["routed_methods"] = json!(routed);
                 if g.status == 404 {
                     v["nearest_routes"] = json!(nearest_routes(&g.sample_path, 3));
+                    // AMUX-3573: separate "records are missing" from "a static
+                    // path is being eaten by the param route". Both render as
+                    // the same normalized target, which is what hid this for so
+                    // long, so the split is stated rather than left derivable.
+                    let mut lits: Vec<(&String, &u64)> = g.param_literals.iter().collect();
+                    lits.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                    if let Some((top, n)) = lits.first().copied() {
+                        v["top_param_literals"] = json!(lits
+                            .iter()
+                            .take(5)
+                            .map(|(l, c)| json!({ "value": l, "count": c }))
+                            .collect::<Vec<_>>());
+                        v["distinct_param_literals"] = json!(g.param_literals.len());
+                        // One literal carrying most of a multi-hit group is a
+                        // caller pointing at a path that does not exist. The
+                        // floor is there because 2-of-2 proves nothing.
+                        if g.count >= 5 && *n * 2 > g.count && g.param_literals.len() > 1 {
+                            v["likely_route_collision"] = json!(true);
+                            verdicts.push(format!(
+                                "404 {} {}: {} of {} used the SAME literal '{}' where the route \
+                                 declares a parameter. That is a caller asking for a path that is \
+                                 not mounted — the param route matches it, so the request reaches \
+                                 the wrong handler and 404s there. Check whether '{}' was meant to \
+                                 be its own route.",
+                                g.method, target, n, g.count, top, top
+                            ));
+                        }
+                    }
                 }
                 if g.status == 405 {
                     verdicts.push(verdict_405(&g.method, &target, &routed, &g.sample_path));
@@ -1893,6 +1965,54 @@ pub async fn debug_routes() -> axum::Json<Value> {
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-3573, from the live specimen rather than a constructed one.
+    ///
+    /// The SPA called `/api/board/gate?item=...` and `/api/board/{id}` matched
+    /// it, so every routing check passed while the handler 404'd looking for a
+    /// card named "gate". The fix is to keep the LITERAL that landed in the
+    /// param slot, because the normalized target is identical for a collision
+    /// and for a record that is genuinely gone.
+    ///
+    /// The controls carry the weight. A wildcard tail must be skipped (it
+    /// swallows several segments and a half-matched literal reads as a
+    /// collision that is not one), and a path with no param must yield nothing
+    /// at all — otherwise the detector fires on every 404 in the system.
+    #[test]
+    fn param_literals_keep_the_value_that_a_normalized_target_throws_away() {
+        // The specimen: "gate" is what makes this diagnosable at all.
+        let lits = super::param_literals_of("/api/board/gate?item=AMUX-1&status=done");
+        assert_eq!(lits, vec!["gate".to_string()], "the param literal must survive normalization");
+
+        // ...and it is exactly what normalize_target discards, which is the
+        // whole reason this function exists.
+        assert_eq!(
+            super::normalize_target("/api/board/gate?item=AMUX-1"),
+            super::normalize_target("/api/board/AMUX-9999"),
+            "precondition: a collision and a missing card normalize IDENTICALLY, \
+             so the group alone cannot tell them apart"
+        );
+
+        // A real card id lands in the same slot — the function does not judge,
+        // it reports, and the count across a group is what discriminates.
+        assert_eq!(super::param_literals_of("/api/board/AMUX-9999"), vec!["AMUX-9999".to_string()]);
+
+        // CONTROL: a wildcard tail is skipped rather than half-reported.
+        for p in ["/api/sessions/amux/peek", "/api/sessions/amux/send"] {
+            let l = super::param_literals_of(p);
+            assert!(
+                !l.iter().any(|s| s == "peek" || s == "send"),
+                "a {{*wildcard}} segment must not be reported as a param literal ({p} -> {l:?})"
+            );
+        }
+
+        // CONTROL: a fully-static routed path has no literals, so the detector
+        // is silent on the majority of traffic instead of flagging all of it.
+        assert!(
+            super::param_literals_of("/api/board/contract").is_empty(),
+            "a static route has no param slot and must yield nothing"
+        );
+    }
+
     /// AF-116: ROUTE_TABLE is hand-maintained beside the mounts, so it drifts
     /// exactly the way the MIGRATIONS array did (AF-99: a .sql on disk was
     /// never registered; the fix was a check that fails when the two

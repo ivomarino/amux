@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.711';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.712';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24571,11 +24571,45 @@ async function _gateResolve(item, statusId) {
   const id = item && item.id;
   if (id) {
     try {
-      const r = await fetch(API + '/api/board/gate?item=' + encodeURIComponent(id)
-                            + '&status=' + encodeURIComponent(statusId));
+      // AMUX-3573. This asked `/api/board/gate?item=...` and that route HAS
+      // NEVER EXISTED: only /api/board/session-gates and /api/board/contract are
+      // mounted, so the request fell through to `/api/board/:id` with id="gate"
+      // and came back 404 {"error":"item not found","id":"gate"}. r.ok was false
+      // every single time, so EVERY gate dialog in the SPA silently used
+      // _effectiveGate — the local fallback whose own comment says it is
+      // "MISSING the TYPE layer the server enforces" and that this is "why the
+      // dialog showed the global gate for 9 of 13 live card types". AMUX-2330's
+      // fix has been inert since it shipped.
+      //
+      // Nothing could catch it: `route.callers_have_routes` asks whether a route
+      // MATCHES the path, and `/api/board/:id` does match, so the check passes
+      // while the handler 404s. A static segment colliding with a `:param` route
+      // is invisible to it by construction.
+      //
+      // /api/board/contract?card= is the endpoint that actually answers this,
+      // and it carries the SOURCE as well, which is the rest of this card.
+      const r = await fetch(API + '/api/board/contract?card=' + encodeURIComponent(id));
       if (r.ok) {
         const d = await r.json();
-        if (Array.isArray(d.gate)) return { gate: d.gate, source: d.source || '', stale: false };
+        const ce = (d && d.card_effective_gates) || {};
+        const g = ce.gates && ce.gates[statusId];
+        if (Array.isArray(g)) {
+          const src = (ce.gate_sources && ce.gate_sources[statusId]) || {};
+          return {
+            gate: g,
+            source: src.source || '',
+            scope: src.scope || '',
+            explain: src.explain || '',
+            retypeHelps: !!src.retype_would_change_it,
+            stale: false,
+          };
+        }
+        // A card with NO gate for this status is a real answer, not a miss.
+        // Falling through here would show the local resolver's invented gate
+        // for a transition the server would have waved straight through.
+        if (ce.gates && typeof ce.gates === 'object') {
+          return { gate: [], source: 'server', scope: '', stale: false };
+        }
       }
     } catch (e) { /* offline — fall through, and SAY so rather than lying */ }
   }
@@ -24603,7 +24637,18 @@ async function _gateConfirm(item, targetStatusId) {
       // A dialog that silently shows the wrong checklist is exactly AMUX-2330.
       + (_res.stale
           ? '<div style="font-size:0.75rem;color:var(--warn,#e0a33e);border:1px solid var(--warn,#e0a33e);border-radius:7px;padding:7px 9px;margin-bottom:10px;">Offline — these are the column defaults, not the criteria the server will enforce for this card&rsquo;s type. The move may still be refused.</div>'
-          : (_res.source ? '<div style="font-size:0.72rem;color:var(--dim);margin:-6px 0 10px;">criteria from: '+esc(_res.source)+'</div>' : ''))
+          // AMUX-3573: a gate the card INHERITED from its worker or group is the
+          // case a human needs told, and it was the one case nothing told them.
+          // The type default is the unremarkable majority and stays a quiet
+          // line; worker/group/column/card get a badge naming the scope, because
+          // those are the tiers retyping cannot move and "change the type" is
+          // the first thing anyone reaches for when a gate looks wrong.
+          : (_res.source === 'worker' || _res.source === 'group' || _res.source === 'column' || _res.source === 'card'
+              ? '<div style="font-size:0.75rem;color:var(--accent);border:1px solid var(--accent);border-radius:7px;padding:7px 9px;margin-bottom:10px;">'
+                + 'These criteria come from the <b>' + esc(_res.source) + '</b> scope'
+                + (_res.scope ? ' (<b>' + esc(_res.scope) + '</b>)' : '')
+                + ', not from this card&rsquo;s type. Retyping the card will not change them.</div>'
+              : (_res.source ? '<div style="font-size:0.72rem;color:var(--dim);margin:-6px 0 10px;">criteria from: '+esc(_res.source === 'type' ? 'the item type' : _res.source)+'</div>' : '')))
       + '<div id="_gate-list" style="margin-bottom:14px;">'+rows+'</div>'
       + '<div class="amux-modal-foot" style="display:flex;gap:8px;justify-content:space-between;align-items:center;">'
       + '<span id="_gate-count" style="font-size:0.75rem;color:var(--dim);"></span>'

@@ -457,6 +457,36 @@ impl GateSource {
         matches!(self, GateSource::TypeDefault)
     }
 
+    /// The tier as a stable token, for a CLIENT that must branch on it rather
+    /// than show it (AMUX-3573).
+    ///
+    /// `explain()` below is prose and it is the right thing for a refusal body,
+    /// but the SPA needs to decide whether to render a badge and which one, and
+    /// the only alternatives to a token are parsing that sentence or inferring
+    /// from `retype_would_help` — which cannot separate Worker from Group from
+    /// Column, the three tiers a human most needs told apart. Kept short and
+    /// lowercase because it is an identifier, not a label.
+    pub fn token(&self) -> &'static str {
+        match self {
+            GateSource::Card => "card",
+            GateSource::Worker(_) => "worker",
+            GateSource::Group(_) => "group",
+            GateSource::Column => "column",
+            GateSource::TypeDefault => "type",
+        }
+    }
+
+    /// The named scope the gate came from (`amux`, `group:amux`, …), or empty
+    /// for tiers that have no scope to name. Separate from `token` so a client
+    /// can render "group amux" without string-splitting the token.
+    pub fn scope(&self) -> String {
+        match self {
+            GateSource::Worker(w) => w.clone(),
+            GateSource::Group(g) => g.clone(),
+            GateSource::Card | GateSource::Column | GateSource::TypeDefault => String::new(),
+        }
+    }
+
     /// A sentence for the refusal body, so the operator learns WHERE the bar
     /// came from instead of being sent to change something irrelevant.
     pub fn explain(&self) -> String {
