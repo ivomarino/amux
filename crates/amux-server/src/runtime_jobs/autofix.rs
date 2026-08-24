@@ -719,6 +719,10 @@ pub(crate) fn detect_latency_at(
     let min_n = latency_min_samples();
 
     let mut per_family: BTreeMap<String, FamilySamples> = BTreeMap::new();
+    // Hoisted so the blindness check below can quote them (AF-180): the zero
+    // answer is only useful next to how much was looked at.
+    let mut considered_rows = 0usize;
+    let mut excluded_rows = 0usize;
     // Rows stamped slow_ok are REQUESTED latency, not service latency
     // (AMUX-3513): a browser `wait` action polls for up to its caller-chosen
     // budget and a timed-out wait is a 200 at exactly that budget — twelve of
@@ -793,6 +797,8 @@ pub(crate) fn detect_latency_at(
                 "latency: scanned request rows; excluded those whose clock spans this \
                  process's start — wall time across a restart is not service time (AF-175)"
             );
+            considered_rows = considered;
+            excluded_rows = spanned_restart;
             if considered >= 400_000 {
                 // The query's LIMIT is binding, so the sample is a silent,
                 // unordered truncation of the period rather than the period.
@@ -810,7 +816,9 @@ pub(crate) fn detect_latency_at(
     // than judged inline because one card naming every affected family is a
     // report, and one card per family is a backlog (rule 5).
     let mut collapsed: Vec<(String, &'static str, usize)> = Vec::new();
+    let mut families_seen = 0usize;
     for (fam, fs) in per_family {
+        families_seen += 1;
         // A SIDE WITH PLENTY OF ROWS AND NO SURVIVORS IS A DETECTOR OUTAGE, not
         // a quiet endpoint. Nothing legitimately discards 100% of a busy
         // family's rows: `slow_ok` is excluded in SQL and never reaches this
@@ -925,6 +933,29 @@ pub(crate) fn detect_latency_at(
     // two busiest families in the system. It was found by a human reading that
     // specific commit. Nothing in amux could have surfaced it, which is the
     // half that makes a fix a class kill rather than one bug.
+    if collapsed.is_empty() {
+        // AF-180 (amux, reviewing AF-178): A HEALTHY ALARM AND A BROKEN ONE ARE
+        // BYTE-IDENTICAL SILENCES. The collapse check above is an ordinary
+        // Finding, which is right for reaching a human but means it speaks only
+        // when the fault occurs — so "the blindness alarm ran and found nothing"
+        // and "the blindness alarm was never wired in" look the same from
+        // outside. That is this detector's own thesis one level up, and AF-178
+        // called this half the part that makes it a class kill.
+        //
+        // The zero goes through `suppressed`, which already means "a candidate
+        // the detector considered and declined" and is already rendered by
+        // GET /api/debug/autofix. No new mechanism, no new process state, and
+        // the healthy answer appears exactly where the unhealthy one would.
+        suppressed.push(sup(
+            DetectorKind::Latency,
+            "latency|input-collapsed",
+            &format!(
+                "blindness check ran: 0 of {families_seen} families lost every row to \
+                 filtering ({considered_rows} rows considered, {excluded_rows} excluded). \
+                 A zero here is a measurement; silence would not be."
+            ),
+        ));
+    }
     if !collapsed.is_empty() {
         let mut fams: Vec<&str> = collapsed.iter().map(|(f, _, _)| f.as_str()).collect();
         fams.sort_unstable();
@@ -4618,6 +4649,67 @@ mod tests {
         assert!(
             !s2.iter().any(|x| x.signature == "latency|p95|/api/collapse"),
             "a 60-row baseline needs no suppression — if this fires the rows were dropped: {s2:?}"
+        );
+    }
+
+    /// AF-180, filed back to me by amux reviewing AF-178, and the finding is
+    /// this card's own thesis one level up.
+    ///
+    /// The collapse alarm is an ordinary Finding, which is right for reaching a
+    /// human, but a Finding speaks only when the fault occurs. So "the blindness
+    /// check ran and found nothing" and "the blindness check was never wired in"
+    /// are byte-identical silences, which is exactly the confusion AF-178 exists
+    /// to end one layer down. Checked rather than assumed: 462 invariants
+    /// evaluated and none matches this, and /api/debug/autofix lists `detectors`
+    /// as a static array of names with no per-detector result.
+    ///
+    /// A zero is a measurement. Silence is not.
+    #[tokio::test]
+    async fn a_healthy_blindness_check_says_it_ran_instead_of_staying_quiet() {
+        let (st, _d) = state();
+        let now = unix_now();
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/ok", family: "/api/ok", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+        }
+        for i in 0..60 {
+            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/ok", family: "/api/ok", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+        }
+        let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, None);
+        assert!(
+            !f.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            "nothing collapsed, so nothing files: {f:?}"
+        );
+        let row = s
+            .iter()
+            .find(|x| x.signature == "latency|input-collapsed")
+            .unwrap_or_else(|| panic!("the healthy answer must be VISIBLE, not implied by an absence: {s:?}"));
+        assert!(
+            row.reason.contains("0 of 1 families"),
+            "quote the zero AND the population it is out of: {:?}",
+            row.reason
+        );
+        assert!(
+            row.reason.contains("120 rows considered"),
+            "a zero is only useful next to how much was looked at: {:?}",
+            row.reason
+        );
+
+        // CONTROL — when something DOES collapse, the healthy row must be gone
+        // and the finding present. Both states are visible and they are
+        // mutually exclusive, so a reader can never mistake one for the other.
+        let (st2, _d2) = state();
+        let boot = now - 100_000.0;
+        for i in 0..60 {
+            log_row(&st2, Row { ts: boot + i as f64, method: "GET", path: "/api/gone", family: "/api/gone", status: 200, body: "", worker: "", ua: "curl/8", ms: 200_000.0 });
+        }
+        let (f2, s2) = detect_latency_at(&st2.store.read().unwrap(), now, Some(boot));
+        assert!(
+            f2.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            "a wiped family must file: {f2:?}"
+        );
+        assert!(
+            !s2.iter().any(|x| x.signature == "latency|input-collapsed"),
+            "the all-clear must not be published in the same tick as the alarm: {s2:?}"
         );
     }
 
