@@ -1348,6 +1348,12 @@ pub(crate) struct Verdict {
     pub foreign: Vec<Value>,
     pub shared: Vec<Value>,
     pub unclaimed: Vec<Value>,
+    /// A peer's work is being SPLIT by this commit (AF-190).
+    ///
+    /// One row per (staged file a peer co-edited, that peer's dirty files this
+    /// commit leaves behind). It is a hazard about the COMMIT, not about the
+    /// tree, and it is the one thing no other check here can see.
+    pub split_risk: Vec<Value>,
 }
 
 /// How the winning owner's claim to a path arose (MG-1484): `firsthand` (an
@@ -1619,7 +1625,80 @@ pub(crate) fn classify(
             ),
         }));
     }
+    split_risk(paths, inp, &mut v);
     v
+}
+
+/// A COMMIT that cannot compile, from a TREE that can (AF-190).
+///
+/// THE SPECIMEN: `53ae4b8b` was the tip of `origin/main` and did not build.
+/// Staging `api/board.rs` took ~16 lines of a peer's in-flight AMUX-3607 wiring
+/// out of the same FILE, including a call to `effective_gate_trail`, which was
+/// defined in `db/board_store.rs` and still uncommitted in their tree. The
+/// caller's `cargo check` passed and the pre-commit gate passed, both correctly:
+/// they check the TREE, which held the peer's definition. Nothing anywhere
+/// builds the COMMIT.
+///
+/// The pathspec rule does not reach this. `git commit -- <paths>` protects
+/// against sweeping whole unrelated FILES; the peer's work was in a file the
+/// committer was legitimately editing, so file-granular staging takes it whole.
+///
+/// WHY THIS IS ALMOST FREE: the guard already holds both halves. It knows which
+/// staged files a peer co-edited (that is `foreign`/`shared`) and it knows which
+/// paths are `dirty`. One cross-reference turns them into the hazard. What it
+/// costs is a set intersection over data already in memory.
+///
+/// IT STATES A FACT, IT DOES NOT POSE A QUESTION, and that is the load-bearing
+/// design choice rather than a stylistic one. The guard ALREADY printed the
+/// discriminating number for this specimen ("34 insertions / 9 deletions — if
+/// that is MORE than you wrote, their work is in it") and its author read past
+/// it, because 34 looked about right for the edit they had made. A number
+/// matching your expectation is exactly where a check gets skipped. Any remedy
+/// that asks the committer to do arithmetic fails the same way.
+///
+/// SILENT unless a peer who co-edited a STAGED file also has dirty work OUTSIDE
+/// the commit. A warning that fires on every commit is one nobody reads, which
+/// is how the insertion-count line came to be ignored in the first place.
+fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
+    let staged: HashSet<&String> = paths.iter().map(|(_, ap)| ap).collect();
+    // Which peers co-edited something in THIS commit, and which staged file
+    // implicated each. Ordered so the output is stable for a test and for a
+    // human diffing two runs.
+    let mut by_owner: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+    for (rel, ap) in paths {
+        if let Some((owner, _)) = inp.theirs.get(ap) {
+            by_owner.entry(owner.as_str()).or_default().push(rel);
+        }
+    }
+    for (owner, staged_rels) in by_owner {
+        // The same peer's other work, still dirty, and NOT in this commit.
+        let mut left: Vec<&String> = inp
+            .theirs
+            .iter()
+            .filter(|(p, (o, _))| o == owner && inp.dirty.contains(*p) && !staged.contains(p))
+            .map(|(p, _)| p)
+            .collect();
+        if left.is_empty() {
+            continue;
+        }
+        left.sort();
+        v.split_risk.push(json!({
+            "owner": owner,
+            "staged": staged_rels,
+            "left_dirty": left,
+            "why": format!(
+                "you are committing {} — which '{owner}' co-edited — while {} of THEIR files \
+                 are dirty and NOT in this commit. A symbol added on one side may be missing \
+                 from the other, so this commit can fail to build even though your tree \
+                 compiles: your tree has their uncommitted half and the commit does not. \
+                 Nothing else here checks that, because `cargo check` and the pre-commit gate \
+                 both build the TREE. Either include their files, or leave their lines out of \
+                 yours (`git add -p`), or confirm with them.",
+                staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                left.len()
+            ),
+        }));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1663,6 +1742,14 @@ impl Envelope {
             "foreign": self.verdict.foreign,
             "shared": self.verdict.shared,
             "unclaimed": self.verdict.unclaimed,
+            // AF-190. A NEW KEY, not folded into `foreign`, and the reason is
+            // the one stated a few lines up in `classify`: installed hooks block
+            // on `foreign` being non-empty, and this is a WARNING about a build,
+            // not a claim that the staged bytes are somebody else's. Putting it
+            // in `foreign` would start blocking commits that are perfectly
+            // legitimate. Older hooks ignore the key, which is the correct
+            // degradation for an advisory.
+            "split_risk": self.verdict.split_risk,
             "unaccounted": self.unaccounted,
             "cotenants": self.cotenants,
             "window_secs": self.window as i64,
@@ -2852,6 +2939,97 @@ mod tests {
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
         g.theirs_firsthand.insert(format!("/repo/{path}"));
         g
+    }
+
+    /// AF-190, rebuilt from the incident's own artifact rather than a
+    /// convenient shape.
+    ///
+    /// `53ae4b8b` was the tip of origin/main and did not compile. Staging
+    /// `api/board.rs` took ~16 lines of `amux`'s in-flight AMUX-3607 wiring from
+    /// the same file, including a call to `effective_gate_trail` whose
+    /// definition lived in `db/board_store.rs` and was still uncommitted in
+    /// their tree. `cargo check` and the pre-commit gate both passed, correctly:
+    /// they build the TREE, which had the peer's definition, and nothing builds
+    /// the COMMIT.
+    ///
+    /// THE CONTROL IS HALF THE TEST. A warning that fires on every commit is one
+    /// nobody reads, and that is not hypothetical here: the guard already
+    /// printed a discriminating insertion count for this specimen and its author
+    /// read past it. So `split_risk` must be SILENT when the peer has nothing
+    /// dirty outside the commit, and silent when the dirty file is theirs but
+    /// already staged (including it is the fix, so warning about it would be
+    /// telling someone off for doing the right thing).
+    #[test]
+    fn a_commit_that_splits_a_peers_work_names_what_it_leaves_behind() {
+        let mut g = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        // The peer's other half: same lane, dirty, NOT staged.
+        g.theirs.insert(
+            "/repo/crates/amux-server/src/db/board_store.rs".into(),
+            ("amux".into(), 100.0),
+        );
+        g.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+
+        let staged = [pair("crates/amux-server/src/api/board.rs")];
+        let v = classify(&staged, 200.0, 3600.0, &g);
+        assert_eq!(v.split_risk.len(), 1, "{:?}", v.split_risk);
+        let r = &v.split_risk[0];
+        assert_eq!(r["owner"], "amux");
+        assert!(
+            r["left_dirty"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap()
+                .ends_with("db/board_store.rs"),
+            "it must NAME the file being left behind, not merely say one exists: {r}"
+        );
+        let why = r["why"].as_str().unwrap();
+        assert!(
+            why.contains("NOT in this commit"),
+            "the hazard is about the COMMIT, so say so: {why}"
+        );
+        assert!(
+            why.contains("fail to build"),
+            "state the consequence — this is the check that catches an unbuildable commit \
+             from a compiling tree: {why}"
+        );
+        assert!(
+            !why.contains('?'),
+            "STATE A FACT, never ask the committer a question. The guard already asked one \
+             for this exact specimen (\"if that is MORE than you wrote...\") and its author \
+             read past it, because the number matched what they expected: {why}"
+        );
+
+        // CONTROL 1: the peer has nothing dirty outside the commit.
+        let mut quiet = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        quiet.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        assert!(
+            classify(&staged, 200.0, 3600.0, &quiet).split_risk.is_empty(),
+            "a co-edited staged file alone is not a split — every commit on this checkout \
+             would warn, and a warning that always fires is one nobody reads"
+        );
+
+        // CONTROL 2: their other file is dirty AND staged. Including it is the
+        // remedy, so warning about it would punish the correct behaviour.
+        let both = [
+            pair("crates/amux-server/src/api/board.rs"),
+            pair("crates/amux-server/src/db/board_store.rs"),
+        ];
+        assert!(
+            classify(&both, 200.0, 3600.0, &g).split_risk.is_empty(),
+            "their two halves are BOTH in the commit, which is exactly the fix"
+        );
+
+        // CONTROL 3: a DIFFERENT peer's dirty file. The hazard is a symbol split
+        // across one lane's work; unrelated dirt from a third lane is noise, and
+        // attributing it here would make the message wrong as well as loud.
+        let mut other = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        other.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        other.theirs.insert("/repo/unrelated.rs".into(), ("desktop".into(), 100.0));
+        other.dirty.insert("/repo/unrelated.rs".into());
+        assert!(
+            classify(&staged, 200.0, 3600.0, &other).split_risk.is_empty(),
+            "only the co-editor's OWN dirty files can split their own symbol"
+        );
     }
 
     /// AMUX-3497, rebuilt from the live specimen: a session whose Bash window

@@ -42,7 +42,7 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 9
+GUARD_VERSION = 10
 
 
 def amux_base_url():
@@ -709,6 +709,30 @@ def main():
         w("  If these are yours via shell edits, proceed. If you do not recognize "
           "one, it is a peer's in-flight hunk riding your git add — stage "
           "per-hunk instead (git add -p %s).\n" % _ua.get("path", ""))
+    # AF-190: this commit SPLITS a peer's work, so it can fail to build even
+    # though the tree it came from compiles. `cargo check` and the pre-commit
+    # gate both pass, correctly — they build the TREE, which holds the peer's
+    # uncommitted half. Nothing builds the COMMIT.
+    #
+    # Printed BEFORE the block section on purpose: when both fire, this one names
+    # a consequence the committer can act on without reading a claim about
+    # ownership first. Advisory, never blocking — it is a warning about a build,
+    # not an assertion that the staged bytes are somebody else's, and blocking on
+    # it would stop commits that are perfectly legitimate.
+    for _sr in d.get("split_risk") or []:
+        w("\namux staged-guard: SPLIT COMMIT WARNING — %s's work is being cut in half:\n"
+          % _sr.get("owner", "?"))
+        w("  in this commit:  %s\n" % ", ".join(_sr.get("staged") or []))
+        w("  left behind, dirty and NOT committed:\n")
+        for _p in _sr.get("left_dirty") or []:
+            w("    %s\n" % _p)
+        # The server's sentence, verbatim. It STATES the hazard rather than
+        # asking the committer to judge a number: the guard already printed a
+        # discriminating insertion count for the specimen behind this feature
+        # ("34 insertions / 9 deletions — if that is MORE than you wrote...")
+        # and its author read past it, because 34 matched what they expected.
+        # A number that agrees with you is exactly where a check gets skipped.
+        w("  %s\n" % _sr.get("why", ""))
     foreign = d.get("foreign") or []
     _m = _read_marker(sess, top)
     if not foreign:
