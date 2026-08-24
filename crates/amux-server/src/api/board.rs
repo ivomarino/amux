@@ -231,7 +231,7 @@ async fn get_contract(
         "recovering_a_clobbered_desc": {
             "where": "_amux_state_events rows carry the FULL pre-mutation card snapshot in                       their payload, so a description overwritten by a PATCH is recoverable                       without any backup",
             "how": "find the row for the mutation (by card id and timestamp) and read the                     snapshot out of its payload",
-            "prevention": "PATCH refuses a replace that drops a strict majority of a desc of                            500+ chars — see desc_shrink_ack. Use desc_append to add to a                            description rather than replacing it",
+            "prevention": "PATCH refuses two acts and the refusal body names which via `rule`: SIZE — a replace dropping a strict majority of a desc of 500+ chars, any writer; and AUTHORSHIP — a replace by a DIFFERENT session that drops 200+ chars of the card owner's prose without keeping it, at ANY magnitude (AF-180 was 36% and destroyed a peer review just as thoroughly). Both escape via desc_shrink_ack. Use desc_append to add to a description rather than replacing it — that is almost always what a reviewer means",
             "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head and \"slim\": 1). An ABSENT field is not an empty                                  one, and .get(\"desc\") returns None either way — read                                  desc_len, or GET the single card",
         },
         "list": {
@@ -2482,26 +2482,87 @@ pub async fn patch_item(
                         .map(crate::api::py_truthy)
                         .unwrap_or(false);
                     let forced = map.get("force").map(crate::api::py_truthy).unwrap_or(false);
-                    if !acked && !forced && before >= 500 && after * 2 < before {
+                    // TWO RULES, and the second is about a different act
+                    // (AMUX-3576). Size catches the owner clobbering their own
+                    // long write-up. It does NOT catch a peer clobbering
+                    // someone else's, because that act is not distinguished by
+                    // magnitude: AF-180 went 3055 -> 1958, a 36% drop that sits
+                    // comfortably under any threshold that avoids crying wolf
+                    // on ordinary trims, and it destroyed a peer's review notes
+                    // exactly as thoroughly as the 60% one next to it did.
+                    //
+                    // The honest discriminator is WHOSE PROSE IS BEING
+                    // DESTROYED (amux-frustrations' framing, sharper than my
+                    // "non-owner"): a reviewer replacing their own earlier note
+                    // is fine, the owner rewriting their own card is fine, and
+                    // a reviewer replacing the OWNER's write-up is the act. That
+                    // is a comparison rather than a threshold, so it can be
+                    // exact instead of tuned.
+                    //
+                    // `!d.contains(old)` is what makes it about DESTRUCTION
+                    // rather than size: any append, or any rewrite that keeps
+                    // what was there, passes untouched however much it adds.
+                    // The net-loss floor then spares a typo fix or a small
+                    // correction on a peer's card, which lose nearly nothing.
+                    //
+                    // I am the specimen. I destroyed ~6400 characters across
+                    // AF-178, AF-180 and AF-182 while acking reviews, having
+                    // shipped the size rule an hour earlier and written the
+                    // commit message explaining why desc_append exists.
+                    let owner_now = row.session.clone().unwrap_or_default().trim().to_string();
+                    let cross_lane = !caller_lane.is_empty()
+                        && !owner_now.is_empty()
+                        && owner_now != caller_lane;
+                    let old_trimmed = next.desc.trim();
+                    let destroys_peer_prose = cross_lane
+                        && before >= 200
+                        && !d.contains(old_trimmed)
+                        && before.saturating_sub(after) >= 200;
+                    if !acked && !forced && (destroys_peer_prose || (before >= 500 && after * 2 < before)) {
                         return finish(
                             &slot_w,
                             PatchOut::Refused(
                             StatusCode::CONFLICT,
                             json!({
-                                "error": format!(
-                                    "refusing to shrink desc from {before} to {after} chars \
-                                     ({} lost). If you read this card from GET /api/board, note \
-                                     that the list OMITS `desc` (it ships desc_len/desc_head and \
-                                     slim:true) — an absent field is not an empty one. Re-read \
-                                     GET /api/board/{id_w} first. To append instead, use \
-                                     desc_append. If the replace is intended, resend with \
-                                     desc_shrink_ack: true.",
-                                    before - after
-                                ),
+                                // NAME WHICH RULE FIRED, because the remedy
+                                // differs. The size rule usually means the
+                                // caller read `desc` off the slim list and took
+                                // absence for emptiness; the authorship rule
+                                // means they read it fine and used replace
+                                // semantics on someone else's prose. Telling a
+                                // reviewer to go re-read the list is the wrong
+                                // advice for the second and was the only advice
+                                // available before AMUX-3576.
+                                "error": if destroys_peer_prose {
+                                    format!(
+                                        "refusing to replace {owner_now}'s description on \
+                                         {id_w} — you are {caller_lane}, and this drops \
+                                         {} of their {before} characters without keeping what \
+                                         was there. Use desc_append to add your note below \
+                                         theirs; that is almost always what a reviewer or a \
+                                         commenter means. If you really do mean to replace \
+                                         their text, resend with desc_shrink_ack: true.",
+                                        before - after
+                                    )
+                                } else {
+                                    format!(
+                                        "refusing to shrink desc from {before} to {after} chars \
+                                         ({} lost). If you read this card from GET /api/board, \
+                                         note that the list OMITS `desc` (it ships \
+                                         desc_len/desc_head and slim:true) — an absent field is \
+                                         not an empty one. Re-read GET /api/board/{id_w} first. \
+                                         To append instead, use desc_append. If the replace is \
+                                         intended, resend with desc_shrink_ack: true.",
+                                        before - after
+                                    )
+                                },
                                 "id": id_w,
                                 "ok": false,
                                 "blocked": true,
                                 "kind": "desc_shrink_blocked",
+                                "rule": if destroys_peer_prose { "authorship" } else { "size" },
+                                "owner": owner_now,
+                                "writer": caller_lane,
                                 "desc_len_before": before,
                                 "desc_len_after": after,
                                 "ack_field": "desc_shrink_ack",
@@ -4357,38 +4418,93 @@ mod slim_tests {
     use super::*;
     use crate::db::board_store::IssueRow;
 
-    /// The desc-shrink guard's THRESHOLD, tested as arithmetic rather than
-    /// through the handler (mvs-infra's near-data-loss, 2026-08-23).
+    /// The desc-clobber guard, tested as the two rules it actually is
+    /// (91648fbc + AMUX-3576), against the four REAL cards from the incidents.
     ///
-    /// The reported incident: 4082 characters of merge evidence replaced by a
-    /// short fresh description, because the worker read `desc` from the LIST
-    /// payload (which omits it) and took absence for emptiness.
+    /// Rule 1, SIZE: catches the owner clobbering their own long write-up.
+    /// mvs-infra's report — 4082 chars of merge evidence replaced by a short
+    /// note, because they read `desc` off the list, which omits it, and took
+    /// absence for emptiness.
     ///
-    /// The controls are the whole value here. A guard tuned only to catch the
-    /// incident would also refuse ordinary edits — trimming a description,
-    /// clearing a short one, rewriting a stub — and a refusal a caller meets
-    /// during normal work is one they learn to ack reflexively, which converts
-    /// a safety property into a keystroke. So the negative cases are pinned as
-    /// hard as the positive one.
+    /// Rule 2, AUTHORSHIP: catches a peer clobbering someone else's prose at
+    /// ANY magnitude. Size cannot: AF-180 went 3055 -> 1958, a 36% drop that
+    /// sits under any threshold which avoids crying wolf on ordinary trims, and
+    /// it destroyed a peer's review notes exactly as thoroughly as the 60% one
+    /// beside it. The discriminator is whose prose is destroyed, which is a
+    /// comparison and can be exact rather than tuned.
+    ///
+    /// The controls carry the weight, as before: a refusal met during ordinary
+    /// work becomes a reflexive ack, which turns a safety property into a
+    /// keystroke. So an append, a typo fix on a peer's card, and the owner
+    /// editing their own must all pass untouched.
     #[test]
-    fn the_desc_shrink_guard_catches_the_incident_and_nothing_ordinary() {
-        // Mirrors the predicate at the write site exactly. If that changes,
-        // this must be changed with it and deliberately.
-        let trips = |before: usize, after: usize| before >= 500 && after * 2 < before;
+    fn the_desc_clobber_guard_catches_both_acts_and_nothing_ordinary() {
+        // Mirrors the predicates at the write site. If those change, this must
+        // change with them and deliberately.
+        let size = |before: usize, after: usize| before >= 500 && after * 2 < before;
+        let authorship = |owner: &str, writer: &str, old: &str, new: &str| {
+            let before = old.chars().count();
+            let after = new.chars().count();
+            let cross = !writer.is_empty() && !owner.is_empty() && owner != writer;
+            cross && before >= 200 && !new.contains(old.trim())
+                && before.saturating_sub(after) >= 200
+        };
+        let text = |n: usize| "x".repeat(n);
 
-        // THE INCIDENT: 4082 chars replaced by a short note.
-        assert!(trips(4082 + 120, 120), "the reported near-data-loss must be refused");
-        assert!(trips(5500, 40), "a 5.5k card replaced by a one-liner must be refused");
+        // -- the real incidents ------------------------------------------------
+        // mvs-infra / MI-4746: 4082 chars of merge evidence -> a short note.
+        assert!(size(4082 + 120, 120), "the reported near-data-loss must be refused");
 
-        // CONTROLS — every one of these is legitimate and must pass untouched.
-        assert!(!trips(4000, 2400), "trimming 40% of a long desc is an ordinary edit");
-        assert!(!trips(4000, 2000), "exactly half must NOT trip — the bar is a strict majority");
-        assert!(!trips(400, 0), "clearing a SHORT desc is not a data loss worth blocking");
-        assert!(!trips(499, 1), "just under the length floor stays out of the guard's way");
-        assert!(!trips(120, 4082), "growth must never trip it");
-        assert!(!trips(0, 900), "writing a desc onto an empty card must never trip it");
-        // desc_append only ever grows, so it cannot reach the guard at all.
-        assert!(!trips(5000, 5200), "an append is growth and is structurally exempt");
+        // AF-180: 3055 -> 1958 by a REVIEWER on the author's card. The size
+        // rule misses it; that miss is the entire reason AMUX-3576 exists.
+        assert!(!size(3055, 1958), "36% is under the size bar — this is the gap, stated");
+        assert!(
+            authorship("amux-frustrations", "amux", &text(3055), &text(1958)),
+            "a reviewer replacing the author's prose must be refused at ANY magnitude"
+        );
+
+        // AF-179: the same act at 46%, which the live guard already refused.
+        assert!(authorship("amux-frustrations", "amux", &text(4573), &text(2103)));
+
+        // -- CONTROLS: every one of these is legitimate --------------------------
+        let orig = text(3000);
+        assert!(
+            !authorship("amux-frustrations", "amux", &orig, &format!("{orig}\n\nmy review")),
+            "APPENDING to a peer's write-up must never trip it — it keeps what was there"
+        );
+        assert!(
+            !authorship("amux", "amux", &text(3055), &text(1958)),
+            "the OWNER editing their own card down is ordinary work"
+        );
+        assert!(
+            !authorship("amux-frustrations", "", &text(3055), &text(1958)),
+            "an unattributed caller has no authorship to compare — the size rule still applies, \
+             but this rule must not fire on an empty writer"
+        );
+        assert!(
+            !authorship("", "amux", &text(3055), &text(1958)),
+            "nor on an ownerless card"
+        );
+        // A typo fix on a peer's card: different text, nearly no loss.
+        let typo_fixed = format!("{}y", text(2999));
+        assert!(
+            !authorship("amux-frustrations", "amux", &text(3000), &typo_fixed),
+            "correcting a peer's typo loses nothing and must pass"
+        );
+        assert!(
+            !authorship("amux-frustrations", "amux", &text(150), &text(10)),
+            "a very short desc is below the floor — not worth a refusal"
+        );
+        assert!(
+            !authorship("amux-frustrations", "amux", &text(3000), &text(2900)),
+            "trimming 100 chars off a peer's card is under the net-loss floor"
+        );
+
+        // -- the size rule's own controls, unchanged ----------------------------
+        assert!(!size(4000, 2400), "trimming 40% of a long desc is an ordinary edit");
+        assert!(!size(4000, 2000), "exactly half must NOT trip — the bar is a strict majority");
+        assert!(!size(400, 0), "clearing a SHORT desc is not a data loss worth blocking");
+        assert!(!size(120, 4082), "growth must never trip it");
     }
 
     /// SLIM MUST CARRY WHAT THE LIST ACTUALLY RENDERS (AMUX-2840).
