@@ -46,6 +46,16 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 # Set here rather than in playwright.config.ts because THIS is the script that
 # pins the build — anything else launching a pinned server gets it for free, and
 # the config cannot forget.
+#
+# A SECOND COPY WAS ADDED TO playwright.config.ts AND REMOVED AGAIN (AF-185). It
+# was written from a CI log that predated this line by twenty minutes, which is
+# the trap worth naming: a failure you can read in a job log is not a failure the
+# current tree has, and the log gives no hint that the tree moved. The copy was
+# also INERT — this `export` runs inside the process the config launches, so it
+# overrides whatever the config passed in, and the redundant setting could never
+# have taken effect even if the two disagreed. If you are here because a run
+# shows `binary changed on disk`, check the run's created_at against this line's
+# commit before patching anything.
 export AMUX_NO_SELF_ADOPT=1
 
 dirty="$(git -C "$REPO" status --porcelain -- crates/ Cargo.toml Cargo.lock 2>/dev/null || true)"
