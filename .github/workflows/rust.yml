@@ -175,6 +175,15 @@ jobs:
       - name: runtime smoke -- a bare cargo does not build into the checkout (AMUX-3667)
         run: bash scripts/test-cargo-target-dir-pinned.sh
 
+      # AMUX-3682. Two runtime hooks ran uncommitted for four days each because
+      # install.sh copied the WORKTREE while its own comments claimed the
+      # committed copy was authoritative. CI is the right home for this: the
+      # dirty-worktree cell builds its own throwaway repo, so it needs no
+      # fixture from this checkout and cannot pass for the wrong reason on a
+      # clean CI tree.
+      - name: runtime smoke -- hooks install from HEAD, not the worktree (AMUX-3682)
+        run: bash scripts/test-hook-install-from-head.sh
+
   e2e:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
     # browser against the real server + real extracted dashboard.

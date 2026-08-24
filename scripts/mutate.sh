@@ -45,6 +45,26 @@ python3 - "$file" "$from" "$to" "$op" <<'PY'
 import sys
 path, frm, to, op = sys.argv[1:5]
 s = open(path, encoding='utf-8').read()
+
+# APPLY MUST NOT CREATE AN AMBIGUOUS REVERT (AMUX-3682, hit while using this).
+#
+# `apply` replaced a line with `cp "$SCRIPT_DIR/$rel" "$dest"`, a string the file
+# ALREADY contained in a fallback branch. So the file then held two copies, and
+# `revert` correctly refused as ambiguous — printing to stderr and LEAVING THE
+# FILE MUTATED. A later `bash -n` passed, the suite was re-run, and only a diff
+# against git showed the installer was still carrying the mutation.
+#
+# That is this tool's own failure mode: the refusal was right, but it fired at
+# revert time when the damage was already done and the operator had moved on.
+# Checked here instead, where refusing costs nothing — and it is the same
+# principle the ethos file states about a gate whose refusal destroys the
+# evidence needed to satisfy it.
+if op == 'apply' and s.count(to) > 0:
+    print(f"mutate apply: the replacement already occurs {s.count(to)} time(s) in {path} — "
+          f"revert would be ambiguous and would leave the file mutated. "
+          f"Pick a replacement unique to this file. NOT applied.", file=sys.stderr)
+    sys.exit(1)
+
 n = s.count(frm)
 if n != 1:
     # Both directions are failures worth stopping on. 0 means the mutation never

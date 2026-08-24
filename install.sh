@@ -176,6 +176,48 @@ if [[ -d "$SCRIPT_DIR/templates" ]]; then
   say "templates: $AMUX_HOME/templates ($(find "$AMUX_HOME/templates" -name template.json | wc -l | tr -d ' ') available)"
 fi
 
+# INSTALL A HOOK FROM THE COMMITTED BLOB, NOT THE WORKING TREE (AMUX-3682).
+#
+# Both hooks below said "installed from the repo, so the committed copy is
+# authoritative" and then copied `$SCRIPT_DIR/...` — the WORKTREE. On a shared
+# checkout somebody is nearly always mid-edit, so `./install.sh` shipped
+# whatever uncommitted bytes happened to be on disk to the whole fleet.
+#
+# Measured 2026-08-24, two incidents on the same arc:
+#   hooks.report_hook_matches_committed   08-20 06:18 -> 08-24 16:25  4d10h
+#   hooks.shared_guard_matches_committed  08-20 06:51 -> 08-24 12:36  4d05h
+# Both began within 32 minutes of each other, both ran uncommitted for four
+# days, and both were resolved only when a DIFFERENT lane happened to commit
+# that file for an unrelated reason. Nobody acted on the detector; it was
+# reporting correctly the whole time.
+#
+# Reading HEAD makes the drift impossible rather than detected: there is no
+# state in which the runtime hook is bytes nobody can review.
+#
+# NOT A SILENT SUBSTITUTION. If the worktree differs, say so — a lane that just
+# edited a hook and ran install.sh must not be left believing their edit is
+# live. And outside a git checkout (tarball, container image) fall back to the
+# file, loudly, because there refusing would be worse than installing.
+install_hook_from_head() {
+  local rel="$1" dest="$2"
+  local head_bytes=""
+  if head_bytes="$(git -C "$SCRIPT_DIR" show "HEAD:$rel" 2>/dev/null)" && [[ -n "$head_bytes" ]]; then
+    printf '%s\n' "$head_bytes" > "$dest"
+    if ! git -C "$SCRIPT_DIR" diff --quiet HEAD -- "$rel" 2>/dev/null; then
+      echo "  NOTE: $rel differs from HEAD in your worktree. Installed the COMMITTED"
+      echo "        bytes; your uncommitted edit is NOT live. Commit it and re-run."
+    fi
+    return 0
+  fi
+  if [[ -f "$SCRIPT_DIR/$rel" ]]; then
+    echo "  NOTE: not a git checkout (or $rel absent from HEAD) — installing the"
+    echo "        working-tree copy of $rel, which nothing can review or roll back."
+    cp "$SCRIPT_DIR/$rel" "$dest"
+    return 0
+  fi
+  return 1
+}
+
 # Shared-checkout git guard (AMUX-3033). The PreToolUse Bash hook runs
 # ~/.amux/hooks/git-shared-guard.py on EVERY Bash tool call across the fleet, so
 # it gates git in shared checkouts. It used to be an unversioned 32KB runtime
@@ -187,7 +229,7 @@ fi
 # the sha embedded in the binary and surfaces any drift in /api/health/invariants.
 if [[ -f "$SCRIPT_DIR/scripts/git-hooks/git-shared-guard.py" ]]; then
   mkdir -p "$AMUX_HOME/hooks"
-  cp "$SCRIPT_DIR/scripts/git-hooks/git-shared-guard.py" "$AMUX_HOME/hooks/git-shared-guard.py"
+  install_hook_from_head scripts/git-hooks/git-shared-guard.py "$AMUX_HOME/hooks/git-shared-guard.py"
   chmod +x "$AMUX_HOME/hooks/git-shared-guard.py"
   _guard_sha="$(shasum -a 256 "$AMUX_HOME/hooks/git-shared-guard.py" | cut -d' ' -f1)"
   printf '%s  git-shared-guard.py\n' "$_guard_sha" > "$AMUX_HOME/hooks/git-shared-guard.py.sha256"
@@ -209,7 +251,7 @@ fi
 # a lane is BLIND, which is the one class where a commit absorbing another
 # session work passes silently.
 if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
-  cp "$SCRIPT_DIR/scripts/hooks/hook-report.sh" "$AMUX_HOME/hook-report.sh"
+  install_hook_from_head scripts/hooks/hook-report.sh "$AMUX_HOME/hook-report.sh"
   chmod +x "$AMUX_HOME/hook-report.sh"
   _rep_sha="$(shasum -a 256 "$AMUX_HOME/hook-report.sh" | cut -d' ' -f1)"
   printf '%s  hook-report.sh\n' "$_rep_sha" > "$AMUX_HOME/hook-report.sh.sha256"
