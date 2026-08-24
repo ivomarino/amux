@@ -987,6 +987,49 @@ fn extract_caller_paths() -> Vec<checks::CallerPath> {
 /// -sk \"$AMUX_URL/api/workers/...\""`) from being reported as a live caller —
 /// though an echoed example that really is malformed will still be caught,
 /// which is a feature.
+/// The last `curl` in `w` that is a real INVOCATION, not the word inside a
+/// longer identifier or a comment (AF-191).
+///
+/// Two tests, and neither is a guess:
+///
+/// * the character AFTER the token must not continue the word. This is the one
+///   that fixes the reported bug: `rfind("curl")` matched `curl_exit`, a JSON
+///   field name in a printf format 251 chars before a path mentioned in prose.
+/// * the token's own line must not be a `#` comment. A curl in a comment is a
+///   recipe, not a call.
+///
+/// What it deliberately does NOT require is a shell operator before the token.
+/// I borrowed that from `cli_curl_timeout_guard.rs` on the first attempt and it
+/// broke 42 of the CLI's 63 curl mentions, because PR 143 routed every real call
+/// site through the `_curl` WRAPPER — so the preceding character is `_`. That
+/// test's polarity is the opposite of this one's: it hunts BARE curl and
+/// excludes `_curl` on purpose, where this hunts call sites and `_curl` IS the
+/// call site. Same discriminator, inverted sign; copying it unchanged inverted
+/// the check. The existing CLI-census cells caught it, which is what they are for.
+fn rfind_curl_invocation(w: &str) -> Option<usize> {
+    let b = w.as_bytes();
+    let mut from = w.len();
+    while let Some(rel) = w[..from].rfind("curl") {
+        let after_ok = b
+            .get(rel + 4)
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && *c != b'_' && *c != b'-');
+        let before_ok = rel
+            .checked_sub(1)
+            .map(|i| b[i])
+            .is_none_or(|c| !c.is_ascii_alphanumeric());
+        let line_start = w[..rel].rfind('\n').map_or(0, |i| i + 1);
+        let commented = w[line_start..rel].trim_start().starts_with('#');
+        if after_ok && before_ok && !commented {
+            return Some(rel);
+        }
+        if rel == 0 {
+            break;
+        }
+        from = rel;
+    }
+    None
+}
+
 fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
     let mut out = Vec::new();
     let mut i = 0usize;
@@ -1000,6 +1043,13 @@ fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
         let (raw, consumed, mut interpolated) = extract_shell_path(&sh[start..]);
         i = start + consumed.max(1);
 
+        // NOT trimming prose punctuation here, deliberately (AF-191). I wrote
+        // that trim first — `/api/x,` in a sentence is a mention of `/api/x` —
+        // and then could not construct a case where it mattered that the two
+        // checks above do not already reject. A change no cell can pin is one
+        // that ships on faith, so it came back out. If a specimen turns up
+        // (an unquoted path with trailing punctuation on a non-comment line
+        // after a real curl), add the trim WITH the cell that fails without it.
         let path = raw.trim_end_matches('/');
         if path.len() < 5 || !path.starts_with("/api/") {
             continue;
@@ -1026,13 +1076,39 @@ fn scan_shell_calls(sh: &str, source: &str) -> Vec<checks::CallerPath> {
         // Backward to the anchoring `curl`. Bash puts flags BEFORE the URL, so
         // backward is correct here — the opposite of the SPA, where the method
         // literal follows the URL.
+        // THE PATH'S OWN LINE MUST NOT BE A COMMENT (AF-191). The reported
+        // specimen was `# Ship the backlog to /api/client-debug, which logs …`
+        // in the CLI — a sentence about an endpoint, not a call to it. Checked
+        // here rather than only at the curl, because the two can sit on
+        // different lines and it is the PATH whose line decides what it is.
+        {
+            let ls = sh[..start].rfind('\n').map_or(0, |i| i + 1);
+            if sh[ls..start].trim_start().starts_with('#') {
+                continue;
+            }
+        }
         let win_start = start.saturating_sub(600);
         let mut win_start = win_start;
         while win_start > 0 && !sh.is_char_boundary(win_start) {
             win_start -= 1;
         }
         let window = &sh[win_start..start];
-        let Some(curl_at) = window.rfind("curl") else { continue };
+        // A `curl` TOKEN IS NOT A CURL INVOCATION (AF-191).
+        //
+        // This was `rfind("curl")`, and on 2026-08-24 it matched `curl_exit` —
+        // a JSON field name inside a printf format string 251 chars before a
+        // path mentioned in a `#` comment. The guard that establishes "this
+        // path is preceded by a curl call" was satisfied by a substring of an
+        // identifier, so the invariant reported `GET /api/client-debug,` (note
+        // the comma: prose punctuation) as an unmounted caller while the route
+        // was mounted with both methods and answering 200.
+        //
+        // The discriminator is tsukimiya's, from `cli_curl_timeout_guard.rs` in
+        // the same PR whose comment tripped this: a command starts a line or
+        // follows a shell operator, so the character immediately before the
+        // token decides it. Borrowed rather than re-derived — two spellings of
+        // "is this a real invocation" is how they drift.
+        let Some(curl_at) = rfind_curl_invocation(window) else { continue };
         let cmd = &window[curl_at..];
 
         let method = if let Some(x) = cmd.find("-X ") {
@@ -1505,6 +1581,83 @@ mod shell_scanner_tests {
                 ("DELETE".into(), "/api/schedules/SCHED-1".into()),
             ]
         );
+    }
+
+    /// AF-191, the reported specimen verbatim: an endpoint named in a `#`
+    /// comment was reported as an unmounted caller while the route was mounted
+    /// with both methods and answering 200.
+    ///
+    /// Three things had to line up and all three are asserted:
+    ///   the path carried prose punctuation           `/api/client-debug,`
+    ///     (the visible symptom — NOT fixed by trimming it, see the scanner)
+    ///   its line was a comment                        `# Ship the backlog to …`
+    ///   the "is there a curl in front of it" guard    matched `curl_exit`, a
+    ///     JSON field name in a printf format 251 chars earlier
+    ///
+    /// The third is the load-bearing one: a substring standing in for a
+    /// structural test. Fixing only the punctuation would make this pass while
+    /// leaving the scanner reading comments — the endpoint IS mounted, so the
+    /// symptom disappears and the defect does not.
+    #[test]
+    fn a_path_named_in_a_comment_after_a_curl_shaped_identifier_is_not_a_caller() {
+        let sh = "  printf '{\"ts\":%s,\"curl_exit\":%s,\"method\":\"%s\"}\\n' \\\n\
+                  \x20   \"$(date -u +%s)\" \"$rc\" \"$method\"\n\
+                  }\n\
+                  \n\
+                  # Ship the backlog to /api/client-debug, which logs the payload at INFO\n";
+        let found = scan_shell_calls(sh, "cli:amux");
+        assert!(
+            found.is_empty(),
+            "a path in a comment, preceded only by the identifier `curl_exit`, is prose: {found:?}"
+        );
+
+        // CONTROL 1 — the same path through the real wrapper IS a caller, or the
+        // fix has not narrowed the scanner, it has blinded it. `_curl` is how
+        // every call site in the CLI is written since PR 143.
+        let real = "_curl -sk \"$AMUX_URL/api/client-debug\"\n";
+        assert_eq!(
+            scan_shell_calls(real, "cli:amux").len(),
+            1,
+            "a `_curl` call site must still be found — that is 42 of the CLI's 63 curl mentions"
+        );
+
+        // CONTROL 2 — a bare curl is still a caller too.
+        let bare = "curl -sk \"$AMUX_URL/api/client-debug\"\n";
+        assert_eq!(scan_shell_calls(bare, "cli:amux").len(), 1);
+
+        // THE CELL THAT PINS THE CURL FIX ITSELF. Above, the comment check
+        // catches the specimen first, so reverting the lookback leaves this
+        // test green — I mutated it and it did, which is why this exists. Here
+        // the path is on an ORDINARY line and the only `curl` in the lookback
+        // is the identifier `curl_exit`, so the invocation test is the only
+        // thing between prose and a false caller.
+        let ident_only = "  printf '{\"curl_exit\":%s}\\n' \"$rc\"\n                          echo \"see $AMUX_URL/api/client-debug for details\"\n";
+        assert!(
+            scan_shell_calls(ident_only, "cli:amux").is_empty(),
+            "`curl_exit` is an identifier, not an invocation — a substring match here is the \
+             defect: {:?}",
+            scan_shell_calls(ident_only, "cli:amux")
+        );
+
+        // THE CELL THAT PINS THE COMMENT CHECK. With a REAL curl earlier in the
+        // file, the invocation test above is satisfied and only the path's own
+        // line decides. This is the commoner shape in 2400 lines of shell than
+        // the `curl_exit` coincidence: a genuine call, then prose mentioning a
+        // different endpoint within the 600-char window.
+        let real_curl_then_prose = "curl -sk \"$AMUX_URL/api/sessions\"\n                                    # see $AMUX_URL/api/client-debug for the payload format\n";
+        let got = scan_shell_calls(real_curl_then_prose, "cli:amux");
+        assert_eq!(
+            got.len(),
+            1,
+            "the real call counts and the comment does not: {got:?}"
+        );
+        assert!(got[0].path.ends_with("/api/sessions"), "{:?}", got[0].path);
+
+        // CONTROL 3 — punctuation is stripped, not the path.
+        let punct = "_curl -sk \"$AMUX_URL/api/client-debug\",\n";
+        let p = scan_shell_calls(punct, "cli:amux");
+        assert_eq!(p.len(), 1);
+        assert!(p[0].path.ends_with("client-debug"), "trailing comma must be gone: {:?}", p[0].path);
     }
 
     /// The anchor is what stops help text and comments being reported as live
