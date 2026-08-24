@@ -3355,6 +3355,43 @@ pub(crate) async fn steer_enqueue_store(
     guard: &str,
     sender: &str,
 ) -> Result<String, &'static str> {
+    steer_enqueue_precond(store, name, text, guard, sender, None).await
+}
+
+/// Enqueue with a DELIVERY-TIME PRECONDITION (AMUX-3659).
+///
+/// `precond` is `(card_id, issues.rev)` — the card this message asserts
+/// something about, and the revision its text was computed against. At delivery
+/// the row is DROPPED if that card has moved on, because the message is about a
+/// state that no longer exists.
+///
+/// Board state is delivered at turn boundaries by design, and that decision is
+/// right. What it costs is that a nudge asserting a card's CURRENT state is
+/// computed at enqueue and read minutes later: measured over 24h, 649
+/// deliveries, mean lag 166s, max 3607s, and 209 (32%) over a minute. On MR-2
+/// that produced a nudge arriving 3m23s after its premise, two minutes after
+/// mvs-research had applied the exact remedy it prescribed — a correct trigger
+/// and a correct remedy adding up to what looked like a broken re-nag.
+///
+/// OPT-IN, and it has to be: a peer relay or a scheduler command asserts
+/// nothing about a card and must deliver unchanged. `guard` cannot carry this,
+/// being a producer label (`board-drive`, `commit-nudge`) rather than a
+/// condition.
+///
+/// The row is dropped, NOT recomputed. Recomputing would need the producer's
+/// logic at the consumer — the second spelling this repo keeps paying for — and
+/// is unnecessary: every producer here is a periodic trigger, so if the
+/// condition still holds it fires again on the next tick.
+#[must_use = "steer_enqueue REFUSES a permanently-blocked target and returns None. \
+Handle it, or write `let _ =` to say the refusal is deliberately unreported here (AF-188)."]
+pub(crate) async fn steer_enqueue_precond(
+    store: &crate::db::SharedStore,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    precond: Option<(&str, i64)>,
+) -> Result<String, &'static str> {
     // REFUSE A PERMANENT BLOCK HERE, not in the handlers (AF-188).
     //
     // `steer_mutate` and `auto_deliver` each refused archived targets; this
@@ -3402,6 +3439,7 @@ pub(crate) async fn steer_enqueue_store(
     let text_s = text.to_string();
     let guard_s = guard.to_string();
     let sender_s = sender.to_string();
+    let precond_w = precond.map(|(c, r)| (c.to_string(), r));
     let _ = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
@@ -3448,14 +3486,18 @@ pub(crate) async fn steer_enqueue_store(
                     rusqlite::params![session, text_s],
                 )?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO steering_queue(id, session, text, queued_at, guard, sender) VALUES(?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO steering_queue\
+                     (id, session, text, queued_at, guard, sender, precond_card, precond_rev) \
+                     VALUES(?,?,?,?,?,?,?,?)",
                     rusqlite::params![
                         id,
                         session,
                         text_s,
                         now_f64(),
                         if guard_s.is_empty() { None } else { Some(guard_s.clone()) },
-                        sender_s
+                        sender_s,
+                        precond_w.as_ref().map(|(c, _)| c.clone()),
+                        precond_w.as_ref().map(|(_, r)| *r),
                     ],
                 )?;
             }
@@ -8186,20 +8228,94 @@ fn pickup_stale_void(
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
     // and keeps the pane captures below proportional to real work.
+    // (steer id, card, why) for rows whose premise expired — filled inside the
+    // read scope, acted on outside it (the delete is a write).
+    let expired: Vec<(String, String, String)>;
     let queued: Vec<(String, String, String, f64, String, String)> = {
         let Ok(conn) = state.store.read() else { return 0 };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') \
+            "SELECT id, session, text, queued_at, COALESCE(guard,''), COALESCE(sender,''), \
+                    COALESCE(precond_card,''), COALESCE(precond_rev,-1) \
              FROM steering_queue ORDER BY queued_at ASC",
         ) else {
             return 0;
         };
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        type QueuedRow = (String, String, String, f64, String, String, String, i64);
+        let rows: Vec<QueuedRow> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+            })
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
-        rows
+        // DROP A ROW WHOSE PREMISE HAS EXPIRED (AMUX-3659).
+        //
+        // The text of a board nudge asserts a card's CURRENT state, and it was
+        // computed at enqueue. Measured over 24h: 649 deliveries, mean lag
+        // 166s, 32% over a minute, max an hour. If the card moved in between,
+        // the message is about a state that no longer exists — and a false
+        // premise on arrival is indistinguishable from a broken trigger, which
+        // is what cost mvs-research an investigation on MR-2.
+        //
+        // Only rows that OPTED IN carry a precondition; everything else is
+        // untouched by this and delivers exactly as before.
+        let mut stale: Vec<(String, String, String)> = Vec::new();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(id, _s, _t, _q, _g, _sd, card, rev)| {
+                if card.is_empty() || *rev < 0 {
+                    return true;
+                }
+                let cur: Option<i64> = conn
+                    .query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![card], |r| r.get(0))
+                    .ok();
+                match cur {
+                    // Card gone: the premise cannot hold, and nothing will
+                    // re-fire for a card that no longer exists.
+                    None => {
+                        stale.push((id.clone(), card.clone(), "card no longer exists".into()));
+                        false
+                    }
+                    Some(now_rev) if now_rev != *rev => {
+                        stale.push((
+                            id.clone(),
+                            card.clone(),
+                            format!("card moved rev {rev} -> {now_rev} since this was computed"),
+                        ));
+                        false
+                    }
+                    Some(_) => true,
+                }
+            })
+            .collect();
+        expired = stale;
+        rows.into_iter()
+            .map(|(a, b, c, d, e, f, _, _)| (a, b, c, d, e, f))
+            .collect::<Vec<_>>()
     };
+    // NEVER SILENT, and OUTSIDE the read guard — the delete is a write and the
+    // read connection must be dropped first. A nudge that was dropped and one
+    // that was never queued look identical from the outside, and that ambiguity
+    // is precisely why this defect took a cross-session investigation to pin
+    // down. Say which rows went and why, in the log the fleet already reads.
+    for (id, card, why) in &expired {
+        tracing::info!(
+            steer_id = %id, card = %card, reason = %why,
+            "steering: dropped a queued nudge whose premise expired before delivery \
+             (AMUX-3659) — the trigger will re-fire if the condition still holds"
+        );
+    }
+    if !expired.is_empty() {
+        let ids: Vec<String> = expired.iter().map(|(i, _, _)| i.clone()).collect();
+        let _ = state
+            .store
+            .write_async(move |c| {
+                for id in &ids {
+                    c.execute("DELETE FROM steering_queue WHERE id=?1", rusqlite::params![id])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+    }
     if queued.is_empty() {
         return 0;
     }
@@ -14761,6 +14877,94 @@ mod tests {
         assert_eq!(pickup_card_id("hey, can you rebase and push?"), None);
         assert_eq!(pickup_card_id("[Ethan] decision on AMUX-1: APPROVED"), None);
         assert_eq!(pickup_card_id("Claimed board card  from your queue"), None);
+    }
+
+    // AMUX-3659, rebuilt from the MR-2 timeline to the second.
+    //
+    //   11:42:57  nudge QUEUED
+    //   11:45     mvs-research complies: needs:you cleared, card -> backlog
+    //   11:46:20  nudge DELIVERED, 3m23s after its premise was computed
+    //
+    // The trigger fired ONCE and was correct; the remedy was applied and worked.
+    // What arrived was a message asserting a state that had already changed, and
+    // a false premise on arrival is indistinguishable from a broken trigger —
+    // which is the conclusion it cost a cross-session investigation to overturn.
+    //
+    // Measured across 24h: 649 deliveries, mean lag 166s, 209 (32%) over a minute.
+    //
+    // The CONTROL is the half that matters. A message with NO precondition must
+    // be untouched, or this drops peer relays and scheduler commands — messages
+    // that assert nothing about a card and cannot go stale.
+    #[tokio::test]
+    async fn a_nudge_whose_card_moved_is_dropped_and_a_plain_message_is_not() {
+        let (st, _dir) = state();
+        let now = now_f64();
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                // rev 7 at compute time; the card has since moved to 9.
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, session, created, updated, rev) \
+                     VALUES ('MR-2','t','backlog','lane-a',0,0,9)",
+                    [],
+                )?;
+                // rev 3 and still 3 — the premise holds.
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, session, created, updated, rev) \
+                     VALUES ('MR-7','t','needsyou','lane-b',0,0,3)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard, precond_card, precond_rev) \
+                     VALUES('stale','lane-a','MR-2 has been waiting on a human answer',?1,'board-drive','MR-2',7)",
+                    rusqlite::params![now - 20.0],
+                )?;
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard, precond_card, precond_rev) \
+                     VALUES('fresh','lane-b','MR-7 has been waiting on a human answer',?1,'board-drive','MR-7',3)",
+                    rusqlite::params![now - 20.0],
+                )?;
+                // CONTROL: no precondition at all — a peer relay.
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
+                     VALUES('plain','lane-c','can you take a look at this?',?1,'')",
+                    rusqlite::params![now - 20.0],
+                )?;
+                // CONTROL: precondition naming a card that no longer exists.
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard, precond_card, precond_rev) \
+                     VALUES('gone','lane-d','GONE-1 has been waiting',?1,'board-drive','GONE-1',1)",
+                    rusqlite::params![now - 20.0],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+
+        steer_deliver_tick(&st).await;
+
+        let conn = st.store.read().unwrap();
+        let present = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(present("stale"), 0, "a nudge whose card moved rev 7->9 must be dropped");
+        assert_eq!(present("gone"), 0, "a nudge about a card that no longer exists must be dropped");
+        // NOT dropped. `fresh` may or may not have been DELIVERED (that depends
+        // on the lane being at a boundary, which a test fleet has no way to be),
+        // so the assertion is the one this change is responsible for: it was not
+        // discarded as stale.
+        assert_eq!(present("fresh"), 1, "a nudge whose card has NOT moved must survive");
+        assert_eq!(
+            present("plain"),
+            1,
+            "a message with no precondition asserts nothing about a card and must be \
+             untouched — dropping these would silently eat peer relays"
+        );
     }
 
     // AMUX-3052: a queued auto-pickup for a card CLOSED after the atomic claim

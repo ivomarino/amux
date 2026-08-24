@@ -326,6 +326,22 @@ pub trait Fleet: Send + Sync {
     fn auto_continue_enabled(&self, lane: &str) -> bool;
     /// Hand text to the lane. Durable queue + the existing delivery loop.
     async fn deliver(&self, lane: &str, text: &str);
+
+    /// Deliver a message whose text ASSERTS SOMETHING ABOUT A CARD (AMUX-3659).
+    ///
+    /// Same delivery, plus the card and the `issues.rev` the text was computed
+    /// against, so the delivery loop can drop the row if the card moved on
+    /// before the turn boundary arrived. Measured: 32% of steering is read more
+    /// than a minute after its premise was computed, and on MR-2 that turned a
+    /// correct trigger plus a correctly-applied remedy into what looked like a
+    /// broken re-nag.
+    ///
+    /// DEFAULTED to plain `deliver` so a Fleet that does not care — every test
+    /// fake — is unaffected, and so adding this could not silently change the
+    /// behaviour of any existing caller.
+    async fn deliver_about(&self, lane: &str, text: &str, _card: &str, _rev: i64) {
+        self.deliver(lane, text).await;
+    }
 }
 
 /// The live fleet: session envs on disk, `session_verbs`' liveness and boundary
@@ -361,6 +377,12 @@ impl Fleet for LiveFleet {
     }
     async fn deliver(&self, lane: &str, text: &str) {
         let _ = crate::api::session_verbs::steer_enqueue(&self.state, lane, text, "board-drive", "").await;
+    }
+    async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) {
+        let _ = crate::api::session_verbs::steer_enqueue_precond(
+            &self.state.store, lane, text, "board-drive", "", Some((card, rev)),
+        )
+        .await;
     }
 }
 
@@ -2870,7 +2892,24 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     drop(conn);
 
     if let Advance::Nudge { target, card, status, text, kind } = advance {
-        fleet.deliver(&target, &text).await;
+        // A NUDGE IS ABOUT A CARD, so it carries that card's revision and the
+        // delivery loop drops it if the card moves first (AMUX-3659). Read
+        // here, at compute time, because that is the state the text describes.
+        // A card whose rev cannot be read delivers unconditionally — the same
+        // behaviour as before, since refusing to nudge because a read failed
+        // would be a worse trade than an occasionally-stale nudge.
+        let rev: Option<i64> = state
+            .store
+            .read()
+            .ok()
+            .and_then(|c| {
+                c.query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![&card], |r| r.get(0))
+                    .ok()
+            });
+        match rev {
+            Some(r) => fleet.deliver_about(&target, &text, &card, r).await,
+            None => fleet.deliver(&target, &text).await,
+        }
         // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
         // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
         // once stamped the card owner's cooldown while the message went to the
