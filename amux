@@ -861,7 +861,14 @@ try:
         'target': os.environ['TGT'],
         'text': os.environ['BODY'],
         'from': os.environ.get('FROM', ''),
-        'ts': int(time.time()),
+        # MILLISECONDS. cmd_history.ts is millis (declared in
+        # invariants/checks.rs TIMESTAMP_COLUMNS), and this wrote SECONDS, so
+        # every reconciled fallback landed in the audit trail dated 1970-01-21
+        # and sorted below every real row — GET /api/history?limit=50 never
+        # returned one. The send WAS recorded and was unfindable where anyone
+        # looks, which is the exact failure this ledger exists to prevent.
+        # Found by writing scripts/test-unstamped-ledger.sh (AMUX-2626).
+        'ts': int(time.time() * 1000),
     }))
 except Exception:
     sys.exit(1)
@@ -893,7 +900,13 @@ print(json.dumps({
     'text': d.get('text', ''),
     'type': 'raw-tmux-fallback',
     'session': d.get('target', ''),
-    'ts': d.get('ts'),
+    # NORMALISE: rows written before the millis fix carry SECONDS. Converting
+    # here rather than only at the write site means a ledger that survived the
+    # upgrade still reconciles to the right instant instead of to 1970.
+    # 1e11 is the discriminator: any plausible seconds timestamp is ~1.8e9 and
+    # any plausible millis one is ~1.8e12, so the gap is three orders of
+    # magnitude and cannot be straddled by clock skew.
+    'ts': (lambda t: int(t) * 1000 if t and int(t) < 100000000000 else t)(d.get('ts')),
     'origin': 'unstamped-fallback from ' + (d.get('from') or 'unknown'),
 }))" 2>/dev/null) || continue
     if curl -sk -m 10 -X POST -H 'Content-Type: application/json' \
