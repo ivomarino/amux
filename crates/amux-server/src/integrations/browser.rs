@@ -307,13 +307,19 @@ pub struct RunningBrowser {
 }
 
 /// The one running browser's ownership snapshot: (profile, started_by,
-/// started_at, pid). What the start handler's takeover guard reads.
-pub fn running_snapshot() -> Option<(String, String, i64, u32)> {
+/// started_at, pid, cdp_port). What the start handler's takeover guard reads.
+///
+/// `cdp_port` joined the tuple for AMUX-3610. The takeover refusal has to be
+/// able to say "0 tabs open for 18.5 hours", and it cannot ask without the port.
+/// A caller told only "someone else holds this" must choose between blocking
+/// forever and destroying possibly-live state, which is a shared single-instance
+/// resource whose only escape hatch is destructive.
+pub fn running_snapshot() -> Option<(String, String, i64, u32, u16)> {
     RUNNING
         .lock()
         .expect("browser registry poisoned")
         .as_ref()
-        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid))
+        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port))
 }
 
 /// Why the last browser is gone (AMUX-3414: a silent Chrome exit left NOTHING
@@ -365,7 +371,7 @@ fn spawn_exit_monitor() {
             let adopted_dead = if dead.is_none() {
                 let snap = running_snapshot();
                 match snap {
-                    Some((profile, owner, _, pid)) => {
+                    Some((profile, owner, _, pid, _)) => {
                         let alive = tokio::process::Command::new("kill")
                             .args(["-0", &pid.to_string()])
                             .status()
@@ -374,7 +380,7 @@ fn spawn_exit_monitor() {
                             .unwrap_or(true); // cannot poll ≠ dead
                         // Only report dead if the registry STILL names this pid
                         // (a stop/start between poll and here changes the pid).
-                        if !alive && running_snapshot().map(|(_, _, _, p)| p) == Some(pid) {
+                        if !alive && running_snapshot().map(|(_, _, _, p, _)| p) == Some(pid) {
                             Some((profile, pid, owner, None, None))
                         } else {
                             None
@@ -650,7 +656,7 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // Runs LAST and unconditionally, including after `adopt_if_orphaned`
     // returned early — the adopted one is a legitimate tenant and is excluded
     // by pid, but its co-tenants are not.
-    let adopted = running_snapshot().map(|(_, _, _, pid)| pid).unwrap_or(0);
+    let adopted = running_snapshot().map(|(_, _, _, pid, _)| pid).unwrap_or(0);
     let strays: Vec<u32> =
         live_chromes_on_dir(home, target_dir).into_iter().filter(|p| *p != adopted).collect();
     for pid in &strays {

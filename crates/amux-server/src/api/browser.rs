@@ -147,6 +147,125 @@ fn resolve_session(explicit: Option<&str>, headers: &HeaderMap) -> String {
     "amux".into()
 }
 
+fn now_epoch() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// The takeover refusal, with enough evidence to JUDGE it (AMUX-3610).
+///
+/// THE REPORT: mvs-research hit `a browser is already running under session
+/// '(unattributed)'`, declined the takeover — correctly — and was left with no
+/// non-destructive move. Measured at the time: pid alive for 18.5 hours, ZERO
+/// tabs open, `started_by` empty. The process being alive rules out a crashed
+/// lock, so nobody could justify a takeover on those grounds; zero tabs for
+/// eighteen hours says it is almost certainly abandoned. Nothing in the API
+/// distinguished those two states, so every caller had to choose between
+/// blocking forever and destroying possibly-live state including staged logins.
+/// A shared single-instance resource whose only escape hatch is destructive is
+/// ethos rule 6, and the same shape as the gate whose only exit was `force`.
+///
+/// TWO OF THE CARD'S FOUR FIXES WERE ALREADY DONE, which is worth recording so
+/// nobody re-does them: `started_by` IS written from the resolved attribution
+/// (see the `chrome::start` call below), and the refusal HAS named the owner
+/// since AMUX-3063. The field was empty because the CALLER sent no
+/// `X-Amux-Session`, not because the server drops it. That is a doc defect in
+/// the browser example, and it belongs to the file's owner.
+///
+/// AN EMPTY OWNER AND AN EMPTY-NAMED SESSION READ IDENTICALLY, so `attribution`
+/// says which out loud. A machine consumer reading `started_by: ""` cannot tell
+/// "nobody claimed this" from "a session whose name is the empty string", and an
+/// absent attribution that announces itself is actionable where an empty string
+/// is not.
+///
+/// IT DOES NOT DECIDE THE TAKEOVER. The card asks whether an unattributed holder
+/// should be reapable by default; making that automatic would have amux destroy
+/// a browser's state — possibly a staged login — on its own judgment, which is
+/// rule 8. So this reports and recommends, and the caller still has to say
+/// `takeover: true` out loud.
+#[allow(clippy::too_many_arguments)]
+fn takeover_refusal(
+    profile: &str,
+    owner: &str,
+    started_at: i64,
+    pid: u32,
+    tabs: Option<usize>,
+    now: i64,
+    requested_by: Option<&str>,
+) -> Value {
+    let held_s = (now - started_at).max(0);
+    let held_h = held_s as f64 / 3600.0;
+    let named = !owner.trim().is_empty();
+    // The evidence sentence, built only from facts actually in hand. `tabs:
+    // None` means CDP did not answer within 3s, which is itself worth saying:
+    // silence there is a DIFFERENT state from "zero tabs" and collapsing them
+    // would recreate the ambiguity this whole card is about.
+    let idle = match tabs {
+        Some(0) => format!("held {held_h:.1}h with ZERO tabs open"),
+        Some(n) => format!("held {held_h:.1}h with {n} tab(s) open"),
+        None => format!(
+            "held {held_h:.1}h; its CDP port did not answer within 3s, so the tab count is \
+             unknown (that is not the same as zero)"
+        ),
+    };
+    let options: Vec<String> = if named {
+        vec![
+            format!("message the holder: amux send {owner} --stdin"),
+            "drive the running browser via the session-scoped verbs instead of starting your own"
+                .into(),
+            "if they agree, or you judge the risk acceptable: {\"takeover\": true}".into(),
+        ]
+    } else {
+        vec![
+            "the holder CANNOT be messaged: it sent no X-Amux-Session, so there is no session \
+             to ask. That is the whole reason this refusal now carries the idle evidence above."
+                .into(),
+            "drive the running browser via the session-scoped verbs instead of starting your own"
+                .into(),
+            "judge from the evidence, then say it out loud: {\"takeover\": true}. An \
+             unattributed holder with zero tabes for hours is very likely abandoned; a \
+             takeover is still YOUR call, not amux's."
+                .into(),
+        ]
+    };
+    json!({
+        // THE ESCAPE STAYS IN THE SENTENCE, not only in `your_options`. Plenty
+        // of callers print `.error` and nothing else, so moving `takeover` into
+        // a sibling field would hide the one documented exit behind a field
+        // nobody reads — the ethos rule 6 shape, introduced by a change made to
+        // fix ethos rule 6. `cross_session_start_refuses_without_takeover_naming_the_owner`
+        // caught exactly that in the first draft of this function.
+        "error": format!(
+            "a browser is already running under session '{}' — starting yours would DESTROY its \
+             state (staged logins included). It is {idle}. Pass {{\"takeover\": true}} to replace \
+             it deliberately, or drive the running one via session-scoped verbs; `your_options` \
+             below spells out the non-destructive moves.",
+            if named { owner } else { "(unattributed)" }
+        ),
+        "running": {
+            "profile": profile,
+            "started_by": owner,
+            // The one-output-two-states fix. Never infer this from the emptiness
+            // of `started_by`, which is exactly the read that fails.
+            "attribution": if named {
+                "session".to_string()
+            } else {
+                "none — the holder sent no X-Amux-Session header, so it cannot be identified \
+                 or messaged".to_string()
+            },
+            "started_at": started_at,
+            "held_secs": held_s,
+            "held_h": (held_h * 10.0).round() / 10.0,
+            "tabs_open": tabs,
+            "pid": pid,
+        },
+        "requested_by": requested_by.unwrap_or("(unattributed)"),
+        "your_options": options,
+    })
+}
+
 /// Map driver-layer failures: NotRunning is the caller's fixable state (409
 /// + the fix), CDP trouble is the browser misbehaving (502).
 fn driver_err(e: chrome::DriverError) -> Response {
@@ -284,28 +403,34 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
     // work they are about to destroy. Adopt first so a browser surviving a
     // server restart is guarded too, not just one this process spawned.
     chrome::adopt_if_orphaned(&home).await;
-    if let Some((r_profile, r_owner, r_started, r_pid)) = chrome::running_snapshot() {
+    if let Some((r_profile, r_owner, r_started, r_pid, r_port)) = chrome::running_snapshot() {
         // Same-session requires BOTH sides attributed and equal. An
         // unattributed caller matches nothing — anonymity forfeits the
         // shortcut, including against an unattributed owner (two anonymous
         // callers are not one session).
         let same = attrib.as_deref().is_some_and(|a| !r_owner.is_empty() && a == r_owner);
         if !same && !body.takeover {
+            // ASK THE BROWSER WHAT IT IS DOING (AMUX-3610). The refusal used to
+            // name an owner and stop, which leaves a caller facing an
+            // unattributed holder with no non-destructive move at all: block
+            // forever, or destroy state nobody can vouch for. `cdp_list` has its
+            // own 3s timeout, and a failure degrades the FIELD to null rather
+            // than the refusal — a wedged CDP must not turn a 409 into a hang.
+            let tabs = chrome::cdp_list(r_port)
+                .await
+                .ok()
+                .and_then(|v| v.as_array().map(|a| a.len()));
             return err(
                 StatusCode::CONFLICT,
-                json!({
-                    "error": format!(
-                        "a browser is already running under session '{}' — starting yours would DESTROY \
-                         its state (staged logins included). Pass {{\"takeover\": true}} to replace it \
-                         deliberately, or drive the running one via session-scoped verbs.",
-                        if r_owner.is_empty() { "(unattributed)" } else { r_owner.as_str() }
-                    ),
-                    "running": {
-                        "profile": r_profile, "started_by": r_owner,
-                        "started_at": r_started, "pid": r_pid,
-                    },
-                    "requested_by": attrib.as_deref().unwrap_or("(unattributed)"),
-                }),
+                takeover_refusal(
+                    &r_profile,
+                    &r_owner,
+                    r_started,
+                    r_pid,
+                    tabs,
+                    now_epoch(),
+                    attrib.as_deref(),
+                ),
             );
         }
         if !same {
@@ -429,7 +554,7 @@ async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     // by whoever notices) but LOUD: the log and the response both name owner
     // and actor, so an anonymous stop can no longer read as a mystery death
     // (AMUX-3063's other half — the 09:05 stop had no actor on record).
-    let owner = chrome::running_snapshot().map(|(_, o, _, _)| o);
+    let owner = chrome::running_snapshot().map(|(_, o, _, _, _)| o);
     if let Some(o) = owner.as_deref() {
         if attrib.as_deref() != Some(o) {
             tracing::warn!(
@@ -1365,11 +1490,75 @@ mod tests {
     /// refuse BEFORE any Chrome is touched (hermetic: seeded registry, temp
     /// home, no launch). Takeover by the OWNER's own session passes the guard
     /// (their browser, their restart).
+    /// AMUX-3610, built from mvs-research's MEASURED specimen rather than a
+    /// convenient one: pid alive 18.5h, ZERO tabs, `started_by` empty.
+    ///
+    /// They declined the takeover, correctly, and had no non-destructive move.
+    /// The process being alive rules out a crashed lock, so nobody could justify
+    /// a takeover on those grounds; zero tabs for eighteen hours says abandoned.
+    /// Nothing in the API separated those two states.
+    ///
+    /// THE THIRD CELL IS THE ONE THAT KEEPS THIS HONEST. `tabs: None` (CDP did
+    /// not answer) must NOT render as zero. Collapsing "I asked and got nothing"
+    /// into "there are no tabs" rebuilds the exact ambiguity this card is about,
+    /// one field further down, and it is the reading that would let a caller
+    /// destroy a live browser on the strength of a timeout.
+    #[test]
+    fn an_unattributed_holder_is_judgeable_from_the_refusal() {
+        let started = 1_787_494_071i64; // 2026-08-23T10:07:51, the reported hold
+        let now = started + 66_600; // 18.5h later
+        let v = takeover_refusal("default", "", started, 7623, Some(0), now, None);
+
+        assert_eq!(v["running"]["tabs_open"], json!(0));
+        assert_eq!(v["running"]["held_h"], json!(18.5), "{v}");
+        let e = v["error"].as_str().unwrap();
+        assert!(e.contains("18.5h") && e.contains("ZERO tabs"),
+                "the idle evidence must be in the SENTENCE — a caller who prints only .error \
+                 is the caller who filed this: {e}");
+        assert!(e.contains("takeover"), "the escape must survive in the sentence too: {e}");
+
+        // ONE OUTPUT, TWO STATES. An empty `started_by` reads identically to a
+        // session whose name is empty; `attribution` has to say which.
+        let attr = v["running"]["attribution"].as_str().unwrap();
+        assert!(
+            attr.contains("no X-Amux-Session"),
+            "an absent attribution must announce itself, or a consumer cannot tell 'nobody \
+             claimed this' from 'a session named \"\"': {attr}"
+        );
+        let opts = serde_json::to_string(&v["your_options"]).unwrap();
+        assert!(
+            opts.contains("CANNOT be messaged"),
+            "with no owner there is nobody to ask, and saying so IS the actionable part: {opts}"
+        );
+
+        // NAMED HOLDER: the normal fleet path exists and must be offered.
+        let named = takeover_refusal("default", "mvs-research", started, 7623, Some(3), now, Some("amux"));
+        assert_eq!(named["running"]["attribution"], json!("session"));
+        let nopts = serde_json::to_string(&named["your_options"]).unwrap();
+        assert!(
+            nopts.contains("amux send mvs-research"),
+            "naming the holder turns a dead end into 'go message that session': {nopts}"
+        );
+        assert!(named["error"].as_str().unwrap().contains("3 tab(s)"), "{named}");
+
+        // CDP SILENT: must not read as zero.
+        let quiet = takeover_refusal("default", "", started, 7623, None, now, None);
+        assert!(quiet["running"]["tabs_open"].is_null(), "{quiet}");
+        let qe = quiet["error"].as_str().unwrap();
+        assert!(
+            qe.contains("unknown") && qe.contains("not the same as zero"),
+            "an unanswered CDP port is a THIRD state and must say so — reading it as zero is \
+             how a caller destroys a live browser on the strength of a timeout: {qe}"
+        );
+    }
+
     #[tokio::test]
     async fn cross_session_start_refuses_without_takeover_naming_the_owner() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(dir.path());
         chrome::test_seed_running("netsuite", "amux-gtm", 424242);
+        // (AMUX-3610's cells live in `an_unattributed_holder_is_judgeable_from_the_refusal`;
+        // this one keeps pinning the AMUX-3063 property it was written for.)
         let app = app();
         // The incident's own request shape: anonymous, default profile.
         let (status, v, _) =
