@@ -1291,7 +1291,15 @@ impl CdpClient {
         };
         match tokio::time::timeout(timeout, fut).await {
             Ok(r) => r,
-            Err(_) => anyhow::bail!("CDP {method} timed out after {}s", timeout.as_secs()),
+            // TYPED, not just a message (AMUX-3672). The API boundary maps a
+            // timeout to 504 and a protocol error to 502, and it must decide
+            // that from a TYPE rather than by matching this string — the wording
+            // here would then be load-bearing for a status code, which is the
+            // fragile coupling ethos rule 7 keeps producing.
+            Err(_) => Err(anyhow::Error::new(CdpTimeout {
+                method: method.to_string(),
+                secs: timeout.as_secs(),
+            })),
         }
     }
 
@@ -1337,6 +1345,34 @@ pub enum DriverError {
     NotRunning,
     Cdp(anyhow::Error),
 }
+
+/// A CDP call that never answered (AMUX-3672).
+///
+/// Carried as a TYPE so the API boundary can answer 504 Gateway Timeout instead
+/// of 502 Bad Gateway. Both used to be `Cdp`, so both became 502 — and
+/// `/api/logs/analyze` groups by (status, method, target), which folded "the
+/// browser is WEDGED" and "the browser REJECTED our call" into one group. Two
+/// different faults, one row, and only the error body told them apart.
+///
+/// That is what made the 2026-08-24 15:57 report need its card body to diagnose:
+/// `Emulation.setDeviceMetricsOverride timed out after 10s` was a symptom of
+/// five Chromes contending one profile (AMUX-3669), and nothing in the log
+/// grouping could have said "this one is a hang".
+#[derive(Debug)]
+pub struct CdpTimeout {
+    pub method: String,
+    pub secs: u64,
+}
+
+impl std::fmt::Display for CdpTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Unchanged wording: it is what the existing card bodies and the
+        // AMUX-3207 notes quote, and a status code no longer depends on it.
+        write!(f, "CDP {} timed out after {}s", self.method, self.secs)
+    }
+}
+
+impl std::error::Error for CdpTimeout {}
 
 impl From<anyhow::Error> for DriverError {
     fn from(e: anyhow::Error) -> Self {

@@ -160,7 +160,27 @@ fn driver_err(e: chrome::DriverError) -> Response {
                          browser this server did not launch.",
             }),
         ),
-        chrome::DriverError::Cdp(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        chrome::DriverError::Cdp(e) => err(cdp_status(&e), json!({ "error": e.to_string() })),
+    }
+}
+
+/// 504 for a CDP call that never answered, 502 for one that failed (AMUX-3672).
+///
+/// Both were 502, and `/api/logs/analyze` groups by (status, method, target) —
+/// so "the browser is WEDGED" and "the browser REJECTED our call" landed in the
+/// same row and only the error body separated them. A wedged browser is the one
+/// that means something else is wrong (a contended profile, a hung tab); a
+/// protocol error usually means the caller asked for something impossible.
+/// Making them different status codes makes them different groups in every log
+/// view, for free.
+///
+/// Decided on the TYPE, never by matching the message: a status code that
+/// depends on error wording breaks the first time someone rephrases it.
+fn cdp_status(e: &anyhow::Error) -> StatusCode {
+    if e.downcast_ref::<chrome::CdpTimeout>().is_some() {
+        StatusCode::GATEWAY_TIMEOUT
+    } else {
+        StatusCode::BAD_GATEWAY
     }
 }
 
@@ -1275,6 +1295,44 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v, proxied)
+    }
+
+    /// AMUX-3672. A wedged browser and a rejected call must not share a status,
+    /// because `/api/logs/analyze` groups by (status, method, target) and would
+    /// otherwise fold two different faults into one row.
+    ///
+    /// The specimen: `Emulation.setDeviceMetricsOverride timed out after 10s`
+    /// on 2026-08-24 15:57, which was five Chromes contending one profile
+    /// (AMUX-3669). Diagnosing it needed the error BODY off the card, because
+    /// the grouping could not say "this one is a hang".
+    #[test]
+    fn a_cdp_timeout_is_504_and_a_protocol_error_is_502() {
+        let timeout = anyhow::Error::new(chrome::CdpTimeout {
+            method: "Emulation.setDeviceMetricsOverride".into(),
+            secs: 10,
+        });
+        assert_eq!(cdp_status(&timeout), StatusCode::GATEWAY_TIMEOUT);
+        // The wording is quoted in existing card bodies and the AMUX-3207
+        // notes, so it must not drift — but nothing about the STATUS depends on
+        // it any more, which is the point of deciding on the type.
+        assert_eq!(
+            timeout.to_string(),
+            "CDP Emulation.setDeviceMetricsOverride timed out after 10s"
+        );
+
+        // CONTROL: an ordinary CDP failure stays 502. A change that answered
+        // 504 for everything would pass the assertion above and relabel every
+        // browser fault as a hang — the same row-folding defect, new status.
+        let protocol = anyhow::anyhow!("CDP websocket closed during Page.navigate");
+        assert_eq!(cdp_status(&protocol), StatusCode::BAD_GATEWAY);
+
+        // CONTROL: a timeout wrapped in CONTEXT is still a timeout. `?` adds
+        // context freely on this path, and a downcast inspecting only the
+        // outermost error would silently regress to 502 the first time someone
+        // wrote `.context(...)`.
+        let wrapped = anyhow::Error::new(chrome::CdpTimeout { method: "X".into(), secs: 1 })
+            .context("while resizing the viewport");
+        assert_eq!(cdp_status(&wrapped), StatusCode::GATEWAY_TIMEOUT);
     }
 
     /// AMUX-3403: an unknown field posted to start is CAPTURED, not silently
