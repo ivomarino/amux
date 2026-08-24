@@ -2553,3 +2553,37 @@ FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, a
   cannot be confused with "0 rows in the period", and add an invariant that fails when a family
   with enough rows in the period has an empty baseline. Both values are already in hand at the
   point of suppression. Detail and acceptance on AF-178.
+
+---
+## The staged guard named me as co-editor of a file I never opened
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-179
+SYMPTOM: amux committed scripts/token-baseline.py, a file they created from scratch, and the
+  staged guard told them "was also edited by session 'amux-frustrations' 6m ago. This commit
+  stages 595 insertions / 0 deletions there". I never opened it. The mechanism is
+  observed-edits-post.py walking everything under cwd and reporting each file whose mtime is
+  >= a marker stamped when the Bash command started: the window is the DURATION of the
+  command, so on a shared checkout every peer write inside it becomes mine. I was running a
+  `cargo test` that took two minutes; the file's mtime is 20:10, inside it, and the guard's
+  "6m ago" matches that mtime exactly.
+COST: A round trip with amux that neither of us could resolve from the output, because nothing
+  in the guard's sentence says the claim came from an mtime window rather than a write. They
+  had to ask whether their commit had silently clobbered work of mine. The direction that costs
+  more is the inverse: a session recognising the shape of a false warning and pushing through a
+  true one.
+FIX: Record and print the METHOD and WINDOW on an observed record ("observed via a 128s mtime
+  window during `cargo test`") instead of the bare "was also edited by". Stop ranking a
+  wide-window observed record equal to a firsthand write. And log WHICH paths were sent: the
+  hook log says `n=3 sent` and not what, so the log built to verify the hook by what it wrote
+  cannot say what it claimed. AF-179.
+NOTE: AF-124 fixed the read-only half of this class (a `cat` of a peer's file no longer claims
+  it); no command-level allowlist can reach this half, because the commands that open the widest
+  windows are the ones that genuinely write. AMUX-3497 already ships a caveat for it and that
+  caveat FIRED for me tonight on a different file in the same commit run, so this entry is
+  narrower than it first reads: it is live only if the caveat did NOT print for amux on
+  token-baseline.py. Asked; holding. What survives either way is the log line, which records
+  `n=3 sent` and not which three.
