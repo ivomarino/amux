@@ -472,6 +472,10 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("interaction_log", "ts", true),
     ("issue_files", "added_at", false),
     ("issue_tags", "added_at", false),
+    // SECONDS, like every other `issues` timestamp. Set from `row.updated`,
+    // which the caller stamps in seconds, and backfilled through
+    // `strftime('%s', ...)` which yields seconds (AMUX-3609).
+    ("issues", "closed_at", false),
     ("issues", "last_verified_at", false),
     ("layout_presets", "created_at", false),
     ("logs", "ts", false),
