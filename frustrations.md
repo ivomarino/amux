@@ -345,41 +345,6 @@ FIX: loadUsage() should accept both "session" and "worker" (the Rust mapper now 
   conclusion in the same direction the entry warns about.
 
 ---
-## Resume drops --name, so a session's pane title shows the CONVERSATION's old name, not the worker's
-AREA: attribution
-SEVERITY: misleads
-STATUS: open
-DATE: 2026-08-09
-SESSION: amux
-CARD: AMUX-2612
-SYMPTOM: This worker is `amux` ($AMUX_SESSION=amux, tmux session amux-amux, log
-  ~/.amux/logs/amux.log). Its tmux PANE TITLE reads `amux-rust`. Root cause is in
-  the launcher: session_flag is EITHER `--resume <uuid>` OR `--name <name>`, never
-  both (amux-server.py:24258-24291; the rust port carries the same seam,
-  session_verbs.rs:2480). Claude Code writes the terminal title from ITS OWN
-  session name, which on a --resume path is the name baked in when the conversation
-  was created. Confirmed, not inferred: ~/.claude/sessions/53855.json and 66447.json
-  both map sessionId 1dd2cd21-c4a7-46b9-9b97-51fccbe721a2 -> name "amux-rust", while
-  amux serves the same worker as `amux`. A model swap resumes by uuid, so EVERY
-  model swap silently re-asserts the stale name.
-COST: The model-swap continuity handoff tells the incoming model "read
-  ~/.amux/logs/amux.log, it contains THIS session's terminal history" — and the
-  banner inside it reads `amux-rust`. I spent a round trip establishing which of
-  the two names was mine before I could trust any of the log as my own context.
-  The failure mode this sets up is worse than the confusion: a session that
-  believes it is a different lane will attribute its work, its commits and its
-  board writes to that lane. Same class as AMUX-1768 (relay misattribution), except
-  here the wrong name is displayed by amux's own instruments rather than typed by
-  an agent.
-FIX: Pass BOTH on resume — `--resume <uuid> --name <worker>` — so the displayed
-  name always tracks the WORKER, which is the only identity amux stamps writes with.
-  If Claude Code rejects the combination, have amux set the pane title itself
-  (tmux select-pane -T "$name") after launch rather than leaving the harness's stale
-  name on screen. Fix in the rust launcher first; the python one is being retired.
-  Cheap detector while it is open: `amux whoami` already contrasts live worker
-  identity against inherited env — extend it to compare against the pane title, so
-  the disagreement is reported instead of discovered.
-
 ## The rust request log recorded a ~15-second restart choreography as a 76ms request
 AREA: instruments
 SEVERITY: slows
@@ -757,23 +722,6 @@ FIX: make the live database opt-IN for a locally-built binary. Either default
   separates "this build is the deployed one" from "this build is someone's working
   tree". Right now nothing distinguishes them and the live file is the default.
 
-## Two endpoints disagree about whether a worker is running, and the card believes the wrong one
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-09
-SESSION: amux
-CARD: AMUX-2657
-SYMPTOM: after Stop, `GET /api/sessions` says `running: true` forever while
-  `GET /api/sessions/<n>/info` says `false`. The list derives running from "a tmux
-  session named amux-<n> exists"; `stop` deliberately leaves the tmux shell alive. The
-  card therefore never shows the Start button and Stop reads as having done nothing.
-COST: a full measurement pass concluded "Stop returns 202 and does not stop the
-  session" — the agent WAS dead; only the card was lying. Wrong conclusion, ~20 min.
-FIX: one batched `tmux list-panes -a -F '#{session_name}:#{pane_current_command}'` into
-  `FleetSignals.shell_only`, plus `agent_running()` as the single accessor so the two
-  answers cannot drift again (written, uncommitted). Verified both agree after Stop.
-
 ## A peer's commit shipped this run's in-flight work to origin, mid-edit
 AREA: attribution
 SEVERITY: slows
@@ -1095,17 +1043,6 @@ FIX: The generalisable half is the CORROBORATION, not the bad grep. I confirmed 
   the mechanism could fire — for hooks specifically, resolve core.hooksPath first,
   because the file at the obvious path may not be the one that runs.
 
-## A dev server on the default AMUX_HOME silently clobbers the shared endpoint.json
-AREA: instruments
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-12
-SESSION: amux
-CARD: AMUX-2971
-SYMPTOM: I ran a throwaway amux-server on an alt PORT (18931) but the DEFAULT home (~/.amux) to read real message rows for a UI verification. On startup it published ~/.amux/endpoint.json pointing canonical_port at 18931. When I killed it, endpoint.json still named the dead port — so the pre-commit staged-guard (which resolves the server via endpoint.json, not AMUX_URL) could not reach a server and printed "staged-guard NOT ENFORCED" for the next commit. This affects EVERY session on this machine, not just mine: they all share ~/.amux/endpoint.json.
-COST: One commit shipped with cross-session sweep protection OFF (recorded in staged-guard-unenforced.jsonl, so at least it was auditable). Restored by launchctl kickstart of the real server to republish. Any session that committed in the window between my dev server starting and the kick would have hit the same.
-FIX: Two candidates, either or both: (1) publish_endpoint should NOT write the shared endpoint.json when the port is not the configured canonical AMUX_RS_PORT — a dev/alt-port instance is not the fleet's server and should not claim to be; gate the write on port==canonical. (2) the staged-guard's server resolution should prefer a liveness check on the canonical port and fall back rather than trusting a possibly-stale endpoint.json. The durable fix is (1): a non-canonical instance clobbering the canonical control file is the root. Until then: always give a dev server its own mktemp AMUX_HOME (my earlier 1892x runs did; this one did not, to get the live DB — that shortcut is the bug).
-
 ## Cloud silently froze behind a red main CI — "skipped" reads as "up to date," not "frozen"
 AREA: cloud
 SEVERITY: slows
@@ -1219,18 +1156,6 @@ NOTE (2026-08-24, amux-frustrations): STAYS OPEN, and the reason is a trap worth
   concurrently with at least one other lane and the auto-builder. That is absence of a
   race in one session, which is not a fix, and no fix was ever made — so it stays open
   until either the race recurs or someone changes how concurrent builds share the dir.
-
-## amux-launched browser does not survive a server self-adopt
-AREA: browser
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-15
-SESSION: amux
-CARD: AMUX-3184
-SYMPTOM: Driving the dashboard for the ollama UI E2E, the amux-launched Chrome (POST /api/browser/start, a Playwright/CDP child of the server) vanished twice mid-test. Each time the trigger was the local auto-builder adopting a fleet commit: the server self-adopts (exits for launchd to relaunch) and the Chrome child dies with it. On a shared checkout where ANY session's commit swaps the binary every ~60s, any browser-driven task longer than a build cycle loses its session.
-  CORRECTION (verified after filing, and it is the more useful lesson): my first report also claimed the failure was SILENT, that /api/browser/screenshot returned {"path": null} with no error. That was MY probe, not the endpoint. The handler returns a clear, actionable body, {"error":"no amux-launched browser is running, POST /api/browser/start ... first", "hint": ...}, and it already WARNs on wedged captures. My extraction was `python3 -c "print(json.load(sys.stdin).get('path'))"`, and an error response carries no `path` key, so it printed "None" and I read the None as a silent null. Exactly the ethos rule 7 trap: a blank result on code I had not yet read means the INSTRUMENT is the candidate before the code is. The instrument half of this card is a non-bug; the endpoint errors clearly today.
-COST: ~8 minutes. ~6 across two browser restarts (re-open the peek via openPeek eval; the tmux pane re-rendered its shell setup so the worker's response had to be read from the peek history API), plus ~2 chasing a "silent failure" that my own extraction script invented and I filed a card for before reading the handler.
-FIX: The real residual is lifecycle, not instrumentation. Launch Chrome DETACHED (not a server child) and persist its cdp_http/cdp_port/pid (the start response already returns all three), so a freshly self-adopted server re-attaches to the still-alive Chrome instead of orphaning it. Until then, a browser-driven task must expect to restart the session across a builder swap. The instrument half needs nothing.
 
 ## staged-guard can't see a subagent's own edits, so it blocks the subagent's real work as "foreign"
 AREA: attribution
@@ -1841,6 +1766,29 @@ REOPENED 2026-08-23 by its own author, on live evidence, when asked to sign this
 
 ---
 
+NOTE (2026-08-24, amux — author, superseding their own 2026-08-23 reading): STILL LIVE, and
+  the mechanism is now named. Their 08-23 reopening read two equal ages as "amux-frustrations
+  is a phantom co-editor on my file"; on re-probing, THE DIRECTION IS INVERSE and the phantom
+  was theirs.
+  They first probed the original alerts.rs specimen and got `shared: []` — and explicitly did
+  NOT stop there, because the tree was clean and nobody had touched that file in the 6h window,
+  so an empty result and a working fix are indistinguishable. They then probed five hot files,
+  got a `shared` row on all five, and checked one against git:
+    crates/amux-server/src/api/board.rs -> age_secs 455, mine_age_secs 455,
+    owner: amux-frustrations, NO co_signal.
+  That identical-age signature is what they could not explain on 08-23. Resolved: commit
+  8575cc6f at 12:18:08 is amux-frustrations' and really does touch board.rs (mtime 12:17:22).
+  amux's own claim is the manufactured one — all they did to that file was `sed -n '2270,2300p'`,
+  a READ, at 12:17, and the Bash observer saw the mtime move during their command and minted an
+  edit claim for them.
+  WHY 357a54e's MITIGATION CANNOT REACH IT: that fix drops an OBSERVED row explained by the
+  other side's TRANSCRIPT record. Here the transcript record belongs to the side whose claim is
+  TRUE, and the phantom is the observed SELF-claim. The probe presents the two symmetrically
+  and emits no co_signal, so nothing in the output says which of the two is manufactured.
+  Working where it applies: three of the five probes DID carry a co_signal (autofix.rs and
+  session_verbs.rs with the AF-179 wording, app.js with the AMUX-3497 wording). The gap is
+  specifically observed-vs-transcript where the transcript side is the real one.
+
 ## Three defects in two days where a compound operation reported success from the parts that worked
 AREA: silent-partial
 SEVERITY: slows
@@ -2319,42 +2267,6 @@ FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, a
   point of suppression. Detail and acceptance on AF-178.
 
 ---
-## An autofix card was dispatched for an incident that had already self-resolved
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-23
-SESSION: amux
-CARD: AMUX-3572
-SYMPTOM: AMUX-3572 was auto-picked-up and handed to me as live work: "Invariant
-  `queue.has_live_consumer` has been failing for amux across 629 evaluations and has not
-  self-healed." The incident row said otherwise. `_amux_invariant_incident` for
-  (queue.has_live_consumer, amux) read `status=pass, resolved_at=1787530412`, which is
-  2026-08-23 20:33 — roughly a minute BEFORE the pickup notice reached me. The card's text
-  and the store disagreed about the present tense, and only the card was delivered.
-COST: A full investigation of a healed incident. I read the check, the monitor, the filer and
-  the incident table, and formed and killed two hypotheses, before establishing that the thing
-  I was sent to diagnose had stopped happening before I was asked. The card does carry a
-  re-check recipe and it is the first thing I ran, but it queries `/api/health/invariants`,
-  which reports FAILURES ONLY — so a resolved incident and an invariant that was never
-  evaluated return the identical empty result, and the recipe cannot distinguish "fixed" from
-  "absent". Establishing it had genuinely resolved needed `/api/debug/invariants` plus a direct
-  read of the incident table, neither of which the card names.
-FIX: The filer already writes `resolved_at` on the incident row. When an incident resolves,
-  say so on the card it minted: annotate it, or move it out of the pickup queue, or at minimum
-  have the pickup notice read the incident's CURRENT status rather than the text frozen at
-  filing time. And point the card's re-check recipe at `/api/debug/invariants`
-  (`latest_per_invariant`), which is the only surface where a PASS is visible — a re-check that
-  cannot tell green from absent is the ethos rule 7 shape, embedded in the remediation advice
-  itself.
-NOTE: The underlying false positive IS fixed at the root (95d97a8e): the check's `expected`
-  string promised "within 300s of the target going idle" while the code measured
-  `now - queued_at`, so any lane with turns over 300s tripped it at every busy->idle transition
-  and cleared seconds later. That is what generated 629 occurrences. This entry is the OTHER
-  half and is not fixed: a card outliving its incident is independent of which detector filed
-  it, and the next self-healing incident will be dispatched exactly the same way.
-
----
 ## A peer's uncommitted lint error blocked my commit and the message named their file, not them
 AREA: gates
 SEVERITY: blocks
@@ -2386,36 +2298,6 @@ NOTE: third instance of one shape in about an hour, with AF-179 (a peer's Bash w
   amux is filing separately. All three are a true statement about the shared checkout delivered
   in the second person.
 
-## A multi-file change is transiently unbuildable for every OTHER session, not just its author
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-23
-SESSION: amux
-CARD: AF-182
-SYMPTOM: Adding a field to `QueuedItem` in checks.rs and populating it in monitor.rs is one
-  logical change across two files. Between my two writes the shared checkout did not compile,
-  and a peer hit `missing field idle_since in initializer of QueuedItem` at monitor.rs:832 —
-  a file and a struct they had never touched. Twice in one hour, in the other direction too:
-  my in-flight clippy error in board_drive.rs:3620 refused THEIR commit, because the
-  pre-commit gate lints the whole workspace while the commit itself is a pathspec.
-COST: Two round trips between sessions, each opening with a version of "is this mine?". Both
-  of us guessed right, and both had to ask. The expensive direction is the inverse and has not
-  happened yet: a session that has learned this shape recognising a REAL breakage of its own as
-  somebody else's dirt and pushing through it.
-FIX: AF-182's proposal is the right one and amux-frustrations owns it — the gate already knows
-  both the staged pathspec and the file each diagnostic names, so telling them apart is a set
-  membership test, not new machinery. Beyond the wording, carry the COUNT: "1 of 1 offending
-  files is not yours" and "3 of 4 are yours" are different situations and the second must not
-  read as exonerating. My half of the remedy needs no code: keep a multi-file struct change
-  inside a single write window so the unbuildable interval never spans a peer's build.
-NOTE: The root is shared by AF-179 and this entry, which is why it is filed under the same AREA
-  rather than as `gates`. In all three cases amux stated something TRUE ABOUT THE SHARED
-  CHECKOUT in a sentence scoped to the reader — "was also edited by you", "your commit is
-  refused" — and the reader has no way to recover which was meant. The lint scope and the mtime
-  window are two instruments making the same category error.
-
----
 ## The browser guard is absent against the one lane the dashboard is hardcoded to impersonate
 AREA: attribution
 SEVERITY: blocks

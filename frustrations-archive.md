@@ -487,3 +487,152 @@ NOTE: AF-124 fixed the read-only half of this class (a `cat` of a peer's file no
   narrower than it first reads: it is live only if the caveat did NOT print for amux on
   token-baseline.py. Asked; holding. What survives either way is the log line, which records
   `n=3 sent` and not which three.
+
+## An autofix card was dispatched for an incident that had already self-resolved
+VALIDATED: amux | GONE — fixed AND firing. amux, 2026-08-24, verified against the running system: note_resolved_incidents at autofix.rs:3849, wired into the tick at 3681, has run 4 times for real between 2026-08-23 23:27 and 2026-08-24 05:34 (AMUX-3611, AMUX-3587, AMUX-3586, AMUX-3578), exactly-once via session_events idem. It also does the second half of the FIX verbatim: repoints the re-check at /api/debug/invariants latest_per_invariant with the 'cannot tell a healed check from one that never ran' reasoning in the message body, and separates unknown from pass because those are different claims (AMUX-3575). amux's own note on the probe: they nearly reported this as NEVER having fired, because they queried issues.desc for a note the code writes to issues.log — zero rows, and the zero looked like an answer. It survived only because they read where the function writes before believing the count.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux
+CARD: AMUX-3572
+SYMPTOM: AMUX-3572 was auto-picked-up and handed to me as live work: "Invariant
+  `queue.has_live_consumer` has been failing for amux across 629 evaluations and has not
+  self-healed." The incident row said otherwise. `_amux_invariant_incident` for
+  (queue.has_live_consumer, amux) read `status=pass, resolved_at=1787530412`, which is
+  2026-08-23 20:33 — roughly a minute BEFORE the pickup notice reached me. The card's text
+  and the store disagreed about the present tense, and only the card was delivered.
+COST: A full investigation of a healed incident. I read the check, the monitor, the filer and
+  the incident table, and formed and killed two hypotheses, before establishing that the thing
+  I was sent to diagnose had stopped happening before I was asked. The card does carry a
+  re-check recipe and it is the first thing I ran, but it queries `/api/health/invariants`,
+  which reports FAILURES ONLY — so a resolved incident and an invariant that was never
+  evaluated return the identical empty result, and the recipe cannot distinguish "fixed" from
+  "absent". Establishing it had genuinely resolved needed `/api/debug/invariants` plus a direct
+  read of the incident table, neither of which the card names.
+FIX: The filer already writes `resolved_at` on the incident row. When an incident resolves,
+  say so on the card it minted: annotate it, or move it out of the pickup queue, or at minimum
+  have the pickup notice read the incident's CURRENT status rather than the text frozen at
+  filing time. And point the card's re-check recipe at `/api/debug/invariants`
+  (`latest_per_invariant`), which is the only surface where a PASS is visible — a re-check that
+  cannot tell green from absent is the ethos rule 7 shape, embedded in the remediation advice
+  itself.
+NOTE: The underlying false positive IS fixed at the root (95d97a8e): the check's `expected`
+  string promised "within 300s of the target going idle" while the code measured
+  `now - queued_at`, so any lane with turns over 300s tripped it at every busy->idle transition
+  and cleared seconds later. That is what generated 629 occurrences. This entry is the OTHER
+  half and is not fixed: a card outliving its incident is independent of which detector filed
+  it, and the next self-healing incident will be dispatched exactly the same way.
+
+---
+
+## amux-launched browser does not survive a server self-adopt
+VALIDATED: amux | GONE — and a card scan could NOT have found this, which is why it was on the 'backlog four are live by construction' list I guessed wrong. amux, 2026-08-24: it shipped under AC-325, not under AMUX-3184. integrations/browser.rs:729 is cmd.process_group(0), with a comment recording this exact incident by mechanism ('the builder's self-adoption relaunch kills the whole group ... three staged-login kills in one morning'). Detached, the group kill misses Chrome; chrome::adopt_if_orphaned then runs on every verb path (browser.rs 173, 266, 359) and re-attaches via browser-running.json. Both clauses of the FIX field satisfied.
+AREA: browser
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux
+CARD: AMUX-3184
+SYMPTOM: Driving the dashboard for the ollama UI E2E, the amux-launched Chrome (POST /api/browser/start, a Playwright/CDP child of the server) vanished twice mid-test. Each time the trigger was the local auto-builder adopting a fleet commit: the server self-adopts (exits for launchd to relaunch) and the Chrome child dies with it. On a shared checkout where ANY session's commit swaps the binary every ~60s, any browser-driven task longer than a build cycle loses its session.
+  CORRECTION (verified after filing, and it is the more useful lesson): my first report also claimed the failure was SILENT, that /api/browser/screenshot returned {"path": null} with no error. That was MY probe, not the endpoint. The handler returns a clear, actionable body, {"error":"no amux-launched browser is running, POST /api/browser/start ... first", "hint": ...}, and it already WARNs on wedged captures. My extraction was `python3 -c "print(json.load(sys.stdin).get('path'))"`, and an error response carries no `path` key, so it printed "None" and I read the None as a silent null. Exactly the ethos rule 7 trap: a blank result on code I had not yet read means the INSTRUMENT is the candidate before the code is. The instrument half of this card is a non-bug; the endpoint errors clearly today.
+COST: ~8 minutes. ~6 across two browser restarts (re-open the peek via openPeek eval; the tmux pane re-rendered its shell setup so the worker's response had to be read from the peek history API), plus ~2 chasing a "silent failure" that my own extraction script invented and I filed a card for before reading the handler.
+FIX: The real residual is lifecycle, not instrumentation. Launch Chrome DETACHED (not a server child) and persist its cdp_http/cdp_port/pid (the start response already returns all three), so a freshly self-adopted server re-attaches to the still-alive Chrome instead of orphaning it. Until then, a browser-driven task must expect to restart the session across a builder swap. The instrument half needs nothing.
+
+## A dev server on the default AMUX_HOME silently clobbers the shared endpoint.json
+VALIDATED: amux | GONE — fixed at 2e7c1899, 2026-08-12. amux verified legacy_port.rs:490-505 refuses the write when a DIFFERENT LIVE pid already owns the file, plus write-then-rename for the torn-read half. Their own note: the shipped fix is BETTER than the one they proposed — they had said gate on port==canonical, and the code's comment explains why that cannot work, since the dev instance sets AMUX_RS_PORT too. The distinguisher is a live foreign owner, not the port.
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-12
+SESSION: amux
+CARD: AMUX-2971
+SYMPTOM: I ran a throwaway amux-server on an alt PORT (18931) but the DEFAULT home (~/.amux) to read real message rows for a UI verification. On startup it published ~/.amux/endpoint.json pointing canonical_port at 18931. When I killed it, endpoint.json still named the dead port — so the pre-commit staged-guard (which resolves the server via endpoint.json, not AMUX_URL) could not reach a server and printed "staged-guard NOT ENFORCED" for the next commit. This affects EVERY session on this machine, not just mine: they all share ~/.amux/endpoint.json.
+COST: One commit shipped with cross-session sweep protection OFF (recorded in staged-guard-unenforced.jsonl, so at least it was auditable). Restored by launchctl kickstart of the real server to republish. Any session that committed in the window between my dev server starting and the kick would have hit the same.
+FIX: Two candidates, either or both: (1) publish_endpoint should NOT write the shared endpoint.json when the port is not the configured canonical AMUX_RS_PORT — a dev/alt-port instance is not the fleet's server and should not claim to be; gate the write on port==canonical. (2) the staged-guard's server resolution should prefer a liveness check on the canonical port and fall back rather than trusting a possibly-stale endpoint.json. The durable fix is (1): a non-canonical instance clobbering the canonical control file is the root. Until then: always give a dev server its own mktemp AMUX_HOME (my earlier 1892x runs did; this one did not, to get the live DB — that shortcut is the bug).
+
+## Two endpoints disagree about whether a worker is running, and the card believes the wrong one
+VALIDATED: amux | GONE — structural, and amux stated the caveat rather than hiding it. Both endpoints resolve through the single agent_running() accessor (sessions_legacy.rs 1306 and 2021), which IS the fix as written, so they cannot drift. Measured 40 workers across both endpoints, 0 disagreements — but amux noted that every live worker is running, so that measurement never exercised the post-Stop state the entry is actually about. That half is covered by the unit cell at sessions_legacy.rs:3036: tmux session alive + shell scrape + no report reads NOT running, which is the post-Stop fixture flowing through the real predicate.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2657
+SYMPTOM: after Stop, `GET /api/sessions` says `running: true` forever while
+  `GET /api/sessions/<n>/info` says `false`. The list derives running from "a tmux
+  session named amux-<n> exists"; `stop` deliberately leaves the tmux shell alive. The
+  card therefore never shows the Start button and Stop reads as having done nothing.
+COST: a full measurement pass concluded "Stop returns 202 and does not stop the
+  session" — the agent WAS dead; only the card was lying. Wrong conclusion, ~20 min.
+FIX: one batched `tmux list-panes -a -F '#{session_name}:#{pane_current_command}'` into
+  `FleetSignals.shell_only`, plus `agent_running()` as the single accessor so the two
+  answers cannot drift again (written, uncommitted). Verified both agree after Stop.
+
+## Resume drops --name, so a session's pane title shows the CONVERSATION's old name, not the worker's
+VALIDATED: amux | GONE — shipped 2026-08-10, verified by amux against the LIVE artifact rather than the code alone: pane titles right now read 'amux', 'amux-cloud', 'amux-frustrations', i.e. the WORKER names, not the conversation's old name. Seam closed at session_verbs.rs:1447, format!("--resume {conv_id} --name {}", ...), with a doc comment naming the card and a regression test resume_carries_the_session_name asserting --name amux survives.
+AREA: attribution
+SEVERITY: misleads
+STATUS: open
+DATE: 2026-08-09
+SESSION: amux
+CARD: AMUX-2612
+SYMPTOM: This worker is `amux` ($AMUX_SESSION=amux, tmux session amux-amux, log
+  ~/.amux/logs/amux.log). Its tmux PANE TITLE reads `amux-rust`. Root cause is in
+  the launcher: session_flag is EITHER `--resume <uuid>` OR `--name <name>`, never
+  both (amux-server.py:24258-24291; the rust port carries the same seam,
+  session_verbs.rs:2480). Claude Code writes the terminal title from ITS OWN
+  session name, which on a --resume path is the name baked in when the conversation
+  was created. Confirmed, not inferred: ~/.claude/sessions/53855.json and 66447.json
+  both map sessionId 1dd2cd21-c4a7-46b9-9b97-51fccbe721a2 -> name "amux-rust", while
+  amux serves the same worker as `amux`. A model swap resumes by uuid, so EVERY
+  model swap silently re-asserts the stale name.
+COST: The model-swap continuity handoff tells the incoming model "read
+  ~/.amux/logs/amux.log, it contains THIS session's terminal history" — and the
+  banner inside it reads `amux-rust`. I spent a round trip establishing which of
+  the two names was mine before I could trust any of the log as my own context.
+  The failure mode this sets up is worse than the confusion: a session that
+  believes it is a different lane will attribute its work, its commits and its
+  board writes to that lane. Same class as AMUX-1768 (relay misattribution), except
+  here the wrong name is displayed by amux's own instruments rather than typed by
+  an agent.
+FIX: Pass BOTH on resume — `--resume <uuid> --name <worker>` — so the displayed
+  name always tracks the WORKER, which is the only identity amux stamps writes with.
+  If Claude Code rejects the combination, have amux set the pane title itself
+  (tmux select-pane -T "$name") after launch rather than leaving the harness's stale
+  name on screen. Fix in the rust launcher first; the python one is being retired.
+  Cheap detector while it is open: `amux whoami` already contrasts live worker
+  identity against inherited env — extend it to compare against the pane title, so
+  the disagreement is reported instead of discovered.
+
+## A multi-file change is transiently unbuildable for every OTHER session, not just its author
+VALIDATED: amux | NARROWED TO GONE by its author, over my objection, and their argument is better than mine. I guessed STILL LIVE on the grounds that today produced instances five and six of the shared-checkout class. amux, 2026-08-24: this entry's own FIX field is shipped, count included — lint-blame.py:65-88 carries all three cells ('N of M offending file(s) ARE in your commit', the peer's in-flight share, and already-broken-on-HEAD), and its comment restates their reasoning about why reporting only the peer's share reads as exonerating. The recorded COST was 'two round trips between sessions, each opening with a version of is this mine?', and on the commit path that round trip is now answered in one line. What remains is REAL but is carried by two other live entries: the unbuildable window itself is AMUX-1315 (per-lane worktrees, not built) and the ad-hoc non-commit path is the second AF-182 entry (scripts/cargo-blame.sh does not exist; lint-blame.py runs only from pre-commit, lines 274 and 300). Keeping this one open as written triple-counts one root. Both successors remain open and unarchived.
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux
+CARD: AF-182
+SYMPTOM: Adding a field to `QueuedItem` in checks.rs and populating it in monitor.rs is one
+  logical change across two files. Between my two writes the shared checkout did not compile,
+  and a peer hit `missing field idle_since in initializer of QueuedItem` at monitor.rs:832 —
+  a file and a struct they had never touched. Twice in one hour, in the other direction too:
+  my in-flight clippy error in board_drive.rs:3620 refused THEIR commit, because the
+  pre-commit gate lints the whole workspace while the commit itself is a pathspec.
+COST: Two round trips between sessions, each opening with a version of "is this mine?". Both
+  of us guessed right, and both had to ask. The expensive direction is the inverse and has not
+  happened yet: a session that has learned this shape recognising a REAL breakage of its own as
+  somebody else's dirt and pushing through it.
+FIX: AF-182's proposal is the right one and amux-frustrations owns it — the gate already knows
+  both the staged pathspec and the file each diagnostic names, so telling them apart is a set
+  membership test, not new machinery. Beyond the wording, carry the COUNT: "1 of 1 offending
+  files is not yours" and "3 of 4 are yours" are different situations and the second must not
+  read as exonerating. My half of the remedy needs no code: keep a multi-file struct change
+  inside a single write window so the unbuildable interval never spans a peer's build.
+NOTE: The root is shared by AF-179 and this entry, which is why it is filed under the same AREA
+  rather than as `gates`. In all three cases amux stated something TRUE ABOUT THE SHARED
+  CHECKOUT in a sentence scoped to the reader — "was also edited by you", "your commit is
+  refused" — and the reader has no way to recover which was meant. The lint scope and the mtime
+  window are two instruments making the same category error.
+
+---
