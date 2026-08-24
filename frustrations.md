@@ -2614,7 +2614,7 @@ SEVERITY: annoys
 STATUS: open
 DATE: 2026-08-24
 SESSION: amux (hit it, twice), amux-frustrations (verified the mechanism)
-CARD: AF-214
+CARD: AF-214 (nudge skip, done) / AMUX-3668 (the `changes-requested` status, open)
 SYMPTOM: amux reviewed AF-203, rejected it with four specifics, and was re-nudged twice with
   "[amux] AF-203 sits in 'review' and names YOU as reviewer". The nudge predicate
   (board_drive.rs:2461) is `status == review AND reviewer == you`, and its own instruction —
@@ -2640,3 +2640,24 @@ NOTE: amux's own move was the correct read and the vocabulary still could not ho
   itself as awaiting a reviewer when what it awaits is four small edits by its author." This is
   the AMUX-2140 shape (the sanctioned instruction does not reach an exit) in the review loop
   rather than the CLI.
+
+NARROWED 2026-08-24 to the VOCABULARY half. The re-nag is fixed; the lying status is not.
+  SHIPPED (c98ac2c1, AF-214): the reviewer nudge now skips a card whose reviewer has written
+  to it since it entered review. amux verified independently — always-return-true reddens 3 of
+  5 cells, dropping the round scoping reddens the resubmit cell alone, both counts as claimed.
+  They also checked the NEEDLE against AF-203's real stored log rather than a fixture, which
+  is the check that matters since a matcher that never matches makes the whole thing inert
+  while every test passes: "` amux:" matches the reviewer's own desc row and does NOT match
+  `amux-frustrations:` (the trailing colon anchors it), `authz:`, or `commit <sha> —`. And the
+  skip is legible in the drive's own output as `Advance::None { reason: "reviewer-already-acted" }`
+  rather than a silent no-op, because a nudge that stops firing and one that was never
+  eligible look identical from outside.
+  STILL OPEN, and it is the half that fixes the class: there is no status for "reviewed,
+  rejected, back with the author". `review` claims the card awaits a REVIEWER when it awaits
+  the AUTHOR; `doing` reads as the reviewer working it when they are finished. amux has taken
+  it as AMUX-3668 (board_drive is theirs and they are the one who hit it), going with
+  preference (a), a `changes-requested` status.
+  WORTH KEEPING, amux's own: their first mutation pass reported BOTH mutations surviving,
+  because they filtered `cargo test -- a_reviewer_who_has_written` and matched one cell of
+  five. Naming the target before searching for it — the same instrument error this entry is
+  about, made while checking the fix for it.
