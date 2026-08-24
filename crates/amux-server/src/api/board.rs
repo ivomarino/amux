@@ -3645,7 +3645,18 @@ pub async fn patch_item(
                     // signatures (invariant streaks, p95-vs-norm, CI) keep the
                     // re-arm: their refile requires the condition to be live
                     // again, which is exactly the signal.
-                    .filter(|s| !s.starts_with("autofix:latency|outlier|"))
+                    // AMUX-3591 adds `5xx|` for the same reason. Its signature
+                    // now carries occurrence identity too, so re-arming it
+                    // refiled the SAME rows while they sat inside the window:
+                    // one hang filed AMUX-3581, discarding it refiled
+                    // AMUX-3589, discarding that refiled AMUX-3591 — identical
+                    // signature, zero new information, a lane-turn each round.
+                    // A NEW 5xx mints a new signature and files regardless of
+                    // this idem, so keeping it loses nothing.
+                    .filter(|s| {
+                        !s.starts_with("autofix:latency|outlier|")
+                            && !s.starts_with("autofix:5xx|")
+                    })
                 {
                     let n = conn.execute(
                         "DELETE FROM session_events WHERE idem = ?1",

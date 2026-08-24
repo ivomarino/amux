@@ -583,7 +583,35 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
 
     let mut out = Vec::new();
     for ((status, method, family, target), g) in groups {
-        let signature = format!("5xx|{status}|{method}|{family}|{target}");
+        // OCCURRENCE IDENTITY (AMUX-3591), the same fix AMUX-3472 made for
+        // latency outliers, arriving here because the 5xx signature never got
+        // it and the loop it causes is now measured.
+        //
+        // Discarding an auto-filed report DELETES its idem to re-arm the
+        // detector (board.rs, AF-137/AMUX-3464) — right for a CONDITION, whose
+        // refile requires the condition to be live again. It is wrong for a
+        // batch of specific requests. This signature named only
+        // status+method+family+target, so "recurrence" meant "any 5xx on that
+        // path still inside the window", and the SAME historical rows kept
+        // qualifying.
+        //
+        // Measured, three filings of one incident: the hang at 00:49-00:51 on
+        // 2026-08-24 filed AMUX-3581; discarding it re-armed and refiled
+        // AMUX-3589; discarding THAT refiled AMUX-3591. Byte-identical
+        // signature each time, zero new information, and every round cost a
+        // lane a full scope-and-decide turn. A worker doing exactly the right
+        // thing — judging a spurious report and discarding it — was the thing
+        // driving the loop.
+        //
+        // With the newest offending row's second-resolution timestamp, the same
+        // rows re-scanned mint the SAME signature (so a discard stays judged)
+        // while a genuinely new 5xx mints a new one and files regardless. The
+        // re-arm skip below then keeps `5xx|` for the same reason it keeps
+        // `latency|outlier|`: an occurrence, once judged, is judged forever.
+        let signature = format!(
+            "5xx|{status}|{method}|{family}|{target}|{}",
+            g.last_ts as i64
+        );
         // COMPUTED title: the signature in English, plus the count. No model.
         let title = format!("{method} {target} → HTTP {status} ({}x)", g.count);
         let recheck = format!(
@@ -4824,7 +4852,24 @@ mod tests {
         }
         assert!(desc.contains("background-conversation"), "the actual error body must be quoted");
         assert!(desc.contains("/api/logs/analyze"), "the recheck must be a runnable query");
-        assert_eq!(sref, "autofix:5xx|500|POST|/api/sessions|/api/sessions/{name}/{*verb}");
+        // AMUX-3591: the signature now carries OCCURRENCE IDENTITY (the newest
+        // offending row's second-resolution ts), so it cannot be pinned as a
+        // literal. Asserting the prefix keeps what this line was actually for —
+        // that source_ref is "autofix:" + the detector's signature and the
+        // target is normalized — while the suffix assertion below pins the new
+        // property: re-scanning the SAME rows must mint the SAME signature, or
+        // a judged report refiles forever.
+        let want_prefix = "autofix:5xx|500|POST|/api/sessions|/api/sessions/{name}/{*verb}|";
+        assert!(
+            sref.starts_with(want_prefix),
+            "source_ref must be autofix: + the signature, target normalized: got {sref}"
+        );
+        let ts_part = sref.trim_start_matches(want_prefix);
+        assert!(
+            ts_part.parse::<i64>().is_ok() && !ts_part.is_empty(),
+            "the occurrence suffix must be a bare epoch second, got {ts_part:?} — without it a \
+             discarded report re-arms and refiles the identical rows (AMUX-3581 -> 3589 -> 3591)"
+        );
         // NEVER `code`: an auto-filed report has no merged commit to claim, so
         // a code gate could only be exited by asserting something untrue.
         assert_eq!(ty, "investigation", "auto-filed faults must not be gated as code");
@@ -5527,6 +5572,69 @@ mod tests {
             0.0,
             "matching is exact, not prefix — a new sub-route must not inherit an exemption \
              nobody measured for it"
+        );
+    }
+
+    /// AMUX-3591: re-scanning the SAME 5xx rows must mint the SAME signature,
+    /// so a discarded report stays judged instead of refiling forever.
+    ///
+    /// THE LOOP THIS CLOSES, measured rather than imagined. One server hang
+    /// filed AMUX-3581. Discarding it deleted the idem to re-arm the detector
+    /// (board.rs, AF-137) — correct for a CONDITION, whose refile requires the
+    /// condition to be live again. But the 5xx signature named only
+    /// status+method+family+target, so "recurrence" meant "any 5xx on that path
+    /// still inside the 6h window", and the SAME historical rows qualified.
+    /// AMUX-3589 was filed. Discarding that filed AMUX-3591. Byte-identical
+    /// signature every time, zero new information, and each round cost a lane a
+    /// full scope-and-decide turn — driven by a worker doing exactly the right
+    /// thing.
+    ///
+    /// The CONTROL is the half that matters: a genuinely NEW 5xx must still
+    /// mint a new signature and file, or this fix trades a loop for a detector
+    /// that goes quiet after its first discard.
+    #[tokio::test]
+    async fn rescanning_the_same_5xx_rows_mints_the_same_signature() {
+        let sref = |st: &AppState| cards(st).first().map(|c| c.4.clone()).unwrap_or_default();
+
+        let (st, _d) = state();
+        let now = unix_now();
+        for i in 0..4 {
+            log_row(&st, Row { ts: now - 300.0 + i as f64, method: "GET", path: "/api/sessions",
+                family: "/api/sessions", status: 500, body: "timed out waiting for connection",
+                worker: "amux", ua: "curl/8.7.1", ms: 30_100.0 });
+        }
+        autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+        let first = sref(&st);
+        assert!(first.starts_with("autofix:5xx|"), "precondition: a 5xx card was filed: {first}");
+
+        // Re-scan the identical rows, exactly as the next tick does while they
+        // sit inside the window. Nothing new happened, so nothing new is news.
+        let (st2, _d2) = state();
+        for i in 0..4 {
+            log_row(&st2, Row { ts: now - 300.0 + i as f64, method: "GET", path: "/api/sessions",
+                family: "/api/sessions", status: 500, body: "timed out waiting for connection",
+                worker: "amux", ua: "curl/8.7.1", ms: 30_100.0 });
+        }
+        autofix_tick(&st2, std::path::Path::new("/nonexistent")).await;
+        assert_eq!(
+            sref(&st2), first,
+            "the same rows must mint the SAME signature — otherwise a discard re-arms and the \
+             identical specimen comes back (AMUX-3581 -> 3589 -> 3591)"
+        );
+
+        // CONTROL: a NEWER 5xx is genuinely new news and must mint a DIFFERENT
+        // signature, so the detector still fires after a discard.
+        let (st3, _d3) = state();
+        for i in 0..4 {
+            log_row(&st3, Row { ts: now - 10.0 + i as f64, method: "GET", path: "/api/sessions",
+                family: "/api/sessions", status: 500, body: "timed out waiting for connection",
+                worker: "amux", ua: "curl/8.7.1", ms: 30_100.0 });
+        }
+        autofix_tick(&st3, std::path::Path::new("/nonexistent")).await;
+        assert_ne!(
+            sref(&st3), first,
+            "a NEW occurrence must mint a NEW signature, or this trades a refile loop for a \
+             detector that goes silent after one discard"
         );
     }
 
