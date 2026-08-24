@@ -645,6 +645,47 @@ pub fn reviewer_acts_next(status: &str) -> bool {
 // DB reads
 // ---------------------------------------------------------------------------
 
+
+/// Has the REVIEWER written to this card since it entered `review`? (AF-214)
+///
+/// The reviewer nudge fires on `status == review AND reviewer == you`, and its
+/// own instruction — "if not, say what fails on the card" — is a DESC write that
+/// does NOT change status. So a reviewer who rejects work exactly as told leaves
+/// the card in the state that re-fires the nudge, and gets asked to review their
+/// own rejection until the 24h budget runs out. amux hit that twice on AF-203 in
+/// one afternoon.
+///
+/// The real fix is a status for it (`changes-requested`): `review` claims the
+/// card awaits a REVIEWER when it awaits the AUTHOR, and `doing` reads as the
+/// reviewer working it when the reviewer is finished. Neither cell exists, so the
+/// board misdescribes the card whichever move the reviewer makes. That is a
+/// vocabulary change and it is tracked on AF-214; this stops the wasted turns
+/// without pretending to fix the lying status.
+///
+/// PARSED FROM THE LOG, and NOT from "the last line's author", which is what the
+/// shape invites and would be wrong: the log carries `authz:` rows and
+/// `commit <sha> — <subject>` rows that are not actor actions, so the newest line
+/// is routinely neither party. Instead: find where the card last entered
+/// `review`, then look for a line by the reviewer strictly after it.
+fn reviewer_acted_since_review(log: &str, reviewer: &str) -> bool {
+    let rev = reviewer.trim();
+    if rev.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = log.lines().collect();
+    // Last transition INTO review. Anything before it belongs to an older round
+    // — a card can be reviewed, sent back, reworked and re-reviewed.
+    let entered = lines
+        .iter()
+        .rposition(|l| l.contains("-> review"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let needle = format!("` {rev}:");
+    lines[entered.min(lines.len())..]
+        .iter()
+        .any(|l| l.contains(&needle))
+}
+
 fn card_event_count(conn: &Connection, etype: &str, card: &str, since: f64) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM session_events WHERE type=?1 AND ts > ?2 AND data LIKE ?3",
@@ -2452,6 +2493,19 @@ pub fn select_advance(
                         detail: format!("reviewer {rev} nudged {spent}x in 24h on {card_id}"),
                     };
                 }
+                // AF-214: they have already reviewed it. Asking again is asking
+                // them to review their own rejection, and the instruction this
+                // nudge gives ("say what fails on the card") is what put the card
+                // in this state — so the nudge re-fires on compliance.
+                if reviewer_acted_since_review(row.log.as_deref().unwrap_or(""), &rev) {
+                    return Advance::None {
+                        reason: "reviewer-already-acted",
+                        detail: format!(
+                            "{rev} has written to {card_id} since it entered review — \
+                             the card awaits its AUTHOR, not a reviewer"
+                        ),
+                    };
+                }
                 // Name the ACTUAL transition. A card at `done` told to "ack
                 // review->done" is being pointed at a move it already made.
                 let next = advance_target(&status)
@@ -3456,6 +3510,80 @@ pub fn routes() -> axum::Router<AppState> {
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod reviewer_renag_tests {
+    use super::reviewer_acted_since_review;
+
+    /// The AF-203 specimen, verbatim in shape: amux is named reviewer, reviews
+    /// and rejects, and the log then carries rows that are NOT actor actions.
+    const REAL: &str = "\
+`14:37` commit ab6f5f30 — fix(messages): clamp /api/history (AF-213)
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars
+`14:40` authz: card=silent worker:amux-frustrations=silent group=silent
+`14:45` commit a8786e4a — docs(frustrations): a rejected review has no status";
+
+    #[test]
+    fn a_reviewer_who_has_written_since_review_is_not_nudged_again() {
+        assert!(
+            reviewer_acted_since_review(REAL, "amux"),
+            "amux wrote at 14:33, after the 14:20 move into review — they have reviewed it"
+        );
+    }
+
+    /// CONTROL, and the one that matters: a guard that suppressed every nudge
+    /// would pass the cell above perfectly.
+    #[test]
+    fn a_reviewer_who_has_not_touched_the_card_is_still_nudged() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:45` commit a8786e4a — docs(frustrations): a rejected review has no status";
+        assert!(
+            !reviewer_acted_since_review(log, "amux"),
+            "nobody has reviewed it — this is exactly the card the nudge exists for"
+        );
+    }
+
+    /// The non-actor rows must not be read as the reviewer acting. `authz:` and
+    /// `commit <sha> —` lines are the newest lines on a real card most of the
+    /// time, which is why "is the last line the reviewer's" is the wrong test.
+    #[test]
+    fn authz_and_commit_rows_are_not_reviewer_activity() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:40` authz: card=silent worker:amux=silent group=silent
+`14:45` commit a8786e4a — amux fixed something";
+        assert!(
+            !reviewer_acted_since_review(log, "amux"),
+            "an authz row naming the reviewer, and a commit subject containing their name, \
+             are not the reviewer writing to the card"
+        );
+    }
+
+    /// A SECOND ROUND re-arms the nudge. The reviewer's note from the previous
+    /// round is older than the latest move into review, so it must not suppress
+    /// the nudge for work that has since been redone and resubmitted.
+    #[test]
+    fn a_resubmitted_card_nudges_the_reviewer_again() {
+        let log = "\
+`10:00` author: doing -> review
+`10:05` amux: desc +900 chars
+`11:00` author: review -> doing
+`12:00` author: doing -> review";
+        assert!(
+            !reviewer_acted_since_review(log, "amux"),
+            "amux reviewed the FIRST submission; the card was reworked and resubmitted at \
+             12:00 and needs a fresh look"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_reviewer_never_suppresses() {
+        assert!(!reviewer_acted_since_review(REAL, ""));
+        assert!(!reviewer_acted_since_review(REAL, "   "));
+    }
+}
 
 #[cfg(test)]
 mod tests {
