@@ -3005,13 +3005,22 @@ mod tests {
         let (store, _dir) = store();
         let now = unix_now();
         let boot = now - 300.0;
+        // NB `ts` is the request START (stamped at line 275, before the handler
+        // runs; migration 0010 documents it and AMUX-3647 measured it). The
+        // predicate under test reduces to `latency > ts - boot`, so read these
+        // three seeds as "how long after ITS OWN process booted did this request
+        // arrive, and did it run longer than that".
+        //
         // A fast baseline so p50 is small and the threshold (5x p50) is low.
         for i in 0..8 {
             seed_boot(&store, now - 200.0 + i as f64, "/api/board", 5.0, Some(boot)).await;
         }
-        // THE SPECIMEN: completed after boot, ARRIVED 100s before it.
+        // THE SPECIMEN: arrived 20s after its boot and ran 120s, so it spent
+        // 100s of that waiting through the process's own startup.
         seed_boot(&store, boot + 20.0, "/api/board", 120_000.0, Some(boot)).await;
-        // THE CONTROL: equally slow, but it arrived well AFTER the boot.
+        // THE CONTROL: equally slow, but it arrived 120s after its boot, so the
+        // whole 120s is service time. Excluding it would be excluding a real
+        // slow request, which is the failure direction nobody notices.
         seed_boot(&store, now - 10.0, "/api/board", 120_000.0, Some(now - 130.0)).await;
 
         let api = logs_api(store.clone());

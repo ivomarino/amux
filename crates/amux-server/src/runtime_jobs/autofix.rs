@@ -751,10 +751,33 @@ fn spans_restart(ts: f64, latency_ms: f64, boot: Option<f64>) -> bool {
 ///
 /// With the row's own boot the test is ONE-SIDED and cannot regress the way the
 /// process-boot form did. A row's `ts` is by construction at or after the boot
-/// of the process that wrote it, so `arrival < boot` alone is exactly "spanned
-/// this process's start". The `ts >= b` conjunct existed only to stop
+/// of the process that wrote it. The `ts >= b` conjunct existed only to stop
 /// "before the current boot" matching every legitimately old row — the trap
 /// that excluded 213,420 of 213,935 rows when it was omitted.
+///
+/// WHAT THIS ACTUALLY TESTS, WHICH IS NOT WHAT IT IS NAMED (AMUX-3647).
+///
+/// `ts` is the request START, not its completion. `request_log.rs` stamps it at
+/// line 275, before `next.run(req).await`, and migration 0010 says so in the
+/// column comment. Measured rather than read: a request bracketed by wall-clock
+/// marks logged `ts` 52ms after the PRE mark and 758ms before the POST mark,
+/// with `ts + latency` landing on the post mark.
+///
+/// So `ts - latency` is a moment BEFORE the request existed, and the expression
+/// below reduces to `latency > ts - boot`: the request was in flight longer than
+/// this process had been up when it arrived. That is a real and useful class —
+/// it is exactly a request that waited through the process's own startup, which
+/// is the 186-second migration stall of 2026-08-24 (see 0032's header) — but it
+/// is not "the row's clock spanned a restart", and a row's clock CANNOT span its
+/// own process's restart, because `ts >= boot` by construction.
+///
+/// The consequence is a real false exclusion in one direction: a genuinely slow
+/// request that ARRIVES within `latency` seconds of a boot is dropped from the
+/// outlier list and from the latency statistics. This server restarts on every
+/// commit the fleet makes (~27/day) and the dashboard polls every ~5s, so that
+/// window is routinely occupied. AMUX-3647 carries the fix, which is to stop
+/// doing latency arithmetic and compare against a recorded `ready_at` — the
+/// instant the server began serving, which it knows and does not store.
 ///
 /// A NULL `boot_at` is a legacy row from before the column existed, and falls
 /// back to the process-boot comparison rather than being treated as "did not
