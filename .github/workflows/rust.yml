@@ -163,6 +163,18 @@ jobs:
       - name: runtime smoke -- staged-guard refuses an index that is not the worktree (AF-195)
         run: bash scripts/test-index-worktree-divergence.sh
 
+      # AMUX-3667. CI has no `.cargo/config.toml` (install.sh writes it and it
+      # is gitignored), so this SKIPS here and exits 0. That is deliberate and
+      # it is not theatre: the half CI can genuinely break is the CONTROL —
+      # this job sets CARGO_TARGET_DIR itself, serve-head.sh exports its own
+      # (AMUX-2961), and a future change that let `build.target-dir` win over
+      # the env would move both silently. The script asserts that precedence
+      # empirically, so when a config IS present the control runs; keeping the
+      # step wired means the day someone commits a config, or CI starts running
+      # install.sh, the assertion is already here rather than remembered.
+      - name: runtime smoke -- a bare cargo does not build into the checkout (AMUX-3667)
+        run: bash scripts/test-cargo-target-dir-pinned.sh
+
   e2e:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
     # browser against the real server + real extracted dashboard.
