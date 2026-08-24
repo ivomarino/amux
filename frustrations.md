@@ -2771,3 +2771,31 @@ FIX: two separate fixes. (1) Upgrade mixpeek/.githooks/amux-staged-guard and
   match to come from a comment-anchored form, or compare GUARD_VERSION
   numerically in addition to/instead of grepping tokens. Otherwise the next
   stale copy hides the same way. Neither started; MR-44.
+
+## session-freshness reported a stale shadowing CLI and prescribed the `cp` that rebuilds it
+AREA: instrumentation
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3687
+SYMPTOM: The freshness hook's Axis-2 shadow detector fired correctly on
+  /usr/local/bin/amux and then offered `cp "$REPO/amux" "$cand"` as the remedy. A copy
+  silences the warning and leaves a copy, which is stale again the next time anyone edits
+  ./amux — so the prescribed fix reconstructs the exact condition being reported. It is
+  also how the specimen got there: ~/.local/bin/amux has been a SYMLINK since install.sh
+  created it, and /usr/local/bin/amux was the copy, so the one file that could drift was
+  the one the remedy would recreate. What was actually sitting there was an Aug-6
+  227-line stub knowing two verbs (send, board) and defaulting AMUX_URL to
+  https://localhost:8822, the retired port (AMUX-3046). A lane resolving it gets
+  connection-refused on every call, and help-and-exit-0 on `url` or `alert`.
+COST: 18 days undetected, and the detection that finally landed pointed at a remedy that
+  would have reset the clock. Not measurable in minutes for me (the hook named the file
+  and I checked it), but any lane whose PATH ordered /usr/local/bin first was talking to
+  a dead port for those 18 days with no error a session would recognise as a stale CLI.
+FIX: `ln -sfn`, in both branches of the axis, with the reason stated inline so it does not
+  get "simplified" back to a cp. b0a0c6b7. Live shadow reconciled the same way; both PATH
+  entries now resolve to the checkout and the axis is silent.
+  The generalisable half: a detector that names a remedy owes the same scrutiny to the
+  REMEDY as to the check. This one could fail, fired correctly, and still closed the loop
+  back onto itself.
