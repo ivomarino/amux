@@ -2622,3 +2622,35 @@ NOTE: The underlying false positive IS fixed at the root (95d97a8e): the check's
   and cleared seconds later. That is what generated 629 occurrences. This entry is the OTHER
   half and is not fixed: a card outliving its incident is independent of which detector filed
   it, and the next self-healing incident will be dispatched exactly the same way.
+
+---
+## A peer's uncommitted lint error blocked my commit and the message named their file, not them
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-182
+SYMPTOM: The pre-commit gate runs `cargo clippy --workspace --all-targets` over the WORKING
+  TREE, not over what is staged. My commit of two clean files was refused with
+  `board_drive.rs:3620 this assertion has a constant value`, from 170 uncommitted lines of a
+  peer's in-flight work. Nothing in the output said the file was not mine. Earlier the same
+  hour, `cargo check` failed on `missing field idle_since in initializer of QueuedItem` from
+  the same peer writing checks.rs and monitor.rs minutes apart, and I built inside the window.
+COST: A commit blocked outright with no correct action available except waiting on another
+  session, plus a rebuild and a spell of doubting my own edits on the earlier one. The tempting
+  wrong move is cheap and available: fix the peer's file. That is how a session ends up
+  committing another session's half-finished work, which is the class the staged guard exists
+  to prevent, reached from a direction the staged guard cannot see.
+FIX: amux's framing, which is better than my first one: the gate reports a WORKSPACE-SCOPED
+  FACT IN A SESSION-SCOPED SENTENCE. The diagnostic is true about the repo and false about the
+  committer and nothing says which was meant. The gate already holds both halves at the moment
+  it refuses (the staged pathspec, and the file each diagnostic names), so the discriminator is
+  a set membership test. Say "BLOCKED BY ANOTHER SESSION'S IN-FLIGHT WORK - not your commit",
+  name the session and that the staged files are clean, and carry the COUNT, because "1 of 1 is
+  not yours" and "3 of 4 are yours" are different situations and the second must not read as
+  exonerating. AF-182.
+NOTE: third instance of one shape in about an hour, with AF-179 (a peer's Bash window sampled
+  my ongoing authorship, reported as "you edited this") and the transient unbuildable window
+  amux is filing separately. All three are a true statement about the shared checkout delivered
+  in the second person.
