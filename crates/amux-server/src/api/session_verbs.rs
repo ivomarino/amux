@@ -3413,7 +3413,18 @@ pub(crate) async fn steer_enqueue_precond(
     // without the attribute this would have been a refusal any future producer
     // could drop silently. CI denies warnings, so every one of the 18 call
     // sites now says out loud what it does with a refusal.
-    if let Some(reason) = permanently_blocked(name) {
+    let blocked = {
+        // Read scoped tight: the resolver needs a connection, and holding one
+        // across the enqueue write below would deadlock the single writer.
+        match store.read() {
+            Ok(conn) => permanently_blocked_resolved(&conn, name),
+            // Unreadable store: fall back to the file-only answer rather than
+            // refusing everything. A read failure is not evidence a target does
+            // not exist, and this path's whole job is to distinguish those.
+            Err(_) => permanently_blocked(name),
+        }
+    };
+    if let Some(reason) = blocked {
         // Stable token so a sweep can COUNT these without a human noticing
         // first — the same /api/logs/analyze WARN sweep that found the bug.
         tracing::warn!(
@@ -7967,6 +7978,50 @@ pub(crate) fn permanently_blocked(name: &str) -> Option<&'static str> {
         return Some("archived");
     }
     None
+}
+
+/// The same policy, but able to answer EXISTENCE for a rust-managed worker
+/// (AMUX-3649, closing GitHub #134 — reported with a 42-verb inventory by an
+/// external contributor).
+///
+/// `permanently_blocked` answers two questions at once: DOES THIS TARGET EXIST
+/// (a resolution question) and MAY WE DELIVER TO IT (a policy question). It
+/// answers the first with `env_path(name).exists()`, which encodes
+/// `existence == has an env file` — true of the tmux fleet substrate and of
+/// nothing else. A rust-managed worker is a `_amux_workers` row that has no env
+/// file, so delivery refused with "no worker called '<name>' exists" about a
+/// worker that demonstrably does.
+///
+/// That check is mine (AF-188) and it is RIGHT for fleet lanes: a typo is the
+/// only block it can produce, and the refusal wording depends on it. So it stays
+/// exactly as it is, and the row lookup is a SECOND way to prove existence,
+/// consulted only when the first says no.
+///
+/// `archived` is deliberately NOT re-derived here. It is a policy about a target
+/// that exists, and for a fleet lane it lives in the env file this branch has
+/// already established is present.
+///
+/// Not a `Target` type yet, which is what the card proposed. That refactor
+/// touches 18 call sites for a split this makes at the one call site where the
+/// two questions are actually confused — delivery. The type is worth having when
+/// a second caller needs it; building it now would be a wider blast radius than
+/// the bug.
+pub(crate) fn permanently_blocked_resolved(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> Option<&'static str> {
+    match permanently_blocked(name) {
+        // The one case a `_amux_workers` row can overturn: the env file is
+        // absent, which for a rust-managed worker is normal rather than fatal.
+        Some("no-env-file") => match crate::db::queries::get_worker(conn, name) {
+            // Existence proven from the row, which is a stronger proof than a
+            // file on disk. `get_worker` excludes soft-deleted rows, so a
+            // deleted worker is still correctly a non-target.
+            Ok(Some(_)) => None,
+            _ => Some("no-env-file"),
+        },
+        other => other,
+    }
 }
 
 /// The sentence for a message that was REFUSED and never stored (AF-188).
@@ -14445,6 +14500,108 @@ mod tests {
     /// `permanently_blocked`), and this change added the chokepoint without
     /// removing the copies. Collapsing them is what makes the threaded reason
     /// live.
+    /// AMUX-3649 / GitHub #134, reported with a 42-verb inventory by an external
+    /// contributor: `/api/workers` has no send, and the delivery path refuses a
+    /// rust-managed worker as non-existent.
+    ///
+    /// The cause was that `permanently_blocked` answers EXISTENCE with
+    /// `env_path(name).exists()` — `existence == has an env file`, true of the
+    /// tmux fleet substrate and of nothing else. A `_amux_workers` row has no
+    /// env file, so a worker that demonstrably exists got "no worker called
+    /// '<name>' exists".
+    ///
+    /// ASSERTS DELIVERY, NOT STATUS, which the card calls for and is the point:
+    /// a cell asserting 200 passes against a handler that drops the body. The
+    /// discriminator is that the message is actually QUEUED.
+    ///
+    /// The negative control is what stops this being indistinguishable from
+    /// deleting the guard — a MISTYPED name must still be refused, and with the
+    /// same wording, because that wording is the only thing a typo produces.
+    #[tokio::test]
+    async fn a_rust_managed_worker_accepts_delivery_and_a_typo_still_does_not() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+
+        // A worker that exists ONLY as a row: no env file anywhere.
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS _amux_workers (\
+                       id TEXT PRIMARY KEY, display_name TEXT, name_aliases TEXT DEFAULT '[]',\
+                       cwd TEXT, provider TEXT, model TEXT, backend TEXT, environment TEXT,\
+                       permissions TEXT, group_id TEXT, state TEXT, version INTEGER DEFAULT 0,\
+                       created_at TEXT, updated_at TEXT);",
+                )?;
+                conn.execute(
+                    "INSERT INTO _amux_workers \
+                     (id, display_name, name_aliases, cwd, provider, backend, state, created_at, updated_at) \
+                     VALUES ('wrk_01ZZZTESTWORKER00000000000','rust-only','[]','/tmp','claude',\
+                             'herdr','{\"state\":\"stopped\"}','2026-08-24T00:00:00Z','2026-08-24T00:00:00Z')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+
+        // PREMISE, asserted so the treatment cannot pass for the wrong reason:
+        // this name has no env file, so the OLD check calls it non-existent.
+        assert_eq!(
+            permanently_blocked("rust-only"),
+            Some("no-env-file"),
+            "fixture premise: the env-file check must still say this does not exist"
+        );
+
+        // TREATMENT: the resolving check consults the row and finds it.
+        {
+            let conn = st.store.read().unwrap();
+            assert_eq!(
+                permanently_blocked_resolved(&conn, "rust-only"),
+                None,
+                "a worker that exists as a row must not be refused as non-existent"
+            );
+            // NEGATIVE CONTROL: a typo has no row and no env file, and must
+            // still be refused with the SAME reason — otherwise this is
+            // indistinguishable from deleting the guard.
+            assert_eq!(
+                permanently_blocked_resolved(&conn, "rust-onlyy"),
+                Some("no-env-file"),
+                "a mistyped name must still be refused"
+            );
+        }
+
+        // DELIVERY, not status: the message has to actually reach the queue.
+        let id = steer_enqueue_store(&st.store, "rust-only", "hello worker", "", "amux").await;
+        assert!(id.is_ok(), "enqueue to a rust-managed worker must be accepted: {id:?}");
+        let queued: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE session='rust-only' AND text='hello worker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1, "the message must be QUEUED, not merely accepted");
+
+        // And the typo must queue NOTHING.
+        let bad = steer_enqueue_store(&st.store, "rust-onlyy", "hello typo", "", "amux").await;
+        assert!(bad.is_err(), "a typo must still be refused");
+        let none: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE session='rust-onlyy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(none, 0, "nothing may be queued behind a permanent block");
+    }
+
     #[tokio::test]
     async fn a_permanently_blocked_target_is_refused_and_nothing_is_queued() {
         let (st, dir) = state();
