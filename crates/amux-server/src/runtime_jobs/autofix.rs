@@ -863,6 +863,117 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
 /// through this function is a test of the shipped path, not of a paraphrase of
 /// it (rule 7: the fixture has to flow through the code where the defect would
 /// be introduced).
+/// How many CPUs this host has, for reading a load average against.
+///
+/// `None` rather than a guess: "load 37" means nothing without the denominator,
+/// and a wrong denominator is worse than an absent one because it invites a
+/// confident conclusion. `_SC_NPROCESSORS_ONLN` is the online count, which is the
+/// right one for oversubscription (a core the OS has parked cannot run a thread).
+fn host_ncpu() -> Option<i64> {
+    // SAFETY: sysconf takes an int name and returns a long; no pointers.
+    let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
+    (n > 0).then_some(n as i64)
+}
+
+/// The host-load sentence for a correlated-slowdown card (AMUX-3646).
+///
+/// STATES THE NUMBER, DOES NOT ASSERT THE CAUSE. The correlation between high
+/// load and these excursions is plausible and, as of the day this shipped,
+/// UNPROVEN: the card's own design section says to add the column first, let it
+/// fill, and verify that slow rows carry high load1 while fast ones do not.
+/// Writing "the host was oversubscribed, that is why" before that check would be
+/// the loud-wrong instrument this file's rule 7 is mostly about, and it would be
+/// believed because it reads like a diagnosis.
+///
+/// So the card gets the fact and the reader gets the judgment. That is also the
+/// honest answer to the two-cell problem this card was filed about: the detector
+/// had "one endpoint is slow" and "N endpoints are slow" and the truth needed a
+/// third cell it could not express.
+///
+/// Sorts in place; the caller owns the vector and does not need the order.
+fn describe_window_load(loads: &mut [f64]) -> String {
+    if loads.is_empty() {
+        return "not recorded — every row in this window predates migration 0034 \
+                (load1), so the host's state during the excursion is unknown"
+            .into();
+    }
+    loads.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p50 = rl::percentile_sorted(loads, 0.5);
+    let max = loads.last().copied().unwrap_or(0.0);
+    match host_ncpu() {
+        Some(n) => format!(
+            "1-minute load across this window: median {p50:.1}, peak {max:.1}, on {n} cores \
+             ({:.2}x at the median). This box compiles and tests amux continuously, so \
+             oversubscription is routine rather than exceptional. It is stated here as a \
+             FACT, not a verdict: check whether the slow rows carry the high load before \
+             concluding it is the cause.",
+            p50 / n as f64
+        ),
+        None => format!(
+            "1-minute load across this window: median {p50:.1}, peak {max:.1}. Core count \
+             unavailable, so there is no denominator to read it against."
+        ),
+    }
+}
+
+/// One family's p95 excursion, held until the fan-in can count them (AMUX-3646).
+struct P95Hit {
+    fam: String,
+    p95_w: f64,
+    p95_b: f64,
+    win_p50: f64,
+    win_max: f64,
+    base_p50: f64,
+    win_n: usize,
+    base_n: usize,
+}
+
+/// The per-family p95 card, unchanged in content from when it was built inline.
+///
+/// Extracted only so the fan-in above can choose between one rollup and N of
+/// these without the payload existing in two spellings. Two spellings of one
+/// rule is how the outlier path kept the wrong restart predicate for a day after
+/// the p95 path was fixed, and that lesson is already written into
+/// `request_log.rs` a few hundred lines away.
+fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
+    Finding {
+        kind: DetectorKind::Latency,
+        signature: format!("latency|p95|{}", h.fam),
+        title: format!(
+            "{} p95 {:.0}ms — {:.1}x its trailing norm",
+            h.fam,
+            h.p95_w,
+            h.p95_w / h.p95_b
+        ),
+        evidence: vec![
+            ("verdict".into(), format!(
+                "{} p95 over the last {:.1}h is {:.0}ms against a {:.0}h trailing p95 of \
+                 {:.0}ms ({:.1}x). Threshold: {mult}x with at least {min_n} samples on both \
+                 sides.",
+                h.fam, window_h(), h.p95_w, baseline_h(), h.p95_b, h.p95_w / h.p95_b
+            )),
+            ("window_samples".into(), h.win_n.to_string()),
+            ("baseline_samples".into(), h.base_n.to_string()),
+            ("window_p50_p95_max".into(), format!(
+                "{:.0} / {:.0} / {:.0} ms", h.win_p50, h.p95_w, h.win_max
+            )),
+            ("baseline_p50_p95".into(), format!("{:.0} / {:.0} ms", h.base_p50, h.p95_b)),
+            ("percentile_method".into(),
+             "nearest-rank over the sorted window (same function /api/logs/stats reports)".into()),
+        ],
+        recheck: format!(
+            "curl -sk \"$AMUX_URL/api/logs/stats?since_h={}\" | python3 -c \"import json,sys; \
+             d=json.load(sys.stdin); print([f for f in d['families'] if f.get('family')=='{}'])\"",
+            window_h() as i64,
+            h.fam
+        ),
+        owner: None,
+        count: h.win_n as u64,
+        last_ts: now,
+        parked_until: None,
+    }
+}
+
 pub(crate) fn detect_latency_at(
     conn: &Connection,
     now: f64,
@@ -875,6 +986,12 @@ pub(crate) fn detect_latency_at(
     let min_n = latency_min_samples();
 
     let mut per_family: BTreeMap<String, FamilySamples> = BTreeMap::new();
+    // The host's load across the WINDOW's rows (AMUX-3646). Filled by the scan
+    // below and read by the p95 fan-in, which is the report that most needs it:
+    // "N families regressed at once" and "the box was at 1.3x oversubscription"
+    // are the same sentence, and until this column existed only the first half
+    // could be said.
+    let mut window_load: Vec<f64> = Vec::new();
     // Hoisted so the blindness check below can quote them (AF-180): the zero
     // answer is only useful next to how much was looked at.
     let mut considered_rows = 0usize;
@@ -886,11 +1003,17 @@ pub(crate) fn detect_latency_at(
     // The endpoint declares the semantics (x-amux-slow-ok response header ->
     // req_meta.slow_ok); both latency shapes skip what the caller asked for.
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT family, latency_ms, ts, boot_at FROM _amux_request_log WHERE ts >= ?1 \
+        "SELECT family, latency_ms, ts, boot_at, load1 FROM _amux_request_log WHERE ts >= ?1 \
            AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') LIMIT 400000",
     ) {
         if let Ok(rows) = stmt.query_map(rusqlite::params![b_start], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?, r.get::<_, f64>(2)?, r.get::<_, Option<f64>>(3)?))
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, f64>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, Option<f64>>(3)?,
+                r.get::<_, Option<f64>>(4)?,
+            ))
         }) {
             // A REQUEST WHOSE CLOCK SPANS A RESTART IS NOT A SLOW REQUEST
             // (AF-175). `latency_ms` is wall time from arrival to completion,
@@ -912,8 +1035,17 @@ pub(crate) fn detect_latency_at(
             // drop everything and look exactly like a filter that worked.
             let mut spanned_restart = 0usize;
             let mut considered = 0usize;
-            for (fam, ms, ts, row_boot) in rows.flatten() {
+            for (fam, ms, ts, row_boot, row_load) in rows.flatten() {
                 considered += 1;
+                // AMUX-3646: the host's load during the WINDOW, so the rollup can
+                // say "28 cores were carrying 37" instead of naming five innocent
+                // endpoints. Window rows only; the baseline spans days and its
+                // load distribution answers a different question.
+                if ts >= w_start {
+                    if let Some(l) = row_load {
+                        window_load.push(l);
+                    }
+                }
                 // COUNT THE ROW BEFORE DECIDING ITS FATE (AF-178). The entry is
                 // taken unconditionally so a family whose rows are ALL filtered
                 // still exists in the map with its pre-filter counts. Under the
@@ -972,6 +1104,12 @@ pub(crate) fn detect_latency_at(
     // than judged inline because one card naming every affected family is a
     // report, and one card per family is a backlog (rule 5).
     let mut collapsed: Vec<(String, &'static str, usize)> = Vec::new();
+    // Every family that regressed this window, collected so the fan-in after the
+    // loop can see HOW MANY there were before deciding whether this is one event
+    // or N tasks (AMUX-3646). Filing inside the loop is precisely what made this
+    // detector unable to ask that question.
+    let mut p95_hits: Vec<P95Hit> = Vec::new();
+    let mult = latency_mult();
     let mut families_seen = 0usize;
     for (fam, fs) in per_family {
         families_seen += 1;
@@ -1026,7 +1164,6 @@ pub(crate) fn detect_latency_at(
         base.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let p95_w = rl::percentile_sorted(&win, 0.95);
         let p95_b = rl::percentile_sorted(&base, 0.95);
-        let mult = latency_mult();
         if p95_b <= 0.0 || p95_w < p95_b * mult {
             continue;
         }
@@ -1034,46 +1171,94 @@ pub(crate) fn detect_latency_at(
         if p95_w < latency_floor_ms() {
             continue;
         }
-        let signature = format!("latency|p95|{fam}");
-        let title = format!(
-            "{fam} p95 {:.0}ms — {:.1}x its trailing norm",
+        // ACCUMULATE, DO NOT FILE YET (AMUX-3646). See the fan-in below.
+        p95_hits.push(P95Hit {
+            fam: fam.clone(),
             p95_w,
-            p95_w / p95_b
-        );
+            p95_b,
+            win_p50: rl::percentile_sorted(&win, 0.5),
+            win_max: win.last().copied().unwrap_or(0.0),
+            base_p50: rl::percentile_sorted(&base, 0.5),
+            win_n: win.len(),
+            base_n: base.len(),
+        });
+    }
+
+    // FAN-IN BEFORE FAN-OUT, for p95 too (AMUX-3646).
+    //
+    // The OUTLIER detector has rolled up simultaneous offenders since AMUX-3588,
+    // and its verdict text argues the case: per-endpoint cards "each name an
+    // endpoint that is probably not the fault, and would bury the board". This
+    // detector had no such rollup, so it emitted exactly the cards the other
+    // detector's own text argues against. Two detectors on one subsystem
+    // disagreeing about whether a correlated slowdown is one fault or many.
+    //
+    // The specimen is a pair from 2026-08-24: AMUX-3657 (`/api/sessions-git` p95
+    // 4624ms, 3.2x) and AMUX-3658 (`/api/board` p95 994ms, 3.1x), both fired in
+    // the same window, both true, both unactionable, both discarded. This fan-in
+    // would have collapsed them into one card, and that is worth doing whatever
+    // the cause turns out to be: a p95 excursion on N families at once is one
+    // event, not N tasks.
+    //
+    // SAME KNOB as the outlier rollup on purpose. `AMUX_OUTLIER_ROLLUP_AT` reads
+    // as outlier-specific and is really "how many simultaneous slow endpoints
+    // before this is one fault", which is one question. A second knob would be a
+    // second thing to keep in step, and the two detectors disagreeing is the
+    // defect being fixed here.
+    if p95_hits.len() >= outlier_rollup_at() {
+        let n_f = p95_hits.len();
+        let fams: Vec<String> = p95_hits.iter().map(|h| h.fam.clone()).collect();
+        let worst = p95_hits.iter().map(|h| h.p95_w / h.p95_b).fold(0.0f64, f64::max);
         out.push(Finding {
             kind: DetectorKind::Latency,
-            signature,
-            title,
+            // Keyed on the FAMILY SET, matching the outlier rollup: a different
+            // collapse is different news, the same one stays idempotent, and no
+            // occurrence timestamp, because a correlated slowdown is a standing
+            // condition rather than one request.
+            signature: format!("latency|p95|ROLLUP|{}", fams.join(",")),
+            title: format!(
+                "{n_f} families regressed at once — one event, not {n_f} tasks (worst {worst:.1}x)"
+            ),
             evidence: vec![
                 ("verdict".into(), format!(
-                    "{fam} p95 over the last {:.1}h is {p95_w:.0}ms against a {:.0}h trailing p95 \
-                     of {p95_b:.0}ms ({:.1}x). Threshold: {mult}x with at least {min_n} samples \
-                     on both sides.",
-                    window_h(), baseline_h(), p95_w / p95_b
+                    "{n_f} DIFFERENT families exceeded {mult}x their own trailing p95 in the SAME \
+                     window. Each statement is true and each is unactionable alone: nothing in a \
+                     per-family payload separates \"this endpoint got slower\" from \"everything \
+                     got slower\". Look for something host-wide or server-wide first."
                 )),
-                ("window_samples".into(), win.len().to_string()),
-                ("baseline_samples".into(), base.len().to_string()),
-                ("window_p50_p95_max".into(), format!(
-                    "{:.0} / {:.0} / {:.0} ms",
-                    rl::percentile_sorted(&win, 0.5), p95_w,
-                    win.last().copied().unwrap_or(0.0)
-                )),
-                ("baseline_p50_p95".into(), format!(
-                    "{:.0} / {p95_b:.0} ms", rl::percentile_sorted(&base, 0.5)
-                )),
+                ("families".into(), p95_hits.iter()
+                    .map(|h| format!("\n  {} {:.0}ms vs {:.0}ms ({:.1}x)",
+                                     h.fam, h.p95_w, h.p95_b, h.p95_w / h.p95_b))
+                    .collect::<String>()),
                 ("percentile_method".into(),
                  "nearest-rank over the sorted window (same function /api/logs/stats reports)".into()),
+                ("host_load".into(), describe_window_load(&mut window_load)),
+                ("rollup_threshold".into(), format!(
+                    "{} families (AMUX_OUTLIER_ROLLUP_AT, shared with the outlier rollup)",
+                    outlier_rollup_at()
+                )),
+                ("if_this_is_wrong".into(),
+                 "If these really are independent regressions, raise AMUX_OUTLIER_ROLLUP_AT \
+                  rather than splitting the card by hand. But check the host first: on this \
+                  box the fleet compiles and tests this server continuously, and a 28-core \
+                  machine carrying a load average of 37 makes every endpoint slow at once \
+                  (AMUX-3646).".into()),
             ],
             recheck: format!(
                 "curl -sk \"$AMUX_URL/api/logs/stats?since_h={}\" | python3 -c \"import json,sys; \
-                 d=json.load(sys.stdin); print([f for f in d['families'] if f.get('family')=='{fam}'])\"",
+                 d=json.load(sys.stdin); print([(f['family'], f.get('p95_ms')) for f in \
+                 d['families']])\"  # look for ONE window, not one family",
                 window_h() as i64
             ),
             owner: None,
-            count: win.len() as u64,
+            count: n_f as u64,
             last_ts: now,
             parked_until: None,
         });
+    } else {
+        for h in &p95_hits {
+            out.push(p95_finding(h, mult, min_n, now));
+        }
     }
 
     // AF-178: THE DETECTOR REPORTS ITS OWN BLINDNESS.
@@ -1173,6 +1358,11 @@ pub(crate) fn detect_latency_at(
         /// endpoint defect, which is what AF-186 wanted and the exclusion only
         /// approximated. `None` for a row predating migration 0030.
         worst_since_boot: Option<f64>,
+        /// AMUX-3646: the host's 1-minute load when the WORST row was logged.
+        /// A single-endpoint outlier card is unweighable without it: 30.3s on a
+        /// quiet box is an endpoint defect and 30.3s on 28 cores carrying 37 is
+        /// a queue. `None` for a row predating migration 0034.
+        worst_load1: Option<f64>,
     }
     let mut seen: BTreeMap<(String, String), OutlierGroup> = BTreeMap::new();
     // AF-175: THIS shape is where the reported incident came from, and it had no
@@ -1188,7 +1378,7 @@ pub(crate) fn detect_latency_at(
     let mut outliers_spanned = 0usize;
     let mut outliers_considered = 0usize;
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT method, path, latency_ms, ts, status, boot_at FROM _amux_request_log \
+        "SELECT method, path, latency_ms, ts, status, boot_at, load1 FROM _amux_request_log \
          WHERE ts >= ?1 AND latency_ms >= ?2 \
            AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') \
          ORDER BY latency_ms DESC LIMIT 2000",
@@ -1201,9 +1391,10 @@ pub(crate) fn detect_latency_at(
                 r.get::<_, f64>(3)?,
                 r.get::<_, i64>(4)?,
                 r.get::<_, Option<f64>>(5)?,
+                r.get::<_, Option<f64>>(6)?,
             ))
         }) {
-            for (method, path, ms, ts, status, row_boot) in rows.flatten() {
+            for (method, path, ms, ts, status, row_boot, row_load) in rows.flatten() {
                 outliers_considered += 1;
                 if spans_own_restart(ts, ms, row_boot, boot) {
                     outliers_spanned += 1;
@@ -1216,6 +1407,7 @@ pub(crate) fn detect_latency_at(
                     last_ts: ts,
                     sample: format!("{method} {path} → {status}"),
                     worst_since_boot: None,
+                    worst_load1: None,
                 });
                 e.n += 1;
                 // The age travels WITH the worst latency, so the evidence line
@@ -1224,6 +1416,7 @@ pub(crate) fn detect_latency_at(
                 if ms > e.worst_ms {
                     e.worst_ms = ms;
                     e.worst_since_boot = row_boot.map(|b| ts - b);
+                    e.worst_load1 = row_load;
                 }
                 e.last_ts = e.last_ts.max(ts);
             }
@@ -1311,6 +1504,14 @@ pub(crate) fn detect_latency_at(
                         ),
                     }
                 }),
+                // AMUX-3646. THE SPECIMEN IS THIS EXACT CARD SHAPE: AMUX-3644
+                // named /api/board, /api/board/{id}, /api/browser/start,
+                // /api/sessions and /api/sessions/{name}/{*verb}, and not one of
+                // them was the fault. The host was a 28-core box carrying a load
+                // average of 36.86, and nothing in the payload could say so, so
+                // the reader got five innocent endpoint names and no trace of
+                // the one fact explaining all five.
+                ("host_load".into(), describe_window_load(&mut window_load)),
                 ("rollup_threshold".into(), format!(
                     "{} distinct targets (AMUX_OUTLIER_ROLLUP_AT)", outlier_rollup_at()
                 )),
@@ -1335,7 +1536,7 @@ pub(crate) fn detect_latency_at(
 
     for (
         (method, target),
-        OutlierGroup { n, worst_ms: worst, last_ts, sample, worst_since_boot },
+        OutlierGroup { n, worst_ms: worst, last_ts, sample, worst_since_boot, worst_load1 },
     ) in seen
     {
         // AMUX-3485: for long-by-design endpoints the effective threshold is
@@ -1394,6 +1595,21 @@ pub(crate) fn detect_latency_at(
                         s / 3600.0
                     ),
                     None => "unknown: the row predates the boot_at column (migration 0030)".into(),
+                }),
+                // AMUX-3646: 30.3s on a quiet box is an endpoint defect; 30.3s
+                // on 28 cores carrying 37 is a queue. This card could not tell
+                // the reader which, and the verdict above sends them to "look at
+                // the request" either way.
+                ("host_load_at_worst".into(), match (worst_load1, host_ncpu()) {
+                    (Some(l), Some(cores)) => format!(
+                        "1-minute load {l:.1} on {cores} cores ({:.2}x). Stated as a fact, not \
+                         a cause: this box compiles and tests amux continuously, so check \
+                         whether the endpoint is slow when the host is NOT loaded before \
+                         treating the endpoint as the fault.",
+                        l / cores as f64
+                    ),
+                    (Some(l), None) => format!("1-minute load {l:.1}; core count unavailable"),
+                    (None, _) => "not recorded — this row predates migration 0034 (load1)".into(),
                 }),
             ],
             recheck: format!(
@@ -6043,6 +6259,88 @@ mod tests {
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         assert!(ev["verdict"].contains("Threshold"), "state the threshold: {ev:?}");
         assert!(ev.contains_key("window_samples") && ev.contains_key("baseline_samples"));
+    }
+
+    /// AMUX-3646: three families regressing at once is ONE event, not three
+    /// tasks, and two is still two.
+    ///
+    /// THE SPECIMEN is a pair filed on 2026-08-24 and discarded the same day:
+    /// AMUX-3657 (`/api/sessions-git` p95 4624ms, 3.2x) and AMUX-3658
+    /// (`/api/board` p95 994ms, 3.1x), fired in the same window while the host
+    /// load average was 36.86 on 28 cores. Both statements were true and both
+    /// were unactionable, because nothing in a per-family payload separates
+    /// "this endpoint got slower" from "everything got slower".
+    ///
+    /// The OUTLIER detector has rolled these up since AMUX-3588 and its verdict
+    /// text argues the case explicitly. This detector did not, so it emitted the
+    /// cards the other detector's own text argues against.
+    ///
+    /// BOTH DIRECTIONS. The below-threshold cell is the one that keeps this
+    /// honest: a rollup that swallowed every regression would pass a
+    /// one-directional test and would have deleted the per-family card that is
+    /// correct when a single endpoint really does regress.
+    #[tokio::test]
+    async fn simultaneous_p95_regressions_collapse_to_one_card_but_two_do_not() {
+        let fast_then_slow = |st: &crate::api::AppState, now: f64, fam: &'static str| {
+            for i in 0..60 {
+                log_row(st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: fam, family: fam, status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+            }
+            for i in 0..60 {
+                log_row(st, Row { ts: now - 100.0 - i as f64, method: "GET", path: fam, family: fam, status: 200, body: "", worker: "", ua: "curl/8", ms: 4000.0 });
+            }
+        };
+
+        // TWO families: below the default threshold of 3, so the per-family
+        // cards must survive untouched.
+        let (st, _d) = state();
+        let now = unix_now();
+        fast_then_slow(&st, now, "/api/two-a");
+        fast_then_slow(&st, now, "/api/two-b");
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            f.iter().any(|x| x.signature == "latency|p95|/api/two-a")
+                && f.iter().any(|x| x.signature == "latency|p95|/api/two-b"),
+            "two regressions are two endpoints until the threshold says otherwise: {:?}",
+            f.iter().map(|x| &x.signature).collect::<Vec<_>>()
+        );
+        assert!(
+            !f.iter().any(|x| x.signature.contains("p95|ROLLUP")),
+            "and must NOT roll up below the threshold: {f:?}"
+        );
+
+        // THREE: one card, naming all three, with no per-family cards left.
+        let (st3, _d3) = state();
+        let now3 = unix_now();
+        for fam in ["/api/three-a", "/api/three-b", "/api/three-c"] {
+            fast_then_slow(&st3, now3, fam);
+        }
+        let (f3, _) = detect_latency(&st3.store.read().unwrap(), now3);
+        let rollups: Vec<_> =
+            f3.iter().filter(|x| x.signature.contains("p95|ROLLUP")).collect();
+        assert_eq!(
+            rollups.len(),
+            1,
+            "three simultaneous regressions are ONE event: {:?}",
+            f3.iter().map(|x| &x.signature).collect::<Vec<_>>()
+        );
+        assert!(
+            !f3.iter().any(|x| x.signature.starts_with("latency|p95|/api/three")),
+            "the per-family cards must be REPLACED, not accompanied — otherwise the rollup \
+             adds a card instead of collapsing three: {:?}",
+            f3.iter().map(|x| &x.signature).collect::<Vec<_>>()
+        );
+        let ev: BTreeMap<_, _> = rollups[0].evidence.iter().cloned().collect();
+        for fam in ["/api/three-a", "/api/three-b", "/api/three-c"] {
+            assert!(
+                ev["families"].contains(fam),
+                "every collapsed family must be NAMED or the card is unactionable: {ev:?}"
+            );
+        }
+        assert!(
+            !rollups[0].signature.contains(&format!("{}", now3 as i64)),
+            "the rollup signature must not carry an occurrence timestamp: a correlated \
+             slowdown is a standing condition, so the same collapse must stay idempotent"
+        );
     }
 
     /// AMUX-3486: an open incident whose last failing evaluation is STALE

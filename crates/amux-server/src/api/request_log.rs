@@ -95,6 +95,26 @@ pub struct LogRow {
     pub req_meta: Option<String>,
 }
 
+/// The host's 1-minute load average, or `None` if the OS would not say
+/// (AMUX-3646).
+///
+/// `getloadavg(3)` rather than the `sysctl vm.loadavg` subprocess `metrics.rs`
+/// shells out for. This runs on every log-batch flush, and forking a process per
+/// flush to measure how oversubscribed the machine is would be the detector
+/// paying its cost in the same resource as the fault (ethos rule 7's spin-catcher
+/// lesson). Present on macOS and glibc alike, so no cfg branch.
+///
+/// `None`, never 0.0, when the call fails. A consumer reading absence as "idle"
+/// would report an oversubscribed host as a quiet one, which inverts the exact
+/// signal this exists to carry.
+pub(crate) fn host_load1() -> Option<f64> {
+    let mut avg = [0f64; 3];
+    // SAFETY: getloadavg writes at most `nelem` doubles into the caller's array;
+    // 3 is the documented maximum and the array is 3 long.
+    let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+    (n >= 1).then(|| (avg[0] * 100.0).round() / 100.0)
+}
+
 /// Cheap-to-clone handle the middleware sends rows through.
 #[derive(Clone)]
 pub struct RequestLogger {
@@ -135,6 +155,9 @@ impl RequestLogger {
                 // AF-175: the boot of the process writing this batch. Constant
                 // within a process, so read once here.
                 let boot = crate::runtime_jobs::heartbeat::boot_at();
+                // AMUX-3646: what the HOST was doing. Once per batch, beside
+                // `boot` and for the same reason.
+                let load1 = host_load1();
                 let res = store
                     .write_async(move |conn| {
                         {
@@ -142,8 +165,8 @@ impl RequestLogger {
                                 "INSERT INTO _amux_request_log \
                                  (ts, method, path, family, status, latency_ms, client_ip, \
                                   user_agent, amux_session, worker, req_bytes, resp_bytes, \
-                                  answered_by, error_body, req_meta, boot_at) \
-                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                                  answered_by, error_body, req_meta, boot_at, load1) \
+                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                             )?;
                             for r in &batch {
                                 stmt.execute(rusqlite::params![
@@ -168,6 +191,12 @@ impl RequestLogger {
                                     // process, and re-reading it per row would
                                     // imply it could.
                                     boot,
+                                    // AMUX-3646: the host's 1-minute load at
+                                    // flush. Same value for every row in the
+                                    // batch, and that is not an approximation
+                                    // worth apologising for: a batch forms in
+                                    // milliseconds and load1 averages a minute.
+                                    load1,
 ])?;
                             }
                         }

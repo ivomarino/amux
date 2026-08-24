@@ -191,6 +191,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0033_steering_precondition",
         sql: include_str!("../../migrations/0033_steering_precondition.sql"),
     },
+    Migration {
+        version: 34,
+        name: "0034_request_log_load1",
+        sql: include_str!("../../migrations/0034_request_log_load1.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
