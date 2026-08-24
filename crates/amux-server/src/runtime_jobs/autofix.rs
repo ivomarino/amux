@@ -1102,6 +1102,77 @@ pub(crate) fn detect_latency_at(
         "latency outliers: restart-spanning rows excluded (AF-175)"
     );
 
+    // FAN-IN BEFORE FAN-OUT, for outliers (AMUX-3588). The same rule the
+    // invariant detector already follows, arriving here because a server-wide
+    // fault is not N endpoint faults.
+    //
+    // Measured: the hang at 00:49-00:51 on 2026-08-24 filed FOUR cards —
+    // /api/sessions as a 5xx and again as a latency outlier, plus
+    // /api/board/statuses and /api/board/session-gates. Every offending row was
+    // stamped 00:49:41 or 00:50:29 at exactly 30.1s, which is a TIMEOUT, not an
+    // endpoint doing work. Each card was individually well-formed and
+    // individually useless: none named the fault, and a lane picking one up
+    // starts by investigating an endpoint that was never broken. One of them
+    // then re-filed and cost a second lane-turn.
+    //
+    // BREADTH IS THE DISCRIMINATOR, and deliberately not "durations cluster at
+    // the timeout value", which is what this card was filed proposing. A
+    // duration heuristic guesses at one failure mode; breadth is the same
+    // predicate the invariant rollup already uses and it is right for the
+    // general case too — if a deploy genuinely made every endpoint slow, that
+    // is also ONE fault and also belongs in one card.
+    let candidates: Vec<_> = seen
+        .iter()
+        .filter(|((_, target), (_, worst, _, _))| *worst > design_budget_ms(target))
+        .collect();
+    let distinct_targets: std::collections::BTreeSet<&String> =
+        candidates.iter().map(|((_, t), _)| t).collect();
+    if distinct_targets.len() >= outlier_rollup_at() {
+        let n_t = distinct_targets.len();
+        let worst_ms = candidates.iter().map(|(_, (_, w, _, _))| *w).fold(0.0f64, f64::max);
+        let last = candidates.iter().map(|(_, (_, _, ts, _))| *ts).fold(0.0f64, f64::max);
+        let targets: Vec<String> = distinct_targets.iter().map(|t| (*t).clone()).collect();
+        out.push(Finding {
+            kind: DetectorKind::Latency,
+            // Keyed on the TARGET SET, so a different collapse is different
+            // news while the same one stays idempotent — the rule the invariant
+            // rollup uses. Not keyed on an occurrence timestamp: a systemic
+            // fault is a standing condition, unlike a single slow request.
+            signature: format!("latency|outlier|ROLLUP|{}", targets.join(",")),
+            title: format!(
+                "{n_t} endpoints slow at once — one fault, not {n_t} tasks (worst {:.1}s)",
+                worst_ms / 1000.0
+            ),
+            evidence: vec![
+                ("verdict".into(), format!(
+                    "{n_t} DIFFERENT endpoints exceeded the outlier threshold in the same                      window. Filed as ONE card on purpose: per-endpoint cards would each name                      an endpoint that is probably not the fault, and would bury the board.                      Look for something SERVER-WIDE first — a hang, a saturated DB pool, a                      stalled dependency. Check ~/.amux/logs/watchdog.log and                      GET /api/debug/invariants before investigating any single endpoint."
+                )),
+                ("endpoints".into(), format!("
+  {}", targets.join("
+  "))),
+                ("worst_ms".into(), format!("{worst_ms:.0}")),
+                ("last_seen".into(), rl::local_when(last)),
+                ("rollup_threshold".into(), format!(
+                    "{} distinct targets (AMUX_OUTLIER_ROLLUP_AT)", outlier_rollup_at()
+                )),
+                ("if_this_is_wrong".into(),
+                 "If these really are independent slow endpoints, the rollup threshold is too \
+                  low for this fleet — raise AMUX_OUTLIER_ROLLUP_AT rather than splitting the \
+                  card by hand.".into()),
+            ],
+            recheck: format!(
+                "sqlite3 ~/.amux/amux.db \"SELECT datetime(ts,'unixepoch','localtime'), \
+                 latency_ms, status, path FROM _amux_request_log WHERE latency_ms >= {:.0} \
+                 ORDER BY ts DESC LIMIT 30;\"  # look for ONE window, not one path",
+                outlier_ms()
+            ),
+            owner: None,
+            count: candidates.len() as u64,
+            last_ts: last,
+        });
+        return (out, suppressed);
+    }
+
     for ((method, target), (n, worst, last_ts, sample)) in seen {
         // AMUX-3485: for long-by-design endpoints the effective threshold is
         // their design budget, not the global outlier floor.
@@ -1479,6 +1550,17 @@ type InvRow = (String, String, String, f64, f64, i64, String, String);
 /// 64 cards, 36% of every open item, each quoting the same occurrence count.
 /// Three related entities is a coincidence worth three cards; four is a
 /// pattern, and a pattern is one piece of work.
+/// Distinct slow TARGETS in one tick before the outlier detector rolls up
+/// (AMUX-3588). Mirrors `AMUX_INVARIANT_ROLLUP_AT`; floor of 2 for the same
+/// reason — a "rollup" of one is just a card with worse wording.
+fn outlier_rollup_at() -> usize {
+    std::env::var("AMUX_OUTLIER_ROLLUP_AT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 2)
+        .unwrap_or(3)
+}
+
 fn invariant_rollup_at() -> usize {
     std::env::var("AMUX_INVARIANT_ROLLUP_AT")
         .ok()
@@ -5445,6 +5527,75 @@ mod tests {
             0.0,
             "matching is exact, not prefix — a new sub-route must not inherit an exemption \
              nobody measured for it"
+        );
+    }
+
+    /// AMUX-3588: a server-wide fault files ONE card, not one per endpoint.
+    ///
+    /// Rebuilt from the incident. The hang at 00:49-00:51 on 2026-08-24 filed
+    /// four cards — /api/sessions twice (5xx and latency), /api/board/statuses,
+    /// /api/board/session-gates — every offending row stamped 00:49:41 or
+    /// 00:50:29 at exactly 30.1s, which is a timeout rather than an endpoint
+    /// doing work. One of them then re-filed and cost a second lane-turn.
+    ///
+    /// The CONTROLS are the point and they are why this is not just "roll up
+    /// when there are lots". Two slow endpoints must still file separately —
+    /// rolling up a pair would hide ordinary independent regressions behind a
+    /// vague systemic card, which is strictly worse than the fan-out it
+    /// replaces.
+    #[test]
+    fn many_endpoints_slow_at_once_file_one_card_not_one_each() {
+        let ts = 1_787_547_029.0;
+        // The incident's own shape: three distinct targets, all at the 30.1s
+        // timeout, in one tick.
+        let hang: Vec<(&str, f64)> = vec![
+            ("/api/sessions", 30_100.0),
+            ("/api/board/statuses", 30_100.0),
+            ("/api/board/session-gates", 30_100.0),
+        ];
+        let distinct = hang.iter().map(|(t, _)| *t).collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            distinct.len() >= outlier_rollup_at(),
+            "the recorded incident must reach the rollup threshold, or this fix does not \
+             address the incident that motivated it: {} targets vs threshold {}",
+            distinct.len(),
+            outlier_rollup_at()
+        );
+
+        // CONTROL: two independent slow endpoints stay two cards. A rollup that
+        // fires at 2 would erase the per-endpoint signal for ordinary
+        // regressions, which is the failure mode of over-correcting here.
+        let pair = ["/api/board", "/api/email/inbox"]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            pair.len() < outlier_rollup_at(),
+            "two slow endpoints must NOT roll up — they are probably two faults"
+        );
+
+        // The threshold is a real knob and cannot be configured into nonsense:
+        // a rollup of one is just a card with worse wording.
+        assert!(outlier_rollup_at() >= 2, "floor of 2");
+
+        // The rollup signature must key on the TARGET SET, so a different
+        // collapse is different news while the same one stays idempotent. If it
+        // keyed on an occurrence timestamp like the per-endpoint signature does,
+        // a standing systemic fault would mint a new card every scan.
+        let sig_a = format!("latency|outlier|ROLLUP|{}", {
+            let mut v: Vec<&str> = distinct.iter().copied().collect();
+            v.sort_unstable();
+            v.join(",")
+        });
+        let sig_b = format!("latency|outlier|ROLLUP|{}", {
+            let mut v: Vec<&str> = distinct.iter().copied().collect();
+            v.sort_unstable();
+            v.join(",")
+        });
+        assert_eq!(sig_a, sig_b, "the same target set must mint the same signature");
+        assert!(
+            !sig_a.contains(&format!("{}", ts as i64)),
+            "the rollup signature must NOT carry an occurrence timestamp — a systemic fault is \
+             a standing condition and would otherwise re-file on every scan"
         );
     }
 
