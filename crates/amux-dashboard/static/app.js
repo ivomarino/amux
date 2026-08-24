@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.713';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.714';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28751,11 +28751,31 @@ async function _handleDeeplink(hash) {
   // #issue=<id> — open a board card directly from anywhere (AMUX-2165), the
   // shareable twin of the task-label id chip.
   if (hash && hash.startsWith('#issue=')) {
-    const id = decodeURIComponent(hash.slice(7));
+    // Optional `:<tab>` suffix — `#issue=AMUX-1:lineage` opens the card ON that
+    // tab. Two reasons, and the second is why it is here rather than in a
+    // backlog: a card's lineage is the thing you want to SEND someone ("look at
+    // how this card got here"), and a tab reachable only by tapping cannot be
+    // linked, screenshotted by the simulator rig, or deep-linked from a nudge.
+    // The rig drives UI states by deeplink because simctl has no tap primitive,
+    // so an untargetable tab is also an unverifiable one.
+    const raw = decodeURIComponent(hash.slice(7));
+    const cut = raw.lastIndexOf(':');
+    // Card ids contain no colon, so a colon can only be the tab separator — but
+    // validate against the known tabs anyway rather than trusting position, or a
+    // future id format silently loses everything after its last colon.
+    const TABS = ['edit', 'preview', 'history', 'lineage'];
+    const maybeTab = cut > 0 ? raw.slice(cut + 1) : '';
+    const tab = TABS.includes(maybeTab) ? maybeTab : '';
+    const id = tab ? raw.slice(0, cut) : raw;
     const tryOpen = (attempt) => {
       if (typeof boardItems !== 'undefined' && boardItems.some(i => i.id === id)) {
         switchView('board');
-        setTimeout(() => { try { openBoardDetail(id); } catch (e) {} }, 250);
+        setTimeout(() => {
+          try {
+            openBoardDetail(id);
+            if (tab) boardDetailTab(tab);
+          } catch (e) {}
+        }, 250);
         return;
       }
       if (attempt < 20) setTimeout(() => tryOpen(attempt + 1), 400);
