@@ -318,7 +318,8 @@ fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
     };
     let rows: Vec<checks::ScheduleKindRow> = conn
         .prepare(
-            "SELECT id, COALESCE(title,''), COALESCE(kind,'tmux'), COALESCE(session,'') \
+            "SELECT id, COALESCE(title,''), COALESCE(kind,'tmux'), COALESCE(session,''), \
+                    COALESCE(command,'') \
              FROM schedules WHERE enabled=1 AND COALESCE(deleted,0)=0",
         )
         .and_then(|mut st| {
@@ -328,6 +329,7 @@ fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
                     title: r.get::<_, String>(1)?,
                     kind: r.get::<_, String>(2)?,
                     session: r.get::<_, String>(3)?,
+                    command: r.get::<_, String>(4)?,
                 })
             })
             .map(|it| it.flatten().collect::<Vec<_>>())

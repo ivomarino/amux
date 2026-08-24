@@ -3822,11 +3822,51 @@ pub struct ScheduleKindRow {
     pub title: String,
     pub kind: String,
     pub session: String,
+    /// What the schedule runs. Carried because the TITLE cannot answer the
+    /// question that matters (AMUX-3680): a schedule burning a model turn on a
+    /// pure shell command is just as expensive whether or not it claims to be
+    /// cheap, and only the command can say which it is.
+    pub command: String,
 }
 
 /// Titles that assert the schedule costs no model tokens. Kept as a list rather
 /// than one string because the claim is what matters, not the spelling.
 const ZERO_COST_CLAIMS: &[&str] = &["zero-token", "zero token", "no-token", "tokenless"];
+
+/// Does this command run a program, with no prose for a model to interpret?
+///
+/// Deliberately conservative: it must START with something that is
+/// unambiguously an invocation. Anything a person would read as an instruction
+/// ("review the breaches and reply", "check X then post Y") does not match, and
+/// that is the direction to be wrong in — a missed expensive schedule costs a
+/// turn a day, while a false one costs a card that says "should this be shell?"
+/// about a command that is prose.
+///
+/// `&&`/`;`/`|` chains are fine and are the common shape here
+/// (`cd ~/dir && ./runner.sh x`): the first token still decides whether a shell
+/// could have run the whole line.
+fn is_pure_shell(command: &str) -> bool {
+    let c = command.trim();
+    if c.is_empty() {
+        return false;
+    }
+    // A blank line means the author wrote a prompt with structure, not a
+    // command line. Real commands here are one line, possibly chained.
+    if c.contains("\n\n") {
+        return false;
+    }
+    let first = c.split_whitespace().next().unwrap_or("");
+    first.starts_with("./")
+        || first.starts_with('/')
+        || first.starts_with("~/")
+        || first.starts_with("$(")
+        || matches!(
+            first,
+            "cd" | "bash" | "sh" | "zsh" | "python" | "python3" | "node" | "npm" | "npx"
+                | "curl" | "git" | "make" | "cargo" | "docker" | "psql" | "sqlite3" | "amux"
+                | "env" | "export" | "source" | "echo" | "rsync" | "aws" | "gh"
+        )
+}
 
 /// `kind: shell` runs the command directly. `kind: tmux` delivers it to a lane as
 /// a PROMPT and wakes a full model turn — measured 2026-08-24 at ~$6.20 per fire
@@ -3848,9 +3888,31 @@ pub fn schedule_cost_titles_match_kind(rows: &[ScheduleKindRow]) -> Vec<Invarian
         let low = t.to_lowercase();
         ZERO_COST_CLAIMS.iter().any(|c| low.contains(c))
     };
+    // THE TITLE IS THE WRONG OPERAND (AMUX-3680, found by gtm-ticker).
+    //
+    // This fired only on a CONTRADICTION — a title claiming zero-token on a row
+    // that is not `shell`. So a schedule whose title says nothing about cost was
+    // invisible, however expensive it was, and honesty was what evaded the
+    // check. Measured 2026-08-24: this check found TWO of gtm-ticker's
+    // schedules; SEVEN were spending a model turn per firing on the same
+    // runner. The five it missed had made no claim, so there was nothing to
+    // contradict. It reported clean on them the whole time.
+    //
+    // The costlier question needs no title at all: does this schedule spend a
+    // model turn to run something a shell could have run? A command with no
+    // prose for a model to interpret, on a kind that wakes a lane, is a wasted
+    // turn per fire whatever the title says.
+    //
+    // Kept HIGH-PRECISION on purpose. This mints cards, and a detector that
+    // guesses at "is this prose" would bury the board in judgement calls; the
+    // rule below only fires on a command that unambiguously starts as a shell
+    // invocation, so the false-positive it can produce is "this looks
+    // self-contained, should it be shell?" — cheap to answer and usually yes.
+    // A prompt like "review the SLA breaches and reply" does not match and is
+    // correctly left alone.
     let liars: Vec<&ScheduleKindRow> = rows
         .iter()
-        .filter(|r| claims_free(&r.title) && r.kind != "shell")
+        .filter(|r| r.kind != "shell" && (claims_free(&r.title) || is_pure_shell(&r.command)))
         .collect();
     if liars.is_empty() {
         return vec![InvariantResult::pass(ID)];
@@ -3883,12 +3945,75 @@ mod schedule_kind_tests {
     use super::*;
 
     fn row(id: &str, title: &str, kind: &str) -> ScheduleKindRow {
+        // Existing cells predate the command operand and are about the TITLE
+        // rule, so they get prose: it does not match `is_pure_shell`, which
+        // keeps each of them asserting exactly what it asserted before.
+        row_cmd(id, title, kind, "review the breaches and reply")
+    }
+
+    fn row_cmd(id: &str, title: &str, kind: &str, command: &str) -> ScheduleKindRow {
         ScheduleKindRow {
             id: id.into(),
             title: title.into(),
             kind: kind.into(),
             session: "gtm-ticker".into(),
+            command: command.into(),
         }
+    }
+
+    /// AMUX-3680, found by gtm-ticker after acting on this check's own output.
+    ///
+    /// The check found TWO of their schedules. SEVEN were spending a model turn
+    /// per firing on the same runner. The five it missed made no cost claim in
+    /// their titles, so there was nothing to contradict, and it reported clean
+    /// on them the whole time — honesty was what evaded the check.
+    ///
+    /// The cell above, `an_ordinary_tmux_schedule_making_no_cost_claim_passes`,
+    /// encoded that blind spot as intended behaviour. It still passes, because
+    /// its command is prose; what changes is that a claimless title no longer
+    /// protects a schedule whose command a shell could have run.
+    #[test]
+    fn a_claimless_title_no_longer_hides_a_model_turn_spent_on_a_shell_command() {
+        // The real command, verbatim, from all seven of gtm-ticker's rows.
+        let runner = "cd ~/Dev/mixpeek/gtm/engine && ./tick_runner.sh rb2b-inbound";
+
+        // THE FIVE IT MISSED: no cost claim, pure shell command, kind=tmux.
+        let missed = row_cmd("SCHED-200", "rb2b inbound tick", "tmux", runner);
+        let out = schedule_cost_titles_match_kind(&[missed]);
+        assert_eq!(out[0].status, Status::Fail, "{:?}", out[0]);
+        assert_eq!(out[0].entity_key, "SCHED-200");
+
+        // Same row on `shell` is the fixed state and must pass — otherwise the
+        // check would keep firing after the remedy it prescribes.
+        let fixed = row_cmd("SCHED-200", "rb2b inbound tick", "shell", runner);
+        assert_eq!(schedule_cost_titles_match_kind(&[fixed])[0].status, Status::Pass);
+
+        // CONTROL, and the reason the rule is conservative: a real PROMPT on a
+        // model lane is not a wasted turn, and flagging it would bury the board
+        // in judgement calls about what counts as prose.
+        let prompt = row_cmd(
+            "SCHED-999",
+            "SLA sweep",
+            "tmux",
+            "review the SLA breaches since yesterday and reply to any over 4h",
+        );
+        assert_eq!(
+            schedule_cost_titles_match_kind(&[prompt])[0].status,
+            Status::Pass,
+            "a genuine prompt must not be flagged"
+        );
+
+        // The predicate itself, both directions, since it is what decides.
+        assert!(is_pure_shell(runner));
+        assert!(is_pure_shell("./scripts/x.sh"));
+        assert!(is_pure_shell("python3 -m foo"));
+        assert!(is_pure_shell("/usr/local/bin/thing --flag"));
+        assert!(!is_pure_shell("review the breaches and reply"));
+        assert!(!is_pure_shell(""));
+        assert!(!is_pure_shell("   "));
+        // A structured prompt that HAPPENS to open with a command-looking word
+        // is still a prompt: the blank line is the tell.
+        assert!(!is_pure_shell("curl the thing\n\nThen summarise what you saw."));
     }
 
     /// The real specimens, verbatim from the board on 2026-08-24.
