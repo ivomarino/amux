@@ -3534,6 +3534,61 @@ fn already_filed(conn: &Connection, signature: &str) -> bool {
     .is_ok()
 }
 
+/// The fault identity, with the OCCURRENCE-BATCH timestamp stripped.
+///
+/// `5xx|` and `latency|outlier|` signatures end in the newest offending row's
+/// epoch, deliberately: it is what makes a discard STICK, because re-scanning
+/// the same rows mints the same signature and `already_filed` blocks the refile
+/// (AMUX-3581 -> 3589 -> 3591, one incident, three cards, each discard re-arming
+/// the next). That fix is correct and stays.
+///
+/// It has an inverse failure nobody measured, and it is the one filling the
+/// board. For a CONTINUOUSLY failing endpoint every scan sees a newer row, so
+/// "a genuinely new 5xx" is every tick, forever: `POST /api/browser/start`
+/// filed EIGHT cards in 50 minutes on 2026-08-24 — AMUX-3650, 3652, 3653, 3654,
+/// 3655, 3656, 3660, 3661 — identical but for a bumped count in the title, 8 of
+/// the 23 cards in one lane's queue. That is ethos rule 5 exactly: at volume it
+/// stops being a set of tasks and becomes a log, and a queue that cannot be read
+/// is one nobody reads, including for the cards that DO discriminate.
+fn fault_identity(signature: &str) -> Option<&str> {
+    if !(signature.starts_with("5xx|") || signature.starts_with("latency|outlier|")) {
+        return None;
+    }
+    // Only a trailing field that is a BARE EPOCH is stripped, same rule as
+    // `invariant_signature_parts`: a target whose last `|`-part is numeric is
+    // not a thing today, and if it becomes one this merges two faults rather
+    // than splitting every one.
+    match signature.rsplit_once('|') {
+        Some((head, tail)) if !head.is_empty() && tail.parse::<i64>().is_ok() => Some(head),
+        _ => None,
+    }
+}
+
+/// Is there already an OPEN card for this exact fault? (AMUX-3667 follow-up)
+///
+/// Deliberately scoped to cards a lane can still act on. A `done`, `verified`
+/// or `discarded` card does NOT suppress, which is what preserves the property
+/// the timestamp was added for: judging a report and discarding it leaves the
+/// signature judged via `already_filed`, and a genuinely new occurrence after
+/// that still files.
+///
+/// So the two rules divide cleanly: `already_filed` answers "have I filed THIS
+/// batch", and this answers "is the same fault already sitting in someone's
+/// queue". Only the second can see that eight cards are one fault.
+fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
+    let ident = fault_identity(signature)?;
+    conn.query_row(
+        "SELECT id FROM issues \
+          WHERE source_ref LIKE ?1 \
+            AND status NOT IN ('done','verified','discarded') \
+            AND archived = 0 AND deleted IS NULL \
+          ORDER BY id DESC LIMIT 1",
+        rusqlite::params![format!("autofix:{ident}|%")],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+}
+
 /// One tick: run every detector, file what is new, note what went quiet.
 ///
 /// Returns the report rather than logging it, so the debug surface shows
@@ -3689,6 +3744,49 @@ pub async fn autofix_tick_with_ci(
                 "autofix_enabled=0 (Settings toggle) — detected, not filed".into(),
             ));
             continue;
+        }
+        // ONE OPEN CARD PER FAULT (AMUX-3667 follow-up).
+        //
+        // `5xx|`/`latency|outlier|` signatures carry the occurrence batch's
+        // timestamp so a DISCARD sticks (AMUX-3581 -> 3589 -> 3591). The
+        // inverse, unmeasured until now: a continuously-failing endpoint has a
+        // newer row every scan, so every tick is "a genuinely new 5xx" and
+        // files. `POST /api/browser/start` minted EIGHT cards in 50 minutes on
+        // 2026-08-24 (AMUX-3650, 3652-3656, 3660, 3661) — identical but for the
+        // count in the title, and 8 of the 23 cards in one lane's queue.
+        //
+        // Suppressed, never silent: the reason NAMES the card that already
+        // holds the fault, so a reader lands there instead of wondering where
+        // the report went. Only open cards suppress, which is what keeps the
+        // discard property — a judged-and-discarded card lets the next genuine
+        // occurrence through.
+        {
+            // ORDER MATTERS, and getting it wrong shadowed a real signal:
+            // running this ahead of `already_filed` made every repeat of an
+            // open fault report as "suppressed" instead of "already_filed", and
+            // `a_restart_does_not_refile` caught it. The two answer different
+            // questions and both are worth keeping — "I already filed THIS
+            // batch" is precise and cheap, "the fault is already in someone's
+            // queue" is the broad one. Ask the precise one first, and let
+            // file_finding own it.
+            let existing = state.store.read().ok().and_then(|c| {
+                if already_filed(&c, &f.signature) {
+                    return None;
+                }
+                open_card_for_fault(&c, &f.signature)
+            });
+            if let Some(card) = existing {
+                rep.suppressed.push((
+                    f.kind.slug().into(),
+                    f.signature.clone(),
+                    format!(
+                        "{card} is open for this same fault — one card per fault, not one \
+                         per scan (AMUX-3667). Its count is what moves; a second card would \
+                         carry no new information."
+                    ),
+                ));
+                continue;
+            }
         }
         to_file.push(f);
     }
@@ -4791,6 +4889,88 @@ mod tests {
         assert!(has("big.db"), "a 2MB file above a 1MB floor must be a candidate: {got:?}");
         assert!(has("a-directory"), "directories must STILL be candidates: {got:?}");
         assert!(!has("small.txt"), "a file below the floor is noise, not a candidate: {got:?}");
+    }
+
+    /// AMUX-3667 follow-up, rebuilt from the eight cards themselves.
+    ///
+    /// `POST /api/browser/start` filed AMUX-3650, 3652, 3653, 3654, 3655, 3656,
+    /// 3660 and 3661 in 50 minutes — one fault, eight cards, identical but for
+    /// the count in the title, 8 of the 23 in one lane's queue. Their
+    /// `source_ref`s differ only in the trailing epoch, which is exactly the
+    /// field added so a DISCARD would stick.
+    ///
+    /// So the treatment and the control pull against each other by design, and
+    /// both have to hold: an OPEN card suppresses, a DISCARDED one does not.
+    #[test]
+    fn one_open_card_per_fault_but_a_discarded_one_does_not_suppress() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
+             archived INTEGER DEFAULT 0, deleted TEXT);",
+        )
+        .unwrap();
+        let add = |id: &str, sref: &str, status: &str| {
+            conn.execute(
+                "INSERT INTO issues (id, source_ref, status, archived, deleted) \
+                 VALUES (?1,?2,?3,0,NULL)",
+                rusqlite::params![id, sref, status],
+            )
+            .unwrap();
+        };
+        // The real signature shape, from the real cards.
+        let sig = |ts: i64| format!("5xx|502|POST|/api/browser|/api/browser/start|{ts}");
+
+        // Nothing filed yet: the first occurrence must get a card.
+        assert_eq!(open_card_for_fault(&conn, &sig(1787585028)), None);
+
+        // AMUX-3650 is open. A LATER batch of the same fault must not file.
+        add("AMUX-3650", &format!("autofix:{}", sig(1787585028)), "todo");
+        assert_eq!(
+            open_card_for_fault(&conn, &sig(1787585376)).as_deref(),
+            Some("AMUX-3650"),
+            "a newer batch of an already-open fault must be suppressed"
+        );
+
+        // CONTROL 1: discarded must NOT suppress, or judging a spurious report
+        // would silence the fault permanently — the opposite failure, and the
+        // one the trailing timestamp exists to avoid.
+        conn.execute("UPDATE issues SET status='discarded' WHERE id='AMUX-3650'", []).unwrap();
+        assert_eq!(
+            open_card_for_fault(&conn, &sig(1787585376)),
+            None,
+            "a discarded card must let the next genuine occurrence through"
+        );
+        for st in ["done", "verified"] {
+            conn.execute("UPDATE issues SET status=?1 WHERE id='AMUX-3650'", rusqlite::params![st])
+                .unwrap();
+            assert_eq!(open_card_for_fault(&conn, &sig(1787585376)), None, "{st}");
+        }
+        // An ARCHIVED open card is not in anyone's queue either.
+        conn.execute("UPDATE issues SET status='todo', archived=1 WHERE id='AMUX-3650'", [])
+            .unwrap();
+        assert_eq!(open_card_for_fault(&conn, &sig(1787585376)), None, "archived");
+
+        // CONTROL 2: a DIFFERENT fault must still file. Matching on the prefix
+        // with a `LIKE` makes over-matching the live risk — `/api/browser` is a
+        // prefix of `/api/browser/start`, so a sloppy pattern would fold every
+        // endpoint under one card and the board would go quiet about real
+        // faults.
+        conn.execute("UPDATE issues SET status='todo', archived=0 WHERE id='AMUX-3650'", [])
+            .unwrap();
+        let other = "5xx|502|POST|/api/browser|/api/browser/stop|1787585376";
+        assert_eq!(open_card_for_fault(&conn, other), None, "a different target is a different fault");
+        let other_status = "5xx|500|POST|/api/browser|/api/browser/start|1787585376";
+        assert_eq!(open_card_for_fault(&conn, other_status), None, "a different status too");
+
+        // CONTROL 3: only the two timestamped families have a fault identity at
+        // all. Stripping a trailing field from an arbitrary signature would
+        // merge unrelated faults.
+        assert_eq!(fault_identity("invariant|hooks.guard|fleet|1787223065"), None);
+        assert_eq!(fault_identity("5xx|502|POST|/api/x|/api/x|nota-number"), None);
+        assert_eq!(
+            fault_identity("latency|outlier|GET|/api/board|1787585028"),
+            Some("latency|outlier|GET|/api/board")
+        );
     }
 
     /// AMUX-3664, rebuilt from the incident row that exposed it.
