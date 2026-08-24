@@ -412,6 +412,30 @@ def main():
                     "confirmed isolated (or the server could not be reached). Ask them, or "
                     "use the two-field form if they consented" % who_in))
                 continue
+            if not owner_grant and _session_is_isolated(who_in):
+                # THE OTHER DIRECTION, AND IT IS THE ONE THAT SILENTLY LIED
+                # (AF-206). `:owner` was already refused when the author is NOT
+                # isolated. The inverse was accepted: a two-field grant for an
+                # author who CANNOT BE ASKED cleared on a trailer match alone
+                # and was logged as author consent, so the audit trail recorded
+                # "the author said yes" about a raw-agent worker with the amux
+                # harness stripped, whose `amux send` is refused by
+                # construction. Nobody had to be careless to produce that — the
+                # refusal message computed the two-field string for every author
+                # including the isolated ones and invited you to paste it.
+                #
+                # This half is what makes the `:owner` distinction mean
+                # anything. An owner grant is a different FACT from an author
+                # grant, and a form that lets you spell one as the other
+                # collapses them at exactly the point the audit needs them
+                # separate.
+                mismatched.append((
+                    sha_in, who_in,
+                    "'%s' is an ISOLATED (raw-agent) worker — `amux send` to it is refused "
+                    "by construction, so its author consent cannot have been obtained. "
+                    "Only the owner can grant this, and it is recorded distinctly: use "
+                    "%s:%s:owner" % (who_in, sha_in, who_in)))
+                continue
             cleared.append((bits[0], who_in, owner_grant))
         if mismatched:
             sys.stderr.write(
@@ -485,6 +509,23 @@ def main():
             safe = _sha
         else:
             break
+    # AN ISOLATED AUTHOR CANNOT BE ASKED, AND THE MESSAGE HAS TO SAY SO (AF-206).
+    #
+    # `:owner` has existed in the parser since 2026-08-23 and appeared in NO exit
+    # this message offers. So the capability reached nobody who needed it —
+    # ethos rule 1 — and on 2026-08-24 a lane hit exactly this wall, correctly
+    # rejected `AMUX_ALLOW_FOREIGN` as recording consent from nobody, and
+    # escalated to the owner to DESIGN a remedy that was already implemented
+    # eleven commits below them.
+    #
+    # Worse than merely absent: the `_consent` string this message computes is
+    # the TWO-field form for every author, including an isolated one, and the
+    # two-field form is ACCEPTED whenever the trailer matches. Following this
+    # refusal literally therefore records "the author said yes" about an author
+    # no peer can reach — the AMUX-3533 shape reappearing one layer up, where
+    # the sanctioned instruction is what produces the dishonest record.
+    _isolated = sorted(w0 for w0 in foreign if _session_is_isolated(w0))
+    _reachable = [w0 for w0 in sorted(foreign) if w0 not in _isolated]
     w("\nTheir work is not yours to deploy. Options:\n")
     if safe:
         w("  - PUSH ONLY YOURS (no override needed) — your commits up to %s form a\n"
@@ -494,7 +535,24 @@ def main():
         w("  - the commit directly above the remote is not yours, so there is no\n"
           "    same-session prefix to ship — those sessions must push first, lower\n"
           "    owner first. Ask them, then push.\n")
-    w("  - or ask that session to push its own commits, or\n")
+    if _reachable:
+        w("  - or ask %s to push its own commits, or\n"
+          % (", ".join(_reachable) if len(_reachable) > 1 else _reachable[0]))
+    if _isolated:
+        _owner_consent = " ".join(
+            "%s:%s:owner" % (sha, who)
+            for who in _isolated for sha, _s in foreign[who])
+        w("\n  ISOLATED AUTHOR — %s cannot be asked. It is a raw-agent worker with\n"
+          "  the amux harness stripped (CC_ISOLATED), so `amux send` to it is refused\n"
+          "  by construction and it is invisible in the fleet list. Do NOT record\n"
+          "  author consent for it: the two-field form asserts a yes that could not\n"
+          "  have been given, and the guard would accept it.\n"
+          "  Only the OWNER can consent on its behalf, and there is a form for that\n"
+          "  which is checked (it is REFUSED unless the session is genuinely\n"
+          "  isolated) and logged as CONSENT-OWNER, distinct from author consent:\n"
+          "      AMUX_FOREIGN_CONSENT=\"%s\" git push ...\n"
+          "  Ask the owner. That request is the thing to escalate — not a design.\n"
+          % (", ".join(_isolated), _owner_consent))
     # NAME THE AUTHOR-CONSENT EXIT FIRST, and PRE-COMPUTE the exact string
     # (AMUX-3533). An escape nobody is handed is decoration — ethos rule 1 —
     # and this refusal previously offered only exits that did not fit the most
@@ -502,14 +560,24 @@ def main():
     # reached for the blanket override on the same day. It is listed ABOVE
     # ALLOW_FOREIGN deliberately: it is the stricter of the two and it should be
     # the one that comes to hand.
+    # ISOLATED AUTHORS ARE EXCLUDED FROM THIS STRING. Offering their sha here in
+    # the two-field form is the defect described above: it hands the reader a
+    # ready-made claim that an unreachable author consented. They get the
+    # `:owner` line instead, and a mixed stack gets both, each covering its own
+    # commits.
     _consent = " ".join(
         "%s:%s" % (sha, who if who != "(no Amux-Session trailer)" else "<unknown>")
-        for who in sorted(foreign) for sha, _s in foreign[who])
-    w("  - if THE AUTHOR of those commits told you to ship them (the usual case\n"
-      "    here — a peer saying \"take my commit\" is not the human asking), record\n"
-      "    that consent instead of overriding blind. It is CHECKED against each\n"
-      "    commit's real author and written to the audit log:\n"
-      "      AMUX_FOREIGN_CONSENT=\"%s\" git push ...\n" % _consent)
+        for who in _reachable for sha, _s in foreign[who])
+    if _consent:
+        w("  - if THE AUTHOR of those commits told you to ship them (the usual case\n"
+          "    here — a peer saying \"take my commit\" is not the human asking), record\n"
+          "    that consent instead of overriding blind. It is CHECKED against each\n"
+          "    commit's real author and written to the audit log:\n"
+          "      AMUX_FOREIGN_CONSENT=\"%s\" git push ...\n" % _consent)
+        if _isolated:
+            w("    (that string covers the reachable authors only — the isolated ones\n"
+              "     above need their own `:owner` entries, and every foreign commit\n"
+              "     must be covered or the push stays blocked.)\n")
     w("  - or, if the HUMAN explicitly asked you to ship everything regardless of\n"
       "    who wrote it:\n"
       "      AMUX_ALLOW_FOREIGN=1 git push ...\n\n")

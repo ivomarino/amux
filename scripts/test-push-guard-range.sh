@@ -23,7 +23,15 @@
 # Exit 0 = all pass, 1 = a failure. Wired into .github/workflows/checks.yml.
 set -uo pipefail
 cd "$(dirname "$0")/.."
-HOOK="$(pwd)/scripts/git-hooks/pre-push"
+# PUSH_GUARD_HOOK lets a caller point these cells at a DIFFERENT copy of the
+# guard — specifically an older one, to confirm a new cell actually fails
+# against the code it was written for. Without the seam that check needs an
+# edit to this file, which means it is done once and never again;
+# scripts/test-frustration-scan.sh has had FRUSTRATION_SCAN for the same
+# reason and it is what made AF-207's control reproducible by its reviewer.
+#   git show <sha>^:scripts/git-hooks/pre-push > /tmp/prefix-guard
+#   PUSH_GUARD_HOOK=/tmp/prefix-guard bash scripts/test-push-guard-range.sh
+HOOK="${PUSH_GUARD_HOOK:-$(pwd)/scripts/git-hooks/pre-push}"
 PASS=0; FAIL=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
@@ -266,6 +274,48 @@ if [ "$rc" -ne 0 ] && grep -qi "only for ISOLATED" "$TMP/out"; then
   ok "K: ':owner' is REFUSED for a worker that is not isolated — ask them instead"
 else
   bad "K: ':owner' cleared a reachable worker — that is a blanket override wearing a suffix"
+  sed 's/^/       /' "$TMP/out"
+fi
+
+# ── O/P. AF-206: the ISOLATED author must not be spellable as author consent, ─
+#         and the refusal must NAME the exit that does exist.
+#
+# `:owner` shipped 2026-08-23 and appeared in NO exit the refusal message
+# offered. On 2026-08-24 a lane hit that wall, correctly rejected
+# AMUX_ALLOW_FOREIGN as recording consent from nobody, and escalated to the
+# owner to DESIGN a remedy that was already implemented eleven commits below it.
+# An escape nobody is handed is decoration (ethos rule 1).
+#
+# O is the sharper half. K already refused `:owner` for a REACHABLE author; the
+# inverse was accepted — a TWO-field grant naming an ISOLATED author cleared on
+# a trailer match alone and was logged as author consent. So the audit recorded
+# "the author said yes" about a worker whose `amux send` is refused by
+# construction, and nobody had to be careless to produce it: the refusal message
+# computed that exact two-field string and invited you to paste it. Without O,
+# the `:owner` distinction is decorative, because you can spell an owner grant
+# as an author grant and the log cannot tell.
+
+rc=$(run_hook_consent "$J" "$JTIP" "$ZERO" feat "$JSHA:desktop")
+if [ "$rc" -ne 0 ] && grep -qi "isolated" "$TMP/out" && grep -q "desktop:owner" "$TMP/out"; then
+  ok "O: author consent for an ISOLATED worker is REFUSED, and points at ':owner'"
+else
+  bad "O: a two-field grant cleared an unaskable author — the audit now says they consented"
+  sed 's/^/       /' "$TMP/out"
+fi
+
+# P. THE DISCOVERY PATH. Blocked with an isolated author among the foreign
+# commits, the refusal must say the author is isolated AND print the `:owner`
+# string, rather than telling you to ask someone who cannot be asked. It must
+# ALSO not offer that sha in the two-field string — handing over a ready-made
+# false claim is what O exists to refuse one step later.
+rc=$(run_hook "$J" "$JTIP" "$ZERO" feat)
+if [ "$rc" -ne 0 ] \
+   && grep -qi "ISOLATED AUTHOR" "$TMP/out" \
+   && grep -q "$JSHA:desktop:owner" "$TMP/out" \
+   && ! grep -qE "FOREIGN_CONSENT=\"[^\"]*$JSHA:desktop[^:]" "$TMP/out"; then
+  ok "P: the refusal names the isolated author and the ':owner' exit, not a false author grant"
+else
+  bad "P: the refusal did not route an isolated author to the owner exit"
   sed 's/^/       /' "$TMP/out"
 fi
 
