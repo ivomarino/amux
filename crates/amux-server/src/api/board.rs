@@ -221,6 +221,19 @@ async fn get_contract(
         // most-recent terminal rows fleet-wide and no signal that it was a
         // sample, so `GET /api/board` could return FEWER of its done cards than
         // `?session=<lane>` did. That reads as data, not as truncation.
+        // RECOVERY, because a path nobody knows about is one nobody uses
+        // (mvs-infra, 2026-08-23). They overwrote 4082 chars of merge evidence
+        // on a card and recovered it in three minutes from _amux_state_events —
+        // then pointed out that nothing in the API told them it was there. The
+        // write guard added the same day refuses the destructive case; this is
+        // for the ones that already happened, and for `force`/ack'd replaces
+        // which are still allowed to destroy prose on purpose.
+        "recovering_a_clobbered_desc": {
+            "where": "_amux_state_events rows carry the FULL pre-mutation card snapshot in                       their payload, so a description overwritten by a PATCH is recoverable                       without any backup",
+            "how": "find the row for the mutation (by card id and timestamp) and read the                     snapshot out of its payload",
+            "prevention": "PATCH refuses a replace that drops a strict majority of a desc of                            500+ chars — see desc_shrink_ack. Use desc_append to add to a                            description rather than replacing it",
+            "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head and \"slim\": 1). An ABSENT field is not an empty                                  one, and .get(\"desc\") returns None either way — read                                  desc_len, or GET the single card",
+        },
         "list": {
             "endpoint": "GET /api/board",
             "returns": "a bare JSON array of items (NOT an envelope) — kept that way \
