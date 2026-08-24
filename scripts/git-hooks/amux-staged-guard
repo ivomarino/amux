@@ -387,6 +387,42 @@ def _derive_session_from_tmux():
     return name[len("amux-"):] if name.startswith("amux-") else ""
 
 
+def _render_split_risk(d, w):
+    """AF-190: this commit SPLITS a peer's work, so it can fail to build even
+    though the tree it came from compiles.
+
+    `cargo check` and the pre-commit gate both pass, correctly — they build the
+    TREE, which holds the peer's uncommitted half. Nothing builds the COMMIT, so
+    53ae4b8b was the tip of origin/main and did not compile.
+
+    A SEPARATE FUNCTION so this can be tested. The rest of the verdict rendering
+    lives inline in main() behind a live HTTP call, which is exactly the shape
+    that lets a print statement be wrong for months: a field the server emits and
+    no hook renders reaches nobody, and nothing about reading main() would say
+    so. test_amux_staged_guard.py drives this directly.
+
+    Advisory, never blocking. It is a warning about a BUILD, not an assertion
+    that the staged bytes are somebody else's, and blocking on it would stop
+    commits that are perfectly legitimate. Printed BEFORE the block section:
+    when both fire, this one names a consequence the committer can act on
+    without first reading a claim about ownership.
+    """
+    for _sr in d.get("split_risk") or []:
+        w("\namux staged-guard: SPLIT COMMIT WARNING — %s's work is being cut in half:\n"
+          % _sr.get("owner", "?"))
+        w("  in this commit:  %s\n" % ", ".join(_sr.get("staged") or []))
+        w("  left behind, dirty and NOT committed:\n")
+        for _p in _sr.get("left_dirty") or []:
+            w("    %s\n" % _p)
+        # The server's sentence, verbatim. It STATES the hazard rather than
+        # asking the committer to judge a number: the guard already printed a
+        # discriminating insertion count for the specimen behind this feature
+        # ("34 insertions / 9 deletions — if that is MORE than you wrote...")
+        # and its author read past it, because 34 matched what they expected.
+        # A number that agrees with you is exactly where a check gets skipped.
+        w("  %s\n" % _sr.get("why", ""))
+
+
 def main():
     sess = os.environ.get("AMUX_SESSION", "")
     derived = False
@@ -709,30 +745,7 @@ def main():
         w("  If these are yours via shell edits, proceed. If you do not recognize "
           "one, it is a peer's in-flight hunk riding your git add — stage "
           "per-hunk instead (git add -p %s).\n" % _ua.get("path", ""))
-    # AF-190: this commit SPLITS a peer's work, so it can fail to build even
-    # though the tree it came from compiles. `cargo check` and the pre-commit
-    # gate both pass, correctly — they build the TREE, which holds the peer's
-    # uncommitted half. Nothing builds the COMMIT.
-    #
-    # Printed BEFORE the block section on purpose: when both fire, this one names
-    # a consequence the committer can act on without reading a claim about
-    # ownership first. Advisory, never blocking — it is a warning about a build,
-    # not an assertion that the staged bytes are somebody else's, and blocking on
-    # it would stop commits that are perfectly legitimate.
-    for _sr in d.get("split_risk") or []:
-        w("\namux staged-guard: SPLIT COMMIT WARNING — %s's work is being cut in half:\n"
-          % _sr.get("owner", "?"))
-        w("  in this commit:  %s\n" % ", ".join(_sr.get("staged") or []))
-        w("  left behind, dirty and NOT committed:\n")
-        for _p in _sr.get("left_dirty") or []:
-            w("    %s\n" % _p)
-        # The server's sentence, verbatim. It STATES the hazard rather than
-        # asking the committer to judge a number: the guard already printed a
-        # discriminating insertion count for the specimen behind this feature
-        # ("34 insertions / 9 deletions — if that is MORE than you wrote...")
-        # and its author read past it, because 34 matched what they expected.
-        # A number that agrees with you is exactly where a check gets skipped.
-        w("  %s\n" % _sr.get("why", ""))
+    _render_split_risk(d, w)
     foreign = d.get("foreign") or []
     _m = _read_marker(sess, top)
     if not foreign:

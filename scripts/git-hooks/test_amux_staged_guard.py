@@ -66,6 +66,38 @@ def main():
     if mod.GUARD_VERSION <= 8:
         failures.append(f"GUARD_VERSION is {mod.GUARD_VERSION} — bump it, every install checks this")
 
+    # AF-190: the server emits `split_risk`; this asserts a HOOK actually prints
+    # it. A field nobody renders reaches nobody, and nothing about reading the
+    # server code would say so — that gap is ethos rule 1, and it is why the
+    # renderer was pulled out of main() into a function a test can call.
+    out = []
+    mod._render_split_risk({
+        "split_risk": [{
+            "owner": "amux",
+            "staged": ["crates/amux-server/src/api/board.rs"],
+            "left_dirty": ["/repo/crates/amux-server/src/db/board_store.rs"],
+            "why": "a symbol added on one side may be missing from the other",
+        }]
+    }, out.append)
+    txt = "".join(out)
+    for needle, what in [
+        ("amux", "the peer whose work is being split"),
+        ("board.rs", "the staged file"),
+        ("board_store.rs", "the file left behind — naming it is the whole point"),
+        ("NOT committed", "that the second half is not in this commit"),
+    ]:
+        if needle not in txt:
+            failures.append(f"split_risk render omits {what} ({needle!r}): {txt!r}")
+
+    # CONTROL: silent when there is nothing to say. A warning that prints on
+    # every commit is one nobody reads, which is exactly how the insertion-count
+    # line this replaces came to be ignored.
+    for empty in ({}, {"split_risk": []}, {"split_risk": None}):
+        out = []
+        mod._render_split_risk(empty, out.append)
+        if out:
+            failures.append(f"split_risk must print NOTHING for {empty!r}, got {out!r}")
+
     if failures:
         print(f"FAIL {len(failures)}:")
         for f in failures:
