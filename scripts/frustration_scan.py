@@ -168,6 +168,24 @@ def main():
                 # frustration would send someone to read Ethan's tone when the
                 # bug is in send_dedup. Found on the first run: ids 30451/30452,
                 # identical, same second, consecutive ids.
+                # SAME SESSION OR IT IS NOT A REPEAT, AND THIS GUARD BELONGS
+                # TO BOTH BRANCHES. It used to live inside the sub-60s branch
+                # below, while the comment there claimed a cross-session pair
+                # "is skipped outright rather than falling through to the repeat
+                # branch below". It was not: only pairs that were ALSO under a
+                # minute and ALSO near-identical were skipped, and everything
+                # else fell through exactly as the comment said it would not.
+                #
+                # Live specimen, 2026-08-24 sweep: id 31240 to `random` and id
+                # 31973 to `tubescience`, both "whats the status?", 31.4h apart.
+                # Reported as `random` repeating itself with jaccard 1.00 — the
+                # top-scoring candidate of the run. Two different lanes each
+                # being asked for status is ordinary operation, and the finding
+                # cost a sweep slot and produced a verdict of "undecidable".
+                #
+                # Ethos rule 6: the promise was in the comment and not in the code.
+                if a["session"] != b["session"]:
+                    continue
                 if gap_s < 60 and sim > 0.98:
                     # SAME SESSION OR IT IS NOT A DELIVERY DEFECT. Measured
                     # 2026-08-23: ids 31157/31158 are the SAME text 12s apart to
@@ -179,8 +197,6 @@ def main():
                     # also NOT a `repeat` (he did not ask twice, he addressed two
                     # workers), so it is skipped outright rather than falling
                     # through to the repeat branch below.
-                    if a["session"] != b["session"]:
-                        continue
                     key = f"double-delivery:{a['id']}"
                     f = findings[key]
                     f["score"] = max(f["score"], 8)

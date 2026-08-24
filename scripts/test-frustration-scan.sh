@@ -40,6 +40,18 @@ rows = [
     # B: SAME text, 8s apart, SAME session -> a real double-delivery candidate.
     (3, "test it with all the gsuite shit for a b and c", "user", "amux", now - 500_000, "", "", "direct"),
     (4, "test it with all the gsuite shit for a b and c", "user", "amux", now - 492_000, "", "", "direct"),
+    # C: SAME text, 31 HOURS apart, DIFFERENT sessions -> still a fan-out, and it
+    # reaches the REPEAT branch rather than the double-delivery one. Cell A's pair
+    # is 12s apart, so it only ever exercised the sub-60s branch — which was the
+    # only branch the session guard was in. The bug lived one branch over, and a
+    # cell asserting exactly the right property sat green through it because its
+    # fixture could not reach the code that was wrong.
+    (5, "whats the status?", "user", "random",      now - 112_000_000, "", "", "direct"),
+    (6, "whats the status?", "user", "tubescience", now -   1_000_000, "", "", "direct"),
+    # D: SAME text, 31 hours apart, SAME session -> a genuine repeat, and it must
+    # survive. Without this, deleting the repeat branch entirely passes cell C.
+    (7, "make me a table of all the outstanding items", "user", "ts", now - 112_000_000, "", "", "direct"),
+    (8, "make me a table of all the outstanding items", "user", "ts", now -   1_000_000, "", "", "direct"),
 ]
 c.executemany("INSERT INTO cmd_history VALUES (?,?,?,?,?,?,?,?)", rows)
 c.commit()
@@ -71,6 +83,36 @@ sys.exit(0 if hit else 1)'; then
   ok "B: a same-session identical pair IS still double-delivery (the fix did not hollow it out)"
 else
   bad "B: the same-session pair was NOT classified double-delivery — detector is now inert"
+  echo "$OUT" | head -30 | sed 's/^/       /'
+fi
+
+# Cell C: a cross-session pair with a LARGE gap must not be reported either.
+# This is the specimen from the 2026-08-24 sweep: id 31240 to `random` and id
+# 31973 to `tubescience`, both "whats the status?", 31.4h apart, reported as
+# `random` repeating itself with jaccard 1.00 — the top-scoring candidate of the
+# run, and a lane that had never repeated anything.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ids={m["id"] for f in d["findings"] for m in f["messages"]}
+sys.exit(0 if not ({5,6} & ids) else 1)'; then
+  ok "C: a cross-session pair 31h apart is NOT a repeat (the branch cell A could not reach)"
+else
+  bad "C: a cross-session pair fell through to the repeat branch — the comment's promise, unimplemented"
+  echo "$OUT" | head -30 | sed 's/^/       /'
+fi
+
+# Cell D: and the repeat detector must still fire on a SAME-session repeat.
+# Cell C alone is satisfied by a scanner that reports no repeats at all.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+hit=[f for f in d["findings"] if f["kind"]=="repeat"
+     and {m["id"] for m in f["messages"]} == {7,8}]
+sys.exit(0 if hit else 1)'; then
+  ok "D: a same-session repeat 31h apart IS still reported (cell C did not hollow it out)"
+else
+  bad "D: the same-session repeat was NOT reported — the repeat detector is now inert"
   echo "$OUT" | head -30 | sed 's/^/       /'
 fi
 
