@@ -3029,7 +3029,36 @@ mod tests {
             1,
             "the spanning row must be gone and the genuinely slow one must remain: {outliers:?}"
         );
-        assert_eq!(outliers[0]["ts"], json!(now - 10.0), "the survivor is the one after boot");
+        // TOLERANCE, not assert_eq! (AEAB-56). `outliers[0]["ts"]` has crossed a
+        // storage boundary — stored as SQLite REAL, read back, serialised to
+        // JSON — while the right-hand side is recomputed here, and serde_json
+        // compares Numbers bit-for-bit. On 2026-08-24 that failed one ULP apart:
+        //     left:  1787580761.0102837
+        //     right: 1787580761.0102835
+        // A unix timestamp is ~1.787e9, so an f64's ~15-16 significant digits
+        // run out at the 17th and the last one is not representable. Whether the
+        // two agree depends on the value of `now` — the test was passing or
+        // failing on the clock rather than on the behaviour it asserts, and it
+        // blocked an unrelated PR whose whole diff was a Dockerfile line.
+        //
+        // The claim is WHICH ROW SURVIVED, and the two candidates are 270s apart
+        // (the specimen is at boot+20 = now-280, the control at now-10). 1e-3 is
+        // five orders below a millisecond and five below any plausible drift,
+        // and 270,000x smaller than the gap it must not mask — a wrong row is
+        // 270 seconds away, not a microsecond. So this cannot go green on the
+        // failure it exists to catch.
+        //
+        // The three sibling `["ts"]` assertions in this crate (dictation.rs:1777,
+        // history.rs:635 and :764) compare INTEGER literals, which round-trip
+        // exactly; grepped, and this was the only computed-float one.
+        let survivor_ts = outliers[0]["ts"].as_f64().expect("ts is a number");
+        assert!(
+            (survivor_ts - (now - 10.0)).abs() < 1e-3,
+            "the survivor is the one after boot: got {survivor_ts}, want ~{} (the excluded \
+             specimen is at {}, 270s away)",
+            now - 10.0,
+            boot + 20.0
+        );
 
         // THE EXCLUSION IS PUBLISHED, NOT SILENT. A detector that quietly drops
         // rows is one nobody can audit (AF-178), and a zero here is what tells a
