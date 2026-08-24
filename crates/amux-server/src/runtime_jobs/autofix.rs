@@ -447,6 +447,16 @@ pub struct Finding {
     pub owner: Option<String>,
     pub count: u64,
     pub last_ts: f64,
+    /// Set when the fault's only exit is a CLOCK, to the epoch it heals at
+    /// (AMUX-3645). A dwell-window check holds itself red on purpose — see
+    /// [`crate::invariants::InvariantResult::heals_at`] — and a card for one
+    /// has no action that closes it. Filed as `backlog` carrying this as its
+    /// resume trigger rather than as `todo`, so it is parked with an expiry
+    /// instead of queued as work a lane cannot do.
+    ///
+    /// `None` on every ordinary finding, which is the answer that means "an
+    /// action is what closes this".
+    pub parked_until: Option<f64>,
 }
 
 /// A fault we deliberately did not file, and why. Published, always.
@@ -471,6 +481,19 @@ pub struct AutofixReport {
     /// (card, "resolved"|"stopped being checkable") — cards told that the
     /// incident behind them is gone (AMUX-3574).
     pub resolved_noted: Vec<(String, String)>,
+    /// (card, signature, local heal time) — cards filed PARKED because the
+    /// fault's only exit is a clock (AMUX-3645).
+    ///
+    /// Here so the next one is self-announcing. A parked card is a deliberate
+    /// non-event: nothing is wrong, nobody is nudged, and it therefore leaves
+    /// no trace anywhere a sweep would look. That is exactly how the ORIGINAL
+    /// defect stayed invisible — AMUX-3640 was filed, picked up, investigated,
+    /// and discarded, and the only record that a lane had burned a pickup on a
+    /// check working as designed was the prose a human wrote onto the card
+    /// afterwards. If parking ever fires on something it should not, or fires
+    /// on nothing at all because a declaration stopped being written, this row
+    /// is what says so without anyone going to look.
+    pub parked: Vec<(String, String, String)>,
     pub errors: Vec<String>,
     pub took_ms: f64,
 }
@@ -649,6 +672,7 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             owner: g.workers.iter().next().cloned(),
             count: g.count,
             last_ts: g.last_ts,
+            parked_until: None,
         });
     }
     (out, suppressed)
@@ -1021,6 +1045,7 @@ pub(crate) fn detect_latency_at(
             owner: None,
             count: win.len() as u64,
             last_ts: now,
+            parked_until: None,
         });
     }
 
@@ -1099,6 +1124,7 @@ pub(crate) fn detect_latency_at(
             owner: None,
             count: collapsed.len() as u64,
             last_ts: now,
+            parked_until: None,
         });
     }
 
@@ -1225,6 +1251,7 @@ pub(crate) fn detect_latency_at(
             owner: None,
             count: candidates.len() as u64,
             last_ts: last,
+            parked_until: None,
         });
         return (out, suppressed);
     }
@@ -1272,6 +1299,7 @@ pub(crate) fn detect_latency_at(
             owner: None,
             count: n,
             last_ts,
+            parked_until: None,
         });
     }
     (out, suppressed)
@@ -1390,6 +1418,7 @@ pub fn detect_dead_routes(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Sup
             owner: None,
             count,
             last_ts: last,
+            parked_until: None,
         });
     }
     (out, suppressed)
@@ -1475,6 +1504,7 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
                 owner: None,
                 count: late.len() as u64,
                 last_ts: now,
+                parked_until: None,
             });
         }
     }
@@ -1579,6 +1609,7 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
                     owner,
                     count: n as u64,
                     last_ts: now,
+                    parked_until: None,
                 });
             }
         }
@@ -1596,7 +1627,7 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
 /// flap is how a board stops being read.
 /// One row of `_amux_invariant_incident`:
 /// (invariant_id, entity_key, status, first_seen, last_seen, occurrences, expected, observed).
-type InvRow = (String, String, String, f64, f64, i64, String, String);
+type InvRow = (String, String, String, f64, f64, i64, String, String, String);
 
 /// How many distinct entities one invariant must be failing for before it is
 /// filed as a SINGLE rollup card instead of one card per entity.
@@ -1641,8 +1672,12 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
     // that wakes and fails again refreshes last_seen and files normally.
     let fresh_cutoff = now - invariant_incident_fresh_s();
     let Ok(mut stmt) = conn.prepare(
+        // `evidence` rides along for AMUX-3645: a dwell-window check declares
+        // its self-heal epoch in there (InvariantResult::heals_at), and that is
+        // what separates "held red on purpose until Tuesday" from "a fault that
+        // is getting worse". Without it the two file identical cards.
         "SELECT invariant_id, entity_key, status, first_seen, last_seen, occurrences, \
-                expected, observed \
+                expected, observed, COALESCE(evidence, '') \
          FROM _amux_invariant_incident WHERE resolved_at IS NULL AND status = 'fail' \
          AND last_seen >= ?1 \
          ORDER BY occurrences DESC LIMIT 200",
@@ -1659,6 +1694,7 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             r.get::<_, i64>(5)?,
             r.get::<_, String>(6)?,
             r.get::<_, String>(7)?,
+            r.get::<_, String>(8)?,
         ))
     }) else {
         return (out, suppressed);
@@ -1763,10 +1799,11 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             owner: None,
             count: filing.len() as u64,
             last_ts: last_seen.max(now - 1.0),
+            parked_until: None,
         });
     }
 
-    for (id, entity, _status, first, last, occ, expected, observed) in flat {
+    for (id, entity, _status, first, last, occ, expected, observed, evidence) in flat {
         let sig_entity = if entity.is_empty() { "fleet".to_string() } else { entity.clone() };
         // Episode identity, same reason as the ROLLUP arm above (AMUX-3633).
         let signature = format!("invariant|{id}|{sig_entity}|{}", first as i64);
@@ -1778,15 +1815,47 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             ));
             continue;
         }
+        // DWELL WINDOW (AMUX-3645): the check declared when it heals on its own.
+        // Only a heal epoch still in the FUTURE parks the card — a declaration
+        // that has already lapsed means the invariant should have passed by now
+        // and has not, which is a real fault and the loudest kind, so it must
+        // not be filed as "parked until a date that is behind us".
+        let parked_until = serde_json::from_str::<serde_json::Value>(&evidence)
+            .ok()
+            .as_ref()
+            .and_then(crate::invariants::heals_at_of)
+            .filter(|t| *t > now);
+        let verdict = match parked_until {
+            // "has not self-healed" is TRUE here and reads as an escalating
+            // fault, and `{occ}` reads as severity when it is the evaluation
+            // rate times the dwell. AMUX-3640 shipped both about a check that
+            // was working exactly as designed, and establishing that took
+            // reading the check's source. State the disposition instead.
+            Some(t) => format!(
+                "Invariant `{id}` is a DWELL WINDOW held red on purpose for {sig_entity}, and it \
+                 heals on its own at {} with no action from anyone. The {occ} occurrences are the \
+                 evaluation rate times the dwell, not a severity. Do not work this as a fault: \
+                 either the thing it names is already handled elsewhere (say where, on this card) \
+                 or it still needs acknowledging before the window closes.",
+                rl::local_when(t),
+            ),
+            None => format!(
+                "Invariant `{id}` has been failing for {sig_entity} across {occ} evaluations \
+                 and has not self-healed. Threshold to file: {min_occ}.",
+            ),
+        };
         out.push(Finding {
             kind: DetectorKind::InvariantBreach,
             signature,
-            title: format!("invariant {id} failing ({occ}x) — {sig_entity}"),
+            title: if parked_until.is_some() {
+                // The count is in the ordinary title because it IS the severity
+                // signal there. On a dwell card it is noise dressed as alarm.
+                format!("invariant {id} in its dwell window — {sig_entity}")
+            } else {
+                format!("invariant {id} failing ({occ}x) — {sig_entity}")
+            },
             evidence: vec![
-                ("verdict".into(), format!(
-                    "Invariant `{id}` has been failing for {sig_entity} across {occ} evaluations \
-                     and has not self-healed. Threshold to file: {min_occ}.",
-                )),
+                ("verdict".into(), verdict),
                 ("expected".into(), truncate(&expected, 500)),
                 ("observed".into(), truncate(&observed, 500)),
                 ("first_seen".into(), rl::local_when(first)),
@@ -1826,6 +1895,7 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
             owner: None,
             count: occ as u64,
             last_ts: last.max(now - 1.0),
+            parked_until,
         });
     }
     (out, suppressed)
@@ -1889,6 +1959,7 @@ pub fn detect_build(_conn: &Connection, now: f64, home: &std::path::Path) -> (Ve
             owner: None,
             count: failures as u64,
             last_ts: now,
+            parked_until: None,
         });
     }
 
@@ -2499,6 +2570,7 @@ pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppr
         owner: None,
         count: 1,
         last_ts: now,
+        parked_until: None,
     });
     (out, suppressed)
 }
@@ -2718,6 +2790,7 @@ pub fn detect_fd(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
         owner: None,
         count: 1,
         last_ts: now,
+        parked_until: None,
     });
     (out, suppressed)
 }
@@ -2927,6 +3000,7 @@ pub fn connector_findings_from_rollup(rollup: &serde_json::Value, now: f64) -> V
             owner: None,
             count: 1,
             last_ts: now,
+            parked_until: None,
         });
     }
     // Canary legs (AMUX-3430): the grant refreshes but a granted API answers
@@ -2965,6 +3039,7 @@ pub fn connector_findings_from_rollup(rollup: &serde_json::Value, now: f64) -> V
                 owner: None,
                 count: 1,
                 last_ts: now,
+                parked_until: None,
             });
         }
     }
@@ -3157,6 +3232,7 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             owner: None,
             count: count as u64,
             last_ts: newest.created_at,
+            parked_until: None,
         });
     }
 
@@ -3608,6 +3684,17 @@ pub async fn autofix_tick_with_ci(
                         })
                         .await;
                 }
+                if let Some(t) = f.parked_until {
+                    // WARN, not info: this is rare by construction, and the
+                    // failure it guards against is the counter going quiet.
+                    tracing::warn!(
+                        card = %card, signature = %f.signature, heals_at = t,
+                        "autofix filed a PARKED card — dwell window, no action closes it \
+                         before {} (AMUX-3645)",
+                        rl::local_when(t)
+                    );
+                    rep.parked.push((card.clone(), f.signature.clone(), rl::local_when(t)));
+                }
                 rep.filed.push((card, f.signature.clone()));
             }
             Ok(None) => rep.already_filed.push(f.signature.clone()),
@@ -3761,6 +3848,7 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
     let idem = idem_of(&signature);
     let kind_slug = f.kind.slug().to_string();
     let now_s = unix_now() as i64;
+    let parked_until = f.parked_until;
 
     // The new id has to come back OUT of the writer closure, which runs on the
     // single writer thread — so it cannot ride a thread_local, and widening
@@ -3781,7 +3869,20 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
             let new = bs::NewIssue {
                 title: title.clone(),
                 desc: desc.clone(),
-                status: "todo".into(),
+                // PARKED, NOT QUEUED (AMUX-3645). A dwell-window fault has no
+                // action that closes it before its clock runs out, so filing it
+                // `todo` hands a lane work it cannot do — and board_drive picks
+                // from `todo`, so the cost is a real pickup and a real
+                // investigation every time. `backlog` plus the non-empty
+                // `source_ref` set below is the shape the drive already reads as
+                // "parked on a live trigger" (board_drive.rs:1614): out of the
+                // untracked-work nag, out of rot, still on the board.
+                //
+                // Deliberately NOT `tripwire`. That type is for a card ARMED
+                // ahead of an event; this one is filed after the event, and its
+                // exit is a date rather than a firing. Retyping it would trade
+                // one gate that does not fit for another.
+                status: if parked_until.is_some() { "backlog".into() } else { "todo".into() },
                 session: owner.clone(),
                 item_type: item_type.into(),
                 creator: "autofix".into(),
@@ -3802,6 +3903,16 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                 "UPDATE issues SET source_ref = ?1 WHERE id = ?2",
                 rusqlite::params![format!("autofix:{signature}"), row.id],
             )?;
+            // Stamp the park (AMUX-3645). `last_verified_at` is what makes a
+            // trigger nobody re-checks DETECTABLE rather than a card sleeping
+            // forever — parking without it buys silence with no expiry, which
+            // is the failure the backlog convention exists to prevent.
+            if parked_until.is_some() {
+                conn.execute(
+                    "UPDATE issues SET last_verified_at = ?1 WHERE id = ?2",
+                    rusqlite::params![now_s, row.id],
+                )?;
+            }
             conn.execute(
                 "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -4175,6 +4286,14 @@ async fn debug_autofix(axum::extract::State(state): axum::extract::State<AppStat
                 .collect::<Vec<_>>(),
             "quiet_noted": r.quiet_noted.iter()
                 .map(|(c, w)| json!({"card": c, "what": w})).collect::<Vec<_>>(),
+            // AMUX-3645. A parked card is filed and then deliberately does
+            // nothing, so it is invisible to every other row here: it is not
+            // suppressed (it WAS filed), it is not quiet (its signature is
+            // live), and it raises no error. Named separately or the whole
+            // mechanism runs unobserved.
+            "parked": r.parked.iter()
+                .map(|(c, s, when)| json!({"card": c, "signature": s, "heals_at": when}))
+                .collect::<Vec<_>>(),
             "errors": r.errors,
         })),
         "note": "suppressed lists EVERY decision not to file, with its reason — a detector that \
@@ -5916,6 +6035,7 @@ mod tests {
             owner: None,
             count: 3,
             last_ts: now - 86_400.0,
+            parked_until: None,
         };
         let id = file_finding(&st, &f).await.unwrap().expect("card filed");
 
@@ -6382,7 +6502,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn inv_row(id: &str, entity: &str, occ: i64) -> InvRow {
-        (id.into(), entity.into(), "fail".into(), 1000.0, 2000.0, occ, "expected".into(), "observed".into())
+        (id.into(), entity.into(), "fail".into(), 1000.0, 2000.0, occ, "expected".into(), "observed".into(), String::new())
+    }
+
+    /// The same row with a DECLARED self-heal epoch, the shape a dwell-window
+    /// check produces (`InvariantResult::heals_at`, AMUX-3645).
+    fn inv_row_healing_at(id: &str, entity: &str, occ: i64, heals_at: f64) -> InvRow {
+        let mut r = inv_row(id, entity, occ);
+        r.8 = json!({"heals_at": heals_at}).to_string();
+        r
     }
 
     /// Drives `detect_invariants` through a real SQLite table, because the
@@ -6391,15 +6519,21 @@ mod tests {
     fn invariant_findings(rows: &[InvRow]) -> Vec<Finding> {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
+            // `evidence` mirrors the real schema (see the migration and
+            // store.rs's upsert). It carries a dwell check's declared heal
+            // epoch, which is what the filer reads to park a card instead of
+            // queueing it (AMUX-3645); a fixture without the column would make
+            // every dwell cell below unrunnable rather than red, which is the
+            // worse of the two failures.
             "CREATE TABLE _amux_invariant_incident (invariant_id TEXT, entity_key TEXT, \
              status TEXT, first_seen REAL, last_seen REAL, occurrences INTEGER, \
-             resolved_at REAL, expected TEXT, observed TEXT);",
+             resolved_at REAL, expected TEXT, observed TEXT, evidence TEXT);",
         )
         .unwrap();
         for r in rows {
             conn.execute(
-                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8)",
-                rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7],
+                "INSERT INTO _amux_invariant_incident VALUES (?1,?2,?3,?4,?5,?6,NULL,?7,?8,?9)",
+                rusqlite::params![r.0, r.1, r.2, r.3, r.4, r.5, r.6, r.7, r.8],
             )
             .unwrap();
         }
@@ -6436,6 +6570,98 @@ mod tests {
         let ev: String = f[0].evidence.iter().map(|(k, v)| format!("{k}{v}")).collect();
         assert!(ev.contains("GET /api/thing0") && ev.contains("GET /api/thing63"),
                 "every entity must still be named in the evidence");
+    }
+
+    /// AMUX-3645, rebuilt from AMUX-3640's own artifact.
+    ///
+    /// That card read "has been failing for panic-base+socd-...panic across
+    /// 5301 evaluations and has not self-healed". Both clauses are TRUE and
+    /// both read as a fault getting worse. It was a 7-day dwell window working
+    /// exactly as designed, and establishing that took reading checks.rs. The
+    /// discriminator the card could not express is the check's own declared
+    /// heal epoch.
+    ///
+    /// The specimen numbers are the real ones: `invariant_findings` evaluates
+    /// at now=9999, so a heal at 99999 is a live dwell.
+    #[test]
+    fn a_dwell_window_card_says_when_the_clock_runs_out_instead_of_how_bad_it_is() {
+        let rows = vec![inv_row_healing_at(
+            "host.no_fresh_kernel_panic",
+            "panic-base+socd-2026-08-19-210001.panic",
+            5301,
+            99_999.0,
+        )];
+        let f = invariant_findings(&rows);
+        assert_eq!(f.len(), 1);
+
+        // The park is what keeps a lane from being handed work it cannot do.
+        assert_eq!(f[0].parked_until, Some(99_999.0), "{:?}", f[0]);
+
+        let verdict: String =
+            f[0].evidence.iter().filter(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).collect();
+        assert!(verdict.contains("DWELL WINDOW"), "verdict must name the shape: {verdict}");
+        assert!(
+            !verdict.contains("has not self-healed"),
+            "the misleading clause from AMUX-3640 must be gone: {verdict}"
+        );
+        // The count survives as CONTEXT (the occurrences row still carries it)
+        // but must not be the headline, which is what made 5301 read as alarm.
+        assert!(
+            !f[0].title.contains("5301"),
+            "the dwell title must not wear the evaluation count as severity: {}",
+            f[0].title
+        );
+        assert!(
+            f[0].evidence.iter().any(|(k, v)| k == "occurrences" && v == "5301"),
+            "the count is still recorded, just not as the headline: {:?}",
+            f[0].evidence
+        );
+    }
+
+    /// The negative control, and the one that matters most: an ordinary
+    /// failure must be untouched. A change that parked EVERY invariant card
+    /// would pass the cell above and silently drain the board.
+    #[test]
+    fn an_ordinary_invariant_breach_is_not_parked() {
+        let f = invariant_findings(&[inv_row("some.invariant", "entity-a", 50)]);
+        assert_eq!(f[0].parked_until, None, "{:?}", f[0]);
+        let verdict: String =
+            f[0].evidence.iter().filter(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).collect();
+        assert!(verdict.contains("has not self-healed"), "{verdict}");
+        assert!(f[0].title.contains("(50x)"), "{}", f[0].title);
+    }
+
+    /// A heal epoch in the PAST is a fault, not a park — the loudest kind,
+    /// because the check declared it would be over by now and it is not.
+    /// Without this the filer would file "parked until <a date behind us>",
+    /// which is the exact shape of a card nobody ever picks up again.
+    #[test]
+    fn a_lapsed_heal_declaration_files_as_an_ordinary_fault() {
+        let f = invariant_findings(&[inv_row_healing_at(
+            "host.no_fresh_kernel_panic",
+            "old.panic",
+            5301,
+            1.0, // long before the fixture's now=9999
+        )]);
+        assert_eq!(f[0].parked_until, None, "a lapsed dwell must not park: {:?}", f[0]);
+        let verdict: String =
+            f[0].evidence.iter().filter(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).collect();
+        assert!(verdict.contains("has not self-healed"), "{verdict}");
+    }
+
+    /// Malformed evidence must degrade to the ordinary path, never panic and
+    /// never park. The column is free text written by whatever a check passed
+    /// to `.evidence()`, and a filer that unwrapped it would take the whole
+    /// autofix tick down on one bad row.
+    #[test]
+    fn unparseable_evidence_falls_back_to_an_ordinary_fault() {
+        let mut row = inv_row("some.invariant", "entity-a", 50);
+        row.8 = "{not json".into();
+        assert_eq!(invariant_findings(&[row])[0].parked_until, None);
+
+        let mut scalar = inv_row("some.invariant", "entity-b", 50);
+        scalar.8 = "42".into();
+        assert_eq!(invariant_findings(&[scalar])[0].parked_until, None);
     }
 
     #[test]

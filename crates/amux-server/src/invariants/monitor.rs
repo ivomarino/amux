@@ -781,7 +781,14 @@ fn kernel_panic_check() -> Vec<InvariantResult> {
             }
         }
     }
-    checks::no_fresh_kernel_panic(&files, window_s)
+    // Same `now` the ages above were measured against (AMUX-3645): the check
+    // derives its declared heal epoch as now - age + window, and a second
+    // clock read here would offset every one of them by the scan duration.
+    let now_epoch = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    checks::no_fresh_kernel_panic(&files, window_s, now_epoch)
 }
 
 /// AMUX-3489. The budget is env-tunable (AMUX_INVARIANT_RESULT_BUDGET) so a

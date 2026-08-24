@@ -1432,7 +1432,11 @@ pub fn host_memory_not_critical(
 /// the filename, so each panic is exactly one incident (the store's dedupe)
 /// and each HEALS when its file ages past the dwell window — stale files get
 /// an explicit entity-keyed pass, which is what resolves the incident row.
-pub fn no_fresh_kernel_panic(panics: &[(String, f64)], window_s: f64) -> Vec<InvariantResult> {
+pub fn no_fresh_kernel_panic(
+    panics: &[(String, f64)],
+    window_s: f64,
+    now: f64,
+) -> Vec<InvariantResult> {
     const ID: &str = "host.no_fresh_kernel_panic";
     if panics.is_empty() {
         return vec![InvariantResult::pass(ID)];
@@ -1456,6 +1460,18 @@ pub fn no_fresh_kernel_panic(panics: &[(String, f64)], window_s: f64) -> Vec<Inv
                 )
                 .entity(name.as_str())
                 .evidence(json!({"file": name, "age_h": age_s / 3600.0}))
+                // The dwell is the point, so SAY when it ends (AMUX-3645).
+                // Without this the auto-filed card reads "failing across N
+                // evaluations and has not self-healed", which is true and
+                // reads as an escalating fault; the honest reading is "held
+                // red on purpose until <date>, no action accelerates it".
+                // `now` is a PARAMETER, not a clock read in here. The ages in
+                // `panics` were measured against the caller's clock, and a
+                // second time source would disagree with them by however long
+                // the directory scan took. It also keeps this a pure function,
+                // so the cell below can assert an exact epoch rather than a
+                // tolerance around whatever the test machine's clock said.
+                .heals_at(now - age_s + window_s)
             } else {
                 InvariantResult::pass(ID).entity(name.as_str())
             }
@@ -3593,20 +3609,42 @@ mod negative_controls {
             2.7 * 86400.0,
         )];
 
-        let fresh = no_fresh_kernel_panic(&specimen, 7.0 * 86400.0);
+        // A FIXED clock, so the heal epoch below is an exact equality rather
+        // than a tolerance around whatever the test machine's clock said.
+        const NOW: f64 = 1_787_500_000.0;
+
+        let fresh = no_fresh_kernel_panic(&specimen, 7.0 * 86400.0, NOW);
         assert_eq!(fresh[0].status, Status::Fail, "{:?}", fresh[0]);
         assert_eq!(fresh[0].entity_key, "panic-base+socd-2026-08-19-210001.panic");
         assert!(fresh[0].observed.contains("AMUX-3396"), "{:?}", fresh[0].observed);
 
+        // AMUX-3645: the dwell is DECLARED, so a consumer can tell "held red on
+        // purpose until Tuesday" from "a fault that is getting worse". The
+        // artifact is 2.7d old inside a 7d window, so it ages out 4.3d from now.
+        let declared = crate::invariants::heals_at_of(&fresh[0].evidence)
+            .expect("a dwell-window failure must declare when it heals");
+        assert!(
+            (declared - (NOW + 4.3 * 86400.0)).abs() < 1.0,
+            "heal epoch is now - age + window: got {declared}, want {}",
+            NOW + 4.3 * 86400.0
+        );
+        // It must survive ALONGSIDE the diagnostic evidence, not replace it —
+        // trading the causal slice for the label would be the worse bargain.
+        assert_eq!(fresh[0].evidence["file"], "panic-base+socd-2026-08-19-210001.panic");
+
         // Past the window the SAME entity gets an explicit pass — that is
         // what resolves the incident row; a bare pass would leave it open
         // forever (the store resolves on matching (invariant, entity)).
-        let aged = no_fresh_kernel_panic(&specimen, 2.0 * 86400.0);
+        let aged = no_fresh_kernel_panic(&specimen, 2.0 * 86400.0, NOW);
         assert_eq!(aged[0].status, Status::Pass);
         assert_eq!(aged[0].entity_key, "panic-base+socd-2026-08-19-210001.panic");
+        // A PASS declares nothing: `heals_at` is a property of a live dwell,
+        // and leaving it on the healed result would park a card for a
+        // condition that is already gone.
+        assert_eq!(crate::invariants::heals_at_of(&aged[0].evidence), None, "{:?}", aged[0]);
 
         // No artifacts at all: a bare pass so the check reads alive.
-        assert_eq!(no_fresh_kernel_panic(&[], 7.0 * 86400.0)[0].status, Status::Pass);
+        assert_eq!(no_fresh_kernel_panic(&[], 7.0 * 86400.0, NOW)[0].status, Status::Pass);
     }
 
     /// The pressure check carries the kernel's verdict: only critical fails,
