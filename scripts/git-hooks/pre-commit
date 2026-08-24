@@ -240,7 +240,40 @@ if echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
   # Falls back to check where clippy is absent: a missing component must not
   # block commits, and check is what this gate did before.
   if cargo clippy --version >/dev/null 2>&1; then
-    cargo clippy --workspace --all-targets --quiet -- -D warnings
+    # WHOSE FAILURE IS IT? (AF-182)
+    #
+    # This lints the WORKSPACE, which is right — a denial in any file turns
+    # `clippy --workspace --all-targets` red for every lane on this shared
+    # checkout and queues a CI failure for whoever pushes next. But it lints the
+    # WORKING TREE, so another session's uncommitted work refuses YOUR commit,
+    # and clippy names their file and nothing names them.
+    #
+    # Hit twice in one hour on 2026-08-23: a transient checks.rs/monitor.rs
+    # window failed a peer's build, then 170 uncommitted lines in board_drive.rs
+    # refused a commit of two unrelated clean files. The diagnostic is TRUE about
+    # the repo and FALSE about the committer, and the output cannot say which was
+    # meant — a workspace-scoped fact in a session-scoped sentence (amux's
+    # phrasing). Both natural readings are wrong: "I broke this" and "this gate
+    # is noise".
+    #
+    # The dangerous one is not the wait. It is that the cheap wrong move is right
+    # there: fix the peer's file. That is how a session commits another session's
+    # half-finished work, which is the class the staged-guard above exists to
+    # prevent, reached from a direction the staged-guard cannot see.
+    #
+    # So: still refuse, always — a red workspace is a red workspace. But
+    # PARTITION the offenders, because the next action is completely different
+    # and the committer cannot work it out from clippy's output alone.
+    if ! _clippy_out=$(cargo clippy --workspace --all-targets --quiet -- -D warnings 2>&1); then
+      printf '%s\n' "$_clippy_out" >&2
+      # NEVER let the blame analysis change the verdict: it runs after the raw
+      # output, its failure is swallowed, and the exit is unconditional. A
+      # diagnostic aid that can suppress a refusal is a worse bug than the one
+      # it explains.
+      CLIPPY_OUT="$_clippy_out" STAGED="$STAGED" \
+        python3 "$ROOT/scripts/git-hooks/lint-blame.py" >&2 || true
+      exit 1
+    fi
     echo "cargo clippy passed (test targets + lints)."
   else
     echo "clippy not installed - falling back to cargo check (lints NOT enforced)" >&2
