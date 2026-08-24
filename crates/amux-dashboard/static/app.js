@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.716';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.717';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9083,16 +9083,30 @@ function _resolveOutputPath(p) {
   return base ? base + '/' + rel : rel;
 }
 
-// Click target for a path in session output: open the FILE BROWSER at it.
+// Click target for a path in session output: a FILE opens the file, a DIRECTORY
+// opens the file browser.
 //
-// The browser is a directory view, so a file path opens its containing folder —
-// you land looking at the file, in context, with the session's shortcuts loaded
-// and the "back to <session>" affordance wired up. A path with no extension in
-// its last segment is treated as a directory and opened directly.
+// SCOPE, because this is narrower than it looks and I got it wrong first.
+// ABSOLUTE paths never reach here: `ansiToHtml`'s own `linkChunk` matches
+// `/abs/x.py` and `./rel/x.py` and wires them straight to `openFilePreview`, and
+// `_linkifyPaths` skips what is already inside a tag. So absolute paths have
+// always opened the file. This handler serves what that regex cannot see — the
+// bare `customers/rothco/data/x.csv` a worker writes inside its own cwd — and
+// THAT branch sent every click to the browser instead. Same blue span, two
+// behaviours, decided by whether the path happened to start with a slash.
 //
-// Deliberately the browser rather than the file-preview overlay: peek output is
-// most often naming a file so you can go LOOK at it and what is around it, and
-// the browser is reachable from a preview while the reverse costs a round trip.
+// The old comment defended the browser as deliberate: "peek output is most often
+// naming a file so you can go LOOK at it and what is around it, and the browser
+// is reachable from a preview while the reverse costs a round trip."
+//
+// Ethan, 2026-08-24 (AMUX-3663, screenshot of these links): "make sure i can
+// click the links and they work / open the files."
+//
+// The half of that rationale worth keeping is "see what is around it", and the
+// comment was ALREADY claiming the way back existed. It did not: `#file-subpath`
+// was dim text with no handler (ethos rule 6 — a claim that justifies a design
+// and is not implemented). It is a real button now, so the round trip the
+// comment promised is one click and the folder is never more than that away.
 async function _openPathFromOutput(p) {
   if (window.getSelection && String(window.getSelection()) !== '') return;  // a drag-select is not a click
   let full = _resolveOutputPath(p);
@@ -9116,8 +9130,15 @@ async function _openPathFromOutput(p) {
   } catch (e) {}
   const lastSeg = full.slice(full.lastIndexOf('/') + 1);
   const looksLikeFile = /\.[A-Za-z0-9]{1,8}$/.test(lastSeg);
-  const dir = looksLikeFile ? (full.slice(0, full.lastIndexOf('/')) || '/') : full;
-  openExplore(dir, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
+  if (looksLikeFile) {
+    // No `:linenum` strip needed here: `_resolveOutputPath` already did it
+    // (and `_linkifyPaths` captures the suffix as a separate group, so `p`
+    // never carried one either). Said out loud so it does not get "fixed" back
+    // in as defensive noise.
+    openFilePreview(full);
+    return;
+  }
+  openExplore(full, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
 }
 
 // Turn file paths in ALREADY-ESCAPED peek HTML into links to the file browser.
@@ -14902,7 +14923,20 @@ async function openFilePreview(path) {
   document.getElementById('file-title').textContent = path.split('/').pop();
   // Title bar shows the file name plus the folder it lives in, like a file manager.
   const _subEl = document.getElementById('file-subpath');
-  if (_subEl) { const _dir = path.slice(0, path.lastIndexOf('/')) || '/'; _subEl.textContent = _dir; _subEl.title = path; }
+  if (_subEl) {
+    const _dir = path.slice(0, path.lastIndexOf('/')) || '/';
+    _subEl.textContent = _dir;
+    // THE WAY BACK TO THE FOLDER (AMUX-3663). Dim text with no handler until
+    // now, while `_openPathFromOutput`'s comment justified sending every file
+    // click to the browser on the grounds that "the browser is reachable from a
+    // preview". It was not reachable from anywhere. Now that a file link opens
+    // the FILE, this is the one click that restores the other half of that
+    // rationale: see what is around it.
+    _subEl.title = 'Open this folder in the file browser';
+    _subEl.classList.add('clickable');
+    _subEl.onclick = () => openExplore(_dir,
+      (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
+  }
   document.getElementById('file-body').className = 'file-overlay-body';
   document.getElementById('file-body').textContent = 'Loading...';
   document.getElementById('file-view-tabs').style.display = 'none';

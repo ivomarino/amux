@@ -895,6 +895,14 @@
   .file-title-wrap { flex: 1; min-width: 0; margin-right: 8px; display: flex; flex-direction: column; justify-content: center; overflow: hidden; }
   .file-overlay-header h2 { font-size: 1rem; margin: 0; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; line-height: 1.25; }
   .file-subpath { font-size: 0.68rem; color: var(--dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: 'SF Mono','Fira Code',monospace; }
+  /* The folder line is the way back to the file browser (AMUX-3663). It has to
+     LOOK clickable or it stays the dim label it has always been, and the
+     rationale for opening files directly depends on this being findable.
+     44px min-height is the mobile touch target; the rest of the row is short
+     text, so without it this is an ~11px tap on a phone. */
+  .file-subpath.clickable { cursor: pointer; text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 2px; }
+  .file-subpath.clickable:hover { color: var(--accent); }
+  @media (max-width: 600px) { .file-subpath.clickable { min-height: 44px; display: flex; align-items: center; } }
   /* Desktop: actions lay out inline in the header; the ⋮ menu button is mobile-only. */
   .file-actions { display: contents; }
   .file-menu-btn { display: none; background: none; border: none; color: var(--text); cursor: pointer; font-size: 1.25rem; line-height: 1; padding: 4px 8px; flex-shrink: 0; }
