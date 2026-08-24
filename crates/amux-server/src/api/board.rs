@@ -2865,7 +2865,60 @@ pub async fn patch_item(
             set_opt("epic", &mut next.epic, &mut changed); // AMUX-2992: assign/clear a card's epic
             set_opt("due", &mut next.due, &mut changed);
             set_opt("due_time", &mut next.due_time, &mut changed);
-            set_opt("source_ref", &mut next.source_ref, &mut changed);
+            // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
+            //
+            // `source_ref` has two owners. autofix stores its fault signature
+            // there (`autofix:<sig>`), and `open_card_for_fault` reads it to
+            // suppress a duplicate filing. `amux board backlog --trigger` also
+            // writes it — the external condition a parked card waits on — and
+            // that write is a plain overwrite.
+            //
+            // So parking an autofix card exactly as the board's own idle nudge
+            // prescribes DESTROYS the dedupe key, and the next tick files a
+            // duplicate of the card you just parked. Measured 2026-08-24 on
+            // AMUX-3651: parked with a trigger, AMUX-3685 filed minutes later
+            // for the same fault. The sanctioned instruction caused it, which
+            // is why a rule telling people to be careful would not help.
+            //
+            // NARROW ON PURPOSE: a trigger replacing another TRIGGER is normal
+            // and still allowed. Only an `autofix:` prefix is protected,
+            // because it is the only value with a second reader.
+            //
+            // The parked semantics survive untouched: board_drive tests that
+            // source_ref is NON-EMPTY (board_drive.rs:1677, :2422) and never
+            // reads the value, so the signature parks the card just as well as
+            // the trigger text did. What the trigger loses is a place to put
+            // its prose, and the card body is where a human reads it anyway —
+            // so it goes there rather than being dropped.
+            {
+                let incoming = body_str(&map, "source_ref");
+                let protected = next
+                    .source_ref
+                    .as_deref()
+                    .is_some_and(|cur| cur.starts_with("autofix:"));
+                match (incoming, protected) {
+                    (Some(t), true) if !t.starts_with("autofix:") => {
+                        tracing::warn!(
+                            card = %next.id, trigger = %t, kept = %next.source_ref.clone().unwrap_or_default(),
+                            "board: refused to overwrite an autofix signature with a trigger \
+                             (AMUX-3686) — the card stays parked and the dedupe key survives; \
+                             the condition is recorded in the card body"
+                        );
+                        // Not silent, and not lost: the reader of this card sees
+                        // the condition, which is the only consumer that ever
+                        // needed the TEXT.
+                        let note = format!(
+                            "\n\nPARKED ON: {t}\n(recorded here rather than in source_ref, which \
+                             holds this card's autofix dedupe signature — AMUX-3686)"
+                        );
+                        next.desc.push_str(&note);
+                        if !changed.iter().any(|c| c == "desc") {
+                            changed.push("desc".into());
+                        }
+                    }
+                    _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
+                }
+            }
             if let Some(ot) = body_str(&map, "owner_type") {
                 let ot = if ot == "agent" { "agent" } else { "human" }.to_string();
                 if ot != next.owner_type {

@@ -2384,3 +2384,105 @@ async fn the_contract_names_a_worker_scoped_gate_before_you_trip_it() {
         "only `done` was pinned — the other transitions are still the type's: {v1}"
     );
 }
+
+// ---- AMUX-3686: a --trigger must not eat an autofix dedupe signature -------
+//
+// `source_ref` has two owners. autofix stores its fault signature there and
+// `open_card_for_fault` reads it to suppress a duplicate filing; `amux board
+// backlog --trigger` writes the external condition a parked card waits on, as
+// a plain overwrite.
+//
+// So parking an autofix card exactly as the board's own idle nudge prescribes
+// destroyed the dedupe key. Measured 2026-08-24: AMUX-3651 parked with a
+// trigger, AMUX-3685 filed minutes later for the same fault. The sanctioned
+// instruction is what caused it.
+//
+// Driven through the REAL router and a real PATCH, not a pure helper, because
+// the decision lives in the handler and a helper test would pin the property
+// one layer above where the defect enters.
+#[tokio::test]
+async fn a_trigger_cannot_overwrite_an_autofix_signature_but_can_replace_a_trigger() {
+    let (app, _dir) = app();
+
+    let (_s, _h, created) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title": "autofix card", "status": "todo", "session": "amux"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    let id = created["id"].as_str().unwrap().to_string();
+
+    // autofix stamps its signature, exactly as file_finding does.
+    let sig = "autofix:latency|outlier|ROLLUP|/api/board,/api/sessions";
+    let (st, _h, _b) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"source_ref": sig})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success(), "autofix must be able to stamp its signature");
+
+    // THE SPECIMEN: park it with a trigger, as the idle nudge prescribes.
+    let trigger = "560d40ba adopted by the running server";
+    let (st, _h, body) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"status": "backlog", "source_ref": trigger, "gate_ack": true})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    assert!(st.is_success(), "parking must still succeed: {body}");
+
+    let (_s, _h, card) = send_with(&app, "GET", &format!("/api/board/{id}"), None, &[]).await;
+    // 1. The dedupe key SURVIVES.
+    assert_eq!(
+        card["source_ref"].as_str().unwrap_or(""),
+        sig,
+        "a trigger must not overwrite an autofix signature"
+    );
+    // 2. And the card is still PARKED — the property --trigger exists for. A
+    //    fix that only preserved the dedupe would break this, which is why both
+    //    are asserted.
+    assert_eq!(card["status"].as_str().unwrap_or(""), "backlog");
+    // 3. The condition is not LOST: it goes where a human reads it.
+    assert!(
+        card["desc"].as_str().unwrap_or("").contains(trigger),
+        "the parked-on condition must be recorded, not dropped: {}",
+        card["desc"]
+    );
+
+    // CONTROL: a trigger replacing another TRIGGER is normal and must still
+    // work — only `autofix:` is protected. Narrowing this wrongly would freeze
+    // every parked card's condition at its first value.
+    let (_s, _h, plain) = send_with(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title": "hand-parked", "status": "todo", "session": "amux"})),
+        &[("X-Amux-Session", "amux")],
+    )
+    .await;
+    let pid = plain["id"].as_str().unwrap().to_string();
+    for cond in ["waiting on vendor", "waiting on the deploy"] {
+        let (st, _h, _b) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{pid}"),
+            Some(json!({"source_ref": cond})),
+            &[("X-Amux-Session", "amux")],
+        )
+        .await;
+        assert!(st.is_success());
+    }
+    let (_s, _h, pcard) = send_with(&app, "GET", &format!("/api/board/{pid}"), None, &[]).await;
+    assert_eq!(
+        pcard["source_ref"].as_str().unwrap_or(""),
+        "waiting on the deploy",
+        "a trigger replacing a trigger must still work"
+    );
+}
