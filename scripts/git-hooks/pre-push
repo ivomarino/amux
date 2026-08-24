@@ -21,6 +21,17 @@ import datetime, json, os, ssl, subprocess, sys, urllib.parse, urllib.request
 ZERO = "0" * 40
 
 
+# The blocking-run probe's budget. It was 3s, which is UNDER what this host
+# delivers: `GET /api/sessions` measured 1.60s with the machine unloaded, and
+# this box runs at load ~37 on 28 cores because the fleet compiles and tests
+# this very server continuously (AMUX-3646). So the probe timed out during a
+# real push today and the guard silently fell back to its trailer-only
+# message. A probe whose budget sits below the normal latency of the thing it
+# probes reports "unreachable" about a healthy server, and the degradation is
+# invisible because the fallback text looks like an answer.
+_API_TIMEOUT_S = float(os.environ.get("AMUX_PUSH_GUARD_API_TIMEOUT_S", "8"))
+
+
 def _session_is_isolated(name):
     """Is `name` an ISOLATED raw-agent worker — one the harness will not let a
     peer send to, so its consent CANNOT be obtained?
@@ -608,6 +619,7 @@ def main():
         _bottom = ordered[-1] if ordered else None
         if _bottom and _bottom[1] != sess:
             _bown = _bottom[1] or "(no Amux-Session trailer)"
+            _bsha_hint = _bottom[0]
             _brun = 0
             for _sha2, _who2 in reversed(ordered):
                 if (_who2 or "(no Amux-Session trailer)") != _bown:
@@ -649,14 +661,33 @@ def main():
                         # fallback pointing at it re-teaches the dead port to
                         # every checkout that lacks AMUX_URL.
                         (os.environ.get("AMUX_URL") or "https://localhost:8824")
-                        + "/api/sessions", context=_ctx, timeout=3).read())
+                        + "/api/sessions", context=_ctx, timeout=_API_TIMEOUT_S).read())
                     _hit = next((r for r in _rows if r.get("name") == _bown), None)
                     _bstat = ("not a session on this machine" if _hit is None
                               else "%s%s" % (_hit.get("status") or "stopped",
                                              "" if _hit.get("running") else " (not running)"))
                 except Exception:
                     _api_ok = False
-                if not _api_ok:
+                if _session_is_isolated(_bown):
+                    # THE FOOTER IS THE LAST THING READ, AND IT WAS STILL WRONG
+                    # (AF-206, found by running the guard against the real stuck
+                    # range instead of only its fixtures). The block above now
+                    # routes an isolated author to `:owner`, and then this
+                    # footer told the same reader to "ask that lane to push its
+                    # own commits, or AMUX_ALLOW_FOREIGN=1" — the two exits that
+                    # are respectively unaskable and consent-from-nobody. Last
+                    # position, wrong instruction.
+                    #
+                    # It also short-circuits the API probe, which is the point:
+                    # for an isolated lane the answer does not depend on whether
+                    # it is live. It cannot be nudged either way.
+                    w("  BLOCKING RUN: the %d commit(s) at the bottom belong to %s, which is\n"
+                      "  ISOLATED and cannot be asked or nudged — its live status does not\n"
+                      "  matter here. Selective pushes cannot drain past them. The exit is the\n"
+                      "  owner grant named above, not the blanket override:\n"
+                      "      AMUX_FOREIGN_CONSENT=\"...%s:%s:owner\" git push ...\n"
+                      % (_brun, _bown, _bsha_hint, _bown))
+                elif not _api_ok:
                     # AH-91: the API was unreachable, so the blocker's LIVE status
                     # is unknown — but the OWNER is not: it came from the
                     # Amux-Session trailer in the commit (_bown). The old fallback
