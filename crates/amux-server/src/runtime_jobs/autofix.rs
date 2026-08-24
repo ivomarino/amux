@@ -177,6 +177,29 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // (the per-call reqwest timeout is 30s), so an outlier past the budget
     // still means what an outlier should: something hung, not something big.
     ("/api/email/inbox", 30_000.0),
+    // GET /api/email/search (AMUX-3690). THE ARGUMENT IS NOT "it is also slow",
+    // it is that this route and the one above are the SAME CODE: both call
+    // `email::inbox_messages`, so both inherit its 8-wide concurrency, its
+    // batch-above-20 path, and its Gmail quota bound. `search` additionally fans
+    // out across every connected account concurrently when no `account=` is
+    // given, and `join_all` waits for the slowest, so a wide query pays the
+    // worst account's latency. The filed row was `q=primis&days=120` with no
+    // account: three mailboxes, 120 days, 10.076s.
+    //
+    // Measured over 7 days: 3226 requests, min 131ms, mean 657ms, worst 11.35s,
+    // and exactly TWO past the 10s floor. 30s is ~2.7x the measured worst, the
+    // same ratio /api/board/commit-mentions uses below for the same reason, and
+    // it keeps the property that makes these budgets mean something: the
+    // per-call reqwest timeout is 30s, so a single wedged transport call alone
+    // blows the budget. Past it still means something HUNG, not something big.
+    //
+    // WHAT THIS TABLE CANNOT EXPRESS, said out loud rather than worked around:
+    // the budget is keyed on the PATH and the cost lives in a shared function.
+    // `inbox` got a row after filing three times in one day and `search` got one
+    // after filing once, and there is no mechanism that would have given either
+    // a budget in advance. The next route to call `inbox_messages` will file too,
+    // for a duration that was designed in before it existed.
+    ("/api/email/search", 30_000.0),
     // POST /api/alert/owner (AMUX-3522, third filing on one mechanism): while
     // the Messages Automation permission stays missing (MI-4933), the
     // iMessage breaker re-probes once per 15-min cooldown and that probe IS
@@ -6397,6 +6420,53 @@ mod tests {
         assert!(
             f2.iter().any(|x| x.signature.contains("/api/files/mdai/run")),
             "past the design budget the endpoint's own timeout failed — that must file: {f2:?}"
+        );
+    }
+
+    /// AMUX-3690: the two Gmail-backed routes share a budget because they share
+    /// an implementation.
+    ///
+    /// `/api/email/search` and `/api/email/inbox` both call
+    /// `email::inbox_messages`, so both inherit its 8-wide concurrency, its
+    /// batch-above-20 path and its Gmail quota bound. `inbox` had a 30s budget
+    /// since AMUX-3519; `search` did not, and filed at 10.076s on
+    /// `q=primis&days=120` with no account, which fans out across three
+    /// mailboxes concurrently and waits for the slowest.
+    ///
+    /// THE SPECIMEN IS THE FIXTURE: 10_076ms is the filed row, and 11_350ms is
+    /// the worst of 3226 requests over seven days. Both must be silent, and the
+    /// second is the one that matters — a budget that only covers the reported
+    /// number leaves the next legitimate run to file.
+    ///
+    /// The past-budget cell is not decoration. 30s is the per-call reqwest
+    /// timeout, so past it the number cannot be a big-but-legitimate fetch; it
+    /// is a hung transport, and that is the one latency story on this route that
+    /// is genuinely wrong.
+    #[tokio::test]
+    async fn the_gmail_backed_routes_share_a_budget_because_they_share_an_implementation() {
+        let (st, _d) = state();
+        let now = unix_now();
+        for (path, ms) in [
+            ("/api/email/search", 10_076.0), // the filed row
+            ("/api/email/search", 11_350.0), // worst of 3226 over 7 days
+            ("/api/email/inbox", 14_105.0),  // the 4-hourly count=600 tick
+        ] {
+            log_row(&st, Row { ts: now - 500.0, method: "GET", path, family: "/api/email", status: 200, body: "", worker: "", ua: "curl/8", ms });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/email/")),
+            "a quota-bound Gmail fetch inside its 30s budget is designed behavior, on BOTH \
+             routes — filing per legitimate call is the threshold-below-baseline defect the \
+             LONG_BY_DESIGN table exists for: {f:?}"
+        );
+
+        log_row(&st, Row { ts: now - 100.0, method: "GET", path: "/api/email/search", family: "/api/email", status: 200, body: "", worker: "", ua: "curl/8", ms: 45_000.0 });
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/email/search")),
+            "past 30s the per-call transport timeout should already have fired, so this is a \
+             hang and must still file: {f2:?}"
         );
     }
 
