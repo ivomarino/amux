@@ -213,7 +213,15 @@ async fn get_contract(
         "how_to_ack": {
             "cli": "amux board <status> <id> --checked \"criterion 1\" \"criterion 2\"",
             "api": "PATCH /api/board/<id> with gate_checked: [\"criterion 1\", ...] or gate_ack: true",
-            "wrong_type": "If the item has no code, set its type first — the gate is DERIVED from the type.",
+            // NAME THE FIELD AND THE COMMAND, not just the intent (AMUX-3590).
+            // This said "set its type first" and stopped there, so a reader
+            // knows WHAT to do and not HOW — and the writable field is `type`
+            // while the gate refusal body displays the key as `item_type`. A
+            // PATCH of `item_type` is ignored (honestly, via `ignored_fields`,
+            // but a caller has to read the body to find out). Six cards were
+            // filed mistyped in one night by guessing the field name at CREATE,
+            // where no refusal exists to correct you.
+            "wrong_type": "If the item has no code, set its type first — the gate is DERIVED                            from the type. CLI: `amux board type <id> <type>`. API: PATCH                            /api/board/<id> with {\"type\": \"investigation\"} — the field is                            `type`, NOT `item_type` (that one is ignored and reported in                            `ignored_fields`). Settable at creation too: POST /api/board with                            {\"title\": ..., \"type\": ...}.",
         },
         // AMUX-2933 (ts-gke). The list filters WORK and were documented
         // NOWHERE — "discoverable only by guessing", and the cap was worse than
