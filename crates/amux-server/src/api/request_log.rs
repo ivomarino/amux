@@ -1599,18 +1599,35 @@ async fn analyze(
                             .map(|(l, c)| json!({ "value": l, "count": c }))
                             .collect::<Vec<_>>());
                         v["distinct_param_literals"] = json!(g.param_literals.len());
-                        // One literal carrying most of a multi-hit group is a
-                        // caller pointing at a path that does not exist. The
+                        // One literal carrying most of a multi-hit group means a
+                        // caller is hammering a value that never resolves. The
                         // floor is there because 2-of-2 proves nothing.
+                        //
+                        // The verdict deliberately does NOT pick between the two
+                        // causes. The first draft asserted "a path that is not
+                        // mounted", which was true of the specimen that motivated
+                        // it (`/api/board/gate`) and WRONG about three of the
+                        // four groups it flagged on first run: `ollama-ui-e2e`
+                        // 7135x and `amax-gtm` 686x are a dead session and a typo
+                        // of `amux-gtm`, where the path shape is right and the
+                        // RESOURCE is absent. Both are real bugs worth the alarm
+                        // — a 686-times misspelling is exactly what this should
+                        // surface — but an instrument that names a cause
+                        // confidently gets believed, and naming the wrong one
+                        // sends the reader to check the route table for a typo.
+                        // State the observation, offer both readings, name the
+                        // endpoint that decides.
                         if g.count >= 5 && *n * 2 > g.count && g.param_literals.len() > 1 {
-                            v["likely_route_collision"] = json!(true);
+                            v["dominant_param_literal"] = json!(top);
                             verdicts.push(format!(
                                 "404 {} {}: {} of {} used the SAME literal '{}' where the route \
-                                 declares a parameter. That is a caller asking for a path that is \
-                                 not mounted — the param route matches it, so the request reaches \
-                                 the wrong handler and 404s there. Check whether '{}' was meant to \
-                                 be its own route.",
-                                g.method, target, n, g.count, top, top
+                                 declares a parameter — one caller hammering one value that never \
+                                 resolves, not records going missing one at a time. Two causes fit \
+                                 and the fix differs: '{}' was meant to be its OWN ROUTE and the \
+                                 param route is swallowing it, or '{}' is a RESOURCE that does not \
+                                 exist (a typo, or a reference to something deleted). \
+                                 `/api/debug/routes` settles which.",
+                                g.method, target, n, g.count, top, top, top
                             ));
                         }
                     }
