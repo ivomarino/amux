@@ -6,7 +6,7 @@
 //! the only place that touches the world.
 
 use std::collections::BTreeSet;
-use super::{checks, store, Confidence, InvariantResult};
+use super::{checks, store, Confidence, InvariantResult, Status};
 use crate::api::AppState;
 use serde_json::json;
 
@@ -177,6 +177,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // already done or verified. The ledger and the cards were two stores of one
     // fact with nothing between them.
     out.extend(frustration_ledger_check(state));
+    out.extend(schedule_kind_check(state));
 
     // -- 6e. is the invariant system's OWN evaluation log bounded? (AMUX-3489:
     // 8M rows / ~2GB from a flat 7-day retention on ~13 green rows/sec — the
@@ -301,6 +302,47 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
 /// Reading the launcher's own function is the point — the check cannot disagree
 /// with what the launcher runs. Pure over the static registry + launch table, so
 /// its negative control drives it with plain rows and needs no live fleet.
+/// AF-216: read enabled schedules and hand (title, kind) to the pure check.
+///
+/// `deleted` and `enabled` are filtered HERE rather than in the check, because a
+/// disabled or deleted schedule costs nothing per fire — it does not fire. The
+/// claim under test is about what a LIVE schedule spends.
+fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
+    let Ok(conn) = state.store.read() else {
+        // Cannot read: Unknown, never Pass. A store we could not open is not a
+        // store with nothing wrong in it.
+        return vec![InvariantResult::new(
+            "schedules.cost_title_matches_kind",
+            Status::Unknown,
+        )];
+    };
+    let rows: Vec<checks::ScheduleKindRow> = conn
+        .prepare(
+            "SELECT id, COALESCE(title,''), COALESCE(kind,'tmux'), COALESCE(session,'') \
+             FROM schedules WHERE enabled=1 AND COALESCE(deleted,0)=0",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| {
+                Ok(checks::ScheduleKindRow {
+                    id: r.get::<_, String>(0)?,
+                    title: r.get::<_, String>(1)?,
+                    kind: r.get::<_, String>(2)?,
+                    session: r.get::<_, String>(3)?,
+                })
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        // No enabled schedules at all is not evidence that none are mislabelled.
+        return vec![InvariantResult::new(
+            "schedules.cost_title_matches_kind",
+            Status::Unknown,
+        )];
+    }
+    checks::schedule_cost_titles_match_kind(&rows)
+}
+
 fn provider_launch_check() -> Vec<InvariantResult> {
     use crate::provider::PromptMode;
     let reg = crate::provider::default_registry();

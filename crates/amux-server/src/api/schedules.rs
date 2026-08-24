@@ -517,7 +517,23 @@ pub async fn create(
     m.insert("title".into(), json!(title));
     m.insert("session".into(), json!(body.session.clone().unwrap_or_default()));
     m.insert("command".into(), json!(body.command.clone().unwrap_or_default()));
-    m.insert("kind".into(), json!(body.kind.clone().unwrap_or_else(|| "tmux".into())));
+    // KIND DEFAULTS TO `tmux`, WHICH IS THE EXPENSIVE ONE, AND THE CALLER IS NOW
+    // TOLD (AF-216). `tmux` delivers the command to a lane as a PROMPT and wakes a
+    // full turn-loop; `shell` runs it directly and costs nothing.
+    //
+    // Measured 2026-08-24: 53 enabled schedules, 50 `tmux` and 3 `shell`, while
+    // "a schedule fired" cost $1,330 across 2,602 turns in 24h — 214 declared
+    // fires/day, so ~12 turns and ~$6.20 PER FIRE. The mechanism to avoid that
+    // works and reaches 3 of 53, which is ethos rule 1 and the mcp.json shape.
+    //
+    // NOT AUTO-SWITCHED, deliberately. A command that LOOKS like shell can still
+    // need a lane — it may expect the worker's cwd, its env, or its agent. Silently
+    // running such a schedule headless would break it in a way nobody would trace
+    // back to here. So the default is unchanged and the response says what was
+    // picked and how to change it: the caller decides, having been told.
+    let kind = body.kind.clone().unwrap_or_else(|| "tmux".into());
+    let kind_defaulted = body.kind.is_none();
+    m.insert("kind".into(), json!(kind));
     m.insert("sched_type".into(), json!(sched_type));
     m.insert("recurrence".into(), body.recurrence.clone().map(Value::from).unwrap_or(Value::Null));
     m.insert("run_at".into(), json!(run_at));
@@ -575,7 +591,21 @@ pub async fn create(
         .await;
     match write {
         Ok(_) => {
-            let body = slot.lock().expect("slot").take().unwrap_or(Value::Null);
+            let mut body = slot.lock().expect("slot").take().unwrap_or(Value::Null);
+            // Say it in the RESPONSE, not only in the docs. A caller who never
+            // passed `kind` has no reason to know there was a choice, and the
+            // scheduler section of CLAUDE.md did not list the field either — so
+            // the expensive default was unanimous and uninformed.
+            if kind_defaulted {
+                if let Value::Object(o) = &mut body {
+                    o.insert(
+                        "kind_note".into(),
+                        json!(
+                            "kind defaulted to 'tmux': this command is delivered to the                              session as a PROMPT and wakes a full model turn on every fire                              (~$6/fire measured 2026-08-24). If it is a self-contained                              command that needs no agent, pass kind:'shell' and it runs                              directly for nothing. AF-216."
+                        ),
+                    );
+                }
+            }
             (StatusCode::CREATED, Json(body)).into_response()
         }
         Err(e) => internal(e),

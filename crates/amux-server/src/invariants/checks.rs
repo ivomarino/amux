@@ -3814,3 +3814,130 @@ mod negative_controls {
         assert_eq!(before, names.len(), "a column is declared twice");
     }
 }
+
+/// A schedule whose TITLE claims a cost property its `kind` contradicts (AF-216).
+#[derive(Debug, Clone)]
+pub struct ScheduleKindRow {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub session: String,
+}
+
+/// Titles that assert the schedule costs no model tokens. Kept as a list rather
+/// than one string because the claim is what matters, not the spelling.
+const ZERO_COST_CLAIMS: &[&str] = &["zero-token", "zero token", "no-token", "tokenless"];
+
+/// `kind: shell` runs the command directly. `kind: tmux` delivers it to a lane as
+/// a PROMPT and wakes a full model turn — measured 2026-08-24 at ~$6.20 per fire
+/// (2,602 schedule-caused turns against 214 declared fires/day).
+///
+/// So a schedule TITLED "zero-token" while running as `tmux` is not a naming
+/// nitpick: it is a row asserting a cost property the row itself contradicts, and
+/// it defeats exactly the audit someone would run to find this class. Both
+/// specimens found on 2026-08-24 already had pure-shell commands
+/// (`cd ~/Dev/... && ./tick_runner.sh opps`), so each was ONE FIELD from being
+/// true, and their titles are why nobody looked.
+///
+/// FAILS TODAY, on purpose: 2 enabled rows. An invariant that goes green on the
+/// day it ships has not been shown to discriminate — this one names its specimens
+/// and can be watched to zero.
+pub fn schedule_cost_titles_match_kind(rows: &[ScheduleKindRow]) -> Vec<InvariantResult> {
+    const ID: &str = "schedules.cost_title_matches_kind";
+    let claims_free = |t: &str| {
+        let low = t.to_lowercase();
+        ZERO_COST_CLAIMS.iter().any(|c| low.contains(c))
+    };
+    let liars: Vec<&ScheduleKindRow> = rows
+        .iter()
+        .filter(|r| claims_free(&r.title) && r.kind != "shell")
+        .collect();
+    if liars.is_empty() {
+        return vec![InvariantResult::pass(ID)];
+    }
+    liars
+        .iter()
+        .map(|r| {
+            let mut out = InvariantResult::new(ID, Status::Fail);
+            // Per-schedule entity_key: two mislabelled rows are two incidents,
+            // and one being corrected must not close the other's.
+            out.entity_key = r.id.clone();
+            out.expected = format!("schedule {} titled zero-cost runs as kind='shell'", r.id);
+            out.observed = format!("kind='{}' — every fire wakes a lane and costs a model turn", r.kind);
+            out.evidence = serde_json::json!({
+                "id": r.id,
+                "title": r.title,
+                "kind": r.kind,
+                "session": r.session,
+                "remedy": "PATCH /api/schedules/<id> {\"kind\":\"shell\"} if the command is \
+                           self-contained, or retitle it — a title asserting a cost property \
+                           the row contradicts is worse than no title",
+            });
+            out
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod schedule_kind_tests {
+    use super::*;
+
+    fn row(id: &str, title: &str, kind: &str) -> ScheduleKindRow {
+        ScheduleKindRow {
+            id: id.into(),
+            title: title.into(),
+            kind: kind.into(),
+            session: "gtm-ticker".into(),
+        }
+    }
+
+    /// The real specimens, verbatim from the board on 2026-08-24.
+    #[test]
+    fn a_zero_token_title_running_as_tmux_is_named() {
+        let rows = vec![
+            row("SCHED-1", "Opps tick: booked meetings -> Lightfield (zero-token, GT-62)", "tmux"),
+            row("SCHED-2", "rb2b inbound tick: sink -> Lightfield, zero-token (playbook 05)", "tmux"),
+        ];
+        let out = schedule_cost_titles_match_kind(&rows);
+        assert_eq!(out.len(), 2, "two mislabelled rows are TWO incidents, not one");
+        assert!(out.iter().all(|r| r.status == Status::Fail));
+        // entity_key must be per-schedule, or correcting one closes the other's incident.
+        let keys: Vec<&str> = out.iter().map(|r| r.entity_key.as_str()).collect();
+        assert_eq!(keys, vec!["SCHED-1", "SCHED-2"]);
+        assert!(out[0].observed.contains("tmux"));
+    }
+
+    /// NEGATIVE CONTROL 1: the claim is TRUE. A check that failed here would be
+    /// telling every correctly-configured schedule it is wrong.
+    #[test]
+    fn a_zero_token_title_running_as_shell_passes() {
+        let rows = vec![row("SCHED-3", "Opps tick (zero-token, GT-62)", "shell")];
+        let out = schedule_cost_titles_match_kind(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass);
+    }
+
+    /// NEGATIVE CONTROL 2: `tmux` is the CORRECT kind for most schedules — the
+    /// defect is the contradiction, not the kind. Without this cell, a check that
+    /// simply flagged every `tmux` row would pass the first cell perfectly and
+    /// fail 50 innocent schedules in production.
+    #[test]
+    fn an_ordinary_tmux_schedule_making_no_cost_claim_passes() {
+        let rows = vec![
+            row("SCHED-4", "MVS reliability/uptime — closed-loop health", "tmux"),
+            row("SCHED-5", "TS P0-P2 driver", "tmux"),
+        ];
+        let out = schedule_cost_titles_match_kind(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass, "a tmux schedule that claims nothing is fine");
+    }
+
+    /// The claim is matched on MEANING, not one spelling, and case-insensitively.
+    #[test]
+    fn the_claim_is_matched_in_its_other_spellings() {
+        for t in ["Nightly sweep (Zero-Token)", "tokenless tick", "no-token relay"] {
+            let out = schedule_cost_titles_match_kind(&[row("S", t, "tmux")]);
+            assert_eq!(out[0].status, Status::Fail, "{t} asserts zero cost and runs as tmux");
+        }
+    }
+}
