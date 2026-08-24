@@ -269,5 +269,75 @@ else
   sed 's/^/       /' "$TMP/out"
 fi
 
+# ── L. AC-227: a commit ALREADY UPSTREAM under a different sha ──────────────
+# The reported bug. A cherry-pick / rebase / replay produces a new object with
+# the SAME diff, so it sits in the foreign range permanently and no sha
+# comparison can see it. amux-cloud's push was blocked and they asked a peer for
+# consent the peer did not need to give. Only the diff answers this, which is
+# what patch-id is for; `acdbfdf` and `9ebc42c` in this repo still share
+# patch-id dff284cf093aecaa today.
+L="$TMP/l"; mkrepo "$L"
+commit_as "$L" "other-lane" "theirs-upstream"
+git -C "$L/work" push -q origin main
+THEIRS=$(git -C "$L/work" rev-parse HEAD)
+git -C "$L/work" checkout -q -b feat HEAD~1
+# -x, not a bare cherry-pick: replaying a commit onto its OWN parent reproduces
+# the identical object (same tree, same parent, same message, same second), so
+# the fixture had no distinct sha to detect and "passed" against a branch with
+# no foreign commit on it at all. -x appends a provenance line to the MESSAGE,
+# which changes the sha and leaves the diff untouched. Confirmed by hand before
+# trusting it: the first version printed a foreign range of one commit, mine.
+git -C "$L/work" cherry-pick -x "$THEIRS" >/dev/null
+commit_as "$L" "mine" "mine-one"
+LTIP=$(git -C "$L/work" rev-parse feat)
+rc=$(run_hook "$L" "$LTIP" "$ZERO" feat)
+if [ "$rc" -eq 0 ] && grep -q "ALREADY UPSTREAM" "$TMP/out"; then
+  ok "L: a replayed commit already on origin is not foreign (AC-227)"
+else
+  bad "L: a cherry-pick of an upstream commit still blocks the push (AC-227 live)"
+  sed 's/^/       /' "$TMP/out"
+fi
+
+# ── M. THE CONTROL for L. Same shape, but the patch is NOT upstream. ─────────
+# Without this, a "fix" that cleared every foreign commit would pass L
+# perfectly. Case B covers the plain range; this one proves the DUPLICATE path
+# specifically does not fire on a diff origin has never seen.
+M="$TMP/m"; mkrepo "$M"
+git -C "$M/work" checkout -q -b feat
+commit_as "$M" "other-lane" "theirs-never-pushed"
+commit_as "$M" "mine" "mine-one"
+MTIP=$(git -C "$M/work" rev-parse feat)
+rc=$(run_hook "$M" "$MTIP" "$ZERO" feat)
+if [ "$rc" -ne 0 ] && ! grep -q "ALREADY UPSTREAM" "$TMP/out"; then
+  ok "M: a foreign commit origin has never seen is still REFUSED"
+else
+  bad "M: the duplicate check cleared a commit that is not upstream — hollowed out"
+  sed 's/^/       /' "$TMP/out"
+fi
+
+# ── N. REVERT SAFETY, the inverse hazard AC-227's own entry names ───────────
+# "the dangerous direction is the inverse — a session assuming a familiar-looking
+# commit is last week's duplicate and shipping something genuinely unreviewed."
+# If the patch was applied upstream and then REVERTED there, re-applying it
+# ships something real. A revert's diff is the reverse of the original, so its
+# patch-id equals the candidate's REVERSE patch-id: both directions present
+# means the net state is ambiguous and the commit must stay foreign.
+N="$TMP/n"; mkrepo "$N"
+commit_as "$N" "other-lane" "theirs-upstream"
+NTHEIRS=$(git -C "$N/work" rev-parse HEAD)
+git -C "$N/work" revert --no-edit "$NTHEIRS" >/dev/null
+git -C "$N/work" push -q origin main
+git -C "$N/work" checkout -q -b feat "$NTHEIRS~1"
+git -C "$N/work" cherry-pick -x "$NTHEIRS" >/dev/null
+commit_as "$N" "mine" "mine-one"
+NTIP=$(git -C "$N/work" rev-parse feat)
+rc=$(run_hook "$N" "$NTIP" "$ZERO" feat)
+if [ "$rc" -ne 0 ] && ! grep -q "ALREADY UPSTREAM" "$TMP/out"; then
+  ok "N: a patch applied AND reverted upstream is NOT cleared (re-applying ships work)"
+else
+  bad "N: a reverted-upstream patch was waved through as a duplicate"
+  sed 's/^/       /' "$TMP/out"
+fi
+
 echo "push-guard range: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

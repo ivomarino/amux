@@ -58,6 +58,94 @@ def _session_is_isolated(name):
     return False
 
 
+def _patch_ids(argv, timeout=25):
+    """`git <argv> | git patch-id --stable` -> {patch_id: sha}.
+
+    Returns None (not {}) when the pipeline could not run, because an empty map
+    and a failed map lead to opposite decisions here: empty means "no upstream
+    twin, keep blocking", failed means "I do not know". Collapsing them is the
+    unwrap_or_default shape the invariants module exists to catch.
+    """
+    try:
+        diff = subprocess.run(["git"] + argv, capture_output=True, text=True,
+                              timeout=timeout)
+        if diff.returncode != 0:
+            return None
+        pid = subprocess.run(["git", "patch-id", "--stable"], input=diff.stdout,
+                             capture_output=True, text=True, timeout=timeout)
+        if pid.returncode != 0:
+            return None
+    except Exception:
+        return None
+    out = {}
+    for row in pid.stdout.splitlines():
+        bits = row.split()
+        if len(bits) >= 2:
+            out.setdefault(bits[0], bits[1])
+    return out
+
+
+def _upstream_duplicates(shas, limit):
+    """Which of `shas` are ALREADY UPSTREAM under a different sha? (AC-227)
+
+    THE BUG THIS FIXES. CLAUDE.md's pre-push recipe lists `origin/main..main`
+    and says to ask the author about any foreign commit. A commit already
+    upstream under a DIFFERENT sha — cherry-pick, rebase, replay — sits in that
+    range permanently, so the guard blocked amux-cloud's own push and made them
+    ask a peer for permission the peer did not need to give. `acdbfdf` and
+    `9ebc42c` share patch-id `dff284cf093aecaa`; both still do today.
+
+    The `--not --remotes=origin` bound above already handles a rebase of YOUR
+    branch onto origin, because those commits stay reachable from an origin ref.
+    It cannot handle a REPLAY, which produces a new object with the same diff.
+    Only the diff can answer that, which is what patch-id is.
+
+    amux-cloud's REFUSAL of 2026-08-11 is why this is code and not another
+    paragraph: the documentation half shipped and they grepped *.sh, *.rs and
+    the CLI and found no executable path computing a patch-id anywhere. A recipe
+    a human runs by hand is not a check.
+
+    REVERT SAFETY, and it is the reason this does not just test membership. If
+    the patch was applied upstream and later REVERTED, re-applying it does ship
+    something new, and clearing it would be the entry's own stated inverse
+    hazard: "a session assuming a familiar-looking commit is last week's
+    duplicate and shipping something genuinely unreviewed". A revert's diff is
+    the reverse of the original, so its patch-id equals the REVERSE patch-id of
+    the candidate. If both directions are present upstream the net state is
+    ambiguous and the commit stays foreign.
+
+    Returns (dup, note). `dup` is {short_sha: (upstream_sha, patch_id)}; it is
+    None when the check could not run at all, which keeps every commit foreign —
+    the safe direction, since this only ever REMOVES a block.
+    """
+    up = _patch_ids(["log", "--no-merges", "-p", "-n", str(limit), "--remotes=origin"])
+    if up is None:
+        return None, "could not compute upstream patch-ids"
+    dup = {}
+    for sha in shas:
+        mine = _patch_ids(["show", "--no-merges", sha], timeout=15)
+        if not mine:
+            continue                       # empty diff, or unreadable: not a duplicate
+        pid = next(iter(mine))
+        if pid not in up:
+            continue
+        # `git show -R` does NOT produce the inverse patch — it swaps the a/b
+        # labels and leaves the +/- direction alone, so its patch-id matches
+        # nothing and the revert guard silently never fired. `git diff <sha>
+        # <sha>^` is the reverse patch, and its id equals the REVERT commit's
+        # exactly. Measured both ways on a throwaway repo before trusting it:
+        # show -R gave a33c5ad7, the revert commit gave d1ef02e4, and
+        # `diff sha sha^` gave d1ef02e4. Case N is the pin.
+        rev = _patch_ids(["diff", sha, "%s^" % sha], timeout=15)
+        if rev and next(iter(rev)) in up:
+            continue                       # applied AND reverted upstream: ambiguous
+        dup[sha] = (up[pid], pid)
+    # NO SILENT CAPS. The walk is bounded, so a twin older than the bound reads
+    # as "not upstream" and the commit stays blocked. That is the safe error, but
+    # it is still an error and the caller must be able to see it was possible.
+    return dup, "compared against the last %d origin commit(s)" % limit
+
+
 def _audit(kind, detail):
     """Append to the push-guard audit log. Best-effort: logging must never
     brick a push, and a guard that dies on a full disk is worse than one that
@@ -168,6 +256,54 @@ def main():
                         (bits[0], bits[1][:62]))
     except Exception:
         return 0  # fail open — the guard must never brick a push
+    # ALREADY-UPSTREAM REPLAYS ARE NOT FOREIGN WORK (AC-227). Runs BEFORE
+    # consent, because a commit that ships nothing new should never need anyone's
+    # permission — that is the exact cost amux-cloud recorded: a blocked push and
+    # a peer asked for consent they did not need to give.
+    dup_note = ""
+    if foreign:
+        try:
+            limit = int(os.environ.get("AMUX_PATCHID_LIMIT", "400"))
+        except ValueError:
+            limit = 400
+        if limit > 0:
+            all_shas = [sha for rows in foreign.values() for sha, _s in rows]
+            dup, note = _upstream_duplicates(all_shas, limit)
+            if dup:
+                remaining = {}
+                for who, rows in foreign.items():
+                    keep = [r for r in rows if r[0] not in dup]
+                    if keep:
+                        remaining[who] = keep
+                _audit("DUPLICATE", "already-upstream=%s" % ",".join(
+                    "%s~%s" % (s, u) for s, (u, _p) in sorted(dup.items())))
+                lines = "".join(
+                    "    %s  is already upstream as %s  (patch-id %s)\n"
+                    % (s, u[:12], p[:16]) for s, (u, p) in sorted(dup.items()))
+                dup_note = (
+                    "\namux push-guard: %d commit(s) look foreign but are ALREADY UPSTREAM "
+                    "under a different sha\n"
+                    "  (cherry-pick / rebase / replay). They ship nothing new, so they are "
+                    "not treated as foreign:\n%s"
+                    "  Matched by DIFF, not by sha, and %s. A commit whose twin is older "
+                    "than that bound\n"
+                    "  still reads as foreign — the safe error, but say so rather than let "
+                    "it look impossible.\n"
+                    "  A patch applied AND reverted upstream is deliberately NOT cleared: "
+                    "re-applying it ships\n"
+                    "  something real (AC-227's own stated inverse hazard).\n\n"
+                    % (len(dup), lines, note))
+                foreign = remaining
+            elif dup is None:
+                dup_note = (
+                    "\namux push-guard: could not check for already-upstream replays "
+                    "(%s).\n"
+                    "  Every commit below stays foreign — the safe direction, but a "
+                    "cherry-pick may be\n"
+                    "  among them (AC-227). `git patch-id` is the discriminator if you "
+                    "want to check by hand.\n\n" % note)
+    if dup_note:
+        sys.stderr.write(dup_note)
     if not foreign:
         return 0
 
