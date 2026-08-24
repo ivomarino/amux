@@ -8554,6 +8554,17 @@ fn stall_log_first_this_bucket(key: &str, bucket: i64) -> bool {
     crate::log_dedupe::first_this_bucket(key, bucket)
 }
 
+/// The stall warning's dedupe key (AF-188).
+///
+/// Extracted so the property can be tested rather than asserted: the key must
+/// contain BOTH reasons the line prints. It used to contain only `cond`, so a
+/// lane whose recorded skip reason changed inside one hour bucket produced no
+/// new warning — the key did not include the value the human actually reads,
+/// which made a change in it invisible by construction.
+fn stall_dedupe_key(session: &str, cond: &str, last_skip: &str) -> String {
+    format!("{session}:{cond}:{last_skip}")
+}
+
 fn skip(session: &str, id: &str, reason: &str) {
     tracing::debug!(session = %session, id = %id, reason = %reason, "steering skipped");
     steer_skips()
@@ -8601,12 +8612,35 @@ async fn warn_on_stalled_lanes(state: &AppState) {
         let blocked = lane_block_reason(&session).await;
         let bucket = crate::log_dedupe::hour_bucket(now);
         let cond = blocked.unwrap_or("busy-past-deadline");
-        if stall_log_first_this_bucket(&format!("{session}:{cond}"), bucket) {
+        // TWO REASONS, AND THEY ARE NOT THE SAME TENSE (AF-188).
+        //
+        // `reason` is the last skip the delivery loop RECORDED for this lane —
+        // history, held in memory, and empty after a restart. `cond` is what
+        // `lane_block_reason` says about the lane RIGHT NOW. This line used to
+        // print only `reason` while deduping only on `cond`, which is wrong in
+        // both directions:
+        //
+        //   - the reader gets a past-tense value inside a present-tense
+        //     sentence. On 2026-08-24 this printed `reason=archived` for
+        //     mixpeek-orchestrator, a lane that is not archived and has no
+        //     CC_ARCHIVED=1 in its env. The daily sweep filed a card proposing
+        //     a fix that had already shipped (AMUX-2796 refuses archived sends
+        //     at the door), because the log named a condition that was not the
+        //     live one.
+        //   - a lane whose SKIP reason changes inside one hour bucket, with
+        //     `cond` unchanged, produced no new warning at all: the dedupe key
+        //     did not contain the value the human reads, so a change in it was
+        //     invisible by construction.
+        //
+        // Both go in the line and both go in the key. They agree most of the
+        // time; the times they disagree are exactly the ones worth seeing.
+        if stall_log_first_this_bucket(&stall_dedupe_key(&session, cond, &reason), bucket) {
             tracing::warn!(
                 session = %session,
                 queued = count,
                 oldest_min = (age / 60.0) as i64,
-                reason = %reason,
+                last_skip = %reason,
+                blocked_now = %cond,
                 "steering queue STALLED — messages are not reaching this lane"
             );
         }
@@ -17104,6 +17138,39 @@ mod steer_max_age_tests {
         // panic or an empty string: the reason vocabulary is the drain loop's,
         // and it will grow.
         assert!(block_reason_explain("wat", "x").contains("NOT DELIVERABLE"));
+    }
+
+    /// AF-188: the stall warning printed a PAST-TENSE reason inside a
+    /// present-tense sentence, and deduped on a value the reader never saw.
+    ///
+    /// `last_skip` is the delivery loop's last recorded skip — memory, empty
+    /// after a restart. `blocked_now` is what lane_block_reason says right now.
+    /// On 2026-08-24 the line printed `reason=archived` for
+    /// mixpeek-orchestrator, a lane with no CC_ARCHIVED=1 in its env, and the
+    /// daily sweep filed a card proposing a fix that had shipped two weeks
+    /// earlier (AMUX-2796 refuses archived sends at the door). The log named a
+    /// condition that was not the live one and cost a real investigation.
+    ///
+    /// THE CELL THAT MATTERS IS THE SECOND. Same session, same live condition,
+    /// different recorded skip: those must be different keys, or a change in the
+    /// value the human reads is suppressed for the rest of the hour bucket.
+    #[test]
+    fn the_stall_dedupe_key_contains_both_reasons_not_just_the_live_one() {
+        let a = stall_dedupe_key("orch", "busy-past-deadline", "archived");
+        // Same lane, same live condition, DIFFERENT recorded skip.
+        let b = stall_dedupe_key("orch", "busy-past-deadline", "not-running");
+        assert_ne!(
+            a, b,
+            "a change in last_skip must produce a new warning — it is what the line prints"
+        );
+        // Same lane, same recorded skip, DIFFERENT live condition: also distinct,
+        // which is the behaviour the old key already had and must not lose.
+        let c = stall_dedupe_key("orch", "archived", "archived");
+        assert_ne!(a, c);
+        // And the key still separates lanes, or one stalled lane silences another.
+        assert_ne!(a, stall_dedupe_key("other", "busy-past-deadline", "archived"));
+        // Identical inputs dedupe.
+        assert_eq!(a, stall_dedupe_key("orch", "busy-past-deadline", "archived"));
     }
 
     #[test]
