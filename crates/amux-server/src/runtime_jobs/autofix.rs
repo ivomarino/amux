@@ -3724,11 +3724,7 @@ pub async fn autofix_tick_with_ci(
                     let _ = state
                         .store
                         .write_async(move |conn| {
-                            conn.execute(
-                                "UPDATE _amux_invariant_incident SET board_issue=?1 \
-                                 WHERE invariant_id=?2 AND entity_key=?3",
-                                rusqlite::params![c, i, e],
-                            )?;
+                            link_incident_to_card(conn, &c, &i, &e)?;
                             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                         })
                         .await;
@@ -3846,6 +3842,69 @@ pub async fn autofix_tick_with_ci(
 /// A rollup finding names several entities and its signature is not this shape,
 /// so it links nothing — correctly: there is no single incident to point at,
 /// and guessing one would attach the card to an arbitrary member.
+/// Attach a freshly-filed card to the incident row it came from, and say so
+/// when it cannot. Returns the number of rows linked (0 or 1).
+///
+/// This is what lets `note_resolved_incidents` tell a card that the condition
+/// behind it is gone (AMUX-3572). The link is written from the SIGNATURE,
+/// because that is the only thing in hand at the filing site that maps back to
+/// `(invariant_id, entity_key)`.
+///
+/// A FLEET-WIDE INVARIANT STORES `entity_key=''` AND SIGNS ITSELF `fleet`
+/// (AMUX-3664). `detect_invariants` computes `sig_entity = if entity.is_empty()
+/// { "fleet" }` for the title and the signature, so for every fleet-scoped
+/// invariant the exact-match UPDATE looked for `entity_key='fleet'`, matched
+/// ZERO rows, and left `board_issue` empty — silently, because a 0-row UPDATE
+/// is not an error.
+///
+/// A display substitution leaked into a storage key, and the cost is that the
+/// resolved-incident notice was INERT for the entire fleet-wide half: it joins
+/// on `board_issue != ''`. Measured 2026-08-24: **10 fleet-wide incidents, 0
+/// with a card link**, including `hooks.shared_guard_matches_committed` — 359
+/// occurrences, resolved at 12:36, its card never told. The notice was
+/// validated the same morning against two entity-keyed specimens, which is
+/// exactly the sample that cannot see this.
+///
+/// The fallback is a RETRY rather than a widened `WHERE`, so an exact match
+/// always wins: an invariant whose real entity is literally named "fleet" keeps
+/// its own row, and only a genuine miss falls through. The signature spelling
+/// is deliberately NOT changed — it is a live dedupe key, and moving it re-files
+/// every open invariant card (measured the hard way, AMUX-3633).
+fn link_incident_to_card(
+    conn: &Connection,
+    card: &str,
+    invariant: &str,
+    entity: &str,
+) -> rusqlite::Result<usize> {
+    let n = conn.execute(
+        "UPDATE _amux_invariant_incident SET board_issue=?1 \
+         WHERE invariant_id=?2 AND entity_key=?3",
+        rusqlite::params![card, invariant, entity],
+    )?;
+    let n = if n == 0 && entity == "fleet" {
+        conn.execute(
+            "UPDATE _amux_invariant_incident SET board_issue=?1 \
+             WHERE invariant_id=?2 AND entity_key=''",
+            rusqlite::params![card, invariant],
+        )?
+    } else {
+        n
+    };
+    // A 0-ROW UPDATE IS NOT AN ERROR, WHICH IS HOW THIS LASTED FOUR DAYS.
+    // Nothing recorded that a card had been minted with no incident to attach
+    // it to, so the only way to find it was to notice a resolved incident that
+    // never told its card — to look for the absence of a message. Say it out
+    // loud instead, or the next spelling drift is exactly as quiet as this one.
+    if n == 0 {
+        tracing::warn!(
+            card = %card, invariant = %invariant, entity = %entity,
+            "autofix filed a card but could not link it to any incident row — a \
+             resolved incident will never be able to tell this card (AMUX-3664)"
+        );
+    }
+    Ok(n)
+}
+
 fn invariant_signature_parts(sig: &str) -> Option<(String, String)> {
     let mut it = sig.splitn(3, '|');
     match (it.next(), it.next(), it.next()) {
@@ -4732,6 +4791,54 @@ mod tests {
         assert!(has("big.db"), "a 2MB file above a 1MB floor must be a candidate: {got:?}");
         assert!(has("a-directory"), "directories must STILL be candidates: {got:?}");
         assert!(!has("small.txt"), "a file below the floor is noise, not a candidate: {got:?}");
+    }
+
+    /// AMUX-3664, rebuilt from the incident row that exposed it.
+    ///
+    /// `hooks.shared_guard_matches_committed` failed 359 times over four days,
+    /// resolved at 12:36, and its card was never told — because the incident
+    /// row's `board_issue` was empty, because the write-back searched for
+    /// `entity_key='fleet'` while a fleet-wide invariant stores `''`.
+    ///
+    /// The fleet-wide case is the treatment AND the entity-keyed case is the
+    /// control: a "fix" that always fell back to `''` would link an
+    /// entity-keyed card to the wrong row, which is worse than not linking it.
+    #[test]
+    fn a_fleet_wide_incident_links_to_its_card_and_an_entity_keyed_one_still_matches_exactly() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _amux_invariant_incident (invariant_id TEXT, entity_key TEXT, \
+             board_issue TEXT);
+             INSERT INTO _amux_invariant_incident VALUES ('hooks.shared_guard','', '');
+             INSERT INTO _amux_invariant_incident VALUES ('route.callers','GET /api/x','');
+             INSERT INTO _amux_invariant_incident VALUES ('route.callers','GET /api/y','');",
+        )
+        .unwrap();
+        let link = |c: &str, i: &str, e: &str| link_incident_to_card(&conn, c, i, e).unwrap();
+        let card_of = |i: &str, e: &str| -> String {
+            conn.query_row(
+                "SELECT COALESCE(board_issue,'') FROM _amux_invariant_incident \
+                 WHERE invariant_id=?1 AND entity_key=?2",
+                rusqlite::params![i, e],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+
+        // TREATMENT: signed `fleet`, stored ''. This returned 0 before the fix.
+        assert_eq!(link("AMUX-1", "hooks.shared_guard", "fleet"), 1);
+        assert_eq!(card_of("hooks.shared_guard", ""), "AMUX-1");
+
+        // CONTROL: an entity-keyed invariant must hit its OWN row and leave its
+        // sibling alone. A blanket fallback would smear one card across both.
+        assert_eq!(link("AMUX-2", "route.callers", "GET /api/x"), 1);
+        assert_eq!(card_of("route.callers", "GET /api/x"), "AMUX-2");
+        assert_eq!(card_of("route.callers", "GET /api/y"), "", "sibling must be untouched");
+
+        // CONTROL: a genuine miss stays a miss and reports 0, rather than the
+        // fallback inventing a link to some unrelated fleet-wide row.
+        assert_eq!(link("AMUX-3", "no.such.invariant", "fleet"), 0);
+        assert_eq!(card_of("hooks.shared_guard", ""), "AMUX-1", "must not be overwritten");
     }
 
     /// AMUX-3665, rebuilt from the report that motivated it.
