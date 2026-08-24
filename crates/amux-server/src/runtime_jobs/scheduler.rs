@@ -1286,7 +1286,7 @@ impl LiveDeliverer {
             sched.str_field("title"),
             sched.id()
         );
-        crate::api::session_verbs::steer_enqueue(
+        let _ = crate::api::session_verbs::steer_enqueue(
             &self.state,
             &owner,
             &text,

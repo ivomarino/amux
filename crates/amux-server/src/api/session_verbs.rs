@@ -3324,13 +3324,15 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
 /// "" for an automated producer, which the `guard` already identifies. It is
 /// recorded so a stalled queue can tell the one party who is holding a false
 /// belief about it — see [`lane_block_reason`] and `warn_on_stalled_lanes`.
+#[must_use = "steer_enqueue REFUSES a permanently-blocked target and returns None. \
+Handle it, or write `let _ =` to say the refusal is deliberately unreported here (AF-188)."]
 pub(crate) async fn steer_enqueue(
     state: &AppState,
     name: &str,
     text: &str,
     guard: &str,
     sender: &str,
-) -> String {
+) -> Option<String> {
     steer_enqueue_store(&state.store, name, text, guard, sender).await
 }
 
@@ -3344,13 +3346,48 @@ pub(crate) async fn steer_enqueue(
 /// then has to be kept in step forever (CLAUDE.md's primitives rule; ethos D6
 /// on what one duplicated seam already costs). One implementation, two
 /// addressing modes.
+#[must_use = "steer_enqueue REFUSES a permanently-blocked target and returns None. \
+Handle it, or write `let _ =` to say the refusal is deliberately unreported here (AF-188)."]
 pub(crate) async fn steer_enqueue_store(
     store: &crate::db::SharedStore,
     name: &str,
     text: &str,
     guard: &str,
     sender: &str,
-) -> String {
+) -> Option<String> {
+    // REFUSE A PERMANENT BLOCK HERE, not in the handlers (AF-188).
+    //
+    // `steer_mutate` and `auto_deliver` each refused archived targets; this
+    // shared path, which its own docstring calls the one delivery path, did not.
+    // Three spellings of one rule and the CHOKEPOINT got none of them, so every
+    // internal producer — scheduler ticks, board-drive nudges, commit nudges,
+    // git-guard notices, owner notifications — queued into archived lanes with
+    // nothing refusing. Nothing wakes an archived lane and un-archiving is a
+    // human's call, so the row is immortal: it regenerates stall warnings,
+    // autofix cards and `steering.stalled` events that can never clear. Two were
+    // ~16h old when this was found, and the one that produced the report sat 53
+    // minutes on a build that already "refused" archived sends.
+    //
+    // Returning Option rather than logging and continuing is deliberate, and
+    // the `#[must_use]` above is what makes it bite: verified empirically that
+    // it reaches the AWAITED output ("unused output of future returned by ...
+    // that must be used"), not merely the future. Plain `Option` does NOT warn
+    // in return position — I assumed it did, tested it, and was wrong — so
+    // without the attribute this would have been a refusal any future producer
+    // could drop silently. CI denies warnings, so every one of the 18 call
+    // sites now says out loud what it does with a refusal.
+    if lane_is_archived(name) {
+        // Stable token so a sweep can COUNT these without a human noticing
+        // first — the same /api/logs/analyze WARN sweep that found the bug.
+        tracing::warn!(
+            steer_refused_archived = name,
+            guard = guard,
+            sender = sender,
+            chars = text.chars().count(),
+            "steer_enqueue refused: '{name}' is archived, so this message would never drain.              Not queued. Un-archiving is a human's call (ethos rule 8)."
+        );
+        return None;
+    }
     let msg_id = format!("steer-{}", (now_f64() * 1000.0) as i64);
     let id = msg_id.clone();
     // The id we RETURN must be the row that actually exists. When a guarded
@@ -3434,7 +3471,7 @@ pub(crate) async fn steer_enqueue_store(
     )
     .await;
     // The row that exists, not the one we minted (AMUX-3557).
-    effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id)
+    Some(effective_id.lock().map(|g| g.clone()).unwrap_or(msg_id))
 }
 
 /// py:25236 _send_dedup_seen — idempotency across client retries, persisted
@@ -4577,13 +4614,24 @@ pub(crate) async fn deliver_automated(
     // No sender lane: this is an automated producer, and `guard` already names
     // which one. An empty sender means the stall notice has no lane to tell —
     // which is the truth, rather than a guess that would misattribute it.
-    let queue_id = steer_enqueue(state, name, text, guard, "").await;
-    AutoDelivery {
-        message: format!("queued (steering) — delivers to '{name}' at its next turn boundary"),
-        submitted: None,
-        submission: "deferred",
-        queue_id: Some(queue_id),
-        refused: false,
+    // AF-188: the enqueue can now refuse. The ONLY refusal it makes is a
+    // permanently-blocked target, so this is terminal — reporting it as
+    // "queued" would be the exact false belief this whole path exists to stop.
+    match steer_enqueue(state, name, text, guard, "").await {
+        Some(queue_id) => AutoDelivery {
+            message: format!("queued (steering) — delivers to '{name}' at its next turn boundary"),
+            submitted: None,
+            submission: "deferred",
+            queue_id: Some(queue_id),
+            refused: false,
+        },
+        None => AutoDelivery {
+            message: block_reason_explain("archived", name),
+            submitted: Some(false),
+            submission: "refused",
+            queue_id: None,
+            refused: true,
+        },
     }
 }
 
@@ -4895,7 +4943,7 @@ async fn send_text_inner(
     if defer_if_busy && waiting {
         // A live selector parks an automated send (py:25545; the
         // AskUserQuestion kill of 2026-07-15).
-        steer_enqueue(state, name, &text, "", "").await;
+        let _ = steer_enqueue(state, name, &text, "", "").await;
         return (true, "queued (steering) — session at a selector, delivers when it resolves".into());
     }
     if waiting && from_steering {
@@ -7818,9 +7866,22 @@ pub(crate) fn lane_block_reason_from(
 /// ethos-1 view/predicate split — a view must share the predicate of the
 /// mechanism it claims to describe, and a send response is a view of the
 /// delivery loop.
+/// Is this lane archived? Extracted so `steer_enqueue_store` can ask WITHOUT
+/// paying `lane_block_reason`'s tmux query, and without re-deriving the
+/// predicate in a fourth place (AF-188).
+///
+/// Archived is the only PERMANENT condition of the three. `not-running` is what
+/// the queue exists for, and `no-env-file` is deliberately NOT refused here: a
+/// lane can be registered later and the row would then drain, so it is
+/// unrecoverable-looking rather than unrecoverable. Refusing it would trade this
+/// bug for the opposite one.
+pub(crate) fn lane_is_archived(name: &str) -> bool {
+    env_path(name).exists() && parse_env(name).get("CC_ARCHIVED") == Some("1")
+}
+
 pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     let env_exists = env_path(name).exists();
-    let archived = env_exists && parse_env(name).get("CC_ARCHIVED") == Some("1");
+    let archived = lane_is_archived(name);
     // Don't pay a tmux query for a lane already known unreachable.
     let running = env_exists && !archived && is_running(name).await;
     lane_block_reason_from(env_exists, archived, running)
@@ -11973,7 +12034,7 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                             })
                             .map(|q| (now_f64() - q).round() as i64)
                     };
-                    steer_enqueue(state, name, &msg, "auto-compact", "").await;
+                    let _ = steer_enqueue(state, name, &msg, "auto-compact", "").await;
                     tracing::warn!(
                         session = %name, pct, used, ?action,
                         pending_age_s = pending_age_s.unwrap_or(0),
@@ -14075,6 +14136,62 @@ mod tests {
         );
     }
 
+    /// AF-188: the shared enqueue must REFUSE a permanently-blocked target,
+    /// and must still queue for a transient one.
+    ///
+    /// Both halves in one test on one temp home, because the claim is that the
+    /// two are TOLD APART. `steer_mutate` and `auto_deliver` each refused
+    /// archived targets and this chokepoint refused nothing, so every internal
+    /// producer queued rows that could never drain: nothing wakes an archived
+    /// lane, un-archiving is a human's call, and the row then regenerates stall
+    /// warnings, autofix cards and `steering.stalled` events forever.
+    ///
+    /// THE CONTROL IS THE CARD'S OWN AND IT IS THE LOAD-BEARING HALF. A fix that
+    /// refuses everything unreachable would also refuse a lane that is merely
+    /// stopped, which is precisely what the queue EXISTS for. Asserting only the
+    /// archived case would pass against that, and it would break delivery for
+    /// the whole fleet rather than for two dead lanes.
+    #[tokio::test]
+    async fn an_archived_target_is_refused_and_a_merely_stopped_one_still_queues() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        // Archived: permanent. Nothing drains it, ever.
+        std::fs::write(sessions.join("dead.env"), "CC_DIR=/tmp\nCC_ARCHIVED=\"1\"\n").unwrap();
+        // Registered and NOT archived. It is also not running under the test
+        // tmux, which is exactly the transient case the queue is for.
+        std::fs::write(sessions.join("stopped.env"), "CC_DIR=/tmp\n").unwrap();
+
+        assert!(
+            lane_is_archived("dead"),
+            "fixture must actually be archived, or the refusal below proves nothing"
+        );
+        assert!(!lane_is_archived("stopped"));
+
+        let refused = steer_enqueue(&st, "dead", "never deliverable", "", "amux").await;
+        assert!(refused.is_none(), "an archived target must be refused, not queued: {refused:?}");
+
+        let queued = steer_enqueue(&st, "stopped", "waits for a wake", "", "amux").await;
+        assert!(
+            queued.is_some(),
+            "a stopped-but-live lane MUST still queue — that is what the queue is for"
+        );
+
+        // And nothing landed in the table for the archived lane. The returned
+        // None is the caller's signal; the empty row is the actual bug fixed,
+        // since the immortal row is what regenerated everything downstream.
+        let conn = st.store.read().unwrap();
+        let rows: Vec<String> = conn
+            .prepare("SELECT session FROM steering_queue")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, vec!["stopped".to_string()], "only the deliverable one is in the queue: {rows:?}");
+    }
+
     /// AMUX-3557. A guarded re-enqueue must NOT reset the message's age.
     ///
     /// Delivery is `ORDER BY queued_at ASC`. The old DELETE-then-INSERT gave
@@ -14098,14 +14215,16 @@ mod tests {
 
         // The guarded message is queued FIRST, so it is the oldest and must
         // stay first no matter how often it is refreshed.
-        let first = steer_enqueue(&st, "lane", "/compact v1", "auto-compact", "").await;
+        let first = steer_enqueue(&st, "lane", "/compact v1", "auto-compact", "").await
+            .expect("a non-archived lane must still queue");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        steer_enqueue(&st, "lane", "a peer message", "", "peer").await;
+        let _ = steer_enqueue(&st, "lane", "a peer message", "", "peer").await;
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
         // Re-fire the guarded one, as the auto-compact trigger does every few
         // seconds while the condition holds.
-        let again = steer_enqueue(&st, "lane", "/compact v2", "auto-compact", "").await;
+        let again = steer_enqueue(&st, "lane", "/compact v2", "auto-compact", "").await
+            .expect("a non-archived lane must still queue");
 
         assert_eq!(
             again, first,

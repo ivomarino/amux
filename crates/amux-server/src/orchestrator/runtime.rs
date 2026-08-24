@@ -1449,7 +1449,7 @@ impl Runtime {
                  (`amux board status {card_id} discarded`) — a card that should not exist is \
                  the honest answer too."
             );
-            crate::api::session_verbs::steer_enqueue_store(
+            let _ = crate::api::session_verbs::steer_enqueue_store(
                 &self.store,
                 &session,
                 &msg,

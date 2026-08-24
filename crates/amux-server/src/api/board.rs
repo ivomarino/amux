@@ -3842,7 +3842,7 @@ pub async fn patch_item(
                          is delivery of a peer's note, not a status request.)",
                         title.chars().take(60).collect::<String>()
                     );
-                    crate::api::session_verbs::steer_enqueue(
+                    let _ = crate::api::session_verbs::steer_enqueue(
                         &state,
                         &owner,
                         &prompt,
@@ -3908,7 +3908,7 @@ async fn reactive_pickup(state: &AppState, session: &str) {
         // race — select_pickup then drop(conn) then claim — so an unconditional
         // claim+dispatch could re-open and re-run a card closed in the gap.
         if crate::runtime_jobs::board_drive::claim_card(state, session, &card).await {
-            crate::api::session_verbs::steer_enqueue(
+            let _ = crate::api::session_verbs::steer_enqueue(
                 state, session, &prompt, "board-drive:reactive", "",
             )
             .await;
@@ -4225,7 +4225,7 @@ async fn status_request(
     // direct send: the decision recorded in ethos.md ("Board state changes are
     // delivered at turn boundaries") is that a running agent cannot consume an
     // event faster than its next turn anyway.
-    crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
+    let _ = crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
         .await;
 
     let line = if question.is_empty() {

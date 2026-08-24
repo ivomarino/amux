@@ -1208,7 +1208,7 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await;
-        crate::api::session_verbs::steer_enqueue(state, session, &msg, "commit-nudge", "").await;
+        let _ = crate::api::session_verbs::steer_enqueue(state, session, &msg, "commit-nudge", "").await;
         sent += 1;
     }
     sent

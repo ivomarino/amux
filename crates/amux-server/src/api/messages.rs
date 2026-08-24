@@ -742,7 +742,7 @@ pub(crate) async fn accountability_tick(state: &AppState) {
              no board card created or moved — the work isn't tracked yet. Please open a board card \
              for the ask (owned by you) and pursue it. Most recent: \"{snippet}\"",
         );
-        crate::api::session_verbs::steer_enqueue(state, &worker, &text, "accountability", "").await;
+        let _ = crate::api::session_verbs::steer_enqueue(state, &worker, &text, "accountability", "").await;
         nudged.insert(worker.clone(), now);
         sent += 1;
         tracing::info!(worker=%worker, human_messages=msgs, "[accountability] nudged unaccounted lane");

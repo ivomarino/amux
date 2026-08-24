@@ -2178,7 +2178,7 @@ pub async fn staged_guard_inner(
                     path_names.first().cloned().unwrap_or_default(),
                     verdict,
                 );
-                crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
+                let _ = crate::api::session_verbs::steer_enqueue(st, &owner, &text, "staged-guard", "")
                     .await;
                 tracing::warn!(
                     target: "staged_guard",
