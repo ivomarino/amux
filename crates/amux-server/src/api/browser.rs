@@ -1303,8 +1303,15 @@ mod tests {
     ///
     /// The specimen: `Emulation.setDeviceMetricsOverride timed out after 10s`
     /// on 2026-08-24 15:57, which was five Chromes contending one profile
-    /// (AMUX-3669). Diagnosing it needed the error BODY off the card, because
+    /// (AMUX-3674). Diagnosing it needed the error BODY off the card, because
     /// the grouping could not say "this one is a hang".
+    ///
+    /// This citation read AMUX-3669 until AMUX-3688. That card is an autofix
+    /// LATENCY report about `/api/sessions-git`; the stray-Chrome work is
+    /// AMUX-3674. Six comments across three files carried the wrong id, all from
+    /// writing it into prose before the card existed. AMUX-3669's own body
+    /// records the slip. Commits 02197674 and a19bedbf still quote the wrong id
+    /// in their subjects and cannot be rewritten.
     #[test]
     fn a_cdp_timeout_is_504_and_a_protocol_error_is_502() {
         let timeout = anyhow::Error::new(chrome::CdpTimeout {

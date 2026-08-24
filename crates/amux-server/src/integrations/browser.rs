@@ -600,7 +600,7 @@ fn pids_on_dir(ps_output: &str, flag: &str) -> Vec<u32> {
 ///   - orphan whose CDP has WEDGED: adopt cannot speak to it and clears the file,
 ///     but the process still owns the dir. Kill it by the pid the running-file
 ///     recorded, or the next launch delegates to a zombie forever.
-///   - CO-TENANTS THE STATE FILE NEVER NAMED (AMUX-3669): the file records one
+///   - CO-TENANTS THE STATE FILE NEVER NAMED (AMUX-3674): the file records one
 ///     pid, and detached Chrome survives a re-exec, so earlier launches strand
 ///     browsers nothing remembers. [`live_chromes_on_dir`] asks the OS instead.
 async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
@@ -640,7 +640,7 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
         }
     }
 
-    // THE ONES THE STATE FILE NEVER KNEW ABOUT (AMUX-3669).
+    // THE ONES THE STATE FILE NEVER KNEW ABOUT (AMUX-3674).
     //
     // Everything above reconciles the ONE pid we persisted. Detached Chrome
     // survives a server re-exec, so earlier launches strand co-tenants the file
@@ -658,7 +658,7 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
             pid, dir = %target_dir.display(),
             "browser: killing a stray Chrome co-tenant on this profile — two Chromes on one \
              user-data-dir is what shows the user 'Something went wrong when opening your \
-             profile' (AMUX-3669)"
+             profile' (AMUX-3674)"
         );
         let _ = tokio::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().await;
     }
@@ -1463,7 +1463,7 @@ pub enum DriverError {
 ///
 /// That is what made the 2026-08-24 15:57 report need its card body to diagnose:
 /// `Emulation.setDeviceMetricsOverride timed out after 10s` was a symptom of
-/// five Chromes contending one profile (AMUX-3669), and nothing in the log
+/// five Chromes contending one profile (AMUX-3674), and nothing in the log
 /// grouping could have said "this one is a hang".
 #[derive(Debug)]
 pub struct CdpTimeout {
@@ -2258,7 +2258,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// AMUX-3669, from Ethan's report and the live `ps` output that explained
+    /// AMUX-3674, from Ethan's report and the live `ps` output that explained
     /// it. Five Chromes were sharing one `--user-data-dir`, which is
     /// single-instance in Chrome, so all but the lock holder showed
     /// "Something went wrong when opening your profile."

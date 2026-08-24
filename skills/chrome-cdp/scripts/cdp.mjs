@@ -35,7 +35,7 @@ function sockPath(targetId) {
     : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
-// DRIVE AN AMUX SAVED PROFILE (AMUX-3669).
+// DRIVE AN AMUX SAVED PROFILE (AMUX-3674).
 //
 // Ethan, 2026-08-24: "i have saved profiles in amux browser — use those saved
 // profiles to do chrome cdp." They were unreachable from here: this script
