@@ -2683,3 +2683,36 @@ NOTE: The root is shared by AF-179 and this entry, which is why it is filed unde
   CHECKOUT in a sentence scoped to the reader — "was also edited by you", "your commit is
   refused" — and the reader has no way to recover which was meant. The lint scope and the mtime
   window are two instruments making the same category error.
+
+---
+## The browser guard is absent against the one lane the dashboard is hardcoded to impersonate
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-183
+SYMPTOM: A session is handed "a browser is already running under session '(unattributed)' —
+  starting yours would DESTROY its state (staged logins included)". It names no owner, so there
+  is nobody to ask and the only safe move is to do nothing. Measured: 451 of 535
+  /api/browser/start rows all-time (84%) carry no X-Amux-Session, so the guard's whole safety
+  property, naming the owner you are about to destroy, is unavailable for most collisions.
+  Worse, app.js:32951 hardcodes `let _bwSession = 'amux'` with the deeplink as its only setter,
+  so a browser a human opens from the Browser tab is recorded as owned by the `amux` LANE. The
+  guard's same-session shortcut then treats that lane's start as the human's own restart:
+  no refusal, no takeover flag, staged logins gone.
+COST: A blocked browser for whoever hits the refusal, and a live path for an agent to silently
+  destroy a human's signed-in session. The text is also verbatim the text of AF-181, an
+  auto-captured card that was DISCARDED and then folded into an unrelated card, so it recurs
+  and the discard is what let it recur.
+FIX: Put the recoverable facts in the SENTENCE (pid, started_at, profile are already in the
+  body but not the string) and let the refusal consult _amux_request_log for the start row, so
+  "started 10h ago from 127.0.0.1 by curl/8.7.1" replaces "(unattributed)". Separately, and
+  routed to Ethan because it is an identity decision, the dashboard must stop calling itself
+  `amux`. AF-183.
+NOTE: this is AMUX-1768's class one layer up. browser.rs:104-113 removed the SERVER-side default
+  constant in writing, for exactly this reason ("framing that lane for every anonymous call ...
+  and worse, the guard's same-session shortcut let any TWO anonymous callers stomp each other").
+  The client-side constant survived the fix. Fourth member of the 2026-08-23 misattribution
+  cluster with AF-179 and AF-182; the other three name a WRONG owner, which is recoverable, and
+  this one names none.
