@@ -240,6 +240,55 @@ def check_envs(retries=1):
     return last
 
 
+def check_backups():
+    """Litestream replication freshness for every RUNNING env. Litestream->S3 is
+    the real backup of customer DBs (the nightly backup-cloud.yml workflow made
+    same-host copies and is disabled_manually since ~08-15); AMUX-2802's lesson
+    is that backups stopped for NINE DAYS and the only witness was an unowned
+    card. This check makes staleness self-announcing where the daily sweep
+    already looks. A running env whose litestream sidecar is missing, or whose
+    last 'replica sync' line is older than 15 minutes, is reported stale."""
+    out = ssh(r'''
+import json, subprocess, datetime
+def run(*a):
+    try: return subprocess.run(a, capture_output=True, text=True, timeout=30).stdout
+    except Exception: return ""
+running = [n for n in run("docker","ps","--format","{{.Names}}").split() if n.startswith("amux-user-")]
+stale, fresh = [], 0
+now = datetime.datetime.now(datetime.timezone.utc)
+for n in running:
+    env = n[len("amux-user-"):]
+    ls = "amux-litestream-" + env
+    # litestream logs go to stderr — capture both streams
+    tail = subprocess.run(["docker","logs","--tail","40",ls], capture_output=True, text=True, timeout=30)
+    text = (tail.stdout or "") + (tail.stderr or "")
+    if "No such container" in text or not text.strip():
+        stale.append(env + " (no litestream sidecar)")
+        continue
+    last = None
+    for line in text.splitlines():
+        if "replica sync" in line and line.startswith("time="):
+            last = line.split("time=",1)[1].split(" ",1)[0]
+    if not last:
+        stale.append(env + " (no replica-sync line in recent logs)")
+        continue
+    try:
+        ts = datetime.datetime.fromisoformat(last.replace("Z","+00:00"))
+        age = (now - ts).total_seconds()
+        if age > 900:
+            stale.append(env + " (last sync %dm ago)" % (age // 60))
+        else:
+            fresh += 1
+    except Exception:
+        stale.append(env + " (unparseable sync time: %s)" % last[:30])
+print(json.dumps({"running": len(running), "fresh": fresh, "stale": stale}))
+''', timeout=60)
+    try:
+        return json.loads(out)
+    except Exception:
+        return {"error": (out or "")[:100]}
+
+
 def check_orphans():
     """Running amux-user containers with NO gateway.db org/user row. The deploy is
     DIRECTORY-driven (deploy-cloud.yml loops /var/amux/users/*/), so a workspace dir
@@ -337,6 +386,22 @@ def main():
                            "Wedged (Exited/Created) amux-user containers: %s. The deploy job "
                            "likely reported green anyway; remove the collided containers and "
                            "`docker compose up -d` in the env dir." % ", ".join(_miss))
+        # Backup freshness (AMUX-2802): litestream->S3 is the real customer-DB
+        # backup; nine days of silent backup absence is the incident this check
+        # exists to make impossible to repeat.
+        result["backups"] = check_backups()
+        _stale = result["backups"].get("stale") or []
+        if result["backups"].get("error"):
+            trace("backups", "ERROR: %s" % result["backups"]["error"], False)
+        else:
+            trace("backups", "litestream fresh=%s/%s%s" % (
+                result["backups"].get("fresh"), result["backups"].get("running"),
+                (" STALE -> " + "; ".join(_stale)) if _stale else ""), not _stale)
+        if _stale and not env_problem:
+            env_problem = ("litestream replication STALE for %d env(s)" % len(_stale),
+                           "Customer-DB backup stream not current: %s. Litestream->S3 is the "
+                           "only off-host backup (nightly workflow disabled since 08-15); a "
+                           "stale stream means those DBs have no fresh backup." % "; ".join(_stale))
         # An env layer that is failing or unknowable must dent the verdict — on
         # 2026-08-22 a 401'd env check rode under "HEALTHY exit 0", which is the
         # green-check-that-cannot-fail shape (ethos rule 7). Board-only escalation:
