@@ -1107,7 +1107,7 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
         // fixed the caller for `desc`). `slim: 1` below is the general remedy:
         // a consumer can refuse a slim row instead of reading absence as
         // emptiness, and `GET /api/board?describe` names exactly what is gone.
-        for k in ["source_ref", "last_verified_at", "due_time", "gate"] {
+        for k in SLIM_OMITS {
             obj.remove(k);
         }
         // SAY THAT THIS ROW IS SLIM. Ten bytes against ~4.5MB, and it is the
@@ -1117,7 +1117,26 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
         // "loud, not silently empty" — true in the idiom it assumes
         // (`row["desc"]`) and false in the one every consumer actually
         // writes (`row.get("desc")`), which returns None and says nothing.
-        obj.insert("slim".into(), json!(1));
+        // `slim` NAMES WHAT IS GONE (AF-200). It used to serialize as `1`, which
+        // says something was omitted and not what — so a consumer still had to
+        // know the drop list by heart, which is the thing this marker exists to
+        // make unnecessary. Two of the six drops shipped a companion (desc ->
+        // desc_head/desc_len, log -> log_n) and four shipped no signal at all,
+        // including `gate`, which governs transitions, and `last_verified_at`,
+        // which is what a `verified` audit reads.
+        //
+        // Cost of the bare boolean, measured on 2026-08-24: reading `desc` off
+        // this payload returned None for a card carrying 1809 characters, and
+        // the conclusion drawn was that `amux board add --desc-file` was
+        // silently dropping bodies. Three probe cards were filed bisecting a CLI
+        // defect that does not exist, one step away from "fixing" a flag that
+        // works. That is AF-161's own predicted next occurrence — its entry ends
+        // by asking for a payload self-describing about what it omits "rather
+        // than restoring one column and waiting for the next report".
+        //
+        // An array is truthy exactly where `1` was, and nothing tests the value:
+        // the SPA detects slim via `items[0].desc !== undefined` (app.js:22577).
+        obj.insert("slim".into(), json!(SLIM_OMITS));
     }
     if stale {
         obj.insert("stale".into(), json!(true));
@@ -2340,6 +2359,23 @@ pub async fn clear_done(State(state): State<AppState>, headers: HeaderMap) -> Re
 /// escape is one field (`desc_shrink_ack`) that the refusal prints, and
 /// `desc_append` is there to add instead. A peer silently destroying a
 /// one-sentence card is the worse trade.
+/// Every field the slim list payload omits, in ONE definition shared by the
+/// writer and its test (AF-200).
+///
+/// The test used to restate this as its own literal beside the code, which is a
+/// paraphrase rather than the shipped list — the shape ethos rule 7 warns about,
+/// and how `reviewer` could be dropped for weeks with a green test next to it
+/// (AF-161). A seventh omission now cannot be added without this array, and the
+/// array is what callers are told.
+pub(crate) const SLIM_OMITS: [&str; 6] = [
+    "desc",
+    "due_time",
+    "gate",
+    "last_verified_at",
+    "log",
+    "source_ref",
+];
+
 pub(crate) fn desc_replace_destroys_peer_prose(
     owner: &str,
     writer: &str,
@@ -4892,12 +4928,21 @@ mod slim_tests {
 
         // The self-description, which is the general remedy rather than the
         // one-column one.
-        assert_eq!(slim["slim"], 1, "a slim row must say so");
+        // A slim row must say WHAT is gone, not merely that something is
+        // (AF-200). Compared against the shipped const rather than a literal
+        // restated here, so the two cannot drift.
+        assert_eq!(
+            slim["slim"],
+            json!(SLIM_OMITS),
+            "a slim row must ENUMERATE its omissions — `1` tells a consumer something \
+             was dropped and leaves it guessing which, which is how a 1809-char desc \
+             read as empty"
+        );
 
         // Still slim: the expensive drops stay dropped, or this test would be
         // pinning the absence of the optimisation instead of the presence of
         // the fix.
-        for gone in ["desc", "log", "gate", "source_ref", "last_verified_at", "due_time"] {
+        for gone in SLIM_OMITS {
             assert!(
                 slim.get(gone).is_none(),
                 "{gone} must stay out of the slim list — it is the payload diet's whole point"
@@ -4907,6 +4952,35 @@ mod slim_tests {
         // And the FULL body is unchanged by any of this: it carries everything,
         // and it must not sprout a `slim` marker.
         let full = list_body(&named, false, false);
+
+        // THE NON-CIRCULAR ASSERTION, and the only one here that can catch a
+        // WRONG const. Everything above iterates SLIM_OMITS, so the code and the
+        // test read the same list and agree with each other by construction —
+        // shrink the const and both stop checking the dropped field together.
+        // That is AF-161's defect exactly: a real property, asserted at a layer
+        // the bug does not pass through.
+        //
+        // So derive the omissions from the two payloads and require the const to
+        // MATCH REALITY. A field dropped without being declared, or declared
+        // without being dropped, fails here and nowhere else.
+        let full_keys: std::collections::BTreeSet<&str> =
+            full.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let slim_keys: std::collections::BTreeSet<&str> =
+            slim.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let actually_omitted: Vec<&str> =
+            full_keys.difference(&slim_keys).copied().collect();
+        let declared: Vec<&str> = {
+            let mut d: Vec<&str> = SLIM_OMITS.to_vec();
+            d.sort_unstable();
+            d
+        };
+        assert_eq!(
+            actually_omitted, declared,
+            "SLIM_OMITS must name exactly the fields the slim body drops. Left is what \
+             the payloads actually differ by, right is what the const claims — a field \
+             in one and not the other is a consumer being told the wrong thing about \
+             what it may trust."
+        );
         assert_eq!(full["reviewer"], "amux-frustrations");
         assert!(full.get("desc").is_some());
         assert!(full.get("slim").is_none(), "a full row must not claim to be slim");
