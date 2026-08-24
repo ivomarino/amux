@@ -839,7 +839,7 @@ impl Runtime {
                                 next.version =
                                     i64::try_from(updated.version).unwrap_or(next.version + 1);
                                 next.updated = now.timestamp();
-                                crate::db::board_store::save_patched(conn, &next)?;
+                                crate::db::board_store::save_patched(conn, &mut next)?;
                                 Ok(WriteOutcome {
                                     applied: true,
                                     events: vec![
@@ -1401,7 +1401,7 @@ impl Runtime {
                     ));
                     *minted_w.lock().unwrap() = Some((row.id.clone(), name));
                 }
-                crate::db::board_store::save_patched(conn, &row)?;
+                crate::db::board_store::save_patched(conn, &mut row)?;
                 // notified is deliberately outside save_patched's SET list
                 // (a Python-owned column); set it here so the assignment
                 // notifier never re-announces a prompt the worker already

@@ -176,6 +176,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0030_request_log_boot_at",
         sql: include_str!("../../migrations/0030_request_log_boot_at.sql"),
     },
+    Migration {
+        version: 31,
+        name: "0031_issues_closed_at",
+        sql: include_str!("../../migrations/0031_issues_closed_at.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
@@ -412,9 +417,17 @@ pub(crate) fn apply_one(conn: &Connection, sql: &str) -> anyhow::Result<()> {
             plain.push('\n');
         }
     }
-    if !plain.trim().is_empty() {
-        conn.execute_batch(&plain)?;
-    }
+    // ADDCOL BEFORE the plain SQL (AMUX-3609). "Add a column, then populate it"
+    // is the natural shape for a backfill migration, and with the old order it
+    // was impossible: the UPDATE ran first and died on `no such column`. Nobody
+    // had hit it because every ADDCOL migration so far only added.
+    //
+    // Safe for the existing 31 because ADDCOL targets tables that already exist
+    // — that is what the directive is FOR (a live Python DB whose tables may or
+    // may not already carry the column). Audited before reordering: no
+    // migration both CREATEs and ADDCOLs the same table, which is the only
+    // arrangement this order would break. `addcol_can_be_used_by_the_same_
+    // migration` pins the new guarantee.
     for (table, column, decl) in addcols {
         if !column_exists(conn, &table, &column)? {
             // Identifiers cannot be bound as parameters; they come from our
@@ -423,6 +436,9 @@ pub(crate) fn apply_one(conn: &Connection, sql: &str) -> anyhow::Result<()> {
                 "ALTER TABLE \"{table}\" ADD COLUMN \"{column}\" {decl};"
             ))?;
         }
+    }
+    if !plain.trim().is_empty() {
+        conn.execute_batch(&plain)?;
     }
     Ok(())
 }
@@ -536,6 +552,87 @@ mod tests {
             .query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rev, 0);
+    }
+
+    /// AMUX-3609's backfill, driven through the SHIPPED migration body rather
+    /// than a paraphrase of its SQL.
+    ///
+    /// The backfill can only recover what the reaper left: `_amux_state_events`
+    /// is swept at 14 days, so ~10,700 of the board's 10,905 rows will end up
+    /// NULL forever. That is the point of the negative cases below — a backfill
+    /// that guessed a date for them would be worse than the NULL, and a test
+    /// with only the positive case would pass against one that did.
+    #[test]
+    fn closed_at_backfill_recovers_only_what_the_journal_still_holds() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all(&mut conn).unwrap();
+
+        conn.execute_batch(
+            "INSERT INTO issues (id,title,desc,status,creator,created,updated) VALUES
+               ('C-CLOSED','a','', 'done',     'x',1,1),
+               ('C-REOPEN','b','', 'doing',    'x',1,1),
+               ('C-REAPED','c','', 'verified', 'x',1,1),
+               ('C-TWICE' ,'d','', 'done',     'x',1,1);
+             INSERT INTO _amux_state_events (rev,entity_type,entity_id,mutation,at,payload) VALUES
+               (1,'task','C-CLOSED','{\"kind\":\"status_changed\",\"from\":\"doing\",\"to\":\"done\"}','2026-08-20T10:00:00.123456+00:00',NULL),
+               -- reopened: its journal says it closed, but it is OPEN now, so
+               -- the backfill must skip it or `closed_at IS NOT NULL` would
+               -- start meaning \"was closed once\".
+               (2,'task','C-REOPEN','{\"kind\":\"status_changed\",\"from\":\"doing\",\"to\":\"done\"}','2026-08-20T11:00:00+00:00',NULL),
+               -- a NON-terminal transition must not be mistaken for a close.
+               (3,'task','C-TWICE','{\"kind\":\"status_changed\",\"from\":\"todo\",\"to\":\"doing\"}','2026-08-19T09:00:00+00:00',NULL),
+               (4,'task','C-TWICE','{\"kind\":\"status_changed\",\"from\":\"doing\",\"to\":\"done\"}','2026-08-20T09:00:00+00:00',NULL),
+               (5,'task','C-TWICE','{\"kind\":\"status_changed\",\"from\":\"done\",\"to\":\"doing\"}','2026-08-21T09:00:00+00:00',NULL),
+               (6,'task','C-TWICE','{\"kind\":\"status_changed\",\"from\":\"doing\",\"to\":\"done\"}','2026-08-22T09:00:00+00:00',NULL);",
+        )
+        .unwrap();
+
+        // Re-run the shipped body. ADDCOL is idempotent; the UPDATE is the part
+        // under test. Reading it from the same include_str the registry uses
+        // means this cannot drift from what production applies.
+        apply_one(&conn, super::MIGRATIONS.iter().find(|m| m.version == 31).unwrap().sql).unwrap();
+
+        let at = |id: &str| -> Option<i64> {
+            conn.query_row("SELECT closed_at FROM issues WHERE id = ?1", [id], |r| r.get(0))
+                .unwrap()
+        };
+
+        // 1787220000 = 2026-08-20T10:00:00Z. The microseconds and the +00:00
+        // offset are parsed by strftime, which is the assumption the migration
+        // rests on — asserted here rather than trusted.
+        assert_eq!(at("C-CLOSED"), Some(1787220000), "a closed card recovers its real close time");
+        assert_eq!(at("C-REOPEN"), None, "a card that is open NOW must not be backfilled from an old close");
+        assert_eq!(at("C-REAPED"), None, "no journal row survives for it: NULL means NOT RECORDED, never a guess");
+        assert_eq!(
+            at("C-TWICE"),
+            Some(1787389200),
+            "2026-08-22T09:00:00Z — the LATEST close, matching the live write rule; MIN would make backfilled rows disagree with every row written after this migration"
+        );
+
+        // Idempotent: the migration is guarded by `closed_at IS NULL`, so a
+        // second run must not disturb what the first wrote.
+        apply_one(&conn, super::MIGRATIONS.iter().find(|m| m.version == 31).unwrap().sql).unwrap();
+        assert_eq!(at("C-CLOSED"), Some(1787220000));
+        assert_eq!(at("C-TWICE"), Some(1787389200));
+    }
+
+    /// A migration must be able to ADD a column and then USE it in the same
+    /// file. Before AMUX-3609 the runner executed plain SQL first and the
+    /// ADDCOLs after, so a backfill died on `no such column` — with nothing in
+    /// the mechanism hinting at the ordering. Nobody hit it because every
+    /// ADDCOL migration until then only added.
+    #[test]
+    fn addcol_can_be_used_by_the_same_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE t (id TEXT PRIMARY KEY, n INTEGER);").unwrap();
+        conn.execute("INSERT INTO t VALUES ('a', 7)", []).unwrap();
+        apply_one(
+            &conn,
+            "-- ADDCOL: t doubled INTEGER\nUPDATE t SET doubled = n * 2;",
+        )
+        .expect("a migration that adds a column and populates it must apply");
+        let got: i64 = conn.query_row("SELECT doubled FROM t WHERE id='a'", [], |r| r.get(0)).unwrap();
+        assert_eq!(got, 14, "the plain SQL must run AFTER the column exists");
     }
 
     #[test]

@@ -3099,7 +3099,7 @@ fn mint_capture_card(
             &format!("capture: title needs self-description — {reason}"),
         ));
     }
-    crate::db::board_store::save_patched(conn, &row)?;
+    crate::db::board_store::save_patched(conn, &mut row)?;
     // `notified` is outside save_patched's SET list; set it so the assignment
     // notifier never re-announces a prompt the worker already received live.
     conn.execute("UPDATE issues SET notified = 1 WHERE id = ?1", rusqlite::params![row.id])?;

@@ -904,7 +904,7 @@ fn fold_capture_for_worker_card(
     c.rev = cap_rev + 1;
     c.version += 1;
     c.updated = now;
-    bs::save_patched(conn, &c)?;
+    bs::save_patched(conn, &mut c)?;
     // Two-fixes rule: the fold leaves a trace, so a sweep can confirm it fires —
     // and can compare fold-count against capture cards STILL discarded by hand (a
     // fold that should have fired but did not). grep "ledger: capture folded".
@@ -3627,7 +3627,7 @@ pub async fn patch_item(
                 next.version = row.version + 1;
             }
             next.updated = now_secs();
-            bs::save_patched(conn, &next)?;
+            bs::save_patched(conn, &mut next)?;
             // AF-137 / AMUX-3464: retiring an auto-filed REPORT re-arms its
             // detector. The filing dedupe is a PERMANENT session_events idem
             // row ("a restart must not refile"), so a discarded report whose
@@ -3964,7 +3964,7 @@ async fn archive_restore(
                     next.rev = row.rev + 1;
                     next.version = i64::try_from(updated.version).unwrap_or(row.version + 1);
                     next.updated = now_secs();
-                    bs::save_patched(conn, &next)?;
+                    bs::save_patched(conn, &mut next)?;
                     let event = ev_snap(&next, MutationKind::Updated);
                     finish(
                         &slot_w,
@@ -4064,7 +4064,7 @@ pub async fn delete_item(
             logged.rev = row.rev + 1;
             logged.version = row.version + 1;
             logged.updated = now_secs();
-            bs::save_patched(conn, &logged)?;
+            bs::save_patched(conn, &mut logged)?;
             if !bs::soft_delete(conn, &id_w)? {
                 return finish(&slot_w, Out::NotFound, no_write());
             }
@@ -4756,7 +4756,7 @@ mod slim_tests {
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
                 source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, deleted INTEGER);
+                epic TEXT, closed_at INTEGER, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));
              CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",

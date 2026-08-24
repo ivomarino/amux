@@ -709,6 +709,15 @@ pub struct IssueRow {
     /// The epic this card rolls up under: the semantic id of a type=epic card,
     /// or NULL (AMUX-2992). Not a foreign key — a dangling id reads as no-epic.
     pub epic: Option<String>,
+    /// When this card entered a TERMINAL status (done/verified/discarded), unix
+    /// seconds; cleared when it leaves one (AMUX-3609).
+    ///
+    /// NULL means NOT RECORDED, never "not closed". Most of the board predates
+    /// the column and its journal rows were reaped at 14 days, so a consumer
+    /// that reads NULL as still-open will be wrong about almost every card.
+    /// Filter on `closed_at IS NOT NULL` when you need a date; `IS NULL` means
+    /// nothing.
+    pub closed_at: Option<i64>,
     /// Append-only history (see [`append_log`]); NULL until first line.
     pub log: Option<String>,
     /// The Python optimistic-concurrency counter (`expect_rev` checks this).
@@ -779,6 +788,12 @@ impl IssueRow {
             "epic": self.epic,
             "source_ref": self.source_ref,
             "last_verified_at": self.last_verified_at,
+            // In BOTH snapshots deliberately, i.e. NOT in `slim_omits`. The
+            // motivating question ("which cards closed in this window") is a
+            // LIST query, so omitting it from the list body would ship the
+            // column and withhold it from its only caller — the AF-161 shape,
+            // twice already (`desc` at c207339, `reviewer` at AF-161).
+            "closed_at": self.closed_at,
             "rev": self.rev,
             "gate": self.gate_criteria(),
             "tags": tags,
@@ -873,7 +888,7 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.gcal_event_id, COALESCE(i.pos,0), COALESCE(i.notified,0), i.gate, i.shepherd, \
      i.type, COALESCE(i.archived,0), i.depends_on, i.reviewer, i.log, \
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
-     i.epic, GROUP_CONCAT(t.tag)";
+     i.epic, i.closed_at, GROUP_CONCAT(t.tag)";
 
 fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
     let depends_raw: Option<String> = r.get(19)?;
@@ -887,7 +902,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
                 .collect()
         })
         .unwrap_or_default();
-    let tags_csv: Option<String> = r.get(27)?;
+    let tags_csv: Option<String> = r.get(28)?;
     let tags = tags_csv
         .unwrap_or_default()
         .split(',')
@@ -922,6 +937,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         last_verified_at: r.get(24)?,
         version: r.get(25)?,
         epic: r.get(26)?,
+        closed_at: r.get(27)?,
         tags,
     })
 }
@@ -1364,19 +1380,74 @@ pub fn soft_delete(conn: &Connection, id: &str) -> rusqlite::Result<bool> {
 /// Python-owned column it does not understand (Phase 11 rollback safety).
 /// The caller is responsible for having bumped `rev`, `version` and
 /// `updated` on the struct (writes bump rev AND version).
-pub fn save_patched(conn: &Connection, row: &IssueRow) -> rusqlite::Result<usize> {
+/// The statuses that mean a card is closed. One list, used by the write rule
+/// and by migration 0031's backfill, so the two cannot disagree about what
+/// "closed" means.
+pub const TERMINAL_STATUSES: [&str; 3] = ["done", "verified", "discarded"];
+
+pub fn is_terminal_status(s: &str) -> bool {
+    TERMINAL_STATUSES.contains(&s)
+}
+
+/// `closed_at` for the row about to be written (AMUX-3609).
+///
+/// Lives INSIDE `save_patched` rather than at the nine call sites that change a
+/// status, deliberately. A rule spread across nine callers is a rule seven of
+/// them will eventually be written without — and ethos rule 6 is explicit that
+/// the fix for that shape is to make the honest path the only path, not to
+/// write a note asking people to remember.
+///
+/// It reads the PREVIOUS status from the database, because the transition is
+/// what the timestamp is about. The tempting stateless version — "if the status
+/// is terminal and `closed_at` is NULL, stamp now" — is wrong in the one case
+/// that matters most: almost every closed card on this board predates the
+/// column and backfilled to NULL, so the next unrelated `desc` append to a card
+/// closed in June would have stamped it closed today. That is a fabricated date
+/// wearing the authority of a real one, which is worse than the NULL it
+/// replaces.
+fn closed_at_for_write(conn: &Connection, row: &IssueRow) -> Option<i64> {
+    let prev: Option<String> = conn
+        .query_row("SELECT status FROM issues WHERE id = ?1", params![row.id], |r| r.get(0))
+        .ok();
+    let was = prev.as_deref().map(is_terminal_status);
+    let now_terminal = is_terminal_status(&row.status);
+    match (was, now_terminal) {
+        // Closing. Stamp the write time the caller already put on `updated`,
+        // so a card's close time and its last-touch agree at the moment of
+        // closing and diverge only afterwards, which is the whole point.
+        (Some(false), true) => Some(row.updated),
+        // Reopening. A card that leaves a terminal status is not closed, and
+        // leaving a stale timestamp behind would make `closed_at IS NOT NULL`
+        // mean "was closed once" while reading like "is closed".
+        (Some(true), false) => None,
+        // Not a transition across the boundary (including the row not existing
+        // yet, where `prev` is None): carry whatever the row holds. This is the
+        // arm that protects an old card's NULL from being overwritten by an
+        // unrelated edit.
+        _ => row.closed_at,
+    }
+}
+
+pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<usize> {
     let dep_json = if row.depends_on.is_empty() {
         None
     } else {
         Some(serde_json::to_string(&row.depends_on).unwrap_or_default())
     };
+    // Written back ONTO the row, not merely into the UPDATE. `replay_roundtrip`
+    // caught this: the state-event journal snapshots the caller's struct, so a
+    // value computed only for the SQL params was absent from the journal and
+    // replaying it could no longer reproduce the live row. Anything derived
+    // inside this function has to land on the row or the journal quietly stops
+    // being a faithful record — which is the one property replay depends on.
+    row.closed_at = closed_at_for_write(conn, row);
     conn.execute(
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
              rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
-             epic = ?22 \
-         WHERE id = ?23 AND deleted IS NULL",
+             epic = ?22, closed_at = ?23 \
+         WHERE id = ?24 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -1400,6 +1471,7 @@ pub fn save_patched(conn: &Connection, row: &IssueRow) -> rusqlite::Result<usize
             row.source_ref,
             row.last_verified_at,
             row.epic,
+            row.closed_at,
             row.id,
         ],
     )
@@ -1669,13 +1741,156 @@ mod tests {
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
                 source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, deleted INTEGER);
+                epic TEXT, closed_at INTEGER, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));
              CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
         )
         .unwrap();
         conn
+    }
+
+    /// AMUX-3609. The write rule lives in `save_patched`, so these drive the
+    /// real function rather than a paraphrase of it.
+    ///
+    /// The third case is the one that motivated putting the rule behind the
+    /// previous status instead of behind `closed_at IS NULL`: almost every
+    /// closed card on this board predates the column and backfilled to NULL, so
+    /// a stateless rule would stamp a card closed in June with today's date on
+    /// its next unrelated edit. A fabricated date wearing the authority of a
+    /// real one is worse than the NULL it replaces.
+    #[test]
+    fn closed_at_records_the_transition_not_the_touch() {
+        let conn = create_db();
+        let mut row = create_issue(&conn, &new_card("doing"), 1000).expect("create");
+        assert_eq!(row.closed_at, None, "an open card has no close time");
+
+        // 1. Closing stamps it.
+        row.status = "done".into();
+        row.updated = 2000;
+        save_patched(&conn, &mut row).unwrap();
+        let after_close = get_issue(&conn, &row.id).unwrap().unwrap();
+        assert_eq!(after_close.closed_at, Some(2000), "closing must stamp the close time");
+
+        // 2. An UNRELATED edit while already closed must not move it. This is
+        //    what makes the field mean "when it closed" rather than "when it
+        //    was last touched while closed", which would just be `updated`
+        //    again and would reproduce the whole bug one column over.
+        let mut touched = after_close.clone();
+        touched.desc = "a later comment".into();
+        touched.updated = 5000;
+        save_patched(&conn, &mut touched).unwrap();
+        assert_eq!(
+            get_issue(&conn, &row.id).unwrap().unwrap().closed_at,
+            Some(2000),
+            "commenting on a closed card must not restamp its close time"
+        );
+
+        // 3. THE FABRICATION CASE. A card that is already closed and carries a
+        //    NULL close time (every pre-column row whose journal was reaped)
+        //    must stay NULL through an unrelated edit. Honest ignorance beats a
+        //    confident wrong date.
+        conn.execute(
+            "UPDATE issues SET closed_at = NULL WHERE id = ?1",
+            params![row.id],
+        )
+        .unwrap();
+        let mut legacy = get_issue(&conn, &row.id).unwrap().unwrap();
+        assert_eq!(legacy.closed_at, None, "fixture must actually be NULL or this proves nothing");
+        legacy.desc = "another comment".into();
+        legacy.updated = 9000;
+        save_patched(&conn, &mut legacy).unwrap();
+        assert_eq!(
+            get_issue(&conn, &row.id).unwrap().unwrap().closed_at,
+            None,
+            "an unrelated edit must NOT invent a close date for a card that never recorded one"
+        );
+
+        // 4. Reopening clears it. Leaving a stale stamp would make
+        //    `closed_at IS NOT NULL` mean "was closed once" while reading like
+        //    "is closed".
+        // The card is currently `done` with a NULL stamp (case 3 left it there),
+        // so REOPEN first — setting `done` on a card that is already `done` is
+        // not a transition and would prove nothing. The first draft of this
+        // test did exactly that and went red, which is the check working.
+        let mut back = get_issue(&conn, &row.id).unwrap().unwrap();
+        back.status = "doing".into();
+        back.updated = 9_500;
+        save_patched(&conn, &mut back).unwrap();
+        assert_eq!(get_issue(&conn, &row.id).unwrap().unwrap().closed_at, None);
+
+        let mut reclosed = get_issue(&conn, &row.id).unwrap().unwrap();
+        reclosed.status = "done".into();
+        reclosed.updated = 10_000;
+        save_patched(&conn, &mut reclosed).unwrap();
+        assert_eq!(
+            get_issue(&conn, &row.id).unwrap().unwrap().closed_at,
+            Some(10_000),
+            "re-closing stamps the LATEST close, matching what the 0031 backfill picks (MAX, not MIN)"
+        );
+
+        let mut back2 = get_issue(&conn, &row.id).unwrap().unwrap();
+        back2.status = "doing".into();
+        back2.updated = 11_000;
+        save_patched(&conn, &mut back2).unwrap();
+        assert_eq!(
+            get_issue(&conn, &row.id).unwrap().unwrap().closed_at,
+            None,
+            "reopening must clear the close time"
+        );
+    }
+
+    /// All three terminal statuses stamp, and a non-terminal one does not.
+    /// Without the negative this passes just as well against `is_terminal_status`
+    /// returning true for everything, which would stamp every card on every
+    /// write and make the column another spelling of `updated`.
+    #[test]
+    fn every_terminal_status_closes_and_no_other_one_does() {
+        for st in ["done", "verified", "discarded"] {
+            let conn = create_db();
+            let mut row = create_issue(&conn, &new_card("doing"), 1000).expect("create");
+            row.status = st.into();
+            row.updated = 4242;
+            save_patched(&conn, &mut row).unwrap();
+            assert_eq!(
+                get_issue(&conn, &row.id).unwrap().unwrap().closed_at,
+                Some(4242),
+                "{st} is terminal and must stamp"
+            );
+        }
+        for st in ["todo", "doing", "review", "backlog"] {
+            let conn = create_db();
+            let mut row = create_issue(&conn, &new_card("todo"), 1000).expect("create");
+            row.status = st.into();
+            row.updated = 4242;
+            save_patched(&conn, &mut row).unwrap();
+            assert_eq!(
+                get_issue(&conn, &row.id).unwrap().unwrap().closed_at,
+                None,
+                "{st} is not terminal and must not stamp"
+            );
+        }
+    }
+
+    /// The column must reach the LIST, not only the full card. The board's slim
+    /// payload has now dropped a needed column twice (`desc` at c207339,
+    /// `reviewer` at AF-161), and the motivating question here — which cards
+    /// closed in this window — is a list query, so omitting it would ship the
+    /// column and withhold it from its only caller.
+    #[test]
+    fn closed_at_is_in_the_slim_list_payload_not_only_the_full_card() {
+        let conn = create_db();
+        let mut row = create_issue(&conn, &new_card("doing"), 1000).expect("create");
+        row.status = "done".into();
+        row.updated = 7777;
+        save_patched(&conn, &mut row).unwrap();
+        let closed = get_issue(&conn, &row.id).unwrap().unwrap();
+        assert_eq!(closed.snapshot()["closed_at"], 7777);
+        assert_eq!(
+            closed.snapshot_slim()["closed_at"],
+            7777,
+            "a list consumer must be able to read the close time without fetching every card"
+        );
     }
 
     fn new_card(status: &str) -> NewIssue {
@@ -1911,6 +2126,7 @@ mod tests {
             rev: 0,
             source_ref: None,
             last_verified_at: None,
+            closed_at: None,
             version: 0,
             tags: vec![],
         };
@@ -2012,7 +2228,7 @@ mod configured_gate_tests {
             due_time: None, pinned: 0, gcal_event_id: None, pos: 0.0, notified: 0,
             gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
             archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
-            source_ref: None, last_verified_at: None, version: 0, tags: vec![],
+            source_ref: None, last_verified_at: None, closed_at: None, version: 0, tags: vec![],
         }
     }
 
