@@ -1909,6 +1909,16 @@ async fn stats(
                             "status": status, "latency_ms": round2(latency_ms),
                             "family": family, "family_p50_ms": round2(p50),
                             "ratio": round2(latency_ms / p50), "worker": worker,
+                            // AMUX-3647: how far into its own process's life this
+                            // request ARRIVED. A row a few seconds in was competing
+                            // with a cold cache, migrations and ~15 background
+                            // loops, and until 2026-08-24 rows like that were
+                            // deleted from this list by latency arithmetic that
+                            // claimed to be a restart filter. Reported rather than
+                            // hidden, so the reader makes that call with the number
+                            // in front of them. NULL means the row predates
+                            // migration 0030.
+                            "since_boot_s": row_boot.map(|b| round2(ts - b)),
                         }),
                     ));
                 }
@@ -2988,39 +2998,40 @@ mod tests {
         assert!(cell3.contains("GET-only"), "{cell3}");
     }
 
-    /// A row whose CLOCK spans a restart is not a slow request (AF-186).
+    /// A slow request near a restart is REPORTED with its age, not deleted
+    /// (AMUX-3647, superseding this cell's AF-186 shape).
     ///
-    /// autofix stopped counting these in AF-175. /api/logs/stats — the endpoint
-    /// a human opens — still did, and on 2026-08-24 the daily sweep's
-    /// slow_outliers was six of them at 33-58s, completing 5s apart with
-    /// latencies falling by exactly 5s, against a family p50 of 0.3ms. One
-    /// dashboard poll draining across a restart, rendered as six slow requests.
+    /// AF-186 was right that `/api/logs/stats` was rendering an outage as six
+    /// slow requests, and wrong about the mechanism, and this test encoded the
+    /// wrong one: its specimen was `ts = boot + 20` with a 120s latency,
+    /// described as "arrived 100s before the boot". `ts` is the request START,
+    /// so that row arrived 20 seconds AFTER its boot. The old predicate excluded
+    /// it through latency arithmetic and this cell certified the arithmetic.
     ///
-    /// THE CONTROL IS THE SECOND HALF and it is the one that matters: a
-    /// genuinely slow request that ARRIVED AFTER the boot must still appear.
-    /// Large is not exempt; only crossing the boundary is. Without that cell a
-    /// filter excluding everything passes.
+    /// Measured before rewriting it: 0 of 97,019 live rows carrying a `boot_at`
+    /// have `ts < boot_at`, and all 4 rows the arithmetic excluded in 24h were
+    /// ordinary slow requests arriving 2 to 15 seconds after a boot. Two were
+    /// the `GET /api/sessions-git` cache stampede (AMUX-3684), so this filter
+    /// was deleting a live defect's evidence from the list a human reads.
+    ///
+    /// THE CLAIM NOW: near-a-restart is CONTEXT, not a reason to drop a row.
+    /// Both slow rows appear, each carrying `since_boot_s`, and the reader
+    /// decides. The exclusion still exists for a row that genuinely predates
+    /// its own process, and still publishes its count including zero.
     #[tokio::test]
-    async fn stats_does_not_report_a_restart_spanning_row_as_a_slow_one() {
+    async fn stats_reports_a_slow_row_near_a_restart_and_says_how_near() {
         let (store, _dir) = store();
         let now = unix_now();
         let boot = now - 300.0;
-        // NB `ts` is the request START (stamped at line 275, before the handler
-        // runs; migration 0010 documents it and AMUX-3647 measured it). The
-        // predicate under test reduces to `latency > ts - boot`, so read these
-        // three seeds as "how long after ITS OWN process booted did this request
-        // arrive, and did it run longer than that".
-        //
         // A fast baseline so p50 is small and the threshold (5x p50) is low.
         for i in 0..8 {
             seed_boot(&store, now - 200.0 + i as f64, "/api/board", 5.0, Some(boot)).await;
         }
-        // THE SPECIMEN: arrived 20s after its boot and ran 120s, so it spent
-        // 100s of that waiting through the process's own startup.
+        // AF-186's own specimen, read correctly: ARRIVED 20s after its process
+        // booted and ran 120s. Startup contention is a plausible cause and this
+        // endpoint is not the place that decides.
         seed_boot(&store, boot + 20.0, "/api/board", 120_000.0, Some(boot)).await;
-        // THE CONTROL: equally slow, but it arrived 120s after its boot, so the
-        // whole 120s is service time. Excluding it would be excluding a real
-        // slow request, which is the failure direction nobody notices.
+        // The far-from-boot twin: equally slow, 120s into its process's life.
         seed_boot(&store, now - 10.0, "/api/board", 120_000.0, Some(now - 130.0)).await;
 
         let api = logs_api(store.clone());
@@ -3035,43 +3046,68 @@ mod tests {
         let outliers = v["slow_outliers"].as_array().unwrap();
         assert_eq!(
             outliers.len(),
-            1,
-            "the spanning row must be gone and the genuinely slow one must remain: {outliers:?}"
+            2,
+            "BOTH slow rows must be reported: the one near a boot was excluded until \
+             AMUX-3647, in the under-reporting direction nobody notices: {outliers:?}"
         );
-        // IDENTIFY the survivor, do not bit-compare it. `assert_eq!` on a
-        // serde_json f64 is an equality of BITS, and this one crosses a JSON
-        // encode/decode boundary: the endpoint emits `now - 10.0` through ryu
-        // and the test parses the text back. That round trip came back one ULP
-        // high on a GitHub runner on 2026-08-24 (1787580761.0102837 vs
-        // ...835 — 2.4e-7 apart at this magnitude, which is exactly 1 ULP) and
-        // failed the run. It reproduces on no local run in 150.
-        //
-        // The bit-equality was never the claim. The claim is WHICH ROW
-        // SURVIVED, and the candidates are 183 seconds apart at the closest
-        // (the baselines sit at now-200..now-193, the spanning specimen at
-        // now-280). A millisecond window is five orders of magnitude tighter
-        // than it needs to be to discriminate, and it stops the test asserting
-        // a property of serde_json's float parser instead of a property of
-        // this endpoint.
-        let got = outliers[0]["ts"].as_f64().expect("outlier ts is a number");
+        // IDENTIFY rows by an approximate ts, never a bit-compare. `assert_eq!`
+        // on a serde_json f64 is an equality of BITS, and this crosses a JSON
+        // encode/decode boundary: a round trip came back one ULP high on a
+        // GitHub runner on 2026-08-24 (1787580761.0102837 vs ...835) and failed
+        // the run, reproducing on no local run in 150. The candidates here are
+        // seconds apart, so a millisecond window discriminates fine and stops
+        // this asserting a property of serde_json's float parser.
+        let at = |want: f64| {
+            outliers
+                .iter()
+                .find(|o| (o["ts"].as_f64().unwrap() - want).abs() < 1e-3)
+                .unwrap_or_else(|| panic!("no outlier at ts {want}: {outliers:?}"))
+        };
+
+        // THE REPLACEMENT INSTRUMENT. The exclusion used to make this judgment
+        // silently and got it wrong; the number makes it the reader's.
+        let near = at(boot + 20.0);
         assert!(
-            (got - (now - 10.0)).abs() < 1e-3,
-            "the survivor is the one after boot: got {got}, want {}, off by {}s ({:?})",
-            now - 10.0,
-            got - (now - 10.0),
-            outliers[0]
+            (near["since_boot_s"].as_f64().expect("since_boot_s must be a number") - 20.0).abs()
+                < 1e-3,
+            "the near-boot row must say HOW near, or hiding it and showing it are equally \
+             uninformative: {near}"
+        );
+        let far = at(now - 10.0);
+        assert!(
+            (far["since_boot_s"].as_f64().unwrap() - 120.0).abs() < 1e-3,
+            "and the far row must say so too, or the field only appears when it is alarming \
+             and its absence becomes the signal: {far}"
         );
 
-        // THE EXCLUSION IS PUBLISHED, NOT SILENT. A detector that quietly drops
-        // rows is one nobody can audit (AF-178), and a zero here is what tells a
-        // reader the exclusion RAN.
-        assert_eq!(v["totals"]["restart_spanning_excluded"], json!(1), "{v}");
+        // THE EXCLUSION STILL EXISTS AND STILL PUBLISHES. A row stamped before
+        // its own process booted is the one thing that spans a restart. It
+        // cannot happen today (0 of 97,019), which is exactly why it is seeded
+        // here: an unreachable branch nobody exercises is one that rots.
+        seed_boot(&store, boot - 5.0, "/api/board", 120_000.0, Some(boot)).await;
+        let (_, body2) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v2: Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(v2["totals"]["restart_spanning_excluded"], json!(1), "{v2}");
+        assert_eq!(
+            v2["slow_outliers"].as_array().unwrap().len(),
+            2,
+            "and the pre-boot row must not reach the list: {v2}"
+        );
+
+        // AF-178: the count is published even when it is ZERO, so "the filter
+        // ran and dropped nothing" is not the same silence as "no filter ran".
+        // This is the assertion that keeps the now-structurally-false predicate
+        // from becoming an invisible no-op.
+        assert_eq!(v["totals"]["restart_spanning_excluded"], json!(0), "{v}");
         let board = v["families"].as_array().unwrap().iter()
             .find(|f| f["family"] == "/api/board").unwrap();
-        assert_eq!(board["restart_spanning_excluded"], json!(1), "{board}");
-        // And it is out of the latency statistics too, not merely the list.
-        assert_eq!(board["count"], 9, "8 fast + the control, not the spanning row: {board}");
-        assert_eq!(board["max_ms"], 120_000.0, "the CONTROL is still the max — it is real: {board}");
+        assert_eq!(board["restart_spanning_excluded"], json!(0), "{board}");
+        assert_eq!(board["count"], 10, "8 fast + both slow rows: {board}");
+        assert_eq!(board["max_ms"], 120_000.0, "{board}");
     }
 
     /// Insert with an explicit `boot_at`, which `seed` does not carry.

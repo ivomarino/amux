@@ -720,6 +720,28 @@ async fn async_main() {
     legacy_port::publish_endpoint(&cfg.amux_home, cfg.port, None);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], cfg.port));
+    // HOW LONG AFTER `record_boot` DID WE ACTUALLY START SERVING (AMUX-3647).
+    //
+    // The card proposed a `ready_at` COLUMN on `_amux_request_log` so the
+    // restart filter could ask "did this request arrive before the server was
+    // serving". It cannot: nothing accepts a connection before this bind, so
+    // `ts < ready_at` is false for every row, and the column would have bought
+    // a schema change and no rows. The load-bearing assumption is that this gap
+    // is small, and asserting that in a comment is exactly the shape this repo
+    // keeps getting wrong, so it is MEASURED on every boot instead. If it is
+    // ever seconds rather than milliseconds, the number is already in the log
+    // and the column argument can be reopened with evidence.
+    //
+    // Note what it does NOT include: migrations. Those run inside
+    // `Store::open`, before `record_boot`, with the port closed. A 186-second
+    // migration (0031, 2026-08-24) shows up as downtime and connection-refused,
+    // never as a slow request.
+    if let Some(b) = runtime_jobs::heartbeat::boot_at() {
+        tracing::info!(
+            ready_after_boot_ms = ((runtime_jobs::registry::unix_now() - b) * 1000.0).round(),
+            "ready: binding the listener; no request can be stamped before this instant"
+        );
+    }
     tracing::info!(%addr, "listening (https, plain-http redirected)");
     let acceptor = tls::RedirectingAcceptor::new(
         axum_server::tls_rustls::RustlsAcceptor::new(rustls_cfg),

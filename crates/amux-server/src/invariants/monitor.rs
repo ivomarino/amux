@@ -93,6 +93,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
 
     // -- 5b. do the `ts` columns hold what their readers assume? (AF-184)
     out.extend(timestamp_units_check(state));
+    out.extend(arrival_follows_boot_check(state));
 
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
     // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
@@ -545,6 +546,32 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     }
     let now = crate::runtime_jobs::registry::unix_now();
     checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now)
+}
+
+/// Gather what [`checks::request_arrival_follows_boot`] needs (AMUX-3647).
+///
+/// ONE query, both numbers, over the indexed `ts` range. Counting the rows that
+/// CARRY a boot_at in the same pass is what lets the check distinguish "the
+/// invariant holds" from "the column stopped being written", which are the two
+/// states a bare violation count cannot tell apart.
+fn arrival_follows_boot_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "reqlog.arrival_follows_boot";
+    const WINDOW_H: f64 = 24.0;
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let cutoff = crate::runtime_jobs::registry::unix_now() - WINDOW_H * 3600.0;
+    match conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(ts < boot_at), 0) FROM _amux_request_log \
+         WHERE ts >= ?1 AND boot_at IS NOT NULL",
+        [cutoff],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ) {
+        Ok((with_boot, before)) => {
+            checks::request_arrival_follows_boot(with_boot, before, WINDOW_H)
+        }
+        Err(e) => vec![InvariantResult::unknown(ID, format!("request log unreadable: {e}"))],
+    }
 }
 
 fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {

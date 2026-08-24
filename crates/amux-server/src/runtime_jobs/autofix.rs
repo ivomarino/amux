@@ -779,33 +779,53 @@ fn spans_restart(ts: f64, latency_ms: f64, boot: Option<f64>) -> bool {
 /// "before the current boot" matching every legitimately old row — the trap
 /// that excluded 213,420 of 213,935 rows when it was omitted.
 ///
-/// WHAT THIS ACTUALLY TESTS, WHICH IS NOT WHAT IT IS NAMED (AMUX-3647).
+/// THE LATENCY ARITHMETIC IS GONE (AMUX-3647, fixed 2026-08-24).
 ///
-/// `ts` is the request START, not its completion. `request_log.rs` stamps it at
-/// line 275, before `next.run(req).await`, and migration 0010 says so in the
-/// column comment. Measured rather than read: a request bracketed by wall-clock
-/// marks logged `ts` 52ms after the PRE mark and 758ms before the POST mark,
-/// with `ts + latency` landing on the post mark.
+/// `ts` is the request START. `request_log.rs` stamps it before
+/// `next.run(req).await` and migration 0010 says so in the column comment, so
+/// `ts - latency` names a moment BEFORE the request existed. The old expression
+/// `ts - latency/1000 < b` therefore reduced to `latency > ts - b`: the request
+/// was in flight longer than its own process had been up when it arrived. That
+/// is not "spanned a restart" and it never was.
 ///
-/// So `ts - latency` is a moment BEFORE the request existed, and the expression
-/// below reduces to `latency > ts - boot`: the request was in flight longer than
-/// this process had been up when it arrived. That is a real and useful class —
-/// it is exactly a request that waited through the process's own startup, which
-/// is the 186-second migration stall of 2026-08-24 (see 0032's header) — but it
-/// is not "the row's clock spanned a restart", and a row's clock CANNOT span its
-/// own process's restart, because `ts >= boot` by construction.
+/// MEASURED against the live table before changing it, because the card filing
+/// this credited the wrong expression with being accidentally right, and it is
+/// not:
 ///
-/// The consequence is a real false exclusion in one direction: a genuinely slow
-/// request that ARRIVES within `latency` seconds of a boot is dropped from the
-/// outlier list and from the latency statistics. This server restarts on every
-/// commit the fleet makes (~27/day) and the dashboard polls every ~5s, so that
-/// window is routinely occupied. AMUX-3647 carries the fix, which is to stop
-/// doing latency arithmetic and compare against a recorded `ready_at` — the
-/// instant the server began serving, which it knows and does not store.
+///   - 0 of 97,019 rows carrying a `boot_at` have `ts < boot_at`. A request
+///     cannot arrive before its own process bound the listener, and the startup
+///     order makes that structural: migrations run inside `Store::open`,
+///     `record_boot` stamps the boot immediately after, and the bind is four
+///     hundred lines later. `checks.rs` pins the same relation from the units
+///     side.
+///   - ALL 4 rows the old expression excluded in 24h were ordinary slow
+///     requests that ARRIVED 2.1s, 2.9s, 14.6s and 15.2s after a boot. None of
+///     them spanned anything. Two were `GET /api/sessions-git` at ~15s, which
+///     is the cache stampede fixed under AMUX-3684. This filter was deleting
+///     that defect's own evidence from `slow_outliers` while it was live.
 ///
-/// A NULL `boot_at` is a legacy row from before the column existed, and falls
-/// back to the process-boot comparison rather than being treated as "did not
-/// span". Absence is not evidence, and this table retains a week.
+/// In a full day the predicate produced false exclusions and nothing else, in
+/// the under-reporting direction nobody notices.
+///
+/// WHY NOT THE `ready_at` COLUMN THE CARD PRESCRIBES: it would be a filter that
+/// matches nothing. `ready_at` can only mean the instant the listener binds, and
+/// no request can be stamped before that, so `ts < ready_at` is false for the
+/// same structural reason `ts < boot_at` is. It would buy a schema change and
+/// zero rows. The gap it was meant to measure is logged at startup instead
+/// (`ready_after_boot_ms`, lib.rs), so if the assumption ever stops holding the
+/// number is already on the record rather than being argued about.
+///
+/// WHAT REPLACED THE EXCLUSION. Nothing hides these rows now; they are
+/// ANNOTATED. `/api/logs/stats` carries `since_boot_s` on every outlier and the
+/// outlier finding says how far into its process's life the worst request
+/// arrived. A reader sees "2.9s after a restart" instead of being silently
+/// protected from the row, which answers AF-186's real concern (a lane
+/// investigating an endpoint that was never broken) without discarding evidence.
+///
+/// A NULL `boot_at` is a legacy row from before the column existed (the newest
+/// is 2026-08-23 23:12) and falls back to the process-boot comparison rather
+/// than being treated as "did not span". Absence is not evidence, and this table
+/// retains a week.
 pub(crate) fn spans_own_restart(
     ts: f64,
     latency_ms: f64,
@@ -813,7 +833,14 @@ pub(crate) fn spans_own_restart(
     proc_boot: Option<f64>,
 ) -> bool {
     match row_boot {
-        Some(b) => ts - latency_ms / 1000.0 < b,
+        // Says exactly what it means, and is structurally false today. Written
+        // as the comparison rather than a bare `false` so the semantics stay
+        // readable at the call sites, and so it starts working on its own if
+        // the architecture ever lets a request predate its process's boot (an
+        // inherited listener, socket activation). The `excluded=` counters at
+        // every call site publish the zero, so this cannot become a silent
+        // filter that matches nothing.
+        Some(b) => ts < b,
         None => spans_restart(ts, latency_ms, proc_boot),
     }
 }
@@ -1129,7 +1156,25 @@ pub(crate) fn detect_latency_at(
     }
 
     // Single-request outliers: one card per (method, target), not per request.
-    let mut seen: BTreeMap<(String, String), (u64, f64, f64, String)> = BTreeMap::new();
+    //
+    // A NAMED STRUCT rather than the 5-tuple this started as. Clippy asked for
+    // a type alias and was complaining about the right thing for the right
+    // reason: the fifth field is `worst_since_boot`, and `e.4` is not something
+    // a reader can check against the evidence line it feeds.
+    struct OutlierGroup {
+        n: u64,
+        worst_ms: f64,
+        last_ts: f64,
+        sample: String,
+        /// AMUX-3647: seconds between the WORST row's arrival and the boot of
+        /// the process that served it. Rows landing near a boot used to be
+        /// excluded outright, so a lane never saw them at all; they are filed
+        /// now WITH the context that separates startup contention from an
+        /// endpoint defect, which is what AF-186 wanted and the exclusion only
+        /// approximated. `None` for a row predating migration 0030.
+        worst_since_boot: Option<f64>,
+    }
+    let mut seen: BTreeMap<(String, String), OutlierGroup> = BTreeMap::new();
     // AF-175: THIS shape is where the reported incident came from, and it had no
     // restart exclusion at all. The first fix put `spans_restart` in the p95 loop
     // above — a real improvement to a different question. The card's verdict
@@ -1165,12 +1210,22 @@ pub(crate) fn detect_latency_at(
                     continue;
                 }
                 let target = rl::normalize_target(&path);
-                let e = seen
-                    .entry((method.clone(), target))
-                    .or_insert((0, 0.0, ts, format!("{method} {path} → {status}")));
-                e.0 += 1;
-                e.1 = e.1.max(ms);
-                e.2 = e.2.max(ts);
+                let e = seen.entry((method.clone(), target)).or_insert_with(|| OutlierGroup {
+                    n: 0,
+                    worst_ms: 0.0,
+                    last_ts: ts,
+                    sample: format!("{method} {path} → {status}"),
+                    worst_since_boot: None,
+                });
+                e.n += 1;
+                // The age travels WITH the worst latency, so the evidence line
+                // describes the request the title quotes rather than whichever
+                // row happened to be last.
+                if ms > e.worst_ms {
+                    e.worst_ms = ms;
+                    e.worst_since_boot = row_boot.map(|b| ts - b);
+                }
+                e.last_ts = e.last_ts.max(ts);
             }
         }
     }
@@ -1205,14 +1260,14 @@ pub(crate) fn detect_latency_at(
     // is also ONE fault and also belongs in one card.
     let candidates: Vec<_> = seen
         .iter()
-        .filter(|((_, target), (_, worst, _, _))| *worst > design_budget_ms(target))
+        .filter(|((_, target), g)| g.worst_ms > design_budget_ms(target))
         .collect();
     let distinct_targets: std::collections::BTreeSet<&String> =
         candidates.iter().map(|((_, t), _)| t).collect();
     if distinct_targets.len() >= outlier_rollup_at() {
         let n_t = distinct_targets.len();
-        let worst_ms = candidates.iter().map(|(_, (_, w, _, _))| *w).fold(0.0f64, f64::max);
-        let last = candidates.iter().map(|(_, (_, _, ts, _))| *ts).fold(0.0f64, f64::max);
+        let worst_ms = candidates.iter().map(|(_, g)| g.worst_ms).fold(0.0f64, f64::max);
+        let last = candidates.iter().map(|(_, g)| g.last_ts).fold(0.0f64, f64::max);
         let targets: Vec<String> = distinct_targets.iter().map(|t| (*t).clone()).collect();
         out.push(Finding {
             kind: DetectorKind::Latency,
@@ -1234,6 +1289,28 @@ pub(crate) fn detect_latency_at(
   "))),
                 ("worst_ms".into(), format!("{worst_ms:.0}")),
                 ("last_seen".into(), rl::local_when(last)),
+                // AMUX-3647: the cheapest way to name a SERVER-WIDE fault the
+                // verdict above tells the reader to go looking for. N endpoints
+                // slow at once, all of them a few seconds into the same
+                // process's life, is a restart, and saying so here saves the
+                // lane the pivot to sqlite. These rows were previously excluded
+                // wholesale, which "named" it by deleting it.
+                ("arrived_into_process_life".into(), {
+                    let ages: Vec<f64> =
+                        candidates.iter().filter_map(|(_, g)| g.worst_since_boot).collect();
+                    match (ages.iter().cloned().fold(f64::INFINITY, f64::min),
+                           ages.iter().cloned().fold(f64::NEG_INFINITY, f64::max)) {
+                        _ if ages.len() < candidates.len() => format!(
+                            "{} of {} worst-rows carry a boot_at; the rest predate the column",
+                            ages.len(), candidates.len()
+                        ),
+                        (lo, hi) => format!(
+                            "worst request per endpoint arrived {lo:.1}s to {hi:.1}s after its \
+                             server process booted. A tight range in the first seconds means a \
+                             RESTART, not {n_t} slow endpoints."
+                        ),
+                    }
+                }),
                 ("rollup_threshold".into(), format!(
                     "{} distinct targets (AMUX_OUTLIER_ROLLUP_AT)", outlier_rollup_at()
                 )),
@@ -1256,7 +1333,11 @@ pub(crate) fn detect_latency_at(
         return (out, suppressed);
     }
 
-    for ((method, target), (n, worst, last_ts, sample)) in seen {
+    for (
+        (method, target),
+        OutlierGroup { n, worst_ms: worst, last_ts, sample, worst_since_boot },
+    ) in seen
+    {
         // AMUX-3485: for long-by-design endpoints the effective threshold is
         // their design budget, not the global outlier floor.
         if worst <= design_budget_ms(&target) {
@@ -1289,6 +1370,31 @@ pub(crate) fn detect_latency_at(
                 ("sample_request".into(), sample),
                 ("threshold_ms".into(), format!("{:.0}", outlier_ms())),
                 ("last_seen".into(), rl::local_when(last_ts)),
+                // AMUX-3647. Until 2026-08-24 a row that arrived within
+                // `latency` seconds of a boot was DROPPED here, so this card
+                // did not exist for that request and nobody could weigh it.
+                // Two of the four rows excluded in the preceding 24h were the
+                // AMUX-3684 sessions-git stampede, whose whole signature is
+                // four clients missing a cold cache right after a restart.
+                // Reported with its age instead of hidden: a reader can rule a
+                // restart in or out, which is the judgment the filter was
+                // making silently and getting wrong.
+                ("arrived_into_process_life".into(), match worst_since_boot {
+                    Some(s) if s < 60.0 => format!(
+                        "{s:.1}s after its server process booted. Check a RESTART before this \
+                         endpoint: a cold cache, migrations, and ~15 background loops all start \
+                         competing at t=0 (see /health boot_gap and 0032's header)."
+                    ),
+                    Some(s) if s < 3600.0 => format!(
+                        "{:.1} minutes into its server process's life, so a restart is not the story",
+                        s / 60.0
+                    ),
+                    Some(s) => format!(
+                        "{:.1}h into its server process's life, so a restart is not the story",
+                        s / 3600.0
+                    ),
+                    None => "unknown: the row predates the boot_at column (migration 0030)".into(),
+                }),
             ],
             recheck: format!(
                 "sqlite3 ~/.amux/amux.db \"SELECT datetime(ts,'unixepoch','localtime'), \
@@ -6318,34 +6424,59 @@ mod tests {
         );
     }
 
-    /// AF-175: the exclusion is a property of the ROW, so it works for every
-    /// restart in the window rather than only the most recent one.
+    /// AMUX-3647: `ts` is the request START, so a row's own boot excludes on
+    /// `ts < boot_at` and NEVER on latency arithmetic.
     ///
-    /// The process-boot form (`spans_restart`) can only ever catch rows that
-    /// span the CURRENT boot. This server restarts ~27 times a day against
-    /// detector windows measured in hours, so every earlier restart inside the
-    /// window was structurally invisible — not a tuning problem, a shape
-    /// problem, and no fixture built around one boot can expose it.
+    /// THE FIXTURES ARE THE LIVE SPECIMENS, not shapes chosen to be convenient.
+    /// Each `arrived_*` row below is one of the four rows the old expression
+    /// excluded from `slow_outliers` in the 24h to 2026-08-24 18:00, with its
+    /// real age-since-boot and its real latency. Every one of them was an
+    /// ordinary slow request, and every one goes RED against the old code, which
+    /// is what makes this cell discriminate rather than describe.
+    ///
+    /// It also pins the semantics that are currently UNREACHABLE in production
+    /// (`ts < boot_at`, measured 0 of 97,019 rows). That is deliberate: the
+    /// predicate says what it means, and if an inherited listener ever lets a
+    /// request predate its process's boot, the behaviour is already specified
+    /// and already tested rather than being re-derived under incident pressure.
     #[test]
-    fn a_restart_earlier_in_the_window_is_still_excluded() {
+    fn a_row_is_excluded_on_arrival_before_its_boot_never_on_latency() {
         let now = 1_787_000_000.0;
         let old_boot = now - 40_000.0; // ~11h ago, several restarts back
         let cur_boot = now - 300.0;    // the process running now
 
-        // THE ROW THE OLD FORM COULD NOT SEE: logged by a process that booted
-        // 11h ago, and it spanned THAT boot. Under the process-boot predicate
-        // it is invisible, because it neither started before nor finished after
-        // the CURRENT boot.
-        let ts = old_boot + 14.0;
-        let ms = 58_400.0; // the incident's own shape: a ~58s "request"
+        // THE FOUR LIVE FALSE EXCLUSIONS. (age since its own boot, latency ms).
+        // The last two are `GET /api/sessions-git` during the AMUX-3684
+        // stampede: the filter was removing that defect's own evidence.
+        for (age_s, ms, what) in [
+            (2.06, 2_445.0, "POST /api/git/staged-guard 11:15:50"),
+            (2.929, 3_326.0, "POST /api/git/staged-guard 14:38:48"),
+            (14.601, 14_949.0, "GET /api/sessions-git 12:03:23 (AMUX-3684 stampede)"),
+            (15.195, 15_577.0, "GET /api/sessions-git 12:03:23 (AMUX-3684 stampede)"),
+        ] {
+            let ts = old_boot + age_s;
+            assert!(
+                ts - ms / 1000.0 < old_boot,
+                "premise: {what} is a row the OLD latency arithmetic excluded — if this ever \
+                 fails the assertion below is not testing the fix"
+            );
+            assert!(
+                !spans_own_restart(ts, ms, Some(old_boot), Some(cur_boot)),
+                "{what} arrived {age_s}s AFTER its own boot and took {:.1}s. It is a slow \
+                 request, not a restart, and dropping it under-reports in the direction \
+                 nobody notices",
+                ms / 1000.0
+            );
+        }
+
+        // THE SEMANTICS, unreachable today and specified anyway.
         assert!(
-            !spans_restart(ts, ms, Some(cur_boot)),
-            "precondition: the process-boot form cannot see this row — that is the defect, \
-             and if this ever fails the test below proves nothing"
+            spans_own_restart(old_boot - 1.0, 500.0, Some(old_boot), Some(cur_boot)),
+            "a row stamped BEFORE its own process booted is the only thing that spans it"
         );
         assert!(
-            spans_own_restart(ts, ms, Some(old_boot), Some(cur_boot)),
-            "the row's own boot must catch a restart earlier in the window"
+            !spans_own_restart(old_boot, 500.0, Some(old_boot), Some(cur_boot)),
+            "and the boundary is exclusive: arriving exactly at boot is not before it"
         );
 
         // ONE-SIDED IS SAFE HERE, and that is the point of carrying the row's
@@ -6356,14 +6487,6 @@ mod tests {
         assert!(
             !spans_own_restart(old_boot + 3600.0, 500.0, Some(old_boot), Some(cur_boot)),
             "an ordinary fast request well after its own boot must be kept"
-        );
-        assert!(
-            !spans_own_restart(old_boot + 1.0, 500.0, Some(old_boot), Some(cur_boot)),
-            "arriving 0.5s after its own boot is not spanning it"
-        );
-        assert!(
-            spans_own_restart(old_boot + 1.0, 2_000.0, Some(old_boot), Some(cur_boot)),
-            "arriving 1s BEFORE its own boot is spanning it"
         );
 
         // LEGACY ROWS fall back rather than being read as "did not span".

@@ -592,6 +592,55 @@ pub fn timestamp_units_are_what_readers_assume(
     out
 }
 
+/// A request cannot arrive before the process that served it booted (AMUX-3647).
+///
+/// This is the assumption the latency detectors now rest on, and it was being
+/// ASSERTED rather than checked. `spans_own_restart` used to subtract a latency
+/// from `ts` and call the result an arrival, which is a moment before the
+/// request existed; the fix compares `ts < boot_at` instead, and that comparison
+/// is only correct because migrations run inside `Store::open`, `record_boot`
+/// stamps the boot straight after, and the listener binds several hundred lines
+/// later. Measured at the time: 0 of 97,019 rows violate it.
+///
+/// The whole point of the check is that the structural argument could stop being
+/// true without anybody noticing. Socket activation, an inherited listener, a
+/// `record_boot` moved after the bind: each would make `since_boot_s` go
+/// negative and each would look like nothing at all. A failing row here is not
+/// cosmetic, it means the exclusion branch this repo believes is unreachable has
+/// started firing.
+///
+/// UNKNOWN when no row carries a `boot_at`, because "the invariant holds" and
+/// "the column was never populated" are different facts and a pass would say the
+/// wrong one. That is the AMUX-3575 rule: a check that cannot run says so.
+pub fn request_arrival_follows_boot(
+    rows_with_boot: i64,
+    arrivals_before_boot: i64,
+    window_h: f64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "reqlog.arrival_follows_boot";
+    if rows_with_boot == 0 {
+        return vec![InvariantResult::unknown(
+            ID,
+            format!("no request_log row in the last {window_h:.0}h carries a boot_at"),
+        )];
+    }
+    if arrivals_before_boot == 0 {
+        return vec![InvariantResult::pass(ID)];
+    }
+    vec![InvariantResult::fail(
+        ID,
+        format!("0 of {rows_with_boot} rows with ts < boot_at"),
+        format!(
+            "{arrivals_before_boot} request(s) in the last {window_h:.0}h are stamped BEFORE the \
+             boot of the process that served them. `ts` is the request START, so this cannot \
+             happen while the listener binds after record_boot — something moved. The latency \
+             detectors' restart exclusion (autofix::spans_own_restart) is now live rather than \
+             structurally false, and /api/logs/stats will report negative since_boot_s. Recheck: \
+             SELECT COUNT(*) FROM _amux_request_log WHERE boot_at IS NOT NULL AND ts < boot_at;"
+        ),
+    )]
+}
+
 pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<InvariantResult> {
     const ID: &str = "config.env_reaches_process";
     let mut out = Vec::new();
@@ -3757,6 +3806,37 @@ mod negative_controls {
             now,
         );
         assert_eq!(oldrow[0].status, Status::Pass, "a 3000-day-old row is old, not mis-united: {oldrow:?}");
+    }
+
+    /// AMUX-3647: the assumption the latency exclusion rests on is CHECKED, and
+    /// its three states stay distinguishable.
+    ///
+    /// The point of this cell is the third one. A violation count of zero and a
+    /// column nobody writes produce the same number, and reporting both as a
+    /// pass is how a check goes green by ceasing to be able to fail. The whole
+    /// reason `ts < boot_at` is safe to compare on is a startup ORDER that a
+    /// future edit could change silently, so "I could not tell" has to be its
+    /// own answer.
+    #[test]
+    fn arrival_before_its_own_boot_is_a_failure_and_no_data_is_not_a_pass() {
+        let clean = request_arrival_follows_boot(97_019, 0, 24.0);
+        assert_eq!(clean[0].status, Status::Pass, "{clean:?}");
+
+        let broken = request_arrival_follows_boot(97_019, 3, 24.0);
+        assert_eq!(broken[0].status, Status::Fail, "{broken:?}");
+        assert!(
+            broken[0].observed.contains("spans_own_restart"),
+            "the failure must name the code whose assumption just broke, or a reader gets a \
+             count with no consequence attached: {broken:?}"
+        );
+
+        let blind = request_arrival_follows_boot(0, 0, 24.0);
+        assert_eq!(
+            blind[0].status,
+            Status::Unknown,
+            "zero violations out of zero observations is not evidence — it is the same number \
+             a check that stopped running produces: {blind:?}"
+        );
     }
 
     /// AF-184 REVIEW (amux): the declaration must cover timestamps, not one
