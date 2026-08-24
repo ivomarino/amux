@@ -1992,7 +1992,7 @@ const PATCH_WRITABLE: [&str; 19] = [
 /// `desc_append` modifies how `desc` is written rather than naming a column,
 /// so it is control, not writable — but it MUST be listed, or it lands in
 /// `ignored_fields` and the append silently does nothing (AC-323).
-const PATCH_CONTROL: [&str; 8] = [
+const PATCH_CONTROL: [&str; 9] = [
     "expect_rev",
     "gate_ack",
     "gate_checked",
@@ -2001,6 +2001,10 @@ const PATCH_CONTROL: [&str; 8] = [
     "authorized_by",
     "override_doing",
     "desc_append",
+    // Must be listed or it lands in `ignored_fields` and the ack silently does
+    // nothing — the caller then retries forever against a refusal it believes
+    // it answered (the AC-323 shape this array's comment already records).
+    "desc_shrink_ack",
 ];
 
 /// One owner-notice per (owner, card, author) per 10 minutes (AVE-36): a burst
@@ -2431,6 +2435,69 @@ pub async fn patch_item(
             }
             if let Some(d) = desc_effective {
                 if d != next.desc {
+                    // A REPLACE THAT DESTROYS MOST OF A DESCRIPTION MUST SAY SO
+                    // AT WRITE TIME (mvs-infra, 2026-08-23).
+                    //
+                    // Reported as a near-data-loss recovered from
+                    // _amux_state_events: a worker listed the board, read
+                    // `desc` as empty, and PATCHed a fresh description over
+                    // 4082 characters of merge evidence. The delta was already
+                    // computed — the History line said "desc -4082 chars" — and
+                    // it was written where only someone reading the card
+                    // afterwards would find it. The discriminator existed and
+                    // reached nobody at the moment it could still prevent
+                    // anything, which is the same defect as AMUX-3562 one
+                    // subsystem over.
+                    //
+                    // The reader-side half is a trap that cannot be fixed by
+                    // shipping more fields: GET /api/board already sends
+                    // `desc_len`, `desc_head` and `slim: true`, and the caller
+                    // still read absence as emptiness, because `.get("desc")`
+                    // returns None and says nothing. So the guard belongs on
+                    // the WRITE, where the truth is known regardless of how the
+                    // caller read the list.
+                    //
+                    // Deliberately narrow. Clearing a short desc, growing one,
+                    // or trimming a little are all untouched; this needs a
+                    // majority of a SUBSTANTIAL description to disappear, which
+                    // is rare and is worth one explicit field. `desc_append`
+                    // never trips it — it only ever grows.
+                    let before = next.desc.chars().count();
+                    let after = d.chars().count();
+                    let acked = map
+                        .get("desc_shrink_ack")
+                        .map(crate::api::py_truthy)
+                        .unwrap_or(false);
+                    let forced = map.get("force").map(crate::api::py_truthy).unwrap_or(false);
+                    if !acked && !forced && before >= 500 && after * 2 < before {
+                        return finish(
+                            &slot_w,
+                            PatchOut::Refused(
+                            StatusCode::CONFLICT,
+                            json!({
+                                "error": format!(
+                                    "refusing to shrink desc from {before} to {after} chars \
+                                     ({} lost). If you read this card from GET /api/board, note \
+                                     that the list OMITS `desc` (it ships desc_len/desc_head and \
+                                     slim:true) — an absent field is not an empty one. Re-read \
+                                     GET /api/board/{id_w} first. To append instead, use \
+                                     desc_append. If the replace is intended, resend with \
+                                     desc_shrink_ack: true.",
+                                    before - after
+                                ),
+                                "id": id_w,
+                                "ok": false,
+                                "blocked": true,
+                                "kind": "desc_shrink_blocked",
+                                "desc_len_before": before,
+                                "desc_len_after": after,
+                                "ack_field": "desc_shrink_ack",
+                                "append_instead": "desc_append",
+                            }),
+                            ),
+                            no_write(),
+                        );
+                    }
                     next.desc = d;
                     changed.push("desc".into());
                 }
@@ -4276,6 +4343,40 @@ mod slim_tests {
 
     use super::*;
     use crate::db::board_store::IssueRow;
+
+    /// The desc-shrink guard's THRESHOLD, tested as arithmetic rather than
+    /// through the handler (mvs-infra's near-data-loss, 2026-08-23).
+    ///
+    /// The reported incident: 4082 characters of merge evidence replaced by a
+    /// short fresh description, because the worker read `desc` from the LIST
+    /// payload (which omits it) and took absence for emptiness.
+    ///
+    /// The controls are the whole value here. A guard tuned only to catch the
+    /// incident would also refuse ordinary edits — trimming a description,
+    /// clearing a short one, rewriting a stub — and a refusal a caller meets
+    /// during normal work is one they learn to ack reflexively, which converts
+    /// a safety property into a keystroke. So the negative cases are pinned as
+    /// hard as the positive one.
+    #[test]
+    fn the_desc_shrink_guard_catches_the_incident_and_nothing_ordinary() {
+        // Mirrors the predicate at the write site exactly. If that changes,
+        // this must be changed with it and deliberately.
+        let trips = |before: usize, after: usize| before >= 500 && after * 2 < before;
+
+        // THE INCIDENT: 4082 chars replaced by a short note.
+        assert!(trips(4082 + 120, 120), "the reported near-data-loss must be refused");
+        assert!(trips(5500, 40), "a 5.5k card replaced by a one-liner must be refused");
+
+        // CONTROLS — every one of these is legitimate and must pass untouched.
+        assert!(!trips(4000, 2400), "trimming 40% of a long desc is an ordinary edit");
+        assert!(!trips(4000, 2000), "exactly half must NOT trip — the bar is a strict majority");
+        assert!(!trips(400, 0), "clearing a SHORT desc is not a data loss worth blocking");
+        assert!(!trips(499, 1), "just under the length floor stays out of the guard's way");
+        assert!(!trips(120, 4082), "growth must never trip it");
+        assert!(!trips(0, 900), "writing a desc onto an empty card must never trip it");
+        // desc_append only ever grows, so it cannot reach the guard at all.
+        assert!(!trips(5000, 5200), "an append is growth and is structurally exempt");
+    }
 
     /// SLIM MUST CARRY WHAT THE LIST ACTUALLY RENDERS (AMUX-2840).
     ///
