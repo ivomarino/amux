@@ -93,6 +93,34 @@ impl EnvPlan {
     fn file_owned(&self) -> std::collections::BTreeSet<&str> {
         self.export.keys().map(String::as_str).collect()
     }
+
+    /// The subset of [`export`](Self::export) that actually needs writing.
+    ///
+    /// `load` is NOT a boot-only function: `invariants::monitor` calls
+    /// `from_process_env()` on every sweep just to find the home dir, so this
+    /// runs every ~15s for the life of the process. Before the marker existed
+    /// that was harmless, because every key was already present and the
+    /// setdefault guard skipped it; refreshing marked keys unconditionally
+    /// would have turned a boot-time mutation into a periodic one.
+    ///
+    /// That matters beyond tidiness: `setenv` concurrent with another thread's
+    /// `getenv` is a data race in the platform libc, and this server is heavily
+    /// threaded. Writing only on a real change puts the steady state back to
+    /// zero mutations and confines the exposure to the moment somebody actually
+    /// edits server.env.
+    ///
+    /// The upside is real and was not designed for: because the monitor reloads
+    /// on a timer, a server.env edit to a marked key now takes effect within
+    /// about 30 seconds, with no redeploy and no restart. Verified live on
+    /// 2026-08-24 with `/health`'s `build` bracketed to prove no redeploy
+    /// happened, against the two unmarked keys as a paired control.
+    fn writes<'a>(&'a self, live: &dyn Fn(&str) -> Option<String>) -> Vec<(&'a str, &'a str)> {
+        self.export
+            .iter()
+            .filter(|(k, v)| live(k).as_deref() != Some(v.as_str()))
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
 }
 
 /// # Why a marker exists at all
@@ -191,13 +219,19 @@ impl ServerConfig {
             &|k| std::env::var_os(k).is_some(),
             prev_marker.as_deref(),
         );
-        for (k, v) in &plan.export {
+        // Only real changes are written — see `EnvPlan::writes`. This function
+        // runs on a timer, not just at boot.
+        for (k, v) in plan.writes(&|k| std::env::var(k).ok()) {
             std::env::set_var(k, v);
         }
         for k in &plan.unset {
-            std::env::remove_var(k);
+            if std::env::var_os(k).is_some() {
+                std::env::remove_var(k);
+            }
         }
-        std::env::set_var(ENV_FROM_FILE_MARKER, &plan.marker);
+        if std::env::var(ENV_FROM_FILE_MARKER).ok().as_deref() != Some(plan.marker.as_str()) {
+            std::env::set_var(ENV_FROM_FILE_MARKER, &plan.marker);
+        }
         // Process wins over server.env (same rule as Python's setdefault) —
         // EXCEPT for keys the process only holds because we put them there.
         let ours = plan.file_owned();
@@ -446,6 +480,35 @@ mod tests {
         let ours = plan.file_owned();
         assert!(ours.contains("STALE") && ours.contains("FRESH"));
         assert!(!ours.contains("THEIRS"));
+    }
+
+    /// `load` runs on a TIMER, not just at boot: `invariants::monitor` calls
+    /// `from_process_env()` every sweep to find the home dir. So refreshing
+    /// marked keys unconditionally would `setenv` every ~15s forever, and
+    /// `setenv` racing another thread's `getenv` is a data race in the platform
+    /// libc on a server this threaded.
+    ///
+    /// Steady state must be ZERO writes; a genuine edit must be exactly one.
+    #[test]
+    fn a_refresh_writes_only_when_the_value_actually_changed() {
+        let file = map(&[("A", "v1"), ("B", "v2")]);
+        let inherited = map(&[("A", "v1"), ("B", "v2")]);
+        let plan = plan_env(&file, true, &inherited, &no_live, Some("A,B"));
+
+        // Both are ours, so both must stay file-owned or the overlay clobbers
+        // them — ownership and writing are different questions.
+        assert_eq!(plan.file_owned().len(), 2);
+
+        let settled = |k: &str| inherited.get(k).cloned();
+        assert!(
+            plan.writes(&settled).is_empty(),
+            "steady state must write nothing: {:?}",
+            plan.writes(&settled)
+        );
+
+        // One key edited in the file: exactly one write, and it is that key.
+        let drifted = |k: &str| if k == "B" { Some("stale".to_string()) } else { inherited.get(k).cloned() };
+        assert_eq!(plan.writes(&drifted), vec![("B", "v2")]);
     }
 
     /// Deleting a line from server.env has to work too, or this is the same
