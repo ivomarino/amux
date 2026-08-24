@@ -759,7 +759,12 @@ fn spans_restart(ts: f64, latency_ms: f64, boot: Option<f64>) -> bool {
 /// A NULL `boot_at` is a legacy row from before the column existed, and falls
 /// back to the process-boot comparison rather than being treated as "did not
 /// span". Absence is not evidence, and this table retains a week.
-fn spans_own_restart(ts: f64, latency_ms: f64, row_boot: Option<f64>, proc_boot: Option<f64>) -> bool {
+pub(crate) fn spans_own_restart(
+    ts: f64,
+    latency_ms: f64,
+    row_boot: Option<f64>,
+    proc_boot: Option<f64>,
+) -> bool {
     match row_boot {
         Some(b) => ts - latency_ms / 1000.0 < b,
         None => spans_restart(ts, latency_ms, proc_boot),

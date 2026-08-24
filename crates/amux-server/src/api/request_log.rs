@@ -1733,6 +1733,13 @@ async fn stats(
     let mut fams: std::collections::BTreeMap<String, FamAcc> = Default::default();
     let mut scanned = 0i64;
     let mut oldest_ts: Option<f64> = None;
+    // Restart-spanning rows, excluded from the latency statistics and COUNTED
+    // (AF-186). Counted rather than silently dropped for AF-178's reason: a
+    // detector that quietly removes rows is one nobody can audit, and a zero
+    // here is a measurement where silence would not be.
+    let proc_boot = crate::runtime_jobs::heartbeat::boot_at();
+    let mut spanned = 0u64;
+    let mut spanned_by_family: std::collections::BTreeMap<String, u64> = Default::default();
     let res = (|| -> rusqlite::Result<()> {
         let mut stmt = conn.prepare(
             // AF-131: ORDER BY ts DESC is load-bearing. With no ORDER BY,
@@ -1743,7 +1750,8 @@ async fn stats(
             // 42k requests was 1.07x against an honest window. Newest-first
             // makes the slice the trailing window everyone assumes AND makes
             // actual_window_h truthful by construction.
-            "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts \
+            "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts, \
+             boot_at \
              FROM _amux_request_log WHERE ts >= ?1 ORDER BY ts DESC LIMIT ?2",
         )?;
         let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP])?;
@@ -1757,6 +1765,27 @@ async fn stats(
             let amux_session: Option<String> = r.get(5)?;
             let client_ip: Option<String> = r.get(6)?;
             let ts: f64 = r.get(7)?;
+            let row_boot: Option<f64> = r.get(8)?;
+            // A REQUEST WHOSE CLOCK SPANS A RESTART IS NOT A SLOW REQUEST (AF-186).
+            //
+            // `latency_ms` is wall time from arrival to completion, so a request
+            // that arrived before the serving process started measured the
+            // OUTAGE. autofix stopped counting these in AF-175; this endpoint —
+            // the one a HUMAN opens — still did, and on 2026-08-24 the daily
+            // sweep's slow_outliers was six of them at 33-58s, completing 5s
+            // apart with latencies falling by exactly 5s. That is one dashboard
+            // poll draining across a restart, and /api/board's real p50 in the
+            // same window is 0.3ms.
+            //
+            // The predicate is IMPORTED from autofix rather than re-derived
+            // here. Two spellings of one rule is how the outlier path kept the
+            // wrong one for a day after the p95 path was fixed.
+            if crate::runtime_jobs::autofix::spans_own_restart(ts, latency_ms, row_boot, proc_boot)
+            {
+                spanned += 1;
+                *spanned_by_family.entry(family.clone()).or_insert(0u64) += 1;
+                continue;
+            }
             oldest_ts = Some(oldest_ts.map_or(ts, |prev: f64| prev.min(ts)));
             let f = fams.entry(family).or_insert_with(|| FamAcc {
                 latencies: Vec::new(),
@@ -1828,6 +1857,10 @@ async fn stats(
                 "p50_ms": round2(p50), "p95_ms": round2(p95), "max_ms": round2(max),
                 "error_count": acc.error_count,
                 "error_rate": round4(error_rate),
+                // Zero is the healthy answer and it is PUBLISHED (AF-186/AF-180).
+                // Silence would be indistinguishable from "the exclusion is not
+                // wired in", which is the defect this endpoint had.
+                "restart_spanning_excluded": spanned_by_family.get(&family).copied().unwrap_or(0),
                 "proxy_count": acc.proxy_count,
                 "origins": acc.origins,
                 "distinct_workers": acc.workers.len(),
@@ -1841,7 +1874,8 @@ async fn stats(
             let threshold = 5.0 * p50;
             let r = (|| -> rusqlite::Result<()> {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT ts, method, path, status, latency_ms, worker FROM _amux_request_log \
+                    "SELECT ts, method, path, status, latency_ms, worker, boot_at \
+                     FROM _amux_request_log \
                      WHERE family = ?1 AND ts >= ?2 AND latency_ms > ?3 \
                      ORDER BY latency_ms DESC LIMIT ?4",
                 )?;
@@ -1854,6 +1888,20 @@ async fn stats(
                     let status: i64 = r.get(3)?;
                     let latency_ms: f64 = r.get(4)?;
                     let worker: Option<String> = r.get(5)?;
+                    let row_boot: Option<f64> = r.get(6)?;
+                    // The same exclusion as the first pass (AF-186). Applied
+                    // here TOO rather than relying on the pass above, because
+                    // this is a separate re-read: on 2026-08-24 the outlier
+                    // list was six restart-spanning rows at 33-58s while the
+                    // family p50 was 0.3ms, and the p95 path had already been
+                    // fixed in autofix while this one had not. Two scans, one
+                    // rule — the second scan is exactly where the rule got lost
+                    // last time.
+                    if crate::runtime_jobs::autofix::spans_own_restart(
+                        ts, latency_ms, row_boot, proc_boot,
+                    ) {
+                        continue;
+                    }
                     outliers.push((
                         latency_ms / p50,
                         json!({
@@ -1900,6 +1948,11 @@ async fn stats(
             "origins": all_origins,
             "distinct_workers": all_workers.len(),
             "distinct_clients": all_clients.len(),
+            // How many rows the restart exclusion removed from every number
+            // above (AF-186). `count` is post-exclusion, so a reader comparing
+            // it to raw traffic needs this to reconcile — and a zero says the
+            // exclusion RAN, where its absence would say nothing at all.
+            "restart_spanning_excluded": spanned,
         },
         "slow_outliers": outliers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
     }))
@@ -2933,6 +2986,85 @@ mod tests {
         let cell3 = vd("POST /api/sessions-graph");
         assert!(cell3.contains("no route exists at this path"), "{cell3}");
         assert!(cell3.contains("GET-only"), "{cell3}");
+    }
+
+    /// A row whose CLOCK spans a restart is not a slow request (AF-186).
+    ///
+    /// autofix stopped counting these in AF-175. /api/logs/stats — the endpoint
+    /// a human opens — still did, and on 2026-08-24 the daily sweep's
+    /// slow_outliers was six of them at 33-58s, completing 5s apart with
+    /// latencies falling by exactly 5s, against a family p50 of 0.3ms. One
+    /// dashboard poll draining across a restart, rendered as six slow requests.
+    ///
+    /// THE CONTROL IS THE SECOND HALF and it is the one that matters: a
+    /// genuinely slow request that ARRIVED AFTER the boot must still appear.
+    /// Large is not exempt; only crossing the boundary is. Without that cell a
+    /// filter excluding everything passes.
+    #[tokio::test]
+    async fn stats_does_not_report_a_restart_spanning_row_as_a_slow_one() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        let boot = now - 300.0;
+        // A fast baseline so p50 is small and the threshold (5x p50) is low.
+        for i in 0..8 {
+            seed_boot(&store, now - 200.0 + i as f64, "/api/board", 5.0, Some(boot)).await;
+        }
+        // THE SPECIMEN: completed after boot, ARRIVED 100s before it.
+        seed_boot(&store, boot + 20.0, "/api/board", 120_000.0, Some(boot)).await;
+        // THE CONTROL: equally slow, but it arrived well AFTER the boot.
+        seed_boot(&store, now - 10.0, "/api/board", 120_000.0, Some(now - 130.0)).await;
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+
+        let outliers = v["slow_outliers"].as_array().unwrap();
+        assert_eq!(
+            outliers.len(),
+            1,
+            "the spanning row must be gone and the genuinely slow one must remain: {outliers:?}"
+        );
+        assert_eq!(outliers[0]["ts"], json!(now - 10.0), "the survivor is the one after boot");
+
+        // THE EXCLUSION IS PUBLISHED, NOT SILENT. A detector that quietly drops
+        // rows is one nobody can audit (AF-178), and a zero here is what tells a
+        // reader the exclusion RAN.
+        assert_eq!(v["totals"]["restart_spanning_excluded"], json!(1), "{v}");
+        let board = v["families"].as_array().unwrap().iter()
+            .find(|f| f["family"] == "/api/board").unwrap();
+        assert_eq!(board["restart_spanning_excluded"], json!(1), "{board}");
+        // And it is out of the latency statistics too, not merely the list.
+        assert_eq!(board["count"], 9, "8 fast + the control, not the spanning row: {board}");
+        assert_eq!(board["max_ms"], 120_000.0, "the CONTROL is still the max — it is real: {board}");
+    }
+
+    /// Insert with an explicit `boot_at`, which `seed` does not carry.
+    async fn seed_boot(
+        store: &crate::db::Store,
+        ts: f64,
+        path: &str,
+        latency_ms: f64,
+        boot_at: Option<f64>,
+    ) {
+        let path = path.to_string();
+        store
+            .write_async(move |conn| {
+                conn.execute(
+                    "INSERT INTO _amux_request_log \
+                     (ts, method, path, family, status, latency_ms, client_ip, \
+                      user_agent, amux_session, worker, answered_by, boot_at) \
+                     VALUES (?1,'GET',?2,?2,200,?3,'127.0.0.1','curl','lane','','native',?4)",
+                    rusqlite::params![ts, path, latency_ms, boot_at],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
