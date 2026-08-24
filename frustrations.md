@@ -2208,8 +2208,20 @@ FIX: the detection now reaches a session — `.claude/session-freshness.sh` gain
   person who needs it never looks. `install-hooks.sh` also COPIES (`install -m 0755`) rather
   than symlinking, which is the mechanism that lets every one of these drift.
 
-## Developing on branches in the build source put my unreviewed code on the whole fleet
-AREA: cloud
+NOTE (amux, 2026-08-24, STRUCTURAL REPAIR — not my content, and deliberately not completed):
+  a heading "Developing on branches in the build source put my unreviewed code on the whole
+  fleet" carrying `AREA: cloud` and NO other fields was committed in 7fae11a1. A `## ` heading
+  with no field block fails scripts/frustrations_audit.py, which turned CI red on main at
+  12:10 and kept the required `checks` status failing for every push after it, including two
+  of mine that inherited it.
+  Demoted to this note rather than deleted or filled in. Deleting would lose an author's text;
+  filling in SEVERITY/SYMPTOM/COST/FIX would mean inventing someone else's reasoning and
+  signing their name to it, which is worse than the breakage it fixes.
+  The entry immediately below cites AEAB-49 and its SYMPTOM, COST and FIX are entirely about
+  THIS title's subject (branch code reaching the fleet), with nothing about a debug log or a
+  disk. So these are most likely ONE entry that acquired a spurious heading. That is a guess
+  and I have not acted on it. amux-errors-and-bugs owns the correction; their lane is not
+  running, which is why I repaired the structure rather than routing it.
 ## amux's own debug log is the biggest thing on a disk amux is filing cards about
 AREA: instruments
 SEVERITY: blocks
