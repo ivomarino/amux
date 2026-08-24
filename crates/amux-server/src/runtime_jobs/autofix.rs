@@ -186,6 +186,26 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // the story an outlier should tell about a fire alarm. Delete this row
     // when the permission is granted and the wall class dies.
     ("/api/alert/owner", 20_000.0),
+    // GET /api/board/commit-mentions (AMUX-3580). The endpoint shells out to
+    // `git log --grep` across every repo behind an open card — 3 repos against
+    // 65 cards when measured — and that scan IS the work. Timed deliberately
+    // before it was put on a job: 10.6s, 11.1s, 10.7s across three consecutive
+    // calls, worst filed row 11.037s. A 10s outlier floor under an ~11s design
+    // duration files a card per legitimate call, which is the
+    // threshold-below-baseline defect this table exists for, and it filed one
+    // within hours of the endpoint gaining its first caller.
+    //
+    // 30s is ~2.7x the measured worst, matching the ratio the rows above use.
+    // The headroom is deliberate rather than generous: the cost scales with
+    // repos x open cards, so a bigger fleet legitimately pushes this up, and a
+    // future reader seeing 20s should widen the budget rather than hunt a bug.
+    //
+    // Past 30s the outlier still means what an outlier should. The scan bounds
+    // its OUTPUT (MAX_COMMITS, reported as `truncated`) but puts no wall clock
+    // on the git subprocess, so a hung git — a locked index, a stalled network
+    // checkout — has nothing else to stop it. That is the one latency story on
+    // this route that is genuinely wrong, and it stays reportable.
+    ("/api/board/commit-mentions", 30_000.0),
 ];
 
 fn design_budget_ms(target: &str) -> f64 {
@@ -5385,6 +5405,47 @@ mod tests {
                 finding.recheck
             );
         }
+    }
+
+    /// AMUX-3580: a long-by-design route is suppressed AT its design duration
+    /// and still reportable ABOVE it.
+    ///
+    /// The second half is the one that matters and the one an over-eager fix
+    /// would destroy. Adding a route here to stop a nuisance card is easy; the
+    /// value is that the route keeps ONE latency story it can still tell —
+    /// "this hung", as against "this was big". A budget set to infinity, or a
+    /// blanket exemption, silences both.
+    #[test]
+    fn a_long_by_design_route_keeps_the_one_latency_story_that_is_still_wrong() {
+        // The measurement that set the number: three consecutive calls at
+        // 10.6/11.1/10.7s, worst filed row 11,037ms.
+        let budget = design_budget_ms("/api/board/commit-mentions");
+        assert!(budget > 0.0, "the route must be enrolled at all");
+        assert!(
+            11_037.0 <= budget,
+            "the measured worst legitimate run must be UNDER the budget, or the card that \
+             motivated this keeps filing: worst 11037ms vs budget {budget}ms"
+        );
+        assert!(
+            budget < 60_000.0,
+            "and the budget must stay small enough to catch a hung git — the scan bounds its \
+             OUTPUT but puts no wall clock on the subprocess, so this is the only thing that \
+             would notice: {budget}ms"
+        );
+
+        // CONTROLS: enrolment is per-route and must not leak.
+        assert_eq!(
+            design_budget_ms("/api/board"),
+            0.0,
+            "the parent family must NOT inherit the budget — /api/board is an ordinary fast \
+             route and silencing it would hide real regressions on the busiest board endpoint"
+        );
+        assert_eq!(
+            design_budget_ms("/api/board/commit-mentions/extra"),
+            0.0,
+            "matching is exact, not prefix — a new sub-route must not inherit an exemption \
+             nobody measured for it"
+        );
     }
 
     /// AF-175: the exclusion is a property of the ROW, so it works for every
