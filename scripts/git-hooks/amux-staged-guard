@@ -37,12 +37,12 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
-# (`grep -L 'GUARD_VERSION = 6' */.git/hooks/amux-staged-guard`), so a tracked
+# (`grep -L 'GUARD_VERSION = 7' */.git/hooks/amux-staged-guard`), so a tracked
 # file that changed without moving this number makes every stale installed copy
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 6
+GUARD_VERSION = 7
 
 
 def amux_base_url():
@@ -334,6 +334,11 @@ def index_worktree_divergence(sess, w):
       "\nTHREE HONEST WAYS FORWARD. Pick by which one is TRUE for you:\n"
       "\n  1. Commit what you tested:\n"
       "         git add %s\n"
+      "     READ THE DIFF FIRST if the divergence surprised you. On a shared\n"
+      "     checkout the disk copy can contain a PEER's edit that landed after\n"
+      "     you staged, and re-adding would sweep it into your commit. The\n"
+      "     cross-session half of this guard runs next and will say so, but you\n"
+      "     want to know before you get there:  git diff -- %s\n"
       "\n  2. Test what you are committing (stash the unstaged remainder first):\n"
       "         git stash push --keep-index && <your test> && git stash pop\n"
       "\n  3. You MEANT to commit a subset (`git add -p`), and you accept that the\n"
@@ -341,7 +346,7 @@ def index_worktree_divergence(sess, w):
       "         AMUX_PARTIAL_STAGE=1 git commit ...\n"
       "\nNot `--no-verify`: that turns off the cross-session sweep protection too,\n"
       "and this refusal is the cheap one to satisfy.\n"
-      % " ".join(both))
+      % (" ".join(both), " ".join(both)))
     return 1
 
 
