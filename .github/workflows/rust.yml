@@ -16,9 +16,20 @@ on:
     # at repo root, outside every other pattern. Without it a fix to the lint
     # config alone could not re-trigger the very gate it fixes, so a red spa-lint
     # stayed red after the fix landed (32c416b: whitelisting XLSX did not re-run CI).
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
+    # `cloud/**` is the THIRD instance of the same shape as the two notes above,
+    # and it was found the same way — by a fix that could not prove itself.
+    # `dockerfile_copies_every_external_include_str_input` reads
+    # cloud/docker/Dockerfile and asserts it COPYs every external include_str!
+    # root, but `cloud/**` was in no pattern, so the test that GUARDS that file
+    # never ran when that file changed. Two consequences, and the second is the
+    # dangerous one: a PR fixing the Dockerfile ran only the secret scan and
+    # could not demonstrate the fix (AEAB-55, this commit), and a PR BREAKING it
+    # by editing only the Dockerfile would have gone green. The break would then
+    # surface as a dead cloud image on the next deploy — which is exactly the
+    # latency the test was written to remove.
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
   pull_request:
-    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
+    paths: ['crates/**', 'Cargo.toml', 'Cargo.lock', 'e2e/**', 'amux', 'scripts/**', 'cloud/**', 'eslint.config.mjs', '.github/workflows/rust.yml']
 
 jobs:
   check:
