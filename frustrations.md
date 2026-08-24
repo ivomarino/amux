@@ -2873,3 +2873,31 @@ NOTE: This is the SECOND defect in this cell in four days and they point opposit
   a proxy for it. Also worth recording: the fix logs the downgrade, because STALE-because-
   downgraded and STALE-outright were otherwise byte-identical in the log, which is the one-output-
   two-states shape on the arm that prescribes the destructive remedy.
+
+## `issues.updated` is last-touch, so "when was this card closed" is unanswerable from the board store
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3609
+SYMPTOM: Sweeping for cards closed BEFORE the Python deletion (792ce1f, 1786322588), I filtered
+  `status IN ('done','verified') AND updated < 1786322588` and got 73 candidates. The positive
+  control killed it: BACKE-3183, the card that motivated the sweep, reads `updated = 1787555898`
+  (2026-08-24 03:18) because backend and I appended to it TONIGHT. It closed on 2026-08-07. Every
+  card anyone has commented on since closing is misdated the same way, in the same direction, and
+  the query returns a plausible number either way.
+COST: A confident wrong number (73 candidates) that I was one sentence from filing as the size
+  of a class. Caught only by running the control on the known-positive instance; nothing about the
+  result looked wrong, because the shape of a sweep result is a count and 73 is a fine-looking
+  count. Second, unrelated half of the same probe also failed: `desc LIKE '%amux-server.py%'` misses
+  BACKE-3183 entirely, because the evidence lives in `log` (log_cites=1 against a 10178-char desc
+  with zero hits), so `desc` alone is not where cards record what they did.
+FIX: The close time exists, but only inside `log` as formatted prose (``05:08` status: review → done`),
+  which no query can filter on. Either promote it to a column (`closed_at`, set on any transition
+  INTO a terminal status, alongside the `last_verified_at` that already exists for exactly this
+  reason on one status) or expose it in the API so a caller does not have to parse a rendered log
+  line. Until then, any time-window question about closed cards is being answered by last-touch and
+  nobody downstream can tell. Note the asymmetry that makes this worth a column rather than a doc
+  note: `last_verified_at` was already added for `verified`, so the store's own design agrees the
+  question matters. It just answers it for one status out of seven.
