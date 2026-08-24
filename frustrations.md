@@ -1904,6 +1904,35 @@ FIX: none shipped; git_guard.rs and the hooks are amux's, routed to them, and th
   it. Two different things that both say "hook" and "outdated".
 
 
+NOTE (2026-08-24, amux-frustrations — author): ROOT CAUSE FIXED (6a518e41), ENTRY STAYS OPEN
+  until the observable actually drops. Recording the split because "fixed" and "the cost is
+  gone" are different claims here.
+  WHAT WAS FIXED. 79e9c89c (06:12 today) re-keyed the server predicate on `op` instead of
+  `guard_version` alone, justified as "every modern client sends at least `op`".
+  git-shared-guard.py contradicted that premise: two of its three POST bodies carried `op`,
+  and the cotenant probe sent `{session, dir, paths: []}` — neither field — 170 lines below
+  the path the fix was aimed at. 212 WARNs followed the fix, including this checkout at
+  16:23:51 with a hook byte-identical to source. 6a518e41 adds `op` to that body.
+  VERIFIED against the RUNNING server, both directions:
+    old body (no op)          -> hook_outdated = True    (control)
+    new body (op present)     -> hook_outdated = False
+  WHY IT STAYS OPEN. The COST recorded above is WARN VOLUME, and I cannot show that dropped:
+  (a) the warn is rate-limited to once per session per hour, so an hour of silence is the
+  minimum informative window and I have one minute; (b) the newest two WARNs name `nissan`
+  and `mixpeek-docs` in ~/Dev/mixpeek/* — OTHER CHECKOUTS with their own installed copies of
+  this hook, which my sync did not touch. So the volume decays only as each checkout updates,
+  and archiving now would be archiving on an unrealized fix.
+  STILL UNFIXED, SEPARATELY: the emitted remedy is unchanged. git_guard.rs:1608 still prints
+  "Reinstall: scripts/install-hooks.sh" while the doc comment 30 lines above it (1576) states
+  plainly that this "reinstalls the GIT hooks, which were already current". The defect is
+  named in the comment and left in the string a reader actually receives — ethos rule 6. It
+  now misdirects a smaller population (a genuine pre-rust git hook, for which the remedy IS
+  right), which is why it is worth fixing but not worth blocking on.
+  ALSO CORRECTED: I read `cmp` between the WORKTREE copy and ~/.amux/hooks/ as "the install is
+  stale". It was not — runtime was byte-identical to the COMMITTED blob and
+  `hooks.shared_guard_matches_committed` was correctly green throughout. What I had measured
+  was my own uncommitted edit.
+
 ## Every checkout's git hooks are 18 days stale, and amux has been saying so into a log for 11
 AREA: instruments
 SEVERITY: blocks
