@@ -3554,6 +3554,26 @@ fn fault_identity(signature: &str) -> Option<&str> {
     if !(signature.starts_with("5xx|") || signature.starts_with("latency|outlier|")) {
         return None;
     }
+    // A ROLLUP'S IDENTITY IS "THE SERVER WAS SLOW", NOT WHICH ENDPOINTS IT
+    // CAUGHT (AMUX-3673).
+    //
+    // The rollup signature is `latency|outlier|ROLLUP|<comma-joined targets>`,
+    // and that target list varies with whichever endpoints happened to be over
+    // threshold in that window. Measured 2026-08-24: SIX rollup cards, all
+    // saying the server was slow, and AMUX-3651 vs AMUX-3673 differ by ONE
+    // element — `/api/board/{id}` against `/api/browser/action`.
+    //
+    // The rollup exists because per-endpoint cards "each name an endpoint that
+    // is probably not the fault" (AMUX-2814). It fixed that fan-out WITHIN a
+    // window and reproduced it ACROSS windows, by putting the varying set into
+    // the identity. The endpoint list is evidence; it belongs in the card body,
+    // which is where the rollup already puts it.
+    //
+    // Two genuinely separate slowdowns still get two cards: only an OPEN card
+    // suppresses, so once the first is judged the next occurrence files.
+    if let Some(i) = signature.find("|ROLLUP|") {
+        return Some(&signature[..i + "|ROLLUP".len()]);
+    }
     // Only a trailing field that is a BARE EPOCH is stripped, same rule as
     // `invariant_signature_parts`: a target whose last `|`-part is numeric is
     // not a thing today, and if it becomes one this merges two faults rather
@@ -4961,6 +4981,27 @@ mod tests {
         assert_eq!(open_card_for_fault(&conn, other), None, "a different target is a different fault");
         let other_status = "5xx|500|POST|/api/browser|/api/browser/start|1787585376";
         assert_eq!(open_card_for_fault(&conn, other_status), None, "a different status too");
+
+        // AMUX-3673: a ROLLUP's identity is "the server was slow", not which
+        // endpoints it caught. These two are the REAL signatures of AMUX-3651
+        // and AMUX-3673, which differ by one element and are the same fault.
+        let r1 = "latency|outlier|ROLLUP|/api/board,/api/board/{id},/api/browser/start,\
+                  /api/sessions,/api/sessions-git,/api/sessions/{name}/{*verb}";
+        let r2 = "latency|outlier|ROLLUP|/api/board,/api/browser/action,/api/browser/start,\
+                  /api/sessions,/api/sessions-git,/api/sessions/{name}/{*verb}";
+        assert_eq!(fault_identity(r1), Some("latency|outlier|ROLLUP"));
+        assert_eq!(
+            fault_identity(r1),
+            fault_identity(r2),
+            "two rollups differing by one endpoint are one fault, not two cards"
+        );
+        // CONTROL: a rollup must NOT collapse into a per-endpoint fault, or the
+        // first slow endpoint would silence every server-wide report after it.
+        assert_ne!(
+            fault_identity(r1),
+            fault_identity("latency|outlier|GET|/api/board|1787585028"),
+            "a rollup and a single-endpoint outlier are different faults"
+        );
 
         // CONTROL 3: only the two timestamped families have a fault identity at
         // all. Stripping a trailing field from an arbitrary signature would
