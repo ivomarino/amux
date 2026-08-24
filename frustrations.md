@@ -2640,3 +2640,36 @@ FIX: an owner column (pid or per-process boot ulid) on the scan row, reaping onl
   whose owner is neither this process nor a live pid. The general form, which is the
   third entry this week under AEAB-11: any predicate that means "mine" or "twice" is
   wrong on a shared DB with two writers, and the failures do not look alike from outside.
+
+## A rejected review has no status, so the reviewer is nudged to review their own rejection
+AREA: board
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-24
+SESSION: amux (hit it, twice), amux-frustrations (verified the mechanism)
+CARD: AF-214
+SYMPTOM: amux reviewed AF-203, rejected it with four specifics, and was re-nudged twice with
+  "[amux] AF-203 sits in 'review' and names YOU as reviewer". The nudge predicate
+  (board_drive.rs:2461) is `status == review AND reviewer == you`, and its own instruction —
+  "if not, say what fails on the card" — is a DESC write that does not change status. So
+  following it exactly leaves the card in the state that re-fires the nudge, until the 24h
+  budget is spent. Verified against the running board: the status vocabulary is backlog, todo,
+  doing, review, done, verified, discarded. There is no cell for "reviewed, rejected, back with
+  the author", so both honest-looking moves misdescribe reality — `review` claims it awaits a
+  REVIEWER when it awaits the AUTHOR, and `doing` reads as the reviewer working it when the
+  reviewer is finished.
+COST: two wasted reviewer turns on one card, each a full re-read to conclude "I already did
+  this". Small per instance and it recurs on every rejected review. The larger cost is the
+  board lying to every reader until the author notices: a card in `review` is indistinguishable
+  from one nobody has looked at yet.
+FIX: a `changes-requested` status (or `review` + a `rejected` flag) — it is the true state, it
+  removes the card from the reviewer-nudge predicate, and it returns the card to the AUTHOR's
+  queue where the work is. Cheaper fallback if that is too much surface: skip the reviewer
+  nudge when the card's most recent activity is the REVIEWER's own note, since they have
+  demonstrably reviewed it. REJECTED: raising the nudge budget — that makes an uninformative
+  nudge fire less often, which is not the same as making it informative.
+NOTE: amux's own move was the correct read and the vocabulary still could not hold it: "Not a
+  second review — my findings stand... this is a status correction so the card stops describing
+  itself as awaiting a reviewer when what it awaits is four small edits by its author." This is
+  the AMUX-2140 shape (the sanctioned instruction does not reach an exit) in the review loop
+  rather than the CLI.
