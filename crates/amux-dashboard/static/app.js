@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.716';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.717';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -34536,26 +34536,32 @@ else document.addEventListener('DOMContentLoaded', _dpInit);
 async function _secretsTabLoad() {
   const container = document.getElementById('secrets-container');
   if (!container) return;
-  
+
   try {
     container.innerHTML = '<div style="padding:20px; text-align:center;">Loading secrets...</div>';
-    
+
     const response = await fetch(API + '/api/secrets', {
       headers: _authHeaders({})
     });
-    
+
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    
+
     const data = await response.json();
     const secrets = data.secrets || [];
-    
+
+    // Build toolbar with refresh button
+    let html = '<div style="margin-bottom:20px; display:flex; gap:8px;">';
+    html += '<button onclick="_secretsRefresh()" style="padding:10px 16px; background:var(--accent); color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold;">🔄 Refresh Secrets</button>';
+    html += '</div>';
+
     if (!secrets.length) {
-      container.innerHTML = '<div style="padding:20px; color:var(--dim);">No secrets configured yet.</div>';
+      html += '<div style="padding:20px; color:var(--dim);">No secrets configured yet.</div>';
+      container.innerHTML = html;
       return;
     }
-    
-    let html = '<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:15px;">';
-    
+
+    html += '<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:15px;">';
+
     for (const path of secrets) {
       html += `<div style="border:1px solid var(--border); border-radius:8px; padding:15px; background:var(--card);">
         <div style="font-family:monospace; font-size:13px; margin-bottom:10px; word-break:break-all; color:var(--accent);">${esc(path)}</div>
@@ -34565,11 +34571,33 @@ async function _secretsTabLoad() {
         </div>
       </div>`;
     }
-    
+
     html += '</div>';
     container.innerHTML = html;
   } catch (e) {
     container.innerHTML = `<div style="padding:20px; color:#f85149;">Error loading secrets: ${esc(e.message)}</div>`;
+  }
+}
+
+async function _secretsRefresh() {
+  try {
+    const response = await fetch(API + '/api/secrets/reload', {
+      method: 'POST',
+      headers: _authHeaders({})
+    });
+
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+
+    const data = await response.json();
+
+    if (data.ok) {
+      showToast('✓ Secrets reloaded');
+      _secretsTabLoad(); // Reload the list
+    } else {
+      showToast(`✗ Reload failed: ${data.error}`);
+    }
+  } catch (e) {
+    showToast(`✗ Error: ${e.message}`);
   }
 }
 

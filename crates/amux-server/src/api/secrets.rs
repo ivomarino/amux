@@ -7,7 +7,7 @@ use crate::api::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -37,6 +37,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/secrets", get(list_secrets))
         .route("/api/secrets/inspect", get(inspect_secrets))
+        .route("/api/secrets/reload", post(reload_secrets))
         .route("/api/secrets/{path}", get(get_secret).post(update_secret))
 }
 
@@ -75,6 +76,34 @@ async fn get_secret(
 async fn inspect_secrets(State(state): State<AppState>) -> impl IntoResponse {
     let schema = state.secrets.inspect_schema().await;
     Json(schema)
+}
+
+/// Manually reload secrets from encrypted file
+///
+/// Called when user clicks "Refresh" button in UI.
+/// Decrypts current secrets/amux-secrets.yaml and updates cache.
+async fn reload_secrets(State(state): State<AppState>) -> impl IntoResponse {
+    match state.secrets.reload().await {
+        Ok(_) => (
+            StatusCode::OK,
+            Json(json!({
+                "ok": true,
+                "message": "Secrets reloaded from encrypted file"
+            })),
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::error!("Failed to reload secrets: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("Failed to reload: {}", e)
+                })),
+            )
+                .into_response()
+        }
+    }
 }
 
 /// Update secret (requires admin auth)
