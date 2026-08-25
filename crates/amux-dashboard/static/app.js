@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.726';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.727';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19258,17 +19258,68 @@ const _ARCHIVED_SLICE = 200;
 let _archivedCountN = null;
 let _archivedCountAt = 0;
 
+// The server scope the Archived section should fetch with, derived from the
+// board's OWN parsed query (AMUX-3716, found by tubescience co-verifying 3715).
+//
+// The section used to fetch a global head-200 of 3008 archived cards, so which
+// lane's cards you saw was an accident of archive ordering. tubescience's 81
+// all landed inside the slice (last index 145) purely because theirs were the
+// most recently archived — the moment another lane bulk-archives 200, theirs
+// fall off and the section stops answering the question it exists for.
+//
+// Uses `_bqParse`, the board's own parser, rather than a second regex over the
+// query string. A private parse here would drift from the one the rows are
+// filtered by, and then the section would fetch one population and display a
+// filter over a different one (ethos rule 1).
+//
+// Positive `session:`/`worker:` facets only. A NEGATED facet (-session:x) does
+// not narrow to anything the server can scope by — it excludes — so it stays a
+// client-side filter over the unscoped fetch, which is correct rather than a
+// limitation: narrowing the fetch on an exclusion would drop rows the board is
+// still showing.
+function _archivedScope() {
+  const parsed = _bqParse(boardSearchQuery || '');
+  const names = [];
+  (parsed.terms || []).forEach(function (t) {
+    if (t.neg) return;
+    if (t.key !== 'session' && t.key !== 'worker') return;
+    (t.vals || []).forEach(function (v) { if (v && names.indexOf(v) < 0) names.push(v); });
+  });
+  // One session -> scope the fetch. Several -> the server takes one value, so
+  // scoping to the first would silently drop the others; stay unscoped and let
+  // the client filter, with the cap notice saying so.
+  return names.length === 1 ? names[0] : null;
+}
+
+function _archivedQuery(extra) {
+  const sc = _archivedScope();
+  return '/api/board?archived=1' + (sc ? '&session=' + encodeURIComponent(sc) : '')
+    + '&limit=' + _ARCHIVED_SLICE + (extra || '');
+}
+
+let _archivedScopeAt = null;
 async function _ensureArchivedCount() {
-  if (_archivedCountN !== null && (Date.now() - _archivedCountAt) < 60000) return;
+  // KEYED ON THE SCOPE, not just on time. Without this, typing session:x into
+  // the board would keep serving the previous scope's cached count for up to a
+  // minute — a header describing a population the rows below no longer are.
+  const sc = _archivedScope();
+  const fresh = _archivedCountN !== null
+    && sc === _archivedScopeAt
+    && (Date.now() - _archivedCountAt) < 60000;
+  if (fresh) return;
   try {
-    // The SAME params the expand will fetch with (archived=1&done_limit=0), so
-    // the header cannot promise a number the section then contradicts. The
-    // server computes it from the same filter+cap the list runs.
-    const r = await fetch(API + '/api/board?archived=1&done_limit=0&count=1');
+    // The SAME scope + limit the expand fetches with, so the header cannot
+    // promise a number the section then contradicts. `count` is computed
+    // server-side from the same filter+cap the list runs; `_ARCHIVED_SLICE` is
+    // NOT applied to it, so this is the TRUE size of the filtered population
+    // and the rows may be a slice of it — which the cap notice then states.
+    const r = await fetch(API + '/api/board?archived=1'
+      + (sc ? '&session=' + encodeURIComponent(sc) : '') + '&done_limit=0&count=1');
     const d = await r.json();
     if (typeof d.count === 'number') {
       _archivedCountN = d.count;
       _archivedCountAt = Date.now();
+      _archivedScopeAt = sc;
       renderBoard();
     }
   } catch (e) { console.error('archived count:', e); }
@@ -19292,16 +19343,22 @@ async function _ensureArchivedCount() {
 // payload bound. `full=1` because slim DROPS source_ref, and the trigger is the
 // one field tubescience said they would act on.
 let _archivedSliceAt = 0;
+let _archivedSliceScope = null;
 async function _loadArchivedSlice() {
   if (_archivedLoading) return _archivedLoading;
-  if (boardArchived.length && (Date.now() - _archivedSliceAt) < 60000) return;
+  const sc = _archivedScope();
+  // Same scope-keying as the count: a cached slice from a different scope is
+  // rows that do not belong to the filter the board is showing.
+  if (boardArchived.length && sc === _archivedSliceScope
+      && (Date.now() - _archivedSliceAt) < 60000) return;
   _archivedLoading = (async () => {
     try {
-      const r = await fetch(API + '/api/board?archived=1&limit=' + _ARCHIVED_SLICE + '&full=1');
+      const r = await fetch(API + _archivedQuery('&full=1'));
       const d = await r.json();
       if (Array.isArray(d)) {
         boardArchived = d.filter(i => i.archived);
         _archivedSliceAt = Date.now();
+        _archivedSliceScope = sc;
         renderBoard();
       }
     } catch (e) { console.error('archived slice:', e); }
@@ -19335,7 +19392,26 @@ function _renderArchivedSection(container) {
     + 'aria-expanded="' + (boardArchivedOpen ? 'true' : 'false') + '">'
     + caret + ' Archived (' + esc(String(n)) + ')</button>';
   if (boardArchivedOpen) {
-    const rows = (boardArchived || []).slice();
+    // THE SAME CLIENT FILTERS THE ACTIVE COLUMNS USE. The server scope narrows
+    // the FETCH (session only); everything else in the board's query — owner,
+    // type, tag, negations, free text — is client-side, and the section must
+    // apply it too or it shows a different population than the columns beside
+    // it under the same query. `_bqFilter` is shared rather than re-derived.
+    let rows = (boardArchived || []).slice();
+    // SAVE/RESTORE `_bqRankActive` around the shared filter. `_bqFilter` sets
+    // that global, and `_boardCardSort`'s own comment says it must reflect "the
+    // _bqFilter call that produced this render's `visible` set" — which is the
+    // columns' call, made earlier in renderBoard. Reusing the shared predicate
+    // is right; silently repointing the ranking flag it owns is not, and it
+    // would surface as columns losing relevance order on any later re-sort
+    // (a drag, the peek board) rather than here, where it would be found.
+    const _rankWas = _bqRankActive;
+    rows = _bqFilter(rows, boardSearchQuery);
+    _bqRankActive = _rankWas;
+    if (!(boardSearchQuery || '').trim()) {
+      rows = rows.filter(i => boardOwnerFilter === 'agent'
+        ? i.owner_type === 'agent' : i.owner_type !== 'agent');
+    }
     if (!rows.length) {
       html += '<div class="board-archived-empty">'
         + (_archivedCountN === 0 ? 'Nothing archived.' : 'Loading…') + '</div>';
@@ -19349,10 +19425,25 @@ function _renderArchivedSection(container) {
       // bounded slice of it, and a section that showed 200 of 3008 without
       // saying so would read as "this is everything archived" — which is the
       // same false completeness the whole feature exists to fix.
+      // NO SILENT CAP, AND NAME THE FILTER (AMUX-3716's acceptance criterion,
+      // tubescience's words: a scoped view that silently truncates is the same
+      // false-completeness bug one scope down).
+      //
+      // The count is the true size of the SCOPED population; the rows are a
+      // slice of it, further narrowed client-side. Saying "200 of 3008" while
+      // scoped to one session would describe the fleet and mislead in the
+      // other direction, so the scope is named either way.
+      const _sc = _archivedScope();
+      const _scopeTxt = _sc ? ' in session:' + esc(_sc) : ' fleet-wide';
       if (_archivedCountN !== null && _archivedCountN > rows.length) {
         html += '<div class="board-archived-empty">Showing ' + rows.length + ' of '
-          + _archivedCountN + '. Use the search box (<code>is:archived</code>) to filter '
-          + 'the full set, or <code>GET /api/board?archived=1</code>.</div>';
+          + _archivedCountN + _scopeTxt + '.'
+          + (_sc ? '' : ' Add <code>session:&lt;lane&gt;</code> to the search box to scope this'
+                       + ' to one lane and see all of its archived cards.')
+          + '</div>';
+      } else if (_archivedCountN !== null) {
+        html += '<div class="board-archived-empty">All ' + rows.length + _scopeTxt
+          + '.</div>';
       }
       Object.keys(groups).sort().forEach(function (st) {
         const g = groups[st];
