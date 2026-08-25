@@ -7904,6 +7904,7 @@ pub(crate) fn lane_block_reason_from(
     env_exists: bool,
     archived: bool,
     running: bool,
+    rate_limited: bool,
 ) -> Option<&'static str> {
     if !env_exists {
         return Some("no-env-file");
@@ -7913,6 +7914,21 @@ pub(crate) fn lane_block_reason_from(
     }
     if !running {
         return Some("not-running");
+    }
+    // HOLD A SEND FOR A RATE-LIMITED LANE (AMUX-2238, Ethan 2026-08-03:
+    // "commands sent to a rate-limited session must queue and deliver only
+    // after the limit is confirmed released").
+    //
+    // LAST of the four, and the order is the claim. A lane that is not running
+    // is not-running whether or not it is also rate-limited, and that is the
+    // more actionable sentence for a sender. This fires only for a lane that is
+    // UP and cannot take work.
+    //
+    // NOT DEAD-LETTERED: `steer_dead_letter_verdict` covers the two permanent
+    // reasons only, and a rate limit is by definition temporary. The row waits,
+    // which is the whole point of the card.
+    if rate_limited {
+        return Some("rate-limited");
     }
     None
 }
@@ -7944,7 +7960,19 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     let archived = lane_is_archived(name);
     // Don't pay a tmux query for a lane already known unreachable.
     let running = env_exists && !archived && is_running(name).await;
-    lane_block_reason_from(env_exists, archived, running)
+    // CONFIRMED RELEASE, NOT A CLOCK — which is what the card asks for and what
+    // makes this implementable at all.
+    //
+    // `rate_limited_since` is maintained by the rate-limit sweep and is
+    // PRESENCE-BASED in both directions: it is stamped when the limit menu or
+    // the credit banner is on screen, and CLEARED on the first tick where
+    // neither is. So a non-zero value means the lane is limited right now, and
+    // zero is a live observation that it is not. No reset timestamp is
+    // consulted, which is why this also covers credit caps — they have no reset
+    // clock at all, and the design was stuck on that until the sweep gained the
+    // presence-based clear.
+    let rate_limited = env_exists && !archived && meta_i64(&load_meta(name), "rate_limited_since") > 0;
+    lane_block_reason_from(env_exists, archived, running, rate_limited)
 }
 
 /// The sentence a sender gets. It states what will HAPPEN, not merely what is
@@ -8070,6 +8098,18 @@ pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
             "NOT DELIVERABLE — '{name}' is not running. The message is stored, but the delivery loop \
              skips stopped lanes, so it waits for the lane to be STARTED, not for it to be free. \
              No deadline will force it through."
+        ),
+        // AMUX-2238. Says WHEN it goes, not merely that it is stuck: the
+        // release is observed (the banner leaving the lane's screen), so a
+        // sender knows waiting is the correct action here, unlike the three
+        // above where waiting helps only after someone does something.
+        "rate-limited" => format!(
+            "HELD — '{name}' is rate-limited. The message is queued and will deliver once the limit \
+             is CONFIRMED released, which amux observes directly: the rate-limit sweep clears the \
+             lane the first tick its limit menu and credit banner are both off screen. No clock is \
+             consulted, so this also covers credit caps, which have no reset time. Nothing is \
+             required of you; the deadline that normally forces a message into a running turn does \
+             not apply, because a rate-limited lane cannot act on it."
         ),
         other => format!("NOT DELIVERABLE — '{name}': {other}."),
     }
@@ -8933,15 +8973,47 @@ async fn warn_on_stalled_lanes(state: &AppState) {
         //
         // Both go in the line and both go in the key. They agree most of the
         // time; the times they disagree are exactly the ones worth seeing.
+        // A HOLD IS NOT A STALL (AMUX-2238). Once a rate-limited lane holds its
+        // queue by design, this path would report the designed behaviour as a
+        // fault: "STALLED — messages are not reaching this lane" is true and
+        // completely misleading, and it would fire every hour a limit lasts,
+        // plus notify the SENDER that something needs doing when nothing does.
+        //
+        // That is how a warning stops being read. So the hold stays VISIBLE and
+        // stops claiming a fault: INFO, its own wording, and no sender
+        // notification. Nothing is lost by not escalating — the lane already
+        // emits `session.rate_limited` and carries the status badge, so the
+        // condition is on the record where people look for it, which is the
+        // question ethos rule 4 actually asks.
+        //
+        // Deliberately NOT a duration threshold. "Warn if the limit lasts more
+        // than N hours" is a tuned parameter guarding a state amux can already
+        // observe directly, and picking N at all is the tell.
+        let held_by_limit = cond == "rate-limited";
         if stall_log_first_this_bucket(&stall_dedupe_key(&session, cond, &reason), bucket) {
-            tracing::warn!(
-                session = %session,
-                queued = count,
-                oldest_min = (age / 60.0) as i64,
-                last_skip = %reason,
-                blocked_now = %cond,
-                "steering queue STALLED — messages are not reaching this lane"
-            );
+            if held_by_limit {
+                tracing::info!(
+                    session = %session,
+                    queued = count,
+                    oldest_min = (age / 60.0) as i64,
+                    last_skip = %reason,
+                    "steering queue HELD — the lane is rate-limited; delivery resumes when the \
+                     sweep observes the limit released (AMUX-2238). This is the designed \
+                     behaviour, not a stall."
+                );
+            } else {
+                tracing::warn!(
+                    session = %session,
+                    queued = count,
+                    oldest_min = (age / 60.0) as i64,
+                    last_skip = %reason,
+                    blocked_now = %cond,
+                    "steering queue STALLED — messages are not reaching this lane"
+                );
+            }
+        }
+        if held_by_limit {
+            continue;
         }
 
         // ETHOS RULE 4, which is the whole of this card: "when this goes wrong,
@@ -17713,13 +17785,13 @@ mod steer_max_age_tests {
     fn the_three_stalled_lanes_are_distinguished_from_a_merely_busy_one() {
         // amux-agent — 15.2h queued, skip reason `no-env-file`.
         assert_eq!(
-            lane_block_reason_from(false, false, false),
+            lane_block_reason_from(false, false, false, false),
             Some("no-env-file"),
             "amux-agent: a lane with no env file is not a worker, and no deadline reaches it"
         );
         // amux-rust-execution — 4.3h queued, and mixpeek-orchestrator at 15.2h.
         assert_eq!(
-            lane_block_reason_from(true, false, false),
+            lane_block_reason_from(true, false, false, false),
             Some("not-running"),
             "amux-rust-execution / mixpeek-orchestrator: a stopped lane waits to be STARTED, \
              not to be free"
@@ -17728,7 +17800,7 @@ mod steer_max_age_tests {
         // exactly this state at the same moment, and they are the reason the
         // other three were invisible: all five reported the same "queued".
         assert_eq!(
-            lane_block_reason_from(true, false, true),
+            lane_block_reason_from(true, false, true, false),
             None,
             "a running, unarchived lane is deliverable — busy is not blocked, and conflating \
              the two is the whole defect"
@@ -17736,12 +17808,93 @@ mod steer_max_age_tests {
         // Archived is its own answer rather than being collapsed into
         // `not-running`: un-archiving is a human's call (ethos rule 8), so the
         // sender needs to be told which of the two they are looking at.
-        assert_eq!(lane_block_reason_from(true, true, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, false, false), Some("archived"));
         assert_eq!(
-            lane_block_reason_from(true, true, true),
+            lane_block_reason_from(true, true, true, false),
             Some("archived"),
             "an archived lane that still has a live pane is still refused — the send path \
              refuses archived, so the queue must not promise otherwise"
+        );
+    }
+
+    /// AMUX-2238: a send to a rate-limited lane HOLDS, and is never dropped.
+    ///
+    /// Ethan, 2026-08-03: "commands sent to a rate-limited session must queue
+    /// and deliver only after the limit is confirmed released — keyed on the
+    /// limit passing + a live confirmation, not just the clock."
+    ///
+    /// THE ORDER IS THE CLAIM, and it is the trap I flagged when triaging this.
+    /// A lane that is not running is `not-running` whether or not it is also
+    /// rate-limited: that is the more actionable sentence, and a held send must
+    /// never reach a lane before the lane is up. The two cells below pin that
+    /// precedence, so a later reorder cannot quietly invert it.
+    ///
+    /// The delivery-order half of the design question resolves BY CONSTRUCTION
+    /// rather than by ordering logic, which is why there is no queue-position
+    /// code here to test: the resume that clears a limit is a direct tmux key
+    /// (`send_keys_op(name, "Enter")` in the sweep), not a steering row. So the
+    /// resume cannot be queued behind a held send, and the queue does not drain
+    /// until the sweep observes the banner gone — which is downstream of the
+    /// lane actually working again.
+    #[test]
+    fn a_rate_limited_lane_holds_its_queue_and_never_dead_letters() {
+        assert_eq!(
+            lane_block_reason_from(true, false, true, true),
+            Some("rate-limited"),
+            "a running lane that cannot take work must block, or the send is delivered into a \
+             limit and lost"
+        );
+        assert_eq!(
+            lane_block_reason_from(true, false, true, false),
+            None,
+            "CONTROL: a running lane with no limit is deliverable — if this ever returns a \
+             block, every send in the fleet queues forever"
+        );
+
+        // PRECEDENCE. Both cells, because either direction of a reorder is a
+        // real bug and only asserting one of them would let the other through.
+        assert_eq!(
+            lane_block_reason_from(true, false, false, true),
+            Some("not-running"),
+            "a stopped lane is not-running first: telling a sender 'rate-limited' would send \
+             them to wait on a limit when the lane needs STARTING"
+        );
+        assert_eq!(
+            lane_block_reason_from(true, true, true, true),
+            Some("archived"),
+            "archived still outranks it — un-archiving is a human's call and no limit release \
+             will ever make an archived lane deliverable"
+        );
+
+        // NEVER DEAD-LETTERED, at any age. The dead-letter path exists for
+        // PERMANENTLY unroutable targets; a rate limit is temporary by
+        // definition, and discarding a held message because the limit lasted a
+        // long time is the failure this card exists to prevent.
+        assert!(
+            steer_dead_letter_verdict("rate-limited", 86_400.0 * 30.0).is_none(),
+            "a month-old hold is still a hold — dead-lettering it would silently drop the \
+             message the card asked to be QUEUED"
+        );
+
+        // The sentence must say WHEN it goes, not just that it is stuck. Every
+        // other block reason requires a human to act; this one does not, and a
+        // sender who cannot tell the difference will go and do something.
+        let msg = block_reason_explain("rate-limited", "busy-lane");
+        assert!(msg.contains("busy-lane"), "{msg}");
+        assert!(
+            msg.contains("CONFIRMED released"),
+            "the card's own words: confirmed, not a clock: {msg}"
+        );
+        assert!(
+            msg.contains("credit caps"),
+            "credit caps have no reset time and were the reason this design stalled — the \
+             sentence has to say they are covered: {msg}"
+        );
+        assert!(
+            !msg.contains("NOT DELIVERABLE"),
+            "it IS deliverable, later, with no action from the sender. Sharing the wording of \
+             the three reasons that need a human is how a temporary hold gets read as a \
+             dead end: {msg}"
         );
     }
 
@@ -17755,8 +17908,8 @@ mod steer_max_age_tests {
     /// and autofix cards that could never clear.
     #[test]
     fn archived_is_the_one_blocked_reason_that_must_not_be_queued() {
-        assert_eq!(lane_block_reason_from(true, true, false), Some("archived"));
-        assert_eq!(lane_block_reason_from(true, true, true), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, false, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, true, false), Some("archived"));
         // The refusal has to publish what to do, or the sender hand-rolls
         // something worse to get past it (the AMUX-2325 shape).
         let msg = block_reason_explain("archived", "old-lane");
