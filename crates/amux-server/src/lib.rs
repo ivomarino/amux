@@ -73,6 +73,7 @@ pub mod orchestrator;
 pub mod provider;
 pub mod push;
 pub mod runtime_jobs;
+pub mod secrets;
 pub mod tls;
 
 use std::sync::Arc;
@@ -166,6 +167,14 @@ async fn async_main() {
     // Config first: the log-file path below needs amux_home.
     let cfg = config::ServerConfig::from_process_env();
 
+    // Initialize secrets store (Phase 3: wire encrypted secrets into startup).
+    // Secrets file lives at checkout root (parent of AMUX_HOME), encrypted with age.
+    let checkout_root = cfg.amux_home.parent().unwrap_or(cfg.amux_home.as_path());
+    let secrets_file = checkout_root.join("secrets/amux-secrets.yaml");
+    let age_key_path = std::path::PathBuf::from(shellexpand::tilde("~/.config/sops/age/keys.txt").as_ref());
+    let secret_store = secrets::SecretStore::new(age_key_path, secrets_file);
+    let secret_store = Arc::new(secret_store);
+
     // Tracing tees to stdout AND ~/.amux/logs/server-rs.log (AMUX-2605):
     // the file is what GET /api/logs/raw tails — python parity, where the
     // Logs tab's raw view reads the server's own log. ANSI off so the file
@@ -256,6 +265,17 @@ async fn async_main() {
     }
 
     tracing::info!(port = cfg.port, db = %cfg.db_path.display(), "starting amux-rust");
+
+    // Load encrypted secrets (Phase 3: SecretStore initialization).
+    // This decrypts secrets/amux-secrets.yaml once and caches in memory.
+    if let Err(e) = secret_store.load().await {
+        tracing::warn!(error = ?e, "failed to load encrypted secrets — continuing without them");
+    } else {
+        // Load secrets into environment variables for access by components
+        if let Err(e) = secret_store.load_env().await {
+            tracing::warn!(error = ?e, "failed to load secrets into environment variables");
+        }
+    }
 
     // WAS THIS RESTART ANNOUNCED? (AF-176)
     //
@@ -354,6 +374,7 @@ async fn async_main() {
         started: Instant::now(),
         build_hash: build_hash(),
         auth_token,
+        secrets: secret_store,
     };
     // EVERY BACKGROUND LOOP BELOW GOES THROUGH `registry::spawn_loop`, and
     // that is not a style preference. Three of these were dead or had never

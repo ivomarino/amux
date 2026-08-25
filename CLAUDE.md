@@ -558,3 +558,68 @@ node skills/chrome-cdp/scripts/cdp.mjs nav <target> <url>
 Requires Chrome remote debugging enabled (`chrome://inspect/#remote-debugging`) and Node.js 22+.
 
 Claude Code, the amux server, and Chrome all run on the same desktop machine. Use `https://localhost:8824` for amux dashboard URLs (not 8822 — that address is retired).
+
+## Encrypted Secrets Management (local/amux-5-fix, Phase 1-4)
+
+**Status:** ✅ Fully operational with age (X25519) encryption.
+
+Central encrypted secrets store for passwords, API keys, OAuth credentials, and webhooks. All workers and handlers can access decrypted secrets via AppState or environment variables.
+
+**Architecture:**
+1. **At rest:** `secrets/amux-secrets.yaml` encrypted with age (X25519)
+2. **At startup:** Server decrypts once, caches in-memory via `Arc<Mutex>`
+3. **In memory:** `SecretStore` provides dot-separated path lookup
+4. **Via API:** `/api/secrets/*` endpoints (GET, POST)
+5. **Legacy code:** Secrets loaded into environment variables (`EXTERNAL_*`, etc.)
+
+**Setup (one-time):**
+```bash
+# Generate age key (if not exists)
+mkdir -p ~/.config/sops/age
+age-keygen -o ~/.config/sops/age/keys.txt
+
+# Encrypt initial secrets with age
+age -r <public-key-from-above> secrets/amux-secrets.yaml.plaintext > secrets/amux-secrets.yaml
+
+# Key is NOT committed; only encrypted .yaml file is
+echo "secrets/amux-secrets.yaml" >> .gitignore
+```
+
+**API Endpoints:**
+```bash
+# List all secret paths (no values)
+curl -sk https://localhost:8824/api/secrets
+
+# Get specific secret
+curl -sk https://localhost:8824/api/secrets/external_services.openai.api_key
+
+# Get schema structure (all values redacted)
+curl -sk https://localhost:8824/api/secrets/inspect
+
+# Update secret (re-encrypts)
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"value":"new-value"}' \
+  https://localhost:8824/api/secrets/external_services.openai.api_key
+```
+
+**Environment Variables Populated:**
+Secrets are automatically loaded into env vars for legacy code:
+- `EXTERNAL_SERVICES_OPENAI_API_KEY` = `external_services.openai.api_key`
+- `OAUTH_GOOGLE_CLIENT_ID` = `oauth.google.client_id`
+- And all others under `external_services`, `oauth`, `databases`, `webhooks`, `api_keys`
+
+**Graceful Degradation:**
+If secrets cannot be loaded, server logs a warning and continues (allows operation without credentials for development).
+
+**Security Notes:**
+- Age encryption (X25519) at rest
+- Age key stored at `~/.config/sops/age/keys.txt` (never committed)
+- Decrypted only once at startup
+- Cached in memory only
+- Environment variable leakage risk — prefer API access for sensitive operations
+- API endpoints require authentication (checked against `state.auth_token`)
+
+**Next Phases:**
+- **Phase 5:** Web UI dashboard for viewing/managing secrets
+- **Phase 6:** MCP integration — Claude agents can request secrets
+- **Phase 7:** GitHub OAuth connector using this infrastructure
