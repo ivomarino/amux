@@ -2774,3 +2774,30 @@ COST: No wrong conclusion shipped, but only because I happened to read the full
 FIX: 79080270, both corrected and both pinned. The general lesson: when a
   verdict gains a second branch, every field computed alongside it inherits the
   branch whether or not it was touched — grep the payload, not the diff.
+
+## `node --check` is blind to a duplicate function name, and that shipped a dead dashboard
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3715
+SYMPTOM: I added `function _renderArchivedSection(container)` for the board's
+  archived section. The sessions view already had a `_renderArchivedSection`
+  ~11,000 lines earlier. Declarations hoist and the last wins, so mine silently
+  replaced theirs; every sessions call site passes no arguments, so it hit
+  `container.appendChild(wrap)` on `undefined` and threw before the loading
+  overlay was hidden. The main dashboard view was dead.
+COST: A live regression on the primary view, shipped and deployed. Found by
+  gtm-research, not by me and not by any check. The PostToolUse hook runs
+  `node --check`, which passed — a duplicate `function` is legal JavaScript. I
+  had also written in that commit that every function the new code CALLS was
+  verified to exist, which is the one-directional half of the check and the half
+  that was already fine.
+FIX: 7607ee46 (gtm-research renamed mine) + a guard in
+  tests/dashboard_assets.rs enumerating duplicate top-level declarations,
+  verified by restoring the collision: `node --check` still passes, the guard
+  fails. The general lesson is in ethos.md rule 7 — when a tool covers a class,
+  ask which members the LANGUAGE makes legal, because those are the ones it
+  silently does not cover. A duplicate `let` is a SyntaxError; a duplicate
+  `function` is not.

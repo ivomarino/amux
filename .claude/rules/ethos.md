@@ -191,6 +191,26 @@ closed. Both standing checks passed the whole time:
 The check that finds it: enumerate every function defined in the client, diff against
 every function called, and inspect the callers.
 
+**AND THE MIRROR, which cost a live regression on 2026-08-25: every name you CALL
+must exist, and every name you DEFINE must not already.** AMUX-3715 added a
+`_renderArchivedSection` for the board; the sessions view had owned that name for
+eleven thousand lines. Function declarations hoist and the LAST one wins, so the new
+one silently replaced the old, every sessions call site started running a body
+expecting an argument it never passes, and the main dashboard view died on
+`container.appendChild` of `undefined`. A peer diagnosed it (gtm-research, 7607ee46).
+
+That commit message had claimed the check was done — "every function the new code
+CALLS was verified to exist" — which is the direction that was already covered. Half a
+bidirectional check reads exactly like the whole one when you are the person who ran it.
+
+**The language hid it, and that generalises past JavaScript.** A duplicate `let`/`const`
+is a SyntaxError `node --check` catches; a duplicate `function` is legal. So the parse
+check gave real coverage on one shape and none on its twin, with nothing from the
+outside distinguishing them. When a tool covers a class, ask which members of that class
+the LANGUAGE makes legal — those are the ones it silently does not cover.
+`tests/dashboard_assets.rs` now enumerates duplicate top-level declarations; verified by
+restoring the collision, at which point `node --check` still passes and the guard fails.
+
 **Check after any deletion:** what would still be green if I had broken this? Test the
 shipped code path, not a paraphrase of it. Simulating what you believe a function does
 cannot catch that function doing something else.
