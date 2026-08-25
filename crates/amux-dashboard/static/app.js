@@ -19327,11 +19327,11 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
-  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
-  // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
+  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors', 'secrets'];
+  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors', 'secrets'];
+  // MUST stay index-aligned with _svIds/_svNames above (21 entries). It once had
   // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
+  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex', 'flex'];
   for (let i = 0; i < _svIds.length; i++) {
     const ve = document.getElementById(_svIds[i] + '-view');
     if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
@@ -19361,6 +19361,7 @@ function switchView(view) {
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
   if (view === 'mdai') _mdaiTabLoad();
   if (view === 'connectors') _connectorsTabLoad();
+  if (view === 'secrets') _secretsTabLoad();
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
     try { if (location.hash.startsWith('#path=')) history.replaceState({}, '', location.pathname); } catch(e) {}
@@ -34530,3 +34531,83 @@ function _dpInit() {
 }
 if (document.body) _dpInit();
 else document.addEventListener('DOMContentLoaded', _dpInit);
+
+// ── Secrets Tab ──────────────────────────────────────────────────────────────
+async function _secretsTabLoad() {
+  const container = document.getElementById('secrets-container');
+  if (!container) return;
+  
+  try {
+    container.innerHTML = '<div style="padding:20px; text-align:center;">Loading secrets...</div>';
+    
+    const response = await fetch(API + '/api/secrets', {
+      headers: _authHeaders({})
+    });
+    
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    
+    const data = await response.json();
+    const secrets = data.secrets || [];
+    
+    if (!secrets.length) {
+      container.innerHTML = '<div style="padding:20px; color:var(--dim);">No secrets configured yet.</div>';
+      return;
+    }
+    
+    let html = '<div style="display:grid; grid-template-columns:repeat(auto-fill,minmax(300px,1fr)); gap:15px;">';
+    
+    for (const path of secrets) {
+      html += `<div style="border:1px solid var(--border); border-radius:8px; padding:15px; background:var(--card);">
+        <div style="font-family:monospace; font-size:13px; margin-bottom:10px; word-break:break-all; color:var(--accent);">${esc(path)}</div>
+        <div style="display:flex; gap:8px;">
+          <button onclick="_secretsView('${esc(path)}')" style="flex:1; padding:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg); cursor:pointer; font-size:12px;">View</button>
+          <button onclick="_secretsCopy('${esc(path)}')" style="flex:1; padding:8px; border:1px solid var(--border); border-radius:4px; background:var(--bg); cursor:pointer; font-size:12px;">Copy</button>
+        </div>
+      </div>`;
+    }
+    
+    html += '</div>';
+    container.innerHTML = html;
+  } catch (e) {
+    container.innerHTML = `<div style="padding:20px; color:#f85149;">Error loading secrets: ${esc(e.message)}</div>`;
+  }
+}
+
+async function _secretsView(path) {
+  try {
+    const response = await fetch(API + `/api/secrets/${encodeURIComponent(path)}`, {
+      headers: _authHeaders({})
+    });
+    
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    
+    const data = await response.json();
+    const value = data.value || '(empty)';
+    
+    alert(`Secret: ${path}\n\n${value}`);
+  } catch (e) {
+    showToast(`Error reading secret: ${e.message}`);
+  }
+}
+
+async function _secretsCopy(path) {
+  try {
+    const response = await fetch(API + `/api/secrets/${encodeURIComponent(path)}`, {
+      headers: _authHeaders({})
+    });
+    
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    
+    const data = await response.json();
+    const value = data.value || '';
+    
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      await navigator.clipboard.writeText(value);
+      showToast(`✓ Copied to clipboard`);
+    } else {
+      alert(`Value:\n\n${value}`);
+    }
+  } catch (e) {
+    showToast(`Error copying secret: ${e.message}`);
+  }
+}
