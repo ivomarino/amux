@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.731';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.732';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19407,6 +19407,20 @@ function _renderBoardArchivedSection(container) {
     + 'aria-expanded="' + (boardArchivedOpen ? 'true' : 'false') + '">'
     + caret + ' Archived (' + esc(String(n)) + ')</button>';
   if (boardArchivedOpen) {
+    // ASKING FOR IT IS WHAT LOADS IT (AMUX-2271's rule, which I broke).
+    //
+    // The fetch used to live ONLY in the toggle handler, so the open state
+    // persisting in localStorage produced a section that renders expanded on the
+    // next page load and never fetches — permanently empty, no request, no
+    // error. Caught by reloading with the section already open, which no
+    // data-layer check reaches and no first visit reproduces.
+    //
+    // `_bqHideArchived` states the rule for the query path: "The ONE place that
+    // decides archived visibility is also the right place to make sure the data
+    // exists... Hooking the trigger anywhere else would be a second mechanism."
+    // This render is that place for the section, so the trigger belongs here and
+    // not only in the toggle. `_loadArchivedSlice` is idempotent and TTL-guarded.
+    if (!(boardArchived || []).length) _loadArchivedSlice();
     // THE SAME CLIENT FILTERS THE ACTIVE COLUMNS USE. The server scope narrows
     // the FETCH (session only); everything else in the board's query — owner,
     // type, tag, negations, free text — is client-side, and the section must
