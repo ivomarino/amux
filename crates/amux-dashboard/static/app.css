@@ -953,7 +953,15 @@
      Dimmed deliberately rather than brightened: punctuation is scaffolding, so it
      should recede while staying legible. */
   .file-overlay-body.file-code .hljs-punctuation { color: #8b949e; }
-  body.light .file-overlay-body.file-code .hljs-punctuation { color: #6e7781; }
+  /* github-dark's own `.hljs-section` is #1f6feb, which MEASURES 3.49:1 against
+     this viewer's light-mode body (#1c2128) and 4.0:1 against its dark one
+     (#010409) — both under WCAG AA's 4.5:1 floor for body text. It is the
+     section header in ini/toml/tf/hcl/cfg/conf, i.e. the most structural line
+     in every config file this fleet opens, and it was the lowest-contrast class
+     across all 61 code types measured. Lifted to GitHub's own accent blue,
+     which measures 5.95:1 here. Same reasoning as the punctuation override
+     above: the theme is a good default, not a per-surface answer. */
+  .file-overlay-body.file-code .hljs-section { color: #58a6ff; }
   /* The light-mode file viewer keeps a DARK body (#1c2128, see the rule near the
      top of this file), so the gutter must match that, not the page background. */
   body.light .file-overlay-body.file-code .hljs-gutter { background: #1c2128; color: #6e7781; }
