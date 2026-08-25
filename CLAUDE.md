@@ -3,12 +3,12 @@
 - whenever you fix a bug do 2 things: 1) fix it durably at the root cause and 2) make it so that the bug would have surfaced in the amux logs so that a log sweep would've caught it, you may need to replicate the bug to confirm it appears in the logs. 
 
 A **Rust workspace** (`crates/amux-core`, `amux-server`, `amux-cli`, `amux-dashboard`)
-serving a static SPA. **The address is 8824** (`AMUX_RS_PORT`, what `./install.sh`
-sets) — use it everywhere.
+serving a static SPA. **The canonical address is 8823** (default from `config::DEFAULT_PORT`,
+overridable via `AMUX_RS_PORT` environment variable) — use it everywhere.
 
 8822 is the RETIRED port and its compatibility bind is **gone** (Ethan dropped it
 2026-08-11: "no more 8822 just rust", `crates/amux-server/src/lib.rs`).
-`curl -sk https://localhost:8824/health` answers; `:8822/health` no longer does.
+`curl -sk https://localhost:8823/health` answers; `:8822/health` no longer does.
 Do NOT re-add the bind to fix a symptom — lib.rs records why, and names what
 replaced it (`endpoint.json` self-heal for hooks, canonical-port launch for new
 lanes). `tests/legacy_port_guard.rs` fails the build if the address reappears.
