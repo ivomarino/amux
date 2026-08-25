@@ -1,5 +1,32 @@
 [
   {
+    "hash": "5e647edd",
+    "short": "5e647ed",
+    "title": "Send to a specific worker by its ID",
+    "date": "2026-08-25",
+    "type": "feat",
+    "tags": ["workers", "api"],
+    "description": "The worker-send route is now canonical: POST /api/sessions/<worker-name>/send is a stable, documented endpoint that external systems can address directly. Previously the send path had to be discovered from the session listing on each call. This change makes it practical to wire GitHub Actions, webhooks, and other external triggers to a named worker by ID, since the URL is now stable across restarts and server updates."
+  },
+  {
+    "hash": "9b27e1c1",
+    "short": "9b27e1c",
+    "title": "Schedules show estimated turns per day at creation and on edit",
+    "date": "2026-08-25",
+    "type": "feat",
+    "tags": ["schedules", "ux"],
+    "description": "When you create or edit a recurring schedule, amux now calculates and displays the estimated agent turns per day that schedule will consume based on its cadence. A schedule running every hour shows 24 turns/day; one running every weekday at 9am shows 5. This lets you forecast token spend before committing to a schedule, rather than discovering cost only after the first week of runs."
+  },
+  {
+    "hash": "84d0bd03",
+    "short": "84d0bd0",
+    "title": "Messages hold during rate limits instead of being dropped",
+    "date": "2026-08-25",
+    "type": "feat",
+    "tags": ["reliability", "steering"],
+    "description": "When a message is sent to a session that is currently rate-limited — either by API quota or by Claude Code's own rate limit — amux now holds the message in a delivery queue and delivers it as soon as the limit is released. Previously the message was silently dropped, with no indication to the sender that it had not been received. This affects agent-to-agent pipelines and external API callers who cannot predict whether a target worker is rate-limited at send time."
+  },
+  {
     "hash": "1ad1e7744d9bebaefd6dd0e568bea886cfb8081b",
     "short": "1ad1e77",
     "title": "Board tasks now record when they closed",
