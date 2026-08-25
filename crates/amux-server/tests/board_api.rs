@@ -2530,3 +2530,132 @@ async fn a_patch_whose_every_key_is_unwritable_is_422_and_a_real_noop_is_not() {
     assert_eq!(st, StatusCode::OK, "one legitimate key means the request was usable: {body}");
     assert_eq!(body["ignored_fields"], json!(["item_type"]), "still reported");
 }
+
+/// AMUX-3715: `?count=1` agrees with the list it describes, and refuses to look
+/// like one.
+///
+/// Requested by tubescience: they archive in bulk (81 cards in one session) and
+/// lost the ability to see that group, because `amux board archive` sets
+/// archived=1 and leaves `status` alone, so archived work scatters under its old
+/// status with nowhere to review it.
+///
+/// The count exists because the dashboard's "Archived (N)" header is collapsed
+/// by default and the archived set was MEASURED at 445KB raw / 87KB gzipped —
+/// +38% on the board poll — which is too much to ship on every load of a
+/// mobile-first dashboard to render a number.
+///
+/// THE PROPERTY THAT MATTERS is not the number, it is that the count and the
+/// list share a predicate. A count from its own SELECT would drift the moment
+/// either side changed, and the header would then confidently disagree with
+/// what expanding it shows (ethos rule 1). So the cells assert the two against
+/// EACH OTHER rather than against literals — a literal still passes if both
+/// drift the same way — and a final pair pins the values so a constant cannot
+/// satisfy the agreement cells.
+#[tokio::test]
+async fn count_agrees_with_the_list_and_is_not_shaped_like_one() {
+    let (app, _dir) = app();
+    // ARCHIVE VIA PATCH, not via create. The first draft passed `archived: 1`
+    // in the create body; POST /api/board ignores it, so nothing was archived
+    // and BOTH sides of every agreement cell were 0 — they passed on an empty
+    // set. The discriminating cells at the bottom are what caught it, which is
+    // the entire reason they are there.
+    for (i, arch) in [(1, 0), (2, 0), (3, 1), (4, 1), (5, 1)] {
+        let c = create(&app, json!({"title": format!("c{i}"), "session": "lane"})).await;
+        if arch == 1 {
+            let id = c["id"].as_str().expect("created id");
+            let (st, _, v) =
+                send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({"archived": 1}))).await;
+            assert_eq!(st, StatusCode::OK, "archive c{i} failed: {v}");
+        }
+    }
+    // PREMISE, asserted: the seeding actually archived something. Without this
+    // an empty board satisfies every "count equals list length" cell below.
+    let (_, _, seeded) = send(&app, "GET", "/api/board?archived=1", None).await;
+    assert_eq!(
+        seeded.as_array().map(Vec::len),
+        Some(3),
+        "premise: 3 cards must actually be archived, or the agreement cells compare 0 to 0"
+    );
+
+    for q in ["archived=1", "archived=0", "session=lane"] {
+        let (_, _, list) = send(&app, "GET", &format!("/api/board?{q}"), None).await;
+        let n_list = list.as_array().expect("the list is a bare array").len();
+        let (_, _, cnt) = send(&app, "GET", &format!("/api/board?{q}&count=1"), None).await;
+        assert_eq!(
+            cnt["count"].as_u64().expect("count is a number") as usize,
+            n_list,
+            "{q}: the count must equal the length of the list it describes: {cnt}"
+        );
+    }
+
+    // SHAPE. An object, not an array: a caller that drops `count=1` from its URL
+    // should get a shape error rather than a plausible one-element array, and
+    // `.length` on the count body must be undefined rather than 1.
+    let (_, _, cnt) = send(&app, "GET", "/api/board?archived=1&count=1", None).await;
+    assert!(cnt.is_object(), "count must not be array-shaped: {cnt}");
+    assert!(cnt.get("filter").is_some(), "it must echo the filter it counted: {cnt}");
+
+    // AND IT MUST DISCRIMINATE, or a constant would pass every agreement cell
+    // above.
+    let (_, _, a1) = send(&app, "GET", "/api/board?archived=1&count=1", None).await;
+    let (_, _, a0) = send(&app, "GET", "/api/board?archived=0&count=1", None).await;
+    assert_eq!(a1["count"], json!(3), "3 archived were seeded: {a1}");
+    assert_eq!(a0["count"], json!(2), "2 active were seeded: {a0}");
+}
+
+/// AMUX-3715: archiving a card that carries a live trigger says so, and one
+/// without a trigger does not.
+///
+/// tubescience's finding, and it is about the primitive rather than the view
+/// they asked for: `archived` hides a card from every board view AND every
+/// autonomy loop, so a `--trigger` in `source_ref` will never fire again. The
+/// card reads as parked-on-a-condition and is parked forever.
+///
+/// Measured when they reported it: 202 archived cards fleet-wide carry a
+/// non-empty source_ref across at least six lanes. Not one will fire.
+///
+/// RECORDED, NOT REFUSED — they archive trigger-bearing cards deliberately and
+/// keep the conditions in committed docs, so refusing would break a working
+/// flow to protect them from a deliberate choice. The log line outlives the
+/// response, which is what a future lane actually reads.
+///
+/// The negative cell is the one that keeps this useful: warning on EVERY
+/// archive would pass the first cell and train everyone to ignore the line.
+#[tokio::test]
+async fn archiving_a_trigger_bearing_card_records_that_it_de_arms_it() {
+    let (app, _dir) = app();
+
+    let armed = create(&app, json!({"title": "armed", "session": "lane"})).await;
+    let armed_id = armed["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{armed_id}"),
+        Some(json!({"source_ref": "when the content_hash deploy lands"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "set trigger: {v}");
+    // PREMISE: the trigger actually stuck. Without this the cell below passes
+    // for a card that never had one.
+    assert_eq!(v["source_ref"], json!("when the content_hash deploy lands"), "{v}");
+
+    let (st, _, v) =
+        send(&app, "PATCH", &format!("/api/board/{armed_id}"), Some(json!({"archived": 1}))).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let log = v["log"].as_str().unwrap_or_default();
+    assert!(log.contains("DE-ARMS"), "the log must say archiving de-arms it: {log}");
+    assert!(
+        log.contains("when the content_hash deploy lands"),
+        "and must quote the trigger, so a future reader knows WHAT stopped firing: {log}"
+    );
+
+    // THE NEGATIVE: no trigger, no warning. A line on every archive is a line
+    // nobody reads.
+    let plain = create(&app, json!({"title": "plain", "session": "lane"})).await;
+    let plain_id = plain["id"].as_str().unwrap();
+    let (_, _, pv) =
+        send(&app, "PATCH", &format!("/api/board/{plain_id}"), Some(json!({"archived": 1}))).await;
+    let plog = pv["log"].as_str().unwrap_or_default();
+    assert!(plog.contains("ARCHIVED"), "it still records the archive: {plog}");
+    assert!(!plog.contains("DE-ARMS"), "but must not warn about a trigger it does not have: {plog}");
+}

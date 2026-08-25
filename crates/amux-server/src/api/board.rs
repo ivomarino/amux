@@ -266,6 +266,13 @@ async fn get_contract(
                 "quota": "1 = per-status terminal quotas (verified floor 300; done/discarded \
                           share done_limit) instead of the lumped cap — the dashboard poll's \
                           shape (AMUX-3503)",
+                "count": "1 = return {count, filter} instead of the rows. Counts what THIS \
+                          filter would return, from the same filter+cap the list runs, so a \
+                          header cannot disagree with what expanding it shows. Pass the SAME \
+                          params you will fetch with — terminal statuses are capped unless \
+                          you add done_limit=0 or all=1. Added for the dashboard's collapsed \
+                          Archived (N) header, where shipping the set to render a number cost \
+                          a measured +38% on the board poll (AMUX-3715)",
             },
             // NOT a filter — descriptive metadata about what `slim` DROPS, so it
             // lives outside `filters`. It sat inside `filters` from 64a9cb7d until
@@ -1265,6 +1272,21 @@ pub struct ListParams {
     // renders from the fetch path and the full-push is retired.
     #[serde(default)]
     pub quota: Option<String>,
+    // `?count=1` (AMUX-3715) — how many rows this filter selects, WITHOUT
+    // shipping them.
+    //
+    // For the dashboard's collapsed "Archived (N)" header. Measured before
+    // adding it: the archived set is 445KB raw / 87KB gzipped, a 38% increase
+    // on the board poll, for a section that is collapsed by default — too much
+    // to pay on every load of a mobile-first dashboard just to render a number.
+    //
+    // It runs the SAME filter+cap path the list runs and counts what that
+    // returns, so the header cannot disagree with what expanding it shows
+    // (ethos rule 1: a view must share the predicate of the mechanism it
+    // describes). A count computed by its own SELECT would drift the moment
+    // either changed.
+    #[serde(default)]
+    pub count: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -1308,7 +1330,7 @@ pub struct ListParams {
 /// announces the terminal cap. (`q`/`query`/`search` are here because they are
 /// consumed above — refused with a 400 — so they are recognised, not ignored.)
 const RECOGNISED_BOARD_PARAMS: &[&str] = &[
-    "status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "limit", "offset", "q", "query",
+    "status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "count", "limit", "offset", "q", "query",
     "search",
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
@@ -1486,7 +1508,7 @@ pub async fn list_board(
                 "use_instead": format!("/api/search?q={term}"),
                 "why": "This param was silently ignored until 2026-08-11, so the full board came \
                         back looking like ranked results. Refusing loudly beats answering wrongly.",
-                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "limit", "offset"],
+                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "count", "limit", "offset"],
             })),
         )
             .into_response();
@@ -1618,6 +1640,33 @@ pub async fn list_board(
     };
     let total = kept.len();
     let now = now_secs();
+
+    // COUNT-ONLY (AMUX-3715). Placed HERE, after the same filter+cap that
+    // produces `kept`, so the number is literally the length of what the list
+    // would have shipped — not a second SELECT that could drift from it.
+    //
+    // Returns an OBJECT while the list returns a bare array, which is
+    // deliberate: a consumer that forgets `count=1` is in its URL gets a shape
+    // error rather than a plausible-looking one-element array, and a client
+    // reading `.length` on `{"count": 662}` gets undefined rather than 1.
+    if qp_truthy(p.count.as_deref()) {
+        return Json(json!({
+            "count": total,
+            "filter": {
+                "status": p.status.clone(),
+                "session": p.session.clone(),
+                "archived": p.archived.clone(),
+                "done_limit": p.done_limit,
+                "quota": p.quota.clone(),
+            },
+            "note": "count of what THIS filter would return, computed from the same \
+                     filter+cap the list runs. Terminal statuses are capped unless you pass \
+                     done_limit=0 or all=1, so a count taken with different params will \
+                     differ from one taken with these — pass the SAME params you will \
+                     fetch with.",
+        }))
+        .into_response();
+    }
 
     // TWO-FIXES (AMUX-3154): the terminal cap already reports itself in
     // x-amux-truncated / x-amux-terminal-total, but a `curl | json.load` consumer
@@ -3996,7 +4045,44 @@ pub async fn patch_item(
                         ),
                         "owner_type" => format!("owner_type -> {}", next.owner_type),
                         "archived" => {
-                            if next.archived == 1 { "ARCHIVED".into() } else { "restored".into() }
+                            // ARCHIVING A TRIGGER-BEARING CARD DE-ARMS IT, SILENTLY
+                            // (AMUX-3715, reported by tubescience). `archived`
+                            // hides a card from every board view AND every
+                            // autonomy loop — advance, pickup, rot — so a
+                            // `--trigger` recorded in `source_ref` will never
+                            // fire again. The card looks parked-on-a-condition
+                            // and is actually parked forever.
+                            //
+                            // Measured when they reported it: 202 archived cards
+                            // fleet-wide carry a non-empty source_ref, across at
+                            // least six lanes (tubescience 77, mvs-infra 22,
+                            // amux 9). Not one of them will fire.
+                            //
+                            // This is ethos rule 1's exemption lesson again, on
+                            // a different field: when you exempt something from
+                            // a loop, name what still reaches it — and if the
+                            // answer is nothing, the exemption did not make it
+                            // cheap, it made it invisible. Same shape as the
+                            // armed watches that were findable only by
+                            // scrolling past them.
+                            //
+                            // RECORDED, NOT REFUSED. tubescience archives
+                            // trigger-bearing cards deliberately and keeps the
+                            // conditions in committed docs, so refusing would
+                            // break a working flow to protect them from a
+                            // choice they are making on purpose (ethos rule 8).
+                            // The log line is what a future lane needs, since it
+                            // outlives the response nobody kept.
+                            if next.archived == 1 {
+                                match next.source_ref.as_deref().map(str::trim) {
+                                    Some(t) if !t.is_empty() => format!(
+                                        "ARCHIVED — and this card carried a live trigger, which                                          archiving DE-ARMS: archived cards are excluded from                                          every autonomy loop, so it will not fire. Trigger was:                                          {t}"
+                                    ),
+                                    _ => "ARCHIVED".into(),
+                                }
+                            } else {
+                                "restored".into()
+                            }
                         }
                         "pinned" => {
                             if next.pinned == 1 { "pinned".into() } else { "unpinned".into() }
