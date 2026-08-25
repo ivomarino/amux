@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.719';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.720';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11067,8 +11067,12 @@ async function _approvalsRefresh() {
 async function _apprApprove(id, btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
+    // AUTOD-48: approve now authorizes on a POSITIVE marker. Absence used to
+    // mean "a human at the dashboard", which a worker produces by sending no
+    // headers at all — and the ledger then recorded that inference as fact.
+    // This names the approver in the send-audit ledger; it is not a password.
     const r = await fetch(API + '/api/email/approve/' + encodeURIComponent(id), {
-      method: 'POST', headers: _authHeaders(),
+      method: 'POST', headers: { ..._authHeaders(), 'X-Amux-Approver': 'dashboard' },
     });
     const d = await r.json().catch(() => ({}));
     if (r.ok) showToast('Approved — sent for ' + (d.sent_for_session || 'worker'));
