@@ -252,8 +252,14 @@ const SecretsUI = {
   async loadSecrets() {
     try {
       // Fetch manifest with metadata (Phase 4 enhancement)
-      const response = await fetch('https://localhost:8823/api/secrets/manifest', {
-        headers: { 'X-Requested-With': 'XMLHttpRequest' }
+      // Note: Works even without service worker (iOS private mode fallback)
+      // Use relative URL so it works on any host/port (localhost, LAN IP, iOS)
+      const response = await fetch('/api/secrets/manifest', {
+        headers: {
+          'X-Requested-With': 'XMLHttpRequest',
+          'Cache-Control': 'no-cache'  // Force fresh fetch in private mode
+        },
+        cache: 'no-store'  // Prevent caching issues on iOS
       });
 
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -263,8 +269,12 @@ const SecretsUI = {
       this.displaySecrets(this.secretsWithMetadata);
     } catch (error) {
       console.error('Failed to load secrets:', error);
+      // Provide helpful error with debugging info
+      const msg = error.message || 'Unknown error';
+      const details = navigator.onLine ? '' : ' (offline)';
       document.getElementById('secrets-list').innerHTML =
-        `<p style="color: red;">Error loading secrets: ${error.message}</p>`;
+        `<p style="color: red;">Error loading secrets: ${msg}${details}</p>
+         <p style="color: #999; font-size: 12px;">Try: Refresh, non-private mode, or check network</p>`;
     }
   },
 
