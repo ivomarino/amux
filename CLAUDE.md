@@ -348,6 +348,75 @@ Raw server tracing is at `~/.amux/logs/server-rs.log`; the dashboard's Logs tab 
 same request log with a UI. If a failure was hard to diagnose because no endpoint could
 express it, that missing instrument is the bug worth fixing (ethos rule 4).
 
+## Branch Strategy — Feature Development
+
+**Goal:** Each feature gets its own PR-ready branch; deployment fixes stay local.
+
+### Branch Types
+
+**Feature branches** (from `origin/main`, can be PRed upstream):
+- `feature/central-secrets-sops` — Central encrypted secrets (SOPS + age)
+- `feature/gmail-calendar-connectors` — Gmail OAuth + Calendar API
+- `feature/session-resume-boot` — Session resume on reboot
+
+**Local-only branch** (never pushed, deployment customizations):
+- `local/amux-5-fix` — Database fixes, systemd setup, worker startup retry
+
+### Workflow
+
+```bash
+# Start a new feature
+git checkout origin/main -b feature/your-feature-name
+# ... make changes ...
+git commit -m "feat: describe your change"
+git push origin feature/your-feature-name
+# Create PR on GitHub
+
+# Keep feature branch updated
+git fetch origin
+git rebase origin/main   # or merge, your choice
+git push origin --force-with-lease
+
+# Deployment customizations (never PR'd)
+git checkout local/amux-5-fix
+# ... make local fixes ...
+git commit -m "fix: local deployment issue"
+# Do NOT push to origin/main
+```
+
+### Branch Status
+
+| Branch | Purpose | Ready for PR? | Example |
+|--------|---------|---------------|---------|
+| `feature/central-secrets-sops` | Encrypted credential store | 🟡 In progress | SOPS + age + API + UI |
+| `feature/gmail-calendar-connectors` | Gmail OAuth + Calendar API | ✅ Yes | Phase E + Phase F |
+| `feature/session-resume-boot` | Resume sessions on reboot | ✅ Yes | Session persistence |
+| `local/amux-5-fix` | Deployment-specific fixes | ❌ Never | DB schema, systemd |
+
+### Why This Structure
+
+- **Feature branches:** Each PR is focused, easier to review, can land independently
+- **Local branch:** Keeps deployment hacks out of upstream, survives rebases
+- **Clean history:** Upstream stays focused on features, not infrastructure
+- **Team ready:** Others can review/PR features; deployment config is local
+
+### Syncing
+
+Before starting new work:
+```bash
+git fetch origin
+git rebase origin/main   # ALL feature branches
+```
+
+After upstream accepts a PR:
+```bash
+git branch -D feature/my-feature   # Delete merged branch
+git checkout origin/main -b feature/next-feature
+```
+
+
+---
+
 ## Deploy
 
 ⚠ **BEFORE `git push origin main`: check what you are shipping that is not yours.** This is a
