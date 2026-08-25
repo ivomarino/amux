@@ -1782,6 +1782,39 @@ pub fn detect_dead_routes(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Sup
     }
     for ((status, method, target), (count, first, last, sample_path, browser)) in groups {
         let signature = format!("dead-route|{status}|{method}|{target}");
+        // GATEWAY-OWNED PATHS 404 HERE BY DESIGN (AMUX-2686).
+        //
+        // `/api/stripe/*`, `/api/gateway/*` and `/api/cloud-logout` are served
+        // by cloud/gateway/gateway.py, never by amux-server — in cloud either,
+        // so "this server does not own them" is true everywhere and needs no
+        // `if IS_CLOUD` (the single-codebase rule). The SPA knows: its own
+        // comment says "/api/stripe/status only exists on the cloud gateway, so
+        // a failed fetch (self-hosted) simply leaves the card hidden", and it
+        // returns early on !r.ok.
+        //
+        // So both sides were already correct and only this detector disagreed,
+        // filing a card nobody could ever close. invariants/checks.rs has
+        // excluded exactly these paths since 2026-08-11, for a reason its own
+        // comment states and which applies verbatim here: "a failure list that
+        // can never reach zero stops being read... permanent rows would have
+        // trained everyone to skim past the real ones."
+        //
+        // CALLING THE SAME FUNCTION, not a second copy of the list. Two
+        // spellings of one exclusion drift the moment either changes, and then
+        // the invariant census and the autofix board disagree about which paths
+        // are somebody else's (ethos rule 1).
+        if crate::invariants::checks::gateway_owned(&sample_path) {
+            suppressed.push(sup(
+                DetectorKind::DeadRoute,
+                &signature,
+                "gateway-owned path: served by cloud/gateway/gateway.py and never by \
+                 amux-server, so a 404 here is correct on every deployment. The SPA handles \
+                 it (hides the card). Excluded by the same predicate invariants/checks.rs \
+                 uses — a card that can never be closed trains readers to skim past the \
+                 ones that can",
+            ));
+            continue;
+        }
         if !browser {
             suppressed.push(sup(
                 DetectorKind::DeadRoute,
@@ -6930,6 +6963,57 @@ mod tests {
         assert!(
             f2.iter().any(|x| x.signature.contains("/api/schedules/{id}/run")),
             "900s exceeds the 600s the endpoint enforces on itself — a bound failed: {f2:?}"
+        );
+    }
+
+    /// AMUX-2686: a gateway-owned path 404ing locally is not a dead route.
+    ///
+    /// `GET /api/stripe/status` filed a dead-route card 6 times from the
+    /// dashboard. Both sides were already correct: the path is served by
+    /// cloud/gateway/gateway.py and never by amux-server, and the SPA's own
+    /// comment says so ("only exists on the cloud gateway, so a failed fetch
+    /// (self-hosted) simply leaves the card hidden") and returns early on
+    /// !r.ok. Only this detector disagreed, filing a card nobody could close.
+    ///
+    /// invariants/checks.rs has excluded exactly these paths since 2026-08-11,
+    /// with a comment stating the reason that applies here verbatim: a failure
+    /// list that can never reach zero stops being read. This calls the SAME
+    /// predicate rather than carrying a second copy.
+    ///
+    /// BOTH DIRECTIONS. The second cell is the load-bearing one: excluding by a
+    /// loose `contains` or a too-broad prefix would silence real dead routes,
+    /// and checks.rs's own history has that bug — `/api/cloud-logout-extra`
+    /// once matched `/api/cloud-logout` and was silently dropped.
+    #[tokio::test]
+    async fn a_gateway_owned_404_is_not_filed_as_a_dead_route() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // Six browser 404s each, which is well past the min-hits floor.
+        for _ in 0..6 {
+            log_row(&st, Row { ts: now - 500.0, method: "GET", path: "/api/stripe/status", family: "/api/stripe", status: 404, body: "", worker: "", ua: "Mozilla/5.0", ms: 3.0 });
+            log_row(&st, Row { ts: now - 500.0, method: "GET", path: "/api/board/statuses", family: "/api/board", status: 404, body: "", worker: "", ua: "Mozilla/5.0", ms: 3.0 });
+        }
+        let (f, sup) = detect_dead_routes(&st.store.read().unwrap(), now);
+
+        // 1. The gateway-owned path must NOT file, and the skip must be visible
+        //    — a silent exclusion is indistinguishable from a detector that
+        //    found nothing.
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/stripe/status")),
+            "a path served by the gateway 404s here on every deployment: {f:?}"
+        );
+        assert!(
+            sup.iter().any(|s| s.signature.contains("/api/stripe/status")
+                && s.reason.contains("gateway-owned")),
+            "the exclusion must be recorded, not silent: {sup:?}"
+        );
+
+        // 2. A NON-gateway 404 must still file. Without this cell an exclusion
+        //    that matched everything would pass — and over-broad matching is a
+        //    bug this list has actually had.
+        assert!(
+            f.iter().any(|x| x.signature.contains("/api/board/statuses")),
+            "an ordinary unrouted path the SPA fetches is still a dead route: {f:?}"
         );
     }
 

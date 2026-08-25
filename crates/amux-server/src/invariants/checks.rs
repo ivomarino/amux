@@ -54,7 +54,7 @@ const GATEWAY_OWNED: &[&str] =
 /// near-misses and not just the hits: an exclusion list that swallows a sibling
 /// hides exactly the work it was meant to make visible (ethos rule 1's
 /// over-filtering corollary).
-fn gateway_owned(path: &str) -> bool {
+pub(crate) fn gateway_owned(path: &str) -> bool {
     GATEWAY_OWNED.iter().any(|p| {
         if let Some(prefix) = p.strip_suffix('/') {
             path == prefix || path.starts_with(p)
