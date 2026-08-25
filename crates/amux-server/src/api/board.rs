@@ -1017,6 +1017,33 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     // row.desc/row.log by reference.
     let mut v = if slim { row.snapshot_slim() } else { detail_body(row) };
     let obj = v.as_object_mut().expect("snapshot is an object");
+    // WHOSE LANE IS THIS, AND CAN ANYONE REACH IT? (AMUX-3713, Ethan: "the card
+    // should have a designation that it is [isolated]".)
+    //
+    // An isolated worker is a raw agent with the harness stripped: hidden from
+    // the peer fleet list and refused as a peer send target. Its CARDS were
+    // exempt from all of that — `desktop` owns 25 of them and not one said so —
+    // so a peer reading the board saw an ordinary card with an ordinary session
+    // name and no indication that the owning lane is undiscoverable and cannot
+    // be messaged. Same shape as AMUX-2796: a notice addressed to a lane that
+    // cannot receive it.
+    //
+    // On BOTH the slim list and the detail body, because the list is what a
+    // reader scans before deciding whom to ask — a designation only on the
+    // detail page is one you find after you have already acted.
+    //
+    // Absent rather than `false` for an ordinary lane: this is a rare property,
+    // and a key on every one of 1718 cards to say "normal" is payload for
+    // nothing (the AMUX-3496 slimming lesson, from the other direction).
+    if row.session.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated) {
+        obj.insert("owner_isolated".into(), json!(true));
+        // The MEANING, not just the flag. A bare boolean makes every consumer
+        // re-derive what isolation implies, and they will not agree.
+        obj.insert(
+            "owner_reach".into(),
+            json!("isolated (raw agent): not in the peer fleet list and refused as a peer send target. Reachable only by the owner from the dashboard — do not route this card to a peer expecting them to message the owner."),
+        );
+    }
     if slim {
         obj.insert("desc_len".into(), json!(row.desc.chars().count()));
         let log_n = row
@@ -4586,20 +4613,55 @@ async fn status_request(
     // direct send: the decision recorded in ethos.md ("Board state changes are
     // delivered at turn boundaries") is that a running agent cannot consume an
     // event faster than its next turn anyway.
-    let _ = crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
-        .await;
+    // READ THE RESULT, DO NOT ASSERT IT (AMUX-3713). This was `let _ =`
+    // followed by a hardcoded `"delivered": true`, which is the two halves of
+    // one contradiction: `steer_enqueue` is `#[must_use]` and its own attribute
+    // text says `let _ =` means "the refusal is deliberately unreported here",
+    // and the very next line then reported delivery unconditionally.
+    //
+    // The enqueue REFUSES a permanently-blocked target (no-env-file, archived),
+    // so for exactly the lanes a status request cannot reach, the caller was
+    // told it had been delivered — and the card log got the same false line
+    // written into it, which is worse, because that one outlives the response.
+    let queued =
+        crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
+            .await;
 
-    let line = if question.is_empty() {
-        format!("status requested by {requester} (routed to {session})")
-    } else {
-        format!("status requested by {requester} — \"{question}\" (routed to {session})")
+    let line = match &queued {
+        Ok(_) if question.is_empty() => {
+            format!("status requested by {requester} (routed to {session})")
+        }
+        Ok(_) => format!("status requested by {requester} — \"{question}\" (routed to {session})"),
+        // The card log records WHAT HAPPENED, not what was attempted. A reader
+        // scanning history for "why did nobody answer" gets the reason here
+        // instead of a routing line that never routed.
+        Err(reason) => format!(
+            "status request by {requester} NOT delivered to {session}: {reason} — the lane \
+             cannot receive, so nobody was asked"
+        ),
     };
     if let Err(e) = append_card_log(&state, &id, &line).await {
         return internal(e);
     }
-    Json(json!({"ok": true, "delivered": true, "session": session,
-                "message": format!("asked {session} to post a status update to {id}")}))
-    .into_response()
+    match queued {
+        Ok(_) => Json(json!({"ok": true, "delivered": true, "session": session,
+                    "message": format!("asked {session} to post a status update to {id}")}))
+        .into_response(),
+        Err(reason) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "delivered": false,
+                "session": session,
+                "blocked_reason": reason,
+                "error": format!(
+                    "{session} cannot receive a status request ({reason}), so none was sent. \
+                     The card log records the refusal."
+                ),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn status_update(
@@ -4764,6 +4826,76 @@ mod param_tests {
         assert!(ignored_board_params("").is_empty());
         // Mixed: only the typo is named, alongside a real filter + cache-buster.
         assert_eq!(ignored_board_params("session=x&includearchived=1&_=9"), vec!["includearchived"]);
+    }
+}
+
+#[cfg(test)]
+mod isolation_designation_tests {
+    use super::*;
+
+    /// AMUX-3713: a card whose owning lane is ISOLATED says so, and an ordinary
+    /// one does not.
+    ///
+    /// Ethan asked for this after the verification: isolated mode works — the
+    /// peer fleet list hides those workers and a peer send is refused 403 — but
+    /// their CARDS were exempt from all of it. `desktop` owns 25 board cards and
+    /// not one carried any indication that the owning lane is undiscoverable and
+    /// cannot be messaged, so a peer reading the board would route work to a
+    /// session it has no way to reach.
+    ///
+    /// BOTH DIRECTIONS. Without the negative cell, stamping every card
+    /// `owner_isolated: true` would pass the first and make the designation
+    /// meaningless — a flag that is always on is not a flag.
+    ///
+    /// The lanes are addressed through `session_is_isolated`, the SAME predicate
+    /// the fleet filter and the send guard consult, so the card cannot claim a
+    /// reachability the send path disagrees with (ethos rule 1).
+    #[test]
+    fn a_card_owned_by_an_isolated_lane_is_designated_and_an_ordinary_one_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).expect("sessions");
+        std::fs::write(dir.path().join("sessions/raw.env"), "CC_ISOLATED=\"1\"\n").expect("w");
+        std::fs::write(dir.path().join("sessions/normal.env"), "CC_TAGS=\"amux\"\n").expect("w");
+
+        // PREMISE, asserted rather than assumed: if the env home did not take,
+        // both lanes read as non-isolated and the negative cell below passes
+        // for the wrong reason.
+        assert!(
+            crate::api::session_verbs::session_is_isolated("raw"),
+            "premise: the fixture's CC_ISOLATED must be visible to the predicate"
+        );
+        assert!(!crate::api::session_verbs::session_is_isolated("normal"));
+
+        let card = |sess: &str| {
+            let mut r = IssueRow { id: "T-1".into(), ..Default::default() };
+            r.session = Some(sess.to_string());
+            r
+        };
+
+        for slim in [true, false] {
+            let iso = list_body(&card("raw"), slim, false);
+            assert_eq!(
+                iso["owner_isolated"],
+                json!(true),
+                "slim={slim}: an isolated lane's card must be designated: {iso}"
+            );
+            let reach = iso["owner_reach"].as_str().unwrap_or_default();
+            assert!(
+                reach.contains("refused as a peer send target"),
+                "slim={slim}: the designation must say what it MEANS, not just that it is \
+                 true — a bare boolean makes every consumer re-derive the implication: {iso}"
+            );
+
+            // THE NEGATIVE. Absent, not `false`: a key on every ordinary card is
+            // payload for nothing, and the list ships 1700+ of them.
+            let ord = list_body(&card("normal"), slim, false);
+            assert!(
+                ord.get("owner_isolated").is_none(),
+                "slim={slim}: an ordinary lane's card must carry no designation at all: {ord}"
+            );
+            assert!(ord.get("owner_reach").is_none(), "slim={slim}: {ord}");
+        }
     }
 }
 
