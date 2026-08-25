@@ -43,29 +43,29 @@ pub async fn encrypt_and_persist(
     // 3. Write YAML to temp file
     tokio::fs::write(&temp_path, &yaml_str).await?;
 
-    // 4. Encrypt with SOPS (using age)
-    let encrypt_output = tokio::process::Command::new("sops")
-        .arg("-e")
-        .arg("--input-type")
-        .arg("yaml")
-        .arg("--output-type")
-        .arg("yaml")
+    // 4. Encrypt with age (X25519 encryption)
+    // Public key from .sops.yaml creation_rule
+    let public_key = "age1l6c7nzuyp3esvtgxs26txkd285mq84rsyjlxmtgwdaz8tfg3yahsmnkfqj";
+
+    let encrypt_output = tokio::process::Command::new("age")
+        .arg("-r")
+        .arg(public_key)
         .arg(&temp_path)
         .output()
         .await
         .map_err(|e| {
-            error!("Failed to run SOPS: {}", e);
+            error!("Failed to run age: {}", e);
             e
         })?;
 
     if !encrypt_output.status.success() {
         let stderr = String::from_utf8_lossy(&encrypt_output.stderr);
-        error!("SOPS encryption failed: {}", stderr);
+        error!("age encryption failed: {}", stderr);
 
         // Clean up temp file
         let _ = tokio::fs::remove_file(&temp_path).await;
 
-        return Err(format!("SOPS encryption failed: {}", stderr).into());
+        return Err(format!("age encryption failed: {}", stderr).into());
     }
 
     // 5. Write encrypted output to final location (atomic via rename)
