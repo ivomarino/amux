@@ -1485,70 +1485,6 @@ FIX: The generalisation, sharpened by amux and worth more than the six specimens
   none of them can currently tell a caller they were misread.
 
 ---
-## `GET /api/board/contract` advertises a `verified` gate the board does not enforce, and the refusal points you back at it
-AREA: gates
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-20
-SESSION: amux-frustrations
-CARD: AF-112
-SYMPTOM: Moving three re-verified investigation cards to `verified`, acking exactly what the
-  contract endpoint advertises, all three refused:
-    GET /api/board/contract -> investigation.verified == ["Outcome confirmed to still hold"]
-    409 body                -> gate == ["Functionality change is live and exercised, not just
-                                        merged", "Peer-reviewed by a DIFFERENT worker in group
-                                        `amux` (name them)", "That peer verified it themselves
-                                        rather than taking the author's word", "No regression in
-                                        what it touched"]
-  Control, so this is not a nesting difference: the string "Peer-reviewed by a DIFFERENT
-  worker" appears ZERO times anywhere in the contract response.
-  The same mismatch holds for doc / ops / chore / research / escalation, which the contract
-  all report as the single "Outcome confirmed to still hold".
-COST: three refused transitions and a round trip to learn the real gate. Small in minutes.
-  The part worth the entry is WHERE it sends you: the 409's own `how_to_ack.contract` field
-  names `GET /api/board/contract` as the place to learn the gate, so the sanctioned
-  instruction points at the source that is wrong. An agent following it correctly is
-  refused — AMUX-2325's shape, recoverable only because the refusal happens to print the
-  real gate.
-FIX: Derive both from ONE table. A view must share the predicate of the mechanism it
-  describes, and here the view is the mechanism's own documentation.
-  Note which direction the drift runs, because it is the dangerous one: the contract
-  advertises a LOWER bar than the gate enforces. The real gate requires peer verification
-  by a different worker who checked it themselves — Ethan's standing rule, encoded. An
-  agent reading only the contract would conclude a card can be self-verified on a re-check,
-  which is precisely the weaker practice the gate exists to prevent. A stale doc that
-  under-states a constraint teaches the wrong habit to everyone who never trips the gate.
-  Not fixed here: which of the two is authoritative is amux's call, not a guess of mine.
-
----
-
-NOTE (2026-08-24, amux-frustrations — author): STILL LIVE, reproduced in two commands, and the
-  card reads `verified`.
-    contract  GET /api/board/contract -> investigation.verified == ["Outcome confirmed to
-                                          still hold"]
-    enforced  PATCH {"status":"verified"} on a scratch investigation card -> 409,
-              blocked: true, gate == ["Functionality change is live and exercised, not just
-              merged", "Peer-reviewed by a DIFFERENT worker in group `amux` (name them)",
-              "That peer verified it themselves rather than taking the author's word",
-              "No regression in what it touched"]
-    control   "Peer-reviewed by a DIFFERENT worker" occurs 0 times in the whole contract
-              response; "live and exercised" occurs 0 times. So this is not a nesting or
-              formatting difference, it is two different gates.
-  Unchanged from the 2026-08-20 report in every particular.
-  THE CARD SAYS `verified`. That is the second specimen today of card status being no evidence
-  about an entry, and it is the stronger one: AMUX-2936's card was merely REPURPOSED, while this
-  card asserts the highest confidence state the board has over a defect that reproduces in one
-  PATCH. Whatever was verified, it was not this.
-  RELATED, and they should probably move together: the enforced string here is the same one
-  amux confirmed STILL LIVE for AMUX-3119 on 2026-08-24 — "Peer-reviewed by a DIFFERENT worker
-  in group `amux` (name them)" at board.rs:2284, which also hard-codes the group and so refuses
-  a cross-group reviewer. One string, two live entries: this one says the contract does not
-  publish it, AMUX-3119 says its group scope is wrong. Fixing the publication without the scope
-  would just document a gate that still rejects a legitimate reviewer.
-  For `review` the two DO agree — checked today on AF-203, where the contract's "Findings
-  written up" / "Ready for another set of eyes" is exactly what the board accepted. So the
-  divergence is specific to `verified`, which is the transition the entry names.
-
 ## A wedged disk scan could not say whether the walk or the database was stuck
 AREA: instruments
 SEVERITY: slows
@@ -2545,6 +2481,27 @@ NOTE: the instrument was RIGHT and I read past it. The guard printed the inserti
   Third time today I have named the confirming-result blind spot and the first time it shipped
   something. Same axis as amux's migration-cost entry: our discipline answers CORRECTNESS and
   does not answer WHAT ACTUALLY SHIPS.
+NARROWED 2026-08-25 (amux-frustrations, the author): part (a) is SHIPPED by amux; part (b) is
+  the half that remains, and it is the one that would actually catch the class.
+  (a) DONE — 7ecdc869 "name the peer work a commit LEAVES BEHIND, not just the work it takes",
+      with a65e2580 asserting the HOOK prints it rather than merely that the server emits it.
+      Server side is `split_risk()` (git_guard.rs:1662, surfaced at :1752); the hook prints
+      "SPLIT COMMIT WARNING — <peer>'s work is being cut in half: in this commit: <staged> /
+      left behind, dirty and NOT committed: <paths>". That is this entry's (a) almost verbatim,
+      including the staged/dirty cross-reference from data the guard already had. A comment at
+      git_guard.rs:2958 records that split_risk must be SILENT when the peer has nothing, which
+      is the negative control the warning needs to not become noise.
+  (b) NOT DONE — nothing builds the COMMIT. `git worktree add` appears once in the whole repo
+      and it is inside a test fixture (test-session-freshness.sh:407); neither pre-commit nor
+      pre-push constructs a detached HEAD or uses `checkout-index`. Every gate still compiles
+      the WORKING TREE, which is the exact substitution this entry is about — and the same
+      substitution AF-195 hit from the other side (I tested the tree and committed the index).
+  WHY (b) STILL MATTERS WITH (a) SHIPPED: split_risk WARNS about the shape; it cannot tell you
+  the commit does not build. A peer's half-file can be absent from your commit with nothing
+  dirty left behind — they may have committed their half seconds after you staged — and the
+  warning is correctly silent while the commit is still unbuildable. Measured cost when it
+  happened: 40.6s to build the commit, against four unbuildable commits landed on 2026-08-08.
+
 ## The disk ranker cannot rank a file, so it could never have named the 1.8 GB one
 AREA: instruments
 SEVERITY: slows

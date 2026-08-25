@@ -746,3 +746,68 @@ FIX: put the observation timestamp in the message, beside the origin-tip timesta
   ("amux-helper — treated as ABSENT, not blind"), so the vocabulary exists.
   The general form, which is the reusable part: a snapshot delivered asynchronously must carry
   the time it was taken, or its confidence outlives its accuracy.
+
+## `GET /api/board/contract` advertises a `verified` gate the board does not enforce, and the refusal points you back at it
+VALIDATED: amux-frustrations | FIXED, all three parts, verified against the RUNNING server with a programmatic comparison rather than by eye. (1) The contract no longer advertises the type default as if it were the gate: the top-level `gates_are` now reads 'TYPE DEFAULTS ONLY - tier 5 of 5. A card's effective gate may be STRICTER via card override, worker, group, or global custom gates. Pass ?card=<id> for the resolved gate enforcement will actually use.' (2) That escape WORKS and matches exactly: on a scratch investigation card, GET /api/board/contract?card=<id> -> card_effective_gates.gates.verified vs the 409 body's gate -> 4 criteria each, IDENTICAL: True (compared as lists, not read off the screen). (3) It answers the follow-on question my COST field was about ('a round trip to learn the real gate'): gate_sources.verified says 'this gate comes from the GROUP scope (amux), not from the item type - retyping will NOT change it', with retype_would_change_it: false and a pointer to GET /api/board/session-gates. That is more than the entry asked for - it names the TIER and forecloses the wrong remedy. NOTE the entry's related complaint about the enforced string itself (its group scope is hardcoded, so a cross-group reviewer's sign-off cannot count) is a DIFFERENT defect and remains open as amux's AMUX-3119, confirmed STILL LIVE by them on 2026-08-24. Publishing the truth and the truth being right are separate; only the first was this entry. Self-validated: amux-frustrations is the originating session.
+AREA: gates
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-112
+SYMPTOM: Moving three re-verified investigation cards to `verified`, acking exactly what the
+  contract endpoint advertises, all three refused:
+    GET /api/board/contract -> investigation.verified == ["Outcome confirmed to still hold"]
+    409 body                -> gate == ["Functionality change is live and exercised, not just
+                                        merged", "Peer-reviewed by a DIFFERENT worker in group
+                                        `amux` (name them)", "That peer verified it themselves
+                                        rather than taking the author's word", "No regression in
+                                        what it touched"]
+  Control, so this is not a nesting difference: the string "Peer-reviewed by a DIFFERENT
+  worker" appears ZERO times anywhere in the contract response.
+  The same mismatch holds for doc / ops / chore / research / escalation, which the contract
+  all report as the single "Outcome confirmed to still hold".
+COST: three refused transitions and a round trip to learn the real gate. Small in minutes.
+  The part worth the entry is WHERE it sends you: the 409's own `how_to_ack.contract` field
+  names `GET /api/board/contract` as the place to learn the gate, so the sanctioned
+  instruction points at the source that is wrong. An agent following it correctly is
+  refused — AMUX-2325's shape, recoverable only because the refusal happens to print the
+  real gate.
+FIX: Derive both from ONE table. A view must share the predicate of the mechanism it
+  describes, and here the view is the mechanism's own documentation.
+  Note which direction the drift runs, because it is the dangerous one: the contract
+  advertises a LOWER bar than the gate enforces. The real gate requires peer verification
+  by a different worker who checked it themselves — Ethan's standing rule, encoded. An
+  agent reading only the contract would conclude a card can be self-verified on a re-check,
+  which is precisely the weaker practice the gate exists to prevent. A stale doc that
+  under-states a constraint teaches the wrong habit to everyone who never trips the gate.
+  Not fixed here: which of the two is authoritative is amux's call, not a guess of mine.
+
+---
+
+NOTE (2026-08-24, amux-frustrations — author): STILL LIVE, reproduced in two commands, and the
+  card reads `verified`.
+    contract  GET /api/board/contract -> investigation.verified == ["Outcome confirmed to
+                                          still hold"]
+    enforced  PATCH {"status":"verified"} on a scratch investigation card -> 409,
+              blocked: true, gate == ["Functionality change is live and exercised, not just
+              merged", "Peer-reviewed by a DIFFERENT worker in group `amux` (name them)",
+              "That peer verified it themselves rather than taking the author's word",
+              "No regression in what it touched"]
+    control   "Peer-reviewed by a DIFFERENT worker" occurs 0 times in the whole contract
+              response; "live and exercised" occurs 0 times. So this is not a nesting or
+              formatting difference, it is two different gates.
+  Unchanged from the 2026-08-20 report in every particular.
+  THE CARD SAYS `verified`. That is the second specimen today of card status being no evidence
+  about an entry, and it is the stronger one: AMUX-2936's card was merely REPURPOSED, while this
+  card asserts the highest confidence state the board has over a defect that reproduces in one
+  PATCH. Whatever was verified, it was not this.
+  RELATED, and they should probably move together: the enforced string here is the same one
+  amux confirmed STILL LIVE for AMUX-3119 on 2026-08-24 — "Peer-reviewed by a DIFFERENT worker
+  in group `amux` (name them)" at board.rs:2284, which also hard-codes the group and so refuses
+  a cross-group reviewer. One string, two live entries: this one says the contract does not
+  publish it, AMUX-3119 says its group scope is wrong. Fixing the publication without the scope
+  would just document a gate that still rejects a legitimate reviewer.
+  For `review` the two DO agree — checked today on AF-203, where the contract's "Findings
+  written up" / "Ready for another set of eyes" is exactly what the board accepted. So the
+  divergence is specific to `verified`, which is the transition the entry names.
