@@ -83,9 +83,9 @@ impl SecretStore {
     /// Get a secret by dot-separated path (e.g., "external_services.openai.api_key")
     pub async fn get(&self, path: &str) -> Option<String> {
         let cache = self.secrets.read().await;
-        
+
         let parts: Vec<&str> = path.split('.').collect();
-        let mut current = &cache;
+        let mut current = &*cache;
 
         for part in parts {
             current = &current[part];

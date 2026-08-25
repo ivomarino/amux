@@ -11,7 +11,6 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use url::form_urlencoded;
 
 use crate::api::AppState;
 
@@ -46,7 +45,13 @@ pub fn routes() -> Router<AppState> {
 async fn start_auth(State(state): State<AppState>) -> impl IntoResponse {
     match load_github_config(&state).await {
         Ok(config) => {
-            let encoded_redirect = form_urlencoded::byte_serialize(config.redirect_uri.as_bytes()).collect::<String>();
+            // Simple percent-encoding for URL parameter
+            let encoded_redirect = config.redirect_uri
+                .replace(' ', "%20")
+                .replace('?', "%3F")
+                .replace('&', "%26")
+                .replace('#', "%23");
+
             let auth_url = format!(
                 "https://github.com/login/oauth/authorize?\
                 client_id={}&redirect_uri={}&scope=repo,user",
@@ -125,7 +130,7 @@ async fn load_github_config(state: &AppState) -> Result<GitHubConfig, String> {
 }
 
 /// Exchange authorization code for access token (mock)
-async fn exchange_code_for_token(state: &AppState, code: &str) -> Result<String, String> {
+async fn exchange_code_for_token(_state: &AppState, code: &str) -> Result<String, String> {
     // In production, this would call GitHub's token endpoint
     // For now, return a mock token
     Ok(format!("gho_mock_{}", code))
