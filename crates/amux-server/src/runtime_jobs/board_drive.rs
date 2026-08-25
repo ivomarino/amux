@@ -2392,22 +2392,46 @@ pub fn select_advance(
                 detail: format!("{card_id} is a capture shell ({why}); already asked for a split"),
             };
         }
+        // SHORT, AND EVERY COMMAND IN IT EXISTS (AMUX-3707, Ethan: "when its a
+        // question and doesnt produce work we get these, i feel like its
+        // wasteful of tokens").
+        //
+        // This block used to be ~250 words that re-argued AMUX-3323's history on
+        // every firing. Measured 2026-08-25: 540 of these ever, 296 in the last
+        // 7 days (~42/day fleet-wide), and 70.6% of the cards ended `discarded`.
+        // The text was the SMALL half of the cost — each nudge wakes an idle lane
+        // for a whole turn, so the prose is ~330 tokens and the turn it provokes
+        // is tens of thousands. Cutting the prose is worth doing; the reason it
+        // is worth MORE than its own token count is that a lane which can act in
+        // one command does not spend a turn working out how.
+        //
+        // Which is the second half, and the sharper one: the old text told the
+        // lane to "discard it" and to "set each child's `epic`", and named a
+        // command for NEITHER. `discard` does dispatch — AMUX-2140 added it as an
+        // alias precisely so this nudge would be walkable — but it is absent from
+        // `amux board` help, so a lane that did not already know it exists cannot
+        // find it. `epic` did not exist at all until this commit added the verb,
+        // while the nudge had been telling every lane to "set each child's epic"
+        // since AMUX-3323. Both roads out of a capture shell therefore ended at a
+        // hand-rolled curl, which drops the worker header: the nudge was
+        // manufacturing the unattributed writes the ledger depends on not having
+        // (ethos rule 6, same shape as AMUX-2325).
+        //
+        // Every command below was WALKED before it shipped, and
+        // tests/nudge_commands_exist.rs now walks them on every build — because
+        // "I checked once" is what AMUX-2140 already thought.
         let text = format!(
-            "[amux] {card_id} is a captured prompt, not a unit of work ({why}). It cannot move \
-             through the gates as it stands, so it is holding your WIP slot and nothing is \
-             driving it.\n\n\
-             If it is genuinely NOT work (a status question, a slash command, an empty \
-             journal), discard it and nothing is lost.\n\n\
-             But if it decomposes into REAL work that is not yet finished, do NOT discard it. \
-             PROMOTE it to an epic that owns the pieces: retype it `epic`, rewrite the desc with \
-             the scope, the child cards, and acceptance criteria (that structure clears this \
-             capture brand), add one card per unit of work (`amux board add \"...\"`), and set \
-             each child's `epic` to {card_id}. Discarding an umbrella whose children are still \
-             open abandons the top-level request and orphans them, and the board then reads that \
-             request as thrown away (AMUX-3323).\n\n\
-             Only discard with a pointer when the pointed-to work is ALREADY done, or already \
-             tracked on another card, and this card adds nothing. Then drive each child through \
-             its gates to done."
+            "[amux] {card_id} is a capture shell ({why}) holding your WIP slot — nothing about \
+             it is done or not-done, so no gate can pass it.\n\n\
+             Answered inline, or not work:\n  \
+             amux board discard {card_id} --outcome-stdin\n\n\
+             ONE unit of work — rewrite the desc with scope + acceptance criteria (that clears \
+             the brand), then drive it:\n  \
+             amux board retitle {card_id} \"<title>\" --desc-stdin\n\n\
+             SEVERAL units — promote it, never discard an umbrella whose children are still \
+             open (that orphans them, AMUX-3323):\n  \
+             amux board type {card_id} epic\n  \
+             amux board add \"<one unit>\"  &&  amux board epic <NEW-ID> {card_id}"
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -3571,6 +3595,7 @@ pub async fn debug_board_drive(
         .iter()
         .filter_map(|v| v["session"].as_str().map(str::to_string))
         .collect();
+    let capture_shells = state.store.read().ok().map(|c| capture_shell_cost(&c));
     let body = json!({
         "note": "per-lane trace of the board -> worker drive loop; `reason` says why a lane \
                  was passed over. A skip that leaves no trace is indistinguishable from a loop \
@@ -3586,8 +3611,59 @@ pub async fn debug_board_drive(
         "lanes_with_eligible_cards": waiting.len(),
         "backlog": waiting,
         "distinct_lanes_waiting": seen.len(),
+        "capture_shells": capture_shells,
     });
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// What the capture-shell nudge is costing, in one call.
+///
+/// AMUX-3707. Ethan flagged these as wasteful ("when its a question and doesnt
+/// produce work we get these"), and answering *how* wasteful took hand-written
+/// SQL joining `session_events` to `issues` — which is the tell that the number
+/// nobody can reach is the number nobody watches. The nudge is emitted once per
+/// card ever (idem `decompose:<id>`), so the row count IS the count of lanes
+/// woken to dispose of a card amux itself minted.
+///
+/// The ratio is the signal, not the total: a `discarded` outcome means the woken
+/// turn produced a one-line retirement, while `promoted_to_epic` and `reshaped`
+/// mean the nudge bought real judgment. If `discarded_pct` climbs, amux is
+/// spending more turns on foregone conclusions and the capture predicate wants
+/// tightening; if it falls, the nudge is earning its keep. Neither direction is
+/// visible from the nudge count alone, which is all anything reported before.
+fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
+    let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+    let nudges = q("SELECT COUNT(*) FROM session_events WHERE idem LIKE 'decompose:%'");
+    let nudges_7d = q(
+        "SELECT COUNT(*) FROM session_events WHERE idem LIKE 'decompose:%' \
+         AND ts > strftime('%s','now') - 7*86400",
+    );
+    let by = |pred: &str| -> i64 {
+        q(&format!(
+            "SELECT COUNT(*) FROM session_events e JOIN issues i \
+             ON i.id = replace(e.idem,'decompose:','') \
+             WHERE e.idem LIKE 'decompose:%' AND {pred}"
+        ))
+    };
+    let discarded = by("i.status='discarded'");
+    let epic = by("i.type='epic'");
+    let resolved = by("i.status IN ('discarded','done','verified')");
+    let pct = |n: i64| -> Option<f64> {
+        (nudges > 0 && n >= 0).then(|| (n as f64 * 1000.0 / nudges as f64).round() / 10.0)
+    };
+    json!({
+        "note": "one nudge per card ever (idem decompose:<id>), so `nudges` is the count of \
+                 lanes woken to dispose of a card amux minted. Watch discarded_pct: it is the \
+                 share of those turns that reached a foregone conclusion.",
+        "nudges": nudges,
+        "nudges_7d": nudges_7d,
+        "outcome_discarded": discarded,
+        "outcome_promoted_to_epic": epic,
+        "outcome_resolved": resolved,
+        "discarded_pct": pct(discarded),
+        "promoted_to_epic_pct": pct(epic),
+        "still_open": (nudges >= 0 && resolved >= 0).then(|| nudges - resolved),
+    })
 }
 
 pub fn routes() -> axum::Router<AppState> {
@@ -5348,13 +5424,30 @@ mod tests {
         match select_advance(&conn, "lane", &[], now_f64()) {
             Advance::Nudge { kind, text, .. } => {
                 assert_eq!(kind, "decompose-asked");
-                // The nudge now distinguishes not-work (discard) from
+                // The nudge distinguishes not-work (discard) from
                 // real-unfinished-work (promote to epic) — AMUX-3323, e8e648f.
                 assert!(text.contains("not a unit of work"), "{text}");
-                assert!(
-                    text.contains("PROMOTE it to an epic") && text.contains("discard it"),
-                    "the decompose ask must offer both the epic-promotion and the discard exits: {text}"
-                );
+                // Assert the EXITS, by the command that reaches each one, not by
+                // the sentence that describes it. This cell used to pin the
+                // literal prose ("PROMOTE it to an epic", "discard it"), which
+                // measures wording and not behaviour: it was green for months
+                // while the epic exit it was guarding named no command at all,
+                // because `amux board epic` did not exist (AMUX-3707). A wording
+                // rewrite must be free; an exit losing its command must not be.
+                for cmd in ["amux board discard", "amux board type", "amux board epic"] {
+                    assert!(
+                        text.contains(cmd),
+                        "the decompose ask must reach its exit with `{cmd}`: {text}"
+                    );
+                }
+                assert_cli_verbs_exist(&text);
+                // And it must stay SHORT. The old text was ~250 words re-argued
+                // on every one of ~42 daily firings; the cost Ethan flagged is
+                // the woken turn, but a lane that can act in one command does not
+                // spend a turn working out how. 120 is slack over the current ~85,
+                // not a target to grow into.
+                let words = text.split_whitespace().count();
+                assert!(words <= 120, "the decompose ask has grown back to {words} words: {text}");
             }
             Advance::None { reason, detail } => panic!("expected a split ask, got {reason}: {detail}"),
         }
@@ -5654,6 +5747,45 @@ mod tests {
                  (AF-66). Known verbs: {verbs:?}"
             );
         }
+    }
+
+    /// The capture-shell meter must move with the OUTCOMES, not just count
+    /// nudges (AMUX-3707). A total alone cannot say whether a woken turn reached
+    /// a foregone conclusion or did real judgment, and that ratio is the whole
+    /// reason the number exists.
+    #[test]
+    fn the_capture_shell_meter_reports_the_outcome_split_not_just_a_total() {
+        let conn = board_db();
+        conn.execute("DELETE FROM session_events", []).expect("clear");
+        // Three nudged capture cards: one discarded (foregone), one promoted to
+        // an epic (real judgment), one still open.
+        add_card(&conn, "C-1", "lane", "discarded", "q", "**Prompt:** what is x");
+        add_card(&conn, "C-2", "lane", "doing", "real", "**Prompt:** do a thing");
+        add_card(&conn, "C-3", "lane", "doing", "open", "**Prompt:** another");
+        conn.execute("UPDATE issues SET type='epic' WHERE id='C-2'", []).expect("retype");
+        for id in ["C-1", "C-2", "C-3"] {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,idem,source) \
+                 VALUES (?1,'lane','decompose-asked','{}',?2,'test')",
+                rusqlite::params![now_f64(), format!("decompose:{id}")],
+            )
+            .expect("event");
+        }
+        let m = capture_shell_cost(&conn);
+        assert_eq!(m["nudges"], 3, "{m}");
+        assert_eq!(m["outcome_discarded"], 1, "{m}");
+        assert_eq!(m["outcome_promoted_to_epic"], 1, "{m}");
+        assert_eq!(m["still_open"], 2, "one discarded, two not resolved: {m}");
+        // The ratio is the signal. 1 of 3 discarded = 33.3%.
+        assert_eq!(m["discarded_pct"], 33.3, "{m}");
+
+        // ...and it must MOVE when the outcomes move, or it is a constant with a
+        // plausible value — the shape that gets believed and never rechecked.
+        conn.execute("UPDATE issues SET status='discarded' WHERE id='C-3'", []).expect("upd");
+        let m2 = capture_shell_cost(&conn);
+        assert_eq!(m2["outcome_discarded"], 2, "{m2}");
+        assert_eq!(m2["discarded_pct"], 66.7, "{m2}");
+        assert_eq!(m2["still_open"], 1, "{m2}");
     }
 
     /// The check above can only be trusted if it FIRES. A prompt naming a verb

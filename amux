@@ -1979,6 +1979,36 @@ types: $(_board_valid_types)"
       echo "$result" | _board_outcome "$id" "" "type set to $new_type"
       return $?
       ;;
+    epic)
+      # AMUX-3707. The decompose nudge has told every lane since AMUX-3323 to
+      # "set each child's `epic` to <ID>" when promoting a capture shell — and
+      # there was no verb. `epic` is a real PATCH field (board.rs:2142, added by
+      # AMUX-2992) reachable only by hand-rolled curl, which drops the worker
+      # header and produces exactly the unattributed writes the ledger depends
+      # on not having. Same defect as `type`, `archive` and `reviewer` above
+      # (AMUX-2325), found the same way: by walking the sanctioned escape with
+      # only the sanctioned tooling and discovering it leaves the trail.
+      local id="${1:-}"; local parent="${2:-}"
+      _board_id_guard "epic" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board epic <ISSUE-ID> <EPIC-ID>
+       amux board epic <ISSUE-ID> none        (detach from its epic)
+Rolls a card up under an epic. The epic itself is a card retyped \`epic\`:
+  amux board type PARENT-1 epic && amux board epic CHILD-1 PARENT-1"
+      # An empty second argument would silently CLEAR the epic, so a typo
+      # (\`amux board epic AMUX-1\`) would detach rather than error. Clearing
+      # must be asked for by name.
+      [[ -n "$parent" ]] || die "amux board epic: name the epic, or 'none' to detach.
+Usage: amux board epic $id <EPIC-ID> | none"
+      case "$parent" in none|None|NONE|clear) parent="" ;; esac
+      local result
+      result=$(P="$parent" python3 -c 'import json,os;print(json.dumps({"epic":os.environ["P"]}))' \
+        | _curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      local _note="epic set to $parent"
+      [[ -n "$parent" ]] || _note="epic cleared"
+      echo "$result" | _board_outcome "$id" "" "$_note"
+      return $?
+      ;;
     archive|unarchive)
       # AMUX-2492. `archived` had no per-card setter anywhere — only the age-archive
       # sweep and a per-session bulk update could touch it, so an automated action had
@@ -2614,6 +2644,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
 
   amux whoami                      Live worker identity vs inherited env (mismatch warns)
   amux board ls [--all]            List open issues (--all includes archived)
+  amux board show <ID>             Print one card in full (title, desc, gate, history)
   amux board add <title>           Create a new todo issue
     --type T                       set the type at create time (the GATE is derived from it)
     --desc/--desc-stdin/--desc-file  give the card a body in the same write
@@ -2627,6 +2658,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board ask <ID> [question]   Ask the owning worker to post a status update
   amux board status-update <ID> …  (for the owning worker) post status to the board
                                    (prose, --stdin or --file <path>; NOT the gate flags below)
+  amux board discard <ID>          Retire a card that is not a unit of work (ungated)
   amux board done <ID>             Move issue to done
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review
@@ -2634,6 +2666,10 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board backlog <ID>          Move issue to backlog
   amux board status <ID> <status>  Set any status
   amux board type <ID> <type>      Correct a card's type (the gate is DERIVED from it)
+  amux board epic <ID> <EPIC-ID>   Roll a card up under an epic ('none' detaches)
+  amux board reviewer <ID> <W>     Name the peer a card in review is handed to
+  amux board archive <ID>          Hide a card from every view AND every autonomy loop
+  amux board unarchive <ID>        Bring an archived card back (the un-do, AMUX-2492)
   amux board retitle <ID> <title>  Rewrite a title/desc so the card stands alone
                                    (--stdin/--file preferred; --desc-stdin for the body)
 

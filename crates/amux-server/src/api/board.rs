@@ -4191,7 +4191,14 @@ pub async fn patch_item(
                     );
                 } else {
                     let prompt = format!(
-                        "[amux board note on {id}: {}] {caller_for_notify} appended a progress \
+                        // "[board note on ...]", NOT "[amux board note on ...]".
+                        // There is no `note` verb; the old header read as a
+                        // command a lane could run, in the one position — the
+                        // first bracket of a delivered message — where an agent
+                        // is most likely to treat text as an instruction.
+                        // AMUX-3707's sweep of every `amux board <verb>` the
+                        // server emits is what surfaced it.
+                        "[board note on {id}: {}] {caller_for_notify} appended a progress \
                          note to YOUR card:\n{note}\n(Full note is on the card {id}. This notice \
                          is delivery of a peer's note, not a status request.)",
                         title.chars().take(60).collect::<String>()
