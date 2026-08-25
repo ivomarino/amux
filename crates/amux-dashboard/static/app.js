@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.722';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.723';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11051,10 +11051,23 @@ async function _approvalsRefresh() {
     // The preference is per-device (localStorage), because "I have seen these"
     // is a property of the person looking, not of the server's queue.
     const collapsed = localStorage.getItem('amuxApprCollapsed') === '1';
+    // COLLAPSING THE ROWS IS NOT COLLAPSING THE BANNER (Ethan: "its still taking
+    // up space"). The first version folded the CONTENT and left the container's
+    // padding and the header's 6px margin, so one line of text still sat in a
+    // ~90px red block. The container has to shrink too.
+    //
+    // 44px stays the floor on the clickable row: css-mobile.md requires it and
+    // this is the only control in the strip. So the padding moves onto the row
+    // instead of the wrapper: 8 (pad) + 44 (row) + 6 (margin) + 8 (pad) = 66px
+    // becomes 44. Derived from these declarations rather than measured off the
+    // screenshot — I first wrote "~90px" from eyeballing the image, which is a
+    // number I could not have justified.
+    el.style.padding = collapsed ? '0 16px' : '8px 16px';
     let html = '<div style="max-width:860px;margin:0 auto;">'
       + '<div onclick="_apprToggle()" role="button" tabindex="0" '
-      + 'style="font-weight:600;margin-bottom:6px;cursor:pointer;display:flex;'
-      + 'align-items:center;gap:8px;min-height:44px;" '
+      + 'style="font-weight:600;cursor:pointer;display:flex;'
+      + 'align-items:center;gap:8px;min-height:44px;'
+      + (collapsed ? '' : 'margin-bottom:6px;') + '" '
       + 'title="' + (collapsed ? 'Show the drafts' : 'Collapse') + '">'
       + '<span style="display:inline-block;width:1em;transition:transform .12s;'
       + 'transform:rotate(' + (collapsed ? '-90' : '0') + 'deg);">&#x25BE;</span>'
@@ -11068,7 +11081,11 @@ async function _approvalsRefresh() {
     for (const p of pending) {
       const pv = p.preview || {};
       const mins = Math.max(1, Math.round((p.expires_in_s || 0) / 60));
-      html += '<details style="margin:4px 0;text-align:left;">'
+      // OPEN BY DEFAULT (Ethan: "i should be able to see the draft email").
+      // The body was behind a second click, so the banner told you a draft
+      // existed and made you hunt for what it said — on the one surface whose
+      // entire job is letting a human judge the content before it sends.
+      html += '<details open style="margin:4px 0;text-align:left;">'
         + '<summary style="cursor:pointer;display:flex;align-items:center;gap:10px;min-height:34px;">'
         + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
         + '<b>' + esc(p.session || '?') + '</b> &rarr; ' + esc(pv.to || '?')
@@ -11088,7 +11105,7 @@ async function _approvalsRefresh() {
         + 'min-height:34px;min-width:44px;">Discard</button>'
         + '</summary>'
         + '<div style="white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.25);'
-        + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:180px;overflow:auto;">'
+        + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:320px;overflow:auto;">'
         + (pv.cc ? 'cc: ' + esc(pv.cc) + '\n' : '')
         + esc(pv.body || '') + '</div></details>';
     }
