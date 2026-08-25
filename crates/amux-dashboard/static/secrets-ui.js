@@ -72,6 +72,48 @@ const SecretsUI = {
       .secret-card .hidden {
         color: var(--text-muted);
       }
+      .secret-metadata {
+        background: var(--code-bg);
+        border-radius: 4px;
+        padding: 10px;
+        margin: 10px 0;
+        font-size: 13px;
+      }
+      .metadata-item {
+        margin: 6px 0;
+        padding: 4px 0;
+        border-bottom: 1px solid var(--border-color);
+      }
+      .metadata-item:last-child {
+        border-bottom: none;
+      }
+      .metadata-item strong {
+        color: var(--primary-color);
+      }
+      .rotation-warning {
+        color: #ff6b6b;
+      }
+      .warning-badge {
+        display: inline-block;
+        background: #ff6b6b;
+        color: white;
+        padding: 3px 8px;
+        border-radius: 3px;
+        font-size: 12px;
+        font-weight: bold;
+      }
+      .used-by {
+        font-size: 12px;
+        color: var(--text-muted);
+        margin: 8px 0;
+        padding: 8px;
+        background: var(--code-bg);
+        border-radius: 4px;
+        border-left: 3px solid var(--primary-color);
+      }
+      .used-by strong {
+        color: var(--primary-color);
+      }
       .secret-controls {
         display: flex;
         gap: 8px;
@@ -209,50 +251,69 @@ const SecretsUI = {
 
   async loadSecrets() {
     try {
-      const response = await fetch('https://localhost:8824/api/secrets', {
+      // Fetch manifest with metadata (Phase 4 enhancement)
+      const response = await fetch('https://localhost:8823/api/secrets/manifest', {
         headers: { 'X-Requested-With': 'XMLHttpRequest' }
       });
-      
+
       if (!response.ok) throw new Error(`HTTP ${response.status}`);
-      
+
       const data = await response.json();
-      this.secrets = data.secrets || [];
-      this.displaySecrets(this.secrets);
+      this.secretsWithMetadata = data.secrets || [];
+      this.displaySecrets(this.secretsWithMetadata);
     } catch (error) {
       console.error('Failed to load secrets:', error);
-      document.getElementById('secrets-list').innerHTML = 
+      document.getElementById('secrets-list').innerHTML =
         `<p style="color: red;">Error loading secrets: ${error.message}</p>`;
     }
   },
 
   displaySecrets(secrets) {
     const list = document.getElementById('secrets-list');
-    
+
     if (!secrets.length) {
       list.innerHTML = '<p>No secrets found.</p>';
       return;
     }
 
-    list.innerHTML = secrets.map(path => `
-      <div class="secret-card">
-        <h3>${path}</h3>
+    list.innerHTML = secrets.map(secret => `
+      <div class="secret-card" data-path="${secret.path}">
+        <h3>${secret.path}</h3>
+        <div class="secret-metadata">
+          ${secret.service ? `<div class="metadata-item"><strong>Service:</strong> ${secret.service}</div>` : ''}
+          ${secret.purpose ? `<div class="metadata-item"><strong>Purpose:</strong> ${secret.purpose}</div>` : ''}
+          ${secret.owner ? `<div class="metadata-item"><strong>Owner:</strong> ${secret.owner}</div>` : ''}
+          ${secret.rotation_days ? `<div class="metadata-item"><strong>Rotation:</strong> ${secret.rotation_days} days</div>` : ''}
+          ${secret.needs_rotation ? `<div class="metadata-item rotation-warning"><span class="warning-badge">⚠️ Needs Rotation</span></div>` : ''}
+        </div>
+        ${secret.used_by && secret.used_by.length > 0 ? `
+          <div class="used-by">
+            <strong>Used by:</strong> ${secret.used_by.join(', ')}
+          </div>
+        ` : ''}
         <div class="secret-controls">
-          <button onclick="SecretsUI.showViewModal('${path}')">View</button>
-          <button onclick="SecretsUI.showEditModal('${path}')">Edit</button>
-          <button onclick="SecretsUI.copyToClipboard('${path}')">Copy</button>
+          <button onclick="SecretsUI.showViewModal('${secret.path}')">View</button>
+          <button onclick="SecretsUI.showEditModal('${secret.path}')">Edit</button>
+          <button onclick="SecretsUI.copyToClipboard('${secret.path}')">Copy</button>
         </div>
       </div>
     `).join('');
   },
 
   filterSecrets(query) {
-    const filtered = this.secrets.filter(s => s.includes(query));
+    // Search in path, service, purpose, and owner
+    const filtered = this.secretsWithMetadata.filter(secret =>
+      secret.path.includes(query) ||
+      (secret.service && secret.service.includes(query)) ||
+      (secret.purpose && secret.purpose.includes(query)) ||
+      (secret.owner && secret.owner.includes(query))
+    );
     this.displaySecrets(filtered);
   },
 
   async showViewModal(path) {
     try {
-      const response = await fetch(`https://localhost:8824/api/secrets/${path}`, {
+      const response = await fetch(`https://localhost:8823/api/secrets/${path}`, {
         headers: { 'X-Requested-With': 'XMLHttpRequest' }
       });
       
@@ -304,7 +365,7 @@ const SecretsUI = {
     const value = document.getElementById('edit-value').value;
     
     try {
-      const response = await fetch(`https://localhost:8824/api/secrets/${path}`, {
+      const response = await fetch(`https://localhost:8823/api/secrets/${path}`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -355,7 +416,7 @@ const SecretsUI = {
 
   async copyToClipboard(path) {
     try {
-      const response = await fetch(`https://localhost:8824/api/secrets/${path}`, {
+      const response = await fetch(`https://localhost:8823/api/secrets/${path}`, {
         headers: { 'X-Requested-With': 'XMLHttpRequest' }
       });
       
