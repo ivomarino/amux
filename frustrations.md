@@ -2719,3 +2719,50 @@ NOTE: this is AMUX-1888's shape, and the rule already exists — `amux send` and
   shape and I used it the old way. The lesson is not "remember the rule": it is that a
   tool taking free text as an argv positional MAKES the trap, and every such tool in this
   repo has now had to learn the same lesson separately.
+
+## The nudge that tells you to discard a card names no command that does it
+AREA: notices
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3707
+SYMPTOM: The capture-shell nudge ("X is a captured prompt, not a unit of work")
+  is ~250 words and fires ~42x/day fleet-wide, once per capture card ever. It
+  tells the lane to "discard it" and to "set each child's `epic`". Neither was
+  reachable from `amux board`: `discard` dispatches but is absent from help, and
+  `epic` had no verb at all, though `epic` is a real PATCH field (board.rs:2142)
+  added by AMUX-2992. Ethan flagged the token cost after seeing one fire on a
+  question he had already answered inline.
+COST: 540 nudges ever, 296 in the last 7 days. 70.6% of the cards ended
+  `discarded`, i.e. the woken turn produced a one-line retirement. The prose is
+  ~330 tokens; the turn each one wakes is tens of thousands. Every lane that
+  followed the nudge to its epic exit had to hand-roll a curl, which drops
+  X-Amux-Session, so the nudge was generating the unattributed board writes the
+  ledger depends on not having.
+FIX: c1c238b1. Text cut to ~85 words with a command on every exit; `amux board
+  epic` added; `discard`/`show`/`reviewer`/`archive`/`unarchive` added to help;
+  tests/nudge_commands_exist.rs sweeps every `amux board <verb>` the server
+  emits against the CLI's case arms on every build.
+
+## An AF-66-style guard existed for this and had been green the whole time
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3707
+SYMPTOM: `assert_cli_verbs_exist` in board_drive.rs does exactly the check that
+  would have caught the above, and was written for exactly this failure (AF-66,
+  where `amux board show` fell through to help and exited 2). It is called on
+  ONE prompt, from one fixture: the pickup Claim prompt. The decompose nudge
+  never flowed through it, so a verb it named for months did not exist and the
+  suite stayed green.
+COST: No wrong conclusion shipped, but the guard's existence is what made the
+  gap invisible. Anyone auditing "do we check that emitted commands exist?"
+  finds the helper, reads it, and stops. Reading the check does not reveal which
+  call sites it covers.
+FIX: c1c238b1 widens it from one fixture to a source sweep of the whole server
+  crate. The general lesson is ethos rule 7's: ask where the defect would be
+  INTRODUCED and confirm the fixture flows through that code, not an ancestor of
+  it. A single-call-site guard is worth naming its scope in its own doc comment.
