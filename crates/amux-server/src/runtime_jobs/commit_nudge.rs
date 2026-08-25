@@ -111,6 +111,12 @@ pub struct Freshness {
     /// out of budget" has been told something false by omission, and on the
     /// checkout that motivated this the second case is the majority.
     pub revived_unchecked: usize,
+    /// How many paths the discriminator ACTUALLY examined. Coverage, not a
+    /// count of findings — and the share of a partial sample must never be
+    /// generalised to the checkout without it (mixpeek-frustrations measured
+    /// 4 of 59 checked under the default budget on a large repo, i.e. 0.5%
+    /// coverage on a 772-path listing).
+    pub revived_checked: usize,
 }
 
 /// Is the worktree copy of `path` an OLD COMMITTED REVISION rather than a new
@@ -355,19 +361,29 @@ pub fn build(
         // read at all. Lead with the ratio and name the checkout-level
         // condition, because at that share the story is the checkout rather
         // than any one path.
-        let share = if dirty.is_empty() { 0 } else { n * 100 / dirty.len() };
-        // A FLOOR ON THE COUNT, not just the share. 1 of 2 paths is 50% and is
-        // not a checkout-wide condition; without this a two-path dirty tree
-        // trivially trips the "the finding is the CHECKOUT" language and the
-        // sentence reads "not 1 separate alarms". Caught by an existing test
-        // going red, which is the only reason it was caught at all.
-        let lede = if share >= 50 && n >= 5 {
+        // THE SHARE IS OF WHAT WAS CHECKED, AND ONLY GENERALISES IF COVERAGE
+        // SUPPORTS IT (mixpeek-frustrations, probes 1 and 2).
+        //
+        // Two separate errors were possible here and both were live. First, the
+        // denominator: dividing by every dirty path counts unchecked ones as
+        // not-revived, which understates by exactly the coverage gap. Second and
+        // worse, generalising at all — under the default budget their repo
+        // checked 4 of 59 paths, so a "75% of your checkout" claim would rest on
+        // four files. A checkout-level statement needs checkout-level coverage.
+        //
+        // A FLOOR ON THE COUNT TOO. 1 of 2 paths is 50% and is not a
+        // checkout-wide condition; an existing test caught that by going red.
+        let denom = fresh.revived_checked.max(n);
+        let share = (n * 100).checked_div(denom).unwrap_or(0);
+        let coverage = fresh.revived_checked + fresh.revived_unchecked;
+        let well_covered = coverage == 0 || fresh.revived_checked * 2 >= coverage;
+        let lede = if share >= 50 && n >= 5 && well_covered {
             format!(
-                "OLD REVISIONS ON DISK — {n} of {} dirty paths ({share}%). At this share the \
-                 finding is the CHECKOUT, not the individual files: it is broadly carrying \
-                 content that was already superseded. Treat this as ONE condition to resolve \
-                 deliberately, not {n} separate alarms",
-                dirty.len()
+                "OLD REVISIONS ON DISK — {n} of the {} path(s) examined ({share}%). At this \
+                 share the finding is the CHECKOUT, not the individual files: it is broadly \
+                 carrying content that was already superseded. Treat this as ONE condition to \
+                 resolve deliberately, not {n} separate alarms",
+                fresh.revived_checked.max(n)
             )
         } else {
             format!("OLD REVISION ON DISK: {n} {whose_r} under {dir}")
@@ -395,15 +411,23 @@ pub fn build(
     // "we looked and it is fine", which is the difference between a bound and a
     // lie. Measured need: 772 paths in one real listing (mixpeek-frustrations).
     if fresh.revived_unchecked > 0 {
+        let total = fresh.revived_checked + fresh.revived_unchecked;
+        let pct = (fresh.revived_checked * 100).checked_div(total).unwrap_or(0);
         sections.push(format!(
-            "NOT CHECKED FOR OLD-REVISION: {} further path(s) were not put through the \
-             old-revision test — this run hit its budget (AMUX_NUDGE_REVIVED_BUDGET_MS / \
-             AMUX_NUDGE_REVIVED_MAX_PATHS). They are listed above as ordinary edits, which is \
-             the SAFE fallback and NOT a finding that they are clean. On a large checkout the \
-             per-path test costs ~700ms, so a full pass over a long dirty list would spend \
-             minutes of git subprocesses on a shared repo. To check one by hand:\n  \
+            "NOT CHECKED FOR OLD-REVISION: {} of {total} candidate path(s) were examined \
+             ({pct}% coverage); the other {} were not, because this run hit its budget \
+             (AMUX_NUDGE_REVIVED_BUDGET_MS / AMUX_NUDGE_REVIVED_MAX_PATHS). The unchecked ones \
+             are listed above as ordinary edits, which is the SAFE fallback and NOT a finding \
+             that they are clean.\n\
+             COVERAGE, STATED AS A PERCENTAGE ON PURPOSE: on a large checkout the per-path \
+             test costs ~700ms and the clock cuts after about four paths, so a long dirty list \
+             gets low single digits. That is an honest bound and it is NOT a sample — do not \
+             read the proportions above as representative of the rest. The examined ones are \
+             spread across top-level directories rather than taken alphabetically, which \
+             removes the worst of the bias but does not make four files a survey.\n\
+             To check one by hand:\n  \
              git log --all --oneline --find-object=$(git hash-object <path>) -- <path>",
-            fresh.revived_unchecked
+            fresh.revived_checked, fresh.revived_unchecked
         ));
     }
 
@@ -1189,7 +1213,7 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
         return fresh;
     }
     let started = std::time::Instant::now();
-    let mut revived_checked = 0usize;
+    let mut pending_revived: Vec<String> = Vec::new();
 
     // Resolve the repo root and address paths from there. `git status` emits
     // repo-root-relative paths, but a lane's CC_DIR is often a SUBDIRECTORY; run
@@ -1340,21 +1364,19 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
         //     can only be answered one way, and reach for the expensive one
         //     solely when the cheap answer is inconclusive.
         if refs_agree {
-            let spent = started.elapsed().as_millis();
-            if revived_checked >= revived_max_paths() || spent >= revived_budget_ms() {
-                // OVER BUDGET. Fall back to `edited` — the safe direction — and
-                // COUNT it, because an unchecked path and a checked-and-novel
-                // path are otherwise the same output for two different states.
-                fresh.revived_unchecked += 1;
-                fresh.edited.push(p.clone());
-                continue;
-            }
-            revived_checked += 1;
-            if revives_an_old_revision(dir, p).await {
-                fresh.revived.push(p.clone());
-            } else {
-                fresh.edited.push(p.clone());
-            }
+            // DEFERRED, NOT DECIDED HERE (mixpeek-frustrations, probe 2). This
+            // loop runs in `git status` order, which is alphabetical, so
+            // checking inline meant the budget always sampled the alphabetically
+            // first paths. On their repo that is 11 canvas/apps and 6
+            // .github/workflows out of a population dominated by 342 SDK
+            // packages, and the two ends disagree wildly: head-of-status reads
+            // 35% revived, a random sample of the same set at the same moment
+            // reads 75%. Same repo, opposite sides of the share threshold,
+            // purely from path ordering.
+            //
+            // So the candidates are collected here and CHECKED in stratified
+            // order below.
+            pending_revived.push(p.clone());
             continue;
         }
 
@@ -1445,6 +1467,69 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
         //    plausible in-flight edit; commit-worthy like today.
         fresh.edited.push(p.clone());
     }
+
+    // ---- the revived pass, in STRATIFIED order --------------------------
+    //
+    // Round-robin across top-level directories rather than taking the first N
+    // (mixpeek-frustrations, probe 2). `git status` is alphabetical, so first-N
+    // samples one end of the repo: on their checkout the first 20 dirty paths
+    // are 11 canvas/apps and 6 .github/workflows, while the population is 342
+    // SDK packages full of regen churn. Head-of-status read 35% revived and a
+    // random sample of the SAME set at the SAME moment read 75% — opposite
+    // sides of the share threshold, decided by path ordering alone.
+    //
+    // Round-robin rather than a shuffle: deterministic, so two runs on an
+    // unchanged tree agree, and a nudge that reported a different verdict each
+    // firing would be worse than a biased one.
+    let mut by_dir: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
+    for p in &pending_revived {
+        by_dir.entry(p.split('/').next().unwrap_or("")).or_default().push(p);
+    }
+    let mut order: Vec<&String> = Vec::with_capacity(pending_revived.len());
+    let mut i = 0usize;
+    while order.len() < pending_revived.len() {
+        let mut moved = false;
+        for v in by_dir.values() {
+            if let Some(p) = v.get(i) {
+                order.push(p);
+                moved = true;
+            }
+        }
+        if !moved {
+            break;
+        }
+        i += 1;
+    }
+    let (budget, cap) = (revived_budget_ms(), revived_max_paths());
+    let mut checked: std::collections::BTreeSet<&str> = Default::default();
+    for p in order {
+        // The clock is checked BETWEEN paths, so a run can overshoot by up to
+        // one walk. Measured at 2374ms against a 2000ms budget on a repo whose
+        // walks cost ~458ms, which is exactly one walk of overshoot. Stated
+        // rather than tuned away: bounding it properly needs a timeout on the
+        // git child, and the overshoot is one walk either way.
+        if checked.len() >= cap || started.elapsed().as_millis() >= budget {
+            break;
+        }
+        checked.insert(p.as_str());
+        if revives_an_old_revision(dir, p).await {
+            fresh.revived.push(p.clone());
+        } else {
+            fresh.edited.push(p.clone());
+        }
+    }
+    for p in &pending_revived {
+        if !checked.contains(p.as_str()) {
+            // UNCHECKED -> `edited`, the safe fallback, and COUNTED. The
+            // fallback output is byte-identical to a path that WAS checked and
+            // found novel, so without the count "we did not look" reads as "we
+            // looked and it is fine".
+            fresh.revived_unchecked += 1;
+            fresh.edited.push(p.clone());
+        }
+    }
+    fresh.revived_checked = checked.len();
+
     fresh
 }
 
@@ -2597,6 +2682,7 @@ mod tests {
         }
 
         // Cap at 2. Set on this process only; the default (40) is what ships.
+        let _serial = REVIVED_ENV.lock().await;
         std::env::set_var("AMUX_NUDGE_REVIVED_MAX_PATHS", "2");
         let dir = work.to_str().unwrap();
         let fresh = freshness_from_repo(dir, &names).await;
@@ -2617,10 +2703,129 @@ mod tests {
         // them as unexamined.
         let n = build(dir, &names, &Default::default(), &fresh, "").expect("nudge");
         assert!(n.contains("NOT CHECKED FOR OLD-REVISION"), "the cap must be visible: {n}");
-        assert!(n.contains("4 further path"), "and must say HOW MANY: {n}");
+        assert!(n.contains("2 of 6 candidate path(s) were examined"), "state coverage: {n}");
+        assert!(n.contains("33% coverage"), "as a percentage, so 4-of-59 reads as 6%: {n}");
         assert!(
             n.contains("NOT a finding that they are clean"),
             "and must refuse the reading that silence means checked: {n}"
+        );
+        assert!(
+            n.contains("is NOT a sample"),
+            "and must refuse the OTHER misreading — that the checked proportion generalises \
+             to the rest (mixpeek-frustrations measured 4 of 59 under the default budget): {n}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Serialises the tests that set AMUX_NUDGE_REVIVED_MAX_PATHS.
+    ///
+    /// The var is PROCESS-GLOBAL and cargo runs tests in parallel, so without
+    /// this one test's `remove_var` lands in the middle of the other's run and
+    /// the cap silently becomes the default. That is a flake that reproduces
+    /// perhaps one run in ten and reads as a logic bug in the code under test.
+    /// `tokio::sync::Mutex`, not `std`: the guard is held across `.await` in
+    /// both tests, and a std guard there is a clippy deny and a real deadlock
+    /// hazard on a multi-threaded runtime.
+    static REVIVED_ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// AMUX-3695 probe 2: the budgeted sample is spread across directories, not
+    /// taken alphabetically.
+    ///
+    /// mixpeek-frustrations measured the same dirty set two ways at the same
+    /// moment: head-of-`git status` read 35% revived, a random sample read 75%.
+    /// The cause is directory mix, not chance — status is alphabetical, so the
+    /// first 20 paths there are 11 canvas/apps and 6 .github/workflows while the
+    /// population is 342 SDK packages full of regen churn. First-N samples the
+    /// wrong end of the repo.
+    ///
+    /// That matters beyond the sample, because the share threshold decides
+    /// between "one checkout-level condition" and "N alarms", and 35% and 75%
+    /// fall on opposite sides of it. The same repo, the same second, decided by
+    /// path ordering.
+    ///
+    /// The fixture reproduces the shape: an alphabetically-first directory that
+    /// would monopolise a first-N budget, and a later one that would never be
+    /// reached.
+    #[tokio::test]
+    async fn the_budgeted_sample_is_spread_across_directories_not_taken_alphabetically() {
+        let tmp = std::env::temp_dir().join(format!("amux-strat-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (bare, work) = (tmp.join("origin.git"), tmp.join("work"));
+        std::fs::create_dir_all(work.join("aaa")).unwrap();
+        std::fs::create_dir_all(work.join("zzz")).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        // Four in `aaa` (alphabetically first, would eat a first-N budget of 2)
+        // and four in `zzz` (would never be reached).
+        let names: Vec<String> = (0..4)
+            .map(|i| format!("aaa/a{i}.txt"))
+            .chain((0..4).map(|i| format!("zzz/z{i}.txt")))
+            .collect();
+        for n in &names {
+            std::fs::write(work.join(n), "v1-old\n").unwrap();
+        }
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "v1"]);
+        for n in &names {
+            std::fs::write(work.join(n), "v2-current\n").unwrap();
+        }
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "v2"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin"]);
+        for n in &names {
+            std::fs::write(work.join(n), "v1-old\n").unwrap();
+        }
+
+        let _serial = REVIVED_ENV.lock().await;
+        std::env::set_var("AMUX_NUDGE_REVIVED_MAX_PATHS", "2");
+        let dir = work.to_str().unwrap();
+        let fresh = freshness_from_repo(dir, &names).await;
+        // The determinism cell below runs under the SAME cap. Removing the var
+        // before it was the first draft's bug: the second run then used the
+        // default 40, checked all eight, and "disagreed" with the first for a
+        // reason that had nothing to do with ordering.
+        let again = freshness_from_repo(dir, &names).await;
+        std::env::remove_var("AMUX_NUDGE_REVIVED_MAX_PATHS");
+
+        assert_eq!(fresh.revived_checked, 2, "the cap still binds: {fresh:?}");
+        // THE CLAIM: both directories are represented. Under the first-N version
+        // this was aaa/a0 and aaa/a1 and `zzz` was invisible.
+        let dirs: std::collections::BTreeSet<&str> =
+            fresh.revived.iter().filter_map(|p| p.split('/').next()).collect();
+        assert_eq!(
+            dirs.len(),
+            2,
+            "a 2-path budget over two directories must take one from each, not two from the \
+             alphabetically first: {:?}",
+            fresh.revived
+        );
+        assert!(dirs.contains("zzz"), "the LATER directory must be reachable: {:?}", fresh.revived);
+
+        // DETERMINISM. A shuffle would also spread the sample and would make the
+        // nudge report a different verdict on each firing over an unchanged
+        // tree, which is worse than a biased one. Round-robin is stable.
+        assert_eq!(
+            fresh.revived, again.revived,
+            "two runs over an unchanged tree must agree, or the nudge contradicts itself"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
