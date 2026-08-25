@@ -272,6 +272,56 @@ pub enum ScheduleExpr {
     Cron(Box<cron::Schedule>),
 }
 
+/// How many times a day this expression fires (AMUX-3546).
+///
+/// `every 15m` is eleven characters and reads like a small choice. It is 96
+/// turns a day, and five of them were enabled on this machine — part of ~1,650
+/// turns/day from 34 rows, each one a full model turn against the owner's own
+/// subscription. Nothing said so at the moment of the decision, which is the
+/// only moment the information is free.
+///
+/// STATED, NEVER REFUSED. A ten-minute poll is a legitimate thing to want; the
+/// cost simply has to be visible when it is chosen (the AMUX-2785 argument, one
+/// subsystem over).
+///
+/// `None` only when the count cannot be established, never 0 — a schedule that
+/// fires an unknown number of times is not a schedule that fires never, and
+/// collapsing them would put the noisiest cell behind the quietest label.
+pub fn fires_per_day(expr: &ScheduleExpr) -> Option<f64> {
+    const DAY: f64 = 86_400.0;
+    match expr {
+        ScheduleExpr::Interval { every } => {
+            let secs = every.num_seconds() as f64;
+            (secs > 0.0).then(|| DAY / secs)
+        }
+        ScheduleExpr::Daily { .. } => Some(1.0),
+        // Mon-Fri: 5 fires per 7 days, expressed per-day so every arm of this
+        // match is in the same unit and the caller never has to ask.
+        ScheduleExpr::Weekday { .. } => Some(5.0 / 7.0),
+        ScheduleExpr::Weekly { .. } => Some(1.0 / 7.0),
+        // 365.2425 / 12: the mean Gregorian month. A flat 30 would report a
+        // monthly schedule as firing 1.4% more often than it does, which is
+        // invisible and wrong rather than approximate and honest.
+        ScheduleExpr::Monthly { .. } => Some(12.0 / 365.2425),
+        // COUNTED, not derived from the field pattern. A cron expression's
+        // firing rate is not readable from its shape without reimplementing
+        // cron, and the `cron` crate already owns that: walk the next 24 hours
+        // and count. Bounded, because `* * * * *` yields 1440 and a malformed
+        // schedule could in principle yield more.
+        ScheduleExpr::Cron(sched) => {
+            let now = chrono::Local::now();
+            let until = now + ChronoDuration::days(1);
+            let n = sched.after(&now).take(MAX_CRON_FIRES).take_while(|t| *t < until).count();
+            (n < MAX_CRON_FIRES).then_some(n as f64)
+        }
+    }
+}
+
+/// One per minute for a day, plus headroom. Reaching it means the count is not
+/// trustworthy, and `fires_per_day` returns None rather than a floor wearing the
+/// authority of a measurement.
+const MAX_CRON_FIRES: usize = 2000;
+
 static RE_IN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^in\s+(\d+)\s*(m|min|minutes?|h|hr|hours?)$").unwrap());
 static RE_EVERY_N: LazyLock<Regex> =
@@ -1751,6 +1801,53 @@ pub async fn run_scheduler(
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-3546: a cadence has a number, and it is the number nobody saw.
+    ///
+    /// From the live board when the card was filed: 165 schedules enabled, ~1,650
+    /// turns/day from 34 rows. `every 15m` is eleven characters and is 96 turns a
+    /// day; five were enabled.
+    #[test]
+    fn fires_per_day_counts_every_expression_shape() {
+        let f = |e: &str| {
+            super::fires_per_day(&ScheduleExpr::parse(e).expect(e)).expect("countable")
+        };
+        // The card's own census, expression by expression.
+        assert_eq!(f("every 15m"), 96.0, "the eleven characters that motivated this card");
+        assert_eq!(f("every 10m"), 144.0);
+        assert_eq!(f("every 30m"), 48.0);
+        assert_eq!(f("every 1h"), 24.0);
+        assert_eq!(f("every 6h"), 4.0);
+        assert_eq!(f("daily at 9am"), 1.0);
+
+        // Sub-daily shapes are per-DAY too, so every arm shares one unit and a
+        // caller never has to ask which it got.
+        assert!((f("every weekday at 9am") - 5.0 / 7.0).abs() < 1e-9, "Mon-Fri is 5/7 per day");
+        assert!((f("weekly on Monday at 9am") - 1.0 / 7.0).abs() < 1e-9);
+        // Mean Gregorian month, not a flat 30: that would over-report a monthly
+        // schedule by 1.4%, which is invisible and wrong rather than approximate
+        // and honest.
+        assert!((f("monthly on 1 at 9am") - 12.0 / 365.2425).abs() < 1e-9);
+
+        // CRON IS COUNTED, not pattern-matched. Reimplementing cron to read a
+        // rate off the field shapes is how the count and the firing disagree.
+        assert_eq!(f("0 9 * * *"), 1.0, "daily cron");
+        assert_eq!(f("*/15 * * * *"), 96.0, "quarter-hourly cron matches `every 15m`");
+        assert_eq!(f("0 * * * *"), 24.0, "hourly cron");
+
+        // THE CONTROL, and it is the one that matters: this must not return a
+        // plausible number for something it cannot count. A floor wearing the
+        // authority of a measurement is worse than no number, because the
+        // caller acts on it.
+        assert!(
+            super::fires_per_day(&ScheduleExpr::Interval {
+                every: ChronoDuration::seconds(0)
+            })
+            .is_none(),
+            "a zero interval fires unboundedly — reporting 0/day would put the noisiest \
+             possible schedule behind the quietest label"
+        );
+    }
+
     use super::*;
     use crate::db::Store;
     use std::sync::Arc;
