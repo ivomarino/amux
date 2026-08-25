@@ -1105,6 +1105,30 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
             },
             _ => false,
         };
+        //     ONE POPULATION THIS DOES NOT SPLIT, and it is a real silent
+        //     revert (mixpeek-frustrations, reviewing the above). 2b is reached
+        //     only when the worktree ALREADY differs from origin, so the state
+        //     here is: worktree != origin, HEAD == origin. That holds two cases:
+        //
+        //       (a) a genuine new edit          -> `edited` is exactly right
+        //       (b) an OLD committed revision on disk -> committing REVERTS the
+        //           content both refs agree on
+        //
+        //     (b) is invisible to both ancestry arms PRECISELY BECAUSE the refs
+        //     agree, so it is the AMUX-3000 shape reached from a direction the
+        //     arms cannot see. It is not an argument against this gate: `edited`
+        //     prescribes no destructive remedy, so the failure is UNDER-warning
+        //     rather than a bad prescription, which is the right way to fail.
+        //
+        //     The discriminator, if anyone wants it, is one command and is
+        //     already in this file's toolkit — a commit printing here means the
+        //     on-disk copy is an old revision:
+        //
+        //       git log --all --oneline --find-object=$(git hash-object <path>) -- <path>
+        //
+        //     Not done here: `--all --find-object` walks every ref per path, on
+        //     a loop that runs against every dirty path, and that cost wants
+        //     measuring before it ships (AMUX-3695).
         if refs_agree {
             fresh.edited.push(p.clone());
             continue;
