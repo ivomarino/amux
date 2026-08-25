@@ -619,7 +619,45 @@ If secrets cannot be loaded, server logs a warning and continues (allows operati
 - Environment variable leakage risk — prefer API access for sensitive operations
 - API endpoints require authentication (checked against `state.auth_token`)
 
-**Next Phases:**
-- **Phase 5:** Web UI dashboard for viewing/managing secrets
-- **Phase 6:** MCP integration — Claude agents can request secrets
-- **Phase 7:** GitHub OAuth connector using this infrastructure
+**Phase 5: Web UI Dashboard** ✅
+- Secrets management interface at `/ui/secrets`
+- Create, read, update secrets via web UI
+- Search and filter functionality
+- Modal dialogs for editing
+- Dark mode support
+
+**Phase 6: MCP Integration** ✅
+- Claude agents can request secrets via MCP
+- `REQUEST_SECRET` tool for specific paths
+- `LIST_SECRETS` and `INSPECT_SCHEMA` tools
+- Secure request logging
+- Ready for rate limiting
+
+**Phase 7: GitHub OAuth Connector** ✅
+- Full OAuth 2.0 flow with GitHub
+- Credentials stored in encrypted secrets
+- GitHub issue/PR sync to amux board
+- Webhook integration ready
+- Setup: See `docs/github-setup.md`
+
+## GitHub Connector (Phase 7)
+
+Integrates GitHub OAuth using the secrets infrastructure.
+
+**Setup:**
+```bash
+# 1. Create OAuth app at https://github.com/settings/developers/new
+# 2. Add credentials to ~/.amux/server.env or secrets store:
+EXTERNAL_SERVICES_GITHUB_CLIENT_ID=Ov23li...
+EXTERNAL_SERVICES_GITHUB_CLIENT_SECRET=...
+
+# 3. Test connection
+curl -sk https://localhost:8824/api/github/status
+```
+
+**Endpoints:**
+- `GET /api/github/status` — Check connection
+- `GET /api/github/auth/start` — Begin OAuth flow
+- `GET /api/github/auth/callback` — Handle OAuth redirect
+
+All credentials are encrypted using the secrets infrastructure (Phases 1-4).

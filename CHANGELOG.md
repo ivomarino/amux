@@ -55,10 +55,29 @@ This file tracks all changes made to the `local/amux-5-fix` branch, which contai
 - API endpoints require authentication
 - Admin-only writes
 
-### Next Steps (Phases 5-6)
-- **Phase 5**: Web UI dashboard for viewing/managing secrets
-- **Phase 6**: MCP integration for Claude agent access
-- Then: GitHub OAuth connector implementation
+### Phase 5: Web UI Dashboard
+- `crates/amux-dashboard/static/secrets-ui.js` (421 lines)
+- Full CRUD interface for secrets management
+- Modal dialogs for create/edit/view operations
+- Search and filter by secret path
+- Dark mode support, mobile responsive
+- Copy to clipboard functionality
+
+### Phase 6: MCP Integration
+- `crates/amux-server/src/mcp_secrets.rs` (64 lines)
+- REQUEST_SECRET tool for Claude agents
+- LIST_SECRETS and INSPECT_SCHEMA tools
+- Path validation (no wildcards)
+- Ready for rate limiting and audit logging
+- Full test coverage
+
+### Phase 7: GitHub OAuth Connector
+- `crates/amux-server/src/api/github_connector.rs` (138 lines)
+- Complete OAuth 2.0 flow implementation
+- Credentials stored in secrets infrastructure
+- Token exchange with GitHub API
+- Status checking endpoint
+- Webhook-ready for GitHub events
 
 ---
 
