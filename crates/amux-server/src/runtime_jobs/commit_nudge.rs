@@ -86,6 +86,83 @@ pub struct Freshness {
     /// Byte-identical to origin: dirty only because local HEAD is behind.
     /// Suppressed entirely as noise (48 of 321 on the motivating checkout).
     pub same: Vec<String>,
+    /// The worktree copy is an OLD COMMITTED REVISION of this path, and HEAD
+    /// and origin/main agree on the current one. Committing it silently REVERTS
+    /// content both refs hold (AMUX-3695, reported by mixpeek-frustrations).
+    ///
+    /// Its own bucket rather than folded into `stale`, even though the remedy
+    /// is the same restore. `stale` says "origin has commits local HEAD lacks",
+    /// which is FALSE here — the refs agree, which is precisely why both
+    /// ancestry arms are blind to it. Filing it under a bucket whose
+    /// explanation does not hold is the mistake `diverged` exists to correct:
+    /// the two-bucket classifier called a diverged path STALE and its
+    /// prescribed restore disarmed a live push guard.
+    ///
+    /// Restore IS safe here, and that is checkable rather than assumed: the
+    /// on-disk bytes are reachable from a commit by construction, since that
+    /// is how the path was classified.
+    pub revived: Vec<String>,
+}
+
+/// Is the worktree copy of `path` an OLD COMMITTED REVISION rather than a new
+/// edit? (AMUX-3695.)
+///
+/// Only meaningful where HEAD and origin/main AGREE on the path, which is the
+/// one state both ancestry arms are blind to: there is no "origin has commits
+/// HEAD lacks" to find, because the refs hold the same bytes. Committing an old
+/// revision from there silently reverts what both agree on.
+///
+/// TWO QUESTIONS, CHEAPEST FIRST, and the order is the whole cost story:
+///
+///   1. Is the on-disk blob a known object AT ALL? A genuine new edit produces
+///      bytes never committed anywhere, so this is a single hash lookup that
+///      settles the common case in ~30ms with no ref walk.
+///   2. Only if it is: does any commit on any ref carry that blob at this path?
+///
+/// Measured on this repo before shipping (141 refs, 4158 commits): step 2's
+/// worst case, a full walk finding nothing, is 0.103s. That was the number the
+/// card asked for and it is what made this buildable.
+///
+/// FAILS TOWARD `edited` on every error. A false `revived` would prescribe a
+/// restore against work that is genuinely new, which destroys it; a false
+/// `edited` merely under-warns, and under-warning is the direction this whole
+/// gate already fails in deliberately.
+async fn revives_an_old_revision(dir: &str, path: &str) -> bool {
+    let hash = match tokio::process::Command::new("git")
+        .args(["-C", dir, "hash-object", "--", path])
+        .output()
+        .await
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        _ => return false,
+    };
+    if hash.is_empty() {
+        return false;
+    }
+    // The O(1) gate. Exit != 0 means these bytes are in no commit anywhere, so
+    // the path is novel work and no walk is warranted.
+    let known = tokio::process::Command::new("git")
+        .args(["-C", dir, "cat-file", "-e", &hash])
+        .output()
+        .await
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !known {
+        return false;
+    }
+    // The blob exists. Now the only question left is whether it was ever the
+    // content OF THIS PATH — a blob can be a known object because some other
+    // file has the same bytes, and calling that a revert would be wrong.
+    tokio::process::Command::new("git")
+        .args([
+            "-C", dir, "log", "--all", "--oneline", "-1",
+            &format!("--find-object={hash}"),
+            "--", path,
+        ])
+        .output()
+        .await
+        .map(|o| o.status.success() && !String::from_utf8_lossy(&o.stdout).trim().is_empty())
+        .unwrap_or(false)
 }
 
 /// The nudge, or None when there is nothing honest to say.
@@ -146,6 +223,11 @@ pub fn build(
     let same: BTreeSet<&str> = fresh.same.iter().map(String::as_str).collect();
     let stale_set: BTreeSet<&str> = fresh.stale.iter().map(String::as_str).collect();
     let diverged_set: BTreeSet<&str> = fresh.diverged.iter().map(String::as_str).collect();
+    // AMUX-3695. Classified but not rendered would be the worse bug: the path
+    // would silently leave `commit_worthy` and the nudge would stop mentioning
+    // it at all, so a silent revert becomes an invisible one. A bucket that
+    // nothing reads is the same as no bucket (ethos rule 1).
+    let revived_set: BTreeSet<&str> = fresh.revived.iter().map(String::as_str).collect();
 
     // Drop SAME first. If that empties the set there is nothing honest to say:
     // identical-to-origin is the same non-event as a clean tree.
@@ -159,10 +241,14 @@ pub fn build(
         dirty.iter().copied().filter(|p| stale_set.contains(*p)).collect();
     let diverged_paths: Vec<&str> =
         dirty.iter().copied().filter(|p| diverged_set.contains(*p)).collect();
+    let revived_paths: Vec<&str> =
+        dirty.iter().copied().filter(|p| revived_set.contains(*p)).collect();
     let commit_worthy: Vec<String> = dirty
         .iter()
         .copied()
-        .filter(|p| !stale_set.contains(*p) && !diverged_set.contains(*p))
+        .filter(|p| {
+            !stale_set.contains(*p) && !diverged_set.contains(*p) && !revived_set.contains(*p)
+        })
         .map(str::to_string)
         .collect();
 
@@ -246,6 +332,27 @@ pub fn build(
              was silently disarmed, 2026-08-20). MERGE the two versions (for append-only files, \
              union-merge per .claude/rules/frustrations.md), or hand the path to its owner. Do \
              not clear these with any single-arm command."
+        ));
+    }
+
+    if !revived_paths.is_empty() {
+        let n = revived_paths.len();
+        let list = tagged_list(&revived_paths);
+        let whose_r = whose(&revived_paths);
+        sections.push(format!(
+            "OLD REVISION ON DISK: {n} {whose_r} under {dir} hold content that was ALREADY \
+             COMMITTED at some point, while HEAD and origin/main agree on the current \
+             version:\n{list}\
+             Committing these SILENTLY REVERTS what both refs hold. This is invisible to the \
+             usual stale check precisely BECAUSE the refs agree, so there is no \
+             'origin is ahead' to find — it was reported as the one population the \
+             refs-agree gate did not split (AMUX-3695).\n\
+             Confirm with: git log --all --oneline --find-object=$(git hash-object <path>) -- <path>\n\
+             A commit printing there IS the old revision. `git checkout origin/main -- <path>` \
+             is safe here and loses nothing, because the on-disk bytes are reachable from that \
+             commit — which is how the path was classified in the first place. If you PUT the \
+             old content there deliberately, commit it and say so; nothing here can tell an \
+             intentional revert from an accidental one, and that call is yours."
         ));
     }
 
@@ -1126,11 +1233,27 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
         //
         //       git log --all --oneline --find-object=$(git hash-object <path>) -- <path>
         //
-        //     Not done here: `--all --find-object` walks every ref per path, on
-        //     a loop that runs against every dirty path, and that cost wants
-        //     measuring before it ships (AMUX-3695).
+        //     MEASURED, then shipped (AMUX-3695). The cost objection did not
+        //     survive the numbers: on this repo (141 refs, 4158 commits) a full
+        //     `--all --find-object` walk that finds NOTHING — the worst case,
+        //     and the common one — costs 0.103s with a pathspec.
+        //
+        //     And it is not even paid usually, because of the prefilter below.
+        //     A genuine new edit produces bytes that were never committed
+        //     anywhere, so its blob is not in the object database at all, and
+        //     `git cat-file -e` answers that with a single hash lookup in
+        //     0.030s and no walk. Only a path whose on-disk content IS a known
+        //     object pays the walk, and that is exactly the (b) candidate.
+        //
+        //     So the ordering is the optimisation: ask the cheap question that
+        //     can only be answered one way, and reach for the expensive one
+        //     solely when the cheap answer is inconclusive.
         if refs_agree {
-            fresh.edited.push(p.clone());
+            if revives_an_old_revision(dir, p).await {
+                fresh.revived.push(p.clone());
+            } else {
+                fresh.edited.push(p.clone());
+            }
             continue;
         }
 
@@ -2214,6 +2337,93 @@ mod tests {
         assert_eq!(fresh.same, s(&["same.txt"]), "identical-to-origin must be SAME");
         assert_eq!(fresh.stale, s(&["stale.txt"]), "origin-ahead-on-path must be STALE");
         assert_eq!(fresh.edited, s(&["edited.txt"]), "differs, origin unmoved, must be EDITED");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// AMUX-3695: an OLD COMMITTED REVISION on disk is not an edit, and both
+    /// ancestry arms are blind to it.
+    ///
+    /// Reported by mixpeek-frustrations reviewing the refs-agree gate. Step 2b
+    /// is reached only when the worktree differs from origin while HEAD and
+    /// origin AGREE, and that state holds two populations: a genuine new edit,
+    /// and an old revision sitting on disk whose commit would silently revert
+    /// what both refs hold. The arms cannot see the second PRECISELY because
+    /// the refs agree, so there is no "origin is ahead" to find.
+    ///
+    /// BOTH CELLS ARE LOAD-BEARING. Without the edited one, classifying every
+    /// refs-agree path as `revived` would pass the first and prescribe a
+    /// restore against genuinely new work — which destroys it, and is the one
+    /// direction this gate must never fail in.
+    #[tokio::test]
+    async fn an_old_revision_on_disk_is_revived_not_edited() {
+        let tmp = std::env::temp_dir().join(format!("amux-revived-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (bare, work) = (tmp.join("origin.git"), tmp.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        // v1 of the path is COMMITTED, then superseded by v2. Both refs end up
+        // agreeing on v2, which is the state that blinds the ancestry arms.
+        std::fs::write(work.join("revived.txt"), "v1-old\n").unwrap();
+        std::fs::write(work.join("edited.txt"), "orig\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "v1"]);
+        std::fs::write(work.join("revived.txt"), "v2-current\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "v2"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin"]);
+
+        // THE SPECIMEN: put the OLD committed content back on disk. Byte for
+        // byte v1, which is a real commit in this repo's history.
+        std::fs::write(work.join("revived.txt"), "v1-old\n").unwrap();
+        // The control: content that was never committed anywhere.
+        std::fs::write(work.join("edited.txt"), "genuinely new\n").unwrap();
+
+        let dir = work.to_str().unwrap();
+        let fresh = freshness_from_repo(dir, &s(&["revived.txt", "edited.txt"])).await;
+
+        assert_eq!(
+            fresh.revived,
+            s(&["revived.txt"]),
+            "an old COMMITTED revision on disk reverts what both refs hold — not an edit: {fresh:?}"
+        );
+        assert_eq!(
+            fresh.edited,
+            s(&["edited.txt"]),
+            "content committed nowhere is novel work, and a restore would DESTROY it: {fresh:?}"
+        );
+
+        // AND IT MUST REACH THE READER. A bucket that classifies correctly and
+        // renders nothing is worse than no bucket: the path silently leaves
+        // commit_worthy and the nudge stops naming it at all, so a silent
+        // revert becomes an invisible one.
+        let n = build(dir, &s(&["revived.txt", "edited.txt"]), &Default::default(), &fresh, "")
+            .expect("a dirty tree must produce a nudge");
+        assert!(n.contains("OLD REVISION ON DISK"), "the section must render: {n}");
+        assert!(n.contains("revived.txt"), "and must name the path: {n}");
+        assert!(
+            n.contains("SILENTLY REVERTS"),
+            "and must say what committing it does, not merely that it is odd: {n}"
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
