@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.724';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.725';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19233,6 +19233,103 @@ function _mergeArchived(data) {
   const have = new Set(data.map(i => i.id));
   return data.concat(boardArchived.filter(i => !have.has(i.id)));
 }
+// ARCHIVED AS A VISIBLE GROUP (AMUX-3715, requested by tubescience).
+//
+// `amux board archive` sets archived=1 and leaves `status` alone, so archived
+// work keeps its old status and scatters — they archived 81 cards in one
+// session and the group became invisible. The data was already reachable
+// (`is:archived` triggers _ensureArchived below), but only by knowing the query
+// syntax. What was missing is a discoverable, persistent affordance.
+//
+// A read-only collapsible SECTION, not a column: they archive deliberately and
+// in bulk via the CLI, never by dragging, so a drop target would be a footgun
+// for the actual usage and would add a mutation path nobody asked for. Their
+// words: "drag-to-archive would be a footgun for exactly my usage."
+//
+// COLLAPSED BY DEFAULT and the count comes from ?count=1, because the archived
+// set was MEASURED at 445KB raw / 87KB gzipped — +38% on the board poll. Paying
+// that on every load of a mobile-first dashboard to render a number is the
+// wrong trade; the rows load only when someone opens it.
+let boardArchivedOpen = false;
+try { boardArchivedOpen = localStorage.getItem('amuxArchivedOpen') === '1'; } catch (e) {}
+let _archivedCountN = null;
+let _archivedCountAt = 0;
+
+async function _ensureArchivedCount() {
+  if (_archivedCountN !== null && (Date.now() - _archivedCountAt) < 60000) return;
+  try {
+    // The SAME params the expand will fetch with (archived=1&done_limit=0), so
+    // the header cannot promise a number the section then contradicts. The
+    // server computes it from the same filter+cap the list runs.
+    const r = await fetch(API + '/api/board?archived=1&done_limit=0&count=1');
+    const d = await r.json();
+    if (typeof d.count === 'number') {
+      _archivedCountN = d.count;
+      _archivedCountAt = Date.now();
+      renderBoard();
+    }
+  } catch (e) { console.error('archived count:', e); }
+}
+
+function _toggleArchivedSection() {
+  boardArchivedOpen = !boardArchivedOpen;
+  try { localStorage.setItem('amuxArchivedOpen', boardArchivedOpen ? '1' : '0'); } catch (e) {}
+  if (boardArchivedOpen) _ensureArchived();
+  renderBoard();
+}
+
+// Render the section. Grouped BY UNDERLYING STATUS, because tubescience's
+// second answer was explicit that a flat list is the visibility problem
+// relocated rather than solved: "79 flat is the visibility problem relocated".
+//
+// Each row carries status + title + the TRIGGER, and the trigger is the
+// load-bearing field — archiving de-arms it (archived is excluded from every
+// autonomy loop), so for a card parked on a condition this view is the only
+// path back to it when that condition lands. Their HK-04/HK-01/ADM-16 are in
+// exactly that state.
+function _renderArchivedSection(container) {
+  const wrap = document.createElement('div');
+  wrap.className = 'board-archived-section';
+  const n = _archivedCountN === null ? '…' : _archivedCountN;
+  const caret = boardArchivedOpen ? '▾' : '▸';
+  let html = '<button class="board-archived-header" onclick="_toggleArchivedSection()" '
+    + 'aria-expanded="' + (boardArchivedOpen ? 'true' : 'false') + '">'
+    + caret + ' Archived (' + esc(String(n)) + ')</button>';
+  if (boardArchivedOpen) {
+    const rows = (boardArchived || []).slice();
+    if (!rows.length) {
+      html += '<div class="board-archived-empty">'
+        + (_archivedCountN === 0 ? 'Nothing archived.' : 'Loading…') + '</div>';
+    } else {
+      const groups = {};
+      rows.forEach(function (i) {
+        const st = _statusCanon(i.status || 'todo');
+        (groups[st] = groups[st] || []).push(i);
+      });
+      Object.keys(groups).sort().forEach(function (st) {
+        const g = groups[st];
+        html += '<div class="board-archived-group"><div class="board-archived-group-h">'
+          + esc(st) + ' (' + g.length + ')</div>';
+        g.forEach(function (i) {
+          const trig = String(i.source_ref || '').trim();
+          html += '<div class="board-archived-row" onclick="openBoardDetail(\'' + esc(i.id) + '\')">'
+            + '<span class="board-archived-id">' + esc(i.id) + '</span> '
+            + '<span class="board-archived-title">' + esc(i.title || '') + '</span>'
+            + (trig
+                ? '<div class="board-archived-trigger" title="archiving DE-ARMS this trigger — '
+                  + 'archived cards are excluded from every autonomy loop, so it will not fire">'
+                  + '⚑ ' + esc(trig) + '</div>'
+                : '')
+            + '</div>';
+        });
+        html += '</div>';
+      });
+    }
+  }
+  wrap.innerHTML = html;
+  container.appendChild(wrap);
+}
+
 async function _ensureArchived() {
   // One in-flight fetch at a time; refresh at most once a minute, since the
   // age-archive sweep only moves cards every few hours.
@@ -23816,6 +23913,13 @@ function renderBoard() {
     },
   });
   const cols = bucket.cols;
+
+  // ARCHIVED SECTION (AMUX-3715). Appended AFTER the columns rather than being
+  // one of them: it is read-only and must never be a drop target, and it must
+  // not participate in the column-reorder Sortable below (which is filtered to
+  // `.board-col`, so `.board-archived-section` is excluded by construction).
+  _ensureArchivedCount();
+  _renderArchivedSection(container);
 
   // Column reorder Sortable — drag columns by their header (global only:
   // reordering rewrites boardStatuses, which no narrower scope may do)

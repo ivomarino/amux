@@ -5618,3 +5618,63 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
   /* Touch target: the tab row is what a thumb actually hits. */
   #bd-tab-lineage { min-height: 44px; }
 }
+
+/* ARCHIVED SECTION (AMUX-3715, requested by tubescience).
+   Read-only and appended after the columns — never a drop target, because they
+   archive deliberately via the CLI in bulk and a drag affordance would be a
+   footgun for that usage. */
+.board-archived-section {
+  flex: 0 0 auto;
+  width: 100%;
+  margin-top: 12px;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.board-archived-header {
+  /* 44px: this is the only control in the section and it is what a thumb hits. */
+  min-height: 44px;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: 0;
+  color: var(--text-dim);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  padding: 0 8px;
+}
+.board-archived-header:hover { color: var(--text); }
+.board-archived-empty { color: var(--text-dim); font-size: 12px; padding: 6px 10px; }
+.board-archived-group { margin: 6px 0 10px; }
+.board-archived-group-h {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: .04em;
+  color: var(--text-dim);
+  padding: 4px 10px;
+}
+.board-archived-row {
+  padding: 8px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  /* Wrap rather than overflow: a 375px screen must not scroll sideways. */
+  overflow-wrap: anywhere;
+}
+.board-archived-row:hover { background: var(--bg-hover); }
+.board-archived-id { color: var(--text-dim); font-variant-numeric: tabular-nums; }
+.board-archived-title { color: var(--text); }
+/* The trigger is the field tubescience acts on: archiving DE-ARMS it, so for a
+   card parked on a condition this is the only path back to it. Styled to be
+   findable by eye when scanning, not decorative. */
+.board-archived-trigger {
+  margin-top: 3px;
+  font-size: 11px;
+  color: var(--amber, #d29922);
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .board-archived-section { margin-top: 8px; }
+  .board-archived-row { padding: 10px; }
+}
