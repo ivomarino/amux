@@ -7,7 +7,7 @@ use crate::api::AppState;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::get;
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -92,14 +92,29 @@ async fn update_secret(
             .into_response();
     }
 
-    // TODO: Implement re-encryption and persistence
-    // For now, return success placeholder
-    (
-        StatusCode::OK,
-        Json(UpdateSecretResponse {
-            ok: true,
-            path: path.clone(),
-        }),
-    )
-        .into_response()
+    // Update and persist to encrypted file
+    match state.secrets.update_and_persist(&path, req.value).await {
+        Ok(_) => {
+            (
+                StatusCode::OK,
+                Json(UpdateSecretResponse {
+                    ok: true,
+                    path: path.clone(),
+                }),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            tracing::error!("Failed to update secret {}: {}", path, e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("Failed to persist: {}", e),
+                    "path": path
+                })),
+            )
+                .into_response()
+        }
+    }
 }

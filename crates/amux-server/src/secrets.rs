@@ -12,9 +12,9 @@
 //! let openai_key = secrets.get("external_services.openai.api_key");
 //! ```
 
-use serde::{Deserialize, Serialize};
+pub mod persist;
+
 use serde_json::{json, Value};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -146,6 +146,69 @@ impl SecretStore {
     pub async fn reload(&self) -> Result<(), Box<dyn std::error::Error>> {
         self.load().await?;
         self.load_env().await?;
+        Ok(())
+    }
+
+    /// Update a single secret and persist to encrypted file
+    ///
+    /// # Process
+    /// 1. Lock cache for write
+    /// 2. Update value at path
+    /// 3. Encrypt and write to disk
+    /// 4. Keep cache updated
+    ///
+    /// # Arguments
+    /// * `path` - Dot-separated path (e.g., "oauth.github.client_id")
+    /// * `value` - Secret value to set
+    ///
+    /// # Errors
+    /// Returns error if encryption fails or path is invalid
+    pub async fn update_and_persist(
+        &self,
+        path: &str,
+        value: String,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // 1. Lock cache for write
+        let mut cache = self.secrets.write().await;
+
+        // 2. Update value in nested structure
+        Self::set_nested_value(&mut cache, path, value.clone())?;
+
+        // 3. Encrypt and persist to disk
+        persist::encrypt_and_persist(&cache, &self.secrets_file, &self.age_key_path).await?;
+
+        // 4. Update env vars from new value
+        let env_name = path.replace('.', "_").to_uppercase();
+        std::env::set_var(&env_name, &value);
+
+        tracing::info!(path = path, "✓ Updated and persisted secret");
+        Ok(())
+    }
+
+    /// Set a value in nested JSON object by dot-separated path
+    fn set_nested_value(obj: &mut Value, path: &str, value: String) -> Result<(), Box<dyn std::error::Error>> {
+        let parts: Vec<&str> = path.split('.').collect();
+
+        if parts.is_empty() {
+            return Err("Path cannot be empty".into());
+        }
+
+        let mut current = obj;
+
+        // Navigate/create intermediate objects
+        for (i, part) in parts.iter().enumerate() {
+            if i == parts.len() - 1 {
+                // Last part: set the value
+                current[part] = Value::String(value.clone());
+            } else {
+                // Intermediate part: navigate or create
+                if !current[part].is_object() {
+                    current[part] = Value::Object(Default::default());
+                }
+                current = &mut current[part];
+            }
+        }
+
         Ok(())
     }
 }

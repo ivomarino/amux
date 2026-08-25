@@ -10,7 +10,6 @@ use axum::{
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 
 use crate::api::AppState;
 
