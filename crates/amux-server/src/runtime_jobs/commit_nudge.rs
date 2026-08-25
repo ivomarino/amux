@@ -1057,6 +1057,59 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
             continue;
         }
 
+        // 2b. THE REFS ALREADY AGREE, so neither STALE nor DIVERGED can be true
+        //     (mixpeek-frustrations, 2026-08-24 — their discriminator, and it is
+        //     better than the one it replaces).
+        //
+        //     Step 2 asks whether the WORKTREE matches origin, via
+        //     `hash-object -- <path>`, which reads the file on disk. When the
+        //     file is DELETED locally that command fails, `identical` is false,
+        //     and the path falls through to the ancestry arms below. On a
+        //     graft-pushed checkout both arms print commits, so a path whose
+        //     content is byte-identical at HEAD, at origin/main and at both
+        //     graft twins was reported DIVERGED: "novel and stale at once,
+        //     NEITHER standard remedy is safe". Their live specimen:
+        //     research/extractors/HYPERSPECTRAL-RASTER-EXTRACTOR-GAP.md, four
+        //     blobs all 1e435f5c9fba, arms 5.5h apart by author date.
+        //
+        //     This compares the two REFS instead. It needs no worktree file, so
+        //     a deletion cannot defeat it, and identical bytes at both refs mean
+        //     there is nothing to merge and nothing at risk WHATEVER the two
+        //     ancestries say. It also subsumes the graft-twin case reported
+        //     first, without anyone having to reason about twins.
+        //
+        //     It does not weaken real STALE either, which is the check worth
+        //     doing before accepting this. STALE means committing the worktree
+        //     would silently REVERT origin — and if HEAD and origin hold the
+        //     same bytes, origin's commits on this path did not change its
+        //     content relative to HEAD, so there is nothing for a commit to
+        //     revert. The honest classification is then the worktree's own
+        //     story: an ordinary edit, or a local deletion, which is the
+        //     OWNER's call rather than something a prescribed restore should
+        //     decide for them.
+        let head_blob = tokio::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", "--verify", "-q", &format!("HEAD:{p}")])
+            .output()
+            .await;
+        let origin_blob = tokio::process::Command::new("git")
+            .args(["-C", dir, "rev-parse", "--verify", "-q", &format!("origin/main:{p}")])
+            .output()
+            .await;
+        let refs_agree = match (head_blob, origin_blob) {
+            (Ok(h), Ok(o)) => match (blob(&h), blob(&o)) {
+                (Some(a), Some(b)) => a == b,
+                // Same rule as step 2: one side unreadable is not agreement.
+                // Absence is not evidence, and calling it agreement here would
+                // suppress a genuine STALE.
+                _ => false,
+            },
+            _ => false,
+        };
+        if refs_agree {
+            fresh.edited.push(p.clone());
+            continue;
+        }
+
         // 3. STALE: origin has commits on this path that local HEAD lacks, so
         //    the worktree copy is older and committing it would REVERT origin.
         //    Here stdout emptiness IS the right test: this is `git log` output,
@@ -2137,6 +2190,7 @@ mod tests {
         assert_eq!(fresh.same, s(&["same.txt"]), "identical-to-origin must be SAME");
         assert_eq!(fresh.stale, s(&["stale.txt"]), "origin-ahead-on-path must be STALE");
         assert_eq!(fresh.edited, s(&["edited.txt"]), "differs, origin unmoved, must be EDITED");
+
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
@@ -2179,6 +2233,8 @@ mod tests {
         git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
         std::fs::write(work.join("replayed.md"), "entry A\n").unwrap();
         std::fs::write(work.join("truly-diverged.md"), "entry A\n").unwrap();
+        // BLOB TWIN + local deletion (mixpeek-frustrations' second report).
+        std::fs::write(work.join("twin.md"), "entry A\n").unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-m", "base"]);
         git(&work, &["push", "-q", "origin", "main"]);
@@ -2187,6 +2243,7 @@ mod tests {
         // under this sha — the graft-push shape.
         std::fs::write(work.join("replayed.md"), "entry A\nentry B\n").unwrap();
         std::fs::write(work.join("truly-diverged.md"), "entry A\nentry B\n").unwrap();
+        std::fs::write(work.join("twin.md"), "entry A\nentry B\n").unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-m", "local: entry B"]);
 
@@ -2201,6 +2258,9 @@ mod tests {
         git(&peer, &["config", "user.name", "t"]);
         std::fs::write(peer.join("replayed.md"), "entry A\nentry B\nentry C\n").unwrap();
         std::fs::write(peer.join("truly-diverged.md"), "entry A\nentry B\nentry C\n").unwrap();
+        // The peer lands the SAME BYTES local already committed, under a
+        // different sha: the graft twin. HEAD:twin.md == origin/main:twin.md.
+        std::fs::write(peer.join("twin.md"), "entry A\nentry B\n").unwrap();
         git(&peer, &["add", "-A"]);
         git(&peer, &["commit", "-m", "peer: entries B and C"]);
         git(&peer, &["push", "-q", "origin", "main"]);
@@ -2246,6 +2306,51 @@ mod tests {
             s(&["truly-diverged.md"]),
             "a path holding a line origin has never seen must STAY DIVERGED — a downgrade that \
              fires unconditionally passes the specimen above and destroys real work"
+        );
+
+        // A LOCALLY DELETED FILE WHOSE REFS AGREE IS NOT DIVERGED
+        // (mixpeek-frustrations' second report, 2026-08-24 — their
+        // discriminator, on their specimen's shape).
+        //
+        // Their live case: research/extractors/HYPERSPECTRAL-RASTER-EXTRACTOR-GAP.md,
+        // blob 1e435f5c9fba at HEAD, at origin/main and at BOTH graft twins,
+        // and NOT ON DISK. Step 2's `hash-object -- <path>` cannot read a
+        // deleted file, so the worktree-identical check cannot run and the path
+        // falls through to the ancestry arms — which on this checkout both
+        // print commits. Verdict: "novel and stale at once, NEITHER standard
+        // remedy is safe", on a path where every blob matches.
+        //
+        // IT LIVES IN THIS TEST, NOT THE FOUR-CLASS ONE, and that was not the
+        // first draft. I wrote these cells against a fixture where origin had
+        // NOT moved on the path, so the row never reached the ancestry arms at
+        // all — mutating the gate to `if false` left them GREEN. The mutation
+        // caught it; reading the test did not. A deleted-file cell only
+        // discriminates where both arms genuinely fire.
+        std::fs::remove_file(work.join("twin.md")).unwrap();
+        let twin_ahead = std::process::Command::new("git")
+            .args(["-C", dir, "log", "--oneline", "origin/main..HEAD", "--", "twin.md"])
+            .output()
+            .unwrap();
+        assert!(
+            !String::from_utf8_lossy(&twin_ahead.stdout).trim().is_empty(),
+            "premise: twin.md must be local-ahead by sha, or the DIVERGED arm is never reached \
+             and this cell is vacuous — which is exactly how its first draft failed"
+        );
+        let del = freshness_from_repo(dir, &s(&["twin.md"])).await;
+        assert!(
+            del.diverged.is_empty(),
+            "identical blobs at HEAD and origin/main cannot be diverged whatever the two \
+             ancestries say — there is nothing to merge and nothing at risk: {del:?}"
+        );
+        assert!(
+            del.stale.is_empty(),
+            "and not STALE either: STALE prescribes a RESTORE, and whether a local deletion is \
+             deliberate is the OWNER's call, not something a nudge decides for them: {del:?}"
+        );
+        assert_eq!(
+            del.edited,
+            s(&["twin.md"]),
+            "it is an ordinary worktree change against agreeing refs: {del:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
     }
