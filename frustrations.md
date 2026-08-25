@@ -2730,3 +2730,47 @@ FIX: 04721906. The advisory stays advisory — a cross-instance id is not an err
   STILL OPEN, and it is Ethan's call, not mine: what actually happens to those 12 entries.
   Reaching amux-errors-and-bugs, or retiring them with a rationale, is a decision about another
   party's contributions (ethos rule 8). The audit now names them; it does not presume to sweep them.
+
+## A detector's query failure was swallowed, so the whole detector had no coverage
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3696
+SYMPTOM: `detect_silent`'s steering block was `if let Ok(mut stmt) =
+  conn.prepare(...)` with no else. A schema error skipped the entire block and
+  left nothing behind, which reads exactly like "no lane has a stalled queue".
+  It is not hypothetical: `steering_queue.sender` is added by
+  `ensure_fleet_tables`' runtime ALTER and by NO migration, so any database
+  built from `migrations/` alone lacks the column and the query does not
+  prepare. That is the state every test fixture is in.
+COST: The steering-stall detector had ZERO test coverage and nobody could have
+  known — every test that appeared to exercise it was exercising nothing,
+  silently. Found only because I wrote a new test, seeded a row, and the INSERT
+  failed on the missing column. Had I written the test without a write, it
+  would have passed vacuously and I would have shipped it as coverage.
+FIX: 79080270 records a Suppressed naming the prepare error, where the autofix
+  report already surfaces suppressions. The test now asserts the query PREPARED
+  before asserting anything about its output.
+
+## An autofix card's fields contradicted each other, and only reading it caught that
+AREA: instruments
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3696
+SYMPTOM: After splitting the steering deadline in two, the emitted card said
+  `threshold_min: 90` on a finding that fired at 360, and its `senders` blurb
+  read "that lane may be unable to receive anything, which is what this card
+  reports" directly beneath `lane_reachable: yes`. Every individual field had
+  been correct before the change and two of them silently stopped being so.
+COST: No wrong conclusion shipped, but only because I happened to read the full
+  payload printed by a FAILING mutation run. No assertion covered either field,
+  and nothing about the change site suggested they needed revisiting. A card
+  whose fields contradict each other is worse than one missing a field, because
+  each is read as a fact.
+FIX: 79080270, both corrected and both pinned. The general lesson: when a
+  verdict gains a second branch, every field computed alongside it inherits the
+  branch whether or not it was touched — grep the payload, not the diff.
