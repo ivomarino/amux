@@ -57,12 +57,34 @@ catch-all as well, so they are listed for completeness.
 | `report` | The harness reporting its own state — D1's exit condition in `ethos.md`, the durable inverse of terminal scraping. |
 | `steer` | How board state reaches a lane at its turn boundary (the 2026-08-03 decision against a global bus). Load-bearing. |
 | `keys` | **Not** a duplicate of `send`: `keys` writes to the terminal, `send` delivers a prompt at a turn boundary. Both are needed and the names should say which is which. |
-| `duplicate` | Survivor of the `clone`/`duplicate` pair. |
+| `duplicate` | Survivor of the `clone`/`duplicate` pair. **BLOCKED on [#137](https://github.com/mixpeek/amux/issues/137) — do not promote yet.** See below. |
 | `resize` | Terminal geometry. |
 | `wake` | |
 | `clear` | |
 | `reset` | |
 | `apply-template` | |
+
+### `duplicate` has a precondition, and promoting it is what makes the defect reachable
+
+Reported by @tsukimiya on [#137](https://github.com/mixpeek/amux/issues/137), re-verified
+on current `main` by @esteininger — every claim holds, only the line numbers moved.
+
+Both `duplicate` and `clone` copy the env file and **never create a store row**.
+`clone_post` then calls `start_session`, so the new session is *running* and unregistered.
+Across the whole of `session_verbs.rs` the `workers` table is touched in exactly one
+place: `get_worker`, the dispatch guard's own read.
+
+This is NOT a live defect today, and that is the point. `dispatch()` answers 501 for every
+verb when the name resolves to a worker row, so neither verb can currently be called on a
+store-managed worker. **Exempting `duplicate` from that guard is precisely what would make
+it reachable** — and this document is the input to doing exactly that.
+
+So the classification above is incomplete on its own: `duplicate` is the right survivor of
+the pair, and promoting it before #137 is settled ships a route that mints unregistered
+sessions. Recorded here rather than left on the issue because the issue is a store this
+document's reader does not open (ethos rule 4), and because AF-204's own acceptance says
+no verb is left to decide later — "decided, blocked on a named precondition" is a
+disposition; silently promoting it is not.
 
 ## DUPLICATE — another route already expresses this. Retire the verb. (7)
 
