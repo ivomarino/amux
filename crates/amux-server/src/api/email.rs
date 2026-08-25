@@ -2132,29 +2132,36 @@ mod tests {
     ///
     /// Every cell below is one of the seven variants autodesk said they would
     /// probe the moment the binary was live. Cheaper to cover in one pass.
+    /// A lane's send, HELD pending approval, with its approval id.
+    ///
+    /// Was a closure inside `approve_refuses_an_absent_or_self_named_approver`;
+    /// lifted to module scope by AMUX-3699 so the contradiction test drives the
+    /// same fixture rather than a second copy that could drift from it.
+    async fn held(
+        name: &'static str,
+    ) -> (axum::Router, tempfile::TempDir, tempfile::TempDir, String) {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "x", "threadId": "t" })),
+        ]);
+        let (app, d, _r) = app_with(http, home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "cto@customer.com", "subject": "Q", "body": "draft",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", name)],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "premise: the send must be HELD: {res}");
+        let id = res["approval_id"].as_str().expect("approval_id").to_string();
+        (app, d, home, id)
+    }
+
     #[tokio::test]
     async fn approve_refuses_an_absent_or_self_named_approver() {
-        let held = |name: &'static str| async move {
-            let home = temp_home();
-            let http = MockHttp::new(vec![
-                ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
-                ("POST", "/messages/send", 200, json!({ "id": "x", "threadId": "t" })),
-            ]);
-            let (app, d, _r) = app_with(http, home.path());
-            let (st, res) = send_req(
-                &app,
-                "POST",
-                "/api/email/send",
-                Some(json!({ "to": "cto@customer.com", "subject": "Q", "body": "draft",
-                             "from": ACCT, "force_new_thread": true })),
-                &[("x-amux-session", name)],
-            )
-            .await;
-            assert_eq!(st, StatusCode::FORBIDDEN, "premise: the send must be HELD: {res}");
-            let id = res["approval_id"].as_str().expect("approval_id").to_string();
-            (app, d, home, id)
-        };
-
         // THE ORIGINAL BYPASS: no headers at all.
         let (app, _d, _h, id) = held("autodesk").await;
         let (st, e) =
@@ -2239,6 +2246,81 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK, "a NAMED approver who is not the creator must succeed: {ok}");
         assert_eq!(ok["approved"], json!(true), "{ok}");
+    }
+
+    /// AMUX-3699: the worker-origin refusal must cover EVERY header spelling
+    /// `hdr_worker` knows, or it narrows silently and the bypass widens.
+    ///
+    /// WHAT INVESTIGATING THIS CARD ACTUALLY FOUND. The card's residual reads
+    /// "the two-call bypass becomes a three-header bypass: a lane sends
+    /// `X-Amux-Approver: dashboard` and the creator check passes because
+    /// `autodesk != dashboard`". True as far as it goes, and it understates one
+    /// guard: AMUX-3510 refuses ANY request carrying a worker origin, at the
+    /// top of `approve`, before the approver is even read. So a lane cannot
+    /// merely add a third header — it must also SUPPRESS its own origin. Two
+    /// independent things, not one.
+    ///
+    /// That is still not a boundary (a lane omits headers at will, and this is
+    /// self-attestation in both directions), which is why the card stays open
+    /// against a precondition amux does not have. But the guard that DOES
+    /// exist is worth keeping honest, and it was covered for exactly one of the
+    /// two header names `hdr_worker` reads.
+    ///
+    /// The list is asserted against `hdr_worker` itself rather than restated,
+    /// so a third origin header added there fails HERE instead of quietly
+    /// creating a spelling the refusal does not see.
+    #[tokio::test]
+    async fn the_worker_origin_refusal_covers_every_header_hdr_worker_reads() {
+        // The guard's own source of truth. A restated copy could drift from the
+        // function it is supposed to mirror, which is how a view and its
+        // mechanism disagree (ethos rule 1).
+        for spelling in ["x-amux-worker", "x-amux-session"] {
+            let mut h = HeaderMap::new();
+            h.insert(spelling, "autodesk".parse().unwrap());
+            assert_eq!(
+                hdr_worker(&h).as_deref(),
+                Some("autodesk"),
+                "premise: hdr_worker reads {spelling}"
+            );
+
+            let (app, _d, _home, id) = held("autodesk").await;
+            let (st, e) = send_req(
+                &app,
+                "POST",
+                &format!("/api/email/approve/{id}"),
+                None,
+                // The full bypass attempt: assert a human identity AND carry
+                // the origin. The origin is what must stop it.
+                &[("x-amux-approver", "dashboard"), (spelling, "autodesk")],
+            )
+            .await;
+            assert_eq!(
+                st,
+                StatusCode::FORBIDDEN,
+                "a lane claiming to be the dashboard while stamping {spelling} must be \
+                 refused, not merely logged: {e}"
+            );
+            assert_eq!(e["code"], json!("worker_cannot_approve"), "{spelling}: {e}");
+        }
+
+        // THE CONTROL. Without it, a guard that refused every approval would
+        // pass both cells above and no mail could ever be released — and the
+        // residual this card documents would read as closed when it is not.
+        let (app, _d, _home, id) = held("autodesk").await;
+        let (st, ok) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{id}"),
+            None,
+            &[("x-amux-approver", "dashboard")], // a browser sends no origin
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "an origin-less caller claiming to be the dashboard still succeeds — that IS the \
+             open residual, and asserting it stops this test reading as a boundary: {ok}"
+        );
     }
 
     #[tokio::test]
