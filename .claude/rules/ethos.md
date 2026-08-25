@@ -386,6 +386,25 @@ not go through. So the question is two questions, and we only had a habit for th
 Ask where the defect would be INTRODUCED, and confirm your test's fixture flows through
 that code, not through an ancestor of it.
 
+**WHEN A CONSUMER READS A PREFIX, VERIFY THE PREFIX — correctness of the whole
+collection is not the property under load** (AMUX-3695, 2026-08-25). The
+commit-nudge samples dirty paths under a time budget, so it consumes the first ~4
+of an ordering it builds. Two successive attempts were correct about the whole
+list and wrong about the part actually read. One-slot-per-directory is unbiased
+across directories and gave 17 singleton groups 41% of the weight for 3% of the
+files. Replacing it with a proportional key fixed the aggregate and still put
+every singleton at exactly 0.5, so with one group of 20 and eight singletons the
+first TEN picks came from one group and no singleton appeared at all — a budget
+stopping at four would have seen a single directory.
+
+This is a step past "a check pinning the wrong layer", and mixpeek-frustrations
+named the difference: it is not a premise that stopped holding, it is a premise
+that was never about the consumed part in the first place. Every whole-list
+assertion passes, honestly, while the property the program depends on goes
+untested — because the test looks at the artifact and the program looks at its
+first N items. Sorting, ranking, prioritising, batching, paginating and
+budget-capped scans are all this shape. Assert on `&order[..n]`, not on `order`.
+
 **When you argue that a failure will be loud, NAME THE IDIOM that makes it loud, and check
 it is the one your callers write.** The same slimming was defended in its own comment as
 safe because `.desc` on a slim row is "a KeyError, which is loud, not silently empty". That

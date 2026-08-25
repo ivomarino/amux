@@ -436,7 +436,22 @@ pub fn build(
         // something the two counts do not: 4-of-59 is much easier to feel as
         // "6%", and 2-of-6 is not.
         let pct = (fresh.revived_checked * 100).checked_div(total).unwrap_or(0);
-        let cov = if total >= 10 { format!(" ({pct}% coverage)") } else { String::new() };
+        // "<1%", NEVER "0%", when anything was actually examined. Integer
+        // division takes 4-of-524 — mixpeek-frustrations' real shape — to
+        // exactly 0, and "0% coverage" beside a sentence saying four paths were
+        // examined is two fields contradicting each other. It also reads as
+        // "nothing was checked", which is a different and wrong fact.
+        //
+        // The counts carry the actionable part either way, which is why they
+        // are printed beside it rather than replaced by it: at these ratios the
+        // percentage is atmosphere and "4 of 524" is the thing a reader can use.
+        let cov = if total < 10 {
+            String::new()
+        } else if pct == 0 && fresh.revived_checked > 0 {
+            " (<1% coverage)".to_string()
+        } else {
+            format!(" ({pct}% coverage)")
+        };
         sections.push(format!(
             "NOT CHECKED FOR OLD-REVISION: {} of {total} candidate path(s) were examined\
              {cov}; the other {} were not, because this run hit its budget \
@@ -2791,6 +2806,23 @@ mod tests {
         let bn = build(dir, &big_paths, &Default::default(), &big, "").expect("nudge");
         assert!(bn.contains("4 of 59 candidate path(s) were examined"), "{bn}");
         assert!(bn.contains("(6% coverage)"), "59 candidates is enough to feel as a rate: {bn}");
+
+        // THEIR REAL SHAPE, 4 of 524, which integer division takes to exactly
+        // zero. "0% coverage" next to "4 ... were examined" is two fields
+        // contradicting each other, and it reads as "nothing was checked".
+        let huge = Freshness {
+            revived: vec!["a.txt".into()],
+            edited: (0..523).map(|i| format!("e{i}.txt")).collect(),
+            revived_checked: 4,
+            revived_unchecked: 520,
+            ..Default::default()
+        };
+        let mut huge_paths = huge.revived.clone();
+        huge_paths.extend(huge.edited.clone());
+        let hn = build(dir, &huge_paths, &Default::default(), &huge, "").expect("nudge");
+        assert!(hn.contains("4 of 524 candidate path(s) were examined"), "{hn}");
+        assert!(hn.contains("(<1% coverage)"), "0.8% must not render as 0%: {hn}");
+        assert!(!hn.contains("(0% coverage)"), "{hn}");
         assert!(
             n.contains("NOT a finding that they are clean"),
             "and must refuse the reading that silence means checked: {n}"
