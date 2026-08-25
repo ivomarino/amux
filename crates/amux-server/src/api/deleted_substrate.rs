@@ -395,6 +395,31 @@ async fn payload(state: &AppState, p: Params) -> (StatusCode, Value) {
         })
     });
 
+    // WHICH PATHS, RANKED. Without this the report is 89 rows that each say
+    // "some file is gone" and a reader skims it; with it, the FIRST line
+    // answers the question. Measured on the live board the day this shipped: 219
+    // of the deletions are `amux-server.py` and all 42 distinct paths are that
+    // file or its Python tests, which is one deliberate port (792ce1f) rather
+    // than 89 independent losses.
+    //
+    // Ranked rather than filtered, and no path is special-cased. Hardcoding the
+    // known deletion would be a tuned parameter for one event and would hide the
+    // NEXT one; a ranking shows a new class standing out against the old without
+    // anyone maintaining a list.
+    let mut path_freq: BTreeMap<&str, usize> = BTreeMap::new();
+    for v in verdict.values() {
+        for p in v["deleted_paths"].as_array().into_iter().flatten() {
+            if let Some(p) = p.as_str() {
+                *path_freq.entry(p).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(&str, usize)> = path_freq.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+    let top: Vec<Value> =
+        ranked.iter().take(20).map(|(p, n)| json!({ "path": p, "commits": n })).collect();
+    let dominant = ranked.first().map(|(p, n)| (p.to_string(), *n));
+
     (
         StatusCode::OK,
         json!({
@@ -405,6 +430,17 @@ async fn payload(state: &AppState, p: Params) -> (StatusCode, Value) {
             "repos": repos.iter().cloned().collect::<Vec<_>>(),
             "truncated": truncated,
             "only_deleted": only_deleted,
+            "deleted_paths_ranked": top,
+            "distinct_deleted_paths": ranked.len(),
+            "read_this_first": match &dominant {
+                Some((p, n)) => format!(
+                    "{n} of the deleted-path hits are `{p}`, out of {} distinct paths. If one \
+                     path dominates, this is probably ONE deliberate deletion rather than N \
+                     independent losses — check that event before reading the card list.",
+                    ranked.len()
+                ),
+                None => "no deleted paths in this scan".to_string(),
+            },
             // THE HEADLINE IS A CITATION COUNT, NOT A REGRESSION COUNT. Most of
             // these were ported deliberately and correctly; a deleted path may
             // have been reimplemented under a new name. Calling them regressions
