@@ -1556,6 +1556,37 @@ pub struct DriverPage {
 /// from [`RUNNING`] only — verbs NEVER attach to a browser this process did
 /// not launch (a human's Chrome is not ours to drive).
 pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<DriverPage, DriverError> {
+    resolve_page_avoiding(session, create_url, None).await
+}
+
+/// How many times a bound target was abandoned because its socket would not
+/// open (AMUX-3708). Read by `GET /api/browser/status`.
+pub static STALE_BINDING_RECOVERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `resolve_page`, but refusing to hand back `avoid`.
+///
+/// AMUX-3708. The bound-tab branch below already falls through when the tab is
+/// GONE from `/json/list`, which covers a closed or crashed tab. It does not
+/// cover the state this card is about: a tab Chrome still LISTS whose renderer
+/// is wedged, so the target resolves fine and the WebSocket connect is reset
+/// without a closing handshake. Two 502s 40s apart on 2026-08-25 were exactly
+/// that pair — `Page.captureScreenshot timed out after 30s` at 11:12:41 leaving
+/// the tab wedged, then `Connection reset without closing handshake` in 24ms at
+/// 11:13:21 when the next request resolved to the same still-listed target.
+/// Recovery arrived at 11:13:25 only because Chrome had by then removed the
+/// target, so the existing fall-through could finally see it. Every request in
+/// that window 502s, and nothing shortens it.
+///
+/// `avoid` closes the window: the caller that just failed to open a socket
+/// knows which target is bad, which is knowledge `/json/list` does not have.
+/// The binding is dropped too, or the next call would resolve straight back to
+/// it.
+pub async fn resolve_page_avoiding(
+    session: &str,
+    create_url: Option<&str>,
+    avoid: Option<&str>,
+) -> Result<DriverPage, DriverError> {
     let port = {
         let guard = RUNNING.lock().expect("browser registry poisoned");
         match guard.as_ref() {
@@ -1584,27 +1615,34 @@ pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<Dri
             map.iter().filter(|(k, _)| k.as_str() != session).map(|(_, v)| v.clone()).collect(),
         )
     };
-    if let Some(tid) = bound {
-        if let Some(p) = tabs
-            .iter()
-            .find(|t| tab_id(t).as_deref() == Some(tid.as_str()))
-            .and_then(page_of)
-        {
-            return Ok(p);
-        }
-        // The bound tab died (closed/crashed): fall through and rebind.
+    let (choice, binding_was_stale) =
+        choose_target(tabs, bound.as_deref(), &claimed_by_others, avoid);
+    if binding_was_stale {
+        // The caller just failed to open a socket on this exact target, so the
+        // binding is stale however healthy `/json/list` still claims it is. Drop
+        // it here rather than at the call site: leaving it would make the very
+        // next request resolve straight back to the tab we are abandoning.
+        NATIVE_TARGETS.lock().expect("native targets poisoned").remove(session);
+        STALE_BINDING_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "[browser] session {session:?} unbound from wedged target {}: Chrome still lists it \
+             but its CDP socket would not open (AMUX-3708); rebinding",
+            bound.as_deref().unwrap_or("?")
+        );
     }
-    if let Some(p) = tabs
-        .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        .filter(|t| tab_id(t).is_some_and(|id| !claimed_by_others.contains(&id)))
-        .find_map(page_of)
-    {
-        NATIVE_TARGETS
-            .lock()
-            .expect("native targets poisoned")
-            .insert(session.to_string(), p.target_id.clone());
-        return Ok(p);
+    match choice {
+        TargetChoice::KeepBound(tid) | TargetChoice::Rebind(tid) => {
+            if let Some(p) = tabs.iter().find(|t| tab_id(t).as_deref() == Some(tid.as_str())).and_then(page_of)
+            {
+                NATIVE_TARGETS
+                    .lock()
+                    .expect("native targets poisoned")
+                    .insert(session.to_string(), p.target_id.clone());
+                return Ok(p);
+            }
+            // Listed but missing a webSocketDebuggerUrl: fall through and open one.
+        }
+        TargetChoice::NewTab => {}
     }
     // Every page tab is claimed by another session (or none exist): open a
     // fresh one rather than hijacking a peer's tab.
@@ -1617,6 +1655,67 @@ pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<Dri
         .expect("native targets poisoned")
         .insert(session.to_string(), p.target_id.clone());
     Ok(p)
+}
+
+/// What `resolve_page_avoiding` should do, given only what Chrome listed and
+/// what this process has bound.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TargetChoice {
+    /// Reuse the session's existing binding.
+    KeepBound(String),
+    /// Bind the session to this listed tab.
+    Rebind(String),
+    /// Nothing usable is listed; open a fresh tab.
+    NewTab,
+}
+
+/// The target-selection rule, separated from its side effects.
+///
+/// PURE ON PURPOSE (AMUX-3708). Every existing test of this area launches a
+/// real Chrome and is `#[ignore]`d, so it never runs in CI — a live-only test
+/// for this fix would be a check that cannot fail because it never executes,
+/// which is the exact shape ethos rule 7 is about. Extracting the decision is
+/// what makes the fix testable at all; unbinding, counting and opening tabs
+/// stay in the caller.
+///
+/// Returns the choice and whether the session's binding was found STALE, i.e.
+/// it names the target the caller has just proven unreachable.
+pub(crate) fn choose_target(
+    tabs: &[Value],
+    bound: Option<&str>,
+    claimed_by_others: &std::collections::HashSet<String>,
+    avoid: Option<&str>,
+) -> (TargetChoice, bool) {
+    let id_of = |t: &Value| t.get("id").and_then(Value::as_str).map(str::to_string);
+    let listed = |tid: &str| {
+        tabs.iter().any(|t| {
+            id_of(t).as_deref() == Some(tid) && t.get("webSocketDebuggerUrl").is_some()
+        })
+    };
+    let stale = bound.is_some() && bound == avoid;
+    if let Some(tid) = bound {
+        // A bound tab that is GONE from /json/list was already handled before
+        // this card: it falls through and rebinds. The case this adds is a tab
+        // still LISTED whose socket will not open, which /json/list reports
+        // identically to a healthy one — only the failing caller knows.
+        if !stale && listed(tid) {
+            return (TargetChoice::KeepBound(tid.to_string()), false);
+        }
+    }
+    let pick = tabs
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+        .filter(|t| id_of(t).is_some_and(|id| !claimed_by_others.contains(&id)))
+        // Never rebind to the target the caller just told us is unreachable.
+        // Dropping the binding makes it "unclaimed", so without this the rebind
+        // picks straight back up the tab we are abandoning.
+        .filter(|t| avoid.is_none() || id_of(t).as_deref() != avoid)
+        .find(|t| t.get("webSocketDebuggerUrl").is_some())
+        .and_then(id_of);
+    match pick {
+        Some(tid) => (TargetChoice::Rebind(tid), stale),
+        None => (TargetChoice::NewTab, stale),
+    }
 }
 
 /// Session bindings for GET /api/browser/sessions: (name, target, alive?).
@@ -2210,6 +2309,76 @@ mod tests {
     // All tests run against TEMP dirs only — never the live Chrome profiles
     // (repo rule: tests must not touch real profile contents), and never
     // launch Chrome except the #[ignore]d gated tests at the bottom.
+
+    /// AMUX-3708: a tab Chrome still LISTS can be unreachable, and only the
+    /// caller that failed to open its socket knows.
+    ///
+    /// THE SPECIMEN is a pair of 502s 40 seconds apart on 2026-08-25, filed as
+    /// one card because they share (status, method, family, target):
+    ///   11:12:41  30,006ms  "CDP Page.captureScreenshot timed out after 30s"
+    ///   11:13:21      24ms  "WebSocket protocol error: Connection reset
+    ///                        without closing handshake"
+    /// The first wedged the renderer. The second is its aftermath: the next
+    /// request resolved to the SAME target, because `/json/list` still reported
+    /// it and the pre-existing fall-through only triggers when a tab is GONE.
+    /// Recovery came at 11:13:25 solely because Chrome had by then removed the
+    /// target. Every request in that window 502s and nothing shortens it.
+    ///
+    /// FOUR CELLS, and the last two are the ones that keep this honest. Without
+    /// the no-avoid cell, dropping every binding unconditionally would pass. Without
+    /// the peer cell, avoiding a target by hijacking a peer's tab would pass.
+    #[test]
+    fn a_listed_but_unreachable_target_is_abandoned_and_not_picked_up_again() {
+        let tab = |id: &str| {
+            json!({"id": id, "type": "page", "webSocketDebuggerUrl": format!("ws://127.0.0.1:9/devtools/page/{id}"), "url": "about:blank", "title": ""})
+        };
+        let none = std::collections::HashSet::new();
+
+        // 1. The bound target is the one that just refused a socket. It must be
+        //    abandoned, reported stale, and NOT handed back.
+        let tabs = vec![tab("WEDGED"), tab("SPARE")];
+        let (choice, stale) = choose_target(&tabs, Some("WEDGED"), &none, Some("WEDGED"));
+        assert!(stale, "the binding names the unreachable target, so it is stale");
+        assert_eq!(
+            choice,
+            TargetChoice::Rebind("SPARE".into()),
+            "must rebind away from the wedged tab, not hand it back"
+        );
+
+        // 2. ...and the rebind must not pick it up again. Dropping the binding
+        //    makes WEDGED unclaimed, so a rebind that ignores `avoid` selects it
+        //    right back: this is the cell that fails if the second filter is lost.
+        let only_wedged = vec![tab("WEDGED")];
+        let (choice, stale) = choose_target(&only_wedged, Some("WEDGED"), &none, Some("WEDGED"));
+        assert!(stale);
+        assert_eq!(
+            choice,
+            TargetChoice::NewTab,
+            "with no other tab, open a fresh one rather than re-selecting the wedged target"
+        );
+
+        // 3. NO avoid: behaviour is unchanged, and the binding is not stale. A
+        //    fix that unbound on every call would satisfy 1 and 2 and break every
+        //    ordinary request.
+        let (choice, stale) = choose_target(&tabs, Some("WEDGED"), &none, None);
+        assert!(!stale, "an ordinary resolve must never report a stale binding");
+        assert_eq!(
+            choice,
+            TargetChoice::KeepBound("WEDGED".into()),
+            "without a failed socket there is nothing to avoid: keep the binding"
+        );
+
+        // 4. Avoiding a target must not reach into a PEER's tab. AC-336 is the
+        //    card that says one lane never adopts another's; a recovery path that
+        //    forgets it would be a regression wearing a fix's clothes.
+        let claimed: std::collections::HashSet<String> = ["SPARE".to_string()].into_iter().collect();
+        let (choice, _) = choose_target(&tabs, Some("WEDGED"), &claimed, Some("WEDGED"));
+        assert_eq!(
+            choice,
+            TargetChoice::NewTab,
+            "SPARE belongs to another lane — open a new tab instead of hijacking it"
+        );
+    }
 
     /// AMUX-3689: an ANSWERED poll and a SILENT one must not read the same.
     ///

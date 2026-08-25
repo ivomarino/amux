@@ -311,10 +311,40 @@ async fn connect_session(session: &str, create_url: Option<&str>) -> Result<(chr
     // amux-launched browser is running" about a browser that is right there.
     chrome::adopt_if_orphaned(&chrome::amux_home()).await;
     let page = chrome::resolve_page(session, create_url).await.map_err(driver_err)?;
-    let cdp = chrome::CdpClient::connect(&page.ws_url)
-        .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })))?;
-    Ok((page, cdp))
+    let first = match chrome::CdpClient::connect(&page.ws_url).await {
+        Ok(cdp) => return Ok((page, cdp)),
+        Err(e) => e,
+    };
+    // ONE retry, against a DIFFERENT target (AMUX-3708).
+    //
+    // A socket that will not open on a target Chrome is still listing means the
+    // renderer is wedged, which `resolve_page` cannot see: it reads
+    // `/json/list`, and a wedged tab is listed exactly like a healthy one. The
+    // failing caller is the only thing in the system that knows which target is
+    // bad, so it is the only thing that can say so.
+    //
+    // Bounded at one attempt on purpose. The recovery is "pick another tab, or
+    // open one", and if THAT socket also fails the fault is Chrome or the CDP
+    // port, which retrying cannot fix and which a 502 should report honestly
+    // rather than hide behind a loop.
+    let retried = chrome::resolve_page_avoiding(session, create_url, Some(&page.target_id)).await;
+    if let Ok(p2) = retried {
+        if p2.target_id != page.target_id {
+            if let Ok(cdp) = chrome::CdpClient::connect(&p2.ws_url).await {
+                return Ok((p2, cdp));
+            }
+        }
+    }
+    // Report the FIRST error, not the retry's. The original names what actually
+    // went wrong with the session's own tab; a second failure on a freshly
+    // opened tab would describe a different target and send the reader after the
+    // wrong one.
+    tracing::warn!(
+        "[browser] session {session:?} could not open a CDP socket on target {} and the rebind \
+         did not recover: {first}",
+        page.target_id
+    );
+    Err(err(StatusCode::BAD_GATEWAY, json!({ "error": first.to_string() })))
 }
 
 // ---------------------------------------------------------------------------
@@ -539,6 +569,19 @@ async fn status() -> Response {
         "tabs": tabs,
         "tabs_error": tabs_error,
         "last_exit": last_exit,
+        // AMUX-3708. A wedged renderer leaves a target that `/json/list` still
+        // reports as healthy, so nothing in `tabs` above can express it and the
+        // recovery is invisible: the request that hit it 502s, the next one
+        // succeeds, and the pair reads as a transient blip. Counting it makes a
+        // browser that keeps wedging self-announcing instead of arriving as an
+        // autofix card twice a week. In-memory, so a restart clears it — zero
+        // means "none since this process started", which is why the note says so
+        // rather than letting the two read identically.
+        "stale_binding_recoveries":
+            chrome::STALE_BINDING_RECOVERIES.load(std::sync::atomic::Ordering::Relaxed),
+        "stale_binding_recoveries_note":
+            "tabs Chrome still listed whose CDP socket would not open, so the session was \
+             rebound. In-memory; a server restart resets it to 0.",
     }))
     .into_response()
 }
