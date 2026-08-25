@@ -229,6 +229,25 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // checkout — has nothing else to stop it. That is the one latency story on
     // this route that is genuinely wrong, and it stays reportable.
     ("/api/board/commit-mentions", 30_000.0),
+    // POST /api/schedules/{id}/run (AMUX-3704). Run-now executes the schedule
+    // SYNCHRONOUSLY and returns its result, so the request's duration IS the
+    // scheduled work's duration — for an arbitrary user-defined command. The
+    // filed row was SCHED-173 at 54.9s, a `shell` schedule whose script queries
+    // signups, sends a founder-welcome email and posts to Slack. That is the
+    // endpoint doing exactly what it was asked to do.
+    //
+    // 600s BECAUSE THE ENDPOINT ENFORCES IT, not because 600 felt right:
+    // `SHELL_TIMEOUT_S` bounds the shell path at 600s, and the tmux path's
+    // boundary wait is bounded by `steer_max_age_s` at the same default. So a
+    // run past 600s means one of those bounds FAILED, which is the one latency
+    // story on this route that is genuinely wrong and stays reportable.
+    //
+    // This is the first entry in this table whose duration is not amux's to
+    // predict — the command belongs to whoever wrote the schedule. That is an
+    // argument for the budget tracking the TIMEOUT rather than any measured
+    // worst case: measure a script today and the number is wrong the next time
+    // someone edits it.
+    ("/api/schedules/{id}/run", 600_000.0),
 ];
 
 fn design_budget_ms(target: &str) -> f64 {
@@ -6420,6 +6439,41 @@ mod tests {
         assert!(
             f2.iter().any(|x| x.signature.contains("/api/files/mdai/run")),
             "past the design budget the endpoint's own timeout failed — that must file: {f2:?}"
+        );
+    }
+
+    /// AMUX-3704: run-now's duration is the SCHEDULED WORK's duration, and the
+    /// budget tracks the timeout that bounds it.
+    ///
+    /// THE SPECIMEN: `POST /api/schedules/SCHED-173/run` at 54.9s, 200. SCHED-173
+    /// is a `shell` schedule whose script queries signups, sends a founder-welcome
+    /// email and posts to Slack — the endpoint doing exactly what it was asked.
+    ///
+    /// The budget is 600s because `SHELL_TIMEOUT_S` and `steer_max_age_s` both
+    /// bound this path there. Past it, a bound FAILED, and that is the one
+    /// latency story on this route worth a card.
+    #[tokio::test]
+    async fn run_now_is_budgeted_by_the_timeout_that_bounds_it() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The filed row, and a longer one that is still inside the timeout.
+        for ms in [54_922.0, 400_000.0] {
+            log_row(&st, Row { ts: now - 500.0, method: "POST", path: "/api/schedules/SCHED-173/run", family: "/api/schedules", status: 200, body: "", worker: "", ua: "curl/8", ms });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/schedules/{id}/run")),
+            "a synchronous run inside its own 600s timeout is the endpoint working: {f:?}"
+        );
+
+        // PAST THE TIMEOUT the bound failed, and that must still file — without
+        // this cell the entry above is indistinguishable from switching the
+        // route off.
+        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/schedules/SCHED-173/run", family: "/api/schedules", status: 200, body: "", worker: "", ua: "curl/8", ms: 900_000.0 });
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/schedules/{id}/run")),
+            "900s exceeds the 600s the endpoint enforces on itself — a bound failed: {f2:?}"
         );
     }
 
