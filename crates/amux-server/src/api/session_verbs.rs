@@ -2663,7 +2663,7 @@ fn get_default_model() -> String {
 // works — on the live shared DB these are no-ops against Python's schema.
 // ---------------------------------------------------------------------------
 
-fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS session_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,

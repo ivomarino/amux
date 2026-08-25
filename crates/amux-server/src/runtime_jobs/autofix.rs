@@ -276,6 +276,22 @@ fn schedule_overdue_min() -> f64 {
 fn steering_stale_min() -> f64 {
     env_f64("AMUX_AUTOFIX_STEERING_STALE_MIN", 90.0).max(5.0)
 }
+
+/// The same deadline for a lane that CAN receive (AMUX-3696).
+///
+/// A queue that will never drain and a queue that drains at the next turn
+/// boundary are different facts, and 90 minutes is the right deadline for only
+/// one of them. A lane mid-turn is not stuck: an agent working a single long
+/// task legitimately runs past 90 minutes without reaching a boundary, so the
+/// old single threshold sat BELOW the natural turn length of a busy lane and
+/// filed cards against healthy ones. That is the "threshold below its own
+/// baseline" failure the card template itself warns about.
+///
+/// 6h, because a DELIVERABLE lane that has not reached a turn boundary in six
+/// hours is a real report — just a different one, and the verdict says which.
+fn steering_stale_deliverable_min() -> f64 {
+    env_f64("AMUX_AUTOFIX_STEERING_STALE_DELIVERABLE_MIN", 360.0).max(steering_stale_min())
+}
 /// An invariant must stay breached across at least this many evaluations. A
 /// flapping invariant is noise, and noise is how a board stops being read.
 /// How recent an incident's last failing evaluation must be to mint a card
@@ -1841,9 +1857,13 @@ pub fn detect_dead_routes(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Sup
 /// Both checks read tables the SERVER owns, deliberately: a silent-subsystem
 /// detector that needed a worker to answer would go silent exactly when the
 /// fleet did.
-pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
+pub fn detect_silent(
+    conn: &Connection,
+    now: f64,
+    blocked: &BTreeMap<String, Option<String>>,
+) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
-    let suppressed = Vec::new();
+    let mut suppressed = Vec::new();
 
     // (a) Schedules whose next_run has passed with no run recorded since.
     let overdue_s = schedule_overdue_min() * 60.0;
@@ -1916,10 +1936,39 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
 
     // (b) A steering queue that is not draining.
     let stale_s = steering_stale_min() * 60.0;
-    if let Ok(mut stmt) = conn.prepare(
+    // A DETECTOR THAT CANNOT RUN MUST SAY SO (AMUX-3696).
+    //
+    // This was a bare `if let Ok(..)`, so a failed prepare skipped the entire
+    // steering block and left NOTHING behind — indistinguishable from "no lane
+    // has a stalled queue", which is the shape ethos rule 4 is about.
+    //
+    // It is not hypothetical. `steering_queue.sender` is added by
+    // `ensure_fleet_tables`'s runtime ALTER and by NO migration, so a database
+    // built from `migrations/` alone does not have it and this query does not
+    // prepare. That is exactly the state every test fixture is in, which is how
+    // this block reached today with no coverage: every test that "exercised" it
+    // was silently exercising nothing.
+    //
+    // Recorded as a Suppressed rather than logged, because the autofix report
+    // already surfaces suppressions and that is where somebody reading "why did
+    // the detector find nothing" will actually look.
+    let steer_stmt = conn.prepare(
         "SELECT session, COUNT(*), MIN(queued_at), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
          FROM steering_queue GROUP BY session",
-    ) {
+    );
+    if let Err(e) = &steer_stmt {
+        suppressed.push(sup(
+            DetectorKind::SilentSubsystem,
+            "silent|steering|<query failed>",
+            &format!(
+                "the steering-queue query did not prepare ({e}) — this detector reported NOTHING \
+                 about stalled queues on this tick, which is not the same as finding nothing. \
+                 Usually a missing column: `sender` comes from ensure_fleet_tables' runtime \
+                 ALTER, not from any migration."
+            ),
+        ));
+    }
+    if let Ok(mut stmt) = steer_stmt {
         let rows = stmt.query_map([], |r| {
             Ok((
                 r.get::<_, String>(0)?,
@@ -1931,9 +1980,34 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
         if let Ok(rows) = rows {
             for (session, n, oldest, senders) in rows.flatten() {
                 let age = now - oldest;
-                if age < stale_s {
+                // WHICH DEADLINE APPLIES DEPENDS ON WHETHER THE LANE CAN RECEIVE
+                // (AMUX-3696). This used to be one threshold for both states,
+                // and the card it filed against THIS lane is the specimen: 92
+                // minutes queued, while `/api/debug/steering` said
+                // `blocked_reason: null, deliverable: true, stalled: false` and
+                // the drain loop's own last skip read "not-at-turn-boundary
+                // (within max age)". The lane was working, not stuck.
+                //
+                // The detector had the distinction in front of it the whole
+                // time: its own evidence block tells the reader to go and check
+                // `blocked_reason` before assuming the lane is hung. It named
+                // the discriminator and did not use it, so the verdict "stuck"
+                // was a claim about a condition never tested — a view
+                // disagreeing with the mechanism it describes (ethos rule 1).
+                //
+                // `blocked` comes from `lane_block_reason`, the SAME predicate
+                // the drain loop and /api/debug/steering use, computed off the
+                // runtime before this sync pass (the AF-97 pattern the disk
+                // detector already follows). Not a second reading of it.
+                let block = blocked.get(&session).and_then(|b| b.clone());
+                let deadline_min = match &block {
+                    Some(_) => steering_stale_min(),
+                    None => steering_stale_deliverable_min(),
+                };
+                if age < deadline_min * 60.0 {
                     continue;
                 }
+                let _ = stale_s;
                 // ROUTE TO THE SENDER, NEVER THE STALLED LANE (AMUX-2796).
                 //
                 // This used to set `owner: Some(session)` — the lane whose queue
@@ -1967,17 +2041,53 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
                 out.push(Finding {
                     kind: DetectorKind::SilentSubsystem,
                     signature: format!("silent|steering|{session}"),
-                    title: format!("{session}: steering queue stuck, oldest {:.0} min", age / 60.0),
+                    title: match &block {
+                        Some(r) => format!(
+                            "{session}: steering queue cannot drain ({r}), oldest {:.0} min",
+                            age / 60.0
+                        ),
+                        // NOT "stuck". A deliverable lane's queue is waiting for
+                        // a turn boundary, and calling that stuck sends the
+                        // reader to look for a hang that is not there.
+                        None => format!(
+                            "{session}: reachable but has not taken a turn boundary in {:.1}h",
+                            age / 3600.0
+                        ),
+                    },
                     evidence: vec![
-                        ("verdict".into(), format!(
-                            "{n} message(s) queued for {session}; the oldest has waited {:.0} min \
-                             (deadline {:.0} min). Queued is not delivered — every one of these \
-                             was reported to its sender as accepted.",
-                            age / 60.0, steering_stale_min()
-                        )),
+                        ("verdict".into(), match &block {
+                            Some(r) => format!(
+                                "{n} message(s) queued for {session}; the oldest has waited \
+                                 {:.0} min (deadline {deadline_min:.0} min). The lane is NOT \
+                                 reachable: {r}. This queue will not drain on its own — queued \
+                                 is not delivered, and every one of these was reported to its \
+                                 sender as accepted.",
+                                age / 60.0
+                            ),
+                            None => format!(
+                                "{n} message(s) queued for {session}; the oldest has waited \
+                                 {:.0} min (deadline {deadline_min:.0} min). The lane IS \
+                                 reachable — no block reason, same predicate the drain loop \
+                                 uses — so this is not a stall: delivery happens at the next \
+                                 TURN BOUNDARY and the lane has not reached one. Look for a \
+                                 lane stuck in one very long turn, not for a broken queue. \
+                                 Senders were told 'accepted', which remains true and remains \
+                                 not-yet-delivered.",
+                                age / 60.0
+                            ),
+                        }),
+                        ("lane_reachable".into(), match &block {
+                            Some(r) => format!("NO — {r}"),
+                            None => "yes — no block reason from lane_block_reason".into(),
+                        }),
                         ("queued".into(), n.to_string()),
                         ("oldest_queued_at".into(), rl::local_when(oldest)),
-                        ("threshold_min".into(), format!("{:.0}", steering_stale_min())),
+                        // The deadline that ACTUALLY applied, not always the
+                        // blocked one. Reporting 90 next to a card that fired at
+                        // 360 is a field disagreeing with the mechanism beside it
+                        // (ethos rule 1) — caught by reading this payload during
+                        // the mutation run.
+                        ("threshold_min".into(), format!("{deadline_min:.0}")),
                         // Say WHY this card is not addressed to the stalled lane,
                         // or the next reader "corrects" it straight back — the
                         // lane's name is in the title and assigning it there
@@ -1988,8 +2098,16 @@ pub fn detect_silent(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppress
                                 "none recorded — these were queued by an automated producer \
                                  (commit-nudge / board-drive / sched:<id>), or before senders were \
                                  tracked. Deliberately UNASSIGNED rather than assigned to \
-                                 '{session}': that lane may be unable to receive anything, which is \
-                                 what this card reports."
+                                 '{session}': {}",
+                                match &block {
+                                    Some(r) => format!(
+                                        "that lane cannot receive anything right now ({r}), which \
+                                         is what this card reports"
+                                    ),
+                                    None => "the lane is reachable, so there is nobody here \
+                                             holding a false belief to notify"
+                                        .to_string(),
+                                }
                             )
                         } else {
                             format!(
@@ -4057,6 +4175,43 @@ pub async fn autofix_tick_with_ci(
         ));
     }
 
+    // LANE REACHABILITY, RESOLVED BEFORE THE SYNC PASS (AMUX-3696).
+    //
+    // `detect_silent` needs to know whether a lane with a queued message CAN
+    // receive one, because "will never drain" and "drains at the next turn
+    // boundary" are different facts and want different deadlines. The predicate
+    // is `lane_block_reason`, which is async (it asks tmux whether the lane is
+    // running), and the detector pass is sync — so it is resolved here, the
+    // same shape the disk detector below already uses.
+    //
+    // Deliberately the SHARED predicate rather than a re-derivation. The drain
+    // loop and /api/debug/steering both call it, and a detector that computed
+    // reachability its own way could report a lane unreachable that the loop
+    // will happily deliver to (ethos rule 1: a view must share the predicate of
+    // the mechanism it claims to describe).
+    let steer_blocked: BTreeMap<String, Option<String>> = {
+        let sessions: Vec<String> = state
+            .store
+            .read()
+            .ok()
+            .and_then(|c| {
+                c.prepare("SELECT DISTINCT session FROM steering_queue")
+                    .ok()
+                    .and_then(|mut st| {
+                        st.query_map([], |r| r.get::<_, String>(0))
+                            .ok()
+                            .map(|rows| rows.flatten().collect())
+                    })
+            })
+            .unwrap_or_default();
+        let mut m = BTreeMap::new();
+        for s in sessions {
+            let b = crate::api::session_verbs::lane_block_reason(&s).await;
+            m.insert(s, b.map(str::to_string));
+        }
+        m
+    };
+
     // DISK DETECTION RUNS OFF THE RUNTIME, AND OUTSIDE THE STORE LOCK (AF-97 —
     // the deeper exit AMUX-35 named and did not take).
     //
@@ -4125,7 +4280,7 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::Http5xx => detect_5xx(&conn, now),
                 DetectorKind::Latency => detect_latency(&conn, now),
                 DetectorKind::DeadRoute => detect_dead_routes(&conn, now),
-                DetectorKind::SilentSubsystem => detect_silent(&conn, now),
+                DetectorKind::SilentSubsystem => detect_silent(&conn, now, &steer_blocked),
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
                 // Computed above, off-runtime and outside this lock (AF-97).
@@ -5857,6 +6012,118 @@ mod tests {
         for off in ["0", "false", "off", "no", "OFF", " 0 ", "False"] {
             assert!(!parse_ops_health_cards(Some(off)), "{off:?} must disable filing");
         }
+    }
+
+    /// AMUX-3696: a queue that cannot drain and a queue waiting for a turn
+    /// boundary are different facts, and only one of them is "stuck".
+    ///
+    /// THE SPECIMEN IS THIS LANE. autofix filed "amux: steering queue stuck,
+    /// oldest 92 min" while `/api/debug/steering` reported
+    /// `blocked_reason: null, deliverable: true, stalled: false` and the drain
+    /// loop's own last skip read "not-at-turn-boundary (within max age)". The
+    /// lane was working a long turn, which is what a busy agent does, so a
+    /// 90-minute deadline sat BELOW the natural turn length of the lanes it
+    /// watches and filed against healthy ones.
+    ///
+    /// The detector had the discriminator in front of it the whole time: its
+    /// own evidence block tells the reader to check `blocked_reason` before
+    /// assuming a hang. It named the test and did not run it.
+    ///
+    /// THREE CELLS. The blocked one must still fire at 90 minutes, or this
+    /// "fix" would have silenced the real defect the detector exists for.
+    #[tokio::test]
+    async fn a_reachable_lane_waiting_on_a_turn_boundary_is_not_a_stuck_queue() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // WRITE PATH, and `ensure_fleet_tables` FIRST. `store.read()` hands back
+        // a read-only connection, and the migrations alone do not create
+        // `steering_queue.sender` — it comes from ensure_fleet_tables' runtime
+        // ALTER. Skip that and the detector's query does not prepare, the whole
+        // steering block is skipped, and every cell below passes against
+        // nothing. That is not a hypothetical: it is what the first draft of
+        // this test did, and it is why the block had no coverage until now.
+        st.store
+            .write_async(move |conn| {
+                crate::api::session_verbs::ensure_fleet_tables(conn)?;
+                for lane in ["busy-lane", "dead-lane"] {
+                    conn.execute(
+                        "INSERT INTO steering_queue (id,session,text,queued_at,guard,sender) \
+                         VALUES (?1,?2,'hi',?3,'','')",
+                        rusqlite::params![format!("s-{lane}"), lane, now - 92.0 * 60.0],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .expect("seed");
+        let conn = st.store.read().unwrap();
+
+        let mut blocked = BTreeMap::new();
+        blocked.insert("busy-lane".to_string(), None);
+        blocked.insert("dead-lane".to_string(), Some("no-env-file".to_string()));
+        let (f, sup) = detect_silent(&conn, now, &blocked);
+
+        // THE PREMISE, asserted rather than assumed: the query must have RUN.
+        // If it did not prepare, the detector records a suppression saying so,
+        // and every assertion below would be about an empty vector.
+        assert!(
+            !sup.iter().any(|x| x.signature.contains("<query failed>")),
+            "the steering query did not prepare, so this test is measuring nothing: {sup:?}"
+        );
+
+        // CELL 1 — reachable at 92 min: NOT a card. This is the specimen.
+        assert!(
+            !f.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+            "a lane the drain loop can deliver to is mid-turn, not stuck: {f:?}"
+        );
+
+        // CELL 2 — UNREACHABLE at the same 92 min: still a card, naming the
+        // reason. Without this, ignoring the queue entirely passes cell 1 and
+        // deletes the detector's whole purpose.
+        let hit = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|dead-lane")
+            .expect("a lane with no env file will NEVER drain — that is the real defect");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        assert!(hit.title.contains("cannot drain"), "not 'stuck': {}", hit.title);
+        assert!(ev["verdict"].contains("no-env-file"), "name the reason: {ev:?}");
+        assert!(ev["lane_reachable"].starts_with("NO"), "{ev:?}");
+
+        // CELL 3 — reachable but far past the LARGER deadline: still reported,
+        // as the different thing it is. A lane that has not reached a turn
+        // boundary in 7h is worth a card; calling it a stuck queue is not.
+        let (f2, _) = detect_silent(&conn, now + 7.0 * 3600.0, &blocked);
+        let late = f2
+            .iter()
+            .find(|x| x.signature == "silent|steering|busy-lane")
+            .expect("past the deliverable deadline it must still report");
+        assert!(
+            late.title.contains("has not taken a turn boundary"),
+            "the title must describe what is actually true: {}",
+            late.title
+        );
+        let ev2: BTreeMap<_, _> = late.evidence.iter().cloned().collect();
+        assert!(
+            ev2["verdict"].contains("not a stall"),
+            "and must send the reader at the long turn, not at the queue: {ev2:?}"
+        );
+        // EVERY FIELD MUST AGREE WITH THE VERDICT BESIDE IT. Both of these were
+        // wrong on the first working draft and were caught by READING the
+        // payload during the mutation run, not by any assertion: `threshold_min`
+        // reported 90 on a card that fired at 360, and the `senders` blurb said
+        // "that lane may be unable to receive anything" directly under
+        // `lane_reachable: yes`. A card whose fields contradict each other is
+        // worse than a missing field, because each one is read as a fact.
+        assert_eq!(ev2["threshold_min"], "360", "report the deadline that APPLIED: {ev2:?}");
+        assert!(
+            ev2["senders"].contains("the lane is reachable"),
+            "the senders blurb must not assert unreachability on a reachable lane: {ev2:?}"
+        );
+        assert_eq!(ev["threshold_min"], "90", "the blocked lane's deadline is the 90: {ev:?}");
+        assert!(
+            ev["senders"].contains("cannot receive anything right now"),
+            "...and there the blurb IS true: {ev:?}"
+        );
     }
 
     fn state() -> (AppState, tempfile::TempDir) {
