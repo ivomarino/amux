@@ -377,7 +377,25 @@ pub fn build(
         let share = (n * 100).checked_div(denom).unwrap_or(0);
         let coverage = fresh.revived_checked + fresh.revived_unchecked;
         let well_covered = coverage == 0 || fresh.revived_checked * 2 >= coverage;
-        let lede = if share >= 50 && n >= 5 && well_covered {
+        // A PERCENTAGE NEEDS ENOUGH OBSERVATIONS TO BE ONE (mixpeek-frustrations).
+        //
+        // Their granularity floor, and it is not a precision argument, it is a
+        // range argument: at n=4 the only values this can produce are 0, 25, 50,
+        // 75 and 100. The true share on their checkout is 63%, and that is not
+        // in the estimator's range AT ANY CONFIDENCE. A share printed from four
+        // observations is not a noisy measurement of the share, it is a
+        // different quantity wearing a percent sign.
+        //
+        // Their arithmetic on how many it would take, at p=0.63 with a finite
+        // population correction and the 458ms mean walk they measured:
+        //   n=4    +/- 47 points     2s
+        //   n=40   +/- 14 points    18s
+        //   n=93   +/-  9 points    43s
+        // So no cap compatible with a 2s budget supports a proportion, and the
+        // answer to "is 40 the right cap" is that there is no right cap. Below
+        // 10 the count IS the honest statement, so print the count.
+        let enough_for_a_rate = denom >= 10;
+        let lede = if share >= 50 && n >= 5 && well_covered && enough_for_a_rate {
             format!(
                 "OLD REVISIONS ON DISK — {n} of the {} path(s) examined ({share}%). At this \
                  share the finding is the CHECKOUT, not the individual files: it is broadly \
@@ -412,19 +430,28 @@ pub fn build(
     // lie. Measured need: 772 paths in one real listing (mixpeek-frustrations).
     if fresh.revived_unchecked > 0 {
         let total = fresh.revived_checked + fresh.revived_unchecked;
+        // Coverage is an EXACT quantity (we counted both sides), not an
+        // estimate, so a percentage is legitimate here at any n — unlike the
+        // share above, which is a sample statistic. Rendered only when it adds
+        // something the two counts do not: 4-of-59 is much easier to feel as
+        // "6%", and 2-of-6 is not.
         let pct = (fresh.revived_checked * 100).checked_div(total).unwrap_or(0);
+        let cov = if total >= 10 { format!(" ({pct}% coverage)") } else { String::new() };
         sections.push(format!(
-            "NOT CHECKED FOR OLD-REVISION: {} of {total} candidate path(s) were examined \
-             ({pct}% coverage); the other {} were not, because this run hit its budget \
+            "NOT CHECKED FOR OLD-REVISION: {} of {total} candidate path(s) were examined\
+             {cov}; the other {} were not, because this run hit its budget \
              (AMUX_NUDGE_REVIVED_BUDGET_MS / AMUX_NUDGE_REVIVED_MAX_PATHS). The unchecked ones \
              are listed above as ordinary edits, which is the SAFE fallback and NOT a finding \
              that they are clean.\n\
              COVERAGE, STATED AS A PERCENTAGE ON PURPOSE: on a large checkout the per-path \
              test costs ~700ms and the clock cuts after about four paths, so a long dirty list \
              gets low single digits. That is an honest bound and it is NOT a sample — do not \
-             read the proportions above as representative of the rest. The examined ones are \
-             spread across top-level directories rather than taken alphabetically, which \
-             removes the worst of the bias but does not make four files a survey.\n\
+             read the proportions above as representative of the rest. Measured: reporting a \
+             share to within 10 points would need ~93 paths and ~43s, so there is no cap \
+             compatible with a 2s budget that supports one. The examined paths are allocated \
+             across top-level directories in PROPORTION to their size, which removes both the \
+             alphabetical bias and the equal-weight-per-directory bias that replacing it \
+             introduced — neither of which makes four files a survey.\n\
              To check one by hand:\n  \
              git log --all --oneline --find-object=$(git hash-object <path>) -- <path>",
             fresh.revived_checked, fresh.revived_unchecked
@@ -1485,21 +1512,54 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
     for p in &pending_revived {
         by_dir.entry(p.split('/').next().unwrap_or("")).or_default().push(p);
     }
-    let mut order: Vec<&String> = Vec::with_capacity(pending_revived.len());
-    let mut i = 0usize;
-    while order.len() < pending_revived.len() {
-        let mut moved = false;
-        for v in by_dir.values() {
-            if let Some(p) = v.get(i) {
-                order.push(p);
-                moved = true;
-            }
+    // PROPORTIONAL, NOT ONE-PER-GROUP (mixpeek-frustrations, third probe).
+    //
+    // The first version took one path per directory per round, which fixes the
+    // alphabetical bias and introduces a worse one when the groups are unequal:
+    // it weights GROUPS equally. On their checkout that is 524 files in 41
+    // groups, 17 of them singleton root-level .md files. So the singletons take
+    // 41% of the round-robin weight while being 3% of the population, and the
+    // three directories holding 63% of the files take 7% of it. The
+    // deterministic first four came out as three root .md files and one
+    // workflow, and ZERO of the 332 SDK files — which are the population the
+    // whole check is about there.
+    //
+    // Each item gets position (i + offset_g) / n_g within its own group, so a
+    // group of 132 lays 132 marks evenly across [0,1) and sorting by the key
+    // makes any PREFIX proportional, not merely the whole list.
+    //
+    // THE PREFIX IS THE ONLY PART THAT EVER RUNS, which is what makes the
+    // offset load-bearing rather than a flourish. The first draft used the
+    // midpoint, (2i+1)/2n, and that is proportional in aggregate and badly
+    // skewed in the prefix: every singleton group lands on exactly 0.5, so with
+    // one group of 20 and eight singletons the first TEN picks were all from
+    // the big group and not one singleton appeared. A budget that stops at four
+    // would have seen a single directory. A test caught it.
+    //
+    // `offset_g` is a stable hash of the group name folded into [0,1), which
+    // scatters the singletons across the interval instead of stacking them at
+    // the midpoint. Deterministic — FNV-1a written out rather than DefaultHasher,
+    // whose output Rust does not promise to keep stable across releases — so two
+    // runs over an unchanged tree still agree, which is the property that ruled
+    // out a shuffle in the first place.
+    let offset = |name: &str| -> f64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
         }
-        if !moved {
-            break;
+        (h >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut keyed: Vec<(f64, &String)> = Vec::with_capacity(pending_revived.len());
+    for (name, v) in &by_dir {
+        let (n, off) = (v.len() as f64, offset(name));
+        for (i, p) in v.iter().enumerate() {
+            keyed.push(((i as f64 + off) / n, p));
         }
-        i += 1;
     }
+    // Tie-break on the path so equal keys cannot reorder between runs.
+    keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    let order: Vec<&String> = keyed.into_iter().map(|(_, p)| p).collect();
     let (budget, cap) = (revived_budget_ms(), revived_max_paths());
     let mut checked: std::collections::BTreeSet<&str> = Default::default();
     for p in order {
@@ -2704,7 +2764,33 @@ mod tests {
         let n = build(dir, &names, &Default::default(), &fresh, "").expect("nudge");
         assert!(n.contains("NOT CHECKED FOR OLD-REVISION"), "the cap must be visible: {n}");
         assert!(n.contains("2 of 6 candidate path(s) were examined"), "state coverage: {n}");
-        assert!(n.contains("33% coverage"), "as a percentage, so 4-of-59 reads as 6%: {n}");
+        // NO PERCENTAGE AT SMALL n. "33%" off 6 candidates adds nothing the two
+        // counts do not already say, and printing a rate where a count is the
+        // honest quantity is the same error the SHARE has at n=4
+        // (mixpeek-frustrations: at 4 observations the estimable values are
+        // 0/25/50/75/100 and the true 63% is not in the range at all).
+        assert!(
+            !n.contains("% coverage"),
+            "a coverage rate off 6 candidates is a count wearing a percent sign: {n}"
+        );
+
+        // ...AND IT DOES APPEAR once there are enough to be worth feeling as a
+        // rate. Driven through `build` directly with a synthetic Freshness,
+        // because 4-of-59 is the shape that matters and standing up 59 real
+        // paths would test git rather than this. Both cells, because a floor
+        // that suppressed the percentage ALWAYS would pass the one above.
+        let big = Freshness {
+            revived: vec!["a.txt".into()],
+            edited: (0..58).map(|i| format!("e{i}.txt")).collect(),
+            revived_checked: 4,
+            revived_unchecked: 55,
+            ..Default::default()
+        };
+        let mut big_paths = big.revived.clone();
+        big_paths.extend(big.edited.clone());
+        let bn = build(dir, &big_paths, &Default::default(), &big, "").expect("nudge");
+        assert!(bn.contains("4 of 59 candidate path(s) were examined"), "{bn}");
+        assert!(bn.contains("(6% coverage)"), "59 candidates is enough to feel as a rate: {bn}");
         assert!(
             n.contains("NOT a finding that they are clean"),
             "and must refuse the reading that silence means checked: {n}"
@@ -2829,6 +2915,74 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// AMUX-3695 probe 3: the allocation is PROPORTIONAL to group size, not one
+    /// slot per group.
+    ///
+    /// Fixing the alphabetical bias with one-path-per-directory introduced a
+    /// worse one when groups are unequal, and mixpeek-frustrations measured how
+    /// unequal they are: 524 dirty files in 41 groups, 17 of them singleton
+    /// root-level .md files, and three directories holding 63% of the files.
+    /// Equal-per-group gives the singletons 41% of the weight for 3% of the
+    /// population, and the three dominant directories 7% for 63% of it. Their
+    /// deterministic first four came out as three root .md files and one
+    /// workflow, with ZERO of the 332 SDK files — the population the check is
+    /// actually about there.
+    ///
+    /// This is a PURE ordering test on purpose: standing up 200 real git paths
+    /// would measure git, and the defect is in the allocation.
+    #[test]
+    fn the_allocation_is_proportional_to_group_size_not_one_slot_per_group() {
+        // Their shape in miniature: one dominant directory and a crowd of
+        // singletons that would otherwise monopolise the budget.
+        let mut paths: Vec<String> = (0..20).map(|i| format!("big/b{i:02}.txt")).collect();
+        paths.extend((0..8).map(|i| format!("s{i}.md")));
+
+        let mut by_dir: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
+        for p in &paths {
+            by_dir.entry(p.split('/').next().unwrap_or("")).or_default().push(p);
+        }
+        let offset = |name: &str| -> f64 {
+            let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+            for b in name.as_bytes() {
+                h ^= *b as u64;
+                h = h.wrapping_mul(0x1000_0000_01b3);
+            }
+            (h >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut keyed: Vec<(f64, &String)> = Vec::new();
+        for (name, v) in &by_dir {
+            let (n, off) = (v.len() as f64, offset(name));
+            for (i, p) in v.iter().enumerate() {
+                keyed.push(((i as f64 + off) / n, p));
+            }
+        }
+        keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let order: Vec<&str> = keyed.iter().map(|(_, p)| p.as_str()).collect();
+
+        // `big` is 20 of 28 files (71%). Over the first 10 picks it must get
+        // roughly that share. Equal-per-group would give it 5 of 10 (50%) —
+        // one per round against 8 singleton groups that exhaust after one each.
+        let first10 = &order[..10];
+        let big_share = first10.iter().filter(|p| p.starts_with("big/")).count();
+        assert!(
+            big_share >= 6,
+            "the directory holding 71% of the files must take most of the early budget, not \
+             one slot: got {big_share} of 10 — {first10:?}"
+        );
+        // ...and the singletons must not be shut out either, or this would have
+        // swapped one bias for its mirror image.
+        assert!(
+            first10.iter().any(|p| p.ends_with(".md")),
+            "proportional is not winner-take-all: {first10:?}"
+        );
+        // DETERMINISM, again: the tie-break on path is what makes equal keys
+        // (a singleton at 0.5 against an odd group's midpoint) stable.
+        let mut keyed2 = keyed.clone();
+        keyed2.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+        let order2: Vec<&str> = keyed2.iter().map(|(_, p)| p.as_str()).collect();
+        assert_eq!(order, order2, "the ordering must be stable across runs");
     }
 
     /// A GRAFT-PUSH CHECKOUT MUST NOT READ AS DIVERGED (reported by
