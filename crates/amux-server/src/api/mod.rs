@@ -68,6 +68,7 @@ pub mod simple;
 pub mod config_iac;
 pub mod skin;
 pub mod commit_mentions;
+pub mod deleted_substrate;
 pub mod sessions_git;
 pub mod sessions_legacy;
 pub mod settings;
@@ -291,6 +292,14 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/board/commit-mentions",
             axum::routing::get(commit_mentions::commit_mentions),
+        )
+        // AMUX-3608's sibling of the line above: same data source (git joined to
+        // card ids), same discipline (surfaces candidates, closes nothing). It
+        // asks the opposite question — commit-mentions finds OPEN cards a commit
+        // already fixed; this finds CLOSED cards whose files no longer exist.
+        .route(
+            "/api/board/deleted-substrate",
+            axum::routing::get(deleted_substrate::deleted_substrate),
         )
         // The shared-checkout staged-guard's endpoint. UNROUTED since the
         // rust cutover — 405, ~1,147 calls/hour, and the installed
