@@ -52,6 +52,157 @@ use serde_json::{json, Value};
 use super::AppState;
 use crate::provider::claude::{probe_usage_raw, UsageProbe};
 
+// ---------------------------------------------------------------------------
+// BACKGROUND RESERVE (AMUX-3545) — a share of the plan window background work
+// may not consume.
+// ---------------------------------------------------------------------------
+
+/// The share of the plan window reserved for the human, as a percent.
+///
+/// Ethan's call, 2026-08-25: **30**. Background work pauses once the session
+/// window is 70% used, so roughly a third of every window is still there when he
+/// sits down.
+///
+/// The measurement behind the question: in the 5-hour window that day, 2,270
+/// turns and 82.1% background — 1,059 peer-message turns, 552 schedule, 50
+/// pickup, against 505 of his own. A person on a $20 plan typing 2-3 prompts was
+/// competing with all of that inside the window their plan meters.
+///
+/// A PREF, NOT A CONSTANT. D4 is this repo's record of what a compiled-in
+/// context policy costs: it becomes the ceiling silently. `0` disables the
+/// reserve entirely, which is the honest off switch.
+pub fn background_reserve_pct() -> i64 {
+    std::env::var("AMUX_BACKGROUND_RESERVE_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| (0..=95).contains(n))
+        .unwrap_or(30)
+}
+
+/// Should background work pause right now?
+///
+/// PURE, so the decision is testable without a plan window — and so the one
+/// property that matters can be pinned: **it fails OPEN.**
+///
+/// `window_pct == None` means the reading is missing or stale, and the answer is
+/// then "do not pause". Pausing on an unknown would stop every schedule and
+/// every pickup across the fleet the moment the usage probe rate-limits or the
+/// OAuth token expires — turning a credit guard into a fleet outage triggered by
+/// a third party. Under-protecting for one window is recoverable; the inverse is
+/// not, and it would be blamed on anything but the probe.
+pub fn background_should_pause(window_pct: Option<i64>, reserve_pct: i64) -> bool {
+    if reserve_pct <= 0 {
+        return false;
+    }
+    match window_pct {
+        Some(p) => p >= 100 - reserve_pct,
+        None => false,
+    }
+}
+
+/// Last observed session-window utilisation, and when it was observed.
+///
+/// Written by `get_usage` as a side effect of serving a request, so on a box
+/// with an open dashboard this stays fresh for free. `window_pct_fresh` is the
+/// only reader and it enforces the age bound, because a percentage from an hour
+/// ago is not a reading of the current window.
+static WINDOW_PCT: std::sync::Mutex<Option<(Instant, i64)>> = std::sync::Mutex::new(None);
+
+/// Record a fresh session-window reading. Idempotent, cheap, never fails.
+pub fn note_window_pct(pct: i64) {
+    if let Ok(mut g) = WINDOW_PCT.lock() {
+        *g = Some((Instant::now(), pct));
+    }
+}
+
+/// The reading, if it is younger than `max_age`. `None` is a real answer and
+/// the caller must treat it as "unknown", never as zero.
+pub fn window_pct_fresh(max_age: Duration) -> Option<i64> {
+    let g = WINDOW_PCT.lock().ok()?;
+    let (at, pct) = (*g)?;
+    (at.elapsed() < max_age).then_some(pct)
+}
+
+/// How stale a window reading may be and still bound a decision.
+///
+/// A 5-hour window moves slowly, but a percentage from an hour ago is not a
+/// reading of the CURRENT one. Deliberately longer than the probe TTL so a
+/// dashboard that is merely idle does not tip the fleet into fail-open.
+const RESERVE_MAX_AGE: Duration = Duration::from_secs(600);
+
+/// Minimum gap between reserve-driven probes, so the background consumers
+/// cannot amplify a rate limit by asking harder when the answer is missing —
+/// the failure the usage cache's own comment already records for the HTTP path.
+const RESERVE_PROBE_EVERY: Duration = Duration::from_secs(120);
+
+static LAST_RESERVE_PROBE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Should background work pause right now, probing at most once per
+/// [`RESERVE_PROBE_EVERY`] if no fresh reading is on hand (AMUX-3545).
+///
+/// THE CONSUMER REFRESHES WHAT IT CONSUMES. `get_usage` notes a reading as a
+/// side effect of serving the dashboard, which keeps this free on a box someone
+/// is looking at; a headless box has nobody polling, and a reserve that silently
+/// never engages there would be the ethos-1 failure — capability that exists and
+/// reaches nobody. So the schedulers top it up themselves, rate-limited.
+///
+/// Fails OPEN at every step: no reading, a failed probe, a probe we declined to
+/// make because one was recent — all of them mean "do not pause".
+pub async fn background_should_pause_now() -> bool {
+    let reserve = background_reserve_pct();
+    if reserve <= 0 {
+        return false;
+    }
+    if let Some(p) = window_pct_fresh(RESERVE_MAX_AGE) {
+        return background_should_pause(Some(p), reserve);
+    }
+    // No fresh reading. Probe, but only if we have not just tried.
+    {
+        let mut g = match LAST_RESERVE_PROBE.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if let Some(at) = *g {
+            if at.elapsed() < RESERVE_PROBE_EVERY {
+                return false;
+            }
+        }
+        *g = Some(Instant::now());
+    }
+    let probe = crate::provider::claude::probe_usage_raw().await;
+    if let UsageProbe::Ok(body) = probe {
+        if let Some(pct) = session_pct_of(&shape_probe(UsageProbe::Ok(body))) {
+            note_window_pct(pct);
+            return background_should_pause(Some(pct), reserve);
+        }
+    }
+    false
+}
+
+/// The sentence a paused consumer prints, so a skipped fire is never silent.
+pub fn reserve_pause_note(kind: &str) -> String {
+    let reserve = background_reserve_pct();
+    let pct = window_pct_fresh(RESERVE_MAX_AGE).unwrap_or(-1);
+    format!(
+        "{kind} PAUSED: the plan window is {pct}% used and {reserve}% is reserved for the human \
+         (AMUX_BACKGROUND_RESERVE_PCT). Background work stops here so a prompt you type still \
+          has room; direct sends are never gated. Set the pref to 0 to disable the reserve."
+    )
+}
+
+/// Pull the `session` window's percent out of a shaped usage body.
+///
+/// The `limits` array is the shape `/api/usage` already returns; `kind` is the
+/// discriminator and `session` is the 5-hour window the plan meters.
+pub fn session_pct_of(body: &Value) -> Option<i64> {
+    body.get("limits")?
+        .as_array()?
+        .iter()
+        .find(|l| l.get("kind").and_then(Value::as_str) == Some("session"))
+        .and_then(|l| l.get("percent"))
+        .and_then(Value::as_i64)
+}
+
 /// Default cache TTL. Python used 30s; this defaults to 60 because the probe
 /// is a NETWORK call made on a settings render, and the endpoint is
 /// rate-limited per account — on a host running a fleet of Claude Code
@@ -457,6 +608,43 @@ fn stmt_top(conn: &rusqlite::Connection, cutoff: i64) -> anyhow::Result<Vec<Valu
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-3545: the reserve decision, and the property that matters most is
+    /// that it FAILS OPEN.
+    ///
+    /// Ethan's call, 2026-08-25: 30%, so background pauses at 70% window use.
+    /// The measurement behind the question, from the 5h window that day: 2,270
+    /// turns, 82.1% background — 1,059 peer-message, 552 schedule, 50 pickup,
+    /// against 505 of his own.
+    #[test]
+    fn the_reserve_pauses_at_the_threshold_and_fails_open_on_an_unknown() {
+        // Ethan's 30: pause at 70 and above, run below it.
+        assert!(!super::background_should_pause(Some(69), 30));
+        assert!(super::background_should_pause(Some(70), 30), "the boundary is inclusive");
+        assert!(super::background_should_pause(Some(99), 30));
+
+        // THE CELL THAT MATTERS. An unknown reading must NOT pause. The usage
+        // probe is a network call to a third party; if a rate limit or an
+        // expired token made `None` mean "pause", every schedule and every
+        // pickup across the fleet would stop, and the outage would be blamed on
+        // anything but the probe. Under-protecting for one window is
+        // recoverable; that is not.
+        assert!(
+            !super::background_should_pause(None, 30),
+            "an unknown window must never pause background work"
+        );
+
+        // 0 is the honest off switch, and it must beat even a maxed window —
+        // otherwise "disabled" would still gate at 100%.
+        assert!(!super::background_should_pause(Some(100), 0));
+        assert!(!super::background_should_pause(None, 0));
+
+        // A larger reserve bites earlier; a smaller one later. Pinned so the
+        // arithmetic cannot invert without a red test — the direction is the
+        // whole meaning of the number.
+        assert!(super::background_should_pause(Some(51), 50), "50% reserve pauses at 50");
+        assert!(!super::background_should_pause(Some(51), 20), "20% reserve does not");
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};

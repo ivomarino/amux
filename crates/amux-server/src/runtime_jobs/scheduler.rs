@@ -1375,7 +1375,27 @@ pub fn delivered_text(command: &str, source: &str) -> String {
 impl Deliverer for LiveDeliverer {
     async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome {
         if sched.str_field("kind") == "shell" {
+            // NOT GATED BY THE RESERVE, and the exemption is the point: a shell
+            // schedule wakes no model turn, so it consumes none of the plan
+            // window the reserve protects. Gating it would stop work that costs
+            // the human nothing — the same distinction AF-216's kind_note and
+            // AMUX-3546's cadence note both draw.
             return self.run_shell(sched).await;
+        }
+        // THE BACKGROUND RESERVE (AMUX-3545). Ethan's call: 30%, so a tmux
+        // schedule stops firing once the plan window is 70% used.
+        //
+        // PAUSE, NOT THROTTLE. A throttle spreads the same total spend over more
+        // time and still arrives at zero; the customer's complaint was never
+        // that background work was fast, it was that it left nothing. The
+        // schedule keeps its next_run and fires normally once the window rolls.
+        //
+        // Refused, not Err: nothing is broken, and a failure count would make a
+        // working reserve look like an outage.
+        if crate::api::usage::background_should_pause_now().await {
+            return RunOutcome::Refused {
+                reason: crate::api::usage::reserve_pause_note("schedule"),
+            };
         }
         let command = sched.str_field("command").trim().to_string();
         if command.is_empty() {
