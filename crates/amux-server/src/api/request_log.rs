@@ -86,6 +86,7 @@ pub struct LogRow {
     pub latency_ms: f64,
     pub client_ip: String,
     pub user_agent: String,
+
     pub amux_session: String,
     pub worker: Option<String>,
     pub req_bytes: Option<i64>,
@@ -93,6 +94,24 @@ pub struct LogRow {
     pub answered_by: String,
     pub error_body: Option<String>,
     pub req_meta: Option<String>,
+}
+
+/// Resolve the CALLER of a request, in the same order every handler uses.
+///
+/// Mirrors `session_verbs::hdr_worker`: `x-amux-worker` first, `x-amux-session`
+/// as the fallback. Extracted so the middleware and its test share ONE
+/// definition rather than the test restating the order — the two drifting is
+/// exactly how the log came to disagree with the handlers in the first place.
+pub(crate) fn caller_from_headers(h: &axum::http::HeaderMap) -> String {
+    for k in ["x-amux-worker", "x-amux-session"] {
+        if let Some(v) = h.get(k).and_then(|v| v.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
 }
 
 /// The host's 1-minute load average, or `None` if the OS would not say
@@ -317,9 +336,34 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
                 .unwrap_or("")
                 .to_string()
         };
+        // CALLER IDENTITY: same resolution order the handlers use (AF-217).
+        //
+        // This read `x-amux-session` alone, while every handler resolves a
+        // caller through `session_verbs::hdr_worker`, which tries
+        // `x-amux-worker` FIRST and falls back to `x-amux-session`. So a client
+        // that sends only `x-amux-worker` — which `amux send` does, because that
+        // is the header carrying the server-stamped origin — was fully
+        // identified to the handler and ANONYMOUS in the log.
+        //
+        // Measured by the 2026-08-25 log sweep: of 29 cross-group send refusals
+        // in 24h, 27 had an empty `amux_session`, and the sender was recoverable
+        // only by regexing it out of `error_body` prose. That is the endpoint
+        // whose ENTIRE JOB is deciding based on who is sending, logging the
+        // decision without the subject — and it made step 4 of the sweep
+        // (401/403 bursts by client) undecidable: every row is 127.0.0.1 with a
+        // blank session, so one lane looping and twelve lanes trying once are
+        // the same picture. The sweep's first reading of it was in fact wrong.
+        //
+        // THIS IS NOT THE FALLBACK THE SWEEP CONTRACT FORBIDS, and the next
+        // reader will think it is. That rule is about the `worker` COLUMN, which
+        // is PATH-derived (`/api/sessions/{name}/*`) and therefore names the
+        // TARGET of a request — using it as an author manufactures a mutation by
+        // whoever was being written ABOUT. `x-amux-worker` is a caller-supplied
+        // header naming the SENDER. Opposite direction, opposite failure.
+        let caller = caller_from_headers(req.headers());
         (
             truncate_chars(&hdr("user-agent"), USER_AGENT_CHARS),
-            hdr("x-amux-session"),
+            caller,
             truncate_chars(&hdr("content-type"), CONTENT_TYPE_CHARS),
         )
     };
@@ -3294,5 +3338,58 @@ mod category_tests {
         assert_eq!(category_of("/api/usage"), "http");
         assert_eq!(category_of("/health"), "http");
         assert_eq!(category_of(""), "http");
+    }
+}
+
+#[cfg(test)]
+mod caller_attribution_tests {
+    use super::caller_from_headers;
+    use axum::http::HeaderMap;
+
+    fn h(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            let name = axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap();
+            m.insert(name, v.parse().unwrap());
+        }
+        m
+    }
+
+    /// The specimen: `amux send` stamps the origin on `x-amux-worker` and sends
+    /// no `x-amux-session`. This is the row that logged as anonymous — 27 of 29
+    /// cross-group refusals on 2026-08-25.
+    #[test]
+    fn a_worker_header_alone_identifies_the_caller() {
+        assert_eq!(caller_from_headers(&h(&[("x-amux-worker", "backend")])), "backend");
+    }
+
+    /// CONTROL: the old behaviour must still work. A client sending only
+    /// `x-amux-session` is the common case and must not regress.
+    #[test]
+    fn a_session_header_alone_still_identifies_the_caller() {
+        assert_eq!(caller_from_headers(&h(&[("x-amux-session", "amux")])), "amux");
+    }
+
+    /// Order matters and matches `hdr_worker`: worker wins when both are present.
+    #[test]
+    fn the_worker_header_wins_when_both_are_sent() {
+        let m = h(&[("x-amux-worker", "sender"), ("x-amux-session", "other")]);
+        assert_eq!(caller_from_headers(&m), "sender");
+    }
+
+    /// CONTROL: an EMPTY worker header must fall through, not shadow the session
+    /// one with "". Without this, a client sending `x-amux-worker: ""` would log
+    /// as anonymous while identifying itself perfectly well on the other header.
+    #[test]
+    fn an_empty_worker_header_falls_through_rather_than_shadowing() {
+        let m = h(&[("x-amux-worker", "   "), ("x-amux-session", "amux")]);
+        assert_eq!(caller_from_headers(&m), "amux");
+    }
+
+    /// CONTROL: no headers at all is still anonymous. A resolver that invented a
+    /// caller would be worse than the bug.
+    #[test]
+    fn no_identity_headers_stays_anonymous() {
+        assert_eq!(caller_from_headers(&HeaderMap::new()), "");
     }
 }
