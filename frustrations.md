@@ -2766,3 +2766,36 @@ FIX: c1c238b1 widens it from one fixture to a source sweep of the whole server
   crate. The general lesson is ethos rule 7's: ask where the defect would be
   INTRODUCED and confirm the fixture flows through that code, not an ancestor of
   it. A single-call-site guard is worth naming its scope in its own doc comment.
+
+---
+## The ledger cannot express that an entry is unvalidatable, so 20% of the open set can never drain
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux-frustrations
+CARD: AF-229
+SYMPTOM: `frustrations_audit.py` resolves every CARD: against the live board and printed one
+  advisory when it missed: "not on this board (other instance, or deleted)". Byte-identical
+  for AC-227 (amux-cloud, a LIVE lane here) and AEAB-18 (amux-errors-and-bugs, absent from
+  all 120 sessions, working out of a `~/Developer/amux` that does not exist on this machine).
+  12 of 59 open entries are AEAB-*; direct GET returns 404 for each, and 0 of 9,296 cards
+  carry that prefix while DESKT-*, also a non-fleet lane, carries 25.
+COST: The deletion protocol keys removal to the ORIGINATING session's sign-off, so those 12
+  have no party who can ever sign them off — they accumulate in the open set forever while
+  reading as ordinary work. This file's entire argument is a COUNT ("three entries sharing an
+  AREA is an argument"), so a fifth of the open set being permanently unactionable distorts
+  every AREA tally computed from it, including the ones used to decide what to rebuild next.
+  Not hypothetical: it is why the drive-to-zero sweep stalled at 59 rather than finishing.
+FIX: 04721906. The advisory stays advisory — a cross-instance id is not an error — but it now
+  discriminates, and the discriminator is the PREFIX NAMESPACE rather than author liveness.
+  That distinction is load-bearing: amux-rust is not live either, yet AR-114 answers HTTP 200,
+  so judging on liveness alone called six drainable AR-* entries permanently stranded on the
+  first run. Same commit fixes a defect it exposed rather than caused: `board.get()` was called
+  on the whole CARD string, so multi-id fields ("AR-114, AR-115, AR-116") had ALWAYS reported
+  unresolved, invisibly, until the branch started saying something specific and said it wrongly.
+  Two of three predicate mutations survived the first draft of the test suite, which is why the
+  roll-up and the empty-session-list controls exist as their own cells.
+  STILL OPEN, and it is Ethan's call, not mine: what actually happens to those 12 entries.
+  Reaching amux-errors-and-bugs, or retiring them with a rationale, is a decision about another
+  party's contributions (ethos rule 8). The audit now names them; it does not presume to sweep them.
