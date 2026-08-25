@@ -755,7 +755,7 @@ pub async fn reject(
     // send you queued is not a bypass; refusing it would leave a worker that
     // notices its own mistake with no way to clean up after itself, which is
     // what left two probe drafts in Ethan's banner.
-    match crate::api::email_approval::discard(&home, &id) {
+    match crate::api::email_approval::discard(&home, &id, &by) {
         Some(doc) => {
             let session = doc.get("session").and_then(Value::as_str).unwrap_or("").to_string();
             tracing::info!(
@@ -2060,6 +2060,46 @@ mod tests {
             e["error"].as_str().unwrap().contains("DISCARDED"),
             "the directory knows which end it met — say it: {e}"
         );
+        // AND IT NAMES WHO, rather than inventing a human (autodesk, third
+        // instance). The first version of this sentence read "a human rejected
+        // it" — while the ledger row for a headerless discard correctly says
+        // `rejected_by: "unidentified"`. The message asserted what the row
+        // refuses to, and pointed at that row as proof.
+        assert!(
+            e["error"].as_str().unwrap().contains("'dashboard'"),
+            "name the rejecter this doc actually recorded: {e}"
+        );
+        assert!(
+            e["error"].as_str().unwrap().contains("CLAIMED, not verified"),
+            "and say the identity is unverified, because nothing here checked it: {e}"
+        );
+
+        // THE UNIDENTIFIED CASE, which is the one that produced the false
+        // sentence: a headerless reject is permitted (it fails safe — refusing
+        // to send destroys nothing that was going to be sent) and must NOT be
+        // narrated as a human.
+        let (st, res2) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "someone@customer.com", "subject": "s2", "body": "b",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{res2}");
+        let id2 = res2["approval_id"].as_str().unwrap().to_string();
+        let (st, _) =
+            send_req(&app, "POST", &format!("/api/email/reject/{id2}"), None, &[]).await;
+        assert_eq!(st, StatusCode::OK, "a headerless discard fails safe and is allowed");
+        let (_, e3) =
+            send_req(&app, "POST", &format!("/api/email/reject/{id2}"), None, &[]).await;
+        let msg = e3["error"].as_str().unwrap();
+        assert!(
+            !msg.contains("a human"),
+            "NOBODY was identified — the sentence must not invent one: {msg}"
+        );
+        assert!(msg.contains("not known"), "say so plainly instead: {msg}");
 
         // AND APPROVE MUST REFUSE IT AFTERWARDS. A discarded draft that could
         // still be released would make the button a suggestion.

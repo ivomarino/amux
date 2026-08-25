@@ -221,10 +221,33 @@ pub fn fate(home: &Path, id: &str) -> String {
                 GET /api/email/log shows who released it and when."
             .into();
     }
-    if dir.join(format!("{id}.rejected.json")).exists() {
-        return "this approval was DISCARDED — a human rejected it and it was never sent. \
-                GET /api/email/log shows who discarded it and why."
-            .into();
+    // NAME THE REJECTER, NEVER INFER ONE (autodesk, third instance of this
+    // defect in one day). This said "a human rejected it" — while the ledger row
+    // for a headerless discard correctly reads `rejected_by: "unidentified"`.
+    // So the MESSAGE asserted what the ROW refuses to assert, and pointed the
+    // reader at that row as proof. An operator reads the message, not the row.
+    //
+    // Same family as `approved_by: "dashboard (no worker origin)"` and the
+    // three-way 404, both fixed hours earlier. I wrote this one after fixing
+    // those, which is the part worth remembering: knowing the rule did not stop
+    // me applying its inverse in the next sentence I typed.
+    let rejected = dir.join(format!("{id}.rejected.json"));
+    if rejected.exists() {
+        let by = std::fs::read_to_string(&rejected)
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .and_then(|d| d.get("rejected_by").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        return match by.as_str() {
+            "" | "unidentified" => "this approval was DISCARDED and never sent. The caller did \
+                                    not identify itself, so who discarded it is not known — \
+                                    GET /api/email/log has the row."
+                .into(),
+            who => format!(
+                "this approval was DISCARDED by '{who}' and never sent (the identity is \
+                 CLAIMED, not verified). GET /api/email/log has the row."
+            ),
+        };
     }
     if dir.join(format!("{id}.expired.json")).exists() {
         return "this approval EXPIRED unreleased (1h TTL) — the worker must request the send again"
@@ -239,14 +262,29 @@ pub fn fate(home: &Path, id: &str) -> String {
 /// than deleted, like every other terminal state here, so "what happened to
 /// apr_X" stays answerable from the directory alone — and so `fate()` can tell a
 /// later caller it was discarded rather than guessing.
-pub fn discard(home: &Path, id: &str) -> Option<Value> {
+pub fn discard(home: &Path, id: &str, by: &str) -> Option<Value> {
     if !valid_id(id) {
         return None;
     }
     let dir = approvals_dir(home);
     let live = dir.join(format!("{id}.json"));
-    let doc = serde_json::from_str::<Value>(&std::fs::read_to_string(&live).ok()?).ok()?;
-    std::fs::rename(&live, dir.join(format!("{id}.rejected.json"))).ok()?;
+    let mut doc = serde_json::from_str::<Value>(&std::fs::read_to_string(&live).ok()?).ok()?;
+    // WHO, RECORDED IN THE DOC ITSELF (autodesk, third instance). `fate()` reads
+    // the directory and nothing else, so without this it could only GUESS who
+    // discarded a draft — and it guessed "a human", which is exactly the
+    // assertion this endpoint spent the morning learning not to make.
+    if let Some(o) = doc.as_object_mut() {
+        o.insert("rejected_by".into(), Value::String(by.to_string()));
+        o.insert("rejected_at".into(), json!(now_f64()));
+    }
+    let dest = dir.join(format!("{id}.rejected.json"));
+    // Write the enriched doc to the destination, then remove the live file. Not
+    // a rename, because the rename would carry the ORIGINAL bytes and lose the
+    // attribution just added. Ordering matters: the destination exists before
+    // the source goes, so a crash between them leaves a discarded record rather
+    // than a vanished draft.
+    std::fs::write(&dest, serde_json::to_string(&doc).ok()?).ok()?;
+    std::fs::remove_file(&live).ok()?;
     Some(doc)
 }
 
