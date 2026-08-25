@@ -1419,6 +1419,7 @@ pub(crate) fn detect_latency_at(
     // service time" differently.
     let mut outliers_spanned = 0usize;
     let mut outliers_considered = 0usize;
+    let mut outliers_failed = 0usize;
     if let Ok(mut stmt) = conn.prepare(
         "SELECT method, path, latency_ms, ts, status, boot_at, load1 FROM _amux_request_log \
          WHERE ts >= ?1 AND latency_ms >= ?2 \
@@ -1440,6 +1441,36 @@ pub(crate) fn detect_latency_at(
                 outliers_considered += 1;
                 if spans_own_restart(ts, ms, row_boot, boot) {
                     outliers_spanned += 1;
+                    continue;
+                }
+                // A REQUEST THAT FAILED IS NOT A LATENCY MEASUREMENT (AMUX-3709).
+                //
+                // Its duration is whatever timeout terminated it, so filing it as
+                // "took 30.0s" sends the reader hunting for slowness in an
+                // endpoint that is fast. The specimen: GET /api/browser/screenshot
+                // 502 at 30,006ms, which is the CDP `Page.captureScreenshot timed
+                // out after 30s` path in api/browser.rs — the tab wedged. Every
+                // other row on that endpoint in the same 24h was 200 at 197-3242ms.
+                // It filed AMUX-3709 ("took 30.0s") while the SAME failure was
+                // already AMUX-3708 ("→ HTTP 502 (2x)"): two cards, two queues,
+                // one fault, and the accurate one is not the one a lane picked up.
+                //
+                // Scoped to >= 500 ON PURPOSE, and that scope is what makes the
+                // exclusion safe rather than a blind spot: it is exactly the set
+                // the 5xx filer above already selects (`WHERE status >= 500`), so
+                // an excluded row still produces a card, just the one that names
+                // the fault. 4xx rows stay in, because nothing else would report a
+                // slow one.
+                //
+                // AMUX-3588 saw this double-filing first and fixed the fan-OUT
+                // half (4+ endpoints failing together roll into one card). It
+                // explicitly rejected "durations cluster at the timeout value" as
+                // the discriminator, and rightly — that guesses at one failure
+                // mode from a number. This is not that heuristic: it reads the
+                // row's own status, and it closes the single-endpoint case the
+                // breadth rule cannot see.
+                if status >= 500 {
+                    outliers_failed += 1;
                     continue;
                 }
                 let target = rl::normalize_target(&path);
@@ -1472,6 +1503,16 @@ pub(crate) fn detect_latency_at(
         considered = outliers_considered,
         excluded = outliers_spanned,
         "latency outliers: restart-spanning rows excluded (AF-175)"
+    );
+    // Same rule, same reason (AF-178): unconditional, including zero. A silent
+    // exclusion and an exclusion that never ran read identically, and this one
+    // is the difference between a lane investigating a fast endpoint and a lane
+    // reading the 5xx card that names the actual fault.
+    tracing::info!(
+        target: "autofix",
+        considered = outliers_considered,
+        excluded = outliers_failed,
+        "latency outliers: FAILED (5xx) rows excluded — already filed by the 5xx path (AMUX-3709)"
     );
 
     // FAN-IN BEFORE FAN-OUT, for outliers (AMUX-3588). The same rule the
@@ -6622,6 +6663,52 @@ mod tests {
         assert!(
             f2.iter().any(|x| x.signature.contains("/api/schedules/{id}/run")),
             "900s exceeds the 600s the endpoint enforces on itself — a bound failed: {f2:?}"
+        );
+    }
+
+    /// AMUX-3709: a request that FAILED is not a latency measurement, and the
+    /// 5xx path already owns it.
+    ///
+    /// THE SPECIMEN IS THE FIXTURE. GET /api/browser/screenshot answered 502 in
+    /// 30,006ms on 2026-08-25 11:12:41 — the CDP `Page.captureScreenshot timed
+    /// out after 30s` path, i.e. a wedged tab, not a slow endpoint. Every other
+    /// row on that route in the same 24h was 200 at 197-3242ms. It filed
+    /// AMUX-3709 ("took 30.0s") while the same failure was ALREADY AMUX-3708
+    /// ("-> HTTP 502 (2x)"). Two cards, two queues, one fault, and the lane
+    /// picked up the one that names an endpoint that was never slow.
+    ///
+    /// BOTH DIRECTIONS, and the second cell is the load-bearing one: excluding
+    /// 5xx must not switch the detector off for the same route. A genuinely
+    /// slow SUCCESS still has to file, because that is a latency story nothing
+    /// else reports — the 5xx filer cannot see a 200.
+    #[tokio::test]
+    async fn a_failed_request_is_not_filed_as_slow_but_a_slow_success_still_is() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // The filed row, verbatim: 502 at the 30s CDP timeout.
+        log_row(&st, Row { ts: now - 500.0, method: "GET", path: "/api/browser/screenshot", family: "/api/browser", status: 502, body: "", worker: "", ua: "curl/8", ms: 30_006.0 });
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/browser/screenshot")),
+            "a 502 at its own timeout is the 5xx path's card, not a latency card: {f:?}"
+        );
+
+        // A 4xx stays IN: nothing else would report a slow one, so excluding it
+        // would be a blind spot rather than a de-duplication.
+        log_row(&st, Row { ts: now - 400.0, method: "GET", path: "/api/browser/state", family: "/api/browser", status: 404, body: "", worker: "", ua: "curl/8", ms: 40_000.0 });
+        let (f4, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
+        assert!(
+            f4.iter().any(|x| x.signature.contains("/api/browser/state")),
+            "a 4xx has no other filer — excluding it would hide the row entirely: {f4:?}"
+        );
+
+        // And the SUCCESS case on the very route the exclusion touches, so the
+        // first cell cannot be passing because the detector went silent.
+        log_row(&st, Row { ts: now - 300.0, method: "GET", path: "/api/browser/screenshot", family: "/api/browser", status: 200, body: "", worker: "", ua: "curl/8", ms: 45_000.0 });
+        let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 2.0);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/browser/screenshot")),
+            "a 200 that really took 45s is a latency story nothing else reports: {f2:?}"
         );
     }
 
