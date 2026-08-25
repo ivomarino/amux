@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+use url::form_urlencoded;
 
 use crate::api::AppState;
 
@@ -45,11 +46,12 @@ pub fn routes() -> Router<AppState> {
 async fn start_auth(State(state): State<AppState>) -> impl IntoResponse {
     match load_github_config(&state).await {
         Ok(config) => {
+            let encoded_redirect = form_urlencoded::byte_serialize(config.redirect_uri.as_bytes()).collect::<String>();
             let auth_url = format!(
                 "https://github.com/login/oauth/authorize?\
                 client_id={}&redirect_uri={}&scope=repo,user",
-                config.client_id, 
-                urlencoding::encode(&config.redirect_uri)
+                config.client_id,
+                encoded_redirect
             );
             
             Json(serde_json::json!({

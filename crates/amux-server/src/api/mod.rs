@@ -84,6 +84,7 @@ pub mod why;
 pub mod worker_create;
 pub mod workers;
 pub mod workers_deadletters;
+pub mod github_connector;
 
 use crate::db::SharedStore;
 use axum::Router;
