@@ -3648,8 +3648,31 @@ fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
     let discarded = by("i.status='discarded'");
     let epic = by("i.type='epic'");
     let resolved = by("i.status IN ('discarded','done','verified')");
+    // `Option`, so a missing DENOMINATOR is null rather than 0.0. That
+    // separates "nothing to divide by" from "a small share" at the type level,
+    // where a string like "<1%" separates them only for a caller that parses it
+    // (mixpeek-frustrations' point, and it is the shape to copy if the nudge's
+    // coverage field ever becomes machine-readable).
+    //
+    // AND NEVER 0.0 FOR A NONZERO COUNT. One-decimal rounding is not integer
+    // truncation and does not collapse at 5-of-501 (that is 1.0), which is what
+    // made this safer than the nudge's coverage field — but it is not immune,
+    // only later: anything past a 2000:1 ratio rounds to 0.0, and `nudges` grows
+    // by roughly 42/day from 545 today, so this becomes reachable in about five
+    // weeks. A DATED bug, not an absent one. Below the rounding floor the
+    // unrounded value is emitted, because "0.0% discarded" beside
+    // `outcome_discarded: 1` is the ZERO THAT MEANS NONE again: not an
+    // imprecise number, a different claim.
     let pct = |n: i64| -> Option<f64> {
-        (nudges > 0 && n >= 0).then(|| (n as f64 * 1000.0 / nudges as f64).round() / 10.0)
+        (nudges > 0 && n >= 0).then(|| {
+            let exact = n as f64 * 100.0 / nudges as f64;
+            let rounded = (exact * 10.0).round() / 10.0;
+            if rounded == 0.0 && n > 0 {
+                exact
+            } else {
+                rounded
+            }
+        })
     };
     json!({
         "note": "one nudge per card ever (idem decompose:<id>), so `nudges` is the count of \
@@ -5786,6 +5809,46 @@ mod tests {
         assert_eq!(m2["outcome_discarded"], 2, "{m2}");
         assert_eq!(m2["discarded_pct"], 66.7, "{m2}");
         assert_eq!(m2["still_open"], 1, "{m2}");
+
+        // NEVER 0.0 FOR A NONZERO COUNT (mixpeek-frustrations, replaying my own
+        // claim against this code). One-decimal rounding survives 5-of-501 where
+        // integer division does not, but it still collapses past a 2000:1 ratio
+        // — and `nudges` grows ~42/day from 545, so that is weeks away, not
+        // never. A rendered 0.0 beside a nonzero count is the same
+        // zero-that-means-none as the nudge's "0% coverage".
+        for _ in 0..5000 {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,idem,source) \
+                 VALUES (?1,'lane','decompose-asked','{}',?2,'test')",
+                rusqlite::params![now_f64(), format!("decompose:pad{}", rand_pad())],
+            )
+            .expect("pad");
+        }
+        let m3 = capture_shell_cost(&conn);
+        // THE PREMISE, asserted: the ratio must actually be past the floor, or
+        // the guard below never fires and the cell passes against anything. The
+        // first draft padded to 2100 and 2-of-2103 rounds to 0.1, not 0.0 — so
+        // it was vacuous, and only a mutation run showed it. The floor is
+        // n*100/nudges < 0.05, i.e. nudges > 2000*n.
+        let nud = m3["nudges"].as_i64().unwrap();
+        let disc = m3["outcome_discarded"].as_i64().unwrap();
+        assert!(
+            disc > 0 && nud > 2000 * disc,
+            "premise: {disc} discarded of {nud} must be past the rounding floor: {m3}"
+        );
+        let d = m3["discarded_pct"].as_f64().expect("still a number");
+        assert!(
+            d > 0.0,
+            "2 discarded out of >2000 must not render as 0.0 — that reads as 'none': {m3}"
+        );
+    }
+
+    /// Distinct ids for the padding rows above. A counter, not randomness:
+    /// `idem` is UNIQUE, and the test must not depend on a clock or an RNG.
+    fn rand_pad() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
     }
 
     /// The check above can only be trusted if it FIRES. A prompt naming a verb
