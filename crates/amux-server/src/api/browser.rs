@@ -185,6 +185,43 @@ fn now_epoch() -> i64 {
 /// a browser's state — possibly a staged login — on its own judgment, which is
 /// rule 8. So this reports and recommends, and the caller still has to say
 /// `takeover: true` out loud.
+/// The real PAGES behind a CDP target list, as (title, host).
+///
+/// AMUX-3711. `cdp_list` returns every target, and most of them are not tabs a
+/// human would recognise: the specimen was 4 targets — two `browser_ui` omnibox
+/// popups, one `iframe`, and ONE page, which was a live Google sign-in. Saying
+/// "4 tab(s)" both overstated the activity and hid the one item that mattered.
+///
+/// HOST ONLY, NEVER THE FULL URL. A sign-in URL carries its `continue=` and
+/// state parameters, which are credentials-adjacent, and this string is going
+/// into an error body that gets logged and pasted around. The host plus the tab
+/// TITLE is everything a reader needs to judge, and neither is a secret.
+///
+/// Deliberately NOT a sign-in classifier. A keyword list would be a stop-gap
+/// that goes stale and that a better model does not need: "Sign in - Google
+/// Accounts (accounts.google.com)" is self-explanatory to whoever reads it, and
+/// reporting the page rather than a verdict about the page keeps this useful for
+/// the cases nobody thought to enumerate.
+fn summarize_pages(targets: &[Value]) -> Vec<(String, String)> {
+    targets
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+        .map(|t| {
+            let title = t.get("title").and_then(Value::as_str).unwrap_or("").trim().to_string();
+            let url = t.get("url").and_then(Value::as_str).unwrap_or("");
+            // Host only. Parsing by hand rather than pulling a URL crate in for
+            // one field; anything unrecognisable degrades to the scheme-ish
+            // prefix rather than leaking the query string.
+            let host = url
+                .split_once("://")
+                .map(|(_, rest)| rest.split(['/', '?', '#']).next().unwrap_or("").to_string())
+                .unwrap_or_else(|| url.split(['/', '?', '#']).next().unwrap_or("").to_string());
+            let title = if title.is_empty() { "(untitled)".to_string() } else { title };
+            (title, host)
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn takeover_refusal(
     profile: &str,
@@ -192,6 +229,7 @@ fn takeover_refusal(
     started_at: i64,
     pid: u32,
     tabs: Option<usize>,
+    pages: &[(String, String)],
     now: i64,
     requested_by: Option<&str>,
 ) -> Value {
@@ -202,12 +240,39 @@ fn takeover_refusal(
     // None` means CDP did not answer within 3s, which is itself worth saying:
     // silence there is a DIFFERENT state from "zero tabs" and collapsing them
     // would recreate the ambiguity this whole card is about.
+    // WHAT IS OPEN, not how many targets exist (AMUX-3711). The count alone
+    // pointed the wrong way on the specimen: "4 tab(s)" was two omnibox popups,
+    // an iframe, and one live Google sign-in, and "0.0h" read as brand new. Both
+    // numbers argued for takeover while the thing at risk was the single most
+    // costly thing to destroy — which the sentence above warns about in the
+    // abstract ("staged logins included") and could not point at.
+    let page_list = pages
+        .iter()
+        .map(|(t, h)| {
+            let t: String = t.chars().take(60).collect();
+            if h.is_empty() { format!("\"{t}\"") } else { format!("\"{t}\" ({h})") }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
     let idle = match tabs {
-        Some(0) => format!("held {held_h:.1}h with ZERO tabs open"),
-        Some(n) => format!("held {held_h:.1}h with {n} tab(s) open"),
         None => format!(
             "held {held_h:.1}h; its CDP port did not answer within 3s, so the tab count is \
              unknown (that is not the same as zero)"
+        ),
+        // Kept verbatim from AMUX-3610: with no targets at all there is nothing
+        // to describe, and this is the abandoned-holder wording that card's
+        // reporter needed to see.
+        Some(0) => format!("held {held_h:.1}h with ZERO tabs open"),
+        Some(n) if pages.is_empty() => format!(
+            "held {held_h:.1}h with {n} CDP target(s) but ZERO real pages open — all of them are \
+             chrome-internal, so there is no page state to lose"
+        ),
+        Some(n) => format!(
+            "held {held_h:.1}h with {} page(s) open: {page_list}. READ THOSE TITLES BEFORE YOU \
+             DECIDE — a takeover destroys them, and an auth flow mid-completion is not \
+             recoverable by reopening the tab. ({n} CDP targets in total; the rest are \
+             chrome-internal)",
+            pages.len()
         ),
     };
     let options: Vec<String> = if named {
@@ -224,9 +289,17 @@ fn takeover_refusal(
                 .into(),
             "drive the running browser via the session-scoped verbs instead of starting your own"
                 .into(),
-            "judge from the evidence, then say it out loud: {\"takeover\": true}. An \
-             unattributed holder with zero tabes for hours is very likely abandoned; a \
-             takeover is still YOUR call, not amux's."
+            // SYMMETRIC (AMUX-3711). This used to name only the abandoned case,
+            // so the single recommendation on offer always argued FOR the
+            // destructive action — including on the specimen, an unattributed
+            // holder two minutes old with a live Google sign-in. Advice that can
+            // only point one way is not advice. (It also said "tabes".)
+            "judge from the evidence above, then say it out loud: {\"takeover\": true}. An \
+             unattributed holder with zero pages for hours is very likely abandoned. An \
+             unattributed holder with pages open, however recently it started, is somebody \
+             mid-task — a fresh start is the WEAKER reason to take over, not the stronger \
+             one, because nothing has been finished yet. Either way the call is YOURS, not \
+             amux's."
                 .into(),
         ]
     };
@@ -258,7 +331,16 @@ fn takeover_refusal(
             "started_at": started_at,
             "held_secs": held_s,
             "held_h": (held_h * 10.0).round() / 10.0,
+            // `tabs_open` counts CDP TARGETS and always has; keeping it stable
+            // rather than silently redefining it, because a consumer comparing
+            // across versions would never see the change. `pages_open` is the
+            // number a human means by "tabs" (AMUX-3711: 4 targets, 1 page).
             "tabs_open": tabs,
+            "pages_open": pages.len(),
+            "pages": pages.iter().map(|(t, h)| json!({"title": t, "host": h}))
+                .collect::<Vec<_>>(),
+            "pages_note": "host only, never the full URL: a sign-in URL carries its continue= \
+                           and state parameters, and this body gets logged",
             "pid": pid,
         },
         "requested_by": requested_by.unwrap_or("(unattributed)"),
@@ -446,10 +528,16 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
             // forever, or destroy state nobody can vouch for. `cdp_list` has its
             // own 3s timeout, and a failure degrades the FIELD to null rather
             // than the refusal — a wedged CDP must not turn a 409 into a hang.
-            let tabs = chrome::cdp_list(r_port)
-                .await
-                .ok()
-                .and_then(|v| v.as_array().map(|a| a.len()));
+            let listed = chrome::cdp_list(r_port).await.ok();
+            let tabs = listed.as_ref().and_then(|v| v.as_array().map(|a| a.len()));
+            // KEEP THE ARRAY (AMUX-3711). This used to take `.len()` here and
+            // drop the rest, which threw away the only evidence that can decide
+            // the question a line before building the refusal that asks it.
+            let pages = listed
+                .as_ref()
+                .and_then(|v| v.as_array())
+                .map(|a| summarize_pages(a))
+                .unwrap_or_default();
             return err(
                 StatusCode::CONFLICT,
                 takeover_refusal(
@@ -458,6 +546,7 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
                     r_started,
                     r_pid,
                     tabs,
+                    &pages,
                     now_epoch(),
                     attrib.as_deref(),
                 ),
@@ -1546,11 +1635,97 @@ mod tests {
     /// into "there are no tabs" rebuilds the exact ambiguity this card is about,
     /// one field further down, and it is the reading that would let a caller
     /// destroy a live browser on the strength of a timeout.
+    /// AMUX-3711: the refusal must name WHAT is open, because the counts pointed
+    /// the wrong way.
+    ///
+    /// THE SPECIMEN IS THE FIXTURE, exactly as Ethan hit it on 2026-08-25. The
+    /// refusal said "held 0.0h with 4 tab(s) open" while GET /api/browser/status
+    /// showed those four targets were two `browser_ui` omnibox popups, one
+    /// `iframe`, and ONE page: a live Google sign-in on the
+    /// `hello-at-amux-io-google` profile. Both reported numbers argued for
+    /// takeover ("0.0h" reads brand new, "4 tabs" reads trivial) while the thing
+    /// at risk was the single most costly thing to destroy — the exact hazard
+    /// the refusal's own first sentence names in the abstract and could not
+    /// point at. `cdp_list` had the titles in hand and `.len()` threw them away.
+    #[test]
+    fn the_refusal_names_the_pages_it_is_protecting_not_just_a_target_count() {
+        // The four targets Chrome actually reported, verbatim in shape.
+        let targets = vec![
+            json!({"type":"browser_ui","title":"Omnibox Popup","url":"chrome://omnibox-popup.top-chrome/"}),
+            json!({"type":"browser_ui","title":"Omnibox Popup","url":"chrome://omnibox-popup.top-chrome/omnibox_popup_aim.html"}),
+            json!({"type":"page","title":"Sign in - Google Accounts","url":"https://accounts.google.com/v3/signin/identifier?continue=https%3A%2F%2Fmail.google.com%2F&state=SECRET"}),
+            json!({"type":"iframe","title":"check","url":"https://accounts.youtube.com/accounts/CheckConnection?pmpo=h"}),
+        ];
+        let pages = summarize_pages(&targets);
+        assert_eq!(pages.len(), 1, "4 targets, 1 real page: {pages:?}");
+        assert_eq!(pages[0].0, "Sign in - Google Accounts");
+        assert_eq!(pages[0].1, "accounts.google.com");
+
+        let started = 1_787_674_083i64;
+        let v = takeover_refusal(
+            "hello-at-amux-io-google",
+            "",
+            started,
+            9999,
+            Some(4),
+            &pages,
+            started + 120, // 0.0h, as reported
+            Some("amux"),
+        );
+        let e = v["error"].as_str().unwrap();
+        assert!(
+            e.contains("Sign in - Google Accounts") && e.contains("accounts.google.com"),
+            "the sentence a caller prints must name the sign-in it is about to destroy: {e}"
+        );
+        assert!(
+            e.contains("1 page(s)"),
+            "1 page is the honest number; '4 tab(s)' overstated it three-fold: {e}"
+        );
+
+        // NEVER THE FULL URL. This body is logged and pasted around, and a
+        // sign-in URL carries continue= and state=. The host answers the
+        // question; the query string only leaks.
+        let whole = serde_json::to_string(&v).unwrap();
+        assert!(!whole.contains("SECRET"), "the state parameter must not reach the body: {whole}");
+        // Scoped to the `pages` array and the sentence, NOT the whole body: the
+        // first draft asserted on the whole body and went red against correct
+        // code, because `pages_note` says the words "continue=" while EXPLAINING
+        // that it omits them. A probe that cannot tell a leak from a note about
+        // leaks reports working code as broken.
+        let rendered = format!("{}{}", serde_json::to_string(&v["running"]["pages"]).unwrap(), e);
+        for leak in ["continue=", "state=", "?", "/v3/signin"] {
+            assert!(
+                !rendered.contains(leak),
+                "{leak:?} reached the page evidence — host and title only: {rendered}"
+            );
+        }
+
+        // The recommendation must not be one-directional. Before this card the
+        // only advice offered was "very likely abandoned", i.e. the sole
+        // recommendation always argued for the destructive action.
+        let opts = serde_json::to_string(&v["your_options"]).unwrap();
+        assert!(
+            opts.contains("mid-task"),
+            "the live-work case has to be named too, or the advice can only ever point at \
+             takeover: {opts}"
+        );
+        assert!(!opts.contains("tabes"), "typo: {opts}");
+
+        // AND the abandoned case must still read as abandoned, or this fix would
+        // just have inverted the bias instead of removing it.
+        let abandoned = takeover_refusal("default", "", started, 9999, Some(4), &[], started + 66_600, None);
+        let ae = abandoned["error"].as_str().unwrap();
+        assert!(
+            ae.contains("ZERO real pages") && ae.contains("no page state to lose"),
+            "4 chrome-internal targets and nothing else is a browser nobody is using: {ae}"
+        );
+    }
+
     #[test]
     fn an_unattributed_holder_is_judgeable_from_the_refusal() {
         let started = 1_787_494_071i64; // 2026-08-23T10:07:51, the reported hold
         let now = started + 66_600; // 18.5h later
-        let v = takeover_refusal("default", "", started, 7623, Some(0), now, None);
+        let v = takeover_refusal("default", "", started, 7623, Some(0), &[], now, None);
 
         assert_eq!(v["running"]["tabs_open"], json!(0));
         assert_eq!(v["running"]["held_h"], json!(18.5), "{v}");
@@ -1575,17 +1750,37 @@ mod tests {
         );
 
         // NAMED HOLDER: the normal fleet path exists and must be offered.
-        let named = takeover_refusal("default", "mvs-research", started, 7623, Some(3), now, Some("amux"));
+        let named = takeover_refusal(
+            "default",
+            "mvs-research",
+            started,
+            7623,
+            Some(3),
+            &[("Docs".into(), "docs.example.com".into())],
+            now,
+            Some("amux"),
+        );
         assert_eq!(named["running"]["attribution"], json!("session"));
         let nopts = serde_json::to_string(&named["your_options"]).unwrap();
         assert!(
             nopts.contains("amux send mvs-research"),
             "naming the holder turns a dead end into 'go message that session': {nopts}"
         );
-        assert!(named["error"].as_str().unwrap().contains("3 tab(s)"), "{named}");
+        // The PROPERTY, not the wording: the tab evidence has to reach the
+        // sentence a caller prints. This cell pinned the literal "3 tab(s)"
+        // until AMUX-3711 replaced the count with the page list, which is a
+        // strictly better answer to the same question — a wording pin would
+        // have made improving the message look like a regression.
+        let ne = named["error"].as_str().unwrap();
+        assert!(
+            ne.contains("Docs") && ne.contains("docs.example.com"),
+            "the sentence must name what is open, not merely how much: {ne}"
+        );
+        assert_eq!(named["running"]["tabs_open"], json!(3), "the target count is still reported: {named}");
+        assert_eq!(named["running"]["pages_open"], json!(1), "1 page out of 3 targets: {named}");
 
         // CDP SILENT: must not read as zero.
-        let quiet = takeover_refusal("default", "", started, 7623, None, now, None);
+        let quiet = takeover_refusal("default", "", started, 7623, None, &[], now, None);
         assert!(quiet["running"]["tabs_open"].is_null(), "{quiet}");
         let qe = quiet["error"].as_str().unwrap();
         assert!(
