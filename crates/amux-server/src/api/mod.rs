@@ -231,6 +231,7 @@ pub fn router(state: AppState) -> Router {
         .merge(observability::routes())
         .merge(connectors::routes())
         .merge(secrets::routes())
+        .merge(github_connector::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).

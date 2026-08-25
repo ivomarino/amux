@@ -74,6 +74,7 @@ pub mod provider;
 pub mod push;
 pub mod runtime_jobs;
 pub mod secrets;
+pub mod mcp_secrets;
 pub mod tls;
 
 use std::sync::Arc;
