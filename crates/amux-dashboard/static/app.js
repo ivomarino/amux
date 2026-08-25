@@ -173,11 +173,34 @@ function _applyTheme(light) {
   if (meta) meta.content = light ? '#ffffff' : '#0d1117';
   _hljsApplyTheme(light);
 }
-// Swap the highlight.js theme stylesheet to match amux's light/dark mode.
-function _hljsApplyTheme(light) {
+// The highlight.js theme is ALWAYS the dark one, because its only consumer is
+// always dark (Ethan, 2026-08-25: "when i open a python file it's just dark i
+// cant read it").
+//
+// This used to swap to `github.min.css` in light mode, to "match amux's
+// light/dark mode". But hljs markup is produced in exactly one place —
+// `_fileHighlightHTML` — and every rule styling it is scoped to
+// `.file-overlay-body.file-code`, which keeps a DARK body in light mode by
+// deliberate design. app.css says so a few rules down, where the GUTTER was
+// given a light-mode override for exactly that reason: "The light-mode file
+// viewer keeps a DARK body (#1c2128), so the gutter must match that, not the
+// page background." The gutter was fixed for the dark body and the syntax
+// colours were not.
+//
+// So in light mode the viewer loaded a stylesheet designed for a WHITE
+// background and painted it onto #1c2128. Measured on the shipped build:
+//   hljs-subst   rgb(36,41,46)  on rgb(28,33,40)  -> ~1.1:1 contrast
+//   hljs-string  rgb(3,47,98)   on rgb(28,33,40)  -> ~1.2:1 contrast
+// WCAG's floor for body text is 4.5:1. That is not "hard to read", it is
+// invisible, and it is why the report was "just dark".
+//
+// The theme is not a preference here, it is a property of the one surface that
+// renders it. If a light-background hljs consumer is ever added, this becomes a
+// per-surface class rather than a document-level stylesheet swap.
+function _hljsApplyTheme() {
   const l = document.getElementById('hljs-theme');
-  if (l) l.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/'
-    + (light ? 'github.min.css' : 'github-dark.min.css');
+  if (l) l.href =
+    'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css';
 }
 function toggleTheme(checked) {
   const isLight = checked !== undefined ? checked : !document.body.classList.contains('light');
@@ -7890,7 +7913,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.733';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.734';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
