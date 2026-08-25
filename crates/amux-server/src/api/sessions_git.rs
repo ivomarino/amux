@@ -180,6 +180,26 @@ pub async fn sessions_git(State(state): State<AppState>) -> (StatusCode, Json<Va
 mod tests {
     use super::*;
 
+    /// SERIALISE THE CELLS THAT DRIVE THE GLOBAL STATICS (AMUX-3684 follow-up).
+    ///
+    /// `CACHE` and `REFRESH` are process-global by design — they are a load
+    /// ceiling for the whole server, not per-request state — and cargo runs the
+    /// tests in one binary on many threads. So three cells that each set
+    /// `CACHE` to a known value and then assert on it were racing: the stampede
+    /// cell caches a result and asserts it is there, while a sibling clears the
+    /// same static a microsecond later.
+    ///
+    /// It failed once in roughly forty runs, which is the worst frequency: rare
+    /// enough to read as a fluke and re-run, common enough to eventually land in
+    /// CI on somebody else's PR. Caught here on a full-suite run and fixed at
+    /// the shared resource rather than by retrying.
+    ///
+    /// A TOKIO mutex, not a std one: the guard is held across the `.await`s in
+    /// the async cells below, and clippy rightly refuses that for a blocking
+    /// guard. It also has no poisoning, so one cell panicking does not turn its
+    /// siblings into unwrap failures that hide which one actually broke.
+    static TEST_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     /// AMUX-3684. Four concurrent misses must produce ONE recompute, not four.
     ///
     /// The specimen, from the request log: slow requests arrived in groups of
@@ -206,6 +226,7 @@ mod tests {
     /// tracked on AMUX-3684 rather than done here.
     #[tokio::test]
     async fn a_stampede_of_misses_recomputes_once() {
+        let _gate = TEST_GATE.lock().await;
         *CACHE.lock().unwrap() = None;
         let computes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -244,6 +265,7 @@ mod tests {
     /// prevent.
     #[tokio::test]
     async fn the_refresh_lock_is_released_so_a_later_miss_still_recomputes() {
+        let _gate = TEST_GATE.lock().await;
         *CACHE.lock().unwrap() = None;
         {
             let _g = REFRESH.lock().await;
@@ -265,6 +287,9 @@ mod tests {
     // still looks well-formed).
     #[test]
     fn cache_is_a_ttl_not_a_permanent_store() {
+        // Sync cell, so there is no runtime to await on; `blocking_lock` is the
+        // right call precisely because nothing async is running here.
+        let _gate = TEST_GATE.blocking_lock();
         {
             let mut g = CACHE.lock().unwrap();
             *g = Some((Instant::now(), json!({"a": 1})));
