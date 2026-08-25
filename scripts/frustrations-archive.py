@@ -20,6 +20,12 @@ name on it would launder exactly the thing the protocol forbids.
 
 Usage:
     scripts/frustrations-archive.py <line> <validated-by> <evidence...>
+    scripts/frustrations-archive.py <line> <validated-by> --evidence-stdin
+    scripts/frustrations-archive.py <line> <validated-by> --evidence-file <path>
+
+PREFER --evidence-stdin/--evidence-file whenever the evidence quotes code.
+Inline text is evaluated by YOUR shell first, so backticks and $(...) in it are
+EXECUTED before this script sees them (AMUX-1888).
     scripts/frustrations-archive.py --list
 """
 import re
@@ -77,7 +83,29 @@ def main():
     if len(sys.argv) < 4:
         print(__doc__)
         return 2
-    ln, who, evidence = int(sys.argv[1]), sys.argv[2], " ".join(sys.argv[3:])
+    ln, who = int(sys.argv[1]), sys.argv[2]
+    # EVIDENCE FROM STDIN OR A FILE, not only from argv (AMUX-1888's shape, hit
+    # here on 2026-08-25).
+    #
+    # Evidence text quotes code, and code contains backticks. Passed as a
+    # positional argument inside double quotes, YOUR SHELL evaluates it before
+    # this script ever runs: `now` became the empty string, and
+    # `grep -c 'WORK ITSELF is at risk'` was EXECUTED and replaced by its own
+    # output, so an archived line read "so 0 returned 0 across the whole
+    # window". Both silently, in the file that exists to be the durable record
+    # of what was verified — the one place a mangled quotation is least
+    # recoverable, since the entry it describes has just been deleted from
+    # frustrations.md.
+    #
+    # `amux send` and `amux board add` already learned this and grew
+    # --stdin/--file. This tool took the same shape and had not.
+    if len(sys.argv) > 3 and sys.argv[3] == "--evidence-stdin":
+        evidence = sys.stdin.read().strip()
+    elif len(sys.argv) > 4 and sys.argv[3] == "--evidence-file":
+        with open(sys.argv[4]) as fh:
+            evidence = fh.read().strip()
+    else:
+        evidence = " ".join(sys.argv[3:])
     if ln not in spans:
         print(f"no entry starts at line {ln}. `--list` shows the heading lines.", file=sys.stderr)
         return 1

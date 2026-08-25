@@ -1592,46 +1592,6 @@ FIX: The hang is a bug; the defect worth fixing is that the test cannot REPORT i
 
 ---
 
-## The at-risk notice fired on work I had already committed, because the edit record is stamped when the HOOK ran
-AREA: attribution
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-21
-SESSION: amux-frustrations
-CARD: AF-130
-SYMPTOM: desktop committed frustrations.md and the staged-guard told me "differs from HEAD
-  and you have no commit for it; the WORK ITSELF is at risk — CHECK THIS ONE". False: my
-  work was in f84a485, their commit is +9/-1 and its one deleted line is from their own
-  DESKT-15 entry. The timestamps say why. f84a485 landed 12:26:04; an OBSERVED edit record
-  for frustrations.md was minted for me at 12:26:38; desktop committed at 12:27:19, and
-  owner_committed_since found no commit of mine newer than 12:26:38. The 12:26:38 record is
-  not a second edit — it is the SAME `cat >> frustrations.md` that opened the compound Bash
-  call whose later segments ran the audit, `git add` and `git commit`. The PostToolUse hook
-  fires after the whole command and the record lands 34s after the commit containing it.
-  Both halves are in the source: observed-edits-post.py:141 reads `os.stat(p).st_mtime` to
-  DECIDE, appends only the path, and posts `{"paths": hits}` — discarding the mtime it just
-  read; git_guard.rs:727-731 then stamps the server clock. An observed record's timestamp is
-  when the hook ran, never when the file was written.
-COST: one reconciliation of a commit that was fine. Small alone, structural in aggregate:
-  edit-then-commit in ONE Bash call is the dominant pattern for bypass-permissions lanes —
-  the exact lanes AF-123 was about, since they are told to work through Bash — so for every
-  such lane, on every commit, the record is guaranteed to postdate the commit. That makes
-  owner_committed_since structurally unable to return SettledByOwner for an observed record,
-  which is the discrimination AMUX-3436 added and that I validated as working earlier today.
-  It fails in the expensive direction too: AtRisk is the one fate the guard marks loud, on
-  purpose, so it will be believed. Firing it on correctly-committed work is how a lane learns
-  to skim the notice that matters.
-FIX: send the mtime the hook already read — `hits.append({"path": p, "mtime": st.st_mtime})`,
-  accepting the bare-string form too so an old installed copy keeps working while coverage
-  rolls over — and stamp that instead of `now`, clamped to <= now so a skewed clock cannot
-  mint a record that outlives the window. Then a file written at 12:25:50 and committed at
-  12:26:04 records 12:25:50 and the fate is SettledByOwner.
-  Note the instrumentation gap this sits inside: the victim notice is delivered as a session
-  message and never written to the server log — `grep -c 'WORK ITSELF is at risk'
-  server-rs.log` returns 0 across the whole retained window. Nobody can count how often it
-  fires or how often it was wrong. This entry is n=1 because n=1 is what the instrument
-  permits, which is AF-127's missing outcome row seen from the other side.
-
 ## A peer's half-saved file blocks an unrelated commit's gate — third sighting in one day
 AREA: shared-checkout
 SEVERITY: slows
@@ -2786,3 +2746,32 @@ FIX: 6d179755. `describe_cdp_probe` names which of {refused, poll timeout, HTTP 
   failure repeats was being deleted BY the fact that it repeated. A truncating diagnostic
   file is fine for a one-shot failure and actively hostile for a retried one, and nothing
   about `File::create` reads as a data-loss decision at the call site.
+
+## The archive tool took evidence as an argv positional, so my shell executed the code I quoted
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux-frustrations
+CARD: AF-222
+SYMPTOM: Archiving AF-130 with evidence that quoted code, via
+  `scripts/frustrations-archive.py <line> <who> "<evidence...>"`. Bash printed
+  `line 1: now: command not found` and the archive line landed corrupted in TWO places:
+  "asserts it comes back as , with the comment" (backtick-now evaluated to empty) and
+  "so 0 returned 0 across the whole window" — where `grep -c 'WORK ITSELF is at risk'`
+  was EXECUTED by my shell and replaced by its own output. The archive succeeded; only
+  the one visible bash error hinted anything was wrong, and it named the wrong half.
+COST: a mangled quotation written into the file that exists to be the DURABLE RECORD of
+  what was verified, and the least recoverable place for it: the entry it describes had
+  just been deleted from frustrations.md in the same operation. Caught only because the
+  stray `now: command not found` was on screen. A quieter substitution — `$(date)`, or a
+  grep that returns nothing — would have left a plausible sentence and no error at all.
+FIX: shipped in the same breath. `--evidence-stdin` / `--evidence-file` on the tool, with
+  the usage text saying to prefer them whenever the evidence quotes code. Verified the
+  file path preserves backticks and $(...) byte-for-byte.
+NOTE: this is AMUX-1888's shape, and the rule already exists — `amux send` and
+  `amux board add` both grew --stdin/--file for exactly this, and CLAUDE.md states it as a
+  fleet convention I have cited repeatedly this week. My own tool was written in the old
+  shape and I used it the old way. The lesson is not "remember the rule": it is that a
+  tool taking free text as an argv positional MAKES the trap, and every such tool in this
+  repo has now had to learn the same lesson separately.

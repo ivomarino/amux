@@ -811,3 +811,44 @@ NOTE (2026-08-24, amux-frustrations — author): STILL LIVE, reproduced in two c
   For `review` the two DO agree — checked today on AF-203, where the contract's "Findings
   written up" / "Ready for another set of eyes" is exactly what the board accepted. So the
   divergence is specific to `verified`, which is the transition the entry names.
+
+## The at-risk notice fired on work I had already committed, because the edit record is stamped when the HOOK ran
+VALIDATED: amux-frustrations | FIXED by amux in 475d74aa, BOTH halves, verified in the shipping code and in the log rather than from the commit message. (1) THE CAUSE: the hook now sends the mtime it already read — observed-edits-post.py:205 'hits.append({"path": p, "mtime": mt})' — with a comment naming the exact failure ('this hook fires after the WHOLE Bash command, so for edit-and-commit in one compound call a hook-time stamp postdates the commit and SettledByOwner can never fire'). Server reads it at git_guard.rs:782 and accepts bare strings so an older installed copy keeps working while coverage rolls over, which is what the entry asked for. (2) THE CLAMP the entry asked for is real and tested: git_guard.rs:3417 feeds mtime 99999.0 and asserts it comes back as `now`, with the comment 'a skewed clock must not mint a record that outlives the pruning window'; the adjacent cell pins that junk rows are SKIPPED, not defaulted. (3) THE INSTRUMENTATION GAP, which is the half I care most about and did not expect to be taken: the victim notice was delivered as a session message and never logged, so `grep -c 'WORK ITSELF is at risk'` returned 0 across the whole window and nobody could count how often it fired or how often it was WRONG. git_guard.rs:2347 now WARNs when an at-risk line ships (INFO for the all-settled shape), quoting my own 'n=1 because n=1 is what the instrument permits' in the comment. Verified it actually fires: 2 hits in server-rs.log, so the count is real and not merely emitted. Self-validated: amux-frustrations is the originating session; the fix is amux's.
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-21
+SESSION: amux-frustrations
+CARD: AF-130
+SYMPTOM: desktop committed frustrations.md and the staged-guard told me "differs from HEAD
+  and you have no commit for it; the WORK ITSELF is at risk — CHECK THIS ONE". False: my
+  work was in f84a485, their commit is +9/-1 and its one deleted line is from their own
+  DESKT-15 entry. The timestamps say why. f84a485 landed 12:26:04; an OBSERVED edit record
+  for frustrations.md was minted for me at 12:26:38; desktop committed at 12:27:19, and
+  owner_committed_since found no commit of mine newer than 12:26:38. The 12:26:38 record is
+  not a second edit — it is the SAME `cat >> frustrations.md` that opened the compound Bash
+  call whose later segments ran the audit, `git add` and `git commit`. The PostToolUse hook
+  fires after the whole command and the record lands 34s after the commit containing it.
+  Both halves are in the source: observed-edits-post.py:141 reads `os.stat(p).st_mtime` to
+  DECIDE, appends only the path, and posts `{"paths": hits}` — discarding the mtime it just
+  read; git_guard.rs:727-731 then stamps the server clock. An observed record's timestamp is
+  when the hook ran, never when the file was written.
+COST: one reconciliation of a commit that was fine. Small alone, structural in aggregate:
+  edit-then-commit in ONE Bash call is the dominant pattern for bypass-permissions lanes —
+  the exact lanes AF-123 was about, since they are told to work through Bash — so for every
+  such lane, on every commit, the record is guaranteed to postdate the commit. That makes
+  owner_committed_since structurally unable to return SettledByOwner for an observed record,
+  which is the discrimination AMUX-3436 added and that I validated as working earlier today.
+  It fails in the expensive direction too: AtRisk is the one fate the guard marks loud, on
+  purpose, so it will be believed. Firing it on correctly-committed work is how a lane learns
+  to skim the notice that matters.
+FIX: send the mtime the hook already read — `hits.append({"path": p, "mtime": st.st_mtime})`,
+  accepting the bare-string form too so an old installed copy keeps working while coverage
+  rolls over — and stamp that instead of `now`, clamped to <= now so a skewed clock cannot
+  mint a record that outlives the window. Then a file written at 12:25:50 and committed at
+  12:26:04 records 12:25:50 and the fate is SettledByOwner.
+  Note the instrumentation gap this sits inside: the victim notice is delivered as a session
+  message and never written to the server log — `grep -c 'WORK ITSELF is at risk'
+  server-rs.log` returns 0 across the whole retained window. Nobody can count how often it
+  fires or how often it was wrong. This entry is n=1 because n=1 is what the instrument
+  permits, which is AF-127's missing outcome row seen from the other side.
