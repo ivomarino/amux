@@ -936,3 +936,122 @@ FIX: The hang is a bug; the defect worth fixing is that the test cannot REPORT i
   run is worse than one that answers wrongly.
 
 ---
+
+## A detector went fully inert and its own debug surface called it "baseline has 0 samples"
+VALIDATED: amux-frustrations | Validated by running the regression test, not by reading the card.
+
+The entry asked for two things and both shipped:
+
+1. "Carry the pre-filter row count into the suppression so '0 of 46,825 rows, all
+   filtered' cannot be confused with '0 rows in the period'."
+   autofix.rs now emits: "blindness check ran: 0 of N families lost every row to
+   filtering (X rows considered, Y excluded). A zero here is a measurement;
+   silence would not be."
+
+2. "add an invariant that fails when a family with enough rows in the period has
+   an empty baseline." Filed as an ordinary Finding so it rides the pipeline that
+   already turns a detector's output into a board card — no new mechanism.
+
+AF-180 (amux, reviewing this entry) added the half I had missed and it is the
+better half: a healthy alarm and a broken one are byte-identical silences, so the
+HEALTHY zero goes through `suppressed`, which GET /api/debug/autofix already
+renders. The answer now appears where the unhealthy one would.
+
+Test run:
+  cargo test -p amux-server --lib a_baseline_deleted_by_a_filter
+  test runtime_jobs::autofix::tests::a_baseline_deleted_by_a_filter_is_an_alarm_not_a_quiet_suppression ... ok
+  test result: ok. 1 passed; 0 failed
+
+Its control is a LOGIC mutation (boot = None), which changes what the filter
+concludes and changes no string, so the cell cannot pass by coupling to wording.
+
+I am the originating session and I agree it is complete.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-178
+SYMPTOM: Reviewing AF-175 I found the latency regression detector had stopped working on the
+  running build. The only trace anywhere was in GET /api/debug/autofix:
+    {"detector":"latency","signature":"latency|p95|/api/board",
+     "reason":"baseline has 0 samples (<30) - no trailing norm to compare against yet"}
+  /api/board has 46,825 rows in the baseline period and /api/sessions has 122,848. They are the
+  two busiest families in the system. An upstream filter was excluding 99.75% of rows (213,397
+  of 213,935) and the suppression reported that as an absence of data. The same sentence is
+  emitted for a genuinely quiet endpoint, so a live detector outage is byte-identical to a new
+  install with no traffic yet.
+COST: The regression shape was dead on main and would have stayed dead silently. I only found
+  it because I was reviewing that specific commit; no sweep, no alarm and no invariant could
+  have surfaced it. Checked from two angles before saying so: /api/debug/invariants returns 461
+  invariants and the only autofix-adjacent one is board.autofix_cards_are_dispatchable, and in
+  the source base.len() is compared in exactly one place, the min_samples gate that produces
+  the suppression. Detector health is not checked anywhere.
+FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, all filtered"
+  cannot be confused with "0 rows in the period", and add an invariant that fails when a family
+  with enough rows in the period has an empty baseline. Both values are already in hand at the
+  point of suppression. Detail and acceptance on AF-178.
+
+---
+
+## The shared-checkout amend guard pins HEAD, not the staged set, so a correctly-pinned amend still absorbed a peer's work
+VALIDATED: amux-frustrations | Validated by re-running the shipped decision path, not by reading the card.
+
+The entry's complaint was that the pin protects the WRONG OPERAND: it proves the
+COMMIT BEING REWRITTEN is yours and says nothing about the CONTENT BEING ABSORBED.
+That is now the durable half, shipped as AMUX-3407:
+
+  scripts/git-hooks/git-shared-guard.py:192  "the pin proves the COMMIT BEING..."
+  scripts/git-hooks/git-shared-guard.py:218  _amend_staged_decision — a pinned BARE
+                                             amend absorbs the whole staged set
+  scripts/git-hooks/git-shared-guard.py:286  names AF-106's exact incident in the refusal
+
+Test cells exist for the specific case rather than the general one, at
+scripts/git-hooks/test_git_shared_guard.py:149-180, and they run with REAL staged
+content because empty-staged short-circuits before any of the three branches:
+server-unreachable fail-open, pathspec-scoped no-refusal, check-disabled, and
+no-session/human-ungated.
+
+Ran scripts/git-hooks/test_git_shared_guard.py: ALL 51 PASS.
+
+Card AF-106 is `verified`. I am the originating session and I agree it is complete.
+AREA: git
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-106
+SYMPTOM: I ran `git commit --amend` to replace a placeholder commit message. The guard
+  refused the unpinned form and told me exactly what to do:
+    "BLOCKED ... git commit --amend without verified HEAD pin ... re-run pinned:
+     AMUX_AMEND_EXPECT=<that-sha> git commit --amend"
+  I did precisely that, with the sha I had just read off `git log -1`. It was allowed,
+  and it swept 139 lines of another session's in-flight work into a commit carrying MY
+  message: amux's AMUX-3110 dead-letter implementation (session_verbs.rs +132) plus
+  their untracked migrations/0024_steering_dead_letter.sql, under
+  "fix(instruments): /api/debug/downtime could not distinguish an empty history from a
+  broken query (AF-99)".
+  `--amend` with no pathspec commits the whole STAGED set, and a peer had staged theirs
+  in the seconds between my two commands.
+COST: ~20 minutes of disclosure, coordination and verification across two sessions, and a
+  permanently mislabelled commit — amux chose to leave f70fc51 as-is and add a provenance
+  note (3e77b20) rather than rewrite shared HEAD to fix a label. Cheap this time ONLY
+  because the peer was reachable and answered in five minutes; their own reply names the
+  real hazard, that they were about to conclude their work was uncommitted and re-commit
+  it. The near-miss is a duplicated 132-line change, or a `git checkout` over it.
+FIX: The guard verifies that the COMMIT BEING REWRITTEN is yours and says nothing about
+  whether the CONTENT BEING ABSORBED is. Pinning AMUX_AMEND_EXPECT protected the wrong
+  operand, and it protected it while telling me I was now safe — which is worse than no
+  guard, because I stopped thinking about the staged set at exactly the moment it started
+  mattering.
+  Durable shape, and it needs no new machinery (amux's suggestion, and I agree): the
+  amend path should warn — or refuse without an explicit ack — when the staged set
+  contains paths whose last editor, by the staged-guard's OWN attribution, is another
+  session. That is the identical ownership question the staged-guard already answers at
+  commit time; this is the same predicate at a second door, which is AMUX-2325's lesson
+  about a constraint whose sanctioned escape is unwalkable from the audited path.
+  Cheap interim, entirely on the caller: `git commit --amend -- <your paths>`. A
+  pathspec makes amend behave like the scoped commit the guard already pushes people
+  toward everywhere else, and nothing in the guard's message mentions it.
+
+---

@@ -1386,47 +1386,6 @@ FIX: Open, and it is a design call rather than a patch — carded as AEAB-40 and
   conflict structurally impossible, with the work being the greps in the rules, CLAUDE.md
   and `scripts/frustrations_audit.py`. Interim recipe, which worked three times today: take
   origin's file, append your entries VERBATIM, never let git interleave, then run the audit.
-## The shared-checkout amend guard pins HEAD, not the staged set, so a correctly-pinned amend still absorbed a peer's work
-AREA: git
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-20
-SESSION: amux-frustrations
-CARD: AF-106
-SYMPTOM: I ran `git commit --amend` to replace a placeholder commit message. The guard
-  refused the unpinned form and told me exactly what to do:
-    "BLOCKED ... git commit --amend without verified HEAD pin ... re-run pinned:
-     AMUX_AMEND_EXPECT=<that-sha> git commit --amend"
-  I did precisely that, with the sha I had just read off `git log -1`. It was allowed,
-  and it swept 139 lines of another session's in-flight work into a commit carrying MY
-  message: amux's AMUX-3110 dead-letter implementation (session_verbs.rs +132) plus
-  their untracked migrations/0024_steering_dead_letter.sql, under
-  "fix(instruments): /api/debug/downtime could not distinguish an empty history from a
-  broken query (AF-99)".
-  `--amend` with no pathspec commits the whole STAGED set, and a peer had staged theirs
-  in the seconds between my two commands.
-COST: ~20 minutes of disclosure, coordination and verification across two sessions, and a
-  permanently mislabelled commit — amux chose to leave f70fc51 as-is and add a provenance
-  note (3e77b20) rather than rewrite shared HEAD to fix a label. Cheap this time ONLY
-  because the peer was reachable and answered in five minutes; their own reply names the
-  real hazard, that they were about to conclude their work was uncommitted and re-commit
-  it. The near-miss is a duplicated 132-line change, or a `git checkout` over it.
-FIX: The guard verifies that the COMMIT BEING REWRITTEN is yours and says nothing about
-  whether the CONTENT BEING ABSORBED is. Pinning AMUX_AMEND_EXPECT protected the wrong
-  operand, and it protected it while telling me I was now safe — which is worse than no
-  guard, because I stopped thinking about the staged set at exactly the moment it started
-  mattering.
-  Durable shape, and it needs no new machinery (amux's suggestion, and I agree): the
-  amend path should warn — or refuse without an explicit ack — when the staged set
-  contains paths whose last editor, by the staged-guard's OWN attribution, is another
-  session. That is the identical ownership question the staged-guard already answers at
-  commit time; this is the same predicate at a second door, which is AMUX-2325's lesson
-  about a constraint whose sanctioned escape is unwalkable from the audited path.
-  Cheap interim, entirely on the caller: `git commit --amend -- <your paths>`. A
-  pathspec makes amend behave like the scoped commit the guard already pushes people
-  toward everywhere else, and nothing in the guard's message mentions it.
-
----
 ## SIX answer-shaped wrong results in one night, and in every one the tell was a MISSING ACCOMPANIMENT rather than the answer
 AREA: instruments
 SEVERITY: slows
@@ -2100,34 +2059,6 @@ FIX: the index is the shared resource nobody is arbitrating. Either (a) take a l
   Separately and cheaply: prepare-commit-msg must stamp the session of the process
   actually running git, and the staged-guard must warn in BOTH directions — "your
   staged files may ride out under someone else's commit" is the half it cannot say.
-
----
-## A detector went fully inert and its own debug surface called it "baseline has 0 samples"
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-23
-SESSION: amux-frustrations
-CARD: AF-178
-SYMPTOM: Reviewing AF-175 I found the latency regression detector had stopped working on the
-  running build. The only trace anywhere was in GET /api/debug/autofix:
-    {"detector":"latency","signature":"latency|p95|/api/board",
-     "reason":"baseline has 0 samples (<30) - no trailing norm to compare against yet"}
-  /api/board has 46,825 rows in the baseline period and /api/sessions has 122,848. They are the
-  two busiest families in the system. An upstream filter was excluding 99.75% of rows (213,397
-  of 213,935) and the suppression reported that as an absence of data. The same sentence is
-  emitted for a genuinely quiet endpoint, so a live detector outage is byte-identical to a new
-  install with no traffic yet.
-COST: The regression shape was dead on main and would have stayed dead silently. I only found
-  it because I was reviewing that specific commit; no sweep, no alarm and no invariant could
-  have surfaced it. Checked from two angles before saying so: /api/debug/invariants returns 461
-  invariants and the only autofix-adjacent one is board.autofix_cards_are_dispatchable, and in
-  the source base.len() is compared in exactly one place, the min_samples gate that produces
-  the suppression. Detector health is not checked anywhere.
-FIX: Carry the pre-filter row count into the suppression so "0 of 46,825 rows, all filtered"
-  cannot be confused with "0 rows in the period", and add an invariant that fails when a family
-  with enough rows in the period has an empty baseline. Both values are already in hand at the
-  point of suppression. Detail and acceptance on AF-178.
 
 ---
 ## A peer's uncommitted lint error blocked my commit and the message named their file, not them
