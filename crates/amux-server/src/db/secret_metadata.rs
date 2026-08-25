@@ -5,11 +5,11 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use rusqlite::{Connection, OptionalExtension, Row};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretMetadata {
-    pub id: i64,
+    pub id: Option<i64>,
     pub secret_path: String,
     pub service_name: String,
     pub purpose: String,
@@ -19,78 +19,66 @@ pub struct SecretMetadata {
     pub last_rotated: Option<DateTime<Utc>>,
 }
 
-/// Get metadata for a specific secret
-pub async fn get_metadata(pool: &SqlitePool, secret_path: &str) -> Result<Option<SecretMetadata>, sqlx::Error> {
-    let row = sqlx::query!(
-        r#"
-        SELECT id, secret_path, service_name, purpose, used_by, owner, rotation_days, last_rotated
-        FROM secret_metadata
-        WHERE secret_path = ?
-        "#,
-        secret_path
-    )
-    .fetch_optional(pool)
-    .await?;
+fn metadata_from_row(r: &Row<'_>) -> rusqlite::Result<SecretMetadata> {
+    let id: i64 = r.get(0)?;
+    let used_by_json: String = r.get(4)?;
+    let last_rotated_str: Option<String> = r.get(7)?;
 
-    Ok(row.map(|r| SecretMetadata {
-        id: r.id,
-        secret_path: r.secret_path,
-        service_name: r.service_name,
-        purpose: r.purpose,
-        used_by: serde_json::from_str(&r.used_by).unwrap_or_default(),
-        owner: r.owner,
-        rotation_days: r.rotation_days,
-        last_rotated: r.last_rotated.and_then(|ts| {
+    Ok(SecretMetadata {
+        id: Some(id),
+        secret_path: r.get(1)?,
+        service_name: r.get(2)?,
+        purpose: r.get(3)?,
+        used_by: serde_json::from_str(&used_by_json).unwrap_or_default(),
+        owner: r.get(5)?,
+        rotation_days: r.get(6)?,
+        last_rotated: last_rotated_str.and_then(|ts| {
             DateTime::parse_from_rfc3339(&ts)
                 .ok()
                 .map(|dt| dt.with_timezone(&Utc))
         }),
-    }))
+    })
+}
+
+/// Get metadata for a specific secret
+pub fn get_metadata(conn: &Connection, secret_path: &str) -> rusqlite::Result<Option<SecretMetadata>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, secret_path, service_name, purpose, used_by, owner, rotation_days, last_rotated
+         FROM secret_metadata
+         WHERE secret_path = ?1"
+    )?;
+
+    stmt.query_row([secret_path], metadata_from_row).optional()
 }
 
 /// List all secret metadata
-pub async fn list_all(pool: &SqlitePool) -> Result<Vec<SecretMetadata>, sqlx::Error> {
-    let rows = sqlx::query!(
-        r#"
-        SELECT id, secret_path, service_name, purpose, used_by, owner, rotation_days, last_rotated
-        FROM secret_metadata
-        ORDER BY service_name, secret_path
-        "#
-    )
-    .fetch_all(pool)
-    .await?;
+pub fn list_all(conn: &Connection) -> rusqlite::Result<Vec<SecretMetadata>> {
+    let mut stmt = conn.prepare(
+        "SELECT id, secret_path, service_name, purpose, used_by, owner, rotation_days, last_rotated
+         FROM secret_metadata
+         ORDER BY service_name, secret_path"
+    )?;
 
-    Ok(rows
-        .into_iter()
-        .map(|r| SecretMetadata {
-            id: r.id,
-            secret_path: r.secret_path,
-            service_name: r.service_name,
-            purpose: r.purpose,
-            used_by: serde_json::from_str(&r.used_by).unwrap_or_default(),
-            owner: r.owner,
-            rotation_days: r.rotation_days,
-            last_rotated: r.last_rotated.and_then(|ts| {
-                DateTime::parse_from_rfc3339(&ts)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-            }),
-        })
-        .collect())
+    let rows = stmt.query_map([], metadata_from_row)?;
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row?);
+    }
+    Ok(result)
 }
 
 /// Create or update secret metadata
-pub async fn set_metadata(pool: &SqlitePool, metadata: &SecretMetadata) -> Result<(), sqlx::Error> {
-    let used_by_json = serde_json::to_string(&metadata.used_by).unwrap_or_else(|_| "[]".to_string());
+pub fn set_metadata(conn: &Connection, metadata: &SecretMetadata) -> rusqlite::Result<()> {
+    let used_by_json = serde_json::to_string(&metadata.used_by)
+        .unwrap_or_else(|_| "[]".to_string());
     let last_rotated = metadata
         .last_rotated
         .map(|dt| dt.to_rfc3339());
 
-    sqlx::query!(
-        r#"
-        INSERT INTO secret_metadata
+    conn.execute(
+        "INSERT INTO secret_metadata
           (secret_path, service_name, purpose, used_by, owner, rotation_days, last_rotated)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
         ON CONFLICT(secret_path) DO UPDATE SET
           service_name = excluded.service_name,
           purpose = excluded.purpose,
@@ -98,18 +86,17 @@ pub async fn set_metadata(pool: &SqlitePool, metadata: &SecretMetadata) -> Resul
           owner = excluded.owner,
           rotation_days = excluded.rotation_days,
           last_rotated = excluded.last_rotated,
-          updated_at = CURRENT_TIMESTAMP
-        "#,
-        metadata.secret_path,
-        metadata.service_name,
-        metadata.purpose,
-        used_by_json,
-        metadata.owner,
-        metadata.rotation_days,
-        last_rotated
-    )
-    .execute(pool)
-    .await?;
+          updated_at = CURRENT_TIMESTAMP",
+        rusqlite::params![
+            metadata.secret_path,
+            metadata.service_name,
+            metadata.purpose,
+            used_by_json,
+            metadata.owner,
+            metadata.rotation_days,
+            last_rotated
+        ],
+    )?;
 
     Ok(())
 }
@@ -150,7 +137,7 @@ mod tests {
     #[test]
     fn test_needs_rotation() {
         let metadata = SecretMetadata {
-            id: 1,
+            id: Some(1),
             secret_path: "test.key".to_string(),
             service_name: "test-service".to_string(),
             purpose: "test".to_string(),
@@ -166,7 +153,7 @@ mod tests {
     #[test]
     fn test_does_not_need_rotation() {
         let metadata = SecretMetadata {
-            id: 1,
+            id: Some(1),
             secret_path: "test.key".to_string(),
             service_name: "test-service".to_string(),
             purpose: "test".to_string(),

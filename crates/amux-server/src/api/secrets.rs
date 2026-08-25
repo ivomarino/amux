@@ -156,7 +156,22 @@ async fn get_metadata(
     State(state): State<AppState>,
     Path(path): Path<String>,
 ) -> impl IntoResponse {
-    match secret_metadata::get_metadata(&state.store.pool, &path).await {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to get database connection: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": "database connection failed"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match secret_metadata::get_metadata(&conn, &path) {
         Ok(Some(metadata)) => {
             let days_until = secret_metadata::days_until_rotation(&metadata);
             let needs_rotation = secret_metadata::needs_rotation(&metadata);
@@ -221,7 +236,22 @@ async fn set_metadata(
     let mut metadata = req;
     metadata.secret_path = path.clone();
 
-    match secret_metadata::set_metadata(&state.store.pool, &metadata).await {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to get database connection: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": "database connection failed"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match secret_metadata::set_metadata(&conn, &metadata) {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({
@@ -247,7 +277,22 @@ async fn set_metadata(
 
 /// List all secrets with their metadata (manifest)
 async fn list_manifest(State(state): State<AppState>) -> impl IntoResponse {
-    match secret_metadata::list_all(&state.store.pool).await {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::error!("Failed to get database connection: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({
+                    "ok": false,
+                    "error": "database connection failed"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    match secret_metadata::list_all(&conn) {
         Ok(metadata_list) => {
             let manifest: Vec<_> = metadata_list
                 .iter()
