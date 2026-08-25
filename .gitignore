@@ -56,3 +56,16 @@ e2e/playwright-report/
 # eslint.config.mjs already treats absence as correct: a direct eslint run
 # without it fails loudly on no-undef rather than passing silently.
 crates/amux-dashboard/eslint.globals.generated.json
+
+# Secrets management
+secrets/*.yaml
+secrets/*.yml
+# Keep only encrypted .sops.yaml and .age files
+!secrets/*.sops.yaml
+!secrets/*.age
+!.sops.yaml
+
+# Temporary plaintext backups
+*.secrets.bak
+/tmp/amux-secrets-*
+
