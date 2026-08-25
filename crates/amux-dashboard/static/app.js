@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.729';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.730';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19413,6 +19413,26 @@ function _renderBoardArchivedSection(container) {
     // apply it too or it shows a different population than the columns beside
     // it under the same query. `_bqFilter` is shared rather than re-derived.
     let rows = (boardArchived || []).slice();
+    // THE OWNER TOGGLE IS NOT APPLIED HERE, and this file already records why.
+    //
+    // Rendered, the first version showed "Archived (3008)" above ONE row. The
+    // count comes from ?count=1 (unfiltered by owner, because owner filtering is
+    // client-side and the server cannot do it), while the rows were being run
+    // through the Human/Sessions toggle — which defaults to Human, and archived
+    // cards are almost all agent-owned. Header and body describing different
+    // populations, which is the defect this whole section was built to fix.
+    //
+    // renderBoard's own comment, twelve thousand lines up, is the same bug:
+    // "Stacking made the chip counts lie: 'Rotting 5' rendered 0 cards, because
+    // all 5 are agent-owned and the toggle defaults to Human. The count is
+    // computed over the same unfiltered set, so a chip that says 5 must show 5.
+    // The toggle is the browse default; the query is the filter."
+    //
+    // So the same rule: the QUERY filters this section (a user asked for it),
+    // the TOGGLE does not (it is a browse default for active work, and archive
+    // review is not about ownership). Only rendering it caught this — every
+    // data-layer check passed, because the mismatch is between a server count
+    // and a client filter and neither side is wrong alone.
     // SAVE/RESTORE `_bqRankActive` around the shared filter. `_bqFilter` sets
     // that global, and `_boardCardSort`'s own comment says it must reflect "the
     // _bqFilter call that produced this render's `visible` set" — which is the
@@ -19423,10 +19443,6 @@ function _renderBoardArchivedSection(container) {
     const _rankWas = _bqRankActive;
     rows = _bqFilter(rows, boardSearchQuery);
     _bqRankActive = _rankWas;
-    if (!(boardSearchQuery || '').trim()) {
-      rows = rows.filter(i => boardOwnerFilter === 'agent'
-        ? i.owner_type === 'agent' : i.owner_type !== 'agent');
-    }
     if (!rows.length) {
       html += '<div class="board-archived-empty">'
         + (_archivedCountN === 0 ? 'Nothing archived.' : 'Loading…') + '</div>';
