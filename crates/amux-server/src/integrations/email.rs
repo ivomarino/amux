@@ -143,7 +143,29 @@ pub fn sig_html_to_text(sig_html: &str) -> String {
     if sig_html.is_empty() {
         return String::new();
     }
-    let br = regex::Regex::new(r"(?i)<\s*br\s*/?>").expect("static regex");
+    // `<br` PLUS ANY ATTRIBUTES (Ethan, 2026-08-24: "formatting wasn't
+    // retained"). This was `<\s*br\s*/?>`, which matches `<br>` and `<br/>` and
+    // NOT `<br style="...">` — and Gmail's signature editor puts an inline style
+    // on every single break. Unmatched, they fell through to the generic
+    // `<[^>]+>` stripper below and were DELETED, so every line break in a real
+    // signature silently vanished.
+    //
+    // What the recipient saw, from the primis reply of that evening, read back
+    // off the SENT message rather than reasoned about:
+    //
+    //   Ethan Steininger
+    //   Founder & CEO @ Mixpeek LinkedInSchedule time with me
+    //   915 Broadway, Suite 1200
+    //
+    // Two link labels concatenated into `LinkedInSchedule` because the break
+    // between them was dropped. `\b` after `br` so `<brother>` is still not a
+    // break.
+    //
+    // Only the text/plain alternative was affected. The HTML alternative
+    // carries the signature HTML verbatim and was correct throughout, which is
+    // exactly why this survived: whoever checked in Gmail saw the HTML part and
+    // it looked fine.
+    let br = regex::Regex::new(r"(?i)<\s*br\b[^>]*>").expect("static regex");
     let blocks = regex::Regex::new(r"(?i)</\s*(p|div|tr|table|h[1-6])\s*>").expect("static regex");
     let tags = regex::Regex::new(r"<[^>]+>").expect("static regex");
     let trail_ws = regex::Regex::new(r"[ \t]+\n").expect("static regex");
@@ -154,7 +176,25 @@ pub fn sig_html_to_text(sig_html: &str) -> String {
     t = html_unescape(&t);
     t = trail_ws.replace_all(&t, "\n").into_owned();
     t = many_nl.replace_all(&t, "\n\n").into_owned();
-    t.trim().to_string()
+    let out = t.trim().to_string();
+    // MAKE THE NEXT ONE SELF-ANNOUNCING. This bug shipped in the text/plain
+    // alternative of every email for as long as the signature had styled breaks,
+    // and nothing anywhere could have reported it: the HTML alternative was
+    // correct, so the send looked right to anyone who checked in Gmail.
+    //
+    // The condition cannot false-positive. A signature with no `<br` at all is
+    // legitimately one line and does not fire; one that HAS breaks and produced
+    // zero newlines has lost every one of them, which is never correct.
+    if !out.is_empty() && !out.contains('\n') && sig_html.to_ascii_lowercase().contains("<br") {
+        tracing::warn!(
+            html_len = sig_html.len(),
+            text_len = out.len(),
+            "email signature: HTML has <br> breaks but the plain-text rendering has NO line \
+             breaks — the text/plain alternative is collapsing the signature onto one line \
+             (this is how `LinkedInSchedule time with me` reached a customer on 2026-08-24)"
+        );
+    }
+    out
 }
 
 /// The handful of entities `html.unescape` sees in real signatures.
@@ -1808,6 +1848,54 @@ mod tests {
         let sig = "<div><b>Ethan</b><br>Founder, Mixpeek</div><p>ethan&amp;co</p>";
         assert_eq!(sig_html_to_text(sig), "Ethan\nFounder, Mixpeek\nethan&co");
         assert_eq!(sig_html_to_text(""), "");
+
+        // THE REAL SIGNATURE, not a convenient one (Ethan, 2026-08-24:
+        // "formatting wasn't retained"). Lifted from the sent MIME of the
+        // primis reply — Gmail's editor puts an inline style on EVERY break,
+        // and the old `<\s*br\s*/?>` matched none of them, so they fell through
+        // to the tag stripper and were deleted.
+        //
+        // The bare-`<br>` fixture above passed the whole time. It is convenient
+        // precisely because it lacks the property that made the incident.
+        let real = concat!(
+            r#"Ethan Steininger<br>Founder &amp; CEO @ "#,
+            r#"<a href="https://mixpeek.com/" style="font-size:13px">Mixpeek</a> "#,
+            r#"<br style="color:rgb(213,218,222);font-size:13px">"#,
+            r#"<br style="color:rgb(213,218,222);font-size:13px">"#,
+            r#"<a href="https://www.linkedin.com/in/ethansteininger/" style="font-size:13px">LinkedIn</a>"#,
+            r#"<br style="color:rgb(213,218,222);font-size:13px">"#,
+            r#"<a href="https://calendly.com/mixpeek" style="font-size:13px">Schedule time with me</a>"#,
+        );
+        let txt = sig_html_to_text(real);
+        assert!(
+            !txt.contains("LinkedInSchedule"),
+            "the exact string a customer received: two link labels concatenated because the \
+             styled <br> between them was dropped: {txt:?}"
+        );
+        assert!(
+            txt.contains("Mixpeek") && txt.contains("LinkedIn") && txt.contains("Schedule time"),
+            "every label must survive — the fix must not trade a lost break for lost text: {txt:?}"
+        );
+        // Pinned as the exact rendering rather than a line count, because my
+        // first draft asserted 4 and the truth is 5: the doubled `<br><br>`
+        // between the title and the links becomes a real BLANK line, which is
+        // correct and which `lines()` counts. The code was right and the
+        // expectation was wrong, so the expectation moved.
+        assert_eq!(
+            txt,
+            "Ethan Steininger\nFounder & CEO @ Mixpeek\n\nLinkedIn\nSchedule time with me",
+            "the whole point is the shape, so assert the shape: {txt:?}"
+        );
+
+        // The boundary that keeps the widened pattern honest: `<br` must not
+        // swallow a tag that merely starts with those letters.
+        assert_eq!(
+            sig_html_to_text("a<brother>b"),
+            "ab",
+            "<brother> is stripped as an unknown tag, NOT treated as a line break"
+        );
+        // Self-closing and upper-case with attributes, both real in the wild.
+        assert_eq!(sig_html_to_text("a<BR CLASS='x'/>b"), "a\nb");
     }
 
     #[test]
