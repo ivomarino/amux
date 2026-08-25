@@ -76,11 +76,30 @@ MARKERS = [
     (r"\bnothing happen|\bno response\b|\bsilent\b", 2, "no-response"),
 ]
 # Short imperatives that mean "you did not do it", as opposed to new work.
-REPROMPT = re.compile(
-    r"^(just do it|do it|continue|go|now|\?+|well\?*|and\?*|status\??|"
+#
+# TWO CLASSES, and conflating them made a CONTINUATION read as a chase.
+# `and\?*` matched `^and\b`, so "and send the email with the ns" and "and
+# suggest a call this week" both scored as re-prompts — both were Ethan
+# finishing one thought in a second message, 8 and 9 seconds after the first,
+# which is the opposite of "you did not do it". Measured 2026-08-25: 2 of the
+# 3 new candidates that sweep produced, and the reprompt kind's whole meaning
+# is "a lane went quiet or a delivery did not land".
+#
+# `and` and `well` are prods ONLY when they are the entire message ("and?",
+# "well?"). Followed by content they introduce more work. The others carry
+# their meaning with a tail — "did you push it", "status of the sweep" — so
+# they keep the prefix form.
+REPROMPT_BARE = re.compile(r"^(and|well|now|go)\?*$", re.I)
+REPROMPT_PREFIX = re.compile(
+    r"^(just do it|do it|continue|\?+|status\??|"
     r"any update|did you|are you)\b",
     re.I,
 )
+
+
+def is_reprompt(norm):
+    """A chase, not a continuation. See REPROMPT_BARE above for why the split."""
+    return bool(REPROMPT_BARE.match(norm) or REPROMPT_PREFIX.match(norm))
 CONTROL = re.compile(
     r"(?:continue|go ahead|go on|proceed|keep going|yes|yep|ok(?:ay)?|sure|"
     r"do it|just do it|next|more|status|thanks?|ty|nice|good|perfect|done)"
@@ -138,7 +157,30 @@ def main():
     msgs = []
     for mid, ts, sess, text in rows:
         norm = normalize(text)
-        if len(norm) < 8:  # "ok", "yes" — not a request, cannot be a repeat
+        # SHORT = NOT A REQUEST, which is a statement about the REPEAT branch and
+        # was being applied to both (AF-224). Its own comment says "cannot be a
+        # repeat", and `continue` dropped the row from `msgs` entirely, so it
+        # never reached the re-prompt branch either.
+        #
+        # That silently disabled the re-prompt signal for the terse prods it
+        # exists to catch. Measured 2026-08-25, normalized lengths: "go" 2,
+        # "and" 3, "now" 3, "and?" 4, "well?" 5, "status?" 7 — every one under
+        # the gate, and every one a chase. "continue" survives on exactly 8
+        # characters, which is why the branch looked like it worked.
+        #
+        # So the REPROMPT table listed `and`, `well`, `now`, `go` and `status?`
+        # as prods while the gate above guaranteed none of them could arrive.
+        # The only form those tokens could ever match was the PREFIX one — "and
+        # <more work>" — i.e. a continuation, which is the opposite of a chase.
+        # They generated false positives exclusively (2 of 3 new candidates in
+        # that sweep) and could never generate a true one.
+        #
+        # Marked control rather than dropped: control rows are excluded from the
+        # repeat branch (what the gate wanted) and kept for the re-prompt branch,
+        # where the timing carries the meaning.
+        if len(norm) < 8:
+            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
+                         "norm": norm, "control": True})
             continue
         # CONTROL WORDS ARE NOT REQUESTS. "continue" appeared six times in the
         # first run as a near-duplicate of itself across three days, which is
@@ -224,7 +266,7 @@ def main():
         for i in range(1, len(group)):
             prev, cur = group[i - 1], group[i]
             gap_s = (cur["ts"] - prev["ts"]) / 1000
-            if gap_s <= 600 and REPROMPT.match(cur["norm"]) and len(cur["norm"]) < 60:
+            if gap_s <= 600 and is_reprompt(cur["norm"]) and len(cur["norm"]) < 60:
                 key = f"reprompt:{cur['id']}"
                 f = findings[key]
                 f["score"] = max(f["score"], 5)

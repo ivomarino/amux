@@ -52,6 +52,16 @@ rows = [
     # survive. Without this, deleting the repeat branch entirely passes cell C.
     (7, "make me a table of all the outstanding items", "user", "ts", now - 112_000_000, "", "", "direct"),
     (8, "make me a table of all the outstanding items", "user", "ts", now -   1_000_000, "", "", "direct"),
+    # E: a CONTINUATION 9s later — "and <more work>". Not a chase. The reprompt
+    # kind means "a lane went quiet or a delivery did not land"; this is Ethan
+    # finishing one thought in two messages. Two real specimens on 2026-08-25
+    # (gtm-ticker 9s, primis 8s) both scored as reprompts under `and\?*`.
+    (9,  "yes make the first touch land on contextual ad matching", "user", "gt", now - 600_000, "", "", "direct"),
+    (10, "and send the email with the ns",                          "user", "gt", now - 591_000, "", "", "direct"),
+    # F: a BARE prod 9s later — "and?" IS a chase and must still be caught, or
+    # the fix is a hollowing-out that passes cell E by reporting nothing.
+    (11, "go over the retriever numbers once more", "user", "pr", now - 400_000, "", "", "direct"),
+    (12, "and?",                                    "user", "pr", now - 391_000, "", "", "direct"),
 ]
 c.executemany("INSERT INTO cmd_history VALUES (?,?,?,?,?,?,?,?)", rows)
 c.commit()
@@ -113,6 +123,31 @@ sys.exit(0 if hit else 1)'; then
   ok "D: a same-session repeat 31h apart IS still reported (cell C did not hollow it out)"
 else
   bad "D: the same-session repeat was NOT reported — the repeat detector is now inert"
+  echo "$OUT" | head -30 | sed 's/^/       /'
+fi
+
+# Cell E: "and <more work>" is a CONTINUATION, not a re-prompt.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ids={m["id"] for f in d["findings"] if f["kind"]=="reprompt" for m in f["messages"]}
+sys.exit(0 if 10 not in ids else 1)'; then
+  ok "E: \"and <more work>\" is a continuation, not a chase"
+else
+  bad "E: a continuation scored as a re-prompt — the kind means a lane went quiet"
+  echo "$OUT" | head -30 | sed 's/^/       /'
+fi
+
+# Cell F: a BARE "and?" must STILL be caught. Without this, deleting the token
+# entirely passes cell E perfectly.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ids={m["id"] for f in d["findings"] if f["kind"]=="reprompt" for m in f["messages"]}
+sys.exit(0 if 12 in ids else 1)'; then
+  ok "F: a bare \"and?\" IS still a re-prompt (cell E did not hollow it out)"
+else
+  bad "F: the bare prod stopped being detected — the discriminator is now inert"
   echo "$OUT" | head -30 | sed 's/^/       /'
 fi
 
