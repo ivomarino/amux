@@ -47,7 +47,7 @@ pub async fn encrypt_and_persist(
     // Public key from .sops.yaml creation_rule
     let public_key = "age1l6c7nzuyp3esvtgxs26txkd285mq84rsyjlxmtgwdaz8tfg3yahsmnkfqj";
 
-    let encrypt_output = tokio::process::Command::new("age")
+    let encrypt_output = tokio::process::Command::new("/usr/bin/age")
         .arg("-r")
         .arg(public_key)
         .arg(&temp_path)
@@ -112,7 +112,7 @@ pub async fn load_and_decrypt(
     }
 
     // Decrypt using age
-    let decrypt_output = tokio::process::Command::new("age")
+    let decrypt_output = tokio::process::Command::new("/usr/bin/age")
         .arg("-d")
         .arg("-i")
         .arg(age_key_path)
