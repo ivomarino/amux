@@ -661,3 +661,35 @@ curl -sk https://localhost:8824/api/github/status
 - `GET /api/github/auth/callback` — Handle OAuth redirect
 
 All credentials are encrypted using the secrets infrastructure (Phases 1-4).
+
+## Secret Metadata Store (Phase 3 — Under Development)
+
+Tracks purpose, ownership, and rotation schedule for encrypted secrets.
+Endpoints: `GET /api/secrets/manifest`, `GET /api/secrets/{path}/metadata`, 
+`POST /api/secrets/{path}/metadata`
+
+Response includes pre-populated Google OAuth metadata with rotation tracking.
+
+### Known Build Issue: Binary Permissions
+
+The auto-builder (`rust-auto-build.sh`) may install the binary without execute
+permissions, causing "exec failed — Permission denied" during self-adoption.
+
+**Fix:**
+```bash
+# Check permissions (should show -rwx------)
+ls -l ~/.local/bin/amux-server-rs
+
+# If not executable:
+chmod +x ~/.local/bin/amux-server-rs
+
+# Restart server
+pkill -9 amux-server-rs
+~/.local/bin/amux-server-rs &
+
+# Verify (server listens on 8823, not 8824)
+curl -sk https://localhost:8823/health
+```
+
+**Note:** Port 8823 is the current server port (8824 was retired; 8822 is legacy).
+The `endpoint.json` self-heal handles port discovery for scripts using `$(amux url)`.
