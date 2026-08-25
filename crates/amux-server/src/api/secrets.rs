@@ -236,22 +236,13 @@ async fn set_metadata(
     let mut metadata = req;
     metadata.secret_path = path.clone();
 
-    let conn = match state.store.read() {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::error!("Failed to get database connection: {}", e);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({
-                    "ok": false,
-                    "error": "database connection failed"
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    match secret_metadata::set_metadata(&conn, &metadata) {
+    match state.store.write_async(move |conn| {
+        secret_metadata::set_metadata(conn, &metadata)?;
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![],
+        })
+    }).await {
         Ok(_) => (
             StatusCode::OK,
             Json(json!({
