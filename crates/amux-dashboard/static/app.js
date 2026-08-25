@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.717';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.718';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -34551,7 +34551,7 @@ async function _secretsTabLoad() {
 
     // Build toolbar with refresh button
     let html = '<div style="margin-bottom:20px; display:flex; gap:8px;">';
-    html += '<button onclick="_secretsRefresh()" style="padding:10px 16px; background:var(--accent); color:white; border:none; border-radius:4px; cursor:pointer; font-weight:bold;">🔄 Refresh Secrets</button>';
+    html += '<button onclick="_secretsRefresh()" style="padding:10px 16px; background:var(--accent); color:#fff; border:none; border-radius:4px; cursor:pointer; font-weight:bold; box-shadow:0 2px 4px rgba(0,0,0,0.2); transition:opacity 0.2s;">🔄 Refresh Secrets</button>';
     html += '</div>';
 
     if (!secrets.length) {
