@@ -2753,7 +2753,7 @@ SEVERITY: slows
 STATUS: fixed
 DATE: 2026-08-25
 SESSION: amux-frustrations
-CARD: AF-222
+CARD: AF-223
 SYMPTOM: Archiving AF-130 with evidence that quoted code, via
   `scripts/frustrations-archive.py <line> <who> "<evidence...>"`. Bash printed
   `line 1: now: command not found` and the archive line landed corrupted in TWO places:
