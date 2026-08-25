@@ -143,6 +143,12 @@ curl -sk -X POST -H 'Content-Type: application/json' \
 | `oauth.google.main` | google-oauth-connector | Google OAuth 2.0 credentials | platform-team | 90 days |
 | `amux.server-auth-token` | amux-server | API authentication token | platform-team | 365 days |
 | `ntfy.notification-topic` | ntfy-notifications | Push notifications | ops-team | 180 days |
+| `github.ivomarino` | github-cli | GitHub PAT for ivomarino account | platform-team | 90 days |
+| `github.im-synth` | github-cli | GitHub PAT for im-synth account | platform-team | 90 days |
+| `gitlab.main` | gitlab-cli | GitLab PAT for gitlab.com - ivomarino account | platform-team | 90 days |
+| `gitlab.kumbe` | gitlab-cli | GitLab PAT for gitlab.kumbe.it - ivofloadsio account | platform-team | 90 days |
+| `gitlab.iwf` | gitlab-cli | GitLab PAT for git.iwf.io - ivo-floads account | platform-team | 90 days |
+| `gitlab.lernetz` | gitlab-cli | GitLab PAT for gitlab.lernetz.ch - ivo.marino account | platform-team | 90 days |
 
 ---
 
