@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.727';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.728';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19383,7 +19383,7 @@ function _toggleArchivedSection() {
 // autonomy loop), so for a card parked on a condition this view is the only
 // path back to it when that condition lands. Their HK-04/HK-01/ADM-16 are in
 // exactly that state.
-function _renderArchivedSection(container) {
+function _renderBoardArchivedSection(container) {
   const wrap = document.createElement('div');
   wrap.className = 'board-archived-section';
   const n = _archivedCountN === null ? '…' : _archivedCountN;
@@ -24058,7 +24058,7 @@ function renderBoard() {
   // not participate in the column-reorder Sortable below (which is filtered to
   // `.board-col`, so `.board-archived-section` is excluded by construction).
   _ensureArchivedCount();
-  _renderArchivedSection(container);
+  _renderBoardArchivedSection(container);
 
   // Column reorder Sortable — drag columns by their header (global only:
   // reordering rewrites boardStatuses, which no narrower scope may do)
