@@ -186,6 +186,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0032_state_events_entity_index",
         sql: include_str!("../../migrations/0032_state_events_entity_index.sql"),
     },
+    Migration {
+        version: 33,
+        name: "0033_secret_metadata",
+        sql: include_str!("../../migrations/0033_secret_metadata.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
