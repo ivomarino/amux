@@ -102,6 +102,15 @@ pub struct Freshness {
     /// on-disk bytes are reachable from a commit by construction, since that
     /// is how the path was classified.
     pub revived: Vec<String>,
+    /// How many paths were NOT put through the revived discriminator because
+    /// the run hit its budget (AMUX-3695, measured by mixpeek-frustrations).
+    ///
+    /// NEVER SILENT. Those paths fall back to `edited`, which is the safe
+    /// direction but is also indistinguishable from a path that was checked and
+    /// found novel. A reader who cannot tell "checked, it is fine" from "we ran
+    /// out of budget" has been told something false by omission, and on the
+    /// checkout that motivated this the second case is the majority.
+    pub revived_unchecked: usize,
 }
 
 /// Is the worktree copy of `path` an OLD COMMITTED REVISION rather than a new
@@ -339,10 +348,33 @@ pub fn build(
         let n = revived_paths.len();
         let list = tagged_list(&revived_paths);
         let whose_r = whose(&revived_paths);
+        // WHEN THIS IS THE MAJORITY IT IS ONE FINDING, NOT N ALARMS
+        // (mixpeek-frustrations measured 7 of 10 on a checkout 6x this repo).
+        // A bucket that fires on most of the set reads as noise and gets
+        // scrolled past, which is how a real silent-revert warning stops being
+        // read at all. Lead with the ratio and name the checkout-level
+        // condition, because at that share the story is the checkout rather
+        // than any one path.
+        let share = if dirty.is_empty() { 0 } else { n * 100 / dirty.len() };
+        // A FLOOR ON THE COUNT, not just the share. 1 of 2 paths is 50% and is
+        // not a checkout-wide condition; without this a two-path dirty tree
+        // trivially trips the "the finding is the CHECKOUT" language and the
+        // sentence reads "not 1 separate alarms". Caught by an existing test
+        // going red, which is the only reason it was caught at all.
+        let lede = if share >= 50 && n >= 5 {
+            format!(
+                "OLD REVISIONS ON DISK — {n} of {} dirty paths ({share}%). At this share the \
+                 finding is the CHECKOUT, not the individual files: it is broadly carrying \
+                 content that was already superseded. Treat this as ONE condition to resolve \
+                 deliberately, not {n} separate alarms",
+                dirty.len()
+            )
+        } else {
+            format!("OLD REVISION ON DISK: {n} {whose_r} under {dir}")
+        };
         sections.push(format!(
-            "OLD REVISION ON DISK: {n} {whose_r} under {dir} hold content that was ALREADY \
-             COMMITTED at some point, while HEAD and origin/main agree on the current \
-             version:\n{list}\
+            "{lede} — content that was ALREADY COMMITTED at some point, while HEAD and \
+             origin/main agree on the current version:\n{list}\
              Committing these SILENTLY REVERTS what both refs hold. This is invisible to the \
              usual stale check precisely BECAUSE the refs agree, so there is no \
              'origin is ahead' to find — it was reported as the one population the \
@@ -353,6 +385,25 @@ pub fn build(
              commit — which is how the path was classified in the first place. If you PUT the \
              old content there deliberately, commit it and say so; nothing here can tell an \
              intentional revert from an accidental one, and that call is yours."
+        ));
+    }
+
+    // NO SILENT CAP. On a large repo the discriminator runs out of budget long
+    // before the dirty list ends, and those paths land in `edited` — the safe
+    // fallback, and also the exact output a path that WAS checked and found
+    // novel produces. Saying nothing here would let "we did not look" read as
+    // "we looked and it is fine", which is the difference between a bound and a
+    // lie. Measured need: 772 paths in one real listing (mixpeek-frustrations).
+    if fresh.revived_unchecked > 0 {
+        sections.push(format!(
+            "NOT CHECKED FOR OLD-REVISION: {} further path(s) were not put through the \
+             old-revision test — this run hit its budget (AMUX_NUDGE_REVIVED_BUDGET_MS / \
+             AMUX_NUDGE_REVIVED_MAX_PATHS). They are listed above as ordinary edits, which is \
+             the SAFE fallback and NOT a finding that they are clean. On a large checkout the \
+             per-path test costs ~700ms, so a full pass over a long dirty list would spend \
+             minutes of git subprocesses on a shared repo. To check one by hand:\n  \
+             git log --all --oneline --find-object=$(git hash-object <path>) -- <path>",
+            fresh.revived_unchecked
         ));
     }
 
@@ -1094,11 +1145,51 @@ async fn worktree_lines_absent_from_origin(dir: &str, p: &str) -> Option<usize> 
 /// When it cannot classify a path (git error, no origin/main ref) it treats the
 /// path as ordinary work, never STALE, so a failure degrades to today's
 /// behaviour rather than inventing a revert warning.
+/// Wall-clock the revived discriminator may spend across ONE nudge run.
+///
+/// MEASURED ON A REPO 6x THIS ONE (mixpeek-frustrations, 2026-08-25): 594 refs,
+/// 26,190 commits, 43,837 tracked files. A single `--find-object` walk costs
+/// 691ms there against 103ms here, and — the part that actually breaks the
+/// design — the O(1) prefilter INVERTS. Of 59 dirty paths sampled, 58 had their
+/// blob already in the object database, so 98% paid the full walk instead of the
+/// 30ms lookup. Projected 40s for that sample, and their idle nudge that morning
+/// listed 772 paths.
+///
+/// The premise this was built on ("a genuine new edit produces bytes committed
+/// nowhere") is not wrong, it is just not load-bearing on a checkout whose dirty
+/// set is genuinely MOSTLY old revisions — which is what their classification
+/// showed: 7 of 10 revived. The prefilter stays because it costs 107ms against a
+/// 691ms walk and it does save everything on repos shaped like this one; it is
+/// simply not the thing that bounds the cost.
+///
+/// A NUDGE MUST NOT COST MINUTES OF GIT SUBPROCESSES. This runs on a shared
+/// checkout, so the cost is paid in the same resource the sessions need, which
+/// is the shape ethos.md warns about: a detector that makes the thing it watches
+/// worse the harder it looks.
+fn revived_budget_ms() -> u128 {
+    std::env::var("AMUX_NUDGE_REVIVED_BUDGET_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(2_000)
+}
+
+/// Hard cap on paths put through the discriminator, independent of the clock.
+/// Belt and braces: a budget alone still starts one walk per path, and on a
+/// 772-path listing the first check of the clock happens after the first walk.
+fn revived_max_paths() -> usize {
+    std::env::var("AMUX_NUDGE_REVIVED_MAX_PATHS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40)
+}
+
 async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
     let mut fresh = Freshness::default();
     if paths.is_empty() {
         return fresh;
     }
+    let started = std::time::Instant::now();
+    let mut revived_checked = 0usize;
 
     // Resolve the repo root and address paths from there. `git status` emits
     // repo-root-relative paths, but a lane's CC_DIR is often a SUBDIRECTORY; run
@@ -1249,6 +1340,16 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
         //     can only be answered one way, and reach for the expensive one
         //     solely when the cheap answer is inconclusive.
         if refs_agree {
+            let spent = started.elapsed().as_millis();
+            if revived_checked >= revived_max_paths() || spent >= revived_budget_ms() {
+                // OVER BUDGET. Fall back to `edited` — the safe direction — and
+                // COUNT it, because an unchecked path and a checked-and-novel
+                // path are otherwise the same output for two different states.
+                fresh.revived_unchecked += 1;
+                fresh.edited.push(p.clone());
+                continue;
+            }
+            revived_checked += 1;
             if revives_an_old_revision(dir, p).await {
                 fresh.revived.push(p.clone());
             } else {
@@ -2418,11 +2519,108 @@ mod tests {
         // revert becomes an invisible one.
         let n = build(dir, &s(&["revived.txt", "edited.txt"]), &Default::default(), &fresh, "")
             .expect("a dirty tree must produce a nudge");
-        assert!(n.contains("OLD REVISION ON DISK"), "the section must render: {n}");
+        // The PROPERTY, not the exact heading: the heading now varies with the
+        // share (a majority-revived checkout gets a different lede), and pinning
+        // the wording would make improving that message look like a regression
+        // — which is exactly how this assertion first went red.
+        assert!(
+            n.contains("OLD REVISION") && n.contains("ALREADY COMMITTED"),
+            "the section must render: {n}"
+        );
         assert!(n.contains("revived.txt"), "and must name the path: {n}");
         assert!(
             n.contains("SILENTLY REVERTS"),
             "and must say what committing it does, not merely that it is odd: {n}"
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// AMUX-3695 follow-up: the discriminator is BOUNDED, and the bound is
+    /// never silent.
+    ///
+    /// mixpeek-frustrations measured the shipped version on a repo 6x this one
+    /// (594 refs, 26,190 commits, 43,837 files) and the cost model did not
+    /// survive: a walk costs 691ms there against 103ms here, and the O(1)
+    /// prefilter INVERTS — 58 of 59 sampled dirty paths already had their blob
+    /// in the object database, so 98% paid the full walk. Their idle nudge that
+    /// morning listed 772 paths. Unbounded, that is minutes of git subprocesses
+    /// on a shared checkout, i.e. a detector paying its cost in the same
+    /// resource the sessions need.
+    ///
+    /// THE SECOND CELL IS THE ONE THAT MATTERS. Falling back to `edited` is the
+    /// safe direction, and it is also byte-identical to the output for a path
+    /// that WAS checked and found novel. If the nudge does not say which
+    /// happened, a bound becomes a false statement about coverage.
+    #[tokio::test]
+    async fn the_revived_check_is_bounded_and_says_what_it_skipped() {
+        let tmp = std::env::temp_dir().join(format!("amux-revcap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (bare, work) = (tmp.join("origin.git"), tmp.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        // Six paths, each with a real v1 superseded by v2, so every one of them
+        // WOULD classify as revived if the budget allowed.
+        let names: Vec<String> = (0..6).map(|i| format!("r{i}.txt")).collect();
+        for n in &names {
+            std::fs::write(work.join(n), "v1-old\n").unwrap();
+        }
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "v1"]);
+        for n in &names {
+            std::fs::write(work.join(n), "v2-current\n").unwrap();
+        }
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "v2"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin"]);
+        for n in &names {
+            std::fs::write(work.join(n), "v1-old\n").unwrap();
+        }
+
+        // Cap at 2. Set on this process only; the default (40) is what ships.
+        std::env::set_var("AMUX_NUDGE_REVIVED_MAX_PATHS", "2");
+        let dir = work.to_str().unwrap();
+        let fresh = freshness_from_repo(dir, &names).await;
+        std::env::remove_var("AMUX_NUDGE_REVIVED_MAX_PATHS");
+
+        // CELL 1 — the cap holds, and the overflow lands in the SAFE bucket.
+        assert_eq!(fresh.revived.len(), 2, "the cap must bound the walks: {fresh:?}");
+        assert_eq!(fresh.revived_unchecked, 4, "and the rest must be COUNTED: {fresh:?}");
+        assert_eq!(
+            fresh.edited.len(),
+            4,
+            "unchecked paths fall back to edited, never to revived — a false revived \
+             prescribes a restore against work that may be novel: {fresh:?}"
+        );
+
+        // CELL 2 — and the nudge SAYS so. Without this the bound is a lie by
+        // omission: 4 paths reported as ordinary edits with nothing marking
+        // them as unexamined.
+        let n = build(dir, &names, &Default::default(), &fresh, "").expect("nudge");
+        assert!(n.contains("NOT CHECKED FOR OLD-REVISION"), "the cap must be visible: {n}");
+        assert!(n.contains("4 further path"), "and must say HOW MANY: {n}");
+        assert!(
+            n.contains("NOT a finding that they are clean"),
+            "and must refuse the reading that silence means checked: {n}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
