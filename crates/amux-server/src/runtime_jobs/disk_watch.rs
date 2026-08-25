@@ -136,16 +136,40 @@ fn gib(b: u64) -> f64 {
 
 /// The two most recent COMPLETED scans, newest first.
 ///
-/// Deliberately `status='done'`: a cancelled or stalled scan has partial
-/// totals, and comparing a partial scan against a complete one would report
-/// every unvisited path as having shrunk to nothing. That is the confident
-/// wrong answer ethos rule 7 is about, and it would arrive as a card telling
-/// someone their caches had cleared themselves.
+/// This USED to require `status='done'`, on the stated grounds that "comparing a
+/// partial scan against a complete one would report every unvisited path as
+/// having shrunk to nothing". That rationale reads as sound and is FALSE for this
+/// code — and it was costing almost every scan (DESKT-28).
+///
+/// Measured 2026-08-25: `reclaim_scans` all-time was
+/// `{done: 1, interrupted: 2, cancelled: 2, stalled: 1}`, because a scan walks
+/// every root in 6-35 minutes while this server re-execs to adopt new builds
+/// every ~23 minutes. So the filter admitted ONE scan in six, and threw away
+/// partial scans holding 124 and 119 real findings (482 GB and 1039 GB).
+///
+/// The feared shrink cannot happen, and two independent layers stop it:
+///   - [`growth_for`] iterates the CURRENT scan's findings and looks each path up
+///     in the previous one, so a path the previous scan never reached yields
+///     `was = None`. A path the CURRENT scan never reached is simply not selected.
+///   - [`render`] states `None` as "no previous reading to compare" and says in
+///     its own comment that a delta from an unmeasured path is a fabricated trend.
+///
+/// Both are pinned by `a_partial_previous_scan_never_manufactures_a_shrink` and
+/// `a_partial_current_scan_reports_a_subset_never_a_shrink`, which construct
+/// exactly the case the old comment feared and assert it does not occur.
+///
+/// What IS still required, and is the real invariant:
+///   - `finished_at IS NOT NULL` — a RUNNING scan's totals are still moving, so
+///     comparing against one would be reading a number mid-write.
+///   - at least one finding — a scan that recorded nothing makes every path look
+///     new, which is the fabricated-trend failure wearing the other face.
 fn last_two_completed(conn: &rusqlite::Connection) -> Vec<(String, i64)> {
     let Ok(mut stmt) = conn.prepare(
-        "SELECT id, finished_at FROM reclaim_scans
-          WHERE status='done' AND finished_at IS NOT NULL
-          ORDER BY finished_at DESC LIMIT 2",
+        "SELECT s.id, s.finished_at FROM reclaim_scans s
+          WHERE s.finished_at IS NOT NULL
+            AND s.status <> 'running'
+            AND EXISTS (SELECT 1 FROM reclaim_findings f WHERE f.scan_id = s.id)
+          ORDER BY s.finished_at DESC LIMIT 2",
     ) else {
         return vec![];
     };
@@ -733,16 +757,45 @@ mod tests {
     /// Comparing against a partial scan would report every unvisited path as
     /// having shrunk to nothing, so only completed scans are candidates.
     #[test]
-    fn only_completed_scans_are_compared() {
+    fn scans_with_findings_are_compared_whatever_their_terminal_status() {
         let (s, _d) = store();
-        seed_scan(&s, "GOOD_OLD", "done", 100);
+        // SUPERSEDES only_completed_scans_are_compared. That test pinned
+        // `status='done'`, whose stated rationale is disproved by
+        // a_partial_previous_scan_never_manufactures_a_shrink. Requiring `done`
+        // admitted 1 scan in 6 on the real box and discarded partial scans
+        // holding 124 and 119 findings (DESKT-28).
+        seed_scan(&s, "OLD_DONE", "done", 100);
+        seed_finding(&s, "OLD_DONE", "/a", 5, true);
         seed_scan(&s, "STALLED", "stalled", 150);
+        seed_finding(&s, "STALLED", "/a", 6, true);
         seed_scan(&s, "CANCELLED", "cancelled", 175);
-        seed_scan(&s, "GOOD_NEW", "done", 200);
+        seed_finding(&s, "CANCELLED", "/a", 7, true);
 
         let conn = s.read().unwrap();
         let got: Vec<String> = last_two_completed(&conn).into_iter().map(|(id, _)| id).collect();
-        assert_eq!(got, vec!["GOOD_NEW".to_string(), "GOOD_OLD".to_string()]);
+        assert_eq!(
+            got,
+            vec!["CANCELLED".to_string(), "STALLED".to_string()],
+            "the two most recent scans WITH FINDINGS win, regardless of terminal status"
+        );
+    }
+
+    /// The two things that genuinely must still be excluded, or widening the
+    /// filter trades one fabricated trend for another.
+    #[test]
+    fn a_running_scan_and_an_empty_scan_are_still_excluded() {
+        let (s, _d) = store();
+        seed_scan(&s, "REAL", "done", 100);
+        seed_finding(&s, "REAL", "/a", 5, true);
+        // Totals still moving — comparing against it reads a number mid-write.
+        seed_scan(&s, "RUNNING", "running", 150);
+        seed_finding(&s, "RUNNING", "/a", 6, true);
+        // Recorded nothing — would make every path look new.
+        seed_scan(&s, "EMPTY", "interrupted", 175);
+
+        let conn = s.read().unwrap();
+        let got: Vec<String> = last_two_completed(&conn).into_iter().map(|(id, _)| id).collect();
+        assert_eq!(got, vec!["REAL".to_string()], "got {got:?}");
     }
 
     /// One card per scan, forever. A weekly job on an hourly tick would
@@ -855,5 +908,72 @@ mod tests {
         for p in &watched {
             assert!(p.exists(), "watched path does not exist: {p:?}");
         }
+    }
+
+    // ---- DESKT-28: is the `status='done'` filter's stated hazard real? ----
+
+    /// The filter's own comment says including a partial scan "would report every
+    /// unvisited path as having shrunk to nothing". This constructs exactly that
+    /// case and asserts it does NOT happen — because two other layers already
+    /// prevent it, which is why the filter is discarding usable data for free.
+    #[test]
+    fn a_partial_previous_scan_never_manufactures_a_shrink() {
+        let (s, _d) = store();
+        // PARTIAL: interrupted before it ever reached /b.
+        seed_scan(&s, "PARTIAL", "interrupted", 100);
+        seed_finding(&s, "PARTIAL", "/a", 10, true);
+        // COMPLETE: saw both.
+        seed_scan(&s, "FULL", "done", 200);
+        seed_finding(&s, "FULL", "/a", 12, true);
+        seed_finding(&s, "FULL", "/b", 50, true);
+
+        let conn = s.read().unwrap();
+        let rows = growth_for(&conn, "FULL", Some("PARTIAL"), 1);
+
+        let a = rows.iter().find(|g| g.path == "/a").expect("/a present");
+        let b = rows.iter().find(|g| g.path == "/b").expect("/b present");
+
+        // /a was in both -> a real delta.
+        assert_eq!(a.was, Some(10 * 1_073_741_824), "/a should compare against the partial");
+        // /b was NEVER VISITED by the partial scan. The feared behaviour is that it
+        // reads as "shrunk to nothing". It must instead read as "no previous reading".
+        assert_eq!(
+            b.was, None,
+            "an unvisited path must have NO previous reading, not a zero to shrink from"
+        );
+        // And nothing anywhere may report a negative delta from this.
+        for g in &rows {
+            if let Some(d) = g.delta_gib() {
+                assert!(d >= 0.0, "phantom shrink on {}: {d}", g.path);
+            }
+        }
+        // The rendered card must SAY so rather than fabricate a trend.
+        let out = render("FULL", &rows, 100.0, 1000.0);
+        assert!(out.contains("/b` is **50.0 GiB** (no previous reading to compare)"), "{out}");
+        assert!(!out.contains("-50.0"), "no fabricated shrink in the card: {out}");
+    }
+
+    /// The mirror: a PARTIAL scan as the CURRENT one reports only what it reached.
+    /// Paths it never got to are simply absent — they cannot be reported as
+    /// shrunk, because the query iterates the current scan's own findings.
+    #[test]
+    fn a_partial_current_scan_reports_a_subset_never_a_shrink() {
+        let (s, _d) = store();
+        seed_scan(&s, "FULL", "done", 100);
+        seed_finding(&s, "FULL", "/a", 10, true);
+        seed_finding(&s, "FULL", "/b", 50, true);
+        seed_scan(&s, "PARTIAL", "interrupted", 200);
+        seed_finding(&s, "PARTIAL", "/a", 14, true);
+
+        let conn = s.read().unwrap();
+        let rows = growth_for(&conn, "PARTIAL", Some("FULL"), 1);
+
+        assert_eq!(rows.len(), 1, "only the path it reached: {rows:?}");
+        assert_eq!(rows[0].path, "/a");
+        assert_eq!(rows[0].was, Some(10 * 1_073_741_824));
+        assert!(
+            !rows.iter().any(|g| g.path == "/b"),
+            "/b was never visited by the current scan, so it must not appear at all"
+        );
     }
 }
