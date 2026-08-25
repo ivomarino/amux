@@ -997,8 +997,51 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 /// [`IssueRow::snapshot`] — the SAME serialization the event journal records
 /// as each mutation's payload (RR-0111a), so API body, journal payload, and
 /// replay verification can never drift apart.
+/// Designate a card whose owning lane is ISOLATED (AMUX-3713, Ethan: "the card
+/// should have a designation that it is").
+///
+/// An isolated worker is a raw agent with the harness stripped: hidden from the
+/// peer fleet list and refused as a peer send target. Its CARDS were exempt from
+/// all of that — `desktop` owns 25 and not one said so — so a peer reading the
+/// board saw an ordinary card with an ordinary session name and no indication
+/// that the owning lane is undiscoverable and cannot be messaged. Same shape as
+/// AMUX-2796: work routed to a lane that cannot receive it.
+///
+/// IN A HELPER BOTH PATHS CALL, because the first version lived in `list_body`
+/// and the single-card GET does not go through it — `get_item` calls
+/// `detail_body` directly. The test drove `list_body(row, slim=false)` and
+/// passed while the live detail endpoint returned nothing, which is ethos rule
+/// 7's wrong-layer failure exactly: a real property asserted in a place the
+/// shipped request does not flow through. Verifying against the running server
+/// is what caught it.
+///
+/// Resolved through `session_is_isolated`, the same predicate the fleet filter
+/// and the send guard consult, so a card cannot claim a reachability the send
+/// path disagrees with.
+fn designate_owner_reach(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
+    if !row.session.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated) {
+        // Absent rather than `false`: this is a rare property and a key on every
+        // one of 1700+ cards saying "normal" is payload for nothing.
+        return;
+    }
+    obj.insert("owner_isolated".into(), json!(true));
+    // The MEANING, not just the flag. A bare boolean makes every consumer
+    // re-derive what isolation implies, and they will not agree.
+    obj.insert(
+        "owner_reach".into(),
+        json!("isolated (raw agent): not in the peer fleet list and refused as a peer send target. Reachable only by the owner from the dashboard — do not route this card to a peer expecting them to message the owner."),
+    );
+}
+
 fn detail_body(row: &IssueRow) -> Value {
-    row.snapshot()
+    let mut v = row.snapshot();
+    // HERE, not in `list_body`: this is the function `get_item` calls for the
+    // single-card GET, and `list_body`'s non-slim branch calls it too — so one
+    // insertion covers both shipped paths (AMUX-3713).
+    if let Some(obj) = v.as_object_mut() {
+        designate_owner_reach(obj, row);
+    }
+    v
 }
 
 /// List body, Python-parity (AMUX-2586 fix #4). The plain list serves the
@@ -1017,33 +1060,12 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     // row.desc/row.log by reference.
     let mut v = if slim { row.snapshot_slim() } else { detail_body(row) };
     let obj = v.as_object_mut().expect("snapshot is an object");
-    // WHOSE LANE IS THIS, AND CAN ANYONE REACH IT? (AMUX-3713, Ethan: "the card
-    // should have a designation that it is [isolated]".)
-    //
-    // An isolated worker is a raw agent with the harness stripped: hidden from
-    // the peer fleet list and refused as a peer send target. Its CARDS were
-    // exempt from all of that — `desktop` owns 25 of them and not one said so —
-    // so a peer reading the board saw an ordinary card with an ordinary session
-    // name and no indication that the owning lane is undiscoverable and cannot
-    // be messaged. Same shape as AMUX-2796: a notice addressed to a lane that
-    // cannot receive it.
-    //
-    // On BOTH the slim list and the detail body, because the list is what a
-    // reader scans before deciding whom to ask — a designation only on the
-    // detail page is one you find after you have already acted.
-    //
-    // Absent rather than `false` for an ordinary lane: this is a rare property,
-    // and a key on every one of 1718 cards to say "normal" is payload for
-    // nothing (the AMUX-3496 slimming lesson, from the other direction).
-    if row.session.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated) {
-        obj.insert("owner_isolated".into(), json!(true));
-        // The MEANING, not just the flag. A bare boolean makes every consumer
-        // re-derive what isolation implies, and they will not agree.
-        obj.insert(
-            "owner_reach".into(),
-            json!("isolated (raw agent): not in the peer fleet list and refused as a peer send target. Reachable only by the owner from the dashboard — do not route this card to a peer expecting them to message the owner."),
-        );
+    // Only the SLIM branch needs this here: the non-slim branch got it inside
+    // `detail_body` above, which is also the function the single-card GET calls.
+    if slim {
+        designate_owner_reach(obj, row);
     }
+    // (see designate_owner_reach for why this exists)
     if slim {
         obj.insert("desc_len".into(), json!(row.desc.chars().count()));
         let log_n = row
@@ -4873,8 +4895,21 @@ mod isolation_designation_tests {
             r
         };
 
-        for slim in [true, false] {
-            let iso = list_body(&card("raw"), slim, false);
+        // DRIVE WHAT THE HTTP HANDLERS DRIVE. The first version of this test
+        // called `list_body(row, slim=false)` for the detail case and passed,
+        // while the live GET /api/board/<id> returned nothing — `get_item`
+        // calls `detail_body` directly and never goes through `list_body`. A
+        // real property, asserted one layer above where the request flows
+        // (ethos rule 7). Caught by curling the running server, not by the
+        // suite. `bodies` now names the actual entry point of each path.
+        type Body = fn(&IssueRow) -> Value;
+        let bodies: [(&str, Body); 3] = [
+            ("detail_body (GET /api/board/{id})", |r| detail_body(r)),
+            ("list_body non-slim", |r| list_body(r, false, false)),
+            ("list_body slim", |r| list_body(r, true, false)),
+        ];
+        for (slim, f) in bodies {
+            let iso = f(&card("raw"));
             assert_eq!(
                 iso["owner_isolated"],
                 json!(true),
@@ -4889,7 +4924,7 @@ mod isolation_designation_tests {
 
             // THE NEGATIVE. Absent, not `false`: a key on every ordinary card is
             // payload for nothing, and the list ships 1700+ of them.
-            let ord = list_body(&card("normal"), slim, false);
+            let ord = f(&card("normal"));
             assert!(
                 ord.get("owner_isolated").is_none(),
                 "slim={slim}: an ordinary lane's card must carry no designation at all: {ord}"
