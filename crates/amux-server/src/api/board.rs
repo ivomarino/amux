@@ -2194,7 +2194,13 @@ enum PatchOut {
     /// Any pre-write refusal (400/409) with its exact body.
     Refused(StatusCode, Value),
     /// Invariant 37: nothing changed; `rev` unmoved.
-    Noop { body: Value, ignored: Vec<String> },
+    ///
+    /// `all_ignored` = the body carried keys and EVERY one was unwritable, so the
+    /// request could not have done anything. That is a caller error and answers
+    /// 422; an ordinary no-op (a writable field set to its current value) is a
+    /// successful request that changed nothing and stays 200. See the response
+    /// arm for why the distinction has to be this narrow.
+    Noop { body: Value, ignored: Vec<String>, all_ignored: bool },
     Applied {
         body: Value,
         ignored: Vec<String>,
@@ -2609,6 +2615,14 @@ pub async fn patch_item(
                 })
                 .cloned()
                 .collect();
+            // EVERY key unwritable = the request was unusable (AEAB/#134 review,
+            // reported by tsukimiya). Narrow on purpose: a MIXED body such as
+            // {"status":"done","item_type":"code"} where the card is already
+            // `done` is also a no-op with something ignored, and it must NOT
+            // 422 — the caller's `status` key was legitimate and the response
+            // already names the typo. Only "nothing you sent was writable"
+            // is unambiguously the caller's mistake.
+            let all_ignored = !map.is_empty() && ignored.len() == map.len();
 
             // ---- stage non-status field changes onto a working copy ------
             // (staged BEFORE the gate check so a PATCH changing type and
@@ -3870,6 +3884,7 @@ pub async fn patch_item(
                     PatchOut::Noop {
                         body: detail_body(&row),
                         ignored,
+                        all_ignored,
                     },
                     no_write(),
                 );
@@ -4118,7 +4133,7 @@ pub async fn patch_item(
         None => internal("patch produced no outcome"),
         Some(PatchOut::NotFound) => not_found(&id),
         Some(PatchOut::Refused(status, body)) => err(status, body),
-        Some(PatchOut::Noop { mut body, ignored }) => {
+        Some(PatchOut::Noop { mut body, ignored, all_ignored }) => {
             body["applied"] = json!(false);
             if !ignored.is_empty() {
                 body["ignored_fields"] = json!(ignored);
@@ -4127,7 +4142,25 @@ pub async fn patch_item(
                      the rest of this response reflects the card as stored"
                 );
             }
-            (StatusCode::OK, Json(body)).into_response()
+            // 422 WHEN NOTHING YOU SENT WAS WRITABLE.
+            //
+            // Reported by tsukimiya reviewing #134: "a PATCH of item_type returns
+            // 200 with a bumped rev and silently does nothing — which cost you six
+            // mistyped cards in one night". The rev-bump and the silence are
+            // already fixed (`applied:false`, rev unmoved, the key named in
+            // `ignored_fields`), and the body has been honest for a while. The
+            // STATUS CODE was not: a caller checking `r.ok` or `resp.status`
+            // still read success, which is AC-227's trap exactly — `d.get('ok',
+            // True)` defaulting True is how a refused write got reported as done.
+            //
+            // Scoped to all_ignored rather than to every no-op, because those are
+            // different facts. A writable field set to its current value is a
+            // SUCCESSFUL request that changed nothing, and 422 would be a lie in
+            // the other direction — plus it would break every caller that PATCHes
+            // idempotently. Only "no key you sent can be written" is the caller's
+            // mistake, and only that answers 422.
+            let code = if all_ignored { StatusCode::UNPROCESSABLE_ENTITY } else { StatusCode::OK };
+            (code, Json(body)).into_response()
         }
         Some(PatchOut::Applied { mut body, ignored, status_transition, progress_notify }) => {
             body["applied"] = json!(true);

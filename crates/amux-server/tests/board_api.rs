@@ -2486,3 +2486,47 @@ async fn a_trigger_cannot_overwrite_an_autofix_signature_but_can_replace_a_trigg
         "a trigger replacing a trigger must still work"
     );
 }
+
+/// tsukimiya, reviewing #134: "a PATCH of item_type returns 200 with a bumped rev
+/// and silently does nothing — which cost you six mistyped cards in one night."
+///
+/// The rev-bump and the silence were already fixed. The STATUS CODE was not: a
+/// caller checking `r.ok` still read success, which is AC-227's trap (`d.get('ok',
+/// True)` defaulting True is how a refused write got reported as done).
+///
+/// Two of these three cells must STAY 200 — a 422 on every no-op is the opposite
+/// bug and would break every caller that PATCHes idempotently.
+#[tokio::test]
+async fn a_patch_whose_every_key_is_unwritable_is_422_and_a_real_noop_is_not() {
+    let (app, _dir) = app();
+    let card = create(&app, json!({ "title": "typo probe", "type": "chore" })).await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // 1) EVERY key unwritable -> 422. `item_type` is the classic typo for `type`.
+    let (st, _, body) = send(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({"item_type": "code"})),
+    ).await;
+    assert_eq!(st, StatusCode::UNPROCESSABLE_ENTITY, "nothing sent was writable: {body}");
+    assert_eq!(body["applied"], json!(false));
+    assert_eq!(body["ignored_fields"], json!(["item_type"]));
+    assert_eq!(body["type"], json!("chore"), "and the card is untouched");
+
+    // 2) CONTROL — an ordinary no-op is a SUCCESSFUL request that changed nothing.
+    let (st, _, body) = send(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({"type": "chore"})),
+    ).await;
+    assert_eq!(st, StatusCode::OK, "a writable field at its current value is not an error: {body}");
+    assert_eq!(body["applied"], json!(false));
+
+    // 3) CONTROL — a MIXED body must not 422. `type` is legitimate and merely
+    // unchanged; the typo is reported, not fatal. Without this cell the narrowing
+    // is untested and "all keys ignored" could quietly become "any key ignored".
+    let (st, _, body) = send(
+        &app, "PATCH", &format!("/api/board/{id}"),
+        Some(json!({"type": "chore", "item_type": "code"})),
+    ).await;
+    assert_eq!(st, StatusCode::OK, "one legitimate key means the request was usable: {body}");
+    assert_eq!(body["ignored_fields"], json!(["item_type"]), "still reported");
+}
