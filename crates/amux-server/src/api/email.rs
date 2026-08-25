@@ -789,6 +789,54 @@ pub async fn approve(
         );
     };
     let home = ctx.client.home().to_path_buf();
+    // CREATOR CHECK BEFORE CONSUME (AUTOD-48 follow-up). This used to run
+    // AFTER, and my own comment argued that was the safe direction. It was not:
+    // `consume` is the one-shot rename, so reading the doc to learn the creator
+    // DESTROYED the draft the check refused.
+    //
+    // What that cost, from autodesk's bisect: any lane could delete any pending
+    // draft, because `GET /api/email/approvals` hands every caller the id AND
+    // the creating session — name that session back at the server and the draft
+    // is gone. And the legitimate failure was worse than the abuse: a lane that
+    // self-approved ONCE, the exact mistake this gate exists to catch,
+    // permanently destroyed the message a human was supposed to review.
+    //
+    // The retry worry that motivated the old order does not survive contact
+    // with it. The approver is a NAME, not a secret, so an attacker never
+    // needed to retry against one pending row; they could always create their
+    // own. I traded a real destructive defect for a guess about an attack that
+    // the design already conceded.
+    if let Some(pending) = crate::api::email_approval::peek(&home, &id) {
+        let creator = pending.get("session").and_then(Value::as_str).unwrap_or("");
+        if !creator.is_empty() && approver.eq_ignore_ascii_case(creator) {
+            tracing::warn!(
+                session = %creator, approver = %approver, approval = %id,
+                "[email] approve refused: the approver names the REQUESTING lane (AUTOD-48 v5) \
+                 — the draft is left PENDING, a refusal must not destroy what it refuses"
+            );
+            // AUDIT THE REFUSAL. It previously wrote nothing, so the only trace
+            // of a destroyed draft was its original freeze — a draft that
+            // existed and died left no row at all.
+            email_log(
+                ctx.client.home(),
+                json!({
+                    "endpoint": "approve", "blocked": "creator_cannot_approve",
+                    "approval_id": id, "session": creator, "approver_claimed": approver,
+                    "approver_verified": false,
+                }),
+            );
+            return err(
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": format!(
+                        "'{approver}' requested this send, so it cannot also approve it. The \
+                         draft is STILL PENDING — surface the preview to a human."
+                    ),
+                    "code": "creator_cannot_approve",
+                }),
+            );
+        }
+    }
     let doc = match crate::api::email_approval::consume(&home, &id) {
         crate::api::email_approval::Consume::Ready(d) => d,
         crate::api::email_approval::Consume::Expired => {
@@ -798,44 +846,24 @@ pub async fn approve(
             )
         }
         crate::api::email_approval::Consume::Gone => {
-            return err(
-                StatusCode::NOT_FOUND,
-                json!({ "error": "no pending approval with that id (already approved, expired, or never existed)" }),
-            )
+            // DO NOT ENUMERATE OUTCOMES THE SERVER CANNOT DISTINGUISH
+            // (AUTOD-48 follow-up). This said "already approved, expired, or
+            // never existed", and the first branch EXCULPATES: an auditor reads
+            // it and concludes a human released the draft. That is the same
+            // family as the `approved_by: "dashboard"` inference this endpoint
+            // was just fixed for — a message asserting something the server
+            // does not know.
+            //
+            // The directory DOES know, because consumed and expired files are
+            // renamed rather than deleted, so say which when it can be read and
+            // say nothing when it cannot.
+            let fate = crate::api::email_approval::fate(&home, &id);
+            return err(StatusCode::NOT_FOUND, json!({ "error": fate }));
         }
     };
     let payload = doc.get("payload").cloned().unwrap_or_else(|| json!({}));
     let session = doc.get("session").and_then(Value::as_str).unwrap_or("").to_string();
     let endpoint = doc.get("endpoint").and_then(Value::as_str).unwrap_or("").to_string();
-    // CREATOR MAY NOT BE APPROVER — a second, independent gate (autodesk's
-    // variant 5). The marker above is a name, not a secret, so if it is ever
-    // guessed or copied this still refuses the specific loop the whole gate
-    // exists to break: the lane that requested the send releasing it itself.
-    //
-    // Checked AFTER `consume` deliberately. Consume is the one-shot rename that
-    // makes approval atomic, and refusing before it would leave a pending
-    // approval that an attacker could retry with a different name until one
-    // stuck. Burning the row on a refused self-approval is the safe direction:
-    // the worker must ask again, in the open, and the refusal is logged.
-    if !session.is_empty() && approver.eq_ignore_ascii_case(&session) {
-        tracing::warn!(
-            session = %session, approver = %approver, approval = %id,
-            "[email] approve refused: the approver names the REQUESTING lane — a worker \
-             releasing its own held send is the loop AMUX-3510 exists to break (AUTOD-48 v5)"
-        );
-        return err(
-            StatusCode::FORBIDDEN,
-            json!({
-                "error": format!(
-                    "'{approver}' requested this send, so it cannot also approve it. Surface \
-                     the preview to a human instead."
-                ),
-                "code": "creator_cannot_approve",
-                "note": "the approval was consumed by this attempt — request the send again \
-                         rather than retrying with a different name",
-            }),
-        );
-    }
     let p = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("").to_string();
     let include_sig = payload.get("signature") != Some(&Value::Bool(false));
     let attachments = match parse_attachments(&payload) {
@@ -1961,6 +1989,15 @@ mod tests {
         // is not a secret, so this is the independent gate that survives the
         // marker being guessed or copied. Case-insensitive, because a name is
         // not a password and `Autodesk` is the same lane.
+        //
+        // AND THE REFUSAL MUST NOT DESTROY THE DRAFT. The first version of this
+        // check ran AFTER `consume`, so it burned the row it refused: any lane
+        // could delete any pending draft by naming its creator back at the
+        // server (the pending list hands out both), and a lane that
+        // self-approved ONCE permanently destroyed the message a human was
+        // meant to review. autodesk bisected it — pending before=True,
+        // after=FALSE — and nothing else in this file could have told us,
+        // because the refusal wrote no ledger row either.
         for who in ["autodesk", "AutoDesk"] {
             let (app, _d, _h, id) = held("autodesk").await;
             let (st, e) = send_req(
@@ -1973,6 +2010,24 @@ mod tests {
             .await;
             assert_eq!(st, StatusCode::FORBIDDEN, "{who} -> {e}");
             assert_eq!(e["code"], json!("creator_cannot_approve"), "{who} -> {e}");
+
+            // THE DRAFT SURVIVES. This is the cell that would have caught the
+            // defect, and the one the original test could not: it asserts on
+            // the SIDE EFFECT of a refusal, not on its status code.
+            let (st2, ok) = send_req(
+                &app,
+                "POST",
+                &format!("/api/email/approve/{id}"),
+                None,
+                &[("x-amux-approver", "dashboard")],
+            )
+            .await;
+            assert_eq!(
+                st2,
+                StatusCode::OK,
+                "a refused self-approval must leave the draft PENDING so a human can still \
+                 release it — {who} -> {ok}"
+            );
         }
 
         // THE CONTROL, and without it every cell above passes against a gate

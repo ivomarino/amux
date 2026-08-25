@@ -144,6 +144,39 @@ pub enum Consume {
     Gone,
 }
 
+/// Read a pending approval WITHOUT consuming it (AUTOD-48 follow-up).
+///
+/// `consume` is a one-shot atomic rename, so any check that has to read the
+/// frozen doc first DESTROYS the draft it is checking. The creator-cannot-approve
+/// gate did exactly that: it consumed to learn the creator, then refused, and the
+/// human's draft was gone.
+///
+/// autodesk bisected it, one probe per fresh approval, checking the pending list
+/// before and after:
+///
+/// ```text
+/// no-headers    -> 403 approver_unidentified   pending before=True  after=True
+/// self-named    -> 403 creator_cannot_approve  pending before=True  after=FALSE
+/// worker-header -> 403 worker_cannot_approve   pending before=True  after=True
+/// ```
+///
+/// Only the creator check consumed. And because `GET /api/email/approvals`
+/// returns each pending id AND its creating session to any caller, ANY lane
+/// could destroy ANY pending draft by naming that creator back at the server.
+///
+/// The legitimate failure mode is worse than the abuse: a lane that self-approves
+/// ONCE — the precise mistake the gate exists to catch — permanently destroyed
+/// the message a human was supposed to review.
+///
+/// So: peek for the checks, consume only on the path that actually sends.
+pub fn peek(home: &Path, id: &str) -> Option<Value> {
+    if !valid_id(id) {
+        return None;
+    }
+    let raw = std::fs::read_to_string(approvals_dir(home).join(format!("{id}.json"))).ok()?;
+    serde_json::from_str::<Value>(&raw).ok()
+}
+
 /// One-shot consume: the rename is the atomicity — of two racing approvals,
 /// exactly one rename succeeds and the loser sees Gone. Consumed and expired
 /// files are KEPT (renamed, not deleted) so "what happened to apr_X" stays
@@ -165,6 +198,34 @@ pub fn consume(home: &Path, id: &str) -> Consume {
         return Consume::Gone; // raced: the other approver's rename won
     }
     Consume::Ready(doc)
+}
+
+/// What actually became of an approval id, read off the directory.
+///
+/// `consume` renames rather than deletes precisely so "what happened to apr_X"
+/// stays answerable, and nothing was reading it — the 404 enumerated three
+/// possibilities instead, one of which (`already approved`) asserts a human
+/// released the draft. An auditor reading that on a draft destroyed by a refused
+/// self-approval would have drawn exactly the wrong conclusion.
+///
+/// Says only what the filesystem shows. An id with no file of any kind gets the
+/// non-committal answer, because that genuinely is indistinguishable from one
+/// that never existed.
+pub fn fate(home: &Path, id: &str) -> String {
+    if !valid_id(id) {
+        return "not a valid approval id".into();
+    }
+    let dir = approvals_dir(home);
+    if dir.join(format!("{id}.approved.json")).exists() {
+        return "this approval was already RELEASED — it is not pending. \
+                GET /api/email/log shows who released it and when."
+            .into();
+    }
+    if dir.join(format!("{id}.expired.json")).exists() {
+        return "this approval EXPIRED unreleased (1h TTL) — the worker must request the send again"
+            .into();
+    }
+    "no approval with that id is pending, and the directory holds no record of one".into()
 }
 
 /// Pending approvals, oldest first, for the dashboard / a human's curl.
