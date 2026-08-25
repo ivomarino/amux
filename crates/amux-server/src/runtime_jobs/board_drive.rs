@@ -3657,12 +3657,21 @@ fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
     // AND NEVER 0.0 FOR A NONZERO COUNT. One-decimal rounding is not integer
     // truncation and does not collapse at 5-of-501 (that is 1.0), which is what
     // made this safer than the nudge's coverage field — but it is not immune,
-    // only later: anything past a 2000:1 ratio rounds to 0.0, and `nudges` grows
-    // by roughly 42/day from 545 today, so this becomes reachable in about five
-    // weeks. A DATED bug, not an absent one. Below the rounding floor the
-    // unrounded value is emitted, because "0.0% discarded" beside
-    // `outcome_discarded: 1` is the ZERO THAT MEANS NONE again: not an
-    // imprecise number, a different claim.
+    // only later. The floor is `nudges > 2000*n`, STRICTLY: 1-of-2000 is exactly
+    // 0.05, ten times that is 0.5, and Rust's f64::round goes half-AWAY-from-
+    // zero, so it renders 0.1. The first ratio that renders zero is 1-of-2001.
+    // `nudges` is 545 today growing ~42/day, which puts that crossing about 35
+    // days out. A DATED bug, not an absent one.
+    //
+    // Below the floor the unrounded value is emitted, because "0.0% discarded"
+    // beside `outcome_discarded: 1` is the ZERO THAT MEANS NONE again: not an
+    // imprecise number, a different claim. A genuine zero still renders 0.0 —
+    // the guard is about nonzero counts, not about hiding zeros, and a cell
+    // pins that.
+    //
+    // The boundary above is pinned in a TEST rather than trusted here, because
+    // I first worked it out in Python and got it wrong by one: Python's round()
+    // is banker's rounding and disagrees with Rust at exactly the half-step.
     let pct = |n: i64| -> Option<f64> {
         (nudges > 0 && n >= 0).then(|| {
             let exact = n as f64 * 100.0 / nudges as f64;
@@ -5841,6 +5850,29 @@ mod tests {
             d > 0.0,
             "2 discarded out of >2000 must not render as 0.0 — that reads as 'none': {m3}"
         );
+
+        // THE BOUNDARY, PINNED IN RUST — because I got it wrong in prose by
+        // checking it in Python (mixpeek-frustrations caught it). Python's
+        // round() is BANKER'S rounding and Rust's f64::round is half-AWAY-from-
+        // zero, so the same expression disagrees at exactly the half-step: 1 of
+        // 2000 is 0.05, times ten is 0.5, and Python gives 0 where Rust gives 1.
+        // A boundary example verified in the wrong language is its own instance
+        // of this thread's whole subject.
+        //
+        // So the floor is `nudges > 2000*n`, STRICTLY, and these cells say so in
+        // the language that ships. They also pin the rounding mode: if
+        // f64::round ever changed, or someone rewrote this with a helper that
+        // rounds half-to-even, the first line goes red.
+        let render = |n: i64, nudges: i64| -> f64 {
+            let exact = n as f64 * 100.0 / nudges as f64;
+            let rounded = (exact * 10.0).round() / 10.0;
+            if rounded == 0.0 && n > 0 { exact } else { rounded }
+        };
+        assert_eq!(render(1, 2000), 0.1, "1-of-2000 is exactly 0.5 and rounds AWAY from zero");
+        assert!(render(1, 2001) > 0.0, "the first ratio past the floor must not be 0.0");
+        assert!(render(1, 2001) < 0.05, "...and it is the exact value, not a rounded one");
+        assert_eq!(render(0, 2001), 0.0, "a genuine ZERO still renders zero — the guard is \
+                                          about nonzero counts, not about hiding zeros");
     }
 
     /// Distinct ids for the padding rows above. A counter, not randomness:
