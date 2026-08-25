@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.723';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.724';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -33491,9 +33491,38 @@ async function _bwGo() {
     const r = await fetch('/api/browser/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const d = await r.json();
     if (d.error) { _bwStatus('Error: ' + d.error); return; }
-    _bwCurrentUrl = (d.data && d.data.url) || url;
+    // SAY WHERE IT LANDED, and say so when that is not where you asked.
+    //
+    // This read `(d.data && d.data.url) || url`. `/api/browser/start` has no
+    // `data` object, so the first term was ALWAYS undefined and the fallback
+    // recorded the url we REQUESTED as though it were the current page. Then
+    // "Navigated" printed unconditionally on the mere absence of d.error. One
+    // word for two states: "you are on the page you typed" and "Chrome started
+    // and went somewhere else entirely".
+    //
+    // Reported 2026-08-25: google.com typed, "Navigated" shown, and the only
+    // page target was a session-restored app.hubspot.com/login. The server now
+    // returns `launch_url` — where the page tab actually is — so the mismatch
+    // is a fact we can show instead of one the user has to notice.
+    //
+    // A DIFFERENCE IS NOT A FAILURE. launch_url is read immediately after
+    // launch, so a slow page can still be about:blank and a redirect may not
+    // have resolved; hosts also legitimately differ (google.com -> www.google.com).
+    // Compare the HOST and only when we have a real one, or this becomes a
+    // false alarm on every redirect.
+    const _landed = d.launch_url || (d.data && d.data.url) || '';
+    _bwCurrentUrl = _landed || url;
     _bwShowProfile(d.profile, d.auto_profile);
-    _bwStatus('Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : ''));
+    let _msg = 'Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : '');
+    if (_landed && !/^about:/.test(_landed)) {
+      const _host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch (e) { return ''; } };
+      const _want = _host(url), _got = _host(_landed);
+      if (_want && _got && _want !== _got) {
+        _msg = 'Started, but the page is ' + _got + ' — not ' + _want
+             + '. The profile may have restored a session; navigate again or pick a different profile.';
+      }
+    }
+    _bwStatus(_msg);
     // We navigated → we now EXPECT a live frame; a blank viewport from here is a
     // failure, not the initial state (drives _bwViewportFail).
     _bwWantFrame = true; _bwHasFrame = false; _bwShotFails = 0;

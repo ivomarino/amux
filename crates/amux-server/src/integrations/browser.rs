@@ -750,6 +750,24 @@ pub struct StartedBrowser {
     pub cdp_http: String,
     pub user_data_dir: String,
     pub started_at: i64,
+    /// The URL of the page tab this launch actually produced.
+    ///
+    /// `start()` took a `url` and returned NOTHING about where the browser
+    /// ended up, so `/api/browser/start`'s response had no url of any kind.
+    /// The dashboard read it as `d.data && d.data.url`, which is undefined for
+    /// this endpoint, fell back to the url it had ASKED for, and printed
+    /// "Navigated" unconditionally. So the one word the user gets meant both
+    /// "you are on the page you typed" and "Chrome started and went somewhere
+    /// else entirely" — reported 2026-08-25 as "it says navigated but i dont
+    /// see anything", with google.com requested and a session-restored
+    /// app.hubspot.com/login on screen.
+    ///
+    /// HONEST ABOUT ITS OWN LIMITS: this is read immediately after launch, so a
+    /// slow page can still be `about:blank` here and a redirect may not have
+    /// resolved. It is evidence of WHERE THE TAB WENT, not a load-complete
+    /// signal — the caller must not treat a mismatch as failure, only as a fact
+    /// worth showing. `None` when CDP listed no page tab at all.
+    pub launch_url: Option<String>,
 }
 
 /// The tail of Chrome's launch stderr, formatted for an error message, or "" if
@@ -1126,12 +1144,26 @@ pub async fn start(
     // matches on tab TYPE and not on the URL string.
     // The CDP call happens BEFORE the lock is taken: NATIVE_TARGETS is a
     // std::sync::Mutex, and holding one across an await deadlocks the runtime.
-    let launch_tab = cdp_list(port).await.ok().and_then(|tabs| {
+    // The same listing already resolves the page tab; its URL was being thrown
+    // away, which is why the response could not say where the browser landed.
+    let launch_page = cdp_list(port).await.ok().and_then(|tabs| {
         tabs.as_array()
             .and_then(|ts| ts.iter().find(|t| t.get("type").and_then(Value::as_str) == Some("page")))
-            .and_then(|t| t.get("id").and_then(Value::as_str))
-            .map(str::to_string)
+            .map(|t| {
+                (
+                    t.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    t.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+                )
+            })
     });
+    let launch_url = launch_page
+        .as_ref()
+        .map(|(_, u)| u.clone())
+        .filter(|u| !u.is_empty());
+    let launch_tab = launch_page
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .filter(|id| !id.is_empty());
     {
         let mut map = NATIVE_TARGETS.lock().expect("native targets poisoned");
         map.clear();
@@ -1157,6 +1189,7 @@ pub async fn start(
         cdp_http: http,
         user_data_dir: target.user_data_dir.display().to_string(),
         started_at,
+        launch_url,
     };
     // `child.id()` is None only once the child has been reaped; a browser we
     // just spawned always has one. Refusing here beats persisting pid 0, which
