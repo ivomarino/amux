@@ -37,7 +37,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/api/secrets", get(list_secrets))
         .route("/api/secrets/inspect", get(inspect_secrets))
-        .route("/api/secrets/:path", get(get_secret).post(update_secret))
+        .route("/api/secrets/{path}", get(get_secret).post(update_secret))
 }
 
 /// List all secret paths (keys only, no values)
