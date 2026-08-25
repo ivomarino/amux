@@ -221,11 +221,33 @@ pub fn fate(home: &Path, id: &str) -> String {
                 GET /api/email/log shows who released it and when."
             .into();
     }
+    if dir.join(format!("{id}.rejected.json")).exists() {
+        return "this approval was DISCARDED — a human rejected it and it was never sent. \
+                GET /api/email/log shows who discarded it and why."
+            .into();
+    }
     if dir.join(format!("{id}.expired.json")).exists() {
         return "this approval EXPIRED unreleased (1h TTL) — the worker must request the send again"
             .into();
     }
     "no approval with that id is pending, and the directory holds no record of one".into()
+}
+
+/// Discard a pending approval without sending it (AMUX-3698).
+///
+/// The same one-shot rename `consume` uses, to `.rejected.json`. Renamed rather
+/// than deleted, like every other terminal state here, so "what happened to
+/// apr_X" stays answerable from the directory alone — and so `fate()` can tell a
+/// later caller it was discarded rather than guessing.
+pub fn discard(home: &Path, id: &str) -> Option<Value> {
+    if !valid_id(id) {
+        return None;
+    }
+    let dir = approvals_dir(home);
+    let live = dir.join(format!("{id}.json"));
+    let doc = serde_json::from_str::<Value>(&std::fs::read_to_string(&live).ok()?).ok()?;
+    std::fs::rename(&live, dir.join(format!("{id}.rejected.json"))).ok()?;
+    Some(doc)
 }
 
 /// Pending approvals, oldest first, for the dashboard / a human's curl.

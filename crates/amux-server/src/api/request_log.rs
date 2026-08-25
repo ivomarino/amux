@@ -1080,6 +1080,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/email/search", methods: &["GET"] },
     RouteEntry { path: "/api/email/log", methods: &["GET"] },
     RouteEntry { path: "/api/email/approve/{id}", methods: &["POST"] },
+    RouteEntry { path: "/api/email/reject/{id}", methods: &["POST"] },
     RouteEntry { path: "/api/email/approvals", methods: &["GET"] },
     RouteEntry { path: "/api/cal-events", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/cal-events/{id}", methods: &["PATCH", "DELETE"] },

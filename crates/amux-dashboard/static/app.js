@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.720';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.722';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11037,10 +11037,34 @@ async function _approvalsRefresh() {
     const d = await r.json();
     const pending = Array.isArray(d.pending) ? d.pending : [];
     if (!pending.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    // COLLAPSIBLE (Ethan, 2026-08-25: "i should be able to collapse this").
+    //
+    // This is a full-width block at the top of a mobile-first dashboard, and it
+    // stays as long as anything is held — which, with a lane probing the gate,
+    // was two rows plus a footer for an hour. There was no way to fold it.
+    //
+    // COLLAPSED STILL SHOWS THE COUNT, deliberately. A queue of pending external
+    // sends that can be hidden completely is worse than one that takes space:
+    // the whole point of the banner is that a human sees there is something
+    // waiting. Folding trades the previews for one line, never the fact.
+    //
+    // The preference is per-device (localStorage), because "I have seen these"
+    // is a property of the person looking, not of the server's queue.
+    const collapsed = localStorage.getItem('amuxApprCollapsed') === '1';
     let html = '<div style="max-width:860px;margin:0 auto;">'
-      + '<div style="font-weight:600;margin-bottom:6px;">&#x2709;&#xFE0F; '
-      + pending.length + ' external email' + (pending.length === 1 ? '' : 's')
-      + ' held for your approval</div>';
+      + '<div onclick="_apprToggle()" role="button" tabindex="0" '
+      + 'style="font-weight:600;margin-bottom:6px;cursor:pointer;display:flex;'
+      + 'align-items:center;gap:8px;min-height:44px;" '
+      + 'title="' + (collapsed ? 'Show the drafts' : 'Collapse') + '">'
+      + '<span style="display:inline-block;width:1em;transition:transform .12s;'
+      + 'transform:rotate(' + (collapsed ? '-90' : '0') + 'deg);">&#x25BE;</span>'
+      + '<span>&#x2709;&#xFE0F; ' + pending.length + ' external email'
+      + (pending.length === 1 ? '' : 's') + ' held for your approval</span></div>';
+    if (collapsed) {
+      el.innerHTML = html + '</div>';
+      el.style.display = 'block';
+      return;
+    }
     for (const p of pending) {
       const pv = p.preview || {};
       const mins = Math.max(1, Math.round((p.expires_in_s || 0) / 60));
@@ -11053,16 +11077,42 @@ async function _approvalsRefresh() {
         + '<button onclick="event.preventDefault();_apprApprove(\'' + esc(p.id) + '\',this)" '
         + 'style="background:#16a34a;color:#fff;border:none;border-radius:6px;'
         + 'padding:8px 14px;font-size:0.8rem;cursor:pointer;min-height:34px;">Approve &amp; send</button>'
+        // DISCARD (AMUX-3698). Until this existed the only button here was
+        // "Approve & send", so a human looking at a draft they did not want had
+        // one move: wait an hour. Ethan hit it directly — two of autodesk's
+        // example.invalid gate probes sitting in his banner, approve-or-wait.
+        // 44x34 keeps it over the mobile touch floor (css-mobile.md).
+        + '<button onclick="event.preventDefault();_apprReject(\'' + esc(p.id) + '\',this)" '
+        + 'style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.45);'
+        + 'border-radius:6px;padding:8px 14px;font-size:0.8rem;cursor:pointer;'
+        + 'min-height:34px;min-width:44px;">Discard</button>'
         + '</summary>'
         + '<div style="white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.25);'
         + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:180px;overflow:auto;">'
         + (pv.cc ? 'cc: ' + esc(pv.cc) + '\n' : '')
         + esc(pv.body || '') + '</div></details>';
     }
-    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">Unapproved drafts expire on their own; nothing sends without the button.</div></div>';
+    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">Nothing sends without Approve. Discard drops a draft now and records who dropped it; unapproved drafts also expire on their own.</div></div>';
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
+}
+function _apprToggle() {
+  const now = localStorage.getItem('amuxApprCollapsed') === '1' ? '0' : '1';
+  localStorage.setItem('amuxApprCollapsed', now);
+  _approvalsRefresh();
+}
+async function _apprReject(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Discarding…'; }
+  try {
+    const r = await fetch(API + '/api/email/reject/' + encodeURIComponent(id), {
+      method: 'POST', headers: { ..._authHeaders(), 'X-Amux-Approver': 'dashboard' },
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) showToast('Discarded — nothing was sent' + (d.was_for_session ? ' (' + d.was_for_session + ')' : ''));
+    else showToast('Discard failed: ' + (d.error || r.status));
+  } catch (e) { showToast('Discard failed: ' + e); }
+  _approvalsRefresh();
 }
 async function _apprApprove(id, btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }

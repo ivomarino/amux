@@ -58,6 +58,7 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/log", get(send_log))
         // AMUX-3510: the human approval half of the external-send gate.
         .route("/approve/{id}", post(approve))
+        .route("/reject/{id}", post(reject))
         .route("/approvals", get(list_approvals))
         .layer(Extension(ctx))
 }
@@ -709,6 +710,78 @@ fn approval_required_response(id: &str, preview: Value) -> Response {
         })),
     )
         .into_response()
+}
+
+/// POST /api/email/reject/{id} — the human DISCARD (AMUX-3698).
+///
+/// Reported by autodesk, and Ethan hit the consequence directly: his approvals
+/// banner showed two of autodesk's `example.invalid` gate probes, and the only
+/// button on it was "Approve & send". A human looking at a draft they do not
+/// want has had exactly one move — wait an hour for the TTL — while the copy
+/// underneath told them so.
+///
+/// That is ethos rule 3 on a HUMAN-facing surface: a constraint whose only exit
+/// is the passage of time. It also means the queue cannot distinguish "pending a
+/// decision" from "decided against, waiting to rot", so a glance at the banner
+/// overstates what is actually awaiting judgment.
+///
+/// Attributed like approve, and for the same reason: a discard is a decision
+/// about someone else's queued work, and "why was this not sent" is a question
+/// the ledger could not answer for ANY unsent draft. It can now.
+pub async fn reject(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let by = headers
+        .get("x-amux-approver")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| hdr_worker(&headers))
+        .unwrap_or_else(|| "unidentified".to_string());
+    let reason = body
+        .as_ref()
+        .and_then(|b| b.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let home = ctx.client.home().to_path_buf();
+    // The creating lane may discard its OWN draft — unlike approve, where
+    // self-release is the whole loop the gate exists to break. Withdrawing a
+    // send you queued is not a bypass; refusing it would leave a worker that
+    // notices its own mistake with no way to clean up after itself, which is
+    // what left two probe drafts in Ethan's banner.
+    match crate::api::email_approval::discard(&home, &id) {
+        Some(doc) => {
+            let session = doc.get("session").and_then(Value::as_str).unwrap_or("").to_string();
+            tracing::info!(
+                approval = %id, session = %session, by = %by, reason = %reason,
+                "[email] approval DISCARDED — the draft was never sent (AMUX-3698)"
+            );
+            email_log(
+                ctx.client.home(),
+                json!({
+                    "endpoint": "reject", "approval_id": id, "session": session,
+                    "rejected": true, "rejected_by": by, "reason": reason,
+                    "approver_verified": false,
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "rejected": true, "approval_id": id,
+                             "was_for_session": session })),
+            )
+                .into_response()
+        }
+        None => err(
+            StatusCode::NOT_FOUND,
+            json!({ "error": crate::api::email_approval::fate(&home, &id) }),
+        ),
+    }
 }
 
 /// POST /api/email/approve/{id} — the human release (AMUX-3510). Refuses any
@@ -1916,6 +1989,89 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::OK, "{res}");
+    }
+
+    /// AMUX-3698: a human can DISCARD a held draft, and it is recorded.
+    ///
+    /// Ethan's screenshot is the specimen: his approvals banner held two of
+    /// autodesk's `example.invalid` gate probes and the only button was
+    /// "Approve & send". The available moves were approve a worker's test email
+    /// or wait an hour — ethos rule 3 on a human-facing surface.
+    #[tokio::test]
+    async fn a_held_draft_can_be_discarded_and_the_discard_is_audited() {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "n", "threadId": "t" })),
+        ]);
+        let (app, _d, _r) = app_with(http, home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "gate-probe@example.invalid", "subject": "probe", "body": "b",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "premise: held: {res}");
+        let id = res["approval_id"].as_str().expect("approval_id").to_string();
+
+        let (st, ok) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/reject/{id}"),
+            Some(json!({ "reason": "worker probe, not a real send" })),
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        assert_eq!(ok["rejected"], json!(true), "{ok}");
+        assert_eq!(ok["was_for_session"], json!("autodesk"), "{ok}");
+
+        // IT MUST NOT SEND. The whole point of a discard is that the draft dies
+        // unsent, and the MockHttp queue above would have served a send.
+        let log = crate::integrations::email::read_email_log(home.path(), 1, 50, "");
+        let rows = log["log"].as_array().unwrap();
+        assert!(
+            !rows.iter().any(|r| r.get("approved") == Some(&json!(true))),
+            "a discard must not release the draft: {rows:?}"
+        );
+        let rej = rows
+            .iter()
+            .find(|r| r.get("rejected") == Some(&json!(true)))
+            .expect("the discard must be a ledger row — 'why was this not sent' was \
+                     unanswerable for ANY unsent draft before this");
+        assert_eq!(rej["rejected_by"], json!("dashboard"));
+        assert_eq!(rej["reason"], json!("worker probe, not a real send"));
+
+        // ONE-SHOT, and the follow-up says WHICH terminal state it reached
+        // rather than enumerating three (the AUTOD-48 exculpation shape).
+        let (st, e) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/reject/{id}"),
+            None,
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{e}");
+        assert!(
+            e["error"].as_str().unwrap().contains("DISCARDED"),
+            "the directory knows which end it met — say it: {e}"
+        );
+
+        // AND APPROVE MUST REFUSE IT AFTERWARDS. A discarded draft that could
+        // still be released would make the button a suggestion.
+        let (st, e2) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{id}"),
+            None,
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{e2}");
     }
 
     /// AUTOD-48: the gate was bypassable in two calls by the lane it stops, and
