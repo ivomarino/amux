@@ -251,6 +251,126 @@ fn already_filed(conn: &rusqlite::Connection, scan_id: &str) -> bool {
     .is_ok()
 }
 
+/// Hourly size sample of the regenerable paths amux itself mandates, so growth
+/// is visible as a SERIES rather than as two spot readings after the fact.
+///
+/// # Why this exists next to the full scan rather than instead of it
+///
+/// The full reclaim scan is the better instrument and it is not being replaced.
+/// But measured 2026-08-25, it has completed ONCE in its lifetime — `reclaim_scans`
+/// reads `{done: 1, interrupted: 2, cancelled: 2, stalled: 1}`. It walks every root
+/// in 6-35 minutes while this server re-execs to adopt new builds every 22.8
+/// minutes on average (66 starts in 25h), so most scans lose that race by
+/// construction and `api/reclaim.rs` marks them `interrupted` at the next startup.
+/// Last completed scan was 2026-08-21, four days before the volume hit 100%.
+///
+/// The consequence was concrete: `~/.amux/rust-build-target` went from 40 GB to
+/// 97 GB in 19 hours and nothing said so. That growth is exactly what the scan
+/// exists to surface (DESKT-26/27).
+///
+/// This is the cheap half that cannot lose the race. One known directory instead
+/// of every root: measured at **9 seconds** for 323,855 files, against the full
+/// scan's 6-35 minutes. It fits inside the restart window with three orders of
+/// magnitude to spare, so it produces a reading every hour whatever the fleet is
+/// doing.
+///
+/// # Hardlink accounting, because it produced a real contradiction
+///
+/// Sizes are summed ONCE PER INODE, which is what `du` does. A naive per-file sum
+/// of this same directory reports 252.7 GB where `du` reports 97 GB, because cargo
+/// hardlinks artifacts heavily. Both numbers are "right" and only one matches the
+/// free space a reader is comparing against, so the wrong one reads as a 2.6x
+/// discrepancy and invites the conclusion that the measurement is broken.
+fn report_regenerable_growth() {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+
+    let mut now_sizes: HashMap<String, u64> = HashMap::new();
+    for path in watched_regenerable_paths() {
+        let Some((bytes, files)) = du_bytes(&path) else { continue };
+        let key = path.to_string_lossy().to_string();
+        let gb = bytes as f64 / 1_073_741_824.0;
+
+        let prev = LAST
+            .lock()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|m| m.get(&key).copied()));
+        match prev {
+            // First reading of a path is a BASELINE, not growth — the same rule
+            // the scan-diff path already follows (see the test named for it).
+            None => tracing::info!(
+                job = JOB,
+                path = %key,
+                gb = format!("{gb:.1}"),
+                files,
+                "regenerable path baseline"
+            ),
+            Some(p) => {
+                let delta = gb - (p as f64 / 1_073_741_824.0);
+                tracing::info!(
+                    job = JOB,
+                    path = %key,
+                    gb = format!("{gb:.1}"),
+                    delta_gb = format!("{delta:+.1}"),
+                    files,
+                    "regenerable path size"
+                );
+            }
+        }
+        now_sizes.insert(key, bytes);
+    }
+    if let Ok(mut g) = LAST.lock() {
+        *g = Some(now_sizes);
+    }
+}
+
+/// The regenerable paths amux itself creates or mandates, so watching them is
+/// amux's business rather than a guess about the user's disk.
+///
+/// Deliberately short. `~/.amux/rust-build-target` is here because CLAUDE.md
+/// MANDATES one shared `CARGO_TARGET_DIR` for the whole fleet — that rule
+/// replaced ~37 per-session target trees that filled the volume on 2026-08-10,
+/// and it has no upper bound of its own. `AMUX_DISK_WATCH_PATHS` (colon or comma
+/// separated) adds more without a code change.
+fn watched_regenerable_paths() -> Vec<std::path::PathBuf> {
+    let mut v = vec![crate::config::amux_home().join("rust-build-target")];
+    if let Ok(extra) = std::env::var("AMUX_DISK_WATCH_PATHS") {
+        for p in extra.split([':', ',']).map(str::trim).filter(|p| !p.is_empty()) {
+            v.push(std::path::PathBuf::from(p));
+        }
+    }
+    v.retain(|p| p.exists());
+    v
+}
+
+/// `(bytes, files)` for a directory tree, counting each INODE once — `du`
+/// semantics. Returns `None` when the path cannot be read at all, which must not
+/// be reported as a size of zero.
+fn du_bytes(root: &std::path::Path) -> Option<(u64, u64)> {
+    use std::collections::HashSet;
+    use std::os::unix::fs::MetadataExt;
+    let mut seen: HashSet<(u64, u64)> = HashSet::new();
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    let mut read_any = false;
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        read_any = true;
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(e.path());
+            } else if seen.insert((md.dev(), md.ino())) {
+                bytes += md.len();
+                files += 1;
+            }
+        }
+    }
+    read_any.then_some((bytes, files))
+}
+
 /// Say out loud, hourly, when free space is low.
 ///
 /// # Why this is here and not where you would expect
@@ -301,6 +421,7 @@ fn report_disk_pressure() {
 
 async fn tick(state: AppState) {
     report_disk_pressure();
+    report_regenerable_growth();
     let (scans, running) = {
         let Ok(conn) = state.store.read() else { return };
         let running: i64 = conn
@@ -664,5 +785,75 @@ mod tests {
             .unwrap();
         assert_eq!(owner, "human");
         assert_eq!(kind, "ops");
+    }
+
+    // ---- DESKT-27: the cheap sampler that cannot lose the re-exec race ----
+
+    /// `du_bytes` must count each INODE once. A naive per-file sum of the real
+    /// shared target dir reports 252.7 GB where `du` reports 97 GB, because cargo
+    /// hardlinks heavily — and only the du-shaped number is comparable to the
+    /// free space a reader is looking at.
+    #[test]
+    fn du_bytes_counts_a_hardlink_once() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        std::fs::write(&a, vec![7u8; 4096]).unwrap();
+        let (before, files_before) = du_bytes(d.path()).expect("readable");
+        std::fs::hard_link(&a, d.path().join("b")).unwrap();
+        let (after, files_after) = du_bytes(d.path()).expect("readable");
+        assert_eq!(
+            before, after,
+            "a hardlink adds a NAME, not bytes — {before} -> {after} means du semantics are wrong"
+        );
+        assert_eq!(files_before, files_after, "and it must not double-count the file either");
+    }
+
+    /// …while a genuinely new file DOES count, or the test above is satisfied by
+    /// a function that always returns the same number.
+    #[test]
+    fn du_bytes_still_counts_a_real_second_file() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("a"), vec![7u8; 4096]).unwrap();
+        let (before, _) = du_bytes(d.path()).unwrap();
+        std::fs::write(d.path().join("c"), vec![9u8; 8192]).unwrap();
+        let (after, _) = du_bytes(d.path()).unwrap();
+        assert!(after > before, "a distinct file must add bytes: {before} -> {after}");
+    }
+
+    /// An unreadable path is None, never Some(0). Reporting a missing tree as
+    /// "0 GB" would render as a dramatic reclaim in the delta line.
+    #[test]
+    fn an_unreadable_path_is_none_not_zero() {
+        assert!(du_bytes(std::path::Path::new("/no-such-dir-9f3a/nope")).is_none());
+    }
+
+    /// Nested directories are summed, or the sampler would report only the top
+    /// level of a cargo tree — which is where almost none of the bytes are.
+    #[test]
+    fn du_bytes_descends() {
+        let d = tempfile::tempdir().unwrap();
+        let deep = d.path().join("x/y/z");
+        std::fs::create_dir_all(&deep).unwrap();
+        std::fs::write(deep.join("f"), vec![1u8; 16384]).unwrap();
+        let (bytes, files) = du_bytes(d.path()).expect("readable");
+        assert_eq!(files, 1);
+        assert!(bytes >= 16384, "nested bytes must be counted, got {bytes}");
+    }
+
+    /// The watch list must always include the shared cargo target dir — that is
+    /// the path CLAUDE.md mandates the whole fleet share, and the one whose
+    /// unbounded growth this sampler exists to make visible (DESKT-26).
+    #[test]
+    fn the_shared_cargo_target_is_always_watched_when_present() {
+        let shared = crate::config::amux_home().join("rust-build-target");
+        let watched = watched_regenerable_paths();
+        if shared.exists() {
+            assert!(watched.contains(&shared), "shared target dir must be watched: {watched:?}");
+        }
+        // Every returned path must exist — a non-existent entry would log a
+        // baseline of nothing, forever.
+        for p in &watched {
+            assert!(p.exists(), "watched path does not exist: {p:?}");
+        }
     }
 }
