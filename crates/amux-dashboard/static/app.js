@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.728';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.729';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19293,8 +19293,23 @@ function _archivedScope() {
 
 function _archivedQuery(extra) {
   const sc = _archivedScope();
+  // `done_limit=0` HERE TOO, or the count and the list describe different
+  // populations (found while verifying tubescience's co-verification numbers).
+  //
+  // The count query already passed it. This one did not, and unscoped that is a
+  // real disagreement: the count returns 3008 (uncapped) while the list is drawn
+  // from 662 (the fleet-wide terminal cap), so the header would have said
+  // "Showing 200 of 3008" about 200 rows taken from a different set. That is
+  // precisely the failure ?count=1 was built to prevent, reintroduced one query
+  // string away from it.
+  //
+  // The scoped branch was already correct by accident: a scoped query is not
+  // capped by default (the ts-gke fix — "A SCOPED query must answer
+  // completely"), which is exactly why scoping surfaced 154 of tubescience's
+  // cards where the fleet view showed 81. Correct-by-accident in one branch is
+  // still wrong in the other.
   return '/api/board?archived=1' + (sc ? '&session=' + encodeURIComponent(sc) : '')
-    + '&limit=' + _ARCHIVED_SLICE + (extra || '');
+    + '&done_limit=0&limit=' + _ARCHIVED_SLICE + (extra || '');
 }
 
 let _archivedScopeAt = null;
