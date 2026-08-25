@@ -384,9 +384,27 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
         ])
         .output();
     let which = std::process::Command::new("which").arg("tmux").output();
+    // AMUX-3700: how often a pane capture had to be KILLED on its deadline.
+    // A bounded capture is invisible by construction — the request succeeds and
+    // the lane's preview is merely absent — so a tmux that has started hanging
+    // reads exactly like a quiet fleet. Before the bound existed, the same
+    // condition showed up as GET /api/sessions at 12.1s and 93.3s, diagnosed
+    // from raw latency rows because nothing could name the cause.
+    let pane_timeouts = crate::api::sessions_legacy::PANE_CAPTURE_TIMEOUTS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let pane_last = crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT
+        .lock()
+        .ok()
+        .and_then(|l| l.clone())
+        .map(|(lane, ts)| serde_json::json!({"lane": lane, "ts": ts}));
     axum::Json(match out {
         Ok(o) => serde_json::json!({
             "spawn": "ok",
+            "pane_capture_timeouts": pane_timeouts,
+            "pane_capture_last_timeout": pane_last,
+            "pane_capture_note": "captures killed on AMUX_PANE_CAPTURE_TIMEOUT_S (default 3s). \
+                                  In-memory, so a restart resets it; a non-zero count means \
+                                  tmux is not answering and some lane previews are missing.",
             "exit": o.status.to_string(),
             "stdout_bytes": o.stdout.len(),
             "stdout_lines": String::from_utf8_lossy(&o.stdout).lines().count(),
