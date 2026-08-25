@@ -87,6 +87,7 @@ pub mod workers_deadletters;
 
 use crate::db::SharedStore;
 use axum::Router;
+use std::sync::Arc;
 use std::time::Instant;
 use tower_http::compression::CompressionLayer;
 
@@ -101,6 +102,8 @@ pub struct AppState {
     pub build_hash: String,
     /// Bearer token; None disables auth (tests, first-run).
     pub auth_token: Option<String>,
+    /// Central secrets store (Phase 3: decrypted at startup, shared to all handlers)
+    pub secrets: Arc<crate::secrets::SecretStore>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -227,6 +230,7 @@ pub fn router(state: AppState) -> Router {
         .merge(habits::routes())
         .merge(observability::routes())
         .merge(connectors::routes())
+        .merge(secrets::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
