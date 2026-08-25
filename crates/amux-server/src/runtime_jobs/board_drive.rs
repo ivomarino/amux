@@ -377,12 +377,60 @@ impl Fleet for LiveFleet {
     }
     async fn deliver(&self, lane: &str, text: &str) {
         let _ = crate::api::session_verbs::steer_enqueue(&self.state, lane, text, "board-drive", "").await;
+        self.record_prompt(lane, text).await;
     }
     async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) {
         let _ = crate::api::session_verbs::steer_enqueue_precond(
             &self.state.store, lane, text, "board-drive", "", Some((card, rev)),
         )
         .await;
+        self.record_prompt(lane, text).await;
+    }
+
+}
+
+impl LiveFleet {
+    /// A PICKUP IS A PROMPT, AND NOTHING RECORDED IT (AMUX-3547 -> AMUX-3544).
+    ///
+    /// `/api/usage/attribution` answers "where did the plan window go" by
+    /// matching every `token_ledger` turn to the most recent preceding
+    /// `cmd_history` row for that session. `steer_enqueue` writes
+    /// `steering_queue` and `steering_history`; only the SEND path writes
+    /// `cmd_history`. Auto-pickup goes through the former, so it wrote no row
+    /// at all.
+    ///
+    /// Measured over 24h before this fix: **247 auto-pickup deliveries in
+    /// `steering_history`, 2 in `cmd_history`.** So ~245 pickups' turns were
+    /// attributed to whatever prompt happened to precede them — and when that
+    /// was the human's, they landed under `user` / "you typed it", whose
+    /// `is_background` is FALSE.
+    ///
+    /// The bias therefore runs toward UNDER-reporting background, which is the
+    /// one direction that matters here: AMUX-3542 is a customer whose plan
+    /// window was eaten by background work, and the instrument built to prove
+    /// it was crediting some of that work to the customer's own typing.
+    ///
+    /// `pickup` as its own type rather than reusing `system` or `direct`: those
+    /// already mean other things in this table, and the question a reader asks
+    /// of this row ("did amux hand me this, or did I ask for it?") deserves its
+    /// own answer instead of being inferred from text.
+    async fn record_prompt(&self, lane: &str, text: &str) {
+        let (lane, text) = (lane.to_string(), text.to_string());
+        let ts = crate::runtime_jobs::registry::unix_now();
+        let _ = self
+            .state
+            .store
+            .write_async(move |conn| {
+                // Best-effort: a missing attribution row must never stop a
+                // delivery. The pickup is the product; this is its receipt.
+                let _ = conn.execute(
+                    "INSERT INTO cmd_history (text, type, session, ts, origin) \
+                     VALUES (?1, 'pickup', ?2, ?3, 'board-drive')",
+                    rusqlite::params![text, lane, (ts * 1000.0) as i64],
+                );
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
     }
 }
 

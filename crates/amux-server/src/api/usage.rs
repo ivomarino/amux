@@ -396,6 +396,11 @@ fn trigger_label(t: &str) -> &'static str {
         "user" => "you typed it",
         "schedule" => "a schedule fired",
         "session" => "a peer lane messaged",
+        // AMUX-3547. Its own cell because "did amux hand me this, or did I ask
+        // for it?" is the question this whole view exists to answer, and until
+        // board_drive::record_prompt shipped, pickup turns had no row and were
+        // credited to whatever prompt preceded them — including the human's.
+        "pickup" => "amux handed this lane a board card",
         "system" => "an amux nudge",
         "direct" | "steering" => "a steering message",
         "" => "no prompt matched — the turn predates this lane's history",
@@ -484,6 +489,11 @@ mod tests {
             // Three prompts into one lane: a human, a schedule, a peer.
                 for (t, origin, at) in [
                     ("user", "", now - 300),
+                    // AMUX-3547: a pickup lands right after the human's prompt.
+                    // Before board_drive::record_prompt existed this row was
+                    // never written, so the turn below was matched to the
+                    // HUMAN's row and counted as foreground.
+                    ("pickup", "board-drive", now - 250),
                     ("schedule", "poll the inbox", now - 200),
                     ("session", "peer-lane", now - 100),
                 ] {
@@ -495,6 +505,7 @@ mod tests {
                 // A turn after each prompt, plus one far outside the window.
                 for (at, cost) in [
                     (now - 290, 1.0),
+                    (now - 240, 7.0), // the pickup's turn
                     (now - 190, 5.0),
                     (now - 90, 20.0),
                     (now - 86_400 * 30, 999.0),
@@ -541,15 +552,51 @@ mod tests {
         assert_eq!(by.get("schedule"), Some(&5.0), "the schedule's turn: {v}");
         assert_eq!(by.get("session"), Some(&20.0), "the peer's turn: {v}");
 
+        // AMUX-3547. A PICKUP IS ITS OWN BUCKET AND IT IS BACKGROUND.
+        //
+        // Measured on the live fleet before the fix: 247 auto-pickup deliveries
+        // in `steering_history` over 24h and TWO in `cmd_history`. Pickup went
+        // through `steer_enqueue`, which writes the steering tables; only the
+        // send path wrote `cmd_history`. So a pickup's turns were matched to
+        // whatever prompt preceded them — here the human's — and counted as
+        // FOREGROUND.
+        //
+        // The bias ran toward under-reporting background, which is the one
+        // direction that matters: AMUX-3542 is a customer whose plan window was
+        // eaten by background work, and the instrument built to prove it was
+        // crediting some of that work to their own typing.
+        assert_eq!(by.get("pickup"), Some(&7.0), "the pickup's turn is its own bucket: {v}");
+        let pickup_row = v["by_source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["source"] == "pickup")
+            .expect("pickup row");
+        assert_eq!(
+            pickup_row["is_background"],
+            json!(true),
+            "amux handing a lane a card is not the human typing: {pickup_row}"
+        );
+        assert!(
+            pickup_row["label"].as_str().unwrap().contains("amux handed"),
+            "the label is read by someone wondering where their credits went: {pickup_row}"
+        );
+        assert_eq!(
+            by.get("user"),
+            Some(&1.0),
+            "AND THE HUMAN'S BUCKET MUST NOT HAVE ABSORBED IT — 8.0 here is the pre-fix \
+             behaviour, and it is the whole defect: {v}"
+        );
+
         // 2. Background share is the headline the complaint was about.
-        assert_eq!(v["total_cost_usd"], json!(26.0));
-        assert_eq!(v["background_cost_usd"], json!(25.0));
-        assert_eq!(v["background_pct"], json!(96.2));
+        assert_eq!(v["total_cost_usd"], json!(33.0));
+        assert_eq!(v["background_cost_usd"], json!(32.0));
+        assert_eq!(v["background_pct"], json!(97.0));
 
         // 3. THE CONTROL. The 30-day-old row must be OUTSIDE a 1-hour window.
         //    If this is 0 the join matched everything and every number above is
         //    the whole table wearing a window's label.
-        assert_eq!(v["rows_considered"], json!(3));
+        assert_eq!(v["rows_considered"], json!(4));
         assert!(
             v["rows_excluded_by_window"].as_i64().unwrap() >= 1,
             "the window excluded nothing — an unbounded match returns a confident wrong \
