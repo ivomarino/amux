@@ -374,6 +374,12 @@ pub fn build(
         // A FLOOR ON THE COUNT TOO. 1 of 2 paths is 50% and is not a
         // checkout-wide condition; an existing test caught that by going red.
         let denom = fresh.revived_checked.max(n);
+        // SAFE ONLY BECAUSE THE `>= 50` BRANCH BELOW IS THE SOLE RENDER SITE.
+        // Integer division can take a small nonzero share to 0 (5 of 501 is 0),
+        // and a rendered "0%" beside a nonzero count is not an imprecise number,
+        // it is the ZERO THAT MEANS NONE — the same collision that made
+        // "0% coverage" read as "nothing was checked". If you ever print
+        // `share` outside that branch, give it the `<1%` treatment `cov` has.
         let share = (n * 100).checked_div(denom).unwrap_or(0);
         let coverage = fresh.revived_checked + fresh.revived_unchecked;
         let well_covered = coverage == 0 || fresh.revived_checked * 2 >= coverage;
@@ -436,11 +442,20 @@ pub fn build(
         // something the two counts do not: 4-of-59 is much easier to feel as
         // "6%", and 2-of-6 is not.
         let pct = (fresh.revived_checked * 100).checked_div(total).unwrap_or(0);
-        // "<1%", NEVER "0%", when anything was actually examined. Integer
-        // division takes 4-of-524 — mixpeek-frustrations' real shape — to
-        // exactly 0, and "0% coverage" beside a sentence saying four paths were
-        // examined is two fields contradicting each other. It also reads as
-        // "nothing was checked", which is a different and wrong fact.
+        // "<1%", NEVER "0%", when anything was actually examined.
+        //
+        // Integer division takes 4-of-524 — mixpeek-frustrations' real shape —
+        // to exactly 0, and their naming of why that matters is the reusable
+        // part: truncation turned a small nonzero into THE ZERO THAT MEANS
+        // NONE. Not an imprecise number, a different claim. "0% coverage"
+        // beside a sentence saying four paths were examined is two fields
+        // contradicting each other, and the reader believes the number.
+        //
+        // Same family as a can't-tell rendering as a known-good, an unreachable
+        // cell rendering as a pass, and an all() over an empty set rendering as
+        // success: the value meaning "we did not look" and the value meaning
+        // "we looked and found little" must stay distinguishable, and
+        // arithmetic collapses them without anyone writing the collision.
         //
         // The counts carry the actionable part either way, which is why they
         // are printed beside it rather than replaced by it: at these ratios the
