@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.732';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.733';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19420,7 +19420,15 @@ function _renderBoardArchivedSection(container) {
     // exists... Hooking the trigger anywhere else would be a second mechanism."
     // This render is that place for the section, so the trigger belongs here and
     // not only in the toggle. `_loadArchivedSlice` is idempotent and TTL-guarded.
-    if (!(boardArchived || []).length) _loadArchivedSlice();
+    // UNCONDITIONAL. `_loadArchivedSlice` already decides — it returns early
+    // when a fetch is in flight, and when the cached slice is BOTH the current
+    // scope and fresh. Guarding it here with `if empty` re-implemented half of
+    // that decision and got it wrong: with 200 unscoped rows cached, typing
+    // session:x left the array non-empty, so the scoped refetch never fired and
+    // the section filtered the STALE unscoped slice forever — 86 rows under a
+    // header that correctly said 154. Two mechanisms deciding one thing, and
+    // the outer one could not see scope at all.
+    _loadArchivedSlice();
     // THE SAME CLIENT FILTERS THE ACTIVE COLUMNS USE. The server scope narrows
     // the FETCH (session only); everything else in the board's query — owner,
     // type, tag, negations, free text — is client-side, and the section must
