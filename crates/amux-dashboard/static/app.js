@@ -7890,7 +7890,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.725';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.726';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19252,6 +19252,9 @@ function _mergeArchived(data) {
 // wrong trade; the rows load only when someone opens it.
 let boardArchivedOpen = false;
 try { boardArchivedOpen = localStorage.getItem('amuxArchivedOpen') === '1'; } catch (e) {}
+// 200: measured. `archived=1&limit=200&full=1` is 142KB gzipped, against 2.9MB
+// for the unbounded query the `is:archived` path uses.
+const _ARCHIVED_SLICE = 200;
 let _archivedCountN = null;
 let _archivedCountAt = 0;
 
@@ -19271,10 +19274,46 @@ async function _ensureArchivedCount() {
   } catch (e) { console.error('archived count:', e); }
 }
 
+// ITS OWN BOUNDED FETCH, not _ensureArchived.
+//
+// _ensureArchived exists for the `is:archived` QUERY and fetches
+// `archived=1&done_limit=0&full=1` — measured live at 8.9MB raw / 2.9MB
+// gzipped across 3008 archived cards fleet-wide. Wiring a one-tap section to
+// that would have put a 2.9MB pull one thumb away on a mobile-first dashboard.
+//
+// I nearly shipped exactly that. The +38% figure I used to justify the design
+// was measured on `archived=1&slim=1` (87KB gzip) — a DIFFERENT QUERY from the
+// one the code runs. Measuring the wrong thing and reasoning from the number is
+// the same failure as verifying a boundary in the wrong language; the fix is
+// the same too, which is to measure the call the code actually makes.
+//
+// 200 rows with prose is 142KB gzipped and is roughly the limit of what a human
+// reviews in one sitting, so the bound is a UX bound that happens to be a
+// payload bound. `full=1` because slim DROPS source_ref, and the trigger is the
+// one field tubescience said they would act on.
+let _archivedSliceAt = 0;
+async function _loadArchivedSlice() {
+  if (_archivedLoading) return _archivedLoading;
+  if (boardArchived.length && (Date.now() - _archivedSliceAt) < 60000) return;
+  _archivedLoading = (async () => {
+    try {
+      const r = await fetch(API + '/api/board?archived=1&limit=' + _ARCHIVED_SLICE + '&full=1');
+      const d = await r.json();
+      if (Array.isArray(d)) {
+        boardArchived = d.filter(i => i.archived);
+        _archivedSliceAt = Date.now();
+        renderBoard();
+      }
+    } catch (e) { console.error('archived slice:', e); }
+    finally { _archivedLoading = null; }
+  })();
+  return _archivedLoading;
+}
+
 function _toggleArchivedSection() {
   boardArchivedOpen = !boardArchivedOpen;
   try { localStorage.setItem('amuxArchivedOpen', boardArchivedOpen ? '1' : '0'); } catch (e) {}
-  if (boardArchivedOpen) _ensureArchived();
+  if (boardArchivedOpen) _loadArchivedSlice();
   renderBoard();
 }
 
@@ -19306,6 +19345,15 @@ function _renderArchivedSection(container) {
         const st = _statusCanon(i.status || 'todo');
         (groups[st] = groups[st] || []).push(i);
       });
+      // NO SILENT CAP. The header count is the TRUE total; this list is a
+      // bounded slice of it, and a section that showed 200 of 3008 without
+      // saying so would read as "this is everything archived" — which is the
+      // same false completeness the whole feature exists to fix.
+      if (_archivedCountN !== null && _archivedCountN > rows.length) {
+        html += '<div class="board-archived-empty">Showing ' + rows.length + ' of '
+          + _archivedCountN + '. Use the search box (<code>is:archived</code>) to filter '
+          + 'the full set, or <code>GET /api/board?archived=1</code>.</div>';
+      }
       Object.keys(groups).sort().forEach(function (st) {
         const g = groups[st];
         html += '<div class="board-archived-group"><div class="board-archived-group-h">'
