@@ -35,6 +35,7 @@
 use super::AppState;
 use axum::extract::State;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use serde_json::{json, Map, Value};
 use std::collections::BTreeMap;
@@ -54,6 +55,26 @@ fn cached() -> Option<Value> {
     let g = CACHE.lock().ok()?;
     let (at, v) = g.as_ref()?;
     (at.elapsed() < CACHE_TTL).then(|| v.clone())
+}
+
+/// How long an EXPIRED value may still be served while a refresh runs behind it
+/// (AMUX-3730). Past this, a caller waits for real data rather than being handed
+/// something arbitrarily old.
+///
+/// The ceiling is the whole reason this is safe. Stale-while-revalidate turns a
+/// visible slowness into an invisible wrongness if the background refresh keeps
+/// failing — the endpoint stays fast and quietly serves last week's branches,
+/// which is worse than the 2s wait it replaces. 5 minutes is ten TTLs: long
+/// enough that a transient git failure or a loaded box never reaches it, short
+/// enough that a persistently broken refresh becomes a wait (and a WARN) rather
+/// than a lie.
+const STALE_CEILING: Duration = Duration::from_secs(300);
+
+/// The cached value and its AGE, regardless of freshness.
+fn cached_any() -> Option<(Duration, Value)> {
+    let g = CACHE.lock().ok()?;
+    let (at, v) = g.as_ref()?;
+    Some((at.elapsed(), v.clone()))
 }
 
 async fn git_toplevel(dir: &str) -> Option<String> {
@@ -80,9 +101,58 @@ async fn git_toplevel(dir: &str) -> Option<String> {
 /// fan-out below; the std one would block the runtime thread.
 static REFRESH: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-pub async fn sessions_git(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
+pub async fn sessions_git(State(state): State<AppState>) -> Response {
     if let Some(v) = cached() {
-        return (StatusCode::OK, Json(v));
+        return ok(v, "hit");
+    }
+
+    // STALE-WHILE-REVALIDATE (AMUX-3730). Single-flight (below) collapsed the
+    // WORK; it did not collapse the WAIT. The refresh is synchronous, so every
+    // client arriving during one still blocked for the whole fan-out:
+    //
+    //     121 sessions, 92 DISTINCT dirs -> one `git rev-parse` each
+    //     GIT_CONCURRENCY = 4            -> 23 sequential waves
+    //     ~30ms per rev-parse, warm      -> ~700ms floor before any contention
+    //     GIT_TIMEOUT = 2s per call      -> a loaded box stretches a wave, which
+    //                                       is where the logged 13-16s came from
+    //
+    // That floor scales with the FLEET and nothing bounded it. So: hand back the
+    // expired value at once and refresh behind it. The header of this module
+    // already makes the staleness argument ("a stale-by-30s branch is correct:
+    // branches change on commit"); this widens the worst case to ~2x TTL in the
+    // normal case, on the same reasoning.
+    //
+    // `try_lock`, deliberately: if a refresh is already running we do NOT queue a
+    // second one, we just serve stale. Spawning per request would rebuild the
+    // stampede this endpoint was fixed for, one layer over.
+    if let Some((age, v)) = cached_any() {
+        if age < STALE_CEILING {
+            if let Ok(guard) = REFRESH.try_lock() {
+                let st = state.clone();
+                tokio::spawn(async move {
+                    // Hold the single-flight guard for the refresh's lifetime, so
+                    // a synchronous caller arriving mid-refresh waits for THIS
+                    // one instead of starting a second.
+                    let _g = guard;
+                    if let Err(e) = recompute(&st).await {
+                        tracing::warn!(
+                            marker = "sessions_git_bg_refresh_failed",
+                            error = %e,
+                            "background refresh failed; stale data will be served until the ceiling"
+                        );
+                    }
+                });
+            }
+            return ok(v, "stale");
+        }
+        // Past the ceiling. Fall through and WAIT — and say so, because an
+        // endpoint that silently went from 30ms to 2s is a support ticket
+        // nobody can diagnose.
+        tracing::warn!(
+            marker = "sessions_git_stale_ceiling",
+            age_s = age.as_secs(),
+            "cached value is past the stale ceiling; making the caller wait for fresh data"
+        );
     }
 
     // CACHE STAMPEDE (AMUX-3684). The TTL made this cheap on a HIT and did
@@ -105,20 +175,40 @@ pub async fn sessions_git(State(state): State<AppState>) -> (StatusCode, Json<Va
     // just politely one after another, which is slower than the stampede.
     let _refresh = REFRESH.lock().await;
     if let Some(v) = cached() {
-        return (StatusCode::OK, Json(v));
+        return ok(v, "hit-after-wait");
     }
+    match recompute(&state).await {
+        Ok(v) => ok(v, "miss"),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
+    }
+}
 
+/// The body, and the ONE place the cache disposition is reported.
+///
+/// The disposition rides a HEADER, never the body. The body is a bare
+/// `{session: {...}}` map and the dashboard does `Object.entries()` over it, so
+/// a top-level `_stale` key would render as a PHANTOM SESSION — the identical
+/// shape as the incident app.js records in its own comment, where a 404's
+/// `{"error":"not found"}` body became one entry whose `.repo` was undefined and
+/// the branch column just went blank with no throw and no console line.
+fn ok(v: Value, disposition: &str) -> Response {
+    let mut r = (StatusCode::OK, Json(v)).into_response();
+    if let Ok(hv) = axum::http::HeaderValue::from_str(disposition) {
+        r.headers_mut().insert("x-amux-cache", hv);
+    }
+    r
+}
+
+/// Rebuild the map and store it. Callable from the request path AND from a
+/// background task, which is the whole point: the two must not drift, so there
+/// is one function rather than a handler and a copy of it.
+///
+/// The CALLER owns the single-flight guard. This does not take it, so a future
+/// reader cannot accidentally make the background path re-enter it.
+async fn recompute(state: &AppState) -> Result<Value, String> {
     // (name, dir, branch) from the SAME source the session list renders.
     let rows: Vec<(String, String, String)> = {
-        let conn = match state.store.read() {
-            Ok(c) => c,
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("store unreadable: {e}")})),
-                )
-            }
-        };
+        let conn = state.store.read().map_err(|e| format!("store unreadable: {e}"))?;
         match super::sessions_legacy::build_array(&conn) {
             Ok(arr) => arr
                 .iter()
@@ -130,12 +220,7 @@ pub async fn sessions_git(State(state): State<AppState>) -> (StatusCode, Json<Va
                         .then_some((name, dir, branch))
                 })
                 .collect(),
-            Err(e) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(json!({"error": format!("session list unavailable: {e}")})),
-                )
-            }
+            Err(e) => return Err(format!("session list unavailable: {e}")),
         }
     };
 
@@ -173,7 +258,7 @@ pub async fn sessions_git(State(state): State<AppState>) -> (StatusCode, Json<Va
     if let Ok(mut g) = CACHE.lock() {
         *g = Some((Instant::now(), body.clone()));
     }
-    (StatusCode::OK, Json(body))
+    Ok(body)
 }
 
 #[cfg(test)]
@@ -300,6 +385,170 @@ mod tests {
             *g = Some((Instant::now() - CACHE_TTL - Duration::from_secs(1), json!({"a": 1})));
         }
         assert!(cached().is_none(), "expired entry must not be served");
+        *CACHE.lock().unwrap() = None;
+    }
+
+    /// AMUX-3730: an EXPIRED entry is served at once, and only up to a ceiling.
+    ///
+    /// `cached_any` is the whole discriminator between "fast and correct" and
+    /// "fast and lying", so it gets pinned in both directions. The ceiling is
+    /// not decoration: without it a background refresh that keeps failing turns
+    /// a visible 2s wait into an invisible week-old answer.
+    #[test]
+    fn an_expired_entry_is_still_servable_until_the_stale_ceiling() {
+        let _gate = TEST_GATE.blocking_lock();
+        let set_age = |d: Duration| {
+            *CACHE.lock().unwrap() = Some((Instant::now() - d, json!({"a": 1})));
+        };
+
+        // Just past the TTL: NOT fresh, but servable as stale.
+        set_age(CACHE_TTL + Duration::from_secs(1));
+        assert!(cached().is_none(), "past the TTL it is not FRESH");
+        let (age, _) = cached_any().expect("but it is still readable as stale");
+        assert!(age < STALE_CEILING, "and it is inside the ceiling: {age:?}");
+
+        // Past the ceiling: still readable, and the handler's guard must reject
+        // it. Asserted as the COMPARISON the handler makes, not just presence —
+        // `cached_any` returning Some is true on both sides of the ceiling, so
+        // presence alone would pass against a build with no ceiling at all.
+        set_age(STALE_CEILING + Duration::from_secs(1));
+        let (age, _) = cached_any().expect("still readable");
+        assert!(
+            age >= STALE_CEILING,
+            "past the ceiling the caller must WAIT rather than be served: {age:?}"
+        );
+
+        // CONTROL: a FRESH entry never takes the stale path at all.
+        set_age(Duration::from_secs(0));
+        assert!(cached().is_some(), "a fresh entry is served by the hit path");
+
+        *CACHE.lock().unwrap() = None;
+    }
+
+    /// THE CELL THAT GOES WRONG QUIETLY (AMUX-3730).
+    ///
+    /// Every other cell here passes against a build that serves stale FOREVER
+    /// and never refreshes — that version is fast, returns data, and honours the
+    /// ceiling. What it does not do is ever change its answer. So this asserts
+    /// the value the cache holds actually MOVES when a refresh runs, which is
+    /// the property "revalidate" names and the only one that separates the fix
+    /// from a cache that quietly froze.
+    #[tokio::test]
+    async fn a_refresh_actually_replaces_the_cached_value() {
+        let _gate = TEST_GATE.lock().await;
+        // A real store and a real temp home, because `recompute` is the SHIPPED
+        // path — the point of this cell is that it drives the same function the
+        // background task and the handler both call. The store is empty, so the
+        // fresh value is an empty map; that is fine and is the harder case,
+        // since it means the assertion below cannot pass by accident on
+        // coincidental content.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _h = crate::api::settings::test_env::set_home(home.path());
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+
+        // Seed a KNOWN-WRONG value with an old timestamp, the way a stale entry
+        // looks in production.
+        let sentinel = json!({"stale-sentinel": {"name": "stale-sentinel"}});
+        *CACHE.lock().unwrap() = Some((
+            Instant::now() - CACHE_TTL - Duration::from_secs(1),
+            sentinel.clone(),
+        ));
+        assert!(cached().is_none(), "set-up: the seeded value must be EXPIRED");
+
+        // Run the same function the background task runs.
+        let fresh = recompute(&state).await.expect("recompute");
+
+        let (age, now_cached) = cached_any().expect("cache must be populated");
+        assert!(age < CACHE_TTL, "recompute must stamp it FRESH, not leave it stale");
+        assert_ne!(
+            now_cached, sentinel,
+            "the cached value did not move — 'serve stale' degenerated into 'never refresh', \
+             which passes every other cell in this module"
+        );
+        assert_eq!(now_cached, fresh, "the cache must hold what recompute returned");
+
+        *CACHE.lock().unwrap() = None;
+    }
+
+    /// THE HANDLER ITSELF, which the cells above cannot reach.
+    ///
+    /// `an_expired_entry_is_still_servable_until_the_stale_ceiling` pins
+    /// `cached_any` and the constant — a real property, one layer ABOVE where
+    /// the defect would live. Delete the handler's ceiling comparison and that
+    /// cell stays green, which is the same wrong-layer shape this module's
+    /// stampede cell already confesses to ("it does NOT drive `sessions_git()`
+    /// itself... this cell CANNOT go red if the handler stops calling the
+    /// pattern"). That confession named the fix: extract the work behind a seam
+    /// the test can call. AMUX-3730's refactor is that seam, so this closes it.
+    ///
+    /// The `x-amux-cache` header is what makes the disposition assertable at
+    /// all. It rides a header rather than the body deliberately: the body is a
+    /// bare `{session: ...}` map the SPA runs `Object.entries()` over, so a
+    /// marker key in it would render as a phantom session.
+    #[tokio::test]
+    async fn the_handler_serves_stale_inside_the_ceiling_and_waits_past_it() {
+        let _gate = TEST_GATE.lock().await;
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _h = crate::api::settings::test_env::set_home(home.path());
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let disposition = |r: &Response| {
+            r.headers()
+                .get("x-amux-cache")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("<none>")
+                .to_string()
+        };
+
+        // FRESH -> served from the hit path, no stale involved.
+        *CACHE.lock().unwrap() = Some((Instant::now(), json!({"a": 1})));
+        let r = sessions_git(State(state.clone())).await;
+        assert_eq!(disposition(&r), "hit");
+
+        // EXPIRED but inside the ceiling -> served IMMEDIATELY as stale. This is
+        // the whole point of the card: the caller does not wait on the fan-out.
+        *CACHE.lock().unwrap() =
+            Some((Instant::now() - CACHE_TTL - Duration::from_secs(1), json!({"a": 1})));
+        let r = sessions_git(State(state.clone())).await;
+        assert_eq!(
+            disposition(&r),
+            "stale",
+            "an expired entry inside the ceiling must be served at once, not recomputed"
+        );
+
+        // PAST the ceiling -> the caller WAITS for real data. Never "stale".
+        // Without this the fix is "serve whatever we have, forever".
+        *CACHE.lock().unwrap() =
+            Some((Instant::now() - STALE_CEILING - Duration::from_secs(1), json!({"a": 1})));
+        let r = sessions_git(State(state.clone())).await;
+        assert_ne!(
+            disposition(&r),
+            "stale",
+            "past the ceiling the caller must wait for fresh data, not be handed stale"
+        );
+
+        // COLD START -> nothing to serve stale, so it must block and compute.
+        // The exemption has to be real; a build that answered "stale" here would
+        // be serving a value it does not have.
+        *CACHE.lock().unwrap() = None;
+        let r = sessions_git(State(state.clone())).await;
+        assert_eq!(disposition(&r), "miss", "a cold start has no stale value to serve");
+
         *CACHE.lock().unwrap() = None;
     }
 
