@@ -1597,6 +1597,23 @@ if ign:
 '
   fi
   local body
+  # WARNING: the block below is inside single quotes (python3 -c '...'). An
+  # apostrophe anywhere in it — including in a comment — closes the quote early
+  # and bash then fails to parse this whole FILE. That is not a local bug: this
+  # script is the symlink target of ~/.local/bin/amux, so a save is a deploy and
+  # every session in the fleet loses every subcommand at once, with the CLI too
+  # broken to print the help that would name the HTTP fallback. It happened
+  # (AMUX-3464, 2026-08-26). Keep explanations out here in bash-comment land,
+  # where quoting does not apply. `.claude/check-and-commit.sh` runs `bash -n`
+  # on save now, and tests/cli_syntax_guard.rs is the backstop.
+  #
+  # `reason` and `desc_append` are BOTH sent for a force, on purpose. The server
+  # interpolates `reason` into the permanent audit line ("force by <who>: a->b
+  # reason=..."); desc_append is prose a later edit can bury. Sending only the
+  # latter is why all 41 force lines this board had ever written read `reason=`
+  # empty, while 9 of those cards carried a good "[FORCED] <why>" in the desc:
+  # --force had already refused to run without a reason, and it simply never
+  # reached the ledger.
   body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" V="$reviewer" python3 -c '
 import json, os, sys, time
 b = {"status": os.environ["S"]}
@@ -1605,7 +1622,10 @@ if os.environ.get("T"): b["type"] = os.environ["T"]
 if os.environ.get("V"): b["reviewer"] = os.environ["V"]
 if os.environ.get("O"): b["override_doing"] = True
 if os.environ.get("R"): b["rev"] = int(os.environ["R"])
-if os.environ.get("F"): b["force"] = True; b["desc_append"] = "[FORCED] " + os.environ["F"]
+if os.environ.get("F"):
+    b["force"] = True
+    b["reason"] = os.environ["F"]
+    b["desc_append"] = "[FORCED] " + os.environ["F"]
 # Stamp last_verified_at alongside source_ref: a trigger with no verification
 # time is indistinguishable from one checked a month ago, and the staleness
 # view keys on exactly that field. Setting one without the other would make
