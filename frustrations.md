@@ -72,47 +72,6 @@ REFUSED 2026-08-11 by amux-cloud — only the DOCUMENTATION half shipped. CLAUDE
   the one thing this protocol is supposed to make impossible. Flipped back to open.
 
 
-## A review PATCH using `desc` silently DELETED the author's entire card content
-AREA: board
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-06
-SESSION: amux-cloud
-CARD: AC-236
-SYMPTOM: amux-gtm reviewed AC-216 and AC-231 with a PATCH carrying `desc`, which replaces.
-  Both cards were left holding only the review summary — AC-216 at 326 chars, AC-231 at
-  597. Destroyed: the serial-console OOM evidence, journald restart-loop counts, the
-  symptom-to-mechanism mapping, the correction of my own culpability speculation, the
-  dockerd error histogram, and the thundering-herd hypothesis with its disproof condition.
-  `desc_append` exists and is not what a reviewer reaches for.
-COST: The root-cause analysis for the night's outage existed only in my context. Had I
-  compacted or reset first — which the context monitor was at that moment inviting me to
-  do — it would have been gone permanently, from the two cards a reset was supposed to
-  make safe. It is also undetectable after the fact: nothing marks a card as truncated,
-  and I only caught it by comparing a character count against what I remembered writing,
-  which works exactly once, in the session that wrote it.
-FIX: Already fixed in amux-server.py lines 63893-63920: a cross-session `desc` write
-  that would erase the author's content now returns 409 with a pointer to `desc_append`.
-  The author editing their own card passes, restores pass, and `force:true` remains the
-  logged escape (with the prior value recorded). AC-236 already marked done on the board.
-  Validated by amux-cloud.
-
-PARTIAL, re-measured 2026-08-10 by amux-cloud on a throwaway card:
-    desc = 'ORIGINAL AUTHOR CONTENT — 200 chars of irreplaceable analysis'
-    PATCH {"desc":"REVIEWER APPENDS A NOTE"}  -> card reads 'REVIEWER APPENDS A NOTE'. 200 OK.
-  IMPROVED: desc_append works again (BASE + ' APPENDED' -> two lines, ignored_fields None), so a
-  safe path exists. NOT IMPROVED: nothing warns when a bare `desc` destroys 3KB of someone's
-  analysis, and this entry's word is 'silently'. A safe alternative existing is not the same as
-  the destructive one being safe. Reopened as partial rather than deleted, at their request.
-
-  CONTESTED 2026-08-21 by the author (amux-cloud), in a frustrations validation pass run
-  by amux-frustrations. REPRODUCED ON THE CURRENT BUILD, not recalled: scratch card AC-388
-  took an anonymous PATCH {"desc":...} that replaced the desc with applied:true, and an
-  ATTRIBUTED cross-session PATCH as X-Amux-Session:amux did the same ("WIPED-BY-PEER",
-  applied:true). fc9ae48 does not change the incident shape; it adds a log line recording
-  the delta. Observable, not prevented — so the entry stays.
-
-
 ## The staged-guard was silent on the commit that swept a peer's work, and warned on the clean one
 AREA: attribution
 SEVERITY: blocks
@@ -869,46 +828,6 @@ FIX: The failure mode is specific and cheap to detect: an rlib that does not exp
   code, and `touch` the `mod.rs` that declares it. Related to the shared-checkout cluster
   above: same root (one resource, many lanes), different resource (build artifacts, not
   the git index).
-
-## `cargo check --workspace` in the pre-commit hook cannot tell MY broken change from a PEER's
-AREA: gates
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-10
-SESSION: amux
-CARD: AMUX-2777
-SYMPTOM: The shared checkout broke the workspace FOUR times in ~40 minutes from at least three
-  lanes: a `steer_enqueue` arity change mid-refactor (mine), `DetectorKind::CiFailure` non-exhaustive
-  match, `note_quiet_signatures` arity, and `amux_core::board::title_needs_self_description` missing
-  for orchestrator/runtime.rs:1288. Every one of them blocked EVERY lane's commits, because the hook
-  checks the WORKING TREE — which on a shared checkout contains everyone's in-flight edits, not the
-  change being committed.
-COST: amux-cloud's AC-335 bounced twice on other lanes' compile errors. I lost ~25 minutes to two
-  breaks that were not mine, and inflicted one on them. The gate's verdict carries no information
-  about the commit it is gating.
-FIX: check the STAGED state, not the working tree — `git write-tree` + `git archive` into a temp dir
-  is read-only w.r.t. the shared checkout, so it is safe to do under other lanes' edits. Cost is a
-  colder build per commit, which is the trade to price. Anything short of this keeps conflating
-  "your change is broken" with "someone else is mid-sentence".
-
-## `cargo test` was green while `cargo check` was green — and the compiled binary lacked my tests
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-10
-SESSION: amux
-CARD: AMUX-2777
-SYMPTOM: `cargo test -p amux-server --lib the_three_stalled_lanes` printed
-  `test result: ok. 0 passed; 0 failed; 752 filtered out` — twice, after a 31s build, with the same
-  binary hash. The tests were on disk (grep confirmed), in a plain `#[cfg(test)]` module whose OTHER
-  five tests were listed by `--list`. The full run minutes earlier reported 781 passed / 787 total;
-  `--list` then reported 751. The artifact was stale under heavy shared-CARGO_TARGET_DIR contention.
-COST: ~15 minutes, and it is the LOUD-WRONG probe shape: it exits 0 and says `ok`. A filter that
-  matches nothing is indistinguishable from a suite that passes, so the natural next move is to
-  believe the code is fine. Had I been verifying someone else's fix I would have reported it working.
-FIX: `0 passed AND 0 filtered-in` should never render as `ok` — but that is upstream. Locally: when
-  a name filter matches zero tests, treat it as a FAILED probe and re-run against `--list` before
-  concluding anything. Same family as the empty-grep rule in ethos.md rule 7.
 
 ## A probe read a hook file that git never executes, and a correct measurement certified the wrong conclusion
 AREA: instruments
@@ -2731,35 +2650,6 @@ FIX: 972b44a4. Hoisted the note to `build()` over the full dirty set so it
   The general shape worth remembering: a citation is only as good as the reader's
   checkout, and the dangerous half of an instruction must never be the half that
   travels while the safety half is behind a link.
-
-## Browser state can see overlay content but cannot click it, so overlay features cannot reach `verified`
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-25
-SESSION: amux
-CARD: AMUX-3721
-SYMPTOM: Verifying the .mdai viewer's bottom tabs (AMUX-3322) in the real UI.
-  `GET /api/browser/state` returned 120 elements plus a `text` blob. The blob
-  CONTAINS "Diagram" and "List", so the tabs are provably in the rendered DOM.
-  The elements array does not contain them, so there is no index to POST to
-  `/api/browser/action` and no way to click them. Three misses in one sitting,
-  all inside the file overlay: the `.mdai-row` div that opens a node (a div with
-  an onclick, not a button), the overlay's X, and the `.mdai-btab` buttons.
-  Compounding it, the overlay has its own scroll container, so a scroll action
-  and an End keypress both moved the page behind it while the overlay stayed put.
-  Neither clicking nor scrolling reaches overlay content.
-COST: ~20 minutes establishing that the instrument rather than the feature was
-  the blocker, and AMUX-3322 closed at `done` on DOM-text evidence instead of
-  `verified` on a click-through. The broader cost is structural: this repo's own
-  standard is that `verified` requires exercising the real UI, so every
-  overlay-hosted surface (file viewer, MDAI viewer, peek) has an honest ceiling
-  of `done` until this is fixed. That is a gate nobody can satisfy truthfully
-  (ethos rule 3), and it fails silently — the state call returns 200 with plenty
-  of elements, so it reads as working right up until you look for a specific one.
-FIX: include elements carrying an onclick handler, not only semantically
-  interactive tags; and let `/api/browser/action` take a CSS selector, which
-  sidesteps the index problem and the scroll-container problem at once.
 
 ## SUPERSEDES the entry above: browser state's cap was silent, and my diagnosis of it was wrong
 AREA: instruments

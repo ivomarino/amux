@@ -20,6 +20,12 @@ name on it would launder exactly the thing the protocol forbids.
 
 Usage:
     scripts/frustrations-archive.py <line> <validated-by> <evidence...>
+    scripts/frustrations-archive.py <line> <who> --superseded --evidence-stdin
+
+`--superseded` is the THIRD disposition, for an entry whose MECHANISM was wrong
+and which a later entry corrects. It stamps SUPERSEDED: instead of VALIDATED:,
+because archiving a wrong entry as validated files a false mechanism as history
+(AF-243).
     scripts/frustrations-archive.py <line> <validated-by> --evidence-stdin
     scripts/frustrations-archive.py <line> <validated-by> --evidence-file <path>
 
@@ -94,7 +100,7 @@ def _api():
     return "https://localhost:8824"
 
 
-def carry_to_card(block, who):
+def carry_to_card(block, who, superseded=False):
     """Put the SYMPTOM and COST on the entry's CARD before the entry leaves.
 
     AF-239. This tool and `frustrations_retire.py` each implemented HALF the
@@ -123,10 +129,19 @@ def carry_to_card(block, who):
     sym, cost = field(block, "SYMPTOM"), field(block, "COST")
     if not sym and not cost:
         return f"{card}: entry has no SYMPTOM/COST to carry"
-    note = ("\n\n=== RETIRED-ENTRY TEXT PRESERVED (AF-38's rule) ===\n"
-            f"Archived out of frustrations.md into frustrations-archive.md, validated by {who}.\n"
-            "Kept here so a RECURRENCE is recognisable from this card alone.\n\n"
-            f"SYMPTOM: {sym}\n\nCOST: {cost}")
+    if superseded:
+        note = ("\n\n=== SUPERSEDED-ENTRY TEXT PRESERVED (AF-38's rule) ===\n"
+                f"Archived out of frustrations.md by {who}, marked SUPERSEDED — the entry's\n"
+                "MECHANISM was WRONG and a later entry carries the corrected diagnosis. It is\n"
+                "kept so the wrong theory stays visible as a DEAD HYPOTHESIS (ethos rule 7:\n"
+                "record which hypotheses are dead, not only which one was right), and so\n"
+                "nobody re-derives it. Do NOT read the text below as a confirmed defect.\n\n"
+                f"SYMPTOM (as reported, since shown wrong): {sym}\n\nCOST: {cost}")
+    else:
+        note = ("\n\n=== RETIRED-ENTRY TEXT PRESERVED (AF-38's rule) ===\n"
+                f"Archived out of frustrations.md into frustrations-archive.md, validated by {who}.\n"
+                "Kept here so a RECURRENCE is recognisable from this card alone.\n\n"
+                f"SYMPTOM: {sym}\n\nCOST: {cost}")
     api = _api()
     r = subprocess.run(["curl", "-sk", "--connect-timeout", "5", "-X", "PATCH",
                         "-H", "Content-Type: application/json",
@@ -149,7 +164,8 @@ def carry_to_card(block, who):
         desc = (json.loads(v.stdout) or {}).get("desc") or ""
     except Exception:
         desc = ""
-    if "RETIRED-ENTRY TEXT PRESERVED" not in desc:
+    marker = "SUPERSEDED-ENTRY TEXT PRESERVED" if superseded else "RETIRED-ENTRY TEXT PRESERVED"
+    if marker not in desc:
         return f"{card}: NOT carried (card does not read back with the marker)"
     return f"{card}: symptom + cost carried to the card"
 
@@ -164,6 +180,9 @@ def main():
     if len(sys.argv) < 4:
         print(__doc__)
         return 2
+    argv = [a for a in sys.argv if a != "--superseded"]
+    superseded = len(argv) != len(sys.argv)
+    sys.argv = argv
     ln, who = int(sys.argv[1]), sys.argv[2]
     # EVIDENCE FROM STDIN OR A FILE, not only from argv (AMUX-1888's shape, hit
     # here on 2026-08-25).
@@ -196,7 +215,23 @@ def main():
     while body and not body[-1].strip():
         body.pop()
     stamped = [body[0]]
-    stamped.append(f"VALIDATED: {who} | {evidence}")
+    # THE THIRD DISPOSITION (AF-243, raised by amux during the 2026-08-26 drain).
+    # An entry can be RIGHT-AND-FIXED, RIGHT-AND-STILL-LIVE, or WRONG. The first
+    # two had exits — archive with a VALIDATED line, or reopen the card. The
+    # third had none, and the available moves both lie about it: archiving a
+    # wrong entry under `VALIDATED:` files a FALSE MECHANISM as validated
+    # history, and reopening its card says a friction is live that was never
+    # real. Their words: "a wrong entry that can only be validated or reopened
+    # has no honest exit", which is ethos rule 3 exactly — a constraint with no
+    # truthful path through it.
+    #
+    # The specimen: AMUX-3721 claimed browser state could see overlay content
+    # but not click it. The selector always contained [onclick] and
+    # selector_click_js() already existed; the real defect was a silent
+    # 120-element cap, with the two elements at indices 155 and 156, addressable
+    # the whole time. Its author superseded it in place with the corrected
+    # diagnosis, so the archive needs to carry it as WRONG rather than as fixed.
+    stamped.append(f"{'SUPERSEDED' if superseded else 'VALIDATED'}: {who} | {evidence}")
     stamped.extend(body[1:])
 
     if not ARCHIVE.exists():
@@ -206,12 +241,12 @@ def main():
 
     # Carry BEFORE the ledger write, so a crash between the two leaves the entry
     # in place rather than gone from both the ledger and the card.
-    carried = carry_to_card("\n".join(body), who)
+    carried = carry_to_card("\n".join(body), who, superseded)
 
     remaining = lines[:i] + lines[end:]
     LEDGER.write_text("\n".join(remaining))
     print(f"archived L{ln}: {title[:70]}")
-    print(f"  validated by {who}")
+    print(f"  {'SUPERSEDED (entry was WRONG)' if superseded else 'validated'} by {who}")
     print(f"  card: {carried}")
     return 0
 
