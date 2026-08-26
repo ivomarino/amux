@@ -2653,7 +2653,19 @@ pub fn select_advance_with(
                 card: card_id,
                 status,
                 text,
-                kind: "renag",
+                // `renag-held`, NOT `renag` (AMUX-3777). Both arms re-nag and
+                // both write `needsyou.renag`, so at the TYPE level they are
+                // indistinguishable — and that type is the one the AMUX-3768
+                // audit confirmed empirically in both directions. The
+                // confirmation was therefore about the type, not about this
+                // branch: this arm could be dead today and the shared counter
+                // would still read 100.
+                //
+                // The distinction is real, not bookkeeping. The other arm scans
+                // the lane's WHOLE QUEUE for the oldest stale ask; this one
+                // fires about the card the lane is CURRENTLY HOLDING. They can
+                // rot independently.
+                kind: "renag-held",
             },
             None => Advance::None {
                 reason: "needsyou-renag-deduped",
@@ -3143,7 +3155,12 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             )
             .await;
         }
-        let etype = if kind == "renag" { "needsyou.renag" } else { "advance.nudged" };
+        // BOTH renag arms write the same event TYPE — the type is the fault
+        // class and it should stay one thing. The arm is carried in `kind`
+        // inside the data, which is where a per-branch counter can read it
+        // without splitting the class (AMUX-3777).
+        let etype =
+            if kind.starts_with("renag") { "needsyou.renag" } else { "advance.nudged" };
         let idem = if kind == "decompose-asked" {
             Some(format!("decompose:{card}"))
         } else {
@@ -4709,6 +4726,86 @@ mod tests {
             "a whitespace-only source_ref is not a live trigger: {ids:?}"
         );
         assert_eq!(held, 1, "exactly the one live-trigger card is counted as held");
+    }
+
+    /// AMUX-3777: the HELD-CARD re-nag arm, which had NO coverage at all.
+    ///
+    /// Two arms emit `needsyou.renag`: one scans the lane's whole queue for the
+    /// oldest stale ask, the other fires about the card the lane is CURRENTLY
+    /// HOLDING. Both wrote `kind: "renag"`, so the ledger could not tell them
+    /// apart — and the AMUX-3768 audit's empirical confirmation of this event
+    /// type (0 during its dead window, 100 rows after the fix) was therefore a
+    /// statement about the TYPE, not about either branch.
+    ///
+    /// Then the suite turned out to be no better than the ledger. Verified by
+    /// mutation before writing this: replacing this arm's whole match with
+    /// `None::<String>` — so it can never nudge — left all 78 board_drive tests
+    /// GREEN. The branch could have been deleted outright and nothing would have
+    /// said so.
+    ///
+    /// So this pins both halves: that the arm fires, and that it is now
+    /// distinguishable from its sibling in the event data.
+    #[test]
+    fn the_held_card_renag_arm_fires_and_is_distinguishable_from_the_queue_scan_arm() {
+        let conn = board_db();
+        let now = now_f64();
+        let stale = now - (needsyou_renag_days() + 2.0) * 86400.0;
+        // The lane HOLDS this card (doing), it is tagged needs:you, and the ask
+        // is older than the window. That is arm 2's precondition.
+        add_card(&conn, "H-1", "lane", "doing", "held and unanswered", "SCOPE: x");
+        tag(&conn, "H-1", "needs:you", stale);
+
+        // ARM 2 IS HEAVILY SHADOWED, which is why it had no coverage: the
+        // queue-scan arm runs FIRST and its query selects ANY stale needs:you
+        // card for the session — tag OR status, including cards in doing/review,
+        // which is arm 2's entire population. It takes the OLDEST and returns.
+        //
+        // So arm 2 is reachable only through a narrow gap: the oldest pick is
+        // inside its own dedupe window (so arm 1 falls through without
+        // returning) while the HELD card is a different, un-nagged one. That is
+        // this fixture. Discovered by writing the naive version first and
+        // watching it hit arm 1 — variant 3 of random's taxonomy (an arm made
+        // unreachable by an earlier one), found in the branch AMUX-3768 flagged
+        // as uncountable.
+        add_card(&conn, "A-0", "lane", "needsyou", "older, already nagged", "SCOPE: x");
+        tag(&conn, "A-0", "needs:you", stale - 86400.0);
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','needsyou.renag','{\"issue\": \"A-0\"}','board-drive')",
+            // 30 MINUTES, NOT 10. A `needsyou.renag` row is read by TWO
+            // clocks: the per-card dedupe (3 days) and the PER-LANE advance
+            // cooldown (15 min, which counts this type). At 10 minutes the
+            // fixture tripped the cooldown and `select_advance` returned early,
+            // so the test failed for a reason that had nothing to do with the
+            // arm under test. 30 minutes is outside the cooldown and well
+            // inside the dedupe window, which is the state being modelled.
+            rusqlite::params![now - 1800.0],
+        )
+        .expect("dedupe the older pick");
+
+        let Advance::Nudge { kind, card, .. } = select_advance(&conn, "lane", &[], now) else {
+            panic!("a held needs:you card past the window must re-nag");
+        };
+        assert_eq!(card, "H-1", "the deduped older card must not be the one nudged about");
+        assert_eq!(
+            kind, "renag-held",
+            "the held-card arm must be distinguishable in the ledger from the queue scan — \
+             sharing `renag` is what made its fire count uncountable"
+        );
+
+        // CONTROL: inside the window it must NOT nudge, or the assertion above
+        // is just "any held needs:you card nudges" and the staleness gate is
+        // untested.
+        let conn2 = board_db();
+        add_card(&conn2, "H-2", "lane", "doing", "held, asked recently", "SCOPE: x");
+        tag(&conn2, "H-2", "needs:you", now - 3600.0);
+        assert!(
+            matches!(
+                select_advance(&conn2, "lane", &[], now),
+                Advance::None { reason: "needsyou", .. }
+            ),
+            "a fresh ask is the human's to answer, not a lane to nag"
+        );
     }
 
     /// A card parked by the DOCUMENTED transition — core's `Doing -> NeedsYou`,
