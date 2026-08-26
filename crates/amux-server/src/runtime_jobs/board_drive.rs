@@ -2528,9 +2528,23 @@ pub fn select_advance_with(
         // Every command below was WALKED before it shipped, and
         // tests/nudge_commands_exist.rs now walks them on every build — because
         // "I checked once" is what AMUX-2140 already thought.
+        // NOT "holding your WIP slot" ANY MORE, and the correction is this
+        // commit's whole point (AMUX-3757 changed the mechanism an hour before
+        // this text was read back to its own author). A capture shell is now
+        // EXEMPT from the WIP cap, so the old wording asserted a blockage that
+        // no longer exists — a nudge whose urgency is fictional, which is the
+        // view-disagrees-with-mechanism shape the same commit went and fixed
+        // one layer down. `the_decompose_nudge_does_not_claim_a_blockage_the_
+        // wip_query_exempts` pins the two together so the next change to either
+        // one fails rather than drifting.
+        //
+        // The honest reason is the second clause, and it was always the real
+        // one: a card nothing can honestly call done or not-done cannot pass a
+        // gate, so it sits on the board reading like work forever.
         let text = format!(
-            "[amux] {card_id} is a capture shell ({why}) holding your WIP slot — nothing about \
-             it is done or not-done, so no gate can pass it.\n\n\
+            "[amux] {card_id} is a capture shell ({why}) — nothing about \
+             it is done or not-done, so no gate can pass it. It no longer blocks your \
+             pickup (AMUX-3757), it just sits on the board looking like work.\n\n\
              Answered inline, or not work:\n  \
              amux board discard {card_id} --outcome-stdin\n\n\
              ONE unit of work — rewrite the desc with scope + acceptance criteria (that clears \
@@ -5240,6 +5254,54 @@ mod tests {
         assert!(
             quoted > 3000,
             "the excerpt must carry the card, not a 500-char stub (got {quoted} body chars)"
+        );
+    }
+
+    /// The nudge and the WIP query must agree about whether a capture shell
+    /// BLOCKS anything.
+    ///
+    /// They stopped agreeing the moment AMUX-3757 exempted capture shells from
+    /// the cap: the nudge still opened "is a capture shell holding your WIP
+    /// slot", which is now false. Caught within the hour, by the nudge being
+    /// delivered to the lane that had just written the exemption — which is
+    /// luck, not a check.
+    ///
+    /// A nudge asserting a blockage that does not exist is worse than a silent
+    /// one. Its entire persuasive force is "this is blocking you", so a lane
+    /// acts on fictional urgency, and the honest reason to dispose of a capture
+    /// shell (no status is a true statement about it, so it sits on the board
+    /// reading like work forever) goes unsaid.
+    ///
+    /// Both halves are derived from the SAME card here, so changing either one
+    /// alone fails.
+    #[test]
+    fn the_decompose_nudge_does_not_claim_a_blockage_the_wip_query_exempts() {
+        let conn = board_db();
+        add_card(&conn, "C-9", "lane", "doing", "Why are you stopping", "**Prompt:** why are you stopping?");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='C-9'", []).expect("mint");
+        add_card(&conn, "T-9", "lane", "todo", "real work", "SCOPE: x\n- [ ] y");
+
+        // The MECHANISM: it does not hold the slot.
+        let blocks_pickup = matches!(
+            select_pickup(&conn, "lane", now_f64()),
+            Pickup::None { reason: "wip-cap", .. }
+        );
+        assert!(!blocks_pickup, "AMUX-3757: a capture shell must not hold the WIP slot");
+
+        // The VIEW: so it must not say it does.
+        let Advance::Nudge { text, kind, .. } = select_advance(&conn, "lane", &[], now_f64()) else {
+            panic!("a capture shell in doing must still draw a decompose nudge");
+        };
+        assert_eq!(kind, "decompose-asked");
+        assert!(
+            !text.to_lowercase().contains("wip slot"),
+            "the nudge claims a blockage the pickup query exempts: {text}"
+        );
+        // And it must still give the lane a REASON to act, or removing the
+        // false claim just leaves an unmotivated chore.
+        assert!(
+            text.contains("done or not-done"),
+            "the honest reason must survive the correction: {text}"
         );
     }
 
