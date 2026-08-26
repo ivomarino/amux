@@ -243,6 +243,13 @@ jobs:
           # the stale-graft republish the guard exists for. Verified against the
           # pre-fix guard: A and D fail, B and C stay green.
           ./scripts/test-push-guard-fork-base.sh
+          # AMUX-3726: the pre-commit gate must answer "is what I am COMMITTING
+          # sound", not "is the tree sound". Cell 4 is the load-bearing one —
+          # a version that always built the index passes every other cell and
+          # taxes the fleet ~22s on every red commit. Verified by mutation, and
+          # cell 4's FIRST draft counted worktrees (which the trap cleans up)
+          # and missed exactly that mutant; it now asserts on a build marker.
+          ./scripts/test-staged-recheck.sh
           # AEAB-52: the e2e harness must SET the seam it depends on. The Rust
           # half is unit-tested; this pins the half that rots silently — a seam
           # nobody sets is decoration (ethos rule 1), and an export placed after

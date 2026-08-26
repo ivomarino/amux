@@ -110,6 +110,21 @@ def main():
         print("  Every other gate still runs, and the skip prints itself in the commit output.")
         print("  Prefer that to --no-verify, which disables the security scan and the "
               "staged-guard as well.")
+        # EXIT 10 = "attributed successfully, and NONE of the offenders are
+        # staged" (AMUX-3726). The hook uses this to decide whether it is worth
+        # building the INDEX to answer the question the tree cannot.
+        #
+        # A DISTINCT code, and only this one, because of the rule this aid is
+        # already bound by: it must never be able to turn a refusal into a pass.
+        # Every other outcome — 0, a crash, a missing interpreter, an unparseable
+        # clippy dump — is NOT 10, and the hook treats not-10 as "refuse, exactly
+        # as before". So a BROKEN aid degrades to today's behaviour and can only
+        # cost a wait; it can never grant an allow.
+        return 10
 
 
-main()
+# The exit code carries the verdict; `main` returns 10 only when it positively
+# established that no offender is staged. `or 0` keeps every other path at 0, so
+# the hook's existing `|| true` semantics are unchanged for them.
+import sys as _sys
+_sys.exit(main() or 0)
