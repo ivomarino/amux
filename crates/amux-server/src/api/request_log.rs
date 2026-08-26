@@ -1589,6 +1589,43 @@ struct ErrGroup {
     /// log readable and it is also what fused those two, so the discriminator
     /// has to be kept alongside the group rather than recovered from it.
     param_literals: std::collections::HashMap<String, u64>,
+    /// AF-232. For gate 409s: how often each (session, the exact gate_checked
+    /// the caller sent) was refused. A 409 here is the gate WORKING, which is
+    /// true of one refusal and wrong of the 340th — and the group renders both
+    /// identically, so a caller wedged in a permanent retry loop looks exactly
+    /// like a fleet touching gates normally.
+    ///
+    /// Same observation as `param_literals` one status code over: one value
+    /// carrying most of a multi-hit group means a caller is hammering
+    /// something that never resolves. Kept alongside the group for the same
+    /// reason — grouping is what makes the log readable and it is also what
+    /// fuses "25 lanes hit a gate twice" with "one lane hit it 349 times".
+    rejected_acks: std::collections::HashMap<RejectedAck, u64>,
+}
+
+/// The identity of one refused gate acknowledgement: who asked, what
+/// transition, what they sent, what was required. All four come out of the
+/// 409 body the server already writes (AMUX-3132 raised the error_body cap to
+/// 2000 chars precisely so `you_sent` and `missing` survive truncation).
+type RejectedAck = (String, String, String, String);
+
+/// Pull (session, attempted_status, you_sent, gate) out of a gate-refusal
+/// body. `None` for any 409 that is not a gate refusal — board 409s also
+/// carry claim conflicts and browser-already-running, and counting those as
+/// stuck acks would manufacture the very false confidence this exists to
+/// remove.
+fn rejected_ack_of(session: &str, error_body: Option<&str>) -> Option<RejectedAck> {
+    let b: Value = serde_json::from_str(error_body?).ok()?;
+    // `gate` is the required criteria; its presence is what marks this body a
+    // gate refusal rather than some other 409.
+    let gate = b.get("gate").filter(|g| !g.is_null())?;
+    let sent = b.get("you_sent").cloned().unwrap_or(Value::Null);
+    Some((
+        session.to_string(),
+        b.get("attempted_status").and_then(Value::as_str).unwrap_or("").to_string(),
+        serde_json::to_string(&sent).ok()?,
+        serde_json::to_string(gate).ok()?,
+    ))
 }
 
 /// GET /api/logs/analyze?since_h=24 — the diagnosis endpoint. Groups every
@@ -1668,8 +1705,16 @@ async fn analyze(
                 status,
                 family,
                 param_literals: std::collections::HashMap::new(),
+                rejected_acks: std::collections::HashMap::new(),
             });
             g.count += 1;
+            if g.status == 409 && g.rejected_acks.len() < 200 {
+                if let Some(k) =
+                    rejected_ack_of(amux_session.as_deref().unwrap_or(""), error_body.as_deref())
+                {
+                    *g.rejected_acks.entry(k).or_insert(0) += 1;
+                }
+            }
             // min/max, never positional: the scan is newest-first now
             // (AF-131), and `last_ts = ts` under DESC would report the
             // group's OLDEST hit as its most recent.
@@ -1723,6 +1768,55 @@ async fn analyze(
                 "clients": g.clients.iter().take(5).collect::<Vec<_>>(),
                 "sample": g.sample,
             });
+            // AF-232: a stuck caller, stated. One (session, gate_checked)
+            // pair carrying most of a multi-hit 409 group is a caller
+            // retrying an acknowledgement the gate has already refused —
+            // invisible in the group line, which shows only a count and a
+            // client tally and so renders "one lane refused 349 times"
+            // exactly like "25 lanes hit a gate twice". The floor mirrors
+            // `dominant_param_literal` above: 5, because 2-of-2 proves
+            // nothing.
+            //
+            // The verdict does NOT guess the cause beyond what the body
+            // settles, and here the body settles a real fork. `you_sent`
+            // present and disjoint from `gate` is a caller sending the WRONG
+            // criteria (it has them hardcoded, or read the type default
+            // instead of the card's resolved gate). `you_sent` null is a
+            // caller not acknowledging at all. Those are different bugs with
+            // different fixes, and naming the wrong one sends the reader to
+            // rewrite working code.
+            if g.status == 409 && !g.rejected_acks.is_empty() {
+                let mut acks: Vec<(&RejectedAck, &u64)> = g.rejected_acks.iter().collect();
+                acks.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                if let Some(((sess, attempted, sent, gate), n)) = acks.first().copied() {
+                    v["top_rejected_ack"] = json!({
+                        "session": sess, "attempted_status": attempted,
+                        "you_sent": sent, "gate_required": gate, "count": n,
+                    });
+                    v["distinct_rejected_acks"] = json!(g.rejected_acks.len());
+                    if *n >= 5 && *n * 2 > g.count {
+                        let who = if sess.is_empty() { "(unattributed)" } else { sess.as_str() };
+                        let reading = if sent == "null" {
+                            "the caller is not acknowledging the gate at all"
+                        } else if sent == gate {
+                            "the caller sent exactly the required gate — if this is still \
+                             refused, the SERVER side is what to check"
+                        } else {
+                            "the caller is sending the WRONG criteria (hardcoded, or the \
+                             type default rather than the card's resolved gate — \
+                             GET /api/board/contract?card=<id> is the resolved one)"
+                        };
+                        verdicts.push(format!(
+                            "409 {} {}: {} of {} are ONE caller ({}) retrying the SAME refused \
+                             acknowledgement for `{}` — {}. A single gate 409 is the gate \
+                             working; this many identical ones is a caller wedged in a loop, \
+                             and the two look the same in the group line. it sent {} where the \
+                             gate requires {}.",
+                            g.method, target, n, g.count, who, attempted, reading, sent, gate,
+                        ));
+                    }
+                }
+            }
             if g.status == 404 || g.status == 405 {
                 let routed = routed_methods_at(&g.sample_path);
                 v["routed_methods"] = json!(routed);
@@ -3127,6 +3221,87 @@ mod tests {
         );
         let aw = v["actual_window_h"].as_f64().unwrap();
         assert!(aw < 70.0, "analyze window claim must shrink too: {aw}");
+    }
+
+    /// AF-232, built from the 2026-08-26 incident's own artifact rather than
+    /// a convenient one: mvs-infra sent the `code` type's four verified
+    /// criteria against `investigation` cards every 30 minutes for 23.5h —
+    /// 340 identical refusals, zero successes, and the group line rendered it
+    /// as ordinary gate traffic (`409 PATCH /api/board/{id} n=494
+    /// clients=25`).
+    ///
+    /// The control is the load-bearing half. A 409 group where the acks
+    /// DIFFER is a fleet touching gates normally and must stay silent —
+    /// without that, a verdict that fired on every 409 group would look
+    /// exactly as green on the incident and be useless.
+    #[tokio::test]
+    async fn analyze_names_a_caller_stuck_retrying_one_refused_gate_ack() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // The real body, keys and all (serde emits them alphabetically, which
+        // is what pushed you_sent/missing past the old 500-char cap — AMUX-3132).
+        let stuck = "{\"attempted_status\":\"verified\",\"blocked\":true,\
+            \"error\":\"gate_checked does not match the gate\",\
+            \"gate\":[\"Outcome confirmed to still hold\"],\
+            \"item\":\"MI-4975\",\"item_type\":\"investigation\",\
+            \"missing\":[\"Outcome confirmed to still hold\"],\"ok\":false,\
+            \"you_sent\":[\"CI/CD green\",\"Deployed to prod\",\
+            \"Confirmed working in prod\",\"Zero regressions\"]}";
+        for i in 0..8 {
+            seed(&store, now - 100.0 - f64::from(i), "PATCH", "/api/board/MI-4975", 409, 1.0,
+                 "mvs-infra", "native", Some(stuck)).await;
+        }
+        // Two other lanes hitting the same gate normally — present so the
+        // dominant pair is a MAJORITY of a mixed group, not the whole of a
+        // pure one. A verdict that only fires on a homogeneous group would
+        // miss the real incident, which was 349 of 494.
+        for (i, who) in ["tubescience", "backend"].iter().enumerate() {
+            seed(&store, now - 50.0 - i as f64, "PATCH", "/api/board/MI-4975", 409, 1.0, who,
+                 "native", Some("{\"attempted_status\":\"done\",\"gate\":[\"Outcome recorded\"],\
+                 \"you_sent\":null}")).await;
+        }
+        // CONTROL: a 409 group where every ack differs. Must NOT produce a
+        // verdict. It has to live in a DIFFERENT family, and that is worth
+        // saying: `/api/board/TG-1` and `/api/board/MI-4975` both normalize
+        // to `/api/board/{id}`, so a board-card control lands in the SAME
+        // group and merely dilutes the majority. That merge is not a quirk of
+        // this test — it is precisely why the production incident hid, since
+        // every card's 409s in the fleet collapse into one line.
+        for (i, who) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+            let body = format!("{{\"attempted_status\":\"done\",\"gate\":[\"g\"],\
+                                \"you_sent\":[\"{who}\"]}}");
+            seed(&store, now - 30.0 - i as f64, "PATCH", "/api/schedules/SCHED-1", 409, 1.0, who,
+                 "native", Some(&body)).await;
+        }
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(&api,
+            HttpRequest::builder().uri("/api/logs/analyze?since_h=24").body(Body::empty()).unwrap()).await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let verdicts: Vec<&str> =
+            v["verdicts"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+
+        let stuck_v = verdicts.iter().find(|s| s.contains("mvs-infra"))
+            .unwrap_or_else(|| panic!("no stuck-caller verdict: {verdicts:?}"));
+        // WHO, HOW MANY, and OUT OF WHAT — the three facts the group line hid.
+        assert!(stuck_v.contains("8 of 10"), "{stuck_v}");
+        assert!(stuck_v.contains("verified"), "the refused transition: {stuck_v}");
+        // The fork the body settles: wrong criteria, not a missing ack.
+        assert!(stuck_v.contains("WRONG criteria"), "{stuck_v}");
+        assert!(stuck_v.contains("contract?card="), "must name the resolved-gate lookup: {stuck_v}");
+
+        // The control group must be silent — a diverse 409 group is health.
+        assert!(!verdicts.iter().any(|s| s.contains("/api/schedules")),
+                "a 409 group with differing acks is normal gate traffic: {verdicts:?}");
+
+        // The structured field is present on the group either way, so a reader
+        // below the verdict floor can still see the distribution.
+        let grp = v["groups"].as_array().unwrap().iter()
+            .find(|g| g["target"] == "/api/board/{id}" && g["status"] == 409)
+            .expect("the 409 board group");
+        assert_eq!(grp["top_rejected_ack"]["session"], "mvs-infra", "{grp}");
+        assert_eq!(grp["top_rejected_ack"]["count"], 8, "{grp}");
     }
 
     #[tokio::test]
