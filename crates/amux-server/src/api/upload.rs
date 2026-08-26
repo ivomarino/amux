@@ -45,6 +45,49 @@ fn uploads_dir() -> PathBuf {
     home.join("uploads")
 }
 
+/// Remove `.chunked-*` staging dirs that no in-flight upload claims and that
+/// are older than `STALE_SECS`.
+///
+/// Keyed on the DIRECTORY NAME rather than on `tmpdir`, so a dir belonging to a
+/// live upload is never removed even if `uploads_dir()` changed under us. The
+/// age gate is what keeps this safe against a concurrent `start()` on another
+/// worker: a dir created seconds ago is never swept, whether or not this
+/// process's map happens to hold it yet.
+///
+/// `dir` and `max_age` are parameters rather than reads of `uploads_dir()` and
+/// `STALE_SECS` so the two rules can be discriminated in a test without
+/// backdating an mtime, which std cannot portably do. A test that could only
+/// drive this through the globals would be reduced to asserting "nothing was
+/// deleted", which passes just as well when the function does nothing at all.
+fn sweep_orphan_chunk_dirs(
+    dir: &std::path::Path,
+    live: &std::collections::HashMap<String, InFlight>,
+    max_age: std::time::Duration,
+) -> usize {
+    let cutoff = max_age;
+    let Ok(rd) = std::fs::read_dir(dir) else { return 0 };
+    let mut n = 0;
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        let Some(uid) = name.strip_prefix(".chunked-") else { continue };
+        if live.contains_key(uid) {
+            continue;
+        }
+        if !ent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let old = ent
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|t| t.elapsed().unwrap_or_default() > cutoff)
+            .unwrap_or(false);
+        if old && std::fs::remove_dir_all(ent.path()).is_ok() {
+            n += 1;
+        }
+    }
+    n
+}
+
 fn now_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -127,6 +170,33 @@ async fn start(state: UploadState, Json(body): Json<StartReq>) -> Response {
         if let Some(entry) = map.remove(&k) {
             let _ = std::fs::remove_dir_all(&entry.tmpdir);
         }
+    }
+    // ...AND THE ONES THE MAP CANNOT ACCOUNT FOR (AF-235). The purge above
+    // iterates the IN-MEMORY map, so it can only ever free directories this
+    // process still knows about. The map does not survive a restart — and this
+    // binary self-adopts on every commit that touches crates/ — so each restart
+    // orphaned its tmpdirs with no record left to purge them by. They then sat
+    // in ~/.amux/uploads forever, invisible to the only cleanup path there was.
+    //
+    // Four EMPTY `.chunked-*` dirs are what let @Dygreens prove the client-side
+    // half of this bug on #124: /api/upload/start had succeeded and chunk 0
+    // never wrote. The evidence was only readable because nothing had cleaned
+    // it up, which is the one upside of a leak, and not a reason to keep it.
+    let swept = sweep_orphan_chunk_dirs(
+        &uploads_dir(),
+        &map,
+        std::time::Duration::from_secs(STALE_SECS),
+    );
+    if swept > 0 {
+        // Loud on purpose. A silent sweep would make the NEXT instance of the
+        // leak — or of a client that abandons transfers at scale — look exactly
+        // like a healthy day, which is how this one went unnoticed.
+        tracing::warn!(
+            swept,
+            "upload: removed {swept} orphaned .chunked-* dir(s) with no in-memory record \
+             (older than {STALE_SECS}s). Expected after a restart; a rising count means \
+             transfers are being abandoned before finish."
+        );
     }
 
     map.insert(uid.clone(), InFlight {
@@ -311,6 +381,49 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use tower::ServiceExt;
+
+    /// AF-235. The stale purge in `start()` iterates the IN-MEMORY map, so it can
+    /// only free directories this process still knows about — and the map does
+    /// not survive a restart, which this binary does on every commit touching
+    /// crates/. Every restart therefore orphaned its `.chunked-*` dirs with no
+    /// record left to purge them by. Four empty ones are what let @Dygreens prove
+    /// the client half of this bug on #124.
+    ///
+    /// Both rules are asserted, in the two directions that can actually fail:
+    /// a LIVE upload's dir is never swept at any age, and an orphan YOUNGER than
+    /// the cutoff is never swept. Testing only "the old orphan went away" would
+    /// pass equally well against a function that deletes the whole directory.
+    #[test]
+    fn sweep_removes_orphans_but_never_live_or_young_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        for n in [".chunked-live", ".chunked-orphan", "not-a-chunk-dir"] {
+            std::fs::create_dir_all(dir.join(n)).unwrap();
+        }
+        // A plain FILE named like a staging dir must not be removed either.
+        std::fs::write(dir.join(".chunked-afile"), b"x").unwrap();
+
+        let mut live: std::collections::HashMap<String, InFlight> = Default::default();
+        live.insert("live".into(), InFlight {
+            filename: "f".into(), chunks: 1, received: BTreeSet::new(),
+            tmpdir: dir.join(".chunked-live"), ts: now_secs(),
+        });
+
+        // Age gate: with a 1h cutoff nothing here is old enough, so a correct
+        // sweep removes NOTHING. This is the assertion that fails if the age
+        // check is dropped — the orphan is deletable in every other respect.
+        let n = sweep_orphan_chunk_dirs(dir, &live, std::time::Duration::from_secs(3600));
+        assert_eq!(n, 0, "nothing is older than an hour; a young orphan must survive");
+        assert!(dir.join(".chunked-orphan").exists(), "young orphan was swept");
+
+        // Age gate satisfied: now the orphan goes and the LIVE one stays.
+        let n = sweep_orphan_chunk_dirs(dir, &live, std::time::Duration::ZERO);
+        assert_eq!(n, 1, "exactly the one orphan directory");
+        assert!(!dir.join(".chunked-orphan").exists(), "orphan should be gone");
+        assert!(dir.join(".chunked-live").exists(), "a LIVE upload's dir must never be swept");
+        assert!(dir.join("not-a-chunk-dir").exists(), "unrelated dirs are not this sweep's business");
+        assert!(dir.join(".chunked-afile").exists(), "a file is not a staging dir");
+    }
 
     fn test_state() -> AppState {
         let dir = tempfile::tempdir().unwrap();

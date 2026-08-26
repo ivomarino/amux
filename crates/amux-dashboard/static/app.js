@@ -5609,7 +5609,7 @@ async function sendFromInput(name) {
   // peek composer (sendPeekCmd). Block while any is still uploading; a
   // files-only send (no text) is allowed.
   const _cf = _cardFiles[name] || [];
-  if (_cf.some(f => f.path == null)) { if (typeof showToast === 'function') showToast('Wait for upload to finish'); return; }
+  if (_blockedByAttachment(_cf)) return;
   const _files = _cf.filter(f => f.path);
   if (!text && _files.length === 0) {
     // Empty send = extract + submit the suggested prompt from the session
@@ -7913,7 +7913,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.735';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.736';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10000,14 +10000,21 @@ function renderPeekFiles() {
   if (!bar) return;
   bar.classList.toggle('has-files', peekFiles.length > 0);
   if (peekFiles.length > 12) {
-    const uploading = peekFiles.filter(f => !f.path).length;
-    const done = peekFiles.length - uploading;
+    // A blocker must not hide behind a collapsed summary. Past 12 files the
+    // chips are folded away, so a row reporting only progress would show a
+    // cheerful percentage while one failed chip held the send guard shut.
+    const failed = peekFiles.filter(f => !f.path && f.error).length;
+    const uploading = peekFiles.filter(f => !f.path && !f.error).length;
+    const done = peekFiles.length - uploading - failed;
     const totalMB = peekFiles.reduce((a, f) => a + (parseFloat(f.sizeMB) || 0), 0);
     const queued = _uploadQueue.length;
     let status = '';
+    const failHtml = failed ? `<span style="color:var(--red)">${failed} failed</span>` : '';
     if (uploading > 0) {
-      const avgPct = peekFiles.filter(f => !f.path).reduce((a, f) => a + (f.totalChunks ? f.chunk / f.totalChunks : 0), 0) / (uploading || 1);
-      status = `<span style="color:var(--dim)">${done}/${peekFiles.length} done (${Math.round(avgPct * 100)}%)${queued ? ', ' + queued + ' queued' : ''}</span>`;
+      const avgPct = peekFiles.filter(f => !f.path && !f.error).reduce((a, f) => a + (f.totalChunks ? f.chunk / f.totalChunks : 0), 0) / (uploading || 1);
+      status = `<span style="color:var(--dim)">${done}/${peekFiles.length} done (${Math.round(avgPct * 100)}%)${queued ? ', ' + queued + ' queued' : ''}</span>` + failHtml;
+    } else if (failed > 0) {
+      status = failHtml;
     } else {
       status = `<span style="color:var(--green)">all uploaded</span>`;
     }
@@ -10030,30 +10037,68 @@ function _renderPeekFileChips() {
     } else {
       thumb = `<span class="chip-icon">${_fileIcon(f.name)}</span>`;
     }
+    // THE × IS ON EVERY CHIP IN EVERY STATE. It used to render only in the
+    // `done` branch, so the one state where you need it most — an upload that
+    // will never finish — had no remove control at all, and `sendPeekCmd`
+    // refuses while any chip lacks a `.path`. One stranded chip therefore made
+    // the composer permanently unsendable with no way out (AF-235). The card
+    // composer got this right at AMUX-3372, citing "the peek's own AMUX-85
+    // lesson" — the lesson reached the new surface and never came back to fix
+    // the one that taught it.
     let statusHtml = '';
-    if (isUploading) {
+    if (f.error) {
+      statusHtml = `<span class="chip-err" title="${esc(f.error)}">!</span>` +
+        `<span class="chip-retry" onclick="event.stopPropagation();retryPeekFile(${i})" title="Retry upload">↻</span>`;
+    } else if (isUploading) {
       const pct = f.totalChunks ? Math.round(f.chunk / f.totalChunks * 100) : 0;
       statusHtml = `<span style="color:var(--dim);font-size:0.6rem;">${pct}%</span>`;
     } else {
-      statusHtml = `<span style="color:var(--green);font-size:0.75rem;margin-right:2px;">✓</span><span class="chip-remove" onclick="removePeekFile(${i})">×</span>`;
+      statusHtml = `<span style="color:var(--green);font-size:0.75rem;margin-right:2px;">✓</span>`;
     }
-    return `<div class="peek-attach-chip${isUploading ? ' uploading' : ''}">
+    const cls = f.path ? '' : (f.error ? ' failed' : ' uploading');
+    return `<div class="peek-attach-chip${cls}">
       ${thumb}
       <span class="chip-name">${esc(f.name)}</span>
       ${statusHtml}
+      <span class="chip-remove" onclick="event.stopPropagation();removePeekFile(${i})" title="Remove">×</span>
     </div>`;
   }).join('');
 }
 
 function removePeekFile(idx) {
   const f = peekFiles[idx];
+  // Cancel BEFORE splicing. Removing the chip no longer stops the transfer by
+  // itself — that was the membership inference this fix removed — so the intent
+  // has to be stated (AF-235).
+  _cancelUpload(f);
   if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl);
   peekFiles.splice(idx, 1);
   renderPeekFiles();
 }
 
+// Say "stop" explicitly, and abort the in-flight request so a large chunk is not
+// still on the wire after the chip is gone.
+function _cancelUpload(f) {
+  if (!f) return;
+  f.cancelled = true;
+  try { if (f.aborter) f.aborter.abort(); } catch (e) {}
+  f.inflight = false;
+}
+
+function retryPeekFile(idx) {
+  const f = peekFiles[idx];
+  if (!f || f.inflight || f.path) return;
+  _runUpload(f, _peekSink());
+}
+
+function retryCardFile(name, idx) {
+  const f = (_cardFiles[name] || [])[idx];
+  if (!f || f.inflight || f.path) return;
+  _runUpload(f, _cardSink(name));
+}
+
 function clearPeekFiles() {
-  peekFiles.forEach(f => { if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+  peekFiles.forEach(f => { _cancelUpload(f); if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
   peekFiles = [];
   // Drop the stash too, or a send would clear the bar and the next open would
   // resurrect the files that were just sent.
@@ -10079,6 +10124,13 @@ function _peekFilesStash(session) {
 
 function _peekFilesRestore(session) {
   peekFiles = (session && _peekFilesBySession[session]) || [];
+  // AN ORPHAN PRESENTS AS SOMETHING TO ACT ON, NOT AS FROZEN PROGRESS (AF-235).
+  // A chip with no path that nothing is driving any more is the exact artifact
+  // the reporting user was staring at — it rendered "0%" forever, which reads
+  // as "still working" and is why they waited instead of removing it.
+  peekFiles.forEach(f => {
+    if (!f.path && !f.inflight && !f.error) f.error = 'upload did not finish — retry or remove';
+  });
   renderPeekFiles();
 }
 
@@ -10116,7 +10168,8 @@ function _renderCardFileChips(name) {
     else thumb = `<span class="chip-icon">${_fileIcon(f.name)}</span>`;
     let status;
     if (f.path) status = `<span style="color:var(--green);font-size:0.75rem;">✓</span>`;
-    else if (f.error) status = `<span class="chip-err" title="${esc(f.error)}">!</span>`;
+    else if (f.error) status = `<span class="chip-err" title="${esc(f.error)}">!</span>` +
+      `<span class="chip-retry" onclick="event.stopPropagation();retryCardFile('${name}',${i})" title="Retry upload">↻</span>`;
     else { const pct = f.totalChunks ? Math.round(f.chunk / f.totalChunks * 100) : 0;
            status = `<span style="color:var(--dim);font-size:0.6rem;">${pct}%</span>`; }
     // The × is on EVERY chip in EVERY state — an escape hatch that only exists
@@ -10129,12 +10182,13 @@ function removeCardFile(name, idx) {
   const a = _cardFiles[name] || [];
   const f = a[idx];
   if (!f) return;
+  _cancelUpload(f);
   if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
   a.splice(idx, 1);
   renderCardFiles(name);
 }
 function _clearCardFiles(name) {
-  (_cardFiles[name] || []).forEach(f => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+  (_cardFiles[name] || []).forEach(f => { _cancelUpload(f); if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
   delete _cardFiles[name];
   renderCardFiles(name);
 }
@@ -10165,6 +10219,39 @@ let _uploadActive = 0;
 // it. The peek composer and each home card are separate sinks, so a file lands in
 // the surface it was dropped/pasted/picked on. This is the one seam that lets the
 // card list reuse the chunked-upload core instead of copying it.
+// THE SEND GUARD NAMES THE FILE AND SAYS WHAT TO DO (AF-235).
+//
+// Both composers used to refuse with a flat "Wait for upload to finish" on
+// `f.path == null`. That predicate cannot tell a transfer in progress from one
+// that died, and the message is a LIE in the second case — nothing is
+// transferring and waiting will never help. It is what kept the reporting user
+// waiting on an upload that was never going to complete, and since AMUX-3372
+// copied the guard to the card composer it was being told from two code paths.
+//
+// Returns true if the send must be blocked, having already explained why.
+function _blockedByAttachment(files) {
+  const arr = files || [];
+  const pending = arr.filter(f => !f.path);
+  if (!pending.length) return false;
+  const inflight = pending.filter(f => f.inflight);
+  const stuck = pending.filter(f => !f.inflight);
+  const say = (typeof showToast === 'function') ? showToast : function () {};
+  if (stuck.length) {
+    // Name the FIRST stuck file — a count alone does not tell you which chip to
+    // press, and past 12 files the chips are collapsed behind a summary row.
+    const n = stuck[0].name;
+    say(stuck.length === 1
+      ? `"${n}" did not upload — Retry (↻) or remove (×) it to send`
+      : `${stuck.length} attachments did not upload, starting with "${n}" — Retry (↻) or remove (×) them to send`);
+    return true;
+  }
+  const n = inflight[0].name;
+  say(inflight.length === 1
+    ? `Still uploading "${n}" — or remove (×) it to send now`
+    : `Still uploading ${inflight.length} attachments, starting with "${n}"`);
+  return true;
+}
+
 function _peekSink() {
   return {
     push: (p) => peekFiles.push(p),
@@ -10218,51 +10305,100 @@ async function uploadAndAttach(file, sink) {
   // another chip, a second attach, a failed-chunk retry that splices — so a
   // numeric index goes stale and the finished file writes to the wrong slot or a
   // placeholder never gets its .path (send then stalls on "wait for upload").
-  const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB, chunk: 0, totalChunks };
+  // `file` is RETAINED so a failed upload can be retried from the chip itself,
+  // and `cancelled`/`inflight` are EXPLICIT rather than inferred (AF-235).
+  const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB,
+                        chunk: 0, totalChunks, file, error: null, inflight: false,
+                        cancelled: false, aborter: null };
   sink.push(placeholder);
   sink.render();
-  const _present = () => sink.has(placeholder);
+  await _runUpload(placeholder, sink);
+}
+
+// Drive one attachment to completion. Safe to call again on a failed chip.
+//
+// CANCELLATION IS AN EXPLICIT FLAG, NOT ARRAY MEMBERSHIP (AF-235, diagnosed by
+// @Dygreens on #124 from a user report: "no delete button. No remove button no
+// way for me to send this prompt"). This loop used to ask `sink.has(placeholder)`
+// — i.e. "is this still in peekFiles?" — to decide whether the user had removed
+// the chip. But `_peekFilesStash` HANDS THE WHOLE ARRAY OFF (`peekFiles = []`)
+// when the peek closes or switches worker, so merely closing the peek read as a
+// removal: the transfer returned at i = 0 and the placeholder was left sitting
+// in the stashed array at 0% with nothing left to drive it. The artifact matched
+// exactly — four EMPTY `.chunked-*` dirs under ~/.amux/uploads, meaning
+// /api/upload/start had succeeded and chunk 0 never wrote.
+//
+// Progress is written by MUTATING `f` IN PLACE, so the transfer does not care
+// which array `f` currently lives in: close the peek, switch worker, reopen, and
+// the chip still lands on its path. That was already the right shape against one
+// array; since AMUX-3372 added card composers there are now several sinks, and it
+// is the only shape that works.
+async function _runUpload(f, sink) {
+  const file = f.file;
+  if (!file) { f.error = 'file no longer held — re-attach it'; f.inflight = false; sink.render(); return; }
+  f.error = null; f.cancelled = false; f.inflight = true; f.chunk = 0;
+  f.aborter = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const _sig = f.aborter ? f.aborter.signal : undefined;
+  const totalChunks = f.totalChunks;
+  sink.render();
 
   try {
     const startR = await fetch(API + '/api/upload/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: file.name, size: file.size, chunks: totalChunks })
+      body: JSON.stringify({ name: file.name, size: file.size, chunks: totalChunks }),
+      signal: _sig
     });
     const startD = await startR.json();
     if (!startR.ok || startD.error) throw new Error(startD.error || 'start failed');
     const uploadId = startD.id;
 
     for (let i = 0; i < totalChunks; i++) {
-      if (!_present()) return;
+      if (f.cancelled) return;
       const start = i * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, file.size);
       const blob = file.slice(start, end);
       const r = await fetch(API + '/api/upload/' + uploadId + '/chunk/' + i, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/octet-stream' },
-        body: blob
+        body: blob,
+        signal: _sig
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
         throw new Error(d.error || 'chunk ' + i + ' failed');
       }
-      placeholder.chunk = i + 1;
+      f.chunk = i + 1;
       sink.render();
     }
 
-    const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST' });
+    const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST', signal: _sig });
     const finD = await finR.json();
     if (!finR.ok || finD.error) throw new Error(finD.error || 'finalize failed');
-    if (!_present()) return;
-    placeholder.path = finD.path;
-    placeholder.url = finD.url;
+    if (f.cancelled) return;
+    f.path = finD.path;
+    f.url = finD.url;
+    f.error = null;
   } catch(e) {
+    // A DELIBERATE CANCEL IS NOT A FAILURE — it has already removed the chip.
+    if (f.cancelled || (e && e.name === 'AbortError')) return;
     console.error('Upload error:', e);
-    showToast('Upload failed: ' + e.message);
-    sink.drop(placeholder);
+    // KEEP THE CHIP. This used to `sink.drop(placeholder)` behind a single
+    // toast, which silently lost the file: the only record that you had
+    // attached anything was a message that disappears. The chip now presents
+    // as something to act on, and `file` above is what makes Retry real.
+    //
+    // Note the card composer has rendered an `f.error` state since AMUX-3372
+    // and NOTHING HAS EVER SET IT — the sole failure path dropped the chip, so
+    // that branch and its `.failed` style were unreachable. This is the write
+    // that makes them live.
+    f.error = (e && e.message) ? e.message : 'upload failed';
+    showToast('Upload failed: ' + f.error + ' — use Retry on the chip');
+  } finally {
+    f.inflight = false;
+    f.aborter = null;
+    sink.render();
   }
-  sink.render();
 }
 
 function handlePeekFileInput(e) {
@@ -10361,7 +10497,7 @@ setTimeout(_updateSendSplit, 0);
 
 async function sendPeekCmd() {
   if (!peekSession) return;
-  if (peekFiles.some(f => !f.path)) { showToast('Wait for upload to finish'); return; }
+  if (_blockedByAttachment(peekFiles)) return;
   const inp = document.getElementById('peek-cmd-input');
   const text = inp.value.trim();
   const files = peekFiles.filter(f => f.path);

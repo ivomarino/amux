@@ -1919,6 +1919,26 @@
   .peek-attach-chip .chip-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; flex: 1; min-width: 0; }
   .peek-attach-chip .chip-remove { cursor: pointer; color: var(--dim); flex-shrink: 0; font-size: 1.1rem; line-height: 1; opacity: 0.7; }
   .peek-attach-chip .chip-remove:hover { color: var(--red); opacity: 1; }
+  /* A FAILED CHIP MUST NOT PULSE (AF-235). `.uploading` animates opacity, which
+     reads as "still working" — the exact wrong cue on a transfer that has
+     stopped, and what kept the reporting user waiting. It gets a static red
+     border instead, and the `!` / retry controls below were referenced by the
+     card composer since AMUX-3372 with NO style ever defined, because the sole
+     failure path dropped the chip so the branch could not render. */
+  .peek-attach-chip.failed { border-color: var(--red); animation: none; opacity: 1; }
+  .peek-attach-chip .chip-err { color: var(--red); font-weight: 700; flex-shrink: 0; line-height: 1; cursor: help; }
+  .peek-attach-chip .chip-retry { cursor: pointer; color: var(--dim); flex-shrink: 0; font-size: 0.95rem; line-height: 1; opacity: 0.75; }
+  .peek-attach-chip .chip-retry:hover { color: var(--accent); opacity: 1; }
+  /* The escape hatch has to be PRESSABLE, or it is not one. Both controls sit on
+     a 20px-tall chip, so without this they are ~12px targets on a phone. */
+  @media (max-width: 600px) {
+    .peek-attach-chip .chip-remove,
+    .peek-attach-chip .chip-retry {
+      min-width: 44px; min-height: 44px; display: inline-flex;
+      align-items: center; justify-content: center; margin: -12px 0;
+    }
+    .peek-attach-chip { max-width: 100%; }
+  }
   .peek-attach-summary {
     display: flex; align-items: center; gap: 8px; padding: 6px 10px;
     background: var(--card); border: 1px solid var(--border); border-radius: 8px;
