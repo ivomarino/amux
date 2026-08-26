@@ -172,7 +172,12 @@ SEVERITY: slows
 STATUS: open
 DATE: 2026-08-08
 SESSION: amux-frustrations
-CARD: AF-10
+CARD: AF-242
+NOTE-CARD: repointed 2026-08-26. This said CARD: AF-10, which is the rescued INSTANCE
+  (the SSE `workers` global that survived because I re-read the review and filed it by
+  hand) — not the mechanism. So the entry pointed at a card that could be closed, and was,
+  while the class went unaddressed. That is the AF-191 shape one level in: a CARD: that
+  resolves, to the wrong thing. AF-242 is the class.
 SYMPTOM: Reviewing AC-275 on 2026-08-06 I found a defect OUTSIDE that card's scope — the
   vocab rename left `workers = msg.payload` in the SSE handler assigning an undeclared
   global while render() kept reading `sessions`. I wrote it into AC-275's description and
