@@ -344,8 +344,7 @@ pub fn build(
              `git checkout origin/main -- <path>` reverts YOUR landed commits — and the \
              find-object restore-safety check PASSES while it does, because locally-committed \
              content is reachable-from-a-commit too (that is how the mixpeek MG-1483 push guard \
-             was silently disarmed, 2026-08-20). MERGE the two versions (for append-only files, \
-             union-merge per .claude/rules/frustrations.md), or hand the path to its owner. Do \
+             was silently disarmed, 2026-08-20). MERGE the two versions, or hand the path to its owner. Do \
              not clear these with any single-arm command."
         ));
     }
@@ -560,6 +559,26 @@ pub fn build(
         return None;
     }
     let mut msg = sections.join("\n\n");
+    // THE APPEND-ONLY NOTE BELONGS TO THE WHOLE DIRTY SET, NOT TO ONE ARM
+    // (AMUX-3718, near-miss 2026-08-25).
+    //
+    // It used to be emitted from inside `commit_worthy_body`, which `build`
+    // hands `commit_worthy` — defined three lines up as the paths that are NOT
+    // stale/diverged/revived. So the archive check was structurally unreachable
+    // for a DIVERGED frustrations.md: the ONE state in which this nudge
+    // actually prescribes a union-merge was the one state that could not be
+    // told how to perform it safely. A lane followed the bare directive
+    // verbatim and would have resurrected an entry closed on a 692/692 prod
+    // measurement.
+    //
+    // Its own unit test was green throughout, because it called
+    // `commit_worthy_body` directly and pinned a layer the broken path does not
+    // flow through (ethos rule 7 / AF-161). Hoisting it here means the note
+    // travels with EVERY arm, and `dirty` is the honest input: the note is
+    // about the file, not about which remedy the file happens to be under.
+    if let Some(note) = append_only_note(&dirty) {
+        msg.push_str(&note);
+    }
     // AF-135 defect 1: the message timestamped origin's tip but never said
     // when it OBSERVED the tree, so a snapshot composed before a commit and
     // delivered at the next turn boundary read as live and named files
@@ -610,12 +629,8 @@ fn is_append_only_shared(path: &str) -> bool {
 /// back"). The general form: a set-difference over ONE file cannot see a
 /// move and reports it as a deletion every time — before treating a
 /// disappearance as loss, look where it may have legitimately moved to.
-fn append_only_note(dirty: &[String]) -> Option<String> {
-    let mut ao: Vec<&str> = dirty
-        .iter()
-        .map(String::as_str)
-        .filter(|p| is_append_only_shared(p))
-        .collect();
+fn append_only_note(dirty: &[&str]) -> Option<String> {
+    let mut ao: Vec<&str> = dirty.iter().copied().filter(|p| is_append_only_shared(p)).collect();
     ao.sort();
     ao.dedup();
     if ao.is_empty() {
@@ -635,6 +650,36 @@ fn append_only_note(dirty: &[String]) -> Option<String> {
          absent from BOTH files is lost work. Never a plain add/commit or a bare restore.",
         ao.join(", ")
     ))
+}
+
+/// The delivered-text invariant behind the AMUX-3718 WARN: if an append-only
+/// shared file is in the dirty set, the message MUST carry CD-78's archive
+/// check. Returns the offending paths when it does not.
+///
+/// Deliberately checks the RENDERED message rather than re-deriving which arm
+/// fired. Re-deriving is how the original defect survived: the note's own test
+/// reasoned about `commit_worthy` and was correct about it, while the bytes a
+/// lane received had no archive check in them at all.
+/// Takes `fresh` so it can SHARE the predicate of the code it describes rather
+/// than re-derive it: `build` drops paths byte-identical to origin before it
+/// renders anything, so a SAME frustrations.md legitimately produces no note and
+/// a checker that missed that would cry wolf on healthy text. A view that
+/// disagrees with the mechanism it reports on is wrong in whichever direction it
+/// disagrees, and a WARN nobody trusts is worse than no WARN.
+fn missing_archive_check(dirty: &[String], fresh: &Freshness, msg: &str) -> Option<String> {
+    if msg.contains("ARCHIVE CHECK") {
+        return None;
+    }
+    let same: BTreeSet<&str> = fresh.same.iter().map(String::as_str).collect();
+    let bad: Vec<&str> = dirty
+        .iter()
+        .map(String::as_str)
+        .filter(|p| is_append_only_shared(p) && !same.contains(*p))
+        .collect();
+    if bad.is_empty() {
+        return None;
+    }
+    Some(bad.join(", "))
 }
 
 fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<String> {
@@ -708,9 +753,6 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
         );
         if let Some(why) = &own.partial {
             m.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
-        }
-        if let Some(note) = append_only_note(dirty) {
-            m.push_str(&note);
         }
         return Some(m);
     }
@@ -823,9 +865,6 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
             who.into_iter().collect::<Vec<_>>().join("/"),
             it
         ));
-    }
-    if let Some(note) = append_only_note(dirty) {
-        msg.push_str(&note);
     }
     Some(msg)
 }
@@ -1684,6 +1723,30 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
             .await;
+        // SELF-CHECK ON THE TEXT WE ARE ABOUT TO SEND (AMUX-3718, second fix).
+        //
+        // The bug this catches shipped for weeks with a green unit test, because
+        // the test pinned a layer the broken path did not flow through. A CI
+        // cell that asserts the right property in the wrong place is
+        // indistinguishable from one in the right place, so the durable
+        // instrument is a check on the ACTUAL delivered bytes: if an append-only
+        // shared file is in the set, the message MUST carry the archive check,
+        // whichever arm rendered it. Without it the nudge prescribes only the
+        // half that loses data.
+        //
+        // WARN, not a suppression: a nudge naming a real divergence is still
+        // worth more than silence, and swallowing it would trade a loud bug for
+        // a quiet one. This is the line a log sweep finds without anyone
+        // knowing to look for it.
+        if let Some(bad) = missing_archive_check(&dirty, &fresh, &msg) {
+            tracing::warn!(
+                session = %session,
+                paths = %bad,
+                "commit-nudge: append-only shared file prescribed a remedy WITHOUT the archive \
+                 check — the union-merge directive lost its safety half and this nudge can \
+                 resurrect archived entries (AMUX-3718 regression)"
+            );
+        }
         let _ = crate::api::session_verbs::steer_enqueue(state, session, &msg, "commit-nudge", "").await;
         sent += 1;
     }
@@ -2519,8 +2582,13 @@ mod tests {
         assert!(!is_append_only_shared("frustrations.md.bak"));
         assert!(!is_append_only_shared("src/app.js"));
 
+        // THROUGH `build`, NOT `commit_worthy_body` (AMUX-3718). This cell used
+        // to call the inner function directly and was green for the entire time
+        // the note was unreachable from the DIVERGED arm — a real property
+        // asserted at a layer the broken path does not flow through.
         let dirty = s(&["frustrations.md", "app.js"]);
-        let msg = commit_worthy_body("/repo", &dirty, &Ownership::default()).unwrap();
+        let msg =
+            build("/repo", &dirty, &Ownership::default(), &Freshness::default(), "S").unwrap();
         assert!(msg.contains("APPEND-ONLY SHARED FILE"), "{msg}");
         assert!(msg.contains("UNION-MERGE"), "{msg}");
         assert!(msg.contains("frustrations.md"), "{msg}");
@@ -2533,8 +2601,120 @@ mod tests {
 
         // No append-only file in the set -> no such block.
         let plain = s(&["app.js", "main.rs"]);
-        let msg2 = commit_worthy_body("/repo", &plain, &Ownership::default()).unwrap();
+        let msg2 =
+            build("/repo", &plain, &Ownership::default(), &Freshness::default(), "S").unwrap();
         assert!(!msg2.contains("APPEND-ONLY SHARED FILE"), "{msg2}");
+    }
+
+    /// THE ARCHIVE CHECK MUST REACH THE **DIVERGED** ARM — the one state in which
+    /// the nudge actually prescribes a union-merge (AMUX-3718, near-miss by
+    /// mixpeek-frustrations 2026-08-25).
+    ///
+    /// The test above is green and pins the wrong layer (ethos rule 7 / AF-161).
+    /// It calls `commit_worthy_body` directly, and `build` hands that function
+    /// `commit_worthy`, which is *defined* as the dirty paths that are NOT
+    /// stale/diverged/revived. So a DIVERGED frustrations.md is structurally
+    /// excluded from the only code that emits the archive check, while the
+    /// DIVERGED section itself says "union-merge" with the safety half behind a
+    /// citation. The reader who is being told to union-merge is precisely the
+    /// reader who cannot be shown how to do it safely.
+    ///
+    /// That is not a hypothetical: a lane followed the bare directive verbatim
+    /// tonight and would have resurrected an entry closed on a 692/692 prod
+    /// measurement.
+    #[test]
+    fn a_diverged_append_only_file_still_gets_the_archive_check() {
+        let dirty = s(&["FRUSTRATIONS.md"]);
+        let fresh = Freshness { diverged: s(&["FRUSTRATIONS.md"]), ..Default::default() };
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("a diverged append-only path must still produce a nudge");
+
+        // PREMISE: we are in the arm that prescribes the merge. Without this the
+        // assertions below could pass from some other section and prove nothing.
+        assert!(m.contains("DIVERGED:"), "premise: the diverged arm must be the one firing: {m}");
+        assert!(m.contains("MERGE the two versions"), "premise: a merge must be prescribed: {m}");
+
+        assert!(
+            m.contains("ARCHIVE CHECK"),
+            "the arm that prescribes a union-merge must carry CD-78's archive check, or it \
+             prescribes the destructive half alone: {m}"
+        );
+        assert!(m.contains("absent from BOTH files"), "{m}");
+    }
+
+    /// THE DELIVERY-TIME WARN MUST DISCRIMINATE (AMUX-3718, second fix).
+    ///
+    /// A check that cannot fire is theatre and a check that always fires is
+    /// noise, so both directions are pinned — and the positive case is built
+    /// from the ACTUAL pre-fix text, not from a convenient string. The specimen
+    /// below is the DIVERGED section as it shipped, which is the message a lane
+    /// really received on 2026-08-25.
+    #[test]
+    fn the_archive_check_warn_fires_on_the_real_specimen_and_stays_quiet_on_healthy_text() {
+        let dirty = s(&["FRUSTRATIONS.md"]);
+        let fresh = Freshness::default();
+
+        // The pre-fix bytes: prescribes the merge, carries no archive check.
+        let broken = "DIVERGED: ... MERGE the two versions (for append-only files, union-merge \
+                      per .claude/rules/frustrations.md), or hand the path to its owner.";
+        assert_eq!(
+            missing_archive_check(&dirty, &fresh, broken).as_deref(),
+            Some("FRUSTRATIONS.md"),
+            "the WARN must fire on the exact text that shipped, or it certifies the bug"
+        );
+
+        // The shipped text, end to end, in EVERY arm — including DIVERGED, the
+        // arm the bug lived in. Pinning only the default arm would leave the
+        // runtime instrument green against the exact regression it exists to
+        // catch, which is the wrong-layer failure one level out.
+        for f in [
+            Freshness::default(),
+            Freshness { diverged: s(&["FRUSTRATIONS.md"]), ..Default::default() },
+            Freshness { stale: s(&["FRUSTRATIONS.md"]), ..Default::default() },
+            Freshness { revived: s(&["FRUSTRATIONS.md"]), ..Default::default() },
+        ] {
+            let live = build("/repo", &dirty, &Ownership::default(), &f, "S").unwrap();
+            assert!(
+                missing_archive_check(&dirty, &f, &live).is_none(),
+                "the fixed nudge must not trip its own WARN: {live}"
+            );
+        }
+
+        // No append-only file in the set -> silent, however the message reads.
+        let plain = s(&["src/app.js"]);
+        assert!(missing_archive_check(&plain, &fresh, broken).is_none());
+
+        // SAME is dropped by `build` before rendering, so a byte-identical
+        // frustrations.md legitimately produces no note and must not warn.
+        let same_fresh = Freshness { same: s(&["FRUSTRATIONS.md"]), ..Default::default() };
+        assert!(
+            missing_archive_check(&dirty, &same_fresh, broken).is_none(),
+            "the checker must share `build`'s same-filter, not re-derive it"
+        );
+    }
+
+    /// THE PROCEDURE MUST BE INLINE, NEVER A REPO-RELATIVE CITATION (AMUX-3718).
+    ///
+    /// The nudge fires in EVERY lane's own checkout, and `.claude/rules/` exists
+    /// in amux and in almost none of them (measured: absent in ~/Dev/mixpeek).
+    /// A path citation therefore resolves for the author and dead-ends for the
+    /// reader — who then either follows the dangerous half from memory or files
+    /// a bug saying the file does not exist. Both happened on 2026-08-25.
+    #[test]
+    fn the_nudge_never_cites_a_repo_relative_path_for_its_own_procedure() {
+        let dirty = s(&["FRUSTRATIONS.md"]);
+        for fresh in [
+            Freshness { diverged: s(&["FRUSTRATIONS.md"]), ..Default::default() },
+            Freshness { stale: s(&["FRUSTRATIONS.md"]), ..Default::default() },
+            Freshness { edited: s(&["FRUSTRATIONS.md"]), ..Default::default() },
+        ] {
+            let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S").unwrap();
+            assert!(
+                !m.contains(".claude/rules/"),
+                "the procedure must travel with the message, not as a path only the amux \
+                 checkout can open: {m}"
+            );
+        }
     }
 
     /// THE EXIT-CODE DISCRIMINATOR, against a real repo (MG-1467). The classifier
