@@ -8555,6 +8555,54 @@ fn warn_stuck_report_once(name: &str, st: &str, ts: f64, age: f64) {
     );
 }
 
+/// One lane's recorded status decisions, newest first, with the timestamp of
+/// the OLDEST row of this kind anywhere.
+///
+/// The second value is what makes an empty list honest. `history: []` means
+/// "this lane has not changed status" when the job has been running, and "no
+/// one has been sampling" when it has not, and the two are indistinguishable
+/// from the array alone — the exact failure AMUX-3761 exists to close, which is
+/// why it is not left for the reader to infer (ethos rule 4).
+///
+/// Deliberately NOT scoped to this lane: a fleet-wide floor answers "how far
+/// back can this table see at all", where a per-lane floor would report a lane
+/// that first appeared an hour ago as if the record started then.
+pub(crate) fn status_decision_history(
+    conn: &rusqlite::Connection,
+    name: &str,
+    limit: usize,
+) -> (Vec<Value>, Option<f64>) {
+    let ev = crate::runtime_jobs::status_history::EVENT;
+    let mut out = Vec::new();
+    if let Ok(mut st) = conn.prepare(
+        "SELECT ts, data FROM session_events WHERE type=?1 AND session=?2 \
+         ORDER BY id DESC LIMIT ?3",
+    ) {
+        if let Ok(rows) = st.query_map(rusqlite::params![ev, name, limit as i64], |r| {
+            Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?))
+        }) {
+            let now = crate::config::now_f64();
+            for (ts, data) in rows.flatten() {
+                let mut v: Value = serde_json::from_str(&data).unwrap_or(json!({}));
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("ts".into(), json!(ts));
+                    o.insert("age_s".into(), json!((now - ts).max(0.0)));
+                }
+                out.push(v);
+            }
+        }
+    }
+    let since: Option<f64> = conn
+        .query_row(
+            "SELECT MIN(ts) FROM session_events WHERE type=?1",
+            rusqlite::params![ev],
+            |r| r.get::<_, Option<f64>>(0),
+        )
+        .ok()
+        .flatten();
+    (out, since)
+}
+
 pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
     // 1. Self-report (hooks). "active" = mid-turn, "waiting" = at a selector.
     //    ONLY while it is still authoritative — a report this gate would honour
@@ -10458,16 +10506,32 @@ async fn get_dispatch(
                 fs.capture_panes();
                 let running = fs.agent_running(&format!("amux-{nm}"));
                 let (status, explain) = fs.derive_status_explain(&nm, running);
-                Ok((running, status, explain))
+                // THE RETROSPECTIVE HALF (AMUX-3761). Everything above answers
+                // "why is this lane's badge what it is RIGHT NOW", and every
+                // question anyone actually asks about a badge is about a moment
+                // that has already passed — a screenshot arrives minutes late,
+                // by which time the lane has taken another turn and the live
+                // verdict is a different, correct, useless answer.
+                let (history, since) = status_decision_history(&conn, &nm, 20);
+                Ok((running, status, explain, history, since))
             })
             .await;
             match joined {
-                Ok(Ok((running, status, explain))) => j200(json!({
+                Ok(Ok((running, status, explain, history, since))) => j200(json!({
                     "session": name,
                     "running": running,
                     "status": status,
                     "explain": explain,
-                    "note": "decided_by names the rule that produced `status`; transition/pane/report carry the evidence and trust windows the rules weighed. Fresh snapshot, same derivation the session list uses.",
+                    "history": history,
+                    // AN EMPTY HISTORY HAS TWO MEANINGS and they are opposite:
+                    // this lane has been stable, or nothing has been sampling
+                    // it. `history_recorded_since` is null in the second case,
+                    // and the cadence says how coarse the sample is, because a
+                    // flip that completes inside one tick leaves no row and
+                    // that gap must not read as "it never changed".
+                    "history_recorded_since": since,
+                    "history_sample_secs": crate::runtime_jobs::status_history::tick_secs(),
+                    "note": "decided_by names the rule that produced `status`; transition/pane/report carry the evidence and trust windows the rules weighed. Fresh snapshot, same derivation the session list uses. `history` is a SAMPLE on change at `history_sample_secs`, not a log of every derivation.",
                 })),
                 Ok(Err(e)) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -17426,6 +17490,87 @@ mod steer_boundary_tests {
             lane_report(&state, "probe").expect("present").applies,
             "a FRESH active report is still the authority — this gate must keep deferring to a real turn"
         );
+    }
+
+    /// AMUX-3761. The load-bearing property is NOT that the rows come back —
+    /// it is that an EMPTY list is distinguishable from an unsampled one.
+    ///
+    /// Ethan's question was "is this badge accurate", asked about a moment 31
+    /// minutes gone. If `history: []` reads the same for "this lane has been
+    /// stable all day" and "nothing has ever recorded this", the endpoint has
+    /// reproduced the exact failure it was built to close, one layer in.
+    #[tokio::test]
+    async fn status_history_tells_a_stable_lane_from_an_unsampled_one() {
+        let (state, _d) = tstate();
+        state
+            .store
+            .write_async(|c| {
+                ensure_fleet_tables(c)?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        // NOTHING RECORDED ANYWHERE. Empty list, and `since` is None — the
+        // whole point: the reader can tell nobody was watching.
+        {
+            let conn = state.store.read().unwrap();
+            let (h, since) = status_decision_history(&conn, "probe", 20);
+            assert!(h.is_empty());
+            assert!(since.is_none(), "with no rows at all, the record has no floor to report");
+        }
+
+        // Two decisions for `probe`, and one for a DIFFERENT lane. The other
+        // lane's row must not appear in probe's history, and it MUST set the
+        // fleet-wide floor — a per-lane floor would tell a reader the record
+        // began when this lane first changed, which is a different claim.
+        let ev = crate::runtime_jobs::status_history::EVENT;
+        state
+            .store
+            .write_async(move |c| {
+                for (ts, lane, st, by) in [
+                    (1000.0, "other", "idle", "report"),
+                    (2000.0, "probe", "active", "contradiction_subagents_working"),
+                    (3000.0, "probe", "idle", "report"),
+                ] {
+                    c.execute(
+                        "INSERT INTO session_events (ts, session, type, data, source) VALUES (?1,?2,?3,?4,'t')",
+                        rusqlite::params![
+                            ts,
+                            lane,
+                            ev,
+                            serde_json::json!({"status": st, "decided_by": by}).to_string()
+                        ],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        let conn = state.store.read().unwrap();
+        let (h, since) = status_decision_history(&conn, "probe", 20);
+        assert_eq!(h.len(), 2, "another lane's decisions are not this lane's history");
+        assert_eq!(h[0]["decided_by"], json!("report"), "newest first: {h:?}");
+        assert_eq!(
+            h[1]["decided_by"],
+            json!("contradiction_subagents_working"),
+            "and the rule that WAS deciding when the screenshot was taken is still there"
+        );
+        assert_eq!(h[0]["ts"], json!(3000.0), "each row carries when it was decided");
+        assert!(h[0]["age_s"].as_f64().unwrap() > 0.0, "and how long ago that was");
+        assert_eq!(
+            since,
+            Some(1000.0),
+            "the floor is fleet-wide (the `other` row), not this lane's first change"
+        );
+
+        // A lane that has NEVER changed, on a fleet that IS being sampled:
+        // empty list, but `since` is populated. This is the cell that separates
+        // "stable" from "unwatched", and it is the reason `since` exists.
+        let (h2, since2) = status_decision_history(&conn, "never-changed", 20);
+        assert!(h2.is_empty());
+        assert_eq!(since2, Some(1000.0), "the record exists, this lane simply never moved");
     }
 
     /// AMUX-3048: subagent start/stop events accumulate a live count in the same

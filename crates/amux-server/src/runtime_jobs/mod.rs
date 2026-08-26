@@ -52,6 +52,7 @@ pub mod board_drive;
 pub mod commit_mention_notes;
 pub mod commit_nudge;
 pub mod context_health;
+pub mod status_history;
 pub mod disk_watch;
 pub mod ghost_rescue;
 pub mod heartbeat;

@@ -465,6 +465,9 @@ async fn async_main() {
     // worse than raw claude" was invisible for months is that nothing counted
     // how many times a lane's conversation had been summarized away.
     drop(runtime_jobs::context_health::spawn());
+    // AMUX-3761: a durable record of WHICH RULE decided each lane's status,
+    // so "was that badge accurate?" is answerable after the screenshot arrives.
+    drop(runtime_jobs::status_history::spawn(state.clone()));
     // The token_ledger WRITER. Every reader of that table was ported at the
     // cutover and this was not, so /api/stats/daily served a confident
     // total_tokens: 0 for 36 hours (AMUX-2892).
