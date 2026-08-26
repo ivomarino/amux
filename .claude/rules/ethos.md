@@ -187,6 +187,43 @@ different claims, and the second one ends the investigation. And where a compani
 exists (an archive, a tombstone table, a moved-to pointer), the check is
 absent-from-BOTH, never absent-from-one.
 
+### The idiom, named — because it keeps being reinvented
+
+This rule's failures share one shape, and @tsukimiya (external contributor) named it
+from the outside before anyone here did: **outputs that read the same whether things are
+healthy or broken.** Zero raw-tmux-fallback rows means "never happens" AND "the ledger
+is broken". A blank peek panel meant "the agent printed nothing" AND "addressing never
+matched". Their point was not that these are bugs — we were fixing them — but that we
+were fixing each one alone.
+
+Measured 2026-08-26, across the whole board: **16 cards, 8 lanes.** backend 5, amux 3,
+amux-frustrations 2, mvs-infra 2, and one each from mvs-research, gtm-engine and
+cold-outbound. Evaluations reporting SUCCESS when every query hard-failed; `cwd` exposed
+as `dir`, where a wrong field name is indistinguishable from an empty one;
+`durability_live` reading 0 for 3.5 minutes of every cycle; a dead Apollo
+indistinguishable from no matches. Sixteen authors, sixteen separate diagnoses.
+
+**And the fix is already an idiom here, reinvented every time.** Six independent
+authors, converging: `scan_truncated` and `actual_window_h` on `analyze`/`stats`;
+`truncated` + `page_span_h` on `/api/logs`; `ran` on `/api/health/invariants?id=`;
+`latest_per_invariant`, which is the only place a PASS is visible at all;
+`ignored_fields` + `applied:false` on board PATCH, with 422 when EVERY key was
+unwritable; and autofix's blindness check routing its HEALTHY ZERO through `suppressed`
+with the comment *"a zero here is a measurement; silence would not be."*
+
+So state it once, as a prescription rather than sixteen discoveries:
+
+> **Any output that can read ZERO or EMPTY must publish, in the same payload, whether
+> the measurement RAN.**
+
+In the same payload is load-bearing — this rule's own second layer is that a tag in a
+store the reader never opens is the same failure as no tag. A `/api/debug/` endpoint
+that could have answered it does not count.
+
+**The review question, which is cheaper than any check and catches it before it ships:**
+*if this reported zero, could the reader tell healthy from broken?* Most of the 16 would
+have been caught by asking it once, at the point of writing.
+
 ## 5. Does it accumulate, or does it discriminate?
 
 Automation that appends without deciding degrades as volume grows, no matter how good

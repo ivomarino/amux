@@ -3035,6 +3035,65 @@ mod tests {
         Router::new().nest("/api/logs", routes()).with_state(state(store))
     }
 
+    /// AF-253 — the CLASS guard, not another instance.
+    ///
+    /// @tsukimiya named the shape from outside the fleet: outputs that read the same
+    /// whether things are healthy or broken. Measured across the board the same day:
+    /// 16 cards, 8 lanes, every one diagnosed and fixed alone — and the FIX is already
+    /// an idiom here that six independent authors reinvented (`scan_truncated`,
+    /// `actual_window_h`, `truncated`, `page_span_h`, `ran`, `ignored_fields`).
+    ///
+    /// Their point was that nobody was treating it as a class. This is the narrow,
+    /// buildable part of doing so: the three endpoints the DAILY SWEEP publishes
+    /// conclusions from must each say whether their measurement was COMPLETE. A wrong
+    /// zero here does not mislead one reader, it becomes a published verdict about the
+    /// fleet — which is exactly what happened on 2026-08-22, when a truncated norm
+    /// turned a 1.07x p95 into a 6.46x "finding" that every guard in the contract would
+    /// have passed through.
+    ///
+    /// SCOPED ON PURPOSE. A general "every instrument declares its completeness" check
+    /// needs a definition of "instrument" that decays into a hand-kept list — the thing
+    /// that goes stale silently here. This list does not: it is the sweep's own entry
+    /// points, maintained because the sweep breaks loudly without them. Adding a fourth
+    /// sweep endpoint without a completeness field fails this test.
+    #[tokio::test]
+    async fn every_sweep_endpoint_says_whether_its_measurement_was_complete() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        for i in 0..3u32 {
+            seed(&store, now - f64::from(i) * 60.0, "GET", "/api/board", 500, 1.0, "lane", "native",
+                 Some("{\"error\":\"x\"}")).await;
+        }
+        let api = logs_api(store.clone());
+        // (path, the field that answers "was this the whole window?")
+        let sweep_endpoints = [
+            ("/api/logs?limit=2000", "truncated"),
+            ("/api/logs/analyze?since_h=24", "scan_truncated"),
+            ("/api/logs/stats?since_h=24", "scan_truncated"),
+        ];
+        for (uri, completeness) in sweep_endpoints {
+            let (st, body) =
+                hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                !v[completeness].is_null(),
+                "{uri} must publish `{completeness}` — a caller cannot otherwise tell a \
+                 complete answer from a slice, and this endpoint's numbers become a \
+                 published verdict about the fleet: {v}"
+            );
+            // The SPAN too, where the answer is a window: "complete" is meaningless if
+            // the reader cannot see what was actually covered. `/api/logs` reports the
+            // page it returned; the two analysis endpoints report the window they read.
+            let span = if uri.starts_with("/api/logs?") { "page_span_h" } else { "actual_window_h" };
+            assert!(
+                v[span].as_f64().is_some(),
+                "{uri} must publish `{span}` — `{completeness}: false` still leaves \
+                 'over what?' unanswered: {v}"
+            );
+        }
+    }
+
     /// AF-230, from the 2026-08-26 sweep's own numbers: step 5 asked for a
     /// 24h window, got 2,000 of 123,645 rows, and that page spanned 0.48
     /// HOURS. `since` was the only time bound, so with `ORDER BY ts DESC
