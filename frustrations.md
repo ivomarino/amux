@@ -2867,3 +2867,39 @@ COST: ~20 minutes establishing that the instrument rather than the feature was
 FIX: include elements carrying an onclick handler, not only semantically
   interactive tags; and let `/api/browser/action` take a CSS selector, which
   sidesteps the index problem and the scroll-container problem at once.
+
+## SUPERSEDES the entry above: browser state's cap was silent, and my diagnosis of it was wrong
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3721
+SYMPTOM: The entry immediately above blames the state extractor's SELECTOR for
+  missing div-with-onclick rows and asks for CSS-selector clicking. Both claims
+  are false and I am correcting them rather than leaving them to be greped as
+  evidence. The selector has always contained `[onclick]`, and
+  `selector_click_js()` already existed in the same file.
+  The real defect: `state_js` collects every visible match into `seen`, renders
+  the first STATE_EL_LIMIT (120) into `els`, and disclosed nothing about the
+  gap. Measured live: 3625 matched the selector, 158 were visible, 120 were
+  returned, and the two elements I could not find sat at indices 155 and 156 —
+  addressable the whole time, because click-by-index resolves against `seen`
+  rather than `els`. Clicking 156 worked the moment I looked past the response.
+COST: A wrong cause filed on a card and written into this file, plus the ~20
+  minutes already recorded. The compounding cost is what makes it worth an
+  entry: a wrong entry here is read as evidence by whoever greps `AREA:
+  instruments` later, and three entries sharing an AREA are supposed to be an
+  argument for rebuilding something. An argument built on a wrong diagnosis
+  points the rebuild at the wrong subsystem.
+FIX: 1cddf81a — disclosure, not a bigger cap: `elements_total`,
+  `elements_shown`, `elements_truncated`, and a note naming the addressable
+  index RANGE and the two ways through. Verified live after adoption:
+  total 162, shown 120, truncated true. The cap is fine; being unable to tell
+  that it applied was the defect.
+  THE TELL I WALKED PAST, which is the transferable part: the response held
+  EXACTLY 120 elements, which is exactly the cap. A count landing precisely on
+  a limit is a truncation, not a census. Both theories predicted the same
+  observation ("my element is not in the list"), and only one was checkable in
+  one command: `document.querySelectorAll(SEL).length`. When two explanations
+  predict the same failure, reach for the one you can separate cheaply.
