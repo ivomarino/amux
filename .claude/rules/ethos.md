@@ -456,6 +456,34 @@ untested — because the test looks at the artifact and the program looks at its
 first N items. Sorting, ranking, prioritising, batching, paginating and
 budget-capped scans are all this shape. Assert on `&order[..n]`, not on `order`.
 
+**A TOTALIZING WORD IN YOUR OWN DESCRIPTION IS THE TRIGGER: test at the scope of the
+MECHANISM, not the scope of the bug** (AMUX-3719, 2026-08-26; the trigger is
+gtm-media-assets'). A test-isolation flake was fixed by having `HomeGuard` snapshot the
+whole process env and restore it on drop — total, no key list, cannot go stale. The
+targeted test passed and the flake it was aimed at disappeared. The full suite then
+failed an unrelated test that sets an env var with a bare `set_var` outside any guard and
+runs twice expecting the same cap: the blanket restore deleted that variable between the
+two runs. One flake traded for a broader one, and the broader one could clobber any
+variable any test owns. (The scoped fix reads the fixture's own `server.env` keys, which
+is the single path that exports into the process env.)
+
+What generalises is not "be careful with env". It is that **the properties which made the
+mechanism feel safe — whole, no list, cannot go stale — are the same properties that put
+its blast radius outside anything the targeted test could express.** A total mechanism
+reaches everything by definition, so a test scoped to the motivating bug is structurally
+incapable of covering it, no matter how carefully it is written. Being more careful was
+not available; the targeted test was green and correct about its own claim.
+
+The trigger is mechanical, which is the point: when the sentence describing your fix
+contains *whole, all, every, blanket, total, cannot go stale*, the check must run at the
+widest scope the mechanism touches. The word is already in your own commit message.
+
+Note the direction, too, because it is the same blind spot as committing an untracked path
+without checking origin (gtm-media-assets, same day): removing or overwriting invites
+verification, since you can visibly destroy something. This change was framed internally as
+"restore MORE", which felt additive and safe, so the leak was verified closed and nothing
+asked what else the restore now reached.
+
 **When you argue that a failure will be loud, NAME THE IDIOM that makes it loud, and check
 it is the one your callers write.** The same slimming was defended in its own comment as
 safe because `.desc` on a slim row is "a KeyError, which is loud, not silently empty". That
