@@ -3,11 +3,20 @@
 //! append, POST import, DELETE clear).
 //!
 //! Python parity decisions, recorded so they are not "fixed" later:
-//! - The five stored `type` values are kept as-is; `kind` (human/session/
-//!   schedule/amux) and `queued` are DERIVED on read, exactly like
-//!   `_msg_kind`/`_msg_is_queued` — unknown types read as human, because
-//!   that is the reading that gets a message looked at rather than filtered
-//!   away.
+//! - The stored `type` values are kept as-is; `kind` (human/session/schedule/
+//!   amux/unknown) and `queued` are DERIVED on read, like `_msg_kind`/
+//!   `_msg_is_queued`.
+//!
+//!   CORRECTED 2026-08-26 (AMUX-3737). This block used to record "unknown types
+//!   read as human, because that is the reading that gets a message looked at
+//!   rather than filtered away" as a deliberate Python-parity decision. The
+//!   reasoning is about VISIBILITY and it is sound; the conclusion does not
+//!   follow, because `human` is not the only visible bucket. That default
+//!   silently attributed 355 machine-generated `pickup` nudges to a person, and
+//!   Ethan caught it from a screenshot rather than from anything here. Unknown
+//!   types now read as `unknown`: just as visible, and honest about what it
+//!   does not know. Kept as a note rather than deleted, because a stale
+//!   rationale is what made the default look considered.
 //! - Every filter (kind, q, session, group) is applied IN SQL, before the
 //!   LIMIT — the page-vs-corpus gap (AMUX-2548) is exactly what the Python
 //!   comments warn about.
@@ -108,16 +117,82 @@ fn ev(id: &str, mutation: MutationKind) -> PendingEvent {
 
 // ---- kind derivation (_MSG_KINDS / _msg_kind / _msg_is_queued) -------------
 
-const MSG_KINDS: [&str; 4] = ["human", "session", "schedule", "amux"];
+const MSG_KINDS: [&str; 6] =
+    ["human", "session", "schedule", "amux", "unstamped", "unknown"];
 
-/// Python `_msg_kind`: canonical kind for a stored type; unknown -> human.
+/// The stored types a HUMAN actually produces. An ALLOWLIST, deliberately.
+///
+/// The old rule was a denylist with `human` as the fallback, which is the most
+/// consequential default available here: it attributes machine-generated text
+/// to a person, and it does so silently for every message type amux invents
+/// after the classifier was written. `pickup` is exactly that: auto-pickup
+/// nudges, stamped `origin: board-drive`, 355 rows reading `Human` in the
+/// Messages view.
+pub(crate) const HUMAN_TYPES: [&str; 4] = [
+    "direct", "steering", "user",
+    // Legacy rows predating the type column. Historical human traffic, kept
+    // human on purpose; this is the one case where absence really does mean a
+    // person typed it.
+    "",
+];
+
+/// The stored types amux itself produces. Same shape as [`HUMAN_TYPES`] and
+/// read by the FILTER as well as the classifier, so the two cannot drift.
+pub(crate) const AMUX_TYPES: [&str; 2] = ["system", "pickup"];
+
+/// A send that went in via raw tmux keystrokes while the server was
+/// unreachable, reconciled into the trail afterwards by the CLI.
+///
+/// ITS OWN KIND, not `amux` and emphatically not `human` (AMUX-2670). A person
+/// probably did type it, but its delivery was never verified — keystrokes
+/// reached a pane and a picker may have eaten them — and its origin is the
+/// CLI's word rather than a server-side stamp. That is a different claim from
+/// either bucket.
+///
+/// The dashboard has classified this as `unstamped` since AMUX-2670, in
+/// `_msgKind`, with a comment saying an unstamped injection must not render
+/// identically to an audited send. THAT BRANCH HAS NEVER RUN: `_msgKind`
+/// returns the server's `kind` when the row carries one, every API row does,
+/// and the server said `human`. There was also no `_MSG_KIND.unstamped` entry,
+/// so even reaching it would have fallen back to the Human badge. A fix written
+/// into a path nothing executes (ethos rule 1), found while fixing AMUX-3737
+/// one line above it.
+pub(crate) const UNSTAMPED_TYPES: [&str; 1] = ["raw-tmux-fallback"];
+
+/// Canonical kind for a stored type.
+///
+/// THE UNKNOWN ARM IS THE POINT (AMUX-3737). Ethan: "youre confusing human vs
+/// session messages", over a screenshot of `[amux] You went idle holding
+/// RC-53...` wearing a blue `Human` badge. That row already carried
+/// `origin: board-drive` and `type: pickup`; the classifier read TYPE, did not
+/// recognise `pickup`, and fell through to `human`. Two fields in one row
+/// disagreeing about the same fact, with the view reading the wrong one.
+///
+/// Adding `"pickup" => "amux"` would fix those 355 rows and leave the shape
+/// intact, so the NEXT type someone adds becomes Human again in silence. An
+/// explicit `unknown` makes that self-announcing instead: a kind nobody expects
+/// showing up in the Messages view is the signal that a type was added without
+/// teaching this function.
+///
+/// Note what the FIX HAD TO CHANGE: `msg_kind("legacy-weirdness") == "human"`
+/// was an assertion pinning the fallback. A test can pin a bug precisely
+/// because a default is indistinguishable from a decision once it is written
+/// down.
+///
+/// `/api/usage/attribution` already had the safe shape — `human = trig ==
+/// "user"`, an allowlist — so its background/human split was never wrong, and
+/// the 49.7%-of-input-tokens-are-amux-initiated figure on AMUX-3759 stands.
+/// Two classifiers over the same distinction, one safe and one not.
 pub(crate) fn msg_kind(mtype: &str) -> &'static str {
-    match mtype.trim().to_lowercase().as_str() {
+    let t = mtype.trim().to_lowercase();
+    match t.as_str() {
         "session" => "session",
         "schedule" => "schedule",
-        "system" => "amux",
-        // direct / steering / user / "" / anything unknown.
-        _ => "human",
+        // Machine-authored. `pickup` is board-drive's auto-pickup prompt.
+        _ if AMUX_TYPES.contains(&t.as_str()) => "amux",
+        _ if UNSTAMPED_TYPES.contains(&t.as_str()) => "unstamped",
+        _ if HUMAN_TYPES.contains(&t.as_str()) => "human",
+        _ => "unknown",
     }
 }
 
@@ -356,15 +431,44 @@ async fn list_history(State(state): State<AppState>, Query(p): Query<ListParams>
             .filter(|k| MSG_KINDS.contains(&k.as_str()))
             .collect();
         if !want.is_empty() {
-            let mut ors: Vec<&str> = Vec::new();
+            let mut ors: Vec<String> = Vec::new();
+            // THE FILTER IS THE CLASSIFIER WRITTEN A SECOND TIME, so it is
+            // built from the SAME lists rather than restated (AMUX-3737). It
+            // used to say `type NOT IN ('session','schedule','system')` for
+            // `human` — the denylist, matching msg_kind's old fallback exactly,
+            // which is the problem: the two agreed, and both were wrong. A
+            // filter that reproduces a misclassification is worse than one that
+            // drifts from it, because the badge and the filter corroborate each
+            // other.
+            let inlist = |types: &[&str], params: &mut Vec<rusqlite::types::Value>| {
+                for t in types {
+                    params.push(rusqlite::types::Value::Text((*t).to_string()));
+                }
+                format!(
+                    "COALESCE(type,'') IN ({})",
+                    types.iter().map(|_| "?").collect::<Vec<_>>().join(",")
+                )
+            };
             for k in &want {
                 match k.as_str() {
-                    // `human` is NOT the other three, so unknown/legacy types
-                    // land there, matching msg_kind's fallback exactly.
-                    "human" => ors.push("type NOT IN ('session','schedule','system')"),
-                    "amux" => ors.push("type='system'"),
+                    "human" => ors.push(inlist(&HUMAN_TYPES, &mut params)),
+                    "amux" => ors.push(inlist(&AMUX_TYPES, &mut params)),
+                    "unstamped" => ors.push(inlist(&UNSTAMPED_TYPES, &mut params)),
+                    // Anything this build does not classify. Selecting it is how
+                    // you FIND the types nobody taught msg_kind about, which is
+                    // the whole reason `unknown` exists as a kind.
+                    "unknown" => {
+                        let known: Vec<&str> = HUMAN_TYPES
+                            .iter()
+                            .chain(AMUX_TYPES.iter())
+                            .chain(UNSTAMPED_TYPES.iter())
+                            .chain(["session", "schedule"].iter())
+                            .copied()
+                            .collect();
+                        ors.push(format!("NOT {}", inlist(&known, &mut params)));
+                    }
                     other => {
-                        ors.push("type=?");
+                        ors.push("type=?".to_string());
                         params.push(rusqlite::types::Value::Text(other.to_string()));
                     }
                 }
@@ -618,19 +722,144 @@ mod tests {
         }
     }
 
+    /// The two rows the pre-AMUX-3737 fixture could not express.
+    ///
+    /// `seed` above holds one row per type the classifier already knew, so
+    /// `kind=human` returned the same two rows under the old denylist and the
+    /// new allowlist and the filter test was green across the bug's whole life.
+    /// A fixture that cannot contain the defect cannot detect it.
+    async fn seed_unclassified(app: &axum::Router) {
+        for (text, htype, ts) in [
+            // The specimen: an auto-pickup nudge, which read `Human`.
+            ("[amux] you went idle holding RC-53", "pickup", 6000),
+            // A type this build has never heard of, standing in for the next
+            // one somebody adds.
+            ("from the future", "some-new-type", 7000),
+        ] {
+            let (st, _) = send(
+                app,
+                "POST",
+                "/api/history",
+                Some(json!({ "text": text, "type": htype, "session": "alpha", "ts": ts })),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+        }
+    }
+
+    /// The FILTER half of AMUX-3737, which is the classifier written a second
+    /// time in SQL and therefore the half that can silently disagree with it.
+    #[tokio::test]
+    async fn the_kind_filter_agrees_with_the_classifier_about_machine_messages() {
+        let (app, _dir) = app();
+        seed(&app).await;
+        seed_unclassified(&app).await;
+
+        let kinds = |v: &Value| -> Vec<String> {
+            v.as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["kind"].as_str().unwrap_or("").to_string())
+                .collect()
+        };
+
+        // The badge. `pickup` must not wear `Human`.
+        let (_, all) = send(&app, "GET", "/api/history", None).await;
+        let by_text: std::collections::HashMap<&str, &str> = all
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| (r["text"].as_str().unwrap(), r["kind"].as_str().unwrap()))
+            .collect();
+        assert_eq!(by_text["[amux] you went idle holding RC-53"], "amux");
+        assert_eq!(by_text["from the future"], "unknown");
+
+        // The filter must reach the same verdict. Selecting Human must not
+        // return either of them.
+        let (_, humans) = send(&app, "GET", "/api/history?kind=human", None).await;
+        let texts: Vec<&str> =
+            humans.as_array().unwrap().iter().map(|r| r["text"].as_str().unwrap()).collect();
+        assert_eq!(
+            texts,
+            vec!["queued steer", "hello from me"],
+            "an auto-pickup nudge and an unclassified row are not human traffic"
+        );
+        assert!(kinds(&humans).iter().all(|k| k == "human"));
+
+        // And selecting amux must FIND the pickup, or the row is simply lost.
+        let (_, amux) = send(&app, "GET", "/api/history?kind=amux", None).await;
+        let texts: Vec<&str> =
+            amux.as_array().unwrap().iter().map(|r| r["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, vec!["[amux] you went idle holding RC-53", "amux nudge"]);
+
+        // `unknown` is selectable, which is how you find the types nobody
+        // taught msg_kind about. A kind you cannot filter on is a kind nobody
+        // will ever go looking for.
+        let (_, unk) = send(&app, "GET", "/api/history?kind=unknown", None).await;
+        let texts: Vec<&str> =
+            unk.as_array().unwrap().iter().map(|r| r["text"].as_str().unwrap()).collect();
+        assert_eq!(texts, vec!["from the future"]);
+
+        // Every row lands in exactly one kind: the four buckets must partition
+        // the table, or a message is invisible under every filter.
+        let mut seen = 0usize;
+        for k in ["human", "session", "schedule", "amux", "unknown"] {
+            let (_, v) = send(&app, "GET", &format!("/api/history?kind={k}"), None).await;
+            seen += v.as_array().unwrap().len();
+        }
+        assert_eq!(seen, 7, "5 seeded + 2 unclassified, each counted once");
+    }
+
+    /// AMUX-3737. Ethan: "youre confusing human vs session messages", over a
+    /// screenshot of `[amux] You went idle holding RC-53...` wearing a blue
+    /// `Human` badge.
+    ///
+    /// THIS TEST USED TO ASSERT THE BUG. Its last line was
+    /// `assert_eq!(msg_kind("legacy-weirdness"), "human")`, with the comment
+    /// "unknown provenance reads as human — the reading that gets looked at",
+    /// and the module header recorded the same thing as a deliberate parity
+    /// decision. The reasoning is about VISIBILITY and it is sound; the
+    /// conclusion does not follow, because `human` is not the only visible
+    /// bucket. Writing a default down is what makes it indistinguishable from a
+    /// decision, and both the doc and the test then defended it.
+    ///
+    /// Measured on the live table before the change: 355 `pickup` rows from
+    /// `origin: board-drive` reading Human, 4.0% of 8,993 messages.
     #[test]
-    fn kind_derivation_matches_python() {
-        assert_eq!(msg_kind("direct"), "human");
-        assert_eq!(msg_kind("steering"), "human");
-        assert_eq!(msg_kind("user"), "human");
-        assert_eq!(msg_kind(""), "human");
-        assert_eq!(msg_kind("SESSION "), "session");
+    fn an_unrecognised_type_is_unknown_never_human() {
+        for t in ["direct", "steering", "user", ""] {
+            assert_eq!(msg_kind(t), "human", "{t:?} is typed by a person");
+        }
+        assert_eq!(msg_kind("SESSION "), "session", "trimmed and lowercased");
         assert_eq!(msg_kind("schedule"), "schedule");
-        assert_eq!(msg_kind("system"), "amux");
-        // Unknown provenance reads as human — the reading that gets looked at.
-        assert_eq!(msg_kind("legacy-weirdness"), "human");
+        for t in ["system", "pickup"] {
+            assert_eq!(msg_kind(t), "amux", "{t:?} is machine-authored");
+        }
+        // AMUX-2670's kind, made real. Not `human` (its delivery was never
+        // verified) and not `amux` (a person probably did type it).
+        assert_eq!(msg_kind("raw-tmux-fallback"), "unstamped");
+        // THE SPECIMEN: the type on MSG-33250, the row in Ethan's screenshot.
+        assert_eq!(msg_kind("pickup"), "amux", "an auto-pickup nudge is not a person");
+        // THE SHAPE, which is what actually matters. Fixing only `pickup` would
+        // pass every line above and leave the next new type reading Human in
+        // silence.
+        assert_eq!(
+            msg_kind("some-type-invented-next-year"),
+            "unknown",
+            "an unrecognised type must announce that it is unrecognised"
+        );
         assert!(msg_is_queued("steering"));
         assert!(!msg_is_queued("direct"));
+
+        // The two lists the SQL filter is built from must stay disjoint, or a
+        // type would match both `kind=human` and `kind=amux`.
+        for h in HUMAN_TYPES {
+            assert!(!AMUX_TYPES.contains(&h), "{h:?} cannot be both human and amux");
+            assert!(!UNSTAMPED_TYPES.contains(&h), "{h:?} cannot be both human and unstamped");
+        }
+        for a in AMUX_TYPES {
+            assert!(!UNSTAMPED_TYPES.contains(&a), "{a:?} cannot be both amux and unstamped");
+        }
     }
 
     #[test]

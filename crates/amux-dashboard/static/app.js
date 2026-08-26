@@ -7938,7 +7938,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.741';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.742';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -12721,13 +12721,18 @@ function _cmdHistRenderChips(items) {
   const bar = document.getElementById('cmd-history-filter');
   if (!bar) return;
   // Server totals when we have them; local tally only as a pre-fetch placeholder.
+  // SEEDED FROM _MSG_KIND_ORDER, never from a hand-written list. Both branches
+  // used to enumerate four kinds inline, so adding a fifth made
+  // `counts[_msgKind(e)]++` increment `undefined` and the chip render NaN —
+  // a new kind would have broken the bar it was added to (AMUX-3737).
+  const _zero = () => _MSG_KIND_ORDER.reduce((a, k) => (a[k] = 0, a), {});
   let counts;
   if (_cmdHistCounts) {
-    counts = { all: _cmdHistCounts.all || 0, human: _cmdHistCounts.human || 0, amux: _cmdHistCounts.amux || 0,
-               session: _cmdHistCounts.session || 0, schedule: _cmdHistCounts.schedule || 0 };
+    counts = Object.assign(_zero(), { all: _cmdHistCounts.all || 0 });
+    _MSG_KIND_ORDER.forEach(k => { counts[k] = _cmdHistCounts[k] || 0; });
   } else {
-    counts = { all: items.length, human: 0, session: 0, schedule: 0, amux: 0 };
-    items.forEach(e => { counts[_msgKind(e)]++; });
+    counts = Object.assign(_zero(), { all: items.length });
+    items.forEach(e => { const k = _msgKind(e); if (k in counts) counts[k]++; });
   }
   const chips = [['all','All']].concat(_MSG_KIND_ORDER.map(k => [k, _MSG_KIND[k].label]));
   bar.innerHTML = chips.map(([k, lbl]) => {
@@ -12799,7 +12804,13 @@ function _msgKind(e) {
   // verified (keystrokes reached a pane; a picker may have eaten them) and its
   // origin is the CLI's word, not a server-side stamp.
   if (t === 'raw-tmux-fallback') return 'unstamped';
-  return 'human';   // direct / steering / user / '' — all a person typing
+  if (t === 'pickup') return 'amux';   // board-drive's auto-pickup prompt
+  // ALLOWLIST, matching the server's msg_kind (AMUX-3737). This used to
+  // `return 'human'` for anything unrecognised, which is how `pickup` wore a
+  // Human badge in 355 rows. Falling through to `unknown` is just as visible
+  // and does not put a person's name on a machine's text.
+  if (t === 'direct' || t === 'steering' || t === 'user' || t === '') return 'human';
+  return 'unknown';
 }
 // Queued vs direct is a DELIVERY detail of a human message, not a fourth kind:
 // same person, same authority, one just waited for the session to free up.
@@ -12896,8 +12907,21 @@ const _MSG_KIND = {
   session:  { label: 'Session',   color: '#8957e5', bg: 'rgba(137,87,229,0.16)' },
   schedule: { label: 'Scheduled', color: '#3fb950', bg: 'rgba(63,185,80,0.15)' },
   amux:     { label: 'amux',      color: '#8b949e', bg: 'rgba(139,148,158,0.14)' },
+  // A send that reached the pane as raw keystrokes while the server was
+  // unreachable (AMUX-2670). `_msgKind` has returned 'unstamped' for it since
+  // that card, and this entry never existed — so it fell through to Human, the
+  // exact rendering that card exists to prevent. The branch also never ran,
+  // because the server's `kind` wins and the server said human. Both halves
+  // fixed together; either alone changes nothing on screen.
+  unstamped:{ label: 'Unstamped',    color: '#db6d28', bg: 'rgba(219,109,40,0.14)' },
+  // AMUX-3737: a kind THIS BUILD does not know. Amber because it is a prompt to
+  // go and classify the type, not a normal resting state. Without this entry
+  // the fallback below painted it blue and called it Human, which is the server
+  // bug reproduced client-side — so fixing only the server would have changed
+  // nothing on screen.
+  unknown:  { label: 'Unclassified', color: '#d29922', bg: 'rgba(210,153,34,0.14)' },
 };
-const _MSG_KIND_ORDER = ['human', 'session', 'schedule', 'amux'];
+const _MSG_KIND_ORDER = ['human', 'session', 'schedule', 'amux', 'unstamped', 'unknown'];
 // Back-compat shim: _msgOrigin was the old 4-way classifier. Anything still
 // calling it gets the canonical kind.
 function _msgOrigin(e) { return _msgKind(e); }
@@ -13041,7 +13065,12 @@ function _cmdHistItemHTML(e, ctx) {
   const _mq = (document.getElementById(ctx.searchId) || {}).value || '';
   const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
   const kind = _msgKind(e);
-  const km = _MSG_KIND[kind] || _MSG_KIND.human;
+  // FALL BACK TO `unknown`, NEVER TO `human` (AMUX-3737). A kind this build
+  // does not recognise is exactly the case where the honest answer is "I do not
+  // know who wrote this", and defaulting it to Human is how a machine nudge
+  // ends up wearing a person's badge — the same defect the server-side
+  // classifier had, one layer out.
+  const km = _MSG_KIND[kind] || _MSG_KIND.unknown;
   // Badge carries the specific origin: "Session · mvs-infra", "Scheduled · Nightly gate".
   // For a human message the origin is you, so instead we surface the delivery
   // path — "Human · queued" vs plain "Human".
