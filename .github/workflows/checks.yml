@@ -146,6 +146,16 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-frustrations-audit.sh
+      # The RETIREMENT tool (AF-243). frustrations-archive.py is the only sanctioned
+      # way an entry leaves the ledger, it DELETES from the source file, and it shipped
+      # with no coverage at all — then gained the whole `--superseded` disposition on
+      # 2026-08-26, still with none. The cells pin the survivors by name on both sides
+      # of the target, because "the entry reached the archive" and "the entry left the
+      # ledger" are both satisfied by a tool that also ate its neighbour.
+      - name: frustrations retirement removes exactly one entry (AF-243)
+        run: |
+          set -uo pipefail
+          ./scripts/test-frustrations-archive.sh
       # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
       # and they belong HERE rather than in rust.yml because rust.yml is
       # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to
