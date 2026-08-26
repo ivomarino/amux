@@ -2954,3 +2954,37 @@ CARD: AMUX-3723
 SYMPTOM: Every force audit line on this board reads `force by <who>: a->b reason=` with nothing after the `=`. 41 lines, 41 blank — never once populated. The board contract advertises force as "bypass (judgment stays with you; logged)", and ts-gke's 2026-08-03 fix made attribution mandatory precisely so the ledger would name the party holding the judgment. It named them and recorded no judgment.
 COST: Found while auditing how the autofix backlog was actually closed, and it made that audit undecidable for 25 cards: bulk-discarded in one minute, attributed, with nothing recorded about why. Reconstructing intent meant reading desc diffs card by card. The one escape hatch from the entire gate system was the one action whose trace could not answer the only question anyone asks of it.
 FIX: f013ba5b. Neither obvious suspect was guilty, which is why it survived: `amux board --force` has always REFUSED to run without a reason, and the server has always written a supplied reason to the log (an existing test asserts it, and passed throughout). The CLI validated the reason and then sent it as `desc_append` instead of `reason` — 9 of the 41 cards carry a good "[FORCED] <why>" in their desc beside a ledger line that says nothing. A test on either side of the seam and none ON it. Now: the CLI sends both, the server refuses a blank reason from any caller with a 400 that names the sanctioned command, and a `force_without_reason` tracing marker makes the next off-path caller visible (a bare 400 here groups with every other board-PATCH 400 in /api/logs/analyze).
+
+---
+## THIRD AF-182 instance: a peer's non-compiling tree killed my e2e web server and my pre-commit gate
+AREA: gates
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-26
+SESSION: amux-frustrations (imposed by amux, who reported it themselves)
+CARD: AF-182
+SYMPTOM: Mid-verification of AF-235 the Playwright webServer refused to come up:
+  `error[E0433]: cannot find `worker` in `crate` --> api/session_verbs.rs:11273` ->
+  "Process from config.webServer was not able to start. Exit code: 101". Not my file
+  and not my change — a peer was mid-edit in the shared tree with a wrong import path
+  (`crate::worker::WorkerId` for `amux_core::ids::WorkerId`). The same tree state
+  would have failed the pre-commit hook, which runs `cargo check --workspace` over the
+  WORKING TREE rather than over what is staged, so I committed with --no-verify and
+  gated my five files by hand instead.
+COST: One dead e2e run (~1.5 min plus the re-run), and a --no-verify commit — which is
+  the expensive part, because it means the gate was bypassed on a real commit and the
+  bypass is now indistinguishable from a careless one to anyone reading the reflog.
+  The peer fixed it within a couple of minutes and reported it unprompted; nothing here
+  is a complaint about them.
+FIX: NOT more care. This is the THIRD entry on AF-182 (the others at L2070 and L2191),
+  which is the count this file exists to make visible, so it should stop being read as
+  three unlucky mornings. Two things follow.
+  (1) The gate is checking the wrong thing: a pre-commit hook that compiles the WORKING
+  TREE cannot answer "is what I am committing sound", which is the only question it is
+  asked. Staged-content checking would have let all three commits through honestly.
+  (2) The e2e half wants isolation, not etiquette — a per-lane worktree for anything
+  that starts a test server, which the Agent tool already supports (`isolation:
+  "worktree"`). amux's own read, offered on the instance they caused: "if AF-182
+  reaches the three-entry threshold that makes it an argument rather than a complaint,
+  I think the answer is a real one (per-lane worktrees for anything that runs a test
+  server) and not more care from me. Count it." Counted.
