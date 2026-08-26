@@ -2207,6 +2207,28 @@ fn mute_warn_days() -> f64 {
     env_f64("AMUX_AUTOFIX_MUTE_WARN_DAYS", 2.0).max(0.25)
 }
 
+/// When a suppressing card stops suppressing (AMUX-3774).
+///
+/// The mute has to END, or "one card per fault" quietly becomes "one card per
+/// fault, forever, whoever parks it first". Only OPEN cards suppress — that is
+/// deliberate, so a judged-and-discarded card lets the next occurrence through
+/// — but `backlog` is open AND parked, which is neither judged nor worked.
+///
+/// SEVEN DAYS, and the number is a judgement rather than a measurement, so it
+/// is stated as one: it is long enough that deliberately parking a card still
+/// buys real quiet (the whole point of parking), and short enough that a fault
+/// class cannot go dark for a fortnight without anyone choosing that. The live
+/// specimen reached 2 days before it was found by accident.
+///
+/// This does NOT bump the card's `updated`. That was the tempting version and it
+/// is worse: it would make a parked card look actively worked, defeat every
+/// staleness sweep that reads `updated`, and trade one dishonest signal for
+/// another. Expiring the suppression says the true thing instead — nobody has
+/// touched this, so the fault is loud again.
+fn mute_expire_days() -> f64 {
+    env_f64("AMUX_AUTOFIX_MUTE_EXPIRE_DAYS", 7.0).max(mute_warn_days())
+}
+
 fn outlier_rollup_at() -> usize {
     std::env::var("AMUX_OUTLIER_ROLLUP_AT")
         .ok()
@@ -4442,6 +4464,43 @@ pub async fn autofix_tick_with_ci(
                 // against a card nobody has touched for days is the whole class
                 // going dark, and it should not need someone to open the debug
                 // surface to find out.
+                // THE MUTE EXPIRES (AMUX-3774, criterion 2: "a deliberately
+                // parked card still suppresses for a bounded, stated period").
+                // Past the bound this stops suppressing and the fault files
+                // again, because the alternative is that whoever parks a card
+                // first owns silence on its whole class indefinitely.
+                //
+                // Deliberately NOT a bump of the card's `updated`, which was the
+                // tempting fix: it would make a parked card look actively worked
+                // and defeat every staleness sweep reading that field. Letting
+                // the fault through says the true thing — nobody has touched
+                // this, so it is loud again.
+                if stale_d.unwrap_or(0.0) >= mute_expire_days() {
+                    tracing::warn!(
+                        card = %card,
+                        detector = f.kind.slug(),
+                        signature = %f.signature,
+                        stale_days = stale_d.unwrap_or(0.0),
+                        expire_days = mute_expire_days(),
+                        "autofix_mute_expired: this fault has been suppressed against an \
+                         untouched card past the bound, so it is being FILED again. The new \
+                         card is not a duplicate — it is evidence the fault recurred while \
+                         the old one sat parked (AMUX-3774)."
+                    );
+                    rep.suppressed.push((
+                        f.kind.slug().into(),
+                        format!("{}|mute-expired", f.signature),
+                        format!(
+                            "{card} held this fault for {:.1} day(s) without being touched, \
+                             past AMUX_AUTOFIX_MUTE_EXPIRE_DAYS ({:.1}). NOT suppressed: \
+                             re-filing, because a parked card must not mute its class forever.",
+                            stale_d.unwrap_or(0.0),
+                            mute_expire_days()
+                        ),
+                    ));
+                    // Fall through to file. The decision is recorded above so
+                    // "why did this re-file" is answerable without a bisect.
+                } else {
                 if stale_d.unwrap_or(0.0) >= mute_warn_days() {
                     tracing::warn!(
                         card = %card,
@@ -4460,10 +4519,13 @@ pub async fn autofix_tick_with_ci(
                     format!(
                         "{card} is open for this same fault — one card per fault, not one \
                          per scan (AMUX-3667).{age} NOTE: suppressing does NOT bump that \
-                         card, so its age is the only signal that this recurred."
+                         card, so its age is the only signal that this recurred. It stops \
+                         suppressing at {:.1} day(s).",
+                        mute_expire_days()
                     ),
                 ));
                 continue;
+                }
             }
         }
         to_file.push(f);
@@ -6350,7 +6412,9 @@ mod tests {
             let r2 = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
             r2.suppressed
                 .iter()
-                .find(|(_, _, why)| why.contains("open for this same fault"))
+                .find(|(_, _, why)| {
+                    why.contains("open for this same fault") || why.contains("NOT suppressed")
+                })
                 .map(|(_, _, why)| why.clone())
                 .unwrap_or_else(|| panic!("the second scan must suppress: {r2:?}"))
         }
@@ -6371,11 +6435,33 @@ mod tests {
              either way rather than only when alarming: {fresh}"
         );
 
-        let stale = reason_after_aging(9.0).await;
+        // 3 days: past the WARN threshold (2), inside the EXPIRY bound (7), so
+        // it still suppresses and must say how stale it is.
+        let stale = reason_after_aging(3.0).await;
         assert!(
-            stale.contains("9.0 day(s)"),
+            stale.contains("3.0 day(s)"),
             "a stale card must report HOW stale — that number is the only signal a reader \
              gets that the fault recurred while nobody was looking: {stale}"
+        );
+        assert!(
+            stale.contains("stops suppressing at"),
+            "and it must state the bound, or a reader cannot tell a park from a permanent \
+             mute: {stale}"
+        );
+
+        // PAST THE BOUND: the mute EXPIRES and the fault files again. Without
+        // this cell the bound could be any number, including infinity, and every
+        // assertion above would still pass (AMUX-3774 criterion 2).
+        let expired = reason_after_aging(30.0).await;
+        assert!(
+            expired.contains("NOT suppressed"),
+            "past AMUX_AUTOFIX_MUTE_EXPIRE_DAYS a parked card must stop muting its class: \
+             {expired}"
+        );
+        assert!(
+            expired.contains("re-filing"),
+            "and the decision must say what it did, so 'why did this re-file' needs no \
+             bisect: {expired}"
         );
     }
 
