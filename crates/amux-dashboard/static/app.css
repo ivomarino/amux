@@ -1727,6 +1727,18 @@
     border-radius: 10px; min-width: 260px; z-index: 60;
     box-shadow: 0 8px 24px rgba(0,0,0,0.4); overflow-x: hidden; overflow-y: auto;
     max-height: calc(100dvh - 80px);
+    /* CAP THE WIDTH OR THE MENU GROWS OFF THE LEFT EDGE (Ethan, 2026-08-26,
+       "fix this on mobile"). Measured at 375px: the menu was 490px wide at
+       left:-146, so 146px of it — every row LABEL — was off-screen, while the
+       right-hand values stayed visible. That is why the screenshot reads as
+       text cut at the START rather than ellipsised at the end.
+       `min-width: 260px` with no max lets content size the box, and `right: 0`
+       anchors it to the gear, so all the growth goes leftward off-screen.
+       `overflow-x: hidden` was already here and cannot help: it clips the
+       PAINT, it does not stop the box sizing to its content.
+       40px keeps ~9px of gutter at any phone width, because the wrapper's own
+       offset from the viewport edge (gear + padding) is near-constant. */
+    max-width: calc(100vw - 40px);
     padding: 10px 0;
   }
   .settings-menu.open { display: block; }

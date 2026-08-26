@@ -7913,7 +7913,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.739';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.740';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -28662,8 +28662,16 @@ async function loadUsage() {
       const col = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
       return '<div style="margin-bottom:9px;">'
         + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px;">'
-        +   '<span style="font-size:0.8rem;color:var(--fg);">' + esc(label(l)) + '</span>'
-        +   '<span style="font-size:0.74rem;color:var(--dim);">' + rem + '% left · ' + esc(resetTxt(l.resets_at)) + '</span>'
+        // THE LABEL SHRINKS, THE NUMBER DOES NOT. Capping the menu width alone
+        // would clip these rows one layer in: both spans were nowrap by default
+        // in a space-between flex, so the row's intrinsic width was 445px on a
+        // 375px screen and something had to be cut. The reading order decides
+        // WHICH: "78% left · resets in <1h" is the answer, "5-hour session" is
+        // the question and is recoverable from position. So the label gets
+        // min-width:0 + ellipsis (a flex item will not shrink below its content
+        // without min-width:0) and the value gets flex-shrink:0.
+        +   '<span style="font-size:0.8rem;color:var(--fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(label(l)) + '</span>'
+        +   '<span style="font-size:0.74rem;color:var(--dim);flex-shrink:0;white-space:nowrap;">' + rem + '% left · ' + esc(resetTxt(l.resets_at)) + '</span>'
         + '</div>'
         + '<div style="height:6px;border-radius:4px;background:var(--border);overflow:hidden;">'
         +   '<div style="height:100%;width:' + used + '%;background:' + col + ';"></div>'
