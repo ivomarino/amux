@@ -2838,3 +2838,32 @@ FIX: 972b44a4. Hoisted the note to `build()` over the full dirty set so it
   The general shape worth remembering: a citation is only as good as the reader's
   checkout, and the dangerous half of an instruction must never be the half that
   travels while the safety half is behind a link.
+
+## Browser state can see overlay content but cannot click it, so overlay features cannot reach `verified`
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3721
+SYMPTOM: Verifying the .mdai viewer's bottom tabs (AMUX-3322) in the real UI.
+  `GET /api/browser/state` returned 120 elements plus a `text` blob. The blob
+  CONTAINS "Diagram" and "List", so the tabs are provably in the rendered DOM.
+  The elements array does not contain them, so there is no index to POST to
+  `/api/browser/action` and no way to click them. Three misses in one sitting,
+  all inside the file overlay: the `.mdai-row` div that opens a node (a div with
+  an onclick, not a button), the overlay's X, and the `.mdai-btab` buttons.
+  Compounding it, the overlay has its own scroll container, so a scroll action
+  and an End keypress both moved the page behind it while the overlay stayed put.
+  Neither clicking nor scrolling reaches overlay content.
+COST: ~20 minutes establishing that the instrument rather than the feature was
+  the blocker, and AMUX-3322 closed at `done` on DOM-text evidence instead of
+  `verified` on a click-through. The broader cost is structural: this repo's own
+  standard is that `verified` requires exercising the real UI, so every
+  overlay-hosted surface (file viewer, MDAI viewer, peek) has an honest ceiling
+  of `done` until this is fixed. That is a gate nobody can satisfy truthfully
+  (ethos rule 3), and it fails silently — the state call returns 200 with plenty
+  of elements, so it reads as working right up until you look for a specific one.
+FIX: include elements carrying an onclick handler, not only semantically
+  interactive tags; and let `/api/browser/action` take a CSS selector, which
+  sidesteps the index problem and the scroll-container problem at once.
