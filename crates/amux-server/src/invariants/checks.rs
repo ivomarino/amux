@@ -2060,6 +2060,11 @@ pub struct LedgerRow {
     pub session: String,
     pub title: String,
     pub card_status: Option<String>,
+    /// Whether the card is ARCHIVED (AF-246). Carried separately from
+    /// `card_status` because an archived card still HAS a status, so the two
+    /// are independent axes and folding them loses the alarming one: `done` is
+    /// reachable, archived is not.
+    pub card_archived: bool,
 }
 
 /// `frustrations.md` is a fixed-field file precisely so it can be counted; this
@@ -2185,9 +2190,41 @@ pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) ->
     let closed = |s: &str| CLOSED_CARD_STATUSES.contains(&s);
     let mut stale_open: Vec<&LedgerRow> = Vec::new();
     let mut premature_fixed: Vec<&LedgerRow> = Vec::new();
+    let mut archived_open: Vec<&LedgerRow> = Vec::new();
     for r in rows {
         let Some(cs) = r.card_status.as_deref() else { continue };
-        if r.file_status == "open" && closed(cs) {
+        // ARCHIVED IS ITS OWN STATE, AND IT IS CHECKED FIRST (AF-246, found on
+        // the 2026-08-26 drain when AC-354 was validated as STILL LIVE and
+        // `amux board status AC-354 todo` answered
+        // `{"error":"task is archived; restore it first"}`).
+        //
+        // This check compared STATUS only, and status is the wrong axis. An
+        // archived card is invisible to auto-pickup, rot detection and the
+        // verify queue simultaneously — every one of them additionally requires
+        // `COALESCE(archived,0)=0` — while still carrying a status this check
+        // happily compares. Two ways that went wrong, and the second is why
+        // this is a precedence change rather than a new bucket:
+        //
+        //   archived + `done`  -> landed in `stale_open`, indistinguishable
+        //                         from an ordinary done-over-open row, so the
+        //                         prescribed remedy ("route it to its session
+        //                         to reopen") hits a refusal this check never
+        //                         predicted.
+        //   archived + `todo`  -> landed NOWHERE. The pair read as AGREEING and
+        //                         the entry looked healthy while nothing could
+        //                         ever pick the card up. A view that is silent
+        //                         about unreachable work is worse than no view,
+        //                         because it is trusted and it is read first.
+        //
+        // THE PREDICATE IS COPIED FROM THE MECHANISM, not re-derived, which is
+        // rule 1's own caution about this exact trap: `archived` here is the
+        // same `COALESCE(archived,0)=0` that board_drive.rs's pickup queries
+        // apply. `owner_type='agent'` is deliberately NOT included — that is
+        // auto-pickup's additional narrowing, and a human-owned card is still
+        // reachable by a human. Unreachable means unreachable BY ANYONE.
+        if r.file_status == "open" && r.card_archived {
+            archived_open.push(r);
+        } else if r.file_status == "open" && closed(cs) {
             stale_open.push(r);
         } else if r.file_status != "open" && !r.file_status.is_empty() && !closed(cs) {
             premature_fixed.push(r);
@@ -2201,7 +2238,7 @@ pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) ->
             })
             .collect::<Vec<_>>()
     };
-    if stale_open.is_empty() && premature_fixed.is_empty() {
+    if stale_open.is_empty() && premature_fixed.is_empty() && archived_open.is_empty() {
         return vec![InvariantResult::pass(ID)
             .evidence(json!({"entries": rows.len(), "source": source}))];
     }
@@ -2221,20 +2258,51 @@ pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) ->
              hit the friction, and a card reading `done` is not proof the friction is gone \
              (AC-227's card was `done` and only its documentation half had shipped). Route each \
              row to its SESSION for sign-off. Ledger read from: {}.",
-            stale_open.len() + premature_fixed.len(),
+            stale_open.len() + premature_fixed.len() + archived_open.len(),
             stale_open.len(),
             ex(&stale_open),
             premature_fixed.len(),
             ex(&premature_fixed),
             source,
-        ),
+        ) + &archived_sentence(&archived_open, &ex),
     )
     .evidence(json!({
         "entries": rows.len(),
         "source": source,
         "stale_open": ev(&stale_open),
         "premature_fixed": ev(&premature_fixed),
+        "archived_open": ev(&archived_open),
+        "archived_open_note": "the card is ARCHIVED, so it is invisible to auto-pickup, rot \
+                               detection and the verify queue at once. `amux board status <id> \
+                               todo` REFUSES with archived_task_immutable — restore it first.",
     }))]
+}
+
+/// The archived clause, appended only when there is one (AF-246).
+///
+/// Separate from the sentence above rather than interpolated into it, because a
+/// zero-count clause reading "0 sit behind an ARCHIVED card ()" is noise on
+/// every ordinary failure, and this check already fails routinely for the two
+/// status classes. It says the REMEDY differs, since that is the part the
+/// prescribed one gets wrong: routing an archived card to its session produces
+/// a refusal, not a reopen.
+fn archived_sentence(
+    archived_open: &[&LedgerRow],
+    ex: &impl Fn(&[&LedgerRow]) -> String,
+) -> String {
+    if archived_open.is_empty() {
+        return String::new();
+    }
+    format!(
+        " SEPARATELY, {} open entry/entries sit behind an ARCHIVED card ({}) — a different and \
+         worse fact than a closed one. Archived hides a card from auto-pickup, rot detection AND \
+         the verify queue at the same time, so the friction is live and no loop can reach it. \
+         Do NOT route these to a session to reopen: `amux board status <id> todo` answers \
+         `archived_task_immutable`. RESTORE the card first, then decide its status with its \
+         author.",
+        archived_open.len(),
+        ex(archived_open),
+    )
 }
 
 /// The `AF-191` in `AF-191-1` is not a card id; the prefix is everything before
@@ -2386,7 +2454,18 @@ mod negative_controls {
             session: "amux-cloud".into(),
             title: "t".into(),
             card_status: card_status.map(str::to_string),
+            card_archived: false,
         }
+    }
+
+    /// Same row, ARCHIVED (AF-246).
+    fn lrow_archived(
+        line: usize,
+        card: &str,
+        file_status: &str,
+        card_status: Option<&str>,
+    ) -> LedgerRow {
+        LedgerRow { card_archived: true, ..lrow(line, card, file_status, card_status) }
     }
 
     /// AF-191 rebuilt from the sweep's own artifact: an entry reading
@@ -2435,6 +2514,89 @@ mod negative_controls {
             Status::Pass,
             "an absent card is cards_are_reachable's finding, not a status disagreement"
         );
+    }
+
+    /// AF-246: an ARCHIVED card behind a live entry is its own state.
+    ///
+    /// Rebuilt from the incident's own artifact rather than a convenient case.
+    /// AC-354 was validated as STILL LIVE on the 2026-08-26 drain and
+    /// `amux board status AC-354 todo` answered `archived_task_immutable`.
+    ///
+    /// THE `todo` CELL IS THE LOAD-BEARING ONE and it is why this had to change
+    /// the existing check rather than sit beside it: an archived card whose
+    /// status reads `todo` matches NEITHER status class, so before this the
+    /// pair read as AGREEING — a green row over work no loop can reach. A
+    /// sibling invariant would have left that green exactly where a reader
+    /// looks first.
+    #[test]
+    fn an_archived_card_behind_a_live_entry_is_reported_as_its_own_state() {
+        // THE NASTY CELL: archived + `todo`. Agrees on status, unreachable in
+        // fact. This is the one that was silently green.
+        let todo_archived = vec![lrow_archived(100, "AC-354", "open", Some("todo"))];
+        let r = frustration_ledger_agrees_with_board(&todo_archived, "worktree");
+        assert_eq!(
+            r[0].status,
+            Status::Fail,
+            "archived+todo agrees on STATUS and is unreachable in fact; it must not read green"
+        );
+        assert!(
+            r[0].observed.contains("ARCHIVED"),
+            "the message must name the state, not fold it into a status disagreement: {}",
+            r[0].observed
+        );
+        assert!(
+            r[0].observed.contains("archived_task_immutable"),
+            "it must say the prescribed remedy REFUSES, or a reader routes it to a session and \
+             gets an error the check never predicted: {}",
+            r[0].observed
+        );
+        assert_eq!(r[0].evidence["archived_open"].as_array().map(Vec::len), Some(1));
+
+        // Archived + a CLOSED status used to land in `stale_open`, where it is
+        // indistinguishable from an ordinary done-over-open row. Archived wins.
+        let done_archived = vec![lrow_archived(101, "AC-355", "open", Some("done"))];
+        let r2 = frustration_ledger_agrees_with_board(&done_archived, "worktree");
+        assert_eq!(r2[0].status, Status::Fail);
+        assert_eq!(
+            r2[0].evidence["stale_open"].as_array().map(Vec::len),
+            Some(0),
+            "an archived card must NOT be filed as an ordinary stale_open row — the remedies differ"
+        );
+        assert_eq!(r2[0].evidence["archived_open"].as_array().map(Vec::len), Some(1));
+
+        // NEGATIVE CONTROL 1 — an archived card behind a CLOSED entry is fine.
+        // The work is done and the card is put away; flagging it would make this
+        // fire on every properly-retired entry, which is the "threshold below
+        // the baseline" failure (a check that fires constantly stops being read).
+        let done_over_archived = vec![lrow_archived(102, "AC-356", "fixed", Some("done"))];
+        assert_eq!(
+            frustration_ledger_agrees_with_board(&done_over_archived, "worktree")[0].status,
+            Status::Pass,
+            "retiring an entry and archiving its card is the NORMAL end state"
+        );
+
+        // NEGATIVE CONTROL 2 — the same rows UNARCHIVED must behave exactly as
+        // before, or this fix has quietly widened the check. Without this cell,
+        // a build that flagged every open entry would pass everything above.
+        let live_todo = vec![lrow(100, "AC-354", "open", Some("todo"))];
+        assert_eq!(
+            frustration_ledger_agrees_with_board(&live_todo, "worktree")[0].status,
+            Status::Pass,
+            "open entry over a live todo card is agreement; archived is what changed"
+        );
+        let live_done = vec![lrow(101, "AC-355", "open", Some("done"))];
+        let r3 = frustration_ledger_agrees_with_board(&live_done, "worktree");
+        assert_eq!(r3[0].status, Status::Fail);
+        assert_eq!(
+            r3[0].evidence["stale_open"].as_array().map(Vec::len),
+            Some(1),
+            "a LIVE done card behind an open entry is still an ordinary stale_open row"
+        );
+
+        // The archived clause must be ABSENT when there is nothing archived, or
+        // every ordinary failure carries a "0 sit behind an ARCHIVED card ()"
+        // clause and the signal is diluted on the rows that fire most often.
+        assert!(!r3[0].observed.contains("ARCHIVED"), "{}", r3[0].observed);
     }
 
     /// AF-191, in the shape amux's hand classification produced: an id whose

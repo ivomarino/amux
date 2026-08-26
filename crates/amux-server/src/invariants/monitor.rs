@@ -987,13 +987,26 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
             // still carries its status, and filtering it out here would report a
             // live link as broken — the archived-filter trap ethos rule 1 logs
             // five instances of.
-            let st: Option<String> = conn
+            // `archived` comes back ALONGSIDE status, never as a filter
+            // (AF-246). The comment above is still right that filtering it out
+            // would report a live link as broken; the defect was that the flag
+            // was not SELECTED at all, so `LedgerRow` could not express
+            // "reachable" and the check compared the one axis it had. An
+            // instrument that cannot state the discriminator is the bug
+            // (ethos rule 4), and here it made an archived card behind a live
+            // entry read as agreeing.
+            let row: Option<(String, i64)> = conn
                 .query_row(
-                    "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                    "SELECT status, COALESCE(archived,0) FROM issues \
+                     WHERE id=?1 AND deleted IS NULL",
                     [&card],
-                    |r| r.get::<_, String>(0),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
                 )
                 .ok();
+            let (st, archived) = match row {
+                Some((s, a)) => (Some(s), a != 0),
+                None => (None, false),
+            };
             rows.push(checks::LedgerRow {
                 line,
                 card,
@@ -1001,6 +1014,7 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
                 session: session.clone(),
                 title: title.clone(),
                 card_status: st,
+                card_archived: archived,
             });
         }
     }
@@ -1567,6 +1581,124 @@ mod tests {
     /// returns one result per probed lane, on one without it returns a single
     /// `Unknown`. What it may never do is return NOTHING, which is what a
     /// silently-dropped binding looks like.
+    /// AF-246: the LOADER must actually read `archived`, not merely have a
+    /// field for it.
+    ///
+    /// This test exists because a mutation proved the check-level tests cannot
+    /// catch its absence. `checks::negative_controls::an_archived_card_behind_
+    /// a_live_entry_is_reported_as_its_own_state` builds `LedgerRow`s directly,
+    /// so gutting this loader to `(Some(s), false)` leaves it green — a real
+    /// property, correctly asserted, one layer above where the defect would be
+    /// introduced (AF-161's shape, found in my own work this time).
+    ///
+    /// So this one runs the SHIPPED path: a real store, a real archived issue,
+    /// a real frustrations.md in a temp home, through `frustration_ledger_check`.
+    #[test]
+    fn the_ledger_loader_reads_archived_from_the_store() {
+        let home = tempfile::tempdir().unwrap();
+        // The ledger is read from `repo_dir()`, NOT from AMUX_HOME. The first
+        // draft of this test wrote the fixture into the temp home and asserted
+        // on the result — it read the REAL repo's frustrations.md the whole
+        // time, whose cards are absent from this temp store, so every row was
+        // skipped and the check passed for a reason that had nothing to do with
+        // the property. It only surfaced because the assertion was written to
+        // fail loudly rather than to confirm.
+        //
+        // AMUX_REPO_DIR is written into the fixture's server.env as well as the
+        // process env, deliberately: HomeGuard restores exactly the fixture's
+        // OWN server.env keys on drop (AMUX-3719), and Drop runs during unwind,
+        // so a panic here cannot leak a temp repo dir into every later test.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(
+            repo.path().join("frustrations.md"),
+            // The header's own template is indented on purpose; entries start at
+            // a column-0 `## ` after the `---`, which is what the parser keys on.
+            "# amux frustrations\n\n---\n\n\
+             ## an entry whose card is put away\n\
+             AREA: cli\nSEVERITY: slows\nSTATUS: open\nDATE: 2026-08-26\n\
+             SESSION: amux\nCARD: ZZ-1\nSYMPTOM: x\nCOST: minutes\nFIX: y\n",
+        )
+        .unwrap();
+        let _h = crate::api::settings::test_env::set_home(home.path());
+        crate::api::settings::set_server_env_key(
+            home.path(),
+            "AMUX_REPO_DIR",
+            &repo.path().to_string_lossy(),
+        )
+        .unwrap();
+        std::env::set_var("AMUX_REPO_DIR", repo.path());
+        // Set-up assertion: if the override did not take, every assertion below
+        // is about the real repo's ledger and means nothing.
+        assert_eq!(
+            crate::api::self_update::repo_dir().as_deref(),
+            Some(repo.path()),
+            "AMUX_REPO_DIR override did not take; the test would read the real ledger"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, archived, created, updated) \
+                     VALUES ('ZZ-1', 't', 'todo', 1, 0, 0)",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed an ARCHIVED card");
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+
+        let rs = frustration_ledger_check(&state);
+        let agree = rs
+            .iter()
+            .find(|r| r.invariant_id == "frustrations.ledger_agrees_with_board")
+            .expect("the agreement check must reach a verdict");
+
+        // `todo` over an open entry AGREES on status. The only thing that can
+        // make this fail is the archived flag having survived the query.
+        assert_eq!(
+            agree.status,
+            crate::invariants::Status::Fail,
+            "an archived card behind a live entry must fail; observed: {}",
+            agree.observed
+        );
+        assert_eq!(
+            agree.evidence["archived_open"].as_array().map(Vec::len),
+            Some(1),
+            "the loader dropped `archived` on the floor: {}",
+            agree.evidence
+        );
+
+        // CONTROL, in the same test: unarchive the same card and the same
+        // fixture must PASS. Without it, a build that failed every open entry
+        // would satisfy the assertions above.
+        state
+            .store
+            .write(|conn| {
+                conn.execute("UPDATE issues SET archived=0 WHERE id='ZZ-1'", [])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("unarchive");
+        let rs2 = frustration_ledger_check(&state);
+        let agree2 = rs2
+            .iter()
+            .find(|r| r.invariant_id == "frustrations.ledger_agrees_with_board")
+            .expect("verdict");
+        assert_eq!(
+            agree2.status,
+            crate::invariants::Status::Pass,
+            "the SAME entry over a LIVE todo card is agreement: {}",
+            agree2.observed
+        );
+    }
+
     #[test]
     fn the_status_pane_check_is_actually_wired_into_the_monitor() {
         let dir = tempfile::tempdir().unwrap();
