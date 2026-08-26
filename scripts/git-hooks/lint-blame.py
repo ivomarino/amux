@@ -92,5 +92,24 @@ def main():
     print("\n  The commit is refused either way: a red workspace is red for every lane, "
           "and CI denies warnings on the next push of main.")
 
+    # NAME THE NARROW ESCAPE, but only when the failure is provably not yours
+    # (AF-182, third instance 2026-08-26). Refusing without an exit is what sent
+    # three commits through `--no-verify`, which ALSO drops the security scan,
+    # the staged-guard, the append-only guard and the JS checks. The gate that
+    # was doing real work is the one that gets disabled, because it is bundled
+    # with the one that was wrong.
+    #
+    # This still does not change the verdict — the hook exits 1 regardless, and
+    # a human or agent has to make the call. It replaces a dead end with a
+    # precise alternative to the nuclear one. Deliberately silent when `mine` is
+    # non-empty: printing an escape beside your OWN denial would be handing you
+    # a false green.
+    if not mine and (theirs or onhead):
+        print("\n  If you are certain none of the offenders are yours, skip THIS gate only:")
+        print("      AMUX_SKIP_RUST_GATE=1 git commit ...")
+        print("  Every other gate still runs, and the skip prints itself in the commit output.")
+        print("  Prefer that to --no-verify, which disables the security scan and the "
+              "staged-guard as well.")
+
 
 main()

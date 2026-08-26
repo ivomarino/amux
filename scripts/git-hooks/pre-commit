@@ -201,7 +201,33 @@ if [ -n "$STAGED_RS" ]; then
   fi
 fi
 
-if echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
+# AMUX_SKIP_RUST_GATE=1 — the NARROW escape, so nobody has to reach for the
+# wide one (AF-182, third instance 2026-08-26).
+#
+# The Rust gate compiles the WORKING TREE, which on this shared checkout is not
+# the question anyone is asking. It cannot distinguish "what you are committing
+# is broken" from "a peer is mid-edit two files away", and `lint-blame.py`
+# exists precisely because that partition is invisible from clippy's output.
+#
+# But attribution alone does not unblock you: the hook refuses either way, and
+# until now the ONLY way past it was `--no-verify` — which also drops the
+# security scan, the staged-guard, the append-only guard and the JS checks.
+# Three AF-182 instances ended that way, most recently a peer whose own files
+# were clean and whose commit was refused by MY half-finished edit. A gate whose
+# refusal is routinely answered by disabling every gate is worse than a gate
+# that refuses precisely (ethos rule 6: a constraint whose sanctioned escape is
+# unwalkable gets walked from an unaudited one).
+#
+# So this skips exactly ONE gate and keeps the rest. It is deliberately not
+# something the blame analysis can set for you: the aid still cannot change a
+# verdict, a human or agent decides, and the skip announces itself in the commit
+# output so it is visible in the transcript rather than silent.
+if [ "${AMUX_SKIP_RUST_GATE:-}" = "1" ] && echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
+  echo "amux: RUST GATE SKIPPED (AMUX_SKIP_RUST_GATE=1) — cargo clippy/check did NOT run." >&2
+  echo "      Every other gate still ran. Use this only when lint-blame attributed the" >&2
+  echo "      failure to another session's in-flight work; if your own staged files are" >&2
+  echo "      in the offender list, this is a false green you are giving yourself." >&2
+elif echo "$STAGED" | grep -qE '^(crates/.*\.rs|Cargo\.(toml|lock))$'; then
   echo "Checking Rust (cargo check --workspace --all-targets)..."
   # --all-targets IS THE POINT, not a flourish (AMUX-2807).
   #
