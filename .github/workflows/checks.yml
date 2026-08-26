@@ -217,6 +217,13 @@ jobs:
           # foreign, unpushed work straight past. Both directions are pinned,
           # and both mutations were confirmed to fail before this was wired in.
           ./scripts/test-push-guard-range.sh
+          # AF-234: the append-only guard must not accuse a FORK contributor of
+          # deleting work they never touched. Cells B and C are the ones that
+          # matter — a "fix" that silenced the guard on forks, or reached for a
+          # merge-base, would pass the reported case perfectly and stop catching
+          # the stale-graft republish the guard exists for. Verified against the
+          # pre-fix guard: A and D fail, B and C stay green.
+          ./scripts/test-push-guard-fork-base.sh
           # AEAB-52: the e2e harness must SET the seam it depends on. The Rust
           # half is unit-tested; this pins the half that rots silently — a seam
           # nobody sets is decoration (ethos rule 1), and an export placed after

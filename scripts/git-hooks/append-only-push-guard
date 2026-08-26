@@ -259,6 +259,21 @@ if edited:
       echo "  old tree being published (MG-1483). The tell is that NO author claims them and"
       echo "  they exist nowhere else. This is the case the checkout fixes."
       echo ""
+      echo "  STALE BASE (you are on a FORK) — a third state, and neither remedy above is"
+      echo "  yours (AF-234, @tsukimiya on PR #157). If you pushed to a fork whose 'origin'"
+      echo "  lags upstream, this guard may be comparing your branch against that stale"
+      echo "  MIRROR. Entries get ARCHIVED out of $f upstream, so a mirror that predates the"
+      echo "  archiving still holds lines that legitimately moved, and your branch reads as"
+      echo "  deleting them. Check it in one command:"
+      echo "      git diff upstream/main -- $f        # empty => you never touched it"
+      echo "  If that is empty, you have deleted nothing, the override below would log a"
+      echo "  rewrite claim for a push that rewrote nothing, and the checkout would pull in"
+      echo "  a STALE copy. Fetch upstream so the guard can see it:"
+      echo "      git remote add upstream https://github.com/mixpeek/amux.git   # if missing"
+      echo "      git fetch upstream main"
+      echo "  With an 'upstream' remote fetched and your branch descending from its main,"
+      echo "  the guard compares against upstream and this refusal does not fire."
+      echo ""
       echo "Do NOT use commit ancestry to decide: a commit-tree graft parented on the"
       echo "current remote tip carries a stale tree, so 'origin/main is an ancestor' is TRUE"
       echo "during MG-1483 itself. Attribution discriminates; history shape does not."
@@ -391,6 +406,38 @@ main() {
       # New branch: nothing on the remote ref yet — compare against the
       # remote's main so a graft onto a fresh branch can't dodge the guard.
       base=$(git rev-parse --verify --quiet "refs/remotes/$remote/main" 2>/dev/null) || continue
+      # ...UNLESS THE PUSH REMOTE IS A FORK, in which case its main is not the
+      # authoritative history and comparing against it accuses the contributor
+      # of deleting work they never touched (AF-234, reported by @tsukimiya on
+      # PR #157).
+      #
+      # On a fork, `origin` is a MIRROR that lags upstream — 251 commits, in
+      # their case. Entries are ARCHIVED out of frustrations.md into
+      # frustrations-archive.md upstream, so the stale mirror still holds lines
+      # upstream has legitimately moved. A branch cut from `upstream/main` then
+      # reads as DELETING all of them. Their `git diff upstream/main --
+      # frustrations.md` was empty and their branch touched one unrelated file.
+      # (Same set-difference-over-one-file blindness CD-78 corrected on
+      # AMUX-3367: a MOVE between a file and its archive reports as a deletion
+      # every time. Here the guard itself was making that mistake.)
+      #
+      # THE DESCENT TEST IS THE SAFETY PROPERTY, not a convenience. Preferring
+      # upstream/main only when HEAD DESCENDS FROM IT is what keeps this from
+      # reintroducing the dodge the comment above exists to prevent: a graft cut
+      # from an OLD commit does not descend from the current tip, so it falls
+      # back to the line above and is still caught. A branch that does descend
+      # from the authoritative tip cannot be republishing stale content, because
+      # it already contains every line that tip has.
+      #
+      # Deliberately NOT the merge-base fix that was suggested: a merge-base is
+      # old exactly when the graft is old, so it stops catching the case the
+      # guard is for. This is precise about forks and leaves the shared-checkout
+      # path — where there is no `upstream` remote — byte-identical.
+      local up
+      up=$(git rev-parse --verify --quiet "refs/remotes/upstream/main" 2>/dev/null || true)
+      if [ -n "$up" ] && [ "$up" != "$base" ] && git merge-base --is-ancestor "$up" "$lsha" 2>/dev/null; then
+        base="$up"
+      fi
     fi
     check_pair "$base" "$lsha"
     case $? in
