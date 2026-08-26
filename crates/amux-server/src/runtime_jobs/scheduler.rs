@@ -1371,6 +1371,22 @@ pub fn delivered_text(command: &str, source: &str) -> String {
     format!("{why}\n\n{command}")
 }
 
+/// Does the background reserve gate a fire from this `source`?
+///
+/// Extracted so the rule is testable without a live usage probe — `deliver`
+/// asks the network, this asks the string, and the string is the whole
+/// decision (Ethan, 2026-08-26: "if i manually send a scheduler to run now it
+/// should override this").
+///
+/// `manual:` WITH THE PREFIX. `run_now` builds `format!("manual:{by}")` so the
+/// row carries who tapped it, and `delivered_text` already reads it that way.
+/// An `== "manual"` check matches nothing and leaves run-now gated exactly as
+/// before — a silent no-op that reads as a fix, which is why this has a test
+/// over the REAL source strings rather than invented ones.
+pub fn reserve_applies_to(source: &str) -> bool {
+    !source.starts_with("manual:")
+}
+
 #[async_trait::async_trait]
 impl Deliverer for LiveDeliverer {
     async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome {
@@ -1392,7 +1408,33 @@ impl Deliverer for LiveDeliverer {
         //
         // Refused, not Err: nothing is broken, and a failure count would make a
         // working reserve look like an outage.
-        if crate::api::usage::background_should_pause_now().await {
+        // A MANUAL RUN-NOW IS NOT BACKGROUND WORK (Ethan, 2026-08-26: "if i
+        // manually send a scheduler to run now it should override this").
+        //
+        // The reserve protects the human's plan window FROM AUTOMATION — its own
+        // note says so: "Background work stops here so a prompt you type still
+        // has room; direct sends are never gated." Pressing Run now IS the human
+        // spending their own reserve, deliberately, on a thing they chose. amux
+        // refusing that is amux deciding something that is the human's to decide
+        // (ethos rule 8), and it does it at exactly the moment they most want
+        // control — the window is nearly full and they are picking what the last
+        // of it goes on.
+        //
+        // The discriminator already existed and was already threaded here.
+        // `source` is the same field AMUX-0032 added because a manual run and a
+        // cron fire were byte-identical rows and a session read three Run-now
+        // taps as the scheduler re-firing. It was recorded for the audit trail
+        // and never read for a decision. This is the decision it was for.
+        //
+        // Scheduled (cron) fires stay gated: nobody typed those.
+        //
+        // `manual:` with the PREFIX, not an equality check: `run_now` builds
+        // `format!("manual:{by}")` so the row carries WHO tapped it, and
+        // `delivered_text` two hundred lines up already reads it that way
+        // (`source.strip_prefix("manual:")`). An `== "manual"` here would have
+        // matched nothing and left the reserve gating run-now exactly as before
+        // — a silent no-op that reads as a fix.
+        if reserve_applies_to(source) && crate::api::usage::background_should_pause_now().await {
             return RunOutcome::Refused {
                 reason: crate::api::usage::reserve_pause_note("schedule"),
             };
@@ -1826,6 +1868,35 @@ mod tests {
     /// From the live board when the card was filed: 165 schedules enabled, ~1,650
     /// turns/day from 34 rows. `every 15m` is eleven characters and is 96 turns a
     /// day; five were enabled.
+    /// AMUX-3740: a manual Run-now overrides the background reserve.
+    ///
+    /// The reserve protects the human's plan window FROM AUTOMATION — its own
+    /// note says "direct sends are never gated". Pressing Run now IS the human
+    /// spending their own reserve on a thing they chose, and refusing it is amux
+    /// deciding what is the human's to decide, at exactly the moment they most
+    /// want control: the window is nearly full and they are picking what the
+    /// last of it goes on.
+    ///
+    /// THE SOURCE STRINGS HERE ARE THE REAL ONES, not invented. `run_now` builds
+    /// `format!("manual:{by}")` and the cron path passes "cron-rs". My first cut
+    /// compared `source != "manual"`, which matches NEITHER and would have left
+    /// run-now gated exactly as before — a silent no-op that reads as a fix.
+    /// That is the whole reason this test exists rather than a comment.
+    #[test]
+    fn a_manual_run_now_is_exempt_from_the_reserve_but_cron_is_not() {
+        // The exact string run_now builds.
+        assert!(!reserve_applies_to("manual:esteininger"));
+        assert!(!reserve_applies_to("manual:amux"));
+        // The exact strings the cron path passes. These MUST stay gated —
+        // nobody typed them, and exempting them would delete the reserve.
+        assert!(reserve_applies_to("cron-rs"));
+        assert!(reserve_applies_to("cron"));
+        assert!(reserve_applies_to(""));
+        // A bare "manual" is NOT the shape run_now produces. Pinned so a future
+        // caller that emits it is caught here rather than silently gated.
+        assert!(reserve_applies_to("manual"));
+    }
+
     #[test]
     fn fires_per_day_counts_every_expression_shape() {
         let f = |e: &str| {
@@ -2570,6 +2641,9 @@ mod tests {
         // byte-identical to the 9am cron fire.
         assert_eq!(delivered_text("do the thing", "cron-rs"), "do the thing");
         assert_eq!(delivered_text("do the thing", "cron"), "do the thing");
+
+
+
         let manual = delivered_text("do the thing", "manual:ethan");
         assert!(manual.contains("Run-now, triggered by ethan"), "{manual}");
         assert!(manual.ends_with("do the thing"), "{manual}");
