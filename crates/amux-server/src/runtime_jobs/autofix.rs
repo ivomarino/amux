@@ -2196,6 +2196,17 @@ type InvRow = (String, String, String, f64, f64, i64, String, String, String);
 /// Distinct slow TARGETS in one tick before the outlier detector rolls up
 /// (AMUX-3588). Mirrors `AMUX_INVARIANT_ROLLUP_AT`; floor of 2 for the same
 /// reason — a "rollup" of one is just a card with worse wording.
+/// How stale a suppressing card may get before the suppression is called out
+/// as a MUTE rather than a dedupe (AMUX-3774).
+///
+/// Two days, because that is what the live specimen cost: AMUX-3651 sat in
+/// `backlog` from 08-24 while every server-wide stall since was correctly
+/// detected, correctly deduped, and filed nowhere. Config rather than a
+/// constant for the D4 reason — a policy baked into code becomes the ceiling.
+fn mute_warn_days() -> f64 {
+    env_f64("AMUX_AUTOFIX_MUTE_WARN_DAYS", 2.0).max(0.25)
+}
+
 fn outlier_rollup_at() -> usize {
     std::env::var("AMUX_OUTLIER_ROLLUP_AT")
         .ok()
@@ -4389,13 +4400,67 @@ pub async fn autofix_tick_with_ci(
                 open_card_for_fault(&c, &f.signature)
             });
             if let Some(card) = existing {
+                // NAME HOW STALE THE SUPPRESSING CARD IS (AMUX-3774).
+                //
+                // This used to assert "Its count is what moves; a second card
+                // would carry no new information." Nothing implemented that.
+                // This block pushes a report row and `continue`s; it never
+                // touches the card. Measured 2026-08-26: AMUX-3651 last updated
+                // 08-24 17:35 while the rollup suppressed against it every ~2
+                // minutes for two days, including through a live six-family
+                // stall. The count was not moving, so a second card WOULD have
+                // carried new information — that the fault recurred today.
+                //
+                // ethos rule 6: grep for what the docstring promises, and either
+                // implement it or delete the claim. Deleted, and replaced with a
+                // fact this code can actually establish.
+                //
+                // THE DEEPER HAZARD the staleness exposes: only OPEN cards
+                // suppress, and `backlog` is open. A fault card parked in
+                // backlog is a permanent mute on its whole class, with no
+                // expiry. `filed: []` then reads identically for "nothing is
+                // wrong" and "everything is muted" — the idiom ethos.md names.
+                let stale_d = state
+                    .store
+                    .read()
+                    .ok()
+                    .and_then(|c| {
+                        c.query_row(
+                            "SELECT COALESCE(updated, created) FROM issues WHERE id=?1",
+                            rusqlite::params![&card],
+                            |r| r.get::<_, f64>(0),
+                        )
+                        .ok()
+                    })
+                    .map(|t| (crate::config::now_f64() - t) / 86400.0);
+                let age = match stale_d {
+                    Some(d) => format!(" It has not been touched in {d:.1} day(s)."),
+                    None => String::new(),
+                };
+                // SELF-ANNOUNCING once the mute is old enough to be a mute
+                // rather than a dedupe. A suppression is normal; suppressing
+                // against a card nobody has touched for days is the whole class
+                // going dark, and it should not need someone to open the debug
+                // surface to find out.
+                if stale_d.unwrap_or(0.0) >= mute_warn_days() {
+                    tracing::warn!(
+                        card = %card,
+                        detector = f.kind.slug(),
+                        signature = %f.signature,
+                        stale_days = stale_d.unwrap_or(0.0),
+                        "autofix_mute: this fault keeps recurring and is suppressed against a \
+                         card nobody has touched. Only OPEN cards suppress and `backlog` is \
+                         open, so a parked card mutes its entire class with no expiry \
+                         (AMUX-3774). Judge or discard the card to let occurrences through."
+                    );
+                }
                 rep.suppressed.push((
                     f.kind.slug().into(),
                     f.signature.clone(),
                     format!(
                         "{card} is open for this same fault — one card per fault, not one \
-                         per scan (AMUX-3667). Its count is what moves; a second card would \
-                         carry no new information."
+                         per scan (AMUX-3667).{age} NOTE: suppressing does NOT bump that \
+                         card, so its age is the only signal that this recurred."
                     ),
                 ));
                 continue;
@@ -6239,6 +6304,79 @@ mod tests {
         // the route pattern — the SAME collapse /api/logs/analyze uses.
         assert!(c[0].1.contains("14x"), "count belongs in the computed title: {}", c[0].1);
         assert!(c[0].1.contains("/api/sessions/{name}/{*verb}"), "title is the route, not a path: {}", c[0].1);
+    }
+
+    /// AMUX-3774: a suppression must not claim a count it does not bump, and a
+    /// STALE suppressing card must say how stale it is.
+    ///
+    /// The reason text asserted "Its count is what moves; a second card would
+    /// carry no new information." Nothing implemented that — the block pushes a
+    /// report row and `continue`s, and never touches the card. Measured on the
+    /// live board: AMUX-3651 last updated 08-24 17:35 while the rollup
+    /// suppressed against it every ~2 minutes for two days, through a live
+    /// six-family stall. The count was not moving, so a second card WOULD have
+    /// carried new information.
+    ///
+    /// Both cells, because a message that always shouts "stale" is as useless
+    /// as one that never does — and the FRESH arm is the common case that must
+    /// stay quiet.
+    #[tokio::test]
+    async fn a_stale_suppressing_card_says_so_and_a_fresh_one_does_not() {
+        async fn reason_after_aging(days: f64) -> String {
+            let (st, _d) = state();
+            let now = unix_now();
+            for i in 0..4 {
+                log_row(&st, Row { ts: now - 60.0 - i as f64, method: "POST", path: "/api/browser/start", family: "/api/browser", status: 502, body: "{}", worker: "l", ua: "curl/8", ms: 9.0 });
+            }
+            let r = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+            assert!(!r.filed.is_empty(), "the first occurrence must file: {r:?}");
+            // Age the card, then re-run: the same fault must now suppress.
+            // A NEW OCCURRENCE, not a re-scan of the same rows. `already_filed`
+            // runs BEFORE the open-card check by design (its comment: asking
+            // the precise question first is what keeps "I filed this batch"
+            // distinct from "the fault is in someone's queue"), so re-ticking
+            // the identical rows never reaches the suppression under test.
+            // A newer row mints a newer trailing epoch, which is exactly the
+            // real case: the fault recurred.
+            let later = unix_now();
+            log_row(&st, Row { ts: later - 1.0, method: "POST", path: "/api/browser/start", family: "/api/browser", status: 502, body: "{}", worker: "l", ua: "curl/8", ms: 9.0 });
+            let stamp = unix_now() - days * 86400.0;
+            st.store
+                .write(move |c| {
+                    c.execute("UPDATE issues SET updated=?1", rusqlite::params![stamp])?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .expect("age the card");
+            let r2 = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
+            r2.suppressed
+                .iter()
+                .find(|(_, _, why)| why.contains("open for this same fault"))
+                .map(|(_, _, why)| why.clone())
+                .unwrap_or_else(|| panic!("the second scan must suppress: {r2:?}"))
+        }
+
+        let fresh = reason_after_aging(0.0).await;
+        assert!(
+            !fresh.contains("Its count is what moves"),
+            "the claim that was never implemented must be GONE: {fresh}"
+        );
+        assert!(
+            fresh.contains("does NOT bump"),
+            "and the reason must say plainly that suppressing leaves the card untouched, or a \
+             reader assumes the recurrence was recorded somewhere: {fresh}"
+        );
+        assert!(
+            fresh.contains("0.0 day(s)"),
+            "a fresh card still reports its age — the number IS the signal, so it is present \
+             either way rather than only when alarming: {fresh}"
+        );
+
+        let stale = reason_after_aging(9.0).await;
+        assert!(
+            stale.contains("9.0 day(s)"),
+            "a stale card must report HOW stale — that number is the only signal a reader \
+             gets that the fault recurred while nobody was looking: {stale}"
+        );
     }
 
     /// A restart must not refile. This is the property an in-memory dedupe
