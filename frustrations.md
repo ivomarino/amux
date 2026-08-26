@@ -2932,3 +2932,25 @@ FIX: fcff219e. `until` ("ts <= ?") makes the window walkable (`since < ts <= unt
   for exactly this reason; this is the same admission on the endpoint that lacked it, so the
   next capped read announces itself in the payload the caller already opens. The contract's
   step 5 now carries the paging loop instead of the workaround.
+
+## `amux` died at load with a bash syntax error — every subcommand, every session, at once
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-26
+SESSION: amux (hit and reported by gtm-media-assets)
+CARD: AMUX-3722
+SYMPTOM: `amux send <peer> --stdin` -> `/Users/ethan/.local/bin/amux: line 1906: syntax error near unexpected token `;;'`. Identical on --file and on every `amux board` subcommand: a parse error at LOAD, so nothing input-dependent. Reporter also observed that ~/.local/bin/amux stats as 26 bytes with a Feb 18 mtime, which cannot be a script with a line 1906 — that is the SYMLINK's own stat, and the target is what changed.
+COST: The whole fleet lost the CLI until a peer noticed and reported it over the HTTP API. Unquantifiable session-minutes across ~50 lanes, and the reporter spent time chasing an mtime that could never have explained it. Worse than the outage: a CLI that cannot parse cannot print its own help, so the tool could not tell anyone how to work around the tool — a session that had only ever used `amux send` had no path left to discover POST /api/sessions/<n>/send exists, and would read it as "amux is down" rather than "the CLI is down".
+FIX: 5ecec79c. Two gates at the two boundaries. `.claude/check-and-commit.sh` runs `bash -n` on any edit to `amux` — that is the one that fires in TIME, because ~/.local/bin/amux is a symlink into the working tree and for the bash CLI the deploy boundary is the SAVE, not the commit: no install, no builder cycle, no CI in between. `tests/cli_syntax_guard.rs` is the backstop for an edit made without the hook. Both mutation-verified against the real specimen. The repo already ran `node --check` on dashboard JS on every save; the CLI, which ships faster and breaks wider, had nothing.
+
+## `force` claimed to log the judgment and logged an empty string, 41 times out of 41
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-26
+SESSION: amux
+CARD: AMUX-3723
+SYMPTOM: Every force audit line on this board reads `force by <who>: a->b reason=` with nothing after the `=`. 41 lines, 41 blank — never once populated. The board contract advertises force as "bypass (judgment stays with you; logged)", and ts-gke's 2026-08-03 fix made attribution mandatory precisely so the ledger would name the party holding the judgment. It named them and recorded no judgment.
+COST: Found while auditing how the autofix backlog was actually closed, and it made that audit undecidable for 25 cards: bulk-discarded in one minute, attributed, with nothing recorded about why. Reconstructing intent meant reading desc diffs card by card. The one escape hatch from the entire gate system was the one action whose trace could not answer the only question anyone asks of it.
+FIX: f013ba5b. Neither obvious suspect was guilty, which is why it survived: `amux board --force` has always REFUSED to run without a reason, and the server has always written a supplied reason to the log (an existing test asserts it, and passed throughout). The CLI validated the reason and then sent it as `desc_append` instead of `reason` — 9 of the 41 cards carry a good "[FORCED] <why>" in their desc beside a ledger line that says nothing. A test on either side of the seam and none ON it. Now: the CLI sends both, the server refuses a blank reason from any caller with a 400 that names the sanctioned command, and a `force_without_reason` tracing marker makes the next off-path caller visible (a bare 400 here groups with every other board-PATCH 400 in /api/logs/analyze).
