@@ -1,22 +1,38 @@
 #!/usr/bin/env python3
-"""Retire a validated frustrations.md entry — carrying its text to the card first.
+"""SUPERSEDED — use scripts/frustrations-archive.py instead. This refuses to run.
 
-Why this is a script and not a sed: on 2026-08-09, 35 entries were deleted after
-validation and TWO of that day's classes recurred within hours (AF-38). The entries
-were gone, so recognising the recurrence AS a recurrence depended on someone
-remembering the deletion. AF-38's own recommendation was to carry the SYMPTOM onto
-the card before deleting, because the card is where a person hitting it again
-actually looks. This does that, every time, instead of relying on whoever runs the
-sweep to remember.
+WHY IT REFUSES RATHER THAN JUST SITTING HERE (AF-239). This tool DELETES a
+validated entry after carrying its text to the card. That was the whole protocol
+on 2026-08-23, when it was written. On 2026-08-24 the protocol gained a second
+half: an entry is MOVED to frustrations-archive.md with a VALIDATED line naming
+who signed it off, because a set-difference over the ledger alone cannot see a
+move and reports it as a deletion every time (CD-78's correction to AMUX-3367;
+creative-dna measured 15 of 15 "lost" entries as archive moves).
 
-Two traps this encodes, both learned the hard way:
-  - CARD IS NOT A DELETE KEY. 20 card ids cover several entries each (AF-38 alone
-    has three). Entries are addressed by their '## ' HEADING.
-  - Entries are separated by the '## ' heading ONLY, not by '---'. A block split on
-    '---' silently matches the wrong span; that is why a first attempt deleted 1 of 4.
+So running this today deletes an entry that is then absent from BOTH files —
+which is precisely the archive check's definition of LOST WORK. The superseded
+tool manufactures the exact false positive the newer protocol exists to prevent,
+and nothing about its name warns you: `retire` is closer to the words Ethan
+actually used ("once its complete delete from this md") than `archive` is.
 
-Usage: frustrations_retire.py "<exact heading substring>" [--dry-run]
+Its one real capability — AF-38's rule that the SYMPTOM and COST must reach the
+CARD, because that is where someone hitting the bug again looks — was NOT lost.
+It has been folded into frustrations-archive.py, which now does both halves in
+one path. Deleting this file outright would have thrown that rule away with it;
+this way the reasoning stays next to the tool that used to own it.
+
+Kept as a refusal rather than deleted so that anyone who has this path in a
+runbook, a note or a habit is TOLD where to go, instead of getting
+"No such file or directory" and reaching for `sed`.
 """
+import sys
+
+print(__doc__, file=sys.stderr)
+print("REFUSING: use scripts/frustrations-archive.py <line> <validated-by> "
+      "--evidence-stdin  (`--list` shows the heading lines).", file=sys.stderr)
+sys.exit(2)
+
+_SUPERSEDED_ORIGINAL = """
 import json, re, subprocess, sys, urllib.parse
 
 FILE = 'frustrations.md'
@@ -105,3 +121,5 @@ def main():
     return 0
 
 sys.exit(main())
+
+"""
