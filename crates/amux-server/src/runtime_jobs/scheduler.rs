@@ -1868,7 +1868,7 @@ mod tests {
     /// From the live board when the card was filed: 165 schedules enabled, ~1,650
     /// turns/day from 34 rows. `every 15m` is eleven characters and is 96 turns a
     /// day; five were enabled.
-    /// AMUX-3740: a manual Run-now overrides the background reserve.
+    /// AMUX-3741: a manual Run-now overrides the background reserve.
     ///
     /// The reserve protects the human's plan window FROM AUTOMATION — its own
     /// note says "direct sends are never gated". Pressing Run now IS the human
