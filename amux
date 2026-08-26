@@ -1728,6 +1728,8 @@ Usage: amux board add <title>
 Optional:
   --desc <text> | --desc-stdin | --desc-file <path>    card body
   --type <type>                                        the GATE is derived from this
+  --depends-on <ISSUE-ID>                              link the new card to one it
+                                                       depends on (repeatable)
   --help                                               this text
 
 types: $(_board_valid_types)
@@ -2209,6 +2211,7 @@ print(json.dumps(b))' \
       # the mistake natural. `retitle` already had these flags; `add`, the verb
       # you reach first, had none and said so nowhere reachable.
       local title="" desc="" itype="" _src=""
+      local -a deps=()
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --stdin|-)     title=$(cat); _src=1; shift ;;
@@ -2222,20 +2225,38 @@ print(json.dumps(b))' \
           --type)        [[ -n "${2:-}" ]] || die "usage: amux board add --type <type>
 types: $(_board_valid_types)"
                          itype="$2"; shift 2 ;;
+          # AF-242. The server has ALWAYS accepted depends_on at create (it is
+          # in the POST handler's known_keys) and honours it — verified live.
+          # `add` could not say it, and `epic` was the CLI's only link verb, so
+          # a card that begets a card took two steps and the second had no verb
+          # at all. That is ethos rule 1: capability present, honoured, reaching
+          # nobody because the sanctioned tool cannot express it. Two lanes
+          # routed around it on 2026-08-26 alone — a reviewer's out-of-scope
+          # finding written into the host card's desc, and an AF-182 -> AMUX-3726
+          # split written into prose on both cards.
+          --depends-on)  [[ -n "${2:-}" ]] || die "usage: amux board add --depends-on <ISSUE-ID>"
+                         deps+=("$2"); shift 2 ;;
           --help|-h)     _board_add_usage; return 0 ;;
           --*)           _board_bad_flag add "$1" \
-                           "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --type <t> --help" ;;
+                           "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --type <t> --depends-on <ID> --help" ;;
           *)             title="${title:+$title }$1"; _src=1; shift ;;
         esac
       done
       [[ -n "$title" ]] || die "$(_board_add_usage)"
       local body result
-      body=$(T="$title" S="${AMUX_SESSION:-}" D="$desc" TY="$itype" python3 -c 'import json,os
+      local _deps_joined=""
+      [[ ${#deps[@]} -gt 0 ]] && _deps_joined=$(printf '%s\n' "${deps[@]}")
+      body=$(T="$title" S="${AMUX_SESSION:-}" D="$desc" TY="$itype" DEP="$_deps_joined" python3 -c 'import json,os
 b = {"title": os.environ["T"].strip(), "status": "todo", "session": os.environ["S"]}
 d = os.environ.get("D", "")
 if d.strip(): b["desc"] = d
 t = os.environ.get("TY", "").strip()
 if t: b["type"] = t
+# ABSENT, not an empty list, when no --depends-on was given. An always-present
+# [] is a different statement to the server and would satisfy any assertion
+# that only checks the flag WORKS (AF-242).
+dep = [x.strip() for x in os.environ.get("DEP", "").split("\n") if x.strip()]
+if dep: b["depends_on"] = dep
 print(json.dumps(b))')
       result=$(_curl -sk -X POST \
         -H 'Content-Type: application/json' \
