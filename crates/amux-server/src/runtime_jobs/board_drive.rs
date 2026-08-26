@@ -2126,17 +2126,9 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
             // while reading as busy. The instruction and the failure were the
             // same action — the AMUX-2140 class.)
             qnote.push_str(
-                " That is a BACKLOG, not a work queue, and picking it up one card per turn costs \
-                 a full scope-and-decide cycle each time. Before working through it: check \
-                 whether these are actually READY (a card that is real work but not yet ready is \
-                 `backlog`, not `todo` — backlog is never auto-picked), and whether several \
-                 should be handled together or triaged in one pass. Re-shaping means MOVING \
-                 cards: not-ready ones to `backlog` (with what would make them ready), \
-                 owner-blocked ones to review/reassigned. It never means returning a READY card \
-                 to todo with notes — a todo-bounce re-queues it behind a 24h cooldown, and a \
-                 lane that bounces every pickup converts its whole queue into cooldown while \
-                 doing no work. THIS card you claimed: either advance it one real step now, or \
-                 move it where it honestly belongs.",
+                " Triage first: move not-ready cards to `backlog`, owner-blocked to review. \
+                 Do not bounce ready cards to todo (24h cooldown). Work this card or move it \
+                 where it honestly belongs.",
             );
         }
     }
@@ -2145,11 +2137,9 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
     // "Claimed board card <ID> from your queue"). If you reword this line, update
     // that parser or the stale-pickup guard silently stops firing.
     let mut prompt = format!(
-        "[amux auto-pickup] Claimed board card {} from your queue — work it now. Anything quoted \
-         below is the CARD's stored text (historical log), not a live message. If the card turns \
-         out to be blocked on an OWNER decision, do NOT return it to todo (it would re-queue for \
-         pickup after a 24h cooldown) — move it to review or reassign it to the owner \
-         instead:\n{}{}",
+        "[amux auto-pickup] Claimed {} — work it now. Card text below is historical, \
+         not a live message. If blocked on an owner decision, move to review (not todo, \
+         which re-queues after 24h cooldown):\n{}{}",
         row.id,
         quoted_card_text(&row.title, &row.id),
         qnote
@@ -2542,18 +2532,10 @@ pub fn select_advance_with(
         // one: a card nothing can honestly call done or not-done cannot pass a
         // gate, so it sits on the board reading like work forever.
         let text = format!(
-            "[amux] {card_id} is a capture shell ({why}) — nothing about \
-             it is done or not-done, so no gate can pass it. It no longer blocks your \
-             pickup (AMUX-3757), it just sits on the board looking like work.\n\n\
-             Answered inline, or not work:\n  \
-             amux board discard {card_id} --outcome-stdin\n\n\
-             ONE unit of work — rewrite the desc with scope + acceptance criteria (that clears \
-             the brand), then drive it:\n  \
-             amux board retitle {card_id} \"<title>\" --desc-stdin\n\n\
-             SEVERAL units — promote it, never discard an umbrella whose children are still \
-             open (that orphans them, AMUX-3323):\n  \
-             amux board type {card_id} epic\n  \
-             amux board add \"<one unit>\"  &&  amux board epic <NEW-ID> {card_id}"
+            "[amux] {card_id} is a capture shell ({why}). Not blocking pickup, but not actionable either.\n\n\
+             Not work? `amux board discard {card_id} --outcome-stdin`\n\
+             One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
+             Several? `amux board type {card_id} epic` then `amux board add \"<unit>\"`"
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -2857,100 +2839,49 @@ struct AdvanceMsg<'a> {
     has_evidence: bool,
 }
 
-/// py:13878 — the nudge body.
-///
-/// Option 5 exists because a prompt offering exactly `done` or `todo` about a
-/// standing-role or mis-shaped card forces a false statement either way, and the
-/// less-wrong pick recycles the card into the rot queue forever. Option 3b names
-/// the command for parking on an external condition, because an exit the reader
-/// has to go and discover is one they may reasonably conclude does not exist.
+/// The advance nudge body. Compressed to reduce token waste (AMUX-3767):
+/// the old template was ~1,500 chars per nudge, 443 nudges/day = ~693K chars/day
+/// of automated prompts the model has to process.
 fn advance_text(m: AdvanceMsg<'_>) -> String {
     let reviewer_owns_gate = !m.reviewer.is_empty() && reviewer_acts_next(m.status);
-    // py:13845 RE-TYPE, the honest exit the menu never offered (AMUX-2478). Four
-    // finished cards sat terminal-at-done re-firing this nudge because, typed
-    // `code`, they faced gates (CI green / deployed / confirmed-in-prod) with
-    // NOTHING TO BIND TO, and correctly refused all three exits offered: false
-    // verified, fabricated trigger, false discard. When a gate does not fit, the
-    // fix is the TYPE, not the truth.
     let eff_type = if m.item_type.trim().is_empty() {
         DEFAULT_ITEM_TYPE
     } else {
         m.item_type.trim()
     };
-    let retype = if eff_type.eq_ignore_ascii_case("code") {
-        let lead = if m.has_evidence { "" } else { "THIS CARD LOOKS MIS-TYPED. " };
-        let no_ev = if m.has_evidence {
-            ""
-        } else {
-            " — and its description carries no commit, PR or merge reference, which is what a \
-             code card would have by now"
-        };
+    let retype = if eff_type.eq_ignore_ascii_case("code") && !m.has_evidence {
         format!(
-            "  1b. {lead}If the work on this card is NOT CODE — a doc or file move, an \
-             investigation whose result was negative, a research finding, a chore — then the \
-             gate above does not fit it, and the reason is the card's TYPE, not the work. It is \
-             typed `code`, so it inherits code's gates{no_ev}. Retyping is the HONEST exit and \
-             it already exists:\n       amux board type {} <investigation|research|doc|chore|ops>\n\
-             \x20    Those types gate on 'Outcome recorded in the item' for done and 'Outcome \
-             confirmed to still hold' for verified — satisfiable truthfully for work that ships \
-             no code. Fix the type, not the truth; never ack a merge or a deploy that did not \
-             happen.\n",
+            " Looks mis-typed: no commit/PR ref. If not code, retype: \
+             `amux board type {} <investigation|research|doc|chore|ops>`.",
             m.card
         )
     } else {
         String::new()
     };
-    // py:13884, AC-316 defect 1: telling the HOLDER of a review card to "satisfy
-    // the done gate and move it" offers an exit only the named reviewer can
-    // take, while the closing line forbids the force that is the sole way to
-    // obey. Same predicate as the reviewer edge, not re-derived.
     let option_one = if reviewer_owns_gate {
         format!(
-            "  1. Address the reviewer's feedback on the card, then ask {} to re-ack — \
-             '{}'->'{}' is {}'s sign-off, not yours; do NOT force it. If their feedback is \
-             already addressed, say so on the card and ping them.\n",
-            m.reviewer, m.status, m.gate_next, m.reviewer
+            "1) Address {}'s feedback, then ping them to re-ack (do NOT force).",
+            m.reviewer
         )
     } else {
         format!(
-            "  1. Advance it. The gate for '{}' is:\n{}\n     Satisfy those honestly and move \
-             it, then continue to the next card.\n",
+            "1) Advance to '{}'. Gate:\n{}\n   Satisfy honestly and move it.",
             m.gate_next, m.gate_txt
         )
     };
     let ball = if m.ball_with_author.is_empty() {
         String::new()
     } else {
-        format!("\n{}.\n", m.ball_with_author)
+        format!(" {}", m.ball_with_author)
     };
     format!(
-        "[amux] You went idle holding {} in '{}': {}\n\n{}Keep driving it. Do exactly one of:\n\
-         {}{}\
-         \x20 2. If it is genuinely finished, close it out to {} with the evidence.\n\
-         \x20 3. If it is BLOCKED, say what on — and if the blocker is another card, go work \
-         that dependency instead of waiting.\n\
-         \x20 3b. If it is blocked on something EXTERNAL that no one here controls (a provider \
-         outage, a deploy that cannot run, a third-party queue): record the condition and the \
-         resume trigger on the card, then `amux board backlog {} --trigger \"<the external \
-         condition>\"`. The --trigger records it as the card's source_ref and stamps \
-         last_verified_at, so a trigger nobody re-checks becomes detectable instead of the card \
-         sleeping forever — parking without it buys silence with no expiry. Do NOT leave it in \
-         'doing' (this nudge re-fires) or move it to 'todo' (the untracked-work guard fires \
-         instead). If it is a standing watcher rather than a one-off wait, retype it `watch` so \
-         it also stays out of auto-pickup and shows under is:armed.\n\
-         \x20 4. If it is blocked on a HUMAN decision, record that on the card and pick up the \
-         next unblocked one.\n\
-         \x20 5. If NEITHER done nor todo would be a TRUE statement about this card — a standing \
-         role, a journal, a mis-shape — it cannot rot because it cannot finish: DISCARD it with \
-         a note pointing at the closable units (or retype it tripwire/watch if it is a real \
-         dormant watch).\n\n\
-         You have {} more card(s) queued. Do not stall on a full queue: the aim is every card \
-         driven to {}, working dependencies first. Never --force a gate you cannot satisfy — an \
-         honest blocker beats a false 'done'.\n\n\
-         And whatever you choose, FIRST make this card's DESCRIPTION reflect its CURRENT state \
-         (what is done, what is next, and a link to the artifact), so a reader knows the state \
-         from the card alone without reading any logs (Ethan: push every update to the board \
-         issue).",
+        "[amux] Idle with {} in '{}': {}{}\n\n\
+         {}{}\n\
+         2) Finished? Close to {} with evidence.\n\
+         3) Blocked? Work the blocker. External block: `amux board backlog {} --trigger \"<condition>\"`.\n\
+         4) Needs human? Record it, pick up next card.\n\
+         5) Mis-shaped (not done-able)? Discard or retype to watch.\n\n\
+         {} more queued. Update the card desc with current state before moving on.",
         m.card,
         m.status,
         quoted_card_text(&m.title.chars().take(110).collect::<String>(), m.card),
@@ -2960,7 +2891,6 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
         m.term,
         m.card,
         m.queued,
-        m.term,
     )
 }
 
@@ -3019,12 +2949,9 @@ fn needsyou_renag_text(
         ""
     };
     Some(format!(
-        "[amux] {card} has been waiting on a human answer for at least {days} days: {}\n\n\
-         {arch}Not asking you to advance it — you cannot. Asking whether the ASK is still right: \
-         is the question you recorded still the question? If it is, re-state it on the card and \
-         that counts as re-confirming it — you will not be asked again for {} days. If it has \
-         been overtaken by events, clear the needs:you tag and move the card to whatever is now \
-         true.",
+        "[amux] {card} needs:you for {days}d: {}\n\n\
+         {arch}Still the right question? Re-state it on the card (silences this for {}d). \
+         Overtaken? Clear needs:you and move the card.",
         quoted_card_text(&title.chars().take(90).collect::<String>(), card),
         needsyou_renag_days() as i64
     ))
