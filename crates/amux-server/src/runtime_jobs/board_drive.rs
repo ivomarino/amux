@@ -3595,6 +3595,20 @@ pub async fn claim_card_from(
     // card in the same atomic step, rather than leaving it `doing` with a stale
     // owner.
     let session_s = session.to_string();
+    // THE GUARD'S VERDICT HAS TO ESCAPE THE CLOSURE (AMUX-3776). `reassigned`
+    // is computed inside the write, where it can be read in the same
+    // transaction as the swap — which is correct and is why it lives there —
+    // and it was then used only for a tracing::warn and a card-log line. So a
+    // genuine cross-owner claim left NO row in `session_events`, while the
+    // ordinary path emits `task.claimed`.
+    //
+    // Two costs. A sweep of the ledger cannot find the violation at all. And
+    // the (reached, taken) instrument AMUX-3768 proposes can only see branches
+    // that RECORD, so this one would report dead-by-absence forever while being
+    // perfectly reachable — the same false negative random hit on
+    // raw-tmux-fallback and corrected.
+    let cross_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let cross_owner_w = cross_owner.clone();
     let reply = state
         .store
         .write_async(move |conn| {
@@ -3646,6 +3660,9 @@ pub async fn claim_card_from(
                     "claim REASSIGNED a card across owners; every caller is supposed to prevent this; \
                      if you see this, a dispatch path let a lane claim another lane's card"
                 );
+                if let Ok(mut g) = cross_owner_w.lock() {
+                    *g = Some(prior_owner.clone());
+                }
                 format!("Auto-picked up from queue by {session_s} (reassigned from {prior_owner})")
             } else if from == "backlog" {
                 // A backlog card is never queue-dispatched; this line only ever
@@ -3672,6 +3689,23 @@ pub async fn claim_card_from(
              (raced to a terminal/doing state, or store unreadable); prompt NOT dispatched"
         );
         return false;
+    }
+    // THE VIOLATION GETS ITS OWN TYPE, and it is emitted BEFORE `task.claimed`
+    // so the ledger reads in causal order: the guard fired, then the claim
+    // landed. A distinct type rather than a field on `task.claimed`, because
+    // this is a different FACT — every caller is supposed to make it
+    // impossible, so one row is a bug report, not a variation on a claim
+    // (AMUX-3776).
+    if let Some(prior) = cross_owner.lock().ok().and_then(|g| g.clone()) {
+        crate::api::session_verbs::emit_event(
+            state,
+            session,
+            "claim.cross_owner",
+            Some(json!({"issue": card, "claimer": session, "prior_owner": prior, "from": from})),
+            None,
+            "board-drive",
+        )
+        .await;
     }
     crate::api::session_verbs::emit_event(
         state,
@@ -5098,6 +5132,46 @@ mod tests {
         assert!(
             log.contains("by amux-frustrations") && log.contains("reassigned from amux"),
             "a cross-owner claim must record the reassignment in the card log: {log:?}"
+        );
+
+        // AND IT MUST REACH THE LEDGER (AMUX-3776). The card log and a
+        // tracing::warn were the only records, so a sweep of `session_events`
+        // could not find this violation at all — while the ordinary path emits
+        // `task.claimed` right beside it. The asymmetry is the bug: the branch
+        // that is supposed to be impossible was the one leaving no row.
+        //
+        // It also blocks the (reached, taken) instrument AMUX-3768 proposes,
+        // which can only see branches that RECORD: this one would report
+        // dead-by-absence forever while being perfectly reachable.
+        let rows = |t: &str| -> Vec<String> {
+            store
+                .read()
+                .unwrap()
+                .prepare("SELECT COALESCE(data,'') FROM session_events WHERE type=?1")
+                .and_then(|mut st| {
+                    st.query_map([t], |r| r.get::<_, String>(0)).map(|r| r.flatten().collect())
+                })
+                .unwrap_or_default()
+        };
+        let cross = rows("claim.cross_owner");
+        assert_eq!(cross.len(), 1, "exactly the ONE cross-owner claim files a row: {cross:?}");
+        assert!(
+            cross[0].contains("AF-99") && cross[0].contains("amux"),
+            "the row must name the card and the prior owner, or it cannot be investigated: {}",
+            cross[0]
+        );
+        // CONTROL: the same-owner claim above must NOT have filed one, or this
+        // type says nothing and the ledger is noisier for no gain.
+        assert!(
+            !cross[0].contains("AF-78"),
+            "a same-owner claim is not a violation: {}",
+            cross[0]
+        );
+        assert_eq!(
+            rows("task.claimed").len(),
+            2,
+            "both claims still emit task.claimed — the new type is ADDITIONAL, not a \
+             replacement, or every existing consumer of the claim ledger silently loses a row"
         );
     }
 
