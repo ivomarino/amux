@@ -3041,6 +3041,9 @@ ${BOLD}Worker management:${RESET}
   amux exec <name> [flags]       Register + start in one step
   amux stop <name>               Stop a running worker
   amux rm <name>                 Remove a worker (stops if running)
+  amux fresh <name> [-y]         Restart the worker on a NEW conversation
+                                 ${DIM}keeps env, cards, memory, groups — drops the${RESET}
+                                 ${DIM}compaction backlog. See /api/debug/context-health${RESET}
   amux start-all                 Start all registered workers
   amux stop-all                  Stop all running workers
 
@@ -3362,6 +3365,80 @@ cmd_whoami() {
 #
 # DEFAULT is a PURE FILE READ (no HTTP probe): probing per-call across ~48 lanes
 # would flood the server to ask where the server is. `--verify` opts into a probe.
+# amux fresh <session> — recycle a worker's CONVERSATION, keep the worker.
+#
+# Why this exists (AMUX-3742). A lane resumes the same Claude conversation
+# forever, so it accumulates compaction generations. Measured 2026-08-26 over
+# every transcript active since 08-05: amux lanes median 8, max 215; a raw
+# terminal sits at 0. Same model, same effort, same first-turn token baseline —
+# the difference is that the lane answers from a summary of a summary while a
+# fresh terminal reads primary sources. That is the whole "raw claude performs
+# better than amux claude" report.
+#
+# The remedy lived in the server the whole time and reached nobody: the
+# dashboard rendered "New conversation" only on a STOPPED worker, and the API
+# answered 409 while running. Every live lane is running, so on all 50 of them
+# the one control that fixes this was hidden AND refused.
+#
+# The worker survives untouched: env, board cards, memory, groups, name, tags.
+# Only the conversation starts over. Deliberately never automatic — the
+# conversation is the lane's accumulated work and discarding it is the owner's
+# call (ethos rule 8).
+cmd_fresh() {
+  local yes=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) yes=1; shift ;;
+      *)        name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: amux fresh <session> [-y]"
+  name=$(resolve_session "$name") || return 1
+
+  local api="${AMUX_API:-$(cmd_url)}"
+  # State the cost before paying it. The generation count is what makes this a
+  # decision instead of a guess, so it is fetched even when -y skips the prompt.
+  local gens
+  gens=$(_curl -sk "$api/api/debug/context-health" 2>/dev/null | N="$name" python3 -c "
+import json,os,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for l in d.get('lanes',[]):
+    if l.get('session')==os.environ['N']:
+        print(l.get('generations') if l.get('measured') else 'unmeasured')
+        break
+")
+  echo "${BOLD}$name${RESET} — conversation has been compacted ${BOLD}${gens:-?}${RESET} time(s)."
+  echo "${DIM}The worker keeps its env, board cards, memory and groups. Only the conversation restarts.${RESET}"
+  if [[ "$yes" -ne 1 ]]; then
+    if [[ ! -t 0 ]]; then
+      die "not a terminal — re-run with -y to confirm discarding this conversation"
+    fi
+    printf "Discard it and restart on a fresh conversation? [y/N] "
+    local reply; read -r reply
+    [[ "$reply" == "y" || "$reply" == "Y" ]] || { echo "${DIM}unchanged${RESET}"; return 0; }
+  fi
+
+  local resp rc=0
+  resp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' \
+    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    -d '{"new_conversation":true,"restart":true}' \
+    "$api/api/sessions/$name/config" 2>/dev/null) || rc=$?
+  [[ "$rc" -eq 0 ]] || die "cannot reach the amux server at $api (curl exit $rc) — NOTHING was changed"
+  # Read the BODY, never the exit code: a 409 is a perfectly successful curl.
+  echo "$resp" | python3 -c "
+import json,sys
+raw=sys.stdin.read()
+try: d=json.loads(raw)
+except Exception: sys.exit('unexpected response: '+raw[:200])
+if d.get('error'):
+    msg=d['error']
+    if d.get('escape'): msg += chr(10)+'  try: '+d['escape']
+    sys.exit(msg)
+print(d.get('message','ok') + (' (was %s generations deep)' % d['generations'] if d.get('generations') is not None else ''))
+"
+}
+
 cmd_url() {
   local literal="https://localhost:8824"   # last-resort floor; appended, never an else-branch
   local retired_floor="8822"                # only consulted when endpoint.json is unreadable
@@ -3466,6 +3543,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     alert)            shift; cmd_alert "$@" ;;
     iac)              shift; cmd_config "$@" ;;
     whoami)           cmd_whoami ;;
+    fresh)            shift; cmd_fresh "$@" ;;
     url)              shift; cmd_url "$@" ;;
     help|--help|-h)   cmd_help ;;
     version|--version|-v) echo "amux v${CC_VERSION}" ;;

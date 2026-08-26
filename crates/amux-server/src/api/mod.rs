@@ -379,6 +379,13 @@ pub fn router(state: AppState) -> Router {
         // Per-session logging health + a computed stale verdict (AMUX-2628).
         // Public like its debug siblings: session names and byte counts only.
         .route("/api/debug/logs", axum::routing::get(session_verbs::debug_logs))
+        // Compaction generations per lane (AMUX-3742): the instrument that
+        // could not express "amux claude performs worse than raw claude".
+        // Public like its debug siblings — lane names and counts only.
+        .route(
+            "/api/debug/context-health",
+            axum::routing::get(session_verbs::debug_context_health),
+        )
         // The rust/python ownership registry, readable where a debugging
         // session already looks (ethos rule 4): which families answer
         // natively, which proxy to python and why, and the cutover exit for

@@ -3100,7 +3100,7 @@ function render() {
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();clearScrollback('${s.name}')"><span class="mi">&#x239A;</span> Clear scrollback</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();duplicateSession('${s.name}')"><span class="mi">&#x2398;</span> Duplicate</div>
-          ${!s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();newConversation('${s.name}')"><span class="mi">&#x1F195;</span> New conversation</div>` : ''}
+          <div class="card-menu-item" onclick="event.stopPropagation();newConversation('${s.name}', ${s.running ? 'true' : 'false'})"><span class="mi">&#x1F195;</span> New conversation</div>
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();shareSession('${s.name}')"><span class="mi">&#x1F517;</span> Share link</div>
           <div class="card-menu-item" onclick="event.stopPropagation();archiveSession('${s.name}')"><span class="mi">&#x1F4E6;</span> Archive</div>
           <div class="card-menu-sep"></div>
@@ -5180,15 +5180,40 @@ function cloneSession(session) {
   editField(session, 'clone', '');
 }
 
-async function newConversation(session) {
+// AMUX-3742: this used to be rendered ONLY on a stopped worker, and the API
+// refused while running — so on every live lane the one control that fixes a
+// degraded conversation was both hidden and refused. A lane resumes forever
+// and accumulates compaction generations (measured: amux median 8, max 215; a
+// raw terminal 0), which is what "raw claude performs better than amux claude"
+// turned out to be. It is available on a running worker now, and it says how
+// many generations deep the conversation is, because that number is what makes
+// this a decision rather than a guess.
+async function newConversation(session, running) {
   closeAllMenus();
-  // was `worker` — undefined here, so the click died as an invisible rejected
-  // promise (the exact bug class this gate exists for; caught by no-undef)
-  if (!await showConfirm('Start a fresh conversation for "' + session + '"?\n\nThe next time you start this worker, it will begin a new Claude conversation (history in the old conversation is preserved but won\'t be continued).', 'Reset', true)) return;
-  await apiCall(API + '/api/sessions/' + session + '/config', {
+  let gens = null;
+  try {
+    const r = await apiCall(API + '/api/debug/context-health');
+    if (r) {
+      const d = await r.json();
+      const lane = (d.lanes || []).find(l => l.session === session);
+      // `measured` is carried separately on purpose: never-compacted and
+      // could-not-measure both arrive as a missing count otherwise.
+      if (lane && lane.measured) gens = lane.generations;
+    }
+  } catch (e) { /* the count is context, not a precondition — proceed without it */ }
+  const depth = gens === null ? 'Its compaction depth could not be measured.'
+                              : 'It has been compacted ' + gens + ' time(s).';
+  const tail = running
+    ? '\n\nThis STOPS the worker now and restarts it on a new conversation. Anything it is mid-turn on is lost.'
+    : '\n\nThe next time you start this worker, it will begin a new conversation.';
+  if (!await showConfirm('Start a fresh conversation for "' + session + '"?\n\n' + depth
+      + ' The worker keeps its env, board cards, memory and groups — only the conversation restarts.'
+      + '\n\nThe old transcript is preserved, just not continued.' + tail, 'Reset', true)) return;
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ new_conversation: true })
+    body: JSON.stringify({ new_conversation: true, restart: !!running })
   });
+  if (r) showToast(running ? 'Restarting ' + session + ' on a fresh conversation' : 'Conversation reset');
 }
 
 async function shareSession(session) {
@@ -7913,7 +7938,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.740';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.741';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

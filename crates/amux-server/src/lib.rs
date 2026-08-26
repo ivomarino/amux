@@ -461,6 +461,10 @@ async fn async_main() {
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
+    // Compaction-generation watch (AMUX-3742): the reason "amux claude performs
+    // worse than raw claude" was invisible for months is that nothing counted
+    // how many times a lane's conversation had been summarized away.
+    drop(runtime_jobs::context_health::spawn());
     // The token_ledger WRITER. Every reader of that table was ported at the
     // cutover and this was not, so /api/stats/daily served a confident
     // total_tokens: 0 for 36 hours (AMUX-2892).

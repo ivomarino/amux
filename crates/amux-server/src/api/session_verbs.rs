@@ -1450,6 +1450,187 @@ fn claude_session_flag(name: &str, conv_id: &str, resumable: bool) -> String {
     }
 }
 
+/// The one marker that means "the conversation was compacted here".
+///
+/// A single compaction writes SEVERAL records: a `system` row with
+/// `subtype:"compact_boundary"` (carrying `compactMetadata`), and a separate
+/// row flagged `isCompactSummary`. The first draft of the census behind
+/// AMUX-3742 counted any of the three and reported exactly 2x the truth —
+/// median 17 where the answer was 8. Count boundaries, not their debris.
+const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"subtype\":\"compact_boundary\"";
+
+/// The transcript file backing a lane's CURRENT conversation, if there is one.
+fn transcript_path_for(name: &str) -> Option<PathBuf> {
+    let conv = meta_str(&load_meta(name), "cc_conversation_id");
+    if conv.is_empty() || !cached_re!(r"^[0-9a-fA-F-]{36}$").is_match(&conv) {
+        return None;
+    }
+    let wd = work_dir_of(&parse_env(name));
+    let p = claude_home().join("projects").join(project_name(&wd)).join(format!("{conv}.jsonl"));
+    p.exists().then_some(p)
+}
+
+/// How many times this lane's conversation has been compacted — the meter for
+/// the degradation AMUX-3742 measured (amux lanes median 8, max 215; raw
+/// terminal sessions median 0).
+///
+/// `None` means the measurement could not RUN — no conversation id yet, or the
+/// transcript is missing. That is a different fact from zero and every payload
+/// reporting this must keep them apart: a pristine lane and an unmeasurable one
+/// look identical otherwise, which is the shape ethos rule 4 is about.
+///
+/// INCREMENTAL, because transcripts reach 648MB on this machine and rescanning
+/// one per request is not acceptable. The cache holds (bytes_scanned, count)
+/// per path and reads only what was appended since; a Claude transcript is
+/// append-only, so this is exact rather than approximate. The offset advances
+/// only to the last complete line, so a record caught mid-write is counted on
+/// the next pass instead of being split and missed. A file that SHRANK was
+/// rotated or replaced, so it is rescanned from zero.
+fn conversation_generations(name: &str) -> Option<u32> {
+    count_compact_boundaries(&transcript_path_for(name)?)
+}
+
+/// The incremental counter behind [`conversation_generations`], split out so
+/// the scanning is testable against a real file without a `$HOME` full of
+/// lanes — the census one is a smoke test at best, since it passes vacuously
+/// on a machine with no sessions (ethos rule 7).
+pub fn count_compact_boundaries(path: &Path) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    static CACHE: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, (u64, u32)>>> =
+        std::sync::Mutex::new(None);
+
+    let path = path.to_path_buf();
+    let len = std::fs::metadata(&path).ok()?.len();
+    let mut guard = CACHE.lock().ok()?;
+    let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+    let (mut offset, mut count) = cache.get(&path).copied().unwrap_or((0, 0));
+    if offset > len {
+        // Rotated or replaced: the cached count describes a file that no
+        // longer exists. Start over rather than report a number for it.
+        offset = 0;
+        count = 0;
+    }
+    if len > offset {
+        let mut f = std::fs::File::open(&path).ok()?;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buf = Vec::with_capacity((len - offset).min(64 * 1024 * 1024) as usize);
+        f.take(64 * 1024 * 1024).read_to_end(&mut buf).ok()?;
+        let scanned = match buf.iter().rposition(|b| *b == b'\n') {
+            Some(i) => i + 1,
+            None => 0, // no complete line yet — leave the offset where it was
+        };
+        count += buf[..scanned].windows(COMPACT_BOUNDARY_MARKER.len()).filter(|w| *w == COMPACT_BOUNDARY_MARKER).count()
+            as u32;
+        offset += scanned as u64;
+        cache.insert(path, (offset, count));
+    }
+    Some(count)
+}
+
+/// A lane is worth recycling somewhere around here. Deliberately a number in
+/// a payload rather than an automatic action: a conversation is the lane's
+/// accumulated work and deciding it is spent belongs to its owner (ethos
+/// rule 8). amux reports; the human presses the button.
+pub const GENERATIONS_WARN_AT: u32 = 20;
+
+/// The degraded predicate, in ONE place. The hourly watch and the debug view
+/// both call it, so a view cannot disagree with the mechanism it describes —
+/// the drift ethos rule 1 names, which has cost this repo five separate
+/// over/under-filtered views.
+pub fn is_degraded(generations: u32) -> bool {
+    generations >= GENERATIONS_WARN_AT
+}
+
+/// Every registered lane and how many compaction generations deep it is.
+///
+/// ONE enumeration, shared by the debug view and the hourly watch, so the two
+/// cannot disagree about which lanes count — a view that re-derives the
+/// mechanism's predicate drifts the moment either changes (ethos rule 1).
+pub(crate) fn generation_census() -> Vec<(String, Option<u32>)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("env") {
+                continue;
+            }
+            if let Some(lane) = p.file_stem().and_then(|s| s.to_str()) {
+                let g = conversation_generations(lane);
+                out.push((lane.to_string(), g));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `GET /api/debug/context-health` — how degraded each lane's conversation is.
+///
+/// This endpoint IS the fix for AMUX-3742 as much as the recycle verb is. The
+/// report was "amux claude performs worse than raw claude, same model, same
+/// prompt", and nothing in amux could express the difference, so it stayed a
+/// feeling for months while the answer was sitting in every transcript. Model
+/// and effort were the same on both sides; compaction generations were not.
+pub async fn debug_context_health() -> Response {
+    let mut running: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(o) = tmux(&["list-sessions", "-F", "#{session_name}"]).await {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Some(n) = line.trim().strip_prefix("amux-") {
+                running.insert(n.to_string());
+            }
+        }
+    }
+    let mut lanes: Vec<Value> = Vec::new();
+    let (mut measured, mut unmeasurable, mut over) = (0u32, 0u32, 0u32);
+    for (lane, gens) in generation_census() {
+        let mb =
+            transcript_path_for(&lane).and_then(|t| std::fs::metadata(t).ok()).map(|m| m.len() / (1024 * 1024));
+        match gens {
+            Some(g) => {
+                measured += 1;
+                if is_degraded(g) {
+                    over += 1;
+                }
+            }
+            None => unmeasurable += 1,
+        }
+        lanes.push(json!({
+            "session": lane,
+            "generations": gens,
+            // NOT inferable from `generations: null` alone — a lane that
+            // has never compacted and one nobody could measure must not
+            // read the same (ethos rule 4).
+            "measured": gens.is_some(),
+            "why_unmeasured": gens.is_none().then(|| {
+                if meta_str(&load_meta(&lane), "cc_conversation_id").is_empty() {
+                    "no conversation id yet (never started, or recycled and not restarted)"
+                } else {
+                    "conversation id recorded but its transcript is missing"
+                }
+            }),
+            "running": running.contains(&lane),
+            "transcript_mb": mb,
+        }));
+    }
+    lanes.sort_by_key(|l| std::cmp::Reverse(l.get("generations").and_then(Value::as_u64).unwrap_or(0)));
+    j200(json!({
+        "note": "compaction generations per lane: how many times this conversation has been \
+                 summarized away. A raw `claude` in a terminal sits at 0; an amux lane resumes \
+                 forever, so it answers from a summary of a summary. Measured 2026-08-26 across \
+                 every transcript active since 08-05: amux median 8 / max 215, raw median 0 / \
+                 max 32 — same models, same effort, same first-turn token baseline.",
+        "sessions": lanes.len(),
+        "measured": measured,
+        "unmeasurable": unmeasurable,
+        "over_warn_threshold": over,
+        "warn_at": GENERATIONS_WARN_AT,
+        "remedy": "amux fresh <session> — keeps the worker (env, cards, memory, groups) and \
+                   starts its conversation over. Never automatic: the conversation is the lane's \
+                   accumulated work, so discarding it is the owner's call (ethos rule 8).",
+        "lanes": lanes,
+    }))
+}
+
 /// The display name a transcript CURRENTLY carries — the last `customTitle` /
 /// `sessionName` record in the file, not the first (AMUX-2612).
 ///
@@ -13893,18 +14074,95 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         return j200(json!({"ok": true, "message": format!("{msg} (restart session to apply)")}));
     }
 
-    // New conversation (py:76741).
+    // New conversation (py:76741), extended to RUNNING workers (AMUX-3742).
+    //
+    // Why this had to change: a lane's conversation is immortal. Every start
+    // resumes (all 8 `start_session` call sites pass skip_conv_id=false; the
+    // one `true` is the `--fork-session` duplicate path), so a lane
+    // accumulates compaction generations forever. Measured over every
+    // transcript active since 2026-08-05: amux lanes median 17 compactions,
+    // max 430; raw terminal sessions median 0. The median lane answers from a
+    // 17th-generation lossy summary while a raw terminal answers from primary
+    // sources — the whole "same model, same prompt, worse output" report.
+    //
+    // The remedy already existed and reached NOBODY (ethos rule 1): this
+    // handler refused while running, and `app.js` rendered the menu item only
+    // when `!s.running`. Every live lane is running, so the one control that
+    // fixes a degraded conversation was hidden and refused on all of them.
+    //
+    // `restart: true` does it live. NOT the default: recycling discards the
+    // lane's accumulated context, which is its work, so the caller says so
+    // explicitly (ethos rule 8). The 409 for the bare form now NAMES its own
+    // escape in the sanctioned tooling rather than in HTTP terms only —
+    // ethos rule 6, the constraint whose documented escape was unwalkable.
     if body.get("new_conversation").map(py_truthy).unwrap_or(false) {
-        if is_running(name).await {
+        let restart = body.get("restart").map(py_truthy).unwrap_or(false);
+        let running = is_running(name).await;
+        if running && !restart {
             return jresp(
                 StatusCode::CONFLICT,
-                json!({"error": "stop the session before starting a new conversation"}),
+                json!({
+                    "error": "worker is running: a fresh conversation needs it restarted",
+                    "running": true,
+                    "escape": format!("amux fresh {name}  (or re-send with {{\"new_conversation\":true,\"restart\":true}})"),
+                }),
             );
         }
+        let generations = conversation_generations(name);
+        // Clear BEFORE the stop. Safe in this order because stop_session
+        // writes only `cc_session_name`; it is `restart_for_swap` that
+        // re-stashes a conversation id via find_latest_session_id, which is
+        // exactly why this path does its own stop/start instead of reusing it.
         let mut meta = load_meta(name);
+        let previous = meta_str(&meta, "cc_conversation_id");
         meta.remove("cc_conversation_id");
         save_meta(name, &meta);
-        return j200(json!({"ok": true, "message": "conversation reset — next start will be a fresh conversation"}));
+        // Greppable, because the point of the fix is that the degradation was
+        // invisible: `conversation_recycled` carries how many generations deep
+        // the discarded conversation was, so a log sweep can see both that
+        // lanes are being recycled and how bad they get before anyone acts.
+        tracing::warn!(
+            session = %name,
+            generations = generations.map(|g| g as i64).unwrap_or(-1),
+            restarted = running,
+            previous_conv = %chars_truncate(&previous, 8),
+            "conversation_recycled: worker keeps its env/cards/memory, the conversation starts fresh"
+        );
+        emit_event(
+            state,
+            name,
+            "session.conversation_recycled",
+            Some(json!({"generations": generations, "restarted": running})),
+            None,
+            "api-config",
+        )
+        .await;
+        if !running {
+            return j200(json!({
+                "ok": true, "restarted": false, "generations": generations,
+                "message": "conversation reset — next start will be a fresh conversation",
+            }));
+        }
+        let st2 = state.clone();
+        let n = name.to_string();
+        tokio::spawn(async move {
+            let _ = stop_session(&n).await;
+            kill_tmux_session(&n).await;
+            // skip_conv_id=true AND the meta already cleared: belt and braces,
+            // because either one alone still leaves a path that could resume.
+            let (ok, msg) = start_session(&st2, &n, "", true).await;
+            if !ok {
+                tracing::warn!(session = %n, reason = %chars_truncate(&msg, 200),
+                    "conversation_recycle_failed: worker stopped but did not come back");
+            }
+        });
+        return jresp(
+            StatusCode::ACCEPTED,
+            json!({
+                "ok": true, "restarted": true, "generations": generations,
+                "message": "restarting on a fresh conversation",
+            }),
+        );
     }
 
     jresp(StatusCode::BAD_REQUEST, json!({"error": "nothing to update"}))
