@@ -1904,7 +1904,23 @@ const STATE_JS: &str = r#"
   return { url: location.href, title: document.title,
            viewport: { w: window.innerWidth, h: window.innerHeight },
            text: ((document.body && document.body.innerText) || '').slice(0, __TEXT_CAP__),
-           elements: els };
+           elements: els,
+           // NO SILENT CAPS (AMUX-3721). `seen` holds every visible match and is
+           // what click-by-index addresses; `els` is only what we render. When
+           // those differ the caller MUST be told, because the failure is
+           // invisible otherwise: you get a full-looking list, the element you
+           // want is not in it, and the only available conclusion is "it is not
+           // on the page" — which is wrong, and which is exactly what happened.
+           elements_total: seen.length,
+           elements_shown: els.length,
+           elements_truncated: seen.length > els.length,
+           elements_note: seen.length > els.length
+             ? ('showing ' + els.length + ' of ' + seen.length + ' visible elements. '
+                + 'The rest ARE addressable: click-by-index resolves against the full list, '
+                + 'so indices ' + els.length + '..' + (seen.length - 1) + ' work even though '
+                + 'they are not listed here. To find one, eval over window.__amux_els, or '
+                + 'click by CSS selector instead of index.')
+             : null };
 })()
 "#;
 
@@ -2884,6 +2900,29 @@ mod tests {
         let js = state_js();
         assert!(!js.contains("__EL_LIMIT__") && !js.contains("__TEXT_CAP__"));
         assert!(js.contains("window.__amux_els"));
+        // THE CAP MUST DISCLOSE ITSELF (AMUX-3721). The state surface renders
+        // STATE_EL_LIMIT elements out of however many are visible, and it used
+        // to say nothing about the difference — so a caller got a full-looking
+        // list of exactly 120, could not find the element it wanted, and had
+        // only one available conclusion: "it is not on the page". Measured live
+        // on the amux dashboard: 158 visible, 120 returned, and the two elements
+        // being looked for sat at indices 155 and 156 — addressable the whole
+        // time, since click-by-index resolves against `seen`, not `els`.
+        //
+        // SCOPE, honestly: this asserts the disclosure is EMITTED, not that its
+        // arithmetic is right — the arithmetic runs in a browser, and no
+        // assertion in this process can execute it. It is a
+        // deletion/regression guard. The arithmetic was verified against the
+        // live dashboard instead, which is the only place it can be.
+        for f in [
+            "elements_total",
+            "elements_shown",
+            "elements_truncated",
+            "elements_note",
+            "seen.length > els.length",
+        ] {
+            assert!(js.contains(f), "state JS must disclose its cap, missing {f}: {js}");
+        }
         // Selector JSON-encodes through format!: quotes must survive.
         let js = selector_click_js("a[href=\"x\"]");
         assert!(js.contains("querySelector(\"a[href=\\\"x\\\"]\")"), "{js}");
