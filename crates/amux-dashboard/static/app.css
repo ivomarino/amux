@@ -2039,6 +2039,19 @@
   .meta-count .mc-total { color: var(--dim); font-weight: 600; }
   /* Session card: scrollback cached on this device (readable with no signal). */
   .card-offline-dot { color: #3fb950; font-size: 0.7rem; opacity: 0.8; }
+  /* ISOLATED (AMUX-3232). A raw agent with the harness stripped and hidden from
+     peers is a RARE, high-consequence state, and until now the only way to learn
+     a worker was in it was to open its ⋯ menu and read a checkbox. A designation
+     that changes what a worker can reach has to be visible where the worker is,
+     not one interaction away.
+     Deliberately a text chip rather than an emoji: this is read at a glance next
+     to the name, and it is the one card-face marker whose meaning is not
+     guessable from a glyph. Sized to sit inside the existing card-name line so
+     it costs no vertical space at 375px, and it is not a touch target, so the
+     44px rule does not apply. */
+  .card-isolated { font-size: 0.6rem; font-weight: 600; letter-spacing: 0.04em;
+    color: var(--warn, #d29922); border: 1px solid currentColor; border-radius: 4px;
+    padding: 0 4px; margin-left: 4px; vertical-align: middle; white-space: nowrap; }
   /* ── Dictation: compact recording popup (above the composer) ── */
   .dict-popup { display: none; position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 60;
     background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
