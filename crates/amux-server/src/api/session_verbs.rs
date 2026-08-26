@@ -1609,6 +1609,41 @@ pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
 /// renamed all park a card on somebody no nudge can reach. This is the one
 /// predicate for "can amux address this name", so the board and the session
 /// verbs cannot disagree about it.
+/// Why `owner` cannot use `reviewer` for peer review, or `None` if it can.
+///
+/// ONE PREDICATE FOR TWO QUESTIONS THAT WERE ANSWERED SEPARATELY (AMUX-3771).
+/// The board asked only "is this a registered worker" before routing a review
+/// nudge. Messaging asks a second question — `cross_group_send_ok` — and only
+/// the send API ever asked it, so the board could hand a lane a reviewer it was
+/// not allowed to talk to.
+///
+/// The result was a system inconsistent in the direction that surprises: review
+/// crossed groups silently, conversation about it was refused. A card then sits
+/// in `review`, which reads healthy, while the two parties cannot correspond.
+///
+/// The escapes are the ones that already exist and are already documented in
+/// the refusal text: `CC_RECEIVE_ANY=1` on the reviewer if it is a fleet-wide
+/// routing target (which is exactly what a designated cross-lane reviewer IS),
+/// or `CC_SEND_ALLOW` on the owner. Refusing here does not decide which; it
+/// forces the decision to be written down somewhere instead of emerging from a
+/// worker description nothing enforces.
+pub fn reviewer_unreachable_reason(owner: &str, reviewer: &str) -> Option<String> {
+    if !session_is_registered(reviewer) {
+        return Some(format!(
+            "`{reviewer}` is not a registered worker — reassign to a lane, or move the card to \
+             needsyou if a human owes the review"
+        ));
+    }
+    // The SAME rule worker-to-worker messaging uses, so a reviewer you cannot
+    // message can never become a reviewer you are waiting on.
+    cross_group_send_ok(owner, reviewer).err().map(|why| {
+        format!(
+            "{owner} cannot reach it for the conversation the review requires. {why} \
+             A designated cross-lane reviewer should carry CC_RECEIVE_ANY=1."
+        )
+    })
+}
+
 pub fn session_is_registered(name: &str) -> bool {
     let n = name.trim();
     !n.is_empty() && valid_session_name(n) && env_path(n).exists()
@@ -17754,6 +17789,71 @@ mod steer_boundary_tests {
         assert!(
             lane_report(&state, "probe").expect("present").applies,
             "a FRESH active report is still the authority — this gate must keep deferring to a real turn"
+        );
+    }
+
+    /// AMUX-3771, Ethan: "figure out why `@random` is peer reviewing code
+    /// outside of its group".
+    ///
+    /// Because the board asked one question and messaging asked another. The
+    /// reviewer gate checked only "is this a registered worker"; the messaging
+    /// rule (`cross_group_send_ok`) is enforced in exactly ONE place, the send
+    /// API, and the review nudge goes through `steer_enqueue` and never touches
+    /// it. So review crossed groups silently while conversation about it was
+    /// refused — a card sits in `review`, which reads healthy, and the two
+    /// parties cannot correspond.
+    ///
+    /// The cells are the three states that matter, and the middle one is the
+    /// whole point: REGISTERED IS NOT ENOUGH.
+    #[tokio::test]
+    async fn a_reviewer_must_be_reachable_not_merely_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("owner.env"), "CC_DIR=/tmp\nCC_TAGS=\"alpha\"\n").unwrap();
+        std::fs::write(sessions.join("peer.env"), "CC_DIR=/tmp\nCC_TAGS=\"alpha\"\n").unwrap();
+        std::fs::write(sessions.join("far.env"), "CC_DIR=/tmp\nCC_TAGS=\"beta\"\n").unwrap();
+        std::fs::write(
+            sessions.join("open.env"),
+            "CC_DIR=/tmp\nCC_TAGS=\"beta\"\nCC_RECEIVE_ANY=\"1\"\n",
+        )
+        .unwrap();
+
+        // ABSENT: the case the old gate already caught.
+        let why = reviewer_unreachable_reason("owner", "ghost").expect("absent must refuse");
+        assert!(why.contains("not a registered worker"), "{why}");
+
+        // SAME GROUP: fine, and this control is what stops the fix being
+        // "refuse every reviewer".
+        assert!(
+            reviewer_unreachable_reason("owner", "peer").is_none(),
+            "a same-group reviewer must still be assignable"
+        );
+
+        // THE NEW CELL: registered, real, and in another group. The old gate
+        // passed this — it is ECOLO-14 and AMUX-3761 exactly — and the owner
+        // then could not message the reviewer it was waiting on.
+        let why = reviewer_unreachable_reason("owner", "far")
+            .expect("a cross-group reviewer must refuse even though it IS registered");
+        assert!(
+            !why.contains("not a registered worker"),
+            "the refusal must name the REACH problem, not mislead about existence: {why}"
+        );
+        assert!(
+            why.contains("CC_RECEIVE_ANY"),
+            "and it must name the sanctioned escape, or the gate is a dead end (ethos rule 6): \
+             {why}"
+        );
+
+        // THE ESCAPE WORKS. A designated fleet-wide reviewer carries
+        // CC_RECEIVE_ANY=1, which is precisely the "documented routing target"
+        // case the messaging guard already provides for. Without this cell the
+        // gate could be unconditional and every assertion above would pass.
+        assert!(
+            reviewer_unreachable_reason("owner", "open").is_none(),
+            "a cross-group reviewer that DECLARES itself open must be assignable — otherwise \
+             the fix bans cross-lane review instead of making it explicit"
         );
     }
 

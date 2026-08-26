@@ -2226,7 +2226,9 @@ pub fn select_advance(
     tags: &[String],
     now: f64,
 ) -> Advance {
-    select_advance_with(conn, session, tags, now, &crate::api::session_verbs::session_is_registered)
+    select_advance_with(conn, session, tags, now, &|owner, reviewer| {
+        crate::api::session_verbs::reviewer_unreachable_reason(owner, reviewer)
+    })
 }
 
 /// [`select_advance`] over an INJECTED "is this name a registered worker"
@@ -2246,7 +2248,7 @@ pub fn select_advance_with(
     session: &str,
     tags: &[String],
     now: f64,
-    is_registered: &dyn Fn(&str) -> bool,
+    reviewer_unreachable: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Advance {
     let budget = advance_card_budget();
 
@@ -2694,18 +2696,38 @@ pub fn select_advance_with(
         // NAMED and WARNed rather than silently skipped, because a nudge that
         // goes nowhere is indistinguishable from a reviewer who is merely slow,
         // and the card looks healthy in `review` either way (ethos rule 4).
-        if !is_registered(&rev) {
+        // REACHABLE, NOT MERELY REGISTERED (AMUX-3771, Ethan: "figure out why
+        // `@random` is peer reviewing code outside of its group").
+        //
+        // This gate used to ask only "is `rev` a registered worker", which is
+        // one predicate short. A registered CROSS-GROUP reviewer passed it, got
+        // nudged, and the owner then could not talk to them: worker-to-worker
+        // messaging is intra-group unless configured, and `cross_group_send_ok`
+        // is enforced in exactly ONE place — the send API. The review nudge goes
+        // through `steer_enqueue` and never touches it.
+        //
+        // So review crossed groups silently while conversation about it did
+        // not. Measured 2026-08-26: ECOLO-14 (ecology/customers -> random/
+        // personal) and AMUX-3761 (amux/amux -> random/personal, set by me).
+        // `random`'s CC_DESC advertises "Peer review for other lanes" — which is
+        // what every lane reads when picking a reviewer — while its config
+        // grants no such reach. The roster promised a role the mechanism did not
+        // implement (ethos rule 1).
+        //
+        // Refusing here does NOT decide whether random should be the fleet
+        // reviewer. It makes the answer explicit: grant the reach with
+        // CC_RECEIVE_ANY / CC_SEND_ALLOW, which the guard already provides for
+        // exactly this case, or stop assigning across groups.
+        if let Some(why) = reviewer_unreachable(session, &rev) {
             tracing::warn!(
-                card = %card_id, reviewer = %rev, owner = %session,
-                "reviewer_unreachable: card parked in review naming a reviewer that is not a \
-                 registered worker — no nudge can be delivered, so nobody is coming"
+                card = %card_id, reviewer = %rev, owner = %session, reason = %why,
+                "reviewer_unreachable: card parked in review naming a reviewer this lane \
+                 cannot reach — the nudge goes nowhere or the conversation about it does, \
+                 and the card looks healthy in `review` either way"
             );
             return Advance::None {
                 reason: "reviewer-unreachable",
-                detail: format!(
-                    "{card_id} names reviewer `{rev}`, which is not a registered worker — \
-                     reassign it to a lane, or move the card to needsyou if a human owes the review"
-                ),
+                detail: format!("{card_id} names reviewer `{rev}`: {why}"),
             };
         }
         match reviewer_has_responded(conn, &card_id, &rev) {
@@ -4051,7 +4073,7 @@ mod tests {
     /// lookup to `select_advance_with`; `the_gate_refuses_a_reviewer_no_nudge_
     /// can_reach` below is the one that does, so this shadow cannot hide it.
     fn select_advance(conn: &Connection, session: &str, tags: &[String], now: f64) -> Advance {
-        select_advance_with(conn, session, tags, now, &|_| true)
+        select_advance_with(conn, session, tags, now, &|_, _| None)
     }
 
     /// The drain cadence must SCALE to the backlog (Ethan 2026-08-13: big idle
@@ -5747,7 +5769,9 @@ mod tests {
         add_card(&conn, "R-9", "lane", "review", "needs a peer", "SCOPE: x");
         conn.execute("UPDATE issues SET reviewer='amux-rust' WHERE id='R-9'", []).expect("rev");
 
-        match select_advance_with(&conn, "lane", &[], now_f64(), &|_| false) {
+        match select_advance_with(&conn, "lane", &[], now_f64(), &|_, r| {
+            Some(format!("`{r}` is not a registered worker"))
+        }) {
             Advance::None { reason, detail } => {
                 assert_eq!(reason, "reviewer-unreachable");
                 assert!(detail.contains("amux-rust"), "must name the dead reviewer: {detail}");
@@ -5755,7 +5779,9 @@ mod tests {
             Advance::Nudge { kind, target, .. } => panic!("an unreachable reviewer must not be nudged (kind={kind}, target={target})"),
         }
 
-        match select_advance_with(&conn, "lane", &[], now_f64(), &|n| n == "amux-rust") {
+        match select_advance_with(&conn, "lane", &[], now_f64(), &|_, n| {
+            (n != "amux-rust").then(|| "not reachable".to_string())
+        }) {
             Advance::Nudge { target, kind, .. } => {
                 assert_eq!(target, "amux-rust", "a REACHABLE reviewer is still routed");
                 assert_eq!(kind, "review-routed");
