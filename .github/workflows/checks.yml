@@ -156,6 +156,15 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-frustrations-archive.sh
+      # The frustration SCANNER's own cells (AF-255). The harness existed and was
+      # never wired here, so the classifier the sweep depends on had 6 tests that
+      # nobody ran. Its false positives are expensive in a specific way: a wrong
+      # candidate spends a session's judgment, and a wrong MARKER attributes a
+      # mood to Ethan from words he did not write.
+      - name: frustration scanner classifies Ethan's words, not what he pasted (AF-255)
+        run: |
+          set -uo pipefail
+          ./scripts/test-frustration-scan.sh
       # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
       # and they belong HERE rather than in rust.yml because rust.yml is
       # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to

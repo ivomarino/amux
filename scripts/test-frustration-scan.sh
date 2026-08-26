@@ -30,6 +30,15 @@ NOW_MS=$(python3 -c 'import time;print(int(time.time()*1000))')
 python3 - "$DB" "$NOW_MS" <<'PY'
 import sqlite3, sys
 db, now = sys.argv[1], int(sys.argv[2])
+# A long forwarded body, the thing both G messages carry and neither wrote.
+QUOTE = ("Thanks Happy to. The one that would help me most is not really a roadmap "
+         "idea it is the direction call on one three four. I posted the inventory and "
+         "I am sitting on the follow up until you say whether the legacy dispatcher is "
+         "the supported path or the workers api gets completed. Either is fine by me I "
+         "would just rather not build one and be told it should have been the other. "
+         "One sentence unblocks it. Roadmap wise the thing I would put at the top from "
+         "reading your commits is a theme you are already naming yourself outputs that "
+         "read the same whether things are healthy or broken.")
 c = sqlite3.connect(db)
 c.execute("CREATE TABLE cmd_history (id INTEGER PRIMARY KEY, text TEXT, type TEXT, "
           "session TEXT, ts INTEGER, origin TEXT, card_id TEXT, delivery TEXT)")
@@ -62,6 +71,29 @@ rows = [
     # the fix is a hollowing-out that passes cell E by reporting nothing.
     (11, "go over the retriever numbers once more", "user", "pr", now - 400_000, "", "", "direct"),
     (12, "and?",                                    "user", "pr", now - 391_000, "", "", "direct"),
+    # G: two DIFFERENT asks that both forward the SAME long email (AF-255). Plain
+    # jaccard scored the QUOTE, not the ask, so these read as a repeated request
+    # at 0.70-1.00. Live specimen 2026-08-26: three forwards of one contributor
+    # email, Ethan's own words "do what u think is best", "did you apply these
+    # suggestions", "do we have these captured" — the top TWO candidates of the
+    # run, at scores 15 and 12.
+    (13, "do what u think is best u have full autonomy\n\n" + QUOTE, "user", "af", now - 300_000, "", "", "direct"),
+    (14, "do we have these captured and working where appropriate\n\n" + QUOTE, "user", "af", now - 200_000, "", "", "direct"),
+    # H: a GENUINE repeat that also happens to quote the same thing must SURVIVE.
+    # Without this, stripping the shared run everywhere passes cell G by
+    # reporting nothing — the hollowing-out.
+    (15, "whats the status on this\n\n" + QUOTE, "user", "hh", now - 300_000, "", "", "direct"),
+    (16, "whats the status on this\n\n" + QUOTE, "user", "hh", now - 200_000, "", "", "direct"),
+    # I: a pasted MEETING TRANSCRIPT. Its markers are spoken by participants, not
+    # by Ethan. Scored 13 on 2026-08-26 — the second-highest candidate of the run
+    # — on still/again/i-said/already/you-didnt/no-response, none of them his.
+    (17, "Meeting Title: Sync\nMeeting participants: Ethan, Dan\n"
+         "Dan: i said this already and you didnt do it, still no response, again",
+         "user", "tt", now - 150_000, "", "", "direct"),
+    # J: the SAME marker words, written by ETHAN, must still score. Without this,
+    # stripping everything passes cell I by scoring nothing.
+    (18, "this still doesnt work and i said already you didnt fix it",
+         "user", "jj", now - 140_000, "", "", "direct"),
 ]
 c.executemany("INSERT INTO cmd_history VALUES (?,?,?,?,?,?,?,?)", rows)
 c.commit()
@@ -152,5 +184,55 @@ else
 fi
 
 echo
+# Cell G: two different asks sharing one long quote must NOT be a repeat.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ids={m["id"] for f in d["findings"] for m in f["messages"]}
+sys.exit(0 if not ({13,14} & ids) else 1)'; then
+  ok "G: two different asks forwarding the SAME email are NOT a repeated request"
+else
+  bad "G: the quote was scored instead of the ask — the 2026-08-26 top-2 artifact"
+  echo "$OUT" | head -40 | sed 's/^/       /'
+fi
+
+# Cell H: a genuine repeat that also quotes must still be caught.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+hit=[f for f in d["findings"] if f["kind"]=="repeat"
+     and {13,14}.isdisjoint({m["id"] for m in f["messages"]})
+     and {15,16} & {m["id"] for m in f["messages"]}]
+sys.exit(0 if hit else 1)'; then
+  ok "H: an IDENTICAL ask that also quotes IS still a repeat (cell G did not hollow it out)"
+else
+  bad "H: a genuine repeat was suppressed by the quote-stripping — hollowed out"
+  echo "$OUT" | head -40 | sed 's/^/       /'
+fi
+
+# Cell I: markers inside a pasted transcript are not Ethan's.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ids={m["id"] for f in d["findings"] for m in f["messages"]}
+sys.exit(0 if 17 not in ids else 1)'; then
+  ok "I: markers spoken by MEETING PARTICIPANTS are not scored as Ethan's"
+else
+  bad "I: a pasted transcript was scored as Ethan's frustration"
+  echo "$OUT" | head -40 | sed 's/^/       /'
+fi
+
+# Cell J: the same words, written by him, must still score.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+ids={m["id"] for f in d["findings"] for m in f["messages"]}
+sys.exit(0 if 18 in ids else 1)'; then
+  ok "J: the SAME marker words written by ETHAN still score (cell I did not hollow it out)"
+else
+  bad "J: marker detection is now inert — stripping went too far"
+  echo "$OUT" | head -40 | sed 's/^/       /'
+fi
+
 echo "frustration-scan cells: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

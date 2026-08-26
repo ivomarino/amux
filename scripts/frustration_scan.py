@@ -47,6 +47,7 @@ fleet talking to itself. `cmd_history.ts` is in MILLISECONDS.
 """
 import json
 import os
+import difflib
 import re
 import sqlite3
 import sys
@@ -125,6 +126,76 @@ def normalize(t):
     return WS.sub(" ", t.lower()).strip()
 
 
+# ---- PASTED CONTENT IS NOT ETHAN'S WORDS (AF-255) --------------------------
+#
+# `normalize` strips the timestamp and the attachment path and nothing else, so
+# everything Ethan PASTES — a forwarded email, a meeting transcript, a canary's
+# output — was scored as though he had written it. Measured on the 2026-08-26
+# run: 4 of 9 candidates were this artifact, including the second-highest
+# scorer, a customer meeting transcript whose "you didn't" / "no response" /
+# "i said" markers were spoken by MEETING PARTICIPANTS. The sweep's own
+# instruction says "do not infer a mood and file it"; the scanner was inferring
+# one from a third party's words and attributing it to Ethan.
+PASTE_HEADER = re.compile(
+    r"^\s*(meeting title|meeting participants|meeting date|attendees|from|to|subject|sent)\s*:",
+    re.I | re.M,
+)
+SIG_DELIM = re.compile(r"^\s*--\s*$", re.M)
+FENCE = re.compile(r"```.*?```", re.S)
+QUOTED_LINE = re.compile(r"^\s*>.*$", re.M)
+
+
+def own_words(t):
+    """What is left after removing what Ethan quoted rather than wrote.
+
+    Conservative on purpose: it removes only regions with an unambiguous paste
+    marker. A forwarded body with no marker at all still survives here — that
+    case is handled at the PAIR level by `ask_similarity`, which is the right
+    layer for it because a quote is only detectable as a quote when it appears
+    twice.
+    """
+    t = FENCE.sub(" ", t or "")
+    t = QUOTED_LINE.sub(" ", t)
+    # A paste header or a signature delimiter starts a block that runs to the
+    # end. Truncate at the EARLIEST of them.
+    cut = len(t)
+    for rx in (PASTE_HEADER, SIG_DELIM):
+        m = rx.search(t)
+        if m:
+            cut = min(cut, m.start())
+    return WS.sub(" ", t[:cut]).strip()
+
+
+def ask_similarity(a, b):
+    """Similarity of the two ASKS, not of what they both quote.
+
+    Two messages that forward the SAME email share hundreds of words, so plain
+    jaccard reports ~1.0 while the actual requests differ completely. Removing
+    the longest shared run and comparing the remainders separates the two cases
+    without needing to recognise any quote format:
+
+      genuinely repeated ask  -> the shared run IS the whole message, both
+                                 remainders are empty, and the original
+                                 similarity stands.
+      different asks, one quote -> the shared run is the quote, the remainders
+                                 are Ethan's two different requests, and their
+                                 similarity is the honest answer.
+
+    Returns (similarity, shared_word_count).
+    """
+    aw, bw = a.split(), b.split()
+    sm = difflib.SequenceMatcher(a=aw, b=bw, autojunk=False)
+    m = sm.find_longest_match(0, len(aw), 0, len(bw))
+    if m.size < 20:
+        return similarity(a, b), m.size
+    rem_a = " ".join(aw[: m.a] + aw[m.a + m.size :]).strip()
+    rem_b = " ".join(bw[: m.b] + bw[m.b + m.size :]).strip()
+    # Nothing meaningful left on one side = the shared run WAS the message.
+    if len(rem_a.split()) < 4 or len(rem_b.split()) < 4:
+        return similarity(a, b), m.size
+    return similarity(rem_a, rem_b), m.size
+
+
 def shingles(s, n=4):
     w = s.split()
     return {" ".join(w[i : i + n]) for i in range(max(0, len(w) - n + 1))} or {s}
@@ -180,7 +251,7 @@ def main():
         # where the timing carries the meaning.
         if len(norm) < 8:
             msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
-                         "norm": norm, "control": True})
+                         "norm": norm, "own": own_words(text), "control": True})
             continue
         # CONTROL WORDS ARE NOT REQUESTS. "continue" appeared six times in the
         # first run as a near-duplicate of itself across three days, which is
@@ -190,10 +261,10 @@ def main():
         # timing is what carries the meaning.
         if CONTROL.fullmatch(norm):
             msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
-                         "norm": norm, "control": True})
+                         "norm": norm, "own": own_words(text), "control": True})
             continue
         msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
-                     "norm": norm, "control": False})
+                     "norm": norm, "own": own_words(text), "control": False})
 
     findings = defaultdict(lambda: {"score": 0, "why": [], "msgs": []})
 
@@ -201,7 +272,7 @@ def main():
     real = [m for m in msgs if not m["control"]]
     for i, a in enumerate(real):
         for b in real[i + 1 :]:
-            sim = similarity(a["norm"], b["norm"])
+            sim, shared = ask_similarity(a["norm"], b["norm"])
             if sim >= 0.55:
                 gap_s = (b["ts"] - a["ts"]) / 1000
                 # UNDER A MINUTE IS NOT A HUMAN REPEATING THEMSELVES. Two
@@ -276,8 +347,12 @@ def main():
     # 3. MARKERS — additive, never sufficient alone unless strong.
     for m in msgs:
         hits, sc = [], 0
+        # AF-255: markers score what ETHAN wrote, never what he pasted. The
+        # 2026-08-26 run scored a customer meeting transcript at 13 on
+        # "still/again/i-said/already/you-didnt/no-response" — every one of
+        # them spoken by a meeting participant.
         for pat, w, name in MARKERS:
-            if re.search(pat, m["norm"]):
+            if re.search(pat, m["own"]):
                 hits.append(name)
                 sc += w
         if not hits:
