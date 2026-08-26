@@ -115,3 +115,46 @@ fn a_missing_transcript_is_unmeasurable_not_zero() {
     let _ = std::fs::remove_file(&missing);
     assert_eq!(amux_server::api::session_verbs::count_compact_boundaries(&missing), None);
 }
+
+#[test]
+fn a_file_larger_than_one_read_chunk_is_scanned_to_the_end() {
+    // THE BUG THIS PINS: the first draft did a single bounded read and returned
+    // the partial count as the answer. On the 324MB transcript of the lane that
+    // wrote this feature it reported 30 against a hand count of 75, and nothing
+    // about a low number says "truncated".
+    //
+    // A 64MB fixture is not worth writing, so this drives the same loop through
+    // the chunk seam with a tiny read size. That seam exists precisely so this
+    // test can fail: any fixture small enough to write fits inside one default
+    // 64MB read, so without it the test passes against the single-read bug it
+    // exists to catch.
+    let dir = std::env::temp_dir().join(format!("amux-gen-big-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("big.jsonl");
+    let mut body = String::new();
+    body.push_str(&one_compaction(0));
+    for i in 0..400 {
+        body.push_str(&ordinary_turn(i));
+    }
+    body.push_str(&one_compaction(1));
+    for i in 0..400 {
+        body.push_str(&ordinary_turn(i));
+    }
+    body.push_str(&one_compaction(2));
+    std::fs::write(&path, &body).unwrap();
+
+    // 4096 is the floor the implementation clamps to, and the fixture is many
+    // times that — so reaching the last boundary REQUIRES more than one read.
+    let chunk = 4096u64;
+    assert!(
+        body.len() as u64 > chunk * 3,
+        "fixture must span several chunks or this test cannot fail (it is {} bytes)",
+        body.len()
+    );
+    assert_eq!(
+        amux_server::api::session_verbs::count_compact_boundaries_with_chunk(&path, chunk),
+        Some(3),
+        "every boundary must be found, including the one at the very end of the file"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

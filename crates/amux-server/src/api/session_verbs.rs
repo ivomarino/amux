@@ -1495,6 +1495,18 @@ fn conversation_generations(name: &str) -> Option<u32> {
 /// lanes — the census one is a smoke test at best, since it passes vacuously
 /// on a machine with no sessions (ethos rule 7).
 pub fn count_compact_boundaries(path: &Path) -> Option<u32> {
+    count_compact_boundaries_with_chunk(path, 64 * 1024 * 1024)
+}
+
+/// [`count_compact_boundaries`] with the per-iteration read size exposed.
+///
+/// The chunk size is a MEMORY bound, never a scan bound — but proving that
+/// needs a fixture bigger than the chunk, and a 64MB fixture is not worth
+/// writing. So the test drives this with a tiny chunk instead. Without this
+/// seam the EOF-scan test is vacuous: any fixture small enough to write fits
+/// in one 64MB read, so it passes against the single-read bug it exists to
+/// catch.
+pub fn count_compact_boundaries_with_chunk(path: &Path, chunk: u64) -> Option<u32> {
     use std::io::{Read, Seek, SeekFrom};
     static CACHE: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, (u64, u32)>>> =
         std::sync::Mutex::new(None);
@@ -1511,17 +1523,48 @@ pub fn count_compact_boundaries(path: &Path) -> Option<u32> {
         count = 0;
     }
     if len > offset {
+        // CHUNKED TO EOF, not one bounded read. The first draft did a single
+        // `take(CHUNK)` and stopped, which on a 324MB transcript scanned the
+        // first 64MB and returned that partial count as if it were the answer:
+        // this lane read 30 against a hand count of 75. It was caught only
+        // because the live endpoint disagreed with the census that motivated
+        // the feature — a truncated scan is indistinguishable from a healthy
+        // low number, which is the exact failure the whole feature exists to
+        // stop reporting (ethos rule 4).
+        //
+        // A marker cannot straddle a chunk boundary: the offset only ever
+        // advances to the last complete LINE, so the next chunk re-reads from
+        // there. The cap is a memory bound per iteration, never a scan bound.
+        let chunk = chunk.max(4096);
         let mut f = std::fs::File::open(&path).ok()?;
         f.seek(SeekFrom::Start(offset)).ok()?;
-        let mut buf = Vec::with_capacity((len - offset).min(64 * 1024 * 1024) as usize);
-        f.take(64 * 1024 * 1024).read_to_end(&mut buf).ok()?;
-        let scanned = match buf.iter().rposition(|b| *b == b'\n') {
-            Some(i) => i + 1,
-            None => 0, // no complete line yet — leave the offset where it was
-        };
-        count += buf[..scanned].windows(COMPACT_BOUNDARY_MARKER.len()).filter(|w| *w == COMPACT_BOUNDARY_MARKER).count()
-            as u32;
-        offset += scanned as u64;
+        loop {
+            let remaining = len.saturating_sub(offset);
+            if remaining == 0 {
+                break;
+            }
+            let mut buf = Vec::with_capacity(remaining.min(chunk) as usize);
+            (&f).take(chunk).read_to_end(&mut buf).ok()?;
+            if buf.is_empty() {
+                break;
+            }
+            let scanned = match buf.iter().rposition(|b| *b == b'\n') {
+                Some(i) => i + 1,
+                // No complete line in this chunk. Leave the offset where it is
+                // so the record is counted once it terminates, and stop rather
+                // than spin: without this break a trailing fragment loops.
+                None => break,
+            };
+            count += buf[..scanned]
+                .windows(COMPACT_BOUNDARY_MARKER.len())
+                .filter(|w| *w == COMPACT_BOUNDARY_MARKER)
+                .count() as u32;
+            offset += scanned as u64;
+            if scanned < buf.len() {
+                // The chunk ended mid-line; re-read from the line boundary.
+                f.seek(SeekFrom::Start(offset)).ok()?;
+            }
+        }
         cache.insert(path, (offset, count));
     }
     Some(count)
