@@ -4870,6 +4870,30 @@ pub(crate) enum SendOrigin {
     Automation,
 }
 
+/// Does the isolation gate refuse this send? `None` means it proceeds.
+///
+/// A PURE PREDICATE, AND THAT IS THE POINT (AMUX-3765). The check used to be
+/// inline at the top of `send_text_inner`, which meant testing the ALLOWED
+/// cases required calling `send_text` — and `send_text_inner`'s auto-wake path
+/// STARTS A REAL SESSION for a lane that is not running. My own control
+/// assertions in `an_isolated_lane_refuses_amux_automation_and_still_takes_the_
+/// owners_send` therefore spawned two live Claude Code processes on the
+/// production tmux socket (`amux-raw`, `amux-ordinary`, 16:14 on 2026-08-26),
+/// in /private/tmp, on a Claude Max seat, and one of them ran a turn replying
+/// to the literal string "owner text".
+///
+/// The refused cases were safe — they return before any side effect — so the
+/// test looked fine and the damage was entirely in the CONTROLS, which exist to
+/// prove the gate is not "refuse everything". A control that has to invoke the
+/// side-effecting path to prove a negative is the wrong shape; assert the
+/// decision, not the delivery.
+pub(crate) fn isolation_refusal(name: &str, origin: SendOrigin) -> Option<&'static str> {
+    (origin == SendOrigin::Automation && session_is_isolated(name)).then_some(
+        "target is an isolated (raw-agent) worker: amux automation is not delivered into it. \
+         The owner's own send still works.",
+    )
+}
+
 /// The `guard` a send carries when a live selector parks it on the queue.
 ///
 /// Split out so the shipped path and its test share ONE definition. The park
@@ -5125,13 +5149,8 @@ async fn send_text_inner(
     // It also closes a hole the queue gate could not see: the `defer_if_busy`
     // park below re-enqueued with an EMPTY guard, so an automated send that
     // happened to find the lane at a selector was laundered into an owner send.
-    if origin == SendOrigin::Automation && session_is_isolated(name) {
-        return (
-            false,
-            "target is an isolated (raw-agent) worker: amux automation is not delivered into it. \
-             The owner's own send still works."
-                .into(),
-        );
+    if let Some(refusal) = isolation_refusal(name, origin) {
+        return (false, refusal.into());
     }
     let cfg = parse_env(name);
     if !iterm2_id(&cfg).is_empty() {
@@ -15350,27 +15369,64 @@ mod tests {
         // while amux automation still reached an isolated lane — the same
         // shape as the consumer list bc6d3067 deleted, one layer down.
         //
-        // `send_text` refuses before it touches tmux, so these assert on the
-        // verdict without a live session. A non-isolated lane returns a
-        // DIFFERENT failure (no tmux session), which is what makes the isolated
-        // case discriminating rather than "everything fails in a test".
-        let (ok, msg) = send_text(&st, "raw", "hot config", false, SendOrigin::Automation).await;
-        assert!(!ok);
+        // ASSERT THE DECISION, NEVER THE DELIVERY (AMUX-3765). The first
+        // version of this block called `send_text` for all three cells. The
+        // REFUSED one is safe — it returns before any side effect — but the two
+        // CONTROLS proceed, and `send_text_inner`'s auto-wake path STARTS A REAL
+        // SESSION for a lane that is not running. They spawned two live Claude
+        // Code processes on the production tmux socket, in /private/tmp, on a
+        // Claude Max seat, and one of them ran a turn replying to the literal
+        // string "owner text".
+        //
+        // The controls are the whole reason this test discriminates, so the
+        // answer is not to drop them: it is to test the gate's VERDICT through
+        // the pure predicate the send path now calls.
         assert!(
-            msg.contains("isolated"),
-            "automation must be refused at the SEND layer too, naming why: {msg}"
+            isolation_refusal("raw", SendOrigin::Automation).is_some(),
+            "automation must be refused at the SEND layer too"
         );
-        let (_, owner_msg) = send_text(&st, "raw", "owner text", false, SendOrigin::Owner).await;
         assert!(
-            !owner_msg.contains("isolated"),
-            "the owner's send must not be refused by the isolation gate: {owner_msg}"
+            isolation_refusal("raw", SendOrigin::Automation).unwrap().contains("isolated"),
+            "and the refusal must name why"
         );
-        let (_, ordinary_msg) =
-            send_text(&st, "ordinary", "hot config", false, SendOrigin::Automation).await;
         assert!(
-            !ordinary_msg.contains("isolated"),
-            "a non-isolated lane must fail for its OWN reason, not this gate: {ordinary_msg}"
+            isolation_refusal("raw", SendOrigin::Owner).is_none(),
+            "the owner's send must not be refused by the isolation gate"
         );
+        assert!(
+            isolation_refusal("ordinary", SendOrigin::Automation).is_none(),
+            "a non-isolated lane must be unaffected, or this gate is just 'turn the fleet off'"
+        );
+    }
+
+    /// The test above spawned real sessions, so this pins the property that
+    /// stops it recurring: NO test in this module may reach the auto-wake path.
+    ///
+    /// The tell is calling `send_text`/`send_text_inner` with a lane that is not
+    /// running — `send_text_inner` starts one. A grep is a weak check, and it is
+    /// the right weight here: the strong version needs a tmux seam this module
+    /// does not have, and a weak check that names the hazard beats the nothing
+    /// that was there when it happened (AMUX-3765).
+    #[test]
+    fn no_test_in_this_module_sends_into_a_lane_that_could_be_auto_woken() {
+        let src = include_str!("session_verbs.rs");
+        let tests = src.rfind("mod tests").map(|i| &src[i..]).unwrap_or("");
+        const NEEDLE: &str = "send_text(&st";
+        for (n, line) in tests.lines().enumerate() {
+            let l = line.trim();
+            // Skip the guard's OWN source: it necessarily contains the
+            // needle it searches for, which is the classic self-match.
+            if l.starts_with("//") || l.contains("NEEDLE") || !l.contains(NEEDLE) {
+                continue;
+            }
+            panic!(
+                "test-module line {n} calls send_text on a live store: {l}\n\
+                 `send_text_inner` AUTO-WAKES a lane that is not running, which starts a real \
+                 Claude Code process on the production tmux socket (AMUX-3765 did exactly this, \
+                 twice). Assert the decision through a pure predicate instead — \
+                 `isolation_refusal` is the one this module already exposes."
+            );
+        }
     }
 
     /// The `defer_if_busy` park used to erase the guard to `""` on its way to
