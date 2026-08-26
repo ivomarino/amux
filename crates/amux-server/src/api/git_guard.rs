@@ -351,6 +351,28 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
             ),
             false,
         ),
+        // AN OBSERVED CLAIM IS CIRCUMSTANTIAL, and says so (AMUX-3778).
+        //
+        // The record is a cwd mtime the Bash hook pair caught, not a recorded
+        // write. On a shared checkout that CANNOT distinguish your write from a
+        // peer's write in the same window: the hook walks the command's cwd and
+        // claims every file whose mtime moved, with no check that the command
+        // touched it. Live specimen (AMUX-3763): mixpeek-general was warned
+        // about radio-canada's brand-new file and both lanes lost a turn.
+        //
+        // Still flagged, still `true` for the at-risk count — the guard exists
+        // because absorption is real and under-warning is the expensive
+        // direction. What changes is that the sentence stops asserting a
+        // recorded write it does not have.
+        PathFate::AtRisk if provenance == "observed" => (
+            format!(
+                "  {pth}  — differs from HEAD and you have no commit for it. NOTE: your claim \
+                 here is OBSERVED (a file mtime moved during one of your Bash commands), not a \
+                 recorded edit. On a shared checkout a peer writing under your cwd looks \
+                 identical from here, so check whether this is actually yours before acting"
+            ),
+            true,
+        ),
         PathFate::AtRisk => (
             format!(
                 "  {pth}  — differs from HEAD and you have no commit for it; \
@@ -1363,6 +1385,25 @@ pub(crate) struct Verdict {
 fn provenance_of(inp: &GuardInputs, ap: &str) -> &'static str {
     if inp.theirs_restore.contains(ap) {
         "restore"
+    // OBSERVED BEFORE FIRSTHAND, and the order is the whole fix (AMUX-3778).
+    //
+    // `apply_observed` inserts observed rows INTO `theirs_firsthand` on
+    // purpose — AF-123, so a Bash-editing lane stops being penalised for a
+    // signal the harness makes unobtainable for it (ethos rule 3). Correct,
+    // and it made this function report every observed row as `firsthand`,
+    // because the firsthand check came first and the set had just been
+    // widened to include them.
+    //
+    // So the VICTIM NOTICE asserted a recorded write where the evidence was a
+    // cwd mtime — while the JSON verdict, three hundred lines up, already
+    // reported `their_provenance: "observed"` correctly off the same set. The
+    // machine-readable field was right and the sentence a human reads was
+    // wrong, which is the worse half to have wrong.
+    //
+    // This does NOT demote the record. Rank is unchanged and AF-123 holds; the
+    // claim is still made, it is just described honestly.
+    } else if inp.theirs_observed_only.contains(ap) {
+        "observed"
     } else if inp.theirs_firsthand.contains(ap) {
         "firsthand"
     } else {
@@ -3732,6 +3773,66 @@ mod tests {
     /// MG-1484: the foreign verdict carries the owner's claim PROVENANCE so
     /// every consumer (victim notice, nudges, external tripwires) can say
     /// "you restored this" instead of "you edited this".
+    /// AMUX-3778: an OBSERVED claim must not be described as a recorded write.
+    ///
+    /// `apply_observed` inserts observed rows into `theirs_firsthand` on
+    /// purpose (AF-123 — a Bash-editing lane must not be penalised for a signal
+    /// the harness denies it). That widened the set the provenance lookup
+    /// checked FIRST, so every observed row reported as `firsthand`, and the
+    /// victim notice asserted a recorded write over a cwd mtime. The JSON
+    /// verdict already reported "observed" correctly off the same data, so the
+    /// machine field was right and the human sentence was wrong.
+    ///
+    /// The specimen is AMUX-3763: mixpeek-general warned about radio-canada's
+    /// brand-new file, both lanes interrupted.
+    #[test]
+    fn an_observed_claim_reads_as_circumstantial_and_a_firsthand_one_does_not() {
+        let mut inp = GuardInputs::default();
+        let p = "/repo/customers/radio-canada/pipeline/s04_faces.py".to_string();
+        // Exactly what apply_observed does: rank it WITH firsthand, and mark
+        // how it was learned.
+        inp.theirs_firsthand.insert(p.clone());
+        inp.theirs_observed_only.insert(p.clone());
+        assert_eq!(
+            provenance_of(&inp, &p),
+            "observed",
+            "an observed row is ranked with firsthand but is not firsthand EVIDENCE"
+        );
+
+        let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed");
+        assert!(at_risk, "it is still flagged — under-warning is the expensive direction");
+        assert!(
+            line.contains("OBSERVED"),
+            "the notice must say how the claim was learned: {line}"
+        );
+        assert!(
+            !line.contains("the WORK ITSELF is at risk"),
+            "and must not assert a recorded write it does not have: {line}"
+        );
+
+        // CONTROL 1: a genuine firsthand edit still warns at FULL strength.
+        // Without this the fix could have defanged the guard and every
+        // assertion above would still pass — the acceptance criterion that
+        // matters most on AMUX-3778.
+        let mut inp2 = GuardInputs::default();
+        inp2.theirs_firsthand.insert(p.clone());
+        assert_eq!(provenance_of(&inp2, &p), "firsthand");
+        let (line2, at_risk2) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand");
+        assert!(at_risk2);
+        assert!(
+            line2.contains("the WORK ITSELF is at risk"),
+            "a recorded edit must keep the loud line: {line2}"
+        );
+
+        // CONTROL 2: restore still wins over both, or the new arm has silently
+        // reordered a case that was already correct.
+        let mut inp3 = GuardInputs::default();
+        inp3.theirs_restore.insert(p.clone());
+        inp3.theirs_firsthand.insert(p.clone());
+        inp3.theirs_observed_only.insert(p.clone());
+        assert_eq!(provenance_of(&inp3, &p), "restore");
+    }
+
     #[test]
     fn foreign_verdicts_carry_the_owners_claim_provenance() {
         let mut g = peer_wrote("f.md", "alice", 1000.0);
