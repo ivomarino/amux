@@ -106,6 +106,15 @@ stays live. So read an archived entry as *this sentence stopped being true*, nev
 *this area is done* — and when you retire the shallow one, say beside it that the deep
 one is open, or the next reader finds a "fixed" entry describing a live bug.
 
+The same edge exists on the CARD side, and it is worth stating because neither half
+would make you check the other. **A REVIEW is a claim about what was BUILT, not about
+the card's title** (amux, 2026-08-26). They signed off `AF-182` on a fix that did
+exactly what it claimed — the notice stopped saying a peer's error was yours — while
+the card's headline, "blocks your commit over a peer's uncommitted file", stayed true
+and recurred after the fix. The card held two units of work and no status was a true
+statement about it. Where an entry can be validated at the wrong DEPTH, a card can be
+reviewed at the wrong SCOPE; the remedy for both is to name which clause you tested.
+
 **Ask the author; do not infer from the card.** Card status is not evidence — this drain
 found entries whose card read `done` because the FEATURE had been deleted, because the
 lesson was encoded in a replacement, and because the card "closed on something else"
