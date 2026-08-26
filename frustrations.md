@@ -2801,3 +2801,40 @@ FIX: 7607ee46 (gtm-research renamed mine) + a guard in
   ask which members the LANGUAGE makes legal, because those are the ones it
   silently does not cover. A duplicate `let` is a SyntaxError; a duplicate
   `function` is not.
+
+## The nudge that tells you to union-merge cannot tell you how to do it safely
+AREA: notices
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: mixpeek-frustrations (hit it), amux (fixed it)
+CARD: AMUX-3718
+SYMPTOM: A DIVERGED FRUSTRATIONS.md nudge said `MERGE the two versions (for
+  append-only files, union-merge per .claude/rules/frustrations.md)` and stopped
+  there. Two things were wrong at once. The cited path exists in ~/Dev/amux and
+  NOT in ~/Dev/mixpeek, where the reader was, because commit_nudge is server
+  code that fires into every lane's OWN checkout. And the safe procedure it was
+  pointing at could never have arrived anyway: `build()` defines commit_worthy
+  as the dirty paths that are NOT stale/diverged/revived, and the archive-check
+  note was emitted from inside `commit_worthy_body`, which receives exactly that
+  set. So a DIVERGED append-only file was structurally excluded from the only
+  code that emits the archive check. The one state that prescribes a union-merge
+  was the one state that could not be told how to perform it.
+COST: A near-miss on real data. The lane followed the destructive half verbatim,
+  which would have resurrected an entry closed on a 692/692 prod measurement and
+  double-inserted a content twin already on origin under a different subject. It
+  also cost a second lane a wrongly-filed card, since from ~/Dev/mixpeek the
+  only visible symptom is "this file does not exist" and the citation looks like
+  the whole bug. Both readings were reasonable and both were incomplete.
+FIX: 972b44a4. Hoisted the note to `build()` over the full dirty set so it
+  travels with every arm, deleted the citation because the procedure is already
+  inline, and rewrote the note's unit test to go through `build()` — it had been
+  calling `commit_worthy_body` directly and was green for the entire time the
+  note was unreachable (ethos rule 7 / AF-161: a check pinning the wrong layer
+  is exactly as green as one pinning the right layer). Second fix per the
+  two-fixes rule: `missing_archive_check()` now WARNs on the ACTUAL delivered
+  bytes before `steer_enqueue`, so the next regression announces itself in
+  server-rs.log instead of arriving as another near-miss.
+  The general shape worth remembering: a citation is only as good as the reader's
+  checkout, and the dangerous half of an instruction must never be the half that
+  travels while the safety half is behind a link.
