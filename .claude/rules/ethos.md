@@ -151,6 +151,42 @@ failure as no tag.** The blindness just moves.
 **Check:** when this goes wrong, what will someone see? Then: will they see it *where
 they already look*? Verify from the consumer's vantage, not the producer's.
 
+**A SET-DIFFERENCE OVER ONE FILE CANNOT SEE A MOVE, AND REPORTS IT AS A DELETION EVERY
+TIME.** Five instances across four subsystems in three weeks, which is why this is here
+rather than in a card. The operation is not careless; it has no vocabulary for what
+happened, so it answers confidently in the one direction that reads as data loss —
+"these lines are gone" — and the natural remedy, restoring them, manufactures
+duplicates.
+
+- creative-dna measured **15 of 15** "lost" `FRUSTRATIONS.md` entries as deliberate
+  archive moves, after the restore/remove cycle had been run three times on origin
+  before anyone noticed (CD-78, correcting AMUX-3367).
+- The append-only push guard compared a FORK branch against the fork's stale
+  `origin/main`; entries archived upstream since the mirror last synced read as 228
+  deleted lines, and it refused an outside contributor's first branch with an
+  accusation of destroying other lanes' work (AF-234).
+- A drain read 17 ledger entries as missing from `origin/main`. All 17 were in the
+  archive.
+- The guard's own `archive_for` probed only `<stem>_ARCHIVE.md` and `<stem>_archive.md`.
+  This repo spells it `frustrations-archive.md`, with a HYPHEN, so the lookup returned
+  "none" **for the one file it exists to serve** — and the refusal text then asserted
+  that as a fact about the repo ("this repo has none"), which was false the whole time.
+- The same guard's union never called `archive_for` at all, so **every archive move in
+  this repo read as a deletion.**
+
+The last two are the ones worth sitting with: the instrument built to stop a move being
+read as a deletion was doing exactly that, in the repo that wrote the rule. Proximity to
+the lesson is not protection — the two authors who hit it most recently had each written
+about it that same week.
+
+Three things generalise past the file format. **Ask what your comparison cannot
+express**, not merely whether it ran: a diff over one file has no MOVE, a count has no
+identity, a status code has no operand. **A lookup that fails must not report its
+failure as a fact about the world** — "none found" and "this repo has none" are
+different claims, and the second one ends the investigation. And where a companion store
+exists (an archive, a tombstone table, a moved-to pointer), the check is
+absent-from-BOTH, never absent-from-one.
+
 ## 5. Does it accumulate, or does it discriminate?
 
 Automation that appends without deciding degrades as volume grows, no matter how good

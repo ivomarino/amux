@@ -1055,3 +1055,40 @@ FIX: The guard verifies that the COMMIT BEING REWRITTEN is yours and says nothin
   toward everywhere else, and nothing in the guard's message mentions it.
 
 ---
+
+## The untracked-work nudge is blind to review work, so a reviewer is told to record what they just recorded
+VALIDATED: amux-frustrations | RETIRED — the friction is gone because the FEATURE is gone, not because it was fixed. Verified on 2026-08-26 across the whole repo: the nudge was Python's `_task_guard`, never ported when 792ce1f deleted that server. `AMUX_TASK_GUARD` survives as a settings value read ONLY by its own GET handler (settings.rs::task_guard_enabled) and its own tests — zero consumers anywhere in crates/, scripts/ or .claude/. Nothing can fire the message this entry reports. The prescribed fix (a reviewer= suppression alongside the session= ones) is therefore unbuildable as written, and is recorded on AF-241 so it is not lost if the nudge is ever reimplemented. AF-241 also carries the live defect this drain surfaced: the dashboard toggle still ships and its status text asserts "idle workers are nudged to log tasks", which is false.
+AREA: notices
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-15
+SYMPTOM: "You went idle but have no board issue tracked as 'doing'. If you just did real
+  work, record it on the board now" fired 3 times in one afternoon against a correct
+  ledger. I had signed off 5 cards that day (AMUX-2542, 2553, 2562, 2565, 2566), each
+  carrying reviewer='amux-frustrations'. Both of the guard's suppressions key on
+  OWNERSHIP — `WHERE session=?` — and review->done lands on the AUTHOR's card, so from the
+  guard's vantage I had done nothing at all.
+COST: Small per firing, but the shape is the expensive part: there is no truthful way to
+  comply. A reviewer can create a card for "reviewed someone else's card" — not a unit of
+  work that can be honestly done or not done, and something the ledger rule explicitly
+  forbids — or ignore the nudge. I ignored it three times, which is exactly the training
+  the guard exists to prevent. _session_recently_closed_issue's own docstring names this
+  outcome: "pressures a session to create a placeholder card to silence it — fake work".
+FIX: One more suppression against the table it already queries:
+  `SELECT 1 FROM issues WHERE reviewer=? AND status='done' AND deleted IS NULL AND updated > ?`
+  using the same recency window. No new state, no new field. AF-15 has the detail.
+NOTE: what makes this instructive rather than just a bug is that the function had ALREADY
+  reasoned about review handoff — it treats an author parking at `review` as handed off,
+  not as stopping short, and explains why (the author is structurally forbidden from
+  closing a card that names a reviewer). It thought about one end of the handoff and not
+  the other. The reviewer is the party whose work is invisible BY CONSTRUCTION, because
+  they never own the card they close.
+  The generalisable half: `session=?` is the RIGHT predicate for auto-pickup and for the
+  verification sweep — you cannot pick up or verify a card you do not own — and the wrong
+  one here. A predicate that is correct three times out of four is the hardest kind to
+  audit, because every instance looks like the established pattern. Same family as the
+  ethos rule-1 note that a view must share the predicate of the mechanism it describes;
+  here the guard describes "did this lane work?" with a predicate that means "does this
+  lane own cards?".
