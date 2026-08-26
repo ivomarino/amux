@@ -666,6 +666,76 @@ async fn force_bypasses_the_gate_and_leaves_the_audit_line() {
     assert_eq!(detail["status"], json!("doing"));
 }
 
+/// AMUX-3464: an ATTRIBUTED force with a BLANK reason is refused too.
+///
+/// The measurement that motivated this: 41 force audit lines existed on the
+/// live board and 41 read `reason=` with nothing after it. Attribution was
+/// enforced (41/41 named an actor) and the judgment half was never once
+/// populated, so the ledger recorded that something happened and nothing about
+/// why — ethos rule 6's "audited bypass" that audits nothing.
+///
+/// The case above cannot catch this: it is UNATTRIBUTED, so it fails on the
+/// older check and would stay green if the reason requirement were deleted.
+/// This one supplies a valid session precisely so the reason is the only thing
+/// under test.
+#[tokio::test]
+async fn force_with_a_blank_reason_is_refused_even_when_properly_attributed() {
+    let (app, _dir) = app();
+
+    // Three spellings of "no judgment supplied", because the production
+    // specimens arrived as the first two: `amux board --force` omitted the
+    // field entirely, and raw PATCHes sent it empty.
+    for body in [
+        json!({ "status": "done", "force": true }),
+        json!({ "status": "done", "force": true, "reason": "" }),
+        json!({ "status": "done", "force": true, "reason": "   " }),
+    ] {
+        let card = create(&app, json!({ "title": "blank", "status": "doing" })).await;
+        let id = card["id"].as_str().unwrap().to_string();
+        let (st, _, v) = send_with(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(body.clone()),
+            &[("X-Amux-Session", "tester")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "body {body} should be refused: {v}");
+        assert_eq!(v["error"], json!("force requires a reason"), "{v}");
+        // The 409/400 body must name the SANCTIONED command, not just the HTTP
+        // shape. AMUX-2325: an error that publishes the escape purely in
+        // protocol terms sends a correct, literal-minded agent off-trail into a
+        // hand-rolled curl, which is where 25 of those 41 came from.
+        let how = v["how"].as_str().unwrap_or_default();
+        assert!(how.contains("amux board"), "refusal must name the CLI escape: {how}");
+
+        // The card did not move — a refused force must not half-apply.
+        let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        assert_eq!(detail["status"], json!("doing"), "{detail}");
+    }
+
+    // POSITIVE CONTROL, in the same test so a build that refuses EVERY force
+    // cannot pass. Without this the assertions above are satisfied by breaking
+    // force outright.
+    let ok = create(&app, json!({ "title": "with reason", "status": "doing" })).await;
+    let ok_id = ok["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send_with(
+        &app,
+        "PATCH",
+        &format!("/api/board/{ok_id}"),
+        Some(json!({ "status": "done", "force": true, "reason": "gate does not fit; judged by hand" })),
+        &[("X-Amux-Session", "tester")],
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "a force WITH a reason must still work: {v}");
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{ok_id}"), None).await;
+    let log = detail["log"].as_str().unwrap();
+    assert!(
+        log.contains("reason=gate does not fit; judged by hand"),
+        "the reason must reach the permanent audit line, not just the request: {log}"
+    );
+}
+
 // ---- archive / restore (RR-0055) -----------------------------------------
 
 #[tokio::test]
@@ -771,13 +841,15 @@ async fn archive_restore_round_trip_preserves_every_field() {
     assert_eq!(v2["rev"].as_i64().unwrap(), rev_after_archive);
 
     // A status PATCH on an archived card is refused (restore it first).
-    // Attributed force: this cell tests archived-immutability, not the
-    // force-attribution refusal (which would 400 first and mask it).
+    // Attributed force WITH a reason: this cell tests archived-immutability,
+    // and BOTH force preconditions 400 before the 409 can be reached, so
+    // either one missing masks the property under test. Attribution was the
+    // first (ts-gke 2026-08-03); `reason` joined it in AMUX-3464.
     let (st, _, v3) = send_with(
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "force": true })),
+        Some(json!({ "status": "done", "force": true, "reason": "testing immutability" })),
         &[("X-Amux-Session", "orch")],
     )
     .await;
@@ -1666,14 +1738,21 @@ async fn force_accepts_x_amux_worker_attribution_like_every_other_module() {
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST, "unattributed force must refuse: {v}");
+    // ORDERING MATTERS, and this assertion pins it. This control omits BOTH a
+    // header and a reason, so it trips two checks; attribution must be the one
+    // that answers, or the test silently stops covering attribution at all and
+    // starts covering AMUX-3464's reason check while still passing.
     assert_eq!(v["error"], json!("force requires attribution"), "{v}");
 
-    // THE CASE: the spelling the bash CLI actually sends.
+    // THE CASE: the spelling the bash CLI actually sends. The `reason` is
+    // required since AMUX-3464 (an audit line reading `reason=` recorded no
+    // judgment) and the CLI sends it; it is incidental to what THIS test is
+    // about, which is that x-amux-worker counts as attribution.
     let (st, _, v) = send_with(
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "force": true })),
+        Some(json!({ "status": "done", "force": true, "reason": "gate does not fit" })),
         &[("x-amux-worker", "amux")],
     )
     .await;

@@ -2660,6 +2660,51 @@ pub async fn patch_item(
             }),
         );
     }
+    // A REASON IS REQUIRED FOR FORCE, for the same reason attribution is
+    // (AMUX-3464, 2026-08-26). The check above fixed WHO and stopped there,
+    // and the half it left undone was 100% broken in production: of the 41
+    // force audit lines this board has ever written, 41 read `reason=` with
+    // nothing after the `=`. Not "mostly empty" — never once populated. The
+    // format string advertises the judgment and the field behind it was
+    // decoration, which is ethos rule 6 exactly: a bypass that claims to be
+    // audited and records only that something happened.
+    //
+    // It was not operators withholding it, either. `amux board --force` has
+    // always REFUSED to run without a reason, then sent it as `desc_append`
+    // instead of `reason` — 9 of those 41 cards carry a good "[FORCED] <why>"
+    // in their desc while their ledger line says nothing. So the sanctioned
+    // path collected the answer and dropped it, and the server accepted the
+    // blank without a murmur. Fixing only one end leaves the class alive:
+    // the CLI now sends `reason`, and this makes a blank one impossible to
+    // write from ANY caller, including the raw PATCHes that produced 25 of
+    // the 41 (the AMUX-2325 shape — a hand-rolled curl off the audited path).
+    //
+    // Fires on `force` ITSELF, not on `eff_gate && force`, for the reason the
+    // block above records: the specimens include gateless todo->discarded
+    // moves, so a gate-conditioned check cannot fail on them.
+    if map.get("force").and_then(Value::as_bool).unwrap_or(false)
+        && body_str(&map, "reason").is_none_or(|r| r.trim().is_empty())
+    {
+        // Named marker, because the refusal alone is not self-announcing: a
+        // 400 here groups with every other board-PATCH 400 in
+        // /api/logs/analyze, so "who is still forcing blind" would be
+        // invisible in the one place people already look. `id` names the card
+        // and `actor` names the lane, which is what routes the fix.
+        tracing::warn!(
+            marker = "force_without_reason",
+            card = %id,
+            actor = %actor_name,
+            "force refused: no reason supplied — caller is off the audited path (AMUX-3464)"
+        );
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "force requires a reason",
+                "why": "force bypasses the checks, so the card's log line IS the audit. `reason=` with nothing after it names an actor and records no judgment, which is indistinguishable from no audit at all — every force ever written to this board before AMUX-3464 was that shape.",
+                "how": "amux board <status> <ID> --force \"<why you are bypassing the gate>\" — the CLI sends both the ledger `reason` and a [FORCED] note on the card. Raw PATCH: add \"reason\": \"<why>\". Or satisfy the gate honestly — if it does not fit the work, the TYPE is wrong; fix the type, not the truth.",
+            }),
+        );
+    }
     let force_actor = actor_name.clone();
     // Python `_hdr_worker`: "" when the header is absent — the cross-lane
     // archive guard only fires for a NAMED caller (AMUX-2492).
