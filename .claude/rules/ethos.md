@@ -773,3 +773,31 @@ notice.
 happens, and hang the consequence off it, addressed to a named consumer, with a
 durable dedupe key. If you cannot name the consumer, you do not have an event —
 you have a log.
+
+## A CRDT is the wrong trade for the board, and the right one for text (2026-08-26)
+
+Recorded because the opposite is an easy conclusion to reach from the outside, and
+because the person best placed to argue FOR it argued against it.
+
+@tsukimiya (external contributor) had starred yjs as the "don't reinvent this wheel"
+option for collaborative editing, and volunteered the limit unprompted: *"For a
+field-level board, a CRDT is probably the wrong trade and you'd lose the audit
+trail."*
+
+That is right, and the audit trail is the reason. The board's load-bearing property is
+not that concurrent writes merge — it is that **every mutation is attributed and
+gated**. `force` names the party holding the judgment, `reviewer != owner` is enforced,
+the desc-clobber guard tests authorship and survival, and `expect_rev` is what makes a
+lost update loud. A CRDT converges silently by construction; converging silently is the
+one behaviour this board must not have. `rev` is not a poor man's CRDT here, it is a
+concurrency check whose FAILURE is the product.
+
+**When to revisit, and it is a real case:** genuine concurrent TEXT editing — shared
+instructions, a steer queue two lanes both edit, a document with no field boundaries.
+There the merge is the product and there is no per-field authorship question to lose.
+That is the case to reach for yjs, and it is not the board.
+
+The general form, worth more than the instance: **ask what the mechanism's FAILURE mode
+is for, before replacing it with one that cannot fail.** An optimistic-concurrency
+conflict is not friction to be engineered away; it is the moment the system tells you
+two parties disagreed, which is exactly what an attributed ledger exists to surface.
