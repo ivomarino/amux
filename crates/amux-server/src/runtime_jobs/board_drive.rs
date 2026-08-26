@@ -2584,6 +2584,34 @@ pub fn select_advance(
     let rev = row.reviewer.clone().unwrap_or_default().trim().to_string();
     let mut ball_with_author = String::new();
     if reviewer_acts_next(&status) && !rev.is_empty() && rev != session {
+        // A REVIEWER WHO IS NOT A WORKER IS A CARD PARKED FOREVER.
+        //
+        // `reviewer` is free text and nothing validates it when it is written,
+        // so a typo, a human's name, or a lane that has since been RENAMED all
+        // address the nudge to somebody who cannot receive it. Measured
+        // 2026-08-26: 7 open cards sat in `review` naming a reviewer that
+        // resolves to no registered worker — including `amux-rust`, renamed to
+        // `amux` long ago, because the rename cascade migrated
+        // `issues.session` and left `issues.reviewer` on the dead name (fixed
+        // in the same commit).
+        //
+        // NAMED and WARNed rather than silently skipped, because a nudge that
+        // goes nowhere is indistinguishable from a reviewer who is merely slow,
+        // and the card looks healthy in `review` either way (ethos rule 4).
+        if !crate::api::session_verbs::session_is_registered(&rev) {
+            tracing::warn!(
+                card = %card_id, reviewer = %rev, owner = %session,
+                "reviewer_unreachable: card parked in review naming a reviewer that is not a \
+                 registered worker — no nudge can be delivered, so nobody is coming"
+            );
+            return Advance::None {
+                reason: "reviewer-unreachable",
+                detail: format!(
+                    "{card_id} names reviewer `{rev}`, which is not a registered worker — \
+                     reassign it to a lane, or move the card to needsyou if a human owes the review"
+                ),
+            };
+        }
         match reviewer_has_responded(conn, &card_id, &rev) {
             // BALL IS WITH THE AUTHOR — SO TELL THE AUTHOR (py:13761, AMUX-2498).
             // Python said exactly this in a log line and then nudged nobody, so

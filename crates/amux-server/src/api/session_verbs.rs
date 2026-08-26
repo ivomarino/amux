@@ -1533,6 +1533,44 @@ pub fn count_compact_boundaries(path: &Path) -> Option<u32> {
 /// rule 8). amux reports; the human presses the button.
 pub const GENERATIONS_WARN_AT: u32 = 20;
 
+/// The rename cascade's table-by-table migration, hoisted to a const so it can
+/// be EXECUTED by a test rather than paraphrased by one (ethos rule 7: a test
+/// that restates the list is green whichever columns the shipped path
+/// actually touches).
+pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
+    ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
+    // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
+    // migrated a card's OWNER and left the two columns that address
+    // OTHER lanes pointing at the dead name. `amux-rust` was renamed
+    // to `amux` and cards still named `amux-rust` as reviewer, so
+    // the reviewer nudge addressed a session that no longer existed
+    // and the cards sat in `review` with nobody coming. Same column
+    // family, same failure, so shepherd goes with it.
+    (
+        "issues.reviewer",
+        "UPDATE issues SET reviewer=?1 WHERE reviewer=?2 AND deleted IS NULL",
+    ),
+    (
+        "issues.shepherd",
+        "UPDATE issues SET shepherd=?1 WHERE shepherd=?2 AND deleted IS NULL",
+    ),
+    ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
+    ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),
+    ("saved_messages", "UPDATE saved_messages SET session=?1 WHERE session=?2"),
+];
+
+/// Does this name resolve to a REGISTERED worker?
+///
+/// `reviewer` and `shepherd` are free-text columns — nothing validates them at
+/// write time — so a typo, a human's name, or a lane that has since been
+/// renamed all park a card on somebody no nudge can reach. This is the one
+/// predicate for "can amux address this name", so the board and the session
+/// verbs cannot disagree about it.
+pub fn session_is_registered(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && valid_session_name(n) && env_path(n).exists()
+}
+
 /// The degraded predicate, in ONE place. The hourly watch and the debug view
 /// both call it, so a view cannot disagree with the mechanism it describes —
 /// the drift ethos rule 1 names, which has cost this repo five separate
@@ -13040,12 +13078,8 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
             let mut out = Vec::new();
             // Python's cascade (py:76375-76437). issues: active only —
             // historical/deleted keep the old name, matching Python.
-            let python_tables: [(&str, &str); 4] = [
-                ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
-                ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
-                ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),
-                ("saved_messages", "UPDATE saved_messages SET session=?1 WHERE session=?2"),
-            ];
+            let python_tables = RENAME_MIGRATIONS;
+
             for (table, sql) in python_tables {
                 match conn.execute(sql, rusqlite::params![new_s, old_s]) {
                     Ok(n) => out.push(format!("db.{table}: {n} row(s)")),
