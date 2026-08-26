@@ -3424,6 +3424,13 @@
   }
   .board-card-noexec { display:inline-block; font-size:0.62rem; font-weight:700; padding:1px 6px; margin-bottom:4px; margin-left:4px;
     border-radius:4px; background:rgba(224,85,91,0.18); color:#e0555b; border:1px solid rgba(224,85,91,0.45); }
+  /* ISOLATED OWNER (AMUX-3728). Same shape as .board-card-noexec because it is
+     the same class of fact — a routing instruction on this card is unfollowable
+     — but AMBER rather than red: "no executor" is a problem to fix, this is a
+     constraint to respect. The full owner_reach sentence rides the title, so the
+     chip stays one line at 375px. */
+  .board-card-isolated { display:inline-block; font-size:0.62rem; font-weight:700; padding:1px 6px; margin-bottom:4px; margin-left:4px;
+    border-radius:4px; background:rgba(210,153,34,0.15); color:var(--warn,#d29922); border:1px solid rgba(210,153,34,0.45); }
   .board-card-shepherd { font-size:0.62rem; padding:1px 6px; border-radius:4px; background:rgba(137,87,229,0.15);
     color:var(--purple,#8957e5); border:1px dashed rgba(137,87,229,0.5); }
   .board-card-rot { display:inline-block; font-size:0.62rem; font-weight:600; padding:1px 6px; margin-bottom:4px;

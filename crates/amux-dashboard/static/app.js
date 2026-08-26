@@ -7913,7 +7913,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.738';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.739';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -23721,6 +23721,19 @@ function _renderBoardCard(item) {
   h += '<div class="board-card-key">' + _hlSearch(esc(item.id), _bq) + '</div>';
   if (item.doing_rot) h += '<div class="board-card-rot" title="Rotting: ' + item.doing_rot_days + 'd in doing with no board update and no commit/PR evidence. Evidence it forward or demote it.">&#x26A0; ' + Math.round(item.doing_rot_days) + 'd no evidence</div>';
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
+  // ISOLATED OWNER (AMUX-3728). The server computes owner_isolated and a
+  // written-out owner_reach for every card whose owning session is a raw agent,
+  // precisely so consumers do not each re-derive what isolation implies — and
+  // nothing rendered it, on any surface, since the day it shipped.
+  //
+  // It belongs HERE, beside `no executor`, because it is the same class of fact:
+  // the standard advice on half the cards on this board is "route it to its
+  // session", and for these cards that advice is unfollowable — the owner is not
+  // in the peer fleet list and peer sends to it are refused. The server's own
+  // sentence is used verbatim rather than paraphrased; that is what the field is
+  // for and re-wording it here would be the second spelling the comment warns
+  // against.
+  if (item.owner_isolated) h += '<div class="board-card-isolated" title="' + esc(item.owner_reach || 'The owning session is an isolated raw agent.') + '">&#x1F512; isolated owner</div>';
   h += '<div class="board-card-title">';
   if (boardViewMode === 'worker') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
   h += _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</div>';
