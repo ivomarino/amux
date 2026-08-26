@@ -2048,10 +2048,20 @@
      to the name, and it is the one card-face marker whose meaning is not
      guessable from a glyph. Sized to sit inside the existing card-name line so
      it costs no vertical space at 375px, and it is not a touch target, so the
-     44px rule does not apply. */
+     44px rule does not apply.
+
+     PREFIXED, like .pin-icon, and that is a bug fix rather than a style choice.
+     `.card-name` is `overflow:hidden; text-overflow:ellipsis; white-space:nowrap`,
+     so a SUFFIXED chip is what gets clipped when the name is long — measured at
+     375px on `af246-isolation-probe`, the chip's right edge landed at 304px
+     against a card edge of 289px and simply vanished. That loses exactly the
+     wrong half: the name is long, guessable and already truncating, while the
+     chip is the rare high-consequence fact the card exists to surface. Prefixing
+     makes the NAME absorb the truncation and keeps the flag visible at every
+     width. */
   .card-isolated { font-size: 0.6rem; font-weight: 600; letter-spacing: 0.04em;
     color: var(--warn, #d29922); border: 1px solid currentColor; border-radius: 4px;
-    padding: 0 4px; margin-left: 4px; vertical-align: middle; white-space: nowrap; }
+    padding: 0 4px; margin-right: 2px; vertical-align: middle; white-space: nowrap; }
   /* ── Dictation: compact recording popup (above the composer) ── */
   .dict-popup { display: none; position: absolute; bottom: calc(100% + 8px); right: 0; z-index: 60;
     background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px;
