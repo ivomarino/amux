@@ -48,6 +48,30 @@
 //! changed", so `status-explain` publishes the cadence beside the history and
 //! `history_recorded_since` distinguishes "this lane has been stable" from
 //! "this job has not been running long enough to know" (ethos rule 4).
+//!
+//! SAMPLING IS THE LOAD-BEARING CHOICE, not a convenience, and the reviewer's
+//! argument for it is better than the one this module shipped with (random,
+//! 2026-08-26): the badge in the original incident flipped because a report's
+//! trust window AGED OUT, and nothing fires when a window expires. Status is a
+//! pure function of (report age, pane, subagents, clocks) evaluated on read, so
+//! an event-driven hook can catch a report landing or a pane repaint and is
+//! structurally blind to a time-driven flip — which is precisely the class of
+//! bug this feature chases. Only sampling observes the whole space.
+//!
+//! ONE EDGE WHERE "EMPTY IS HONEST" LEAKS, recorded rather than hidden: the
+//! guarantee holds for RUNNING lanes, each of which gets a baseline row on its
+//! first census. A lane that has NEVER run returns `history: []` with a
+//! non-null `history_recorded_since`, which reads as "stable and sampled" when
+//! the truth is "never in the census". Benign, because a lane that never ran has
+//! no live badge to interrogate — but it is a leak, and making it airtight means
+//! separating "seen in a census at least once" from "never seen" on the read
+//! path.
+//!
+//! TICKS CANNOT OVERLAP, which is what makes it safe for these rows to carry no
+//! idempotency key: `spawn_periodic_every` is a single
+//! `loop { tick.tick().await; f().await; }` with `MissedTickBehavior::Delay`, so
+//! a slow tick delays the next one rather than running beside it. Two concurrent
+//! ticks would read the same `prev` and both insert the same change row.
 
 use rusqlite::Connection;
 use serde_json::json;
@@ -131,12 +155,17 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
         return (0, 0, 0);
     };
     let mut signals = crate::api::sessions_legacy::FleetSignals::load(&conn);
+    let prev = last_recorded(&conn);
+    // DROP THE POOLED CONNECTION BEFORE THE TMUX FAN-OUT (reviewer note, random
+    // 2026-08-26). `capture_panes` shells out across ~52 lanes and needs no DB;
+    // holding an r2d2 handle across it kept a pooled connection checked out for
+    // the whole fan-out. Writers take their own connection, so this was never a
+    // stall, only waste.
+    drop(conn);
     // The same evidence the badge weighs. Without this the job would derive a
     // status from signals the dashboard does not have, and record a history
     // that disagrees with the thing it exists to explain.
     signals.capture_panes();
-    let prev = last_recorded(&conn);
-    drop(conn);
 
     let mut rows: Vec<(String, String)> = Vec::new();
     let mut lanes = 0u32;
@@ -155,16 +184,30 @@ pub fn tick(state: &AppState) -> (u32, u32, u32) {
             .get(&name)
             .map(|(a, b)| (a.clone(), b.clone()))
             .unwrap_or_else(|| (String::new(), String::new()));
+        // `last_recorded_*`, NOT `prev_*` (reviewer note, random 2026-08-26).
+        // These are the last SAMPLED decision, which is not always the
+        // immediately preceding real one: within a single tick, A -> B -> C
+        // records only C carrying A, so the row reads as if A and C were
+        // adjacent while B was never seen. `prev_` claims an adjacency the
+        // sampler cannot promise, and this feature's whole spine is not
+        // overstating what an instrument knows.
+        //
         // Carry the EVIDENCE, not only the verdict. "decided_by: report" a day
         // later is half an answer; the report's state and age are what let
         // someone check whether the rule was applied to something sane.
         let data = json!({
             "status": status,
             "decided_by": decided_by,
-            "prev_status": ps,
-            "prev_decided_by": pd,
+            "last_recorded_status": ps,
+            "last_recorded_decided_by": pd,
             "report": explain.get("report").cloned().unwrap_or(serde_json::Value::Null),
-            "pane_says_working": explain["pane"]["says_working"],
+            // The WHOLE pane block, not just `says_working` — the same argument
+            // the reviewer made for keeping the report object, applied
+            // consistently. Without `churn_distinct_frames`, "was the pane
+            // actually painting then" was the one retrospective question a row
+            // could not answer, which is an odd gap in a feature built for
+            // retrospective questions.
+            "pane": explain.get("pane").cloned().unwrap_or(serde_json::Value::Null),
             "idle_report_age_s": explain.get("idle_report_age_s").cloned().unwrap_or(serde_json::Value::Null),
             "subagents_live": explain.get("subagents_live").cloned().unwrap_or(serde_json::Value::Null),
         });
