@@ -8481,27 +8481,94 @@ pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_
     SteerDelivery::Hold
 }
 
+/// One lane's stored self-report, with the SHARED trust verdict already applied.
+///
+/// `None` means the lane has never reported — a hookless lane (gemini, codex),
+/// or one whose hooks have not fired yet. It never means "idle".
+pub(crate) struct LaneReport {
+    pub state: String,
+    pub age_s: f64,
+    /// [`sessions_legacy::report_applies`] — the SAME predicate the status
+    /// badge uses. When false the report is evidence of nothing and the caller
+    /// must fall through to the pane.
+    pub applies: bool,
+}
+
+/// Read the report and judge it, in one place, for every mechanism that acts on
+/// one. Two callers had their own copy of the read and NEITHER judged it
+/// (AMUX-3756).
+pub(crate) fn lane_report(state: &AppState, name: &str) -> Option<LaneReport> {
+    let conn = state.store.read().ok()?;
+    let raw: String = conn
+        .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let rep = v.get(name)?;
+    let st = rep["state"].as_str()?.to_string();
+    // ts is a FLOAT (time.time()); as_i64 reads every report as epoch-0.
+    let ts = rep["ts"].as_f64().unwrap_or(0.0);
+    let started: f64 = conn
+        .query_row(
+            "SELECT MAX(ts) FROM session_events WHERE type='session.started' AND session=?1",
+            rusqlite::params![name],
+            |r| r.get::<_, Option<f64>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
+    let now = crate::config::now_f64();
+    let applies = crate::api::sessions_legacy::report_applies(&st, ts, started, now);
+    if !applies {
+        warn_stuck_report_once(name, &st, ts, now - ts);
+    }
+    Some(LaneReport { state: st, age_s: (now - ts).max(0.0), applies })
+}
+
+/// WARN once per lane per stuck report, so a lane held out of the drive loop by
+/// a report nothing will ever refresh SELF-ANNOUNCES (the two-fixes rule).
+///
+/// Keyed on the report's `ts`, not on the lane, for two reasons: the gate runs
+/// every tick and an unkeyed WARN would be a per-tick spew, and a NEW stuck
+/// report on the same lane is a new occurrence that must be heard. Silence here
+/// means every lane's report is being honoured, which is a different fact from
+/// "the gate never ran" — the board-drive trace carries the count either way.
+fn warn_stuck_report_once(name: &str, st: &str, ts: f64, age: f64) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+    let mut g = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    if g.get(name).copied() == Some(ts) {
+        return;
+    }
+    g.insert(name.to_string(), ts);
+    tracing::warn!(
+        session = %name,
+        report_state = %st,
+        report_age_s = age,
+        "stuck_self_report: this lane's stored report is no longer authoritative, so the \
+         turn-boundary gate is falling through to the pane. A stuck `active` report used to \
+         hold a lane out of auto-pickup, nudges and steering FOREVER (AMUX-3756) — the lane \
+         only ever escaped when a human typed at it. GET /api/sessions/<name>/status-explain \
+         for the trust evidence."
+    );
+}
+
 pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
     // 1. Self-report (hooks). "active" = mid-turn, "waiting" = at a selector.
-    let reported: Option<String> = state
-        .store
-        .read()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
-        })
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v[name]["state"].as_str().map(str::to_string));
-    if let Some(st) = reported {
-        return st == "idle";
+    //    ONLY while it is still authoritative — a report this gate would honour
+    //    but the status badge refuses is the AMUX-3756 deadlock.
+    if let Some(r) = lane_report(state, name) {
+        if r.applies {
+            return r.state == "idle";
+        }
     }
-    // 2. Hookless lane: the pane. Empty capture means "cannot tell" — and for a
-    // herdr lane mid-turn the capture is empty BY DESIGN (herdr refuses a
-    // history read while working/blocked), so treating empty as idle would
-    // deliver into exactly the state we are trying to avoid.
+    // 2. Hookless lane, or a report that no longer applies: the pane. Empty
+    //    capture means "cannot tell" — and for a herdr lane mid-turn the
+    //    capture is empty BY DESIGN (herdr refuses a history read while
+    //    working/blocked), so treating empty as idle would deliver into exactly
+    //    the state we are trying to avoid.
     let raw = tmux_capture(name, 12).await;
     if raw.trim().is_empty() {
         return false;
@@ -8527,18 +8594,12 @@ pub(crate) fn pane_is_at_boundary(raw: &str) -> bool {
 /// The same two signals `steer_lane_at_boundary` reads, fed into
 /// [`steer_decide`] together with the message's age.
 pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64) -> SteerDelivery {
-    let reported: Option<String> = state
-        .store
-        .read()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
-        })
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v[name]["state"].as_str().map(str::to_string));
+    // Same shared read and the same trust verdict as the gate above — this used
+    // to be a second, unjudged copy of the report read (AMUX-3756). A report
+    // that no longer applies is dropped to `None`, which routes to the pane
+    // exactly as a hookless lane does.
+    let reported: Option<String> =
+        lane_report(state, name).filter(|r| r.applies).map(|r| r.state);
     let pane_idle = if reported.is_some() {
         None
     } else {
@@ -17237,12 +17298,22 @@ mod steer_boundary_tests {
     }
 
     async fn set_report(state: &AppState, name: &str, st: &str) {
+        set_report_aged(state, name, st, 0.0).await
+    }
+
+    /// A report `age_s` old. The `ts` is not decoration: the boundary gate now
+    /// judges a report's AGE (AMUX-3756), and this fixture used to omit `ts`
+    /// entirely — which the old gate could not notice, because it asked only
+    /// `state == "idle"`. A fixture that cannot express the field the mechanism
+    /// reads cannot test the mechanism.
+    async fn set_report_aged(state: &AppState, name: &str, st: &str, age_s: f64) {
         let (n, s) = (name.to_string(), st.to_string());
+        let ts = crate::config::now_f64() - age_s;
         state
             .store
             .write_async(move |conn| {
                 ensure_fleet_tables(conn)?;
-                let blob = serde_json::json!({ &n: { "state": s } }).to_string();
+                let blob = serde_json::json!({ &n: { "state": s, "ts": ts } }).to_string();
                 conn.execute(
                     "INSERT INTO prefs(key,value) VALUES('session_reports',?1) \
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -17329,6 +17400,32 @@ mod steer_boundary_tests {
                 "reported state {reported:?} should give at_boundary={want}"
             );
         }
+
+        // AMUX-3756: AND ONLY WHILE THE REPORT IS STILL AUTHORITATIVE. A stuck
+        // `active` — the Stop hook never fired — used to hold the lane here
+        // forever, because this gate asked `state == "idle"` and nothing else.
+        // Measured live: 4 of 52 running lanes, up to 61.4 HOURS, every one
+        // with auto_pickup on and cards waiting. The lane's own dashboard badge
+        // read IDLE throughout, from the same row.
+        //
+        // A refused report falls through to the pane, and the pane for this
+        // fixture's non-existent tmux session captures empty, which
+        // `steer_lane_at_boundary` reads as "cannot tell" -> false. So both
+        // sides are false here and the assertion below would pass either way.
+        // The DISCRIMINATOR is `lane_report`'s verdict, which is what the gate
+        // consults, so assert on that: it is the value that used to be absent.
+        set_report_aged(&state, "probe", "active", 214_567.0).await;
+        let r = lane_report(&state, "probe").expect("the report row is present");
+        assert!(
+            !r.applies,
+            "a 59.5h-old `active` report must be refused, not honoured as mid-turn forever"
+        );
+        assert!(r.age_s > 200_000.0, "and its age must be legible to the caller");
+        set_report_aged(&state, "probe", "active", 30.0).await;
+        assert!(
+            lane_report(&state, "probe").expect("present").applies,
+            "a FRESH active report is still the authority — this gate must keep deferring to a real turn"
+        );
     }
 
     /// AMUX-3048: subagent start/stop events accumulate a live count in the same

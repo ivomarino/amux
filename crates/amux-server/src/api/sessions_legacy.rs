@@ -104,6 +104,51 @@ fn env_secs(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Is a stored self-report authoritative RIGHT NOW? The ONE trust rule, so the
+/// DISPLAY and the MECHANISMS that act on a report cannot disagree about the
+/// same row (AMUX-3756).
+///
+/// They did disagree, for months, and it deadlocked lanes permanently. The
+/// status derivation below applies this test and records `applied:false` for a
+/// report it refuses. `steer_lane_at_boundary` — the gate on auto-pickup, board
+/// nudges and steering delivery — read the SAME row and asked only
+/// `state == "idle"`, with no age, no life and no staleness. So a lane whose
+/// Stop hook never fired kept a stuck `active` report, the dashboard correctly
+/// showed IDLE (`decided_by: activity_fallback`), and the drive loop skipped it
+/// as `mid-turn` forever. Measured live 2026-08-26: 4 of 52 running lanes held
+/// this way — ai-video-editor 59.5h, creative-dna 61.4h, mixpeek-autopilot 6.4h,
+/// primer 1.0h — every one of them `auto_pickup: true` with eligible cards
+/// waiting.
+///
+/// The deadlock is SELF-PERPETUATING, which is what made it Ethan's "why do i
+/// need to push X to continue": only a turn writes a new report, and only a
+/// human starts a turn on a lane the drive loop refuses to touch. Pushing it by
+/// hand was the sole exit, and doing so cleared the evidence.
+///
+/// Pure and parameterised so both callers can be tested on the same cells.
+pub fn report_applies(state: &str, ts: f64, started: f64, now: f64) -> bool {
+    // A report from BEFORE the session's last (re)start describes a PREVIOUS
+    // LIFE. A restarted claude lane loses nothing: its hooks re-report on the
+    // first turn, and until then the pane and activity decide.
+    let from_this_life = started <= ts;
+    let age = now - ts;
+    // An `active` report is a claim about a turn in flight, and a turn in
+    // flight paints. Silence past the heartbeat means the claim outlived its
+    // evidence — a Stop hook that never fired, a crashed turn, an interrupt.
+    let stale_active = state == "active" && age > env_secs("AMUX_ACTIVE_HEARTBEAT_S", 120.0);
+    // `idle` survives silence (an idle lane has nothing to report until its
+    // next prompt); every other state has a much shorter trust window.
+    let trust_window = if state == "idle" {
+        env_secs("AMUX_HOOKS_LIVE_IDLE_S", 86400.0)
+    } else {
+        env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
+    };
+    from_this_life
+        && !stale_active
+        && age < trust_window
+        && matches!(state, "active" | "idle" | "waiting")
+}
+
 /// Pane captures abandoned on a deadline, and the lanes they were for.
 ///
 /// AMUX-3700. Surfaced in `GET /api/debug/tmux` because a bounded capture is
@@ -1175,7 +1220,8 @@ impl FleetSignals {
             // claude lane loses nothing: its hooks re-report on the first
             // turn, and until then the pane and activity decide — which is
             // exactly right for the boot window.
-            let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= ts;
+            let started = self.started.get(name).copied().unwrap_or(0.0);
+            let from_this_life = started <= ts;
             let age = self.now - ts;
             let stale_active = st == "active" && age > heartbeat;
             let trust_window = if st == "idle" {
@@ -1183,11 +1229,11 @@ impl FleetSignals {
             } else {
                 env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
             };
-            let live = age < trust_window;
-            let applied = from_this_life
-                && !stale_active
-                && live
-                && matches!(st, "active" | "idle" | "waiting");
+            // THE VERDICT COMES FROM THE SHARED PREDICATE, never from the
+            // locals above — those exist only to publish the evidence. The
+            // steering/pickup gate calls the same function, so the display and
+            // the mechanism cannot drift (AMUX-3756, ethos rule 1).
+            let applied = report_applies(st, ts, started, self.now);
             ex.insert(
                 "report".into(),
                 json!({
@@ -3656,6 +3702,80 @@ Claude usage limit reached. Your limit will reset at 3pm.
         let (status, ex) = s.derive_status_explain("x", false);
         assert_eq!(status, "");
         assert_eq!(ex["decided_by"], json!("not_running"));
+    }
+
+    /// AMUX-3756. The status badge and the turn-boundary gate must reach the
+    /// same verdict about the same stored report.
+    ///
+    /// The bug was not that either side was wrong in isolation. `derive_status`
+    /// judged the report and published `applied:false`; the gate on auto-pickup
+    /// / nudges / steering read the same row and asked only `state == "idle"`.
+    /// A stuck `active` report therefore showed IDLE on the dashboard and
+    /// `mid-turn` to the drive loop — permanently, because the only thing that
+    /// writes a new report is a turn and the only thing that starts a turn on a
+    /// lane the loop refuses to touch is a human typing at it.
+    ///
+    /// The cells below are the four lanes MEASURED in that state on 2026-08-26,
+    /// with their real ages. Each carries the drive loop's old answer beside the
+    /// new one, so the row that used to deadlock is named rather than implied.
+    #[test]
+    fn the_boundary_gate_and_the_badge_judge_a_report_the_same_way() {
+        let now = 1_787_766_000.0;
+        let born = now - 400_000.0; // every lane started well before its report
+        // (state, age_s, applies?, lane it was measured on)
+        let cells: &[(&str, f64, bool, &str)] = &[
+            ("active", 214_567.0, false, "ai-video-editor (59.5h, prompt-hook)"),
+            ("active", 221_356.0, false, "creative-dna (61.4h, tool-hook)"),
+            ("active", 22_952.0, false, "mixpeek-autopilot (6.4h, prompt-hook)"),
+            ("active", 3_390.0, false, "primer (56m, tool-hook)"),
+            ("active", 9.0, true, "tubescience — genuinely mid-turn, must stay held"),
+            // THE CELLS THAT ISOLATE `stale_active` FROM THE TRUST WINDOW.
+            // Every measured lane above is also past the 1800s active window,
+            // so without these three the whole `stale_active` leg could be
+            // deleted and this test would stay green — verified by mutation,
+            // which is the only reason they exist. An `active` report is
+            // refreshed by the tool hook on every tool call, so silence past
+            // the 120s heartbeat means the turn died; without this leg the
+            // deadlock window is 30 minutes rather than 2.
+            ("active", 119.0, true, "inside the heartbeat — a real turn between tool calls"),
+            ("active", 121.0, false, "one second past it: the turn stopped reporting"),
+            ("active", 600.0, false, "10m silent but inside the 1800s window — stale_active only"),
+            ("idle", 50.0, true, "gtm-research — fresh stop-hook idle"),
+            ("idle", 40_000.0, true, "idle survives silence inside its 24h window"),
+            ("idle", 90_000.0, false, "past the 24h idle window"),
+            ("waiting", 60.0, true, "a fresh selector report"),
+            ("compacting", 5.0, false, "a state no rule knows is not evidence"),
+        ];
+        for (st, age, want, why) in cells {
+            let ts = now - age;
+            assert_eq!(
+                report_applies(st, ts, born, now),
+                *want,
+                "report_applies({st}, age={age}s): {why}"
+            );
+            // THE ANTI-DRIFT HALF: the badge's own `applied` field, produced by
+            // the shipped derivation over the same row, must agree. A second
+            // copy of this rule inside derive_status_explain would pass every
+            // assertion above and still deadlock the fleet.
+            let mut s = signals();
+            s.now = now;
+            s.running.insert("amux-x".into());
+            s.reports = json!({"x": {"state": st, "ts": ts, "source": "t"}});
+            let (_, ex) = s.derive_status_explain("x", true);
+            assert_eq!(
+                ex["report"]["applied"],
+                json!(*want),
+                "the badge disagrees with the gate about {st}/{age}s: {ex}"
+            );
+        }
+
+        // A report from a PREVIOUS LIFE is refused whatever its age says. The
+        // gate had no life check at all, so a pre-restart `active` held a lane
+        // that had since been restarted and was sitting at a fresh prompt.
+        assert!(
+            !report_applies("active", now - 5.0, now - 1.0, now),
+            "a report predating the last session.started describes a dead process"
+        );
     }
 
     /// AMUX-3433, the property the card exists for: a lane generating with a

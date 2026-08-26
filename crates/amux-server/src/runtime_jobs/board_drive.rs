@@ -1402,11 +1402,32 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     // needs:you re-nag keeps chasing the human either way. Same LIKE form as
     // the candidate query below, so the two loops can never disagree about
     // which cards are human-blocked (the py split this fixes).
+    // AND NEITHER DOES A CAPTURE SHELL amux MINTED ITSELF (AMUX-3757). A card
+    // whose desc is still literally `**Prompt:** <what the human typed>` is an
+    // UNANSWERED PROMPT, not work in progress — nothing about it is done or
+    // not-done, which is why the decompose nudge exists to make the lane
+    // dispose of it.
+    //
+    // Counting it against WIP-1 made the act of TYPING AT A LANE disable that
+    // lane's auto-pickup. Ethan, 2026-08-26: "why do i need to push
+    // @tubescience to continue despite it having so many tasks in its
+    // backlog". tubescience was holding TUBES-2225, titled "Why are you
+    // stopping" — his own complaint about the lane stopping, captured as a
+    // `doing` card, which is what guaranteed it would keep stopping. The
+    // frustrated re-prompt is the single most likely prompt to arrive at a
+    // stalled lane, so the loop closes on exactly the lanes already in trouble.
+    //
+    // Same `substr(desc,1,11)` form as the fold query in board.rs, so the two
+    // can never disagree about what a capture shell is. RESHAPING the desc —
+    // the sanctioned exit the decompose nudge asks for — makes the card stop
+    // matching and start counting again, which is correct: at that point it IS
+    // a unit of work.
     let cap = wip_cap();
     let holding: Vec<String> = conn
         .prepare(
             "SELECT id FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
+             AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''), 1, 11) = '**Prompt:**') \
              AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
                              AND lower(t.tag) LIKE 'needs:you%') \
              ORDER BY id",
@@ -2171,6 +2192,28 @@ pub fn select_advance(
     tags: &[String],
     now: f64,
 ) -> Advance {
+    select_advance_with(conn, session, tags, now, &crate::api::session_verbs::session_is_registered)
+}
+
+/// [`select_advance`] over an INJECTED "is this name a registered worker"
+/// lookup.
+///
+/// The reviewer-unreachable gate (AMUX-3751) needs to know whether a nudge can
+/// actually be delivered, and the only source for that is the real
+/// `~/.amux/sessions` tree. Reading it from inside this otherwise-pure board
+/// function made three routing tests depend on which lanes happen to exist on
+/// the machine running them — they passed here and would fail in CI, which is
+/// the worst version of that dependency because the failure appears in someone
+/// else's push. `set_home` would serialise them against every other
+/// home-mutating test; an injected lookup costs nothing and is what
+/// `config::resolve_home`'s doc asks new tests to prefer.
+pub fn select_advance_with(
+    conn: &Connection,
+    session: &str,
+    tags: &[String],
+    now: f64,
+    is_registered: &dyn Fn(&str) -> bool,
+) -> Advance {
     let budget = advance_card_budget();
 
     // PER-SESSION COOLDOWN, with PROGRESS YIELDING IT (py:13346, AMUX-2500).
@@ -2598,7 +2641,7 @@ pub fn select_advance(
         // NAMED and WARNed rather than silently skipped, because a nudge that
         // goes nowhere is indistinguishable from a reviewer who is merely slow,
         // and the card looks healthy in `review` either way (ethos rule 4).
-        if !crate::api::session_verbs::session_is_registered(&rev) {
+        if !is_registered(&rev) {
             tracing::warn!(
                 card = %card_id, reviewer = %rev, owner = %session,
                 "reviewer_unreachable: card parked in review naming a reviewer that is not a \
@@ -2995,8 +3038,23 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // anything not positively known to be idle is left alone. A nudge that waits
     // one more tick costs nothing; a nudge delivered mid-turn is an interruption.
     if !fleet.at_boundary(lane).await {
-        return LaneTrace::skip(lane, "mid-turn", "lane is not at a turn boundary")
-            .with_counts(eligible, open);
+        // NAME THE EVIDENCE, not just the verdict. `mid-turn` read identically
+        // for a lane genuinely generating and for one held by a self-report
+        // nothing would ever refresh — and the second kind sat here for up to
+        // 61 hours (AMUX-3756). The gate now falls through to the pane for a
+        // stale report, so this detail is what makes the remaining cases
+        // legible: a fresh report age is a real turn, a huge one is the class
+        // that used to deadlock.
+        let detail = match crate::api::session_verbs::lane_report(state, lane) {
+            Some(r) => format!(
+                "lane is not at a turn boundary (self-report `{}` {:.0}s old, {})",
+                r.state,
+                r.age_s,
+                if r.applies { "authoritative" } else { "REFUSED as stale — pane decided" }
+            ),
+            None => "lane is not at a turn boundary (no self-report; the pane decided)".into(),
+        };
+        return LaneTrace::skip(lane, "mid-turn", detail).with_counts(eligible, open);
     }
 
     let now = now_f64();
@@ -3833,6 +3891,19 @@ mod reviewer_renag_tests {
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// Every test below routes through the injected-lookup seam with a
+    /// PERMISSIVE registry, shadowing the real `select_advance`.
+    ///
+    /// A board fixture's `peer` / `reviewer` lanes exist on no machine, so the
+    /// reviewer-unreachable gate (AMUX-3751) turned "this test host has no lane
+    /// called peer" into a routing failure — three routing tests, red on any
+    /// host, including CI. Tests that mean to exercise the GATE pass their own
+    /// lookup to `select_advance_with`; `the_gate_refuses_a_reviewer_no_nudge_
+    /// can_reach` below is the one that does, so this shadow cannot hide it.
+    fn select_advance(conn: &Connection, session: &str, tags: &[String], now: f64) -> Advance {
+        select_advance_with(conn, session, tags, now, &|_| true)
+    }
 
     /// The drain cadence must SCALE to the backlog (Ethan 2026-08-13: big idle
     /// backlogs drained too slowly at a flat 2h). Pure math, no env.
@@ -4862,6 +4933,54 @@ mod tests {
         assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
     }
 
+    /// AMUX-3757, Ethan 2026-08-26: "why do i need to push @tubescience to
+    /// continue despite it having so many tasks in its backlog".
+    ///
+    /// Because typing at a lane disabled its auto-pickup. Every prompt is
+    /// auto-captured as a `doing` card whose desc is still literally
+    /// `**Prompt:** <what he typed>`, and that card counted against WIP-1. The
+    /// specimen is TUBES-2225, titled "Why are you stopping" — the complaint
+    /// about the lane stopping was the thing holding the slot that kept it
+    /// stopped. Measured that day: 14 of 52 running lanes idle at the cap with
+    /// 281 cards stranded behind them.
+    ///
+    /// The second cell is the one that makes this a gate rather than a hole. A
+    /// RESHAPED card — desc rewritten into a real definition, which is the exit
+    /// the decompose nudge asks for — must go back to holding WIP, because at
+    /// that point it IS work in progress. Without it, `NOT (creator='amux')`
+    /// alone would exempt every amux-minted card forever and this test would
+    /// look identical.
+    #[test]
+    fn a_capture_shell_does_not_hold_the_wip_slot_but_a_reshaped_card_does() {
+        let conn = board_db();
+        add_card(&conn, "C-1", "lane", "doing", "Why are you stopping", "**Prompt:** why are you stopping? you should continue");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='C-1'", []).expect("mint");
+        add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
+        assert_eq!(
+            claimed(&select_pickup(&conn, "lane", now_f64())),
+            Some("T-1"),
+            "an unanswered prompt is not work in progress; the lane must still be dealt"
+        );
+
+        // Reshaped: same card, same creator, a real definition.
+        conn.execute(
+            "UPDATE issues SET \"desc\"='SCOPE: fix the stall\n- [ ] repro' WHERE id='C-1'",
+            [],
+        )
+        .expect("reshape");
+        conn.execute("UPDATE issues SET status='todo' WHERE id='T-1'", []).expect("reset");
+        match select_pickup(&conn, "lane", now_f64()) {
+            Pickup::None { reason, detail } => {
+                assert_eq!(reason, "wip-cap");
+                assert!(detail.contains("C-1"), "the reshaped card holds the slot: {detail}");
+            }
+            other => panic!(
+                "a reshaped capture is real work and must hold WIP, got {:?}",
+                claimed(&other)
+            ),
+        }
+    }
+
     /// Backend, 2026-08-11 afternoon: 16 claims in one hour, every card
     /// bounced `doing -> todo` with notes, nothing executed — and the drive
     /// kept dealing. Three bounced claims in 2h now stop the deal. The
@@ -5177,6 +5296,42 @@ mod tests {
             needsyou_renag_text(&conn, "lane", "D-1", "t", 10.0 * 86400.0, 0, now_f64()).is_none(),
             "a re-stated ask must not be re-nagged"
         );
+    }
+
+    /// AMUX-3751's gate, which shipped with no test of its own and whose only
+    /// effect on the suite was turning three unrelated routing tests red.
+    ///
+    /// A card parked in `review` naming a reviewer that resolves to no worker
+    /// reads HEALTHY — the status says someone is looking at it — while the
+    /// nudge is addressed to a session that does not exist, so nobody is
+    /// coming. Seven open cards sat that way on 2026-08-26, two of them naming
+    /// `amux-rust`, a lane renamed to `amux` long before, because the rename
+    /// cascade migrated `issues.session` and left `issues.reviewer` behind.
+    ///
+    /// Both cells, over the SAME card: the only thing that changes is whether
+    /// the reviewer is reachable. A gate tested only on its refusal could be
+    /// `|_| false` and look identical here.
+    #[test]
+    fn the_gate_refuses_a_reviewer_no_nudge_can_reach() {
+        let conn = board_db();
+        add_card(&conn, "R-9", "lane", "review", "needs a peer", "SCOPE: x");
+        conn.execute("UPDATE issues SET reviewer='amux-rust' WHERE id='R-9'", []).expect("rev");
+
+        match select_advance_with(&conn, "lane", &[], now_f64(), &|_| false) {
+            Advance::None { reason, detail } => {
+                assert_eq!(reason, "reviewer-unreachable");
+                assert!(detail.contains("amux-rust"), "must name the dead reviewer: {detail}");
+            }
+            Advance::Nudge { kind, target, .. } => panic!("an unreachable reviewer must not be nudged (kind={kind}, target={target})"),
+        }
+
+        match select_advance_with(&conn, "lane", &[], now_f64(), &|n| n == "amux-rust") {
+            Advance::Nudge { target, kind, .. } => {
+                assert_eq!(target, "amux-rust", "a REACHABLE reviewer is still routed");
+                assert_eq!(kind, "review-routed");
+            }
+            Advance::None { reason, detail } => panic!("the gate must only refuse the unreachable case, got {reason}: {detail}"),
+        }
     }
 
     /// A card in review with a named reviewer is the REVIEWER's work: pushing
