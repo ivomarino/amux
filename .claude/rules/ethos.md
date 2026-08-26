@@ -42,6 +42,37 @@ So **exemption lists deserve the same "who receives this by default" question as
 feature flags.** When you exempt something from a loop, name what still reaches it. If
 the answer is nothing, the exemption did not make it cheap, it made it invisible.
 
+**A SAFETY NOTE ATTACHED TO THE HEALTHY BRANCH OF A CONDITIONAL CANNOT REACH THE
+UNHEALTHY ONE** (AMUX-3718, 2026-08-25; the generalisation is
+mixpeek-frustrations'). The commit nudge's union-merge directive carried CD-78's
+archive check inline and correctly, and it was emitted from `commit_worthy_body`,
+which by definition receives only the paths that are NOT stale/diverged/revived.
+So a DIVERGED `frustrations.md` was structurally excluded from the one piece of
+text that says how to merge it safely. The state that prescribes the dangerous
+operation was the state that could not be told how to perform it, and a lane
+followed the destructive half verbatim because that half was all it received.
+
+Reviewing that fix, the same shape was found one instance over and confirmed with
+a control before anything was changed: `ATTRIBUTION IS PARTIAL` came from the same
+function, so a DIVERGED-only nudge dropped it — while that arm's prescribed exit
+is "hand the path to its owner" and the caveat is the one saying the ownership
+axis is blind. Two independent warnings, same emitter, both scoped to the arm
+that needed them least.
+
+Two things generalise. **A caveat about the whole SET belongs at the top level,
+never inside an arm** — an arm-scoped emitter silently scopes the warning to that
+arm, and nothing about reading it reveals that. And **the audit is per-STATE, not
+per-string**: "is the warning present and correct" was yes throughout, so the
+question has to be *which states actually receive it*. Where the arms are
+enumerable, assert the matrix rather than the case, so a third caveat added to the
+wrong function fails the moment its arm is listed.
+
+Note what did NOT catch either one. A delivery-time check on the rendered bytes
+catches the text going missing, which is a different failure; it is blind to a new
+note born in the wrong scope. That gap was found by a reviewer asking what the new
+instrument still could not see, which is the question worth asking after adding
+one.
+
 The trap nests, which is how you know it is structural rather than a slip: the fix
 (`is:armed`) ran on a payload filtered to `archived=0`, and so did the review sweep
 built alongside it — so three ARCHIVED armed watches remained invisible to both the

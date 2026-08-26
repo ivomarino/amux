@@ -579,6 +579,27 @@ pub fn build(
     if let Some(note) = append_only_note(&dirty) {
         msg.push_str(&note);
     }
+    // SAME SHAPE, ONE INSTANCE OVER (flagged by mixpeek-frustrations while
+    // reviewing the fix above; measured with a positive control before acting).
+    //
+    // `ATTRIBUTION IS PARTIAL` was also emitted only from `commit_worthy_body`,
+    // so a nudge whose every path is DIVERGED — commit_worthy empty, that
+    // function never called — dropped it. Probe: diverged+partial rendered
+    // false, commit-worthy+partial rendered true.
+    //
+    // It matters most exactly where it went missing. The DIVERGED arm's
+    // prescribed exit is "hand the path to its owner", and this caveat is the
+    // one that says the ownership axis is unreliable. The arm that most needs
+    // to know attribution is blind was the arm that could not be told.
+    //
+    // The generalisation, worth more than either fix: A SAFETY NOTE ATTACHED TO
+    // THE HEALTHY BRANCH OF A CONDITIONAL CANNOT REACH THE UNHEALTHY ONE. When
+    // you write a warning, check which states actually receive it. Caveats
+    // about the WHOLE dirty set belong here, at the top level, never inside an
+    // arm — an arm-scoped emitter silently scopes the warning to that arm.
+    if let Some(why) = &own.partial {
+        msg.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
+    }
     // AF-135 defect 1: the message timestamped origin's tip but never said
     // when it OBSERVED the tree, so a snapshot composed before a commit and
     // delivered at the next turn boundary read as live and named files
@@ -724,7 +745,9 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
         }
         let n = unknown.len();
         let list: String = unknown.iter().take(10).map(|f| format!("  {f}\n")).collect();
-        let mut m = format!(
+        // Not `mut`: the partial-attribution caveat used to be appended here and
+        // now renders once in `build`, so it reaches every arm (AMUX-3718).
+        let m = format!(
             "You went idle with {n} uncommitted change(s) under {dir} whose OWNERSHIP IS \
              UNKNOWN — no session has an edit record for {}:\n{list}\n\
              Do NOT assume {} yours. `git add -A` here would commit whatever a peer is \
@@ -751,9 +774,6 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
             if n == 1 { "it" } else { "them" },
             if n == 1 { "it is" } else { "they are" },
         );
-        if let Some(why) = &own.partial {
-            m.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
-        }
         return Some(m);
     }
 
@@ -818,9 +838,6 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              Not counted above and not necessarily yours; check before staging.",
             list.join(", ")
         ));
-    }
-    if let Some(why) = &own.partial {
-        msg.push_str(&format!("\n\nATTRIBUTION IS PARTIAL — {why}"));
     }
     if !own.shared.is_empty() {
         // AF-135 defect 2: "(unknown)" is the NO-PEER placeholder from the
@@ -2691,6 +2708,53 @@ mod tests {
             missing_archive_check(&dirty, &same_fresh, broken).is_none(),
             "the checker must share `build`'s same-filter, not re-derive it"
         );
+    }
+
+    /// A CAVEAT ABOUT THE WHOLE DIRTY SET MUST REACH EVERY ARM (AMUX-3718,
+    /// second instance, flagged by mixpeek-frustrations).
+    ///
+    /// The archive check and the partial-attribution disclosure are both
+    /// properties of the SET, not of whichever remedy the set happens to be
+    /// under. Both were emitted from `commit_worthy_body`, which only ever sees
+    /// `commit_worthy` — the paths that are NOT stale/diverged/revived — so both
+    /// vanished from exactly the arms that most needed them. Measured before
+    /// fixing, with a control: diverged+partial rendered false, ordinary
+    /// commit-worthy+partial rendered true.
+    ///
+    /// This cell exists so the SHAPE cannot come back quietly. It is a matrix,
+    /// not a case: a third caveat added to the wrong function fails here the
+    /// moment someone adds its arm to the list.
+    #[test]
+    fn set_wide_caveats_render_in_every_arm_not_only_the_commit_worthy_one() {
+        let dirty = s(&["FRUSTRATIONS.md"]);
+        let own = Ownership {
+            partial: Some("no transcript for cotenant amux-helper".into()),
+            ..Default::default()
+        };
+        // Every arm `build` can render, including the default (commit-worthy)
+        // one, which is the control: if IT ever goes false the test is broken
+        // rather than the code.
+        let arms: [(&str, Freshness); 4] = [
+            ("commit-worthy", Freshness::default()),
+            ("diverged", Freshness { diverged: s(&["FRUSTRATIONS.md"]), ..Default::default() }),
+            ("stale", Freshness { stale: s(&["FRUSTRATIONS.md"]), ..Default::default() }),
+            ("revived", Freshness { revived: s(&["FRUSTRATIONS.md"]), ..Default::default() }),
+        ];
+        for (arm, fresh) in arms {
+            let m = build("/repo", &dirty, &own, &fresh, "S")
+                .unwrap_or_else(|| panic!("{arm}: must render"));
+            assert!(
+                m.contains("ATTRIBUTION IS PARTIAL"),
+                "{arm}: a blind guard must be disclosed whichever remedy is prescribed — the \
+                 DIVERGED arm says 'hand the path to its owner' and this is the line saying the \
+                 ownership axis cannot be trusted: {m}"
+            );
+            assert!(m.contains("amux-helper"), "{arm}: name who is invisible: {m}");
+            assert!(
+                m.contains("ARCHIVE CHECK"),
+                "{arm}: the archive check is a property of the file, not of the arm: {m}"
+            );
+        }
     }
 
     /// THE PROCEDURE MUST BE INLINE, NEVER A REPO-RELATIVE CITATION (AMUX-3718).
