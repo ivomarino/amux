@@ -92,7 +92,19 @@ const ADVANCE_COOLDOWN_S: f64 = 15.0 * 60.0;
 /// py:12855 `_DECOMPOSE_NUDGE_COOLDOWN`.
 const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
 /// py:14514 freshness gate — never auto-run a card nobody has touched in 7 days.
-const PICKUP_FRESHNESS_S: i64 = 7 * 86400;
+/// Default; overridable via `AMUX_PICKUP_FRESHNESS_S` (AMUX-3779). With pickup
+/// scoring on, age SURFACES old cards before they reach this edge, so the gate
+/// is a backstop for a genuinely-overwhelmed lane, not the thing that hides a
+/// starved card — and when it does exclude a todo, `select_pickup` now says so
+/// in the trace instead of the card silently vanishing from auto-pickup.
+const PICKUP_FRESHNESS_S_DEFAULT: i64 = 7 * 86400;
+fn pickup_freshness_s() -> i64 {
+    std::env::var("AMUX_PICKUP_FRESHNESS_S")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(PICKUP_FRESHNESS_S_DEFAULT)
+}
 /// Per-card re-claim cooldown (py:14515 / AMUX-1857), now a knob and much
 /// SHORTER (AMUX-2987). It exempts a card from re-pickup for this long after it
 /// was last claimed — so a card that was dispatched, returned to `todo`, and is
@@ -895,7 +907,7 @@ const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
 /// happen inside the loop and surface as `all-candidates-refused` — an honest
 /// difference, since those are judgments about a card, not queue membership.
 fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
-    let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
+    let fresh_cut = (now as i64) - pickup_freshness_s();
     let reclaim_cut = now - reclaim_cooldown_s();
     conn.query_row(
         &format!("SELECT COUNT(*) FROM issues i WHERE {DISPATCHABLE_WHERE}"),
@@ -1384,6 +1396,98 @@ pub enum Pickup {
     None { reason: &'static str, detail: String },
 }
 
+/// Age-weighted pickup scoring (AMUX-3779). Default ON; `AMUX_PICKUP_SCORING=0`
+/// reverts to the legacy `ORDER BY pos ASC, created ASC` selection (board-drag
+/// order, which — because a new card is inserted at `pos = min-1024`, i.e. the
+/// TOP of its column, `board_store::create_issue` — is newest-first / LIFO by
+/// default and starves old cards until the freshness gate silently drops them).
+/// The knob reverts without a rebuild if the new ordering ever misbehaves fleet-wide.
+fn pickup_scoring_enabled() -> bool {
+    std::env::var("AMUX_PICKUP_SCORING").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Severity/importance weight by card type — a shipping/blocking card outranks a
+/// journal of the same age, so a bug does not need a human to drag it above a
+/// doc. Unknown types default code-like, matching this file's `COALESCE(type,
+/// 'code')`. Dormant types (tripwire/watch/epic) are filtered out of pickup
+/// upstream, so their weight is never reached.
+fn type_weight(item_type: &str) -> i64 {
+    match item_type.to_ascii_lowercase().as_str() {
+        "blocker" | "escalation" => 30,
+        "bug" => 24,
+        "code" | "ops" => 12,
+        "investigation" => 6,
+        "research" | "chore" | "doc" => 0,
+        _ => 6,
+    }
+}
+
+/// Explicit human severity carried on tags (`p0`, `sev1`, `urgent`, ...). The
+/// deliberate "this one matters" signal, distinct from where a card happens to
+/// sit in the column.
+fn tag_severity(tags: &[String]) -> i64 {
+    let mut boost = 0;
+    for t in tags {
+        match t.to_ascii_lowercase().as_str() {
+            "p0" | "sev0" | "sev1" | "critical" | "urgent" => boost = boost.max(40),
+            "p1" | "sev2" | "high" => boost = boost.max(20),
+            _ => {}
+        }
+    }
+    boost
+}
+
+/// How many non-terminal cards depend on this one: this card is on their
+/// critical path, so working it unblocks the most downstream work. This is
+/// amux-core `orchestrator::score`'s `dependents` signal — computed there for the
+/// provider-fleet planner but never consulted on the path that actually drives
+/// the human fleet, until now.
+fn count_dependents(conn: &Connection, id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0 \
+         AND status NOT IN ('done','verified','discarded') \
+         AND depends_on LIKE '%\"' || ?1 || '\"%'",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// The pickup priority score. Higher = sooner. Mirrors amux-core
+/// `orchestrator::score` (an hour of waiting outranks a drag point, so
+/// starvation self-corrects without a separate aging pass), extended with type
+/// and tag severity. `drag` is the card's rank by board position (topmost =
+/// highest, 0 for the bottom) kept a MINOR term: it fine-tunes among
+/// similar-priority cards and lets a deliberate drag nudge one up, without
+/// re-installing the pos-LIFO default that buries old work. `pinned` is the hard
+/// human override — a pinned card leads regardless of everything else.
+fn pickup_score(row: &bs::IssueRow, now: f64, dependents: i64, drag: i64) -> i64 {
+    let age_hours = (((now as i64) - row.created).max(0)) / 3600;
+    let pin = if row.pinned != 0 { 10_000 } else { 0 };
+    pin + age_hours
+        + type_weight(&row.item_type)
+        + tag_severity(&row.tags)
+        + dependents * 5
+        + drag
+}
+
+/// Count todos that would be dispatchable but for the freshness gate — the
+/// cards the 7d window is silently withholding. Surfaced in the pickup trace so
+/// an aged-out queue is legible instead of reading as an empty one (AMUX-3779).
+fn stale_gate_excluded_todos(conn: &Connection, session: &str, fresh_cut: i64) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='todo' \
+         AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+         AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
+         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                         AND lower(t.tag) LIKE 'needs:you%') \
+         AND i.updated < ?2",
+        rusqlite::params![session, fresh_cut],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
 /// Select the next board task for `session`, or say why not. Pure over the
 /// connection: no sends, no writes — so a test can assert the DECISION without
 /// a fleet, and the caller owns the ordering of claim-then-deliver.
@@ -1486,28 +1590,90 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     // from one loop and dispatchable by the other. Unifying on the LIKE form
     // only ever WIDENS the exemption, so the first run after the change emits
     // nothing; the opposite direction would have discharged a backlog.
-    let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
+    let fresh_cut = (now as i64) - pickup_freshness_s();
     let reclaim_cut = now - reclaim_cooldown_s();
-    let ids: Vec<String> = conn
-        .prepare(
-            &format!(
+    // Candidate ordering. Legacy (AMUX_PICKUP_SCORING=0): board-drag order
+    // `pos ASC, created ASC` — newest-first by default, because a new card lands
+    // at the top of its column, which starves old work. Default now: fetch
+    // eligible OLDEST-first (so a deep queue never truncates the oldest before it
+    // can score), then order by `pickup_score` — age surfaces starved cards, type
+    // and tag severity lift P0s, dependents lift critical-path work, and drag
+    // position / pin stay as human overrides.
+    let ids: Vec<String> = if pickup_scoring_enabled() {
+        let raw: Vec<String> = conn
+            .prepare(&format!(
                 "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-                 ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
-            ),
-        )
+                 ORDER BY i.created ASC LIMIT 256"
+            ))
+            .and_then(|mut st| {
+                st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+        let rows: Vec<bs::IssueRow> = raw
+            .iter()
+            .filter_map(|id| bs::get_issue(conn, id).ok().flatten())
+            .collect();
+        // Drag rank: topmost board position (min `pos`) scores highest; ties by
+        // id so the rank is deterministic.
+        let n = rows.len() as i64;
+        let mut by_pos: Vec<(&str, f64)> =
+            rows.iter().map(|r| (r.id.as_str(), r.pos)).collect();
+        by_pos.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(b.0))
+        });
+        let drag: std::collections::HashMap<&str, i64> = by_pos
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (*id, n - i as i64))
+            .collect();
+        let mut scored: Vec<(i64, i64, String)> = rows
+            .iter()
+            .map(|r| {
+                let deps = count_dependents(conn, &r.id);
+                let s = pickup_score(r, now, deps, *drag.get(r.id.as_str()).unwrap_or(&0));
+                (s, r.created, r.id.clone())
+            })
+            .collect();
+        // score DESC, then oldest-first, then id — a deterministic total order.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        scored.into_iter().map(|(_, _, id)| id).collect()
+    } else {
+        conn.prepare(&format!(
+            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
+             ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
+        ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
                 r.get::<_, String>(0)
             })
             .map(|rows| rows.flatten().collect())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+    };
     if ids.is_empty() {
+        // Name the aged-out cards rather than reporting an empty queue: the
+        // freshness gate silently withholds stale todos, and "nothing
+        // dispatchable" read identically to "no cards" before this (AMUX-3779).
+        let aged = stale_gate_excluded_todos(conn, session, fresh_cut);
+        let days = pickup_freshness_s() / 86400;
+        let aged_note = if aged > 0 {
+            format!(
+                "; {aged} todo card(s) aged past the {days}d freshness window — \
+                 touch or re-file to re-enable"
+            )
+        } else {
+            String::new()
+        };
         return Pickup::None {
             reason: "no-eligible-card",
             detail: format!(
                 "queue holds nothing dispatchable (needs:you, archived, dormant, \
-                 stale >7d and cards claimed in the last {}h are all exempt)",
+                 stale >{days}d and cards claimed in the last {}h are all exempt){aged_note}",
                 (reclaim_cooldown_s() / 3600.0).round() as i64
             ),
         };
@@ -1760,12 +1926,15 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
     // types (tripwire/watch) and no card parked on a live source_ref trigger.
+    // OLDEST-first (AMUX-3779): the idle-drain nudge now lists the same
+    // oldest-first order the todo scorer works in, so "what gets attention next"
+    // reads one way across todo and backlog instead of newest-here/oldest-there.
     conn.prepare(
         "SELECT id, title, created FROM issues \
          WHERE session=?1 AND status='backlog' AND deleted IS NULL \
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
          AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')='' \
-         ORDER BY created DESC LIMIT 8",
+         ORDER BY created ASC LIMIT 8",
     )
     .and_then(|mut st| {
         st.query_map(rusqlite::params![session], |r| {
@@ -4519,6 +4688,96 @@ mod tests {
             Pickup::Claim { card, .. } => Some(card),
             _ => None,
         }
+    }
+
+    // ---- pickup scoring (AMUX-3779) --------------------------------------
+
+    /// Full-control insert for scoring tests: pick the type, creation time,
+    /// board position and pin. Desc/title are the same non-junk shape the
+    /// passing pickup tests use, so the refusal guards let the card through.
+    #[allow(clippy::too_many_arguments)]
+    fn add_full(
+        conn: &Connection,
+        id: &str,
+        session: &str,
+        status: &str,
+        item_type: &str,
+        created: i64,
+        pos: f64,
+        pinned: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,pos,pinned) \
+             VALUES (?1, 'Work item ' || ?1, 'SCOPE: real work\n- [ ] do it', ?2,?3,?4,?4,'agent',?5,?6,?7)",
+            rusqlite::params![id, status, session, created, item_type, pos, pinned],
+        )
+        .expect("insert full");
+    }
+
+    /// A non-terminal card in some OTHER lane that depends on `target` — counts
+    /// toward `target`'s critical path without competing as a pickup candidate.
+    fn add_dependent(conn: &Connection, id: &str, target: &str) {
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,depends_on) \
+             VALUES (?1,?1,'x','todo','other', 0, 0,'agent','code', ?2)",
+            rusqlite::params![id, format!("[\"{target}\"]")],
+        )
+        .expect("insert dependent");
+    }
+
+    #[test]
+    fn scoring_picks_the_oldest_todo_not_the_newest() {
+        // Default (scoring on). Legacy pos-order would pick the newest card,
+        // which sits at the top of the column; scoring surfaces the starved one.
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 3 * 86400, -1024.0, 0);
+        add_full(&conn, "NEW", "lane", "todo", "code", now as i64, -99999.0, 0); // topmost pos
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("OLD"), "the 3-day-old card must be worked before the fresh one");
+    }
+
+    #[test]
+    fn a_pinned_todo_leads_regardless_of_age() {
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 5 * 86400, -1024.0, 0);
+        add_full(&conn, "PIN", "lane", "todo", "code", now as i64, -50.0, 1); // pinned, fresh
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("PIN"), "a pinned card is the hard human override");
+    }
+
+    #[test]
+    fn a_p0_tag_lifts_a_fresh_bug_over_an_older_chore() {
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "CHORE", "lane", "todo", "chore", now as i64 - 2 * 86400, -1024.0, 0);
+        add_full(&conn, "BUG", "lane", "todo", "bug", now as i64, -50.0, 0);
+        tag(&conn, "BUG", "p0", now);
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("BUG"), "a fresh p0 bug must outrank a 2-day-old chore");
+    }
+
+    #[test]
+    fn dependents_lift_a_card_on_the_critical_path() {
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "PLAIN", "lane", "todo", "code", now as i64, -99999.0, 0); // topmost
+        add_full(&conn, "DEP", "lane", "todo", "code", now as i64, -50.0, 0);
+        add_dependent(&conn, "D1", "DEP");
+        add_dependent(&conn, "D2", "DEP");
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("DEP"), "the card two others depend on must lead");
+    }
+
+    #[test]
+    fn type_and_tag_weights_are_ordered() {
+        assert!(type_weight("blocker") > type_weight("code"));
+        assert!(type_weight("bug") > type_weight("doc"));
+        assert_eq!(type_weight("chore"), 0);
+        assert_eq!(type_weight("unknown-legacy"), 6, "unknown defaults code-like");
+        assert!(tag_severity(&["p0".into()]) > tag_severity(&["p1".into()]));
+        assert_eq!(tag_severity(&["nope".into()]), 0);
     }
 
     #[test]
