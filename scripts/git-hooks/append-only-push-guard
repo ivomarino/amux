@@ -105,7 +105,31 @@ archive_for() {
   dirn=$(dirname "$f"); bn=$(basename "$f")
   stem="${bn%.*}"; ext=""
   [ "$stem" != "$bn" ] && ext=".${bn##*.}"
-  for cand in "${stem}_ARCHIVE${ext}" "${stem}_archive${ext}"; do
+  # HYPHEN VARIANTS TOO, and this is not hypothetical tidiness (AF-234
+  # follow-up, 2026-08-26). This repo's archive is `frustrations-archive.md`
+  # with a HYPHEN and this list was underscore-only, so `archive_for` returned
+  # "none" for the one file it exists to serve. 30 archived entries.
+  #
+  # The refusal text then asserted the consequence as a fact about the repo —
+  # "the union rule looks for a companion ARCHIVE FILE and this repo has none"
+  # — which was FALSE. The file was there, tracked, the whole time. A separator
+  # nobody thought about became a documented claim about the repository, which
+  # is why the fix is to probe both rather than to pick one and write prose.
+  #
+  # SCOPE, stated because the first draft of this comment got it wrong: this
+  # function feeds the LOG LINE and the refusal text. It was not, at the time,
+  # consulted by the union at all — so "archive_for returned none" did not
+  # disable the union rule, it made the diagnostics name nothing. The union
+  # missing the archive was a separate defect with the same symptom, fixed in
+  # check_pair. Two bugs, one appearance; fixing the lookup alone would have
+  # left every archive move still reading as a deletion while the log line
+  # cheerfully named the archive it was ignoring.
+  #
+  # NOTE: this candidate list is DUPLICATED at the resurrection check below.
+  # Both must change together or the guard's two halves disagree about what an
+  # archive is called.
+  for cand in "${stem}_ARCHIVE${ext}" "${stem}_archive${ext}" \
+              "${stem}-ARCHIVE${ext}" "${stem}-archive${ext}"; do
     [ "$dirn" != "." ] && cand="$dirn/$cand"
     if git rev-parse --verify --quiet "$commitish:$cand" >/dev/null 2>&1; then
       echo "$cand"
@@ -131,7 +155,26 @@ check_pair() {
   local union_tmp
   union_tmp=$(mktemp 2>/dev/null) || return 2
   local f hb
+  # THE COMPANION ARCHIVES BELONG IN THE UNION, and until now they were only in
+  # it by accident (AF-234 follow-up, 2026-08-26). The comment above describes
+  # the archived line surviving "in FRUSTRATIONS_ARCHIVE.md's pushed copy" —
+  # true only when the archive is ITSELF a guarded file, which happens in
+  # mixpeek because its `.append-only-files` lists both. amux has no such file,
+  # so DEFAULT_FILES is just the two frustrations spellings and the archive was
+  # never concatenated: every archive move here read as a deletion, which is
+  # the class this rule exists to prevent, in the repo that wrote the rule.
+  #
+  # The UNION widens; the CHECKED set does not. An archive is included as
+  # evidence that a line still exists, not made subject to the append-only
+  # rule itself — being listed in `.append-only-files` is still what does that.
+  local union_files=("${files[@]}") a
   for f in "${files[@]}"; do
+    a=$(archive_for "$head" "$f")
+    case "$a" in none|self) continue ;; esac
+    case " ${union_files[*]} " in *" $a "*) continue ;; esac
+    union_files+=("$a")
+  done
+  for f in "${union_files[@]}"; do
     hb=$(git rev-parse --verify --quiet "$head:$f" 2>/dev/null) || continue
     git cat-file blob "$hb" >> "$union_tmp" 2>/dev/null || true
     printf '\n' >> "$union_tmp"
@@ -250,10 +293,11 @@ if edited:
       echo "  one's text was preserved somewhere first. Enumerate the headings above and"
       echo "  name where each one went. If you can do that for ALL of them, the deletion is"
       echo "  legitimate and the checkout below WOULD UNDO IT. Take the scoped override."
-      echo "  In amux the preserved copy is the BOARD CARD, written by"
+      echo "  In amux the preserved copy is usually the BOARD CARD, written by"
       echo "  scripts/frustrations_retire.py (it refuses to delete if the card write fails),"
-      echo "  which is why this guard cannot see it: the union rule looks for a companion"
-      echo "  ARCHIVE FILE and this repo has none."
+      echo "  which this guard cannot see — the union rule reads a companion ARCHIVE FILE,"
+      echo "  not the board. It DOES read $(archive_for "$head" "$f") for this file, so a"
+      echo "  line that merely MOVED there is not counted as missing."
       echo ""
       echo "  STALE REPUBLISH — nobody deleted these lines; they are simply absent from an"
       echo "  old tree being published (MG-1483). The tell is that NO author claims them and"
@@ -311,7 +355,11 @@ if edited:
     stem="${bn%.*}"; ext=""
     [ "$stem" != "$bn" ] && ext=".${bn##*.}"
     arch=""
-    for cand in "${stem}_ARCHIVE${ext}" "${stem}_archive${ext}"; do
+    # Both separators — see the note in archive_for(). This is the SECOND copy
+    # of this candidate list; they must be changed together or the guard's two
+    # halves disagree about what an archive is called.
+    for cand in "${stem}_ARCHIVE${ext}" "${stem}_archive${ext}" \
+                "${stem}-ARCHIVE${ext}" "${stem}-archive${ext}"; do
       [ "$dirn" != "." ] && cand="$dirn/$cand"
       if git rev-parse --verify --quiet "$head:$cand" >/dev/null 2>&1; then
         arch="$cand"

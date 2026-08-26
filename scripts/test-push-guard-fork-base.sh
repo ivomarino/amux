@@ -166,5 +166,51 @@ else
   bad "D: the refusal does not name the fork case as a third state"
 fi
 
+# --- CELL E: the union rule must SEE a hyphen-separated archive.
+#
+# Found while writing this file (AF-234 follow-up). `archive_for` probed only
+# `<stem>_ARCHIVE.md` / `<stem>_archive.md`; this repo's archive is
+# `frustrations-archive.md` with a HYPHEN, so the lookup returned "none" and
+# the union rule — the entire mechanism for not reporting a MOVE as a deletion
+# — had never fired here. 30 archived entries were invisible to it, and the
+# refusal text stated the consequence as a fact about the repo ("this repo has
+# none") which was false the whole time.
+#
+# This is the SAME class as the fork bug above and as CD-78's correction on
+# AMUX-3367: a set-difference over one file cannot see a MOVE. Three subsystems
+# now.
+q git checkout -b archiver "$UPSTREAM_TIP"
+{ echo "# frustrations"; } > frustrations.md                        # three moves out
+{ echo "# archive"; entry one; entry two; entry three; } > frustrations-archive.md
+must "stage the archive move" git add -A
+must "commit the archive move" git -c core.hooksPath=/dev/null commit -m "archive three"
+HEAD_E=$(git rev-parse HEAD)
+# Premise: the entry really must still exist, in the companion file.
+grep -q '^## three$' frustrations-archive.md \
+  || { echo "  SETUP FAILED — cell E did not move the entry into the archive" >&2; exit 1; }
+if printf 'refs/heads/archiver %s refs/heads/archiver %s\n' "$HEAD_E" "$ZERO" \
+     | "$GUARD" origin >/dev/null 2>"$TMP/e.err"; then
+  ok "E: a MOVE into a hyphen-separated archive is not counted as a deletion"
+else
+  bad "E: archive_for cannot see <stem>-archive.md — a move reads as a deletion"
+fi
+
+# --- CELL F: and a REAL deletion must still be refused, or E was bought by
+#     making the guard blind rather than by making it see the archive.
+q git checkout -b deleter "$UPSTREAM_TIP"
+{ echo "# frustrations"; } > frustrations.md          # entry three vanishes entirely
+must "stage the real deletion" git add -A
+must "commit the real deletion" git -c core.hooksPath=/dev/null commit -m "delete three"
+HEAD_F=$(git rev-parse HEAD)
+# Premise: the entry must exist in NEITHER file, or this is cell E again.
+! grep -q '^## three$' frustrations-archive.md \
+  || { echo "  SETUP FAILED — cell F's entry is still in the archive" >&2; exit 1; }
+if printf 'refs/heads/deleter %s refs/heads/deleter %s\n' "$HEAD_F" "$ZERO" \
+     | "$GUARD" origin >/dev/null 2>"$TMP/f.err"; then
+  bad "F: a line deleted from BOTH files was allowed — the union rule is blind, not seeing"
+else
+  ok "F: a line that exists nowhere is still refused"
+fi
+
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]
