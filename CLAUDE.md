@@ -236,8 +236,26 @@ its env was missing", which testing the endpoint and the settings entry cannot.
   Jul-31 copy whose missing verb printed help and exited 0, silently swallowing three
   status requests.
 - **Commit after every completed task.** When you finish a piece of work (bug fix, feature, refactor), immediately `git add` the files you changed and `git commit` with a concise message. Don't batch multiple tasks into one commit. Committing is also what DEPLOYS locally (next bullet).
-- **Editing the working tree changes nothing that is live — COMMITTED source is what
-  ships.** `com.amux.server-rs-builder` (`scripts/rust-auto-build.sh`, every 60s)
+- **For the RUST SERVER, editing the working tree changes nothing that is live —
+  COMMITTED source is what ships. The bash `amux` CLI is the EXCEPTION, and it is
+  the dangerous direction (AF-237).** `~/.local/bin/amux` is a SYMLINK into this
+  working tree (`ls -l $(which amux)` shows it), so for `./amux` the deploy
+  boundary is the **SAVE**: no commit, no builder cycle, no CI, no adoption. An
+  unsaved edit is the only thing that is not live, fleet-wide, immediately.
+
+  That asymmetry matters because the failure is total. A bash parse error is
+  fatal at LOAD, so a broken `./amux` cannot print its own help — the tool cannot
+  tell anyone how to work around the tool, and a lane that has only ever used
+  `amux send` has no path left to discover `POST /api/sessions/<n>/send` exists.
+  It reads as "amux is down" rather than "the CLI is down". That happened on
+  2026-08-26 (AMUX-3722) from an apostrophe inside a `python3 -c '...'` block.
+  `.claude/check-and-commit.sh` now runs `bash -n` on every save of `amux`, and
+  `tests/cli_syntax_guard.rs` is the backstop — but the gates catch the syntax
+  error, not the belief that an uncommitted edit is safe. This bullet used to
+  state the "committed source is what ships" rule as a universal, which taught
+  every lane that belief on every read.
+
+  For the server: `com.amux.server-rs-builder` (`scripts/rust-auto-build.sh`, every 60s)
   rebuilds when the last commit touching `crates/`/`Cargo.*` moves, installs
   `~/.local/bin/amux-server-rs`, and the running server self-adopts (exits for launchd
   to relaunch). 8822 is retired and no longer bound (see the top of this file) — if
