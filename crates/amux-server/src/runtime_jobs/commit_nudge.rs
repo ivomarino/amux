@@ -2757,6 +2757,97 @@ mod tests {
         }
     }
 
+    /// THE DIFFERENTIAL FORM, WHICH NEEDS NO REGISTRY (AMUX-3718;
+    /// mixpeek-frustrations, reviewing the matrix above).
+    ///
+    /// The matrix is a registry of strings I already know about. A third
+    /// set-wide caveat pushed inside `commit_worthy_body` next month is
+    /// invisible to it until someone remembers to add a row — and "someone must
+    /// remember" is precisely the step that failed twice, once for the archive
+    /// check and once for partial attribution.
+    ///
+    /// This compares two RENDERINGS of the same dirty set instead: every
+    /// `\n\n`-delimited block the commit-worthy arm emits must also appear in
+    /// the DIVERGED arm, minus the blocks that are legitimately arm-specific.
+    /// A caveat nobody registered is caught the day it is added, by this test,
+    /// without anyone touching it.
+    ///
+    /// It fails closed in the useful direction: adding a genuinely
+    /// arm-specific note to `commit_worthy_body` also trips it, which is a
+    /// prompt to name it in ARM_SPECIFIC and say why, rather than a false
+    /// alarm. That list is short and every entry is a claim someone had to
+    /// make deliberately.
+    #[test]
+    fn every_caveat_the_commit_worthy_arm_emits_also_reaches_the_diverged_arm() {
+        // Blocks that belong to the commit-worthy arm BY DESIGN: they describe
+        // staging work you are being told to commit, which the DIVERGED arm
+        // explicitly forbids. Anything not listed here is presumed set-wide.
+        const ARM_SPECIFIC: &[&str] = &[
+            "uncommitted change(s)",  // the commit-worthy headline itself
+            "OWNERSHIP IS UNKNOWN",   // "stage only what you recognise" advice
+            "NOT YOURS",              // do-not-commit warning about staging
+            "also edited by",         // shared-path staging caveat
+            // The ancestry direction protocol. Flagged by this test on its first
+            // run, and the judgement is that it is genuinely arm-specific: it
+            // exists to decide commit-vs-restore for paths whose DIRECTION is
+            // unknown. In the DIVERGED arm the direction is already known to be
+            // "both", and that arm forbids both remedies outright, so running
+            // the test there only leads the reader back to the verdict they were
+            // already given. The safety point it carries is not lost — the
+            // DIVERGED section states the same danger in its own terms,
+            // including that the find-object restore-safety check PASSES while
+            // reverting your landed commits.
+            "IS NOT A DIRECTION",
+        ];
+
+        let dirty = s(&["FRUSTRATIONS.md", "src/app.js"]);
+        let own = Ownership {
+            partial: Some("no transcript for cotenant amux-helper".into()),
+            ..Default::default()
+        };
+
+        let worthy = build("/repo", &dirty, &own, &Freshness::default(), "S").unwrap();
+        let diverged = build(
+            "/repo",
+            &dirty,
+            &own,
+            &Freshness { diverged: s(&["FRUSTRATIONS.md", "src/app.js"]), ..Default::default() },
+            "S",
+        )
+        .unwrap();
+
+        // PREMISE: the two renderings must actually differ, or a bug that made
+        // build() ignore `fresh` entirely would satisfy this test vacuously.
+        assert_ne!(worthy, diverged, "premise: the two arms must render differently");
+
+        let mut missing: Vec<&str> = Vec::new();
+        for block in worthy.split("\n\n") {
+            let block = block.trim();
+            // The provenance stamp carries a wall-clock time, so the two
+            // renderings differ in it by construction; compare on the marker.
+            if block.is_empty() || block.starts_with("(S; tree observed") {
+                continue;
+            }
+            if ARM_SPECIFIC.iter().any(|a| block.contains(a)) {
+                continue;
+            }
+            // Compare on the block's own leading marker rather than the whole
+            // text: the arms legitimately word counts and lists differently.
+            let marker: String = block.chars().take(40).collect();
+            if !diverged.contains(marker.trim()) {
+                missing.push(block);
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "these caveats reach the commit-worthy arm and NOT the DIVERGED arm. Either they \
+             are set-wide and belong at the top of `build` (see AMUX-3718, twice), or they are \
+             genuinely arm-specific and belong in ARM_SPECIFIC with a reason:\n\n{}\n\n\
+             --- DIVERGED rendering was ---\n{diverged}",
+            missing.join("\n---\n")
+        );
+    }
+
     /// THE PROCEDURE MUST BE INLINE, NEVER A REPO-RELATIVE CITATION (AMUX-3718).
     ///
     /// The nudge fires in EVERY lane's own checkout, and `.claude/rules/` exists

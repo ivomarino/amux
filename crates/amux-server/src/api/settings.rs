@@ -620,12 +620,28 @@ pub(crate) mod test_env {
     /// against each other — two guards can never interleave — but nothing
     /// makes the ~79 `amux_home()` READ sites take it, so a guardless test
     /// reading a home concurrently with a guard's window sees the fixture
-    /// home. Accepted with ~43 users and zero observed bites; if one is ever
-    /// observed, the promotion path is routing test reads through the
-    /// injected-lookup seam `config::resolve_home(get)` already provides
-    /// (built for exactly this), not a bigger lock. Until then: prefer that
-    /// seam over this guard for NEW tests when the code under test can take
-    /// an injected lookup — every test that does shrinks the exposure.
+    /// home. Accepted with ~43 users; the promotion path is routing test reads
+    /// through the injected-lookup seam `config::resolve_home(get)` already
+    /// provides (built for exactly this), not a bigger lock. Until then: prefer
+    /// that seam over this guard for NEW tests when the code under test can
+    /// take an injected lookup — every test that does shrinks the exposure.
+    ///
+    /// THE "ZERO OBSERVED BITES" CLAUSE IS SPENT (AMUX-3719, 2026-08-25). One
+    /// was observed: `owner_alert_full_send_shape_channels_and_ledger` read a
+    /// pin that only exists in another test's fixture home, once in 4 full-suite
+    /// runs. That is the trigger this comment named, so the exit condition is
+    /// live rather than hypothetical.
+    ///
+    /// It does not match the exposure described above, which is what makes it
+    /// worth writing down instead of just fixing: BOTH tests involved hold a
+    /// guard, and two guards cannot interleave. Ruled out with the code, so
+    /// nobody re-runs them: `set_server_env_key` writes only the file and never
+    /// the process env; every unguarded `set_var("AMUX_HOME")` is in `tests/`,
+    /// which are separate binaries. The mechanism is still unknown and the flake
+    /// did not reproduce in three subsequent full runs. The failing assertion now
+    /// prints the fixture home, `AMUX_HOME`, and the resolved home, so the next
+    /// occurrence identifies its own cause instead of costing another
+    /// investigation that ends here.
     pub fn set_home(path: &std::path::Path) -> HomeGuard {
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_leaky: Vec<(&'static str, Option<String>)> = leaky_keys()
