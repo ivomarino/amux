@@ -2154,13 +2154,57 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
         quoted_card_text(&row.title, &row.id),
         qnote
     );
-    let desc = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
-    let desc: String = desc.trim().chars().take(500).collect();
+    let full = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
+    let full = full.trim();
+    let cap = pickup_excerpt_chars();
+    let desc: String = full.chars().take(cap).collect();
+    let truncated = full.chars().count() > cap;
     if !desc.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&quoted_card_text(&desc, &row.id));
+        // SAY SO WHEN IT IS CUT. A silently-truncated excerpt is
+        // indistinguishable from a short card, so a lane handed half a
+        // definition works confidently from half a definition (ethos rule 4:
+        // absence must not read as emptiness — the same shape as the board's
+        // slim payload dropping `reviewer`, AF-161).
+        if truncated {
+            prompt.push_str(&format!(
+                "\n\n[excerpt cut at {cap} chars of {} — GET /api/board/{} for the whole card]",
+                full.chars().count(),
+                row.id
+            ));
+        }
     }
     prompt
+}
+
+/// How much of a card's definition rides along with the pickup (AMUX-3759).
+///
+/// THE OLD VALUE WAS A HARDCODED 500 CHARS, and it was optimising the wrong
+/// resource by three orders of magnitude. A steering message is a few KB of
+/// text; the thing it saves is a MODEL CALL, and a model call in this fleet
+/// carries a median RESIDENT CONTEXT of 308k tokens (p90 738k, measured
+/// 2026-08-26 over 11k turns). So every tool step the lane spends fetching back
+/// text amux already had in hand costs ~300k input tokens, to save ~1k of
+/// prompt.
+///
+/// It showed up as Ethan's "theres also way too much tokens used for some
+/// reason in between tasks". An auto-pickup turn takes a MEDIAN OF 22 TOOL
+/// STEPS where a human-prompted turn takes 3, because the human supplies the
+/// task inline and the pickup supplies an ID plus a 500-char stub. Measured on
+/// the live queue that day: the cap truncated 86% of todo cards (median
+/// definition 1,933 chars, p90 6,658) and discarded 108,820 characters of card
+/// definition the lane then had to go and read back.
+///
+/// Config, not a constant, because this is D4 in the ethos ledger — a
+/// context-scarcity policy baked into code silently becomes the ceiling as
+/// windows grow. 4000 leaves ~20% of today's cards truncated, and those say so.
+fn pickup_excerpt_chars() -> usize {
+    std::env::var("AMUX_PICKUP_EXCERPT_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4000)
 }
 
 // ---------------------------------------------------------------------------
@@ -5143,6 +5187,60 @@ mod tests {
         assert_eq!(e["dispatchable_pct"], json!(0.0));
         assert_eq!(e["open_total"], json!(0), "zero%% with zero open is 'nothing to do': {e}");
         assert!(e["needsyou_median_age_d"].is_null(), "no pile, no age: {e}");
+    }
+
+    /// AMUX-3759, Ethan: "theres also way too much tokens used for some reason
+    /// in between tasks".
+    ///
+    /// The pickup handed the lane a card ID and 500 characters, so the lane
+    /// spent MODEL CALLS fetching back text amux already had. Measured
+    /// 2026-08-26: an auto-pickup turn takes a median of 22 tool steps where a
+    /// human-prompted turn takes 3, at a median resident context of 308k tokens
+    /// per call — so a saved fetch is worth ~300k input tokens against ~1k of
+    /// extra prompt. On the live queue the cap truncated 86% of todo cards and
+    /// discarded 108,820 characters of definition.
+    ///
+    /// Two cells, and the second is the one that matters: a cut excerpt must
+    /// SAY it was cut. Silent truncation is indistinguishable from a short
+    /// card, so the lane works confidently from half a definition — the AF-161
+    /// shape, absence reading as emptiness.
+    #[test]
+    fn the_pickup_excerpt_carries_the_card_and_admits_when_it_does_not() {
+        let conn = board_db();
+        let short = "SCOPE: rotate the key\n- [ ] do it";
+        add_card(&conn, "P-1", "lane", "todo", "short card", short);
+        let row = bs::get_issue(&conn, "P-1").unwrap().unwrap();
+        let p = pickup_prompt(&conn, "lane", &row);
+        assert!(p.contains("rotate the key"), "the whole definition must ride along: {p}");
+        assert!(
+            !p.contains("excerpt cut at"),
+            "a card that fits is not truncated and must not claim to be: {p}"
+        );
+
+        // A card longer than the cap. 6,000 chars is between this fleet's p75
+        // (3,652) and its max (10,299), so it is a real card, not a synthetic
+        // extreme — and it is over the 4000 default while being under what a
+        // "just raise it a lot" cap would catch.
+        let long = format!("SCOPE: big one\n{}", "x".repeat(6000));
+        add_card(&conn, "P-2", "lane", "todo", "long card", &long);
+        let row = bs::get_issue(&conn, "P-2").unwrap().unwrap();
+        let p = pickup_prompt(&conn, "lane", &row);
+        assert!(
+            p.contains("excerpt cut at"),
+            "a truncated excerpt must announce itself: {}",
+            &p[..p.len().min(400)]
+        );
+        assert!(
+            p.contains("GET /api/board/P-2"),
+            "and name the read that returns the rest, or the admission is useless"
+        );
+        // The old 500-char cap is the regression this guards: the excerpt must
+        // carry MUCH more than a stub, or the lane is back to fetching.
+        let quoted = p.matches('x').count();
+        assert!(
+            quoted > 3000,
+            "the excerpt must carry the card, not a 500-char stub (got {quoted} body chars)"
+        );
     }
 
     /// Backend, 2026-08-11 afternoon: 16 claims in one hour, every card
