@@ -1092,3 +1092,83 @@ NOTE: what makes this instructive rather than just a bug is that the function ha
   ethos rule-1 note that a view must share the predicate of the mechanism it describes;
   here the guard describes "did this lane work?" with a predicate that means "does this
   lane own cards?".
+
+## The reviewer-identity check fires on done->verified, blocking the peer amux routed the verification to
+VALIDATED: amux-frustrations | RETIRED — the reported check does not exist in the Rust server, and its LESSON is encoded in the replacement. Verified 2026-08-26: no refusal anywhere in crates/ is keyed on who acked a review ("review sign-off required from the reviewer", "must come from that session" — zero hits); the message was Python's and was never ported at 792ce1f. What replaced it is AF-160's reviewer-name gate in api/board.rs, and its predicate is exactly what this entry prescribed: `reviewer != THE CARD'S OWNER`, never `reviewer != WHOEVER IS TYPING`. The comment at board.rs:3827 records that the first draft of that rule (mine) compared against the ACTING session and would have refused both real verifications on this board within the hour — AF-161 (owner=amux, reviewer=amux-frustrations, acting=amux-frustrations) and AF-16, its mirror image — because criterion 3 says the peer verifies it THEMSELVES, so reviewer == acting is the CORRECT shape. It was validated against every verified card rather than a fixture: admits 147 of 148 live and refuses exactly one, AMUX-2409, where owner and reviewer are both amux-homepage, which is the self-review the criterion exists to prevent. The gate is also scoped by `criterion_wants_a_name`, so it fires only where the criterion asks for a peer — this entry's "scope the identity check to the transition it is about".
+AREA: gates
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-20
+SYMPTOM: Working the VERIFY queue amux dispatched to me ("You are the independent check"),
+  done -> verified was refused twice with "review sign-off required from the reviewer ...
+  the review->done ack must come from that session". The attempted edge is done->verified,
+  not review->done. On AMUX-2385 it is unsatisfiable by construction: the card went
+  doing -> done directly (log: `status: doing -> done (by amux/session)`), so the named
+  reviewer never acked a review and has no pending ack to give.
+COST: Two forced bypasses in one afternoon (AMUX-2334, AMUX-2385) on cards I had fully
+  measured. Both logged and attributed, so nothing is hidden — but the alternative was
+  leaving a completed verification unrecorded, and a gate that trains its most careful users
+  to reach for --force is inverting its own purpose.
+FIX: Scope the identity check to the transition it is about. It exists so an author cannot
+  self-ack their own review — that is review->done. done->verified is a different edge with
+  a different role and already has its own peer criterion. Failing that, accept ANY different
+  worker in the group, which is what the gate text already asks for. At minimum fix the
+  message: naming the wrong transition sends the reader hunting an ack that cannot exist.
+NOTE: ethos rule 6 — the published contract and the enforced one disagree. The `verified`
+  gate lists four criteria; criterion 2 is "Peer-reviewed by a DIFFERENT worker in group
+  `amux` (name them)", which I satisfied and named. The refusal comes from a check the gate
+  text never mentions. A card can therefore pass every criterion it publishes and still be
+  refused, which is the state that makes --force feel like the honest move.
+
+## The co-edit notice asserts a git fact that was true at emission and false by delivery
+VALIDATED: amux-frustrations | RETIRED — fixed by AF-135, via a different mechanism than this entry prescribed, and the different mechanism is sound. Verified 2026-08-26: the perishable sentence is gone (grep for "have not committed it since" across crates/ returns nothing). Delivery is still steer_enqueue, so the emission-to-delivery gap this entry identified genuinely still exists — what changed is that the notice no longer asserts an untimed present-tense fact. commit_nudge.rs:610 stamps every nudge "(...; tree observed HH:MM:SSZ — if you committed AFTER that moment this nudge predates it: re-run `git status` before acting on any remedy)". So the claim became TIME-QUALIFIED rather than re-checked: it is a true statement about a stated moment instead of a false statement about now, which removes the reported cost (auditing a clean commit for work that is not in it) without paying a git call per delivery or racing the same window again. AF-135's own note records the sharper reason it mattered: harmless on the commit branch, but on the STALE branch the same lag prescribed `git checkout origin/main -- <path>` against paths origin does not have, which DELETES them.
+AREA: notices
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-08
+SESSION: amux-frustrations
+CARD: AF-21
+SYMPTOM: Two consecutive co-edit notices said "amux-server.py: you edited it at 18:58 and
+  have not committed it since 18:33". My commit 44bd9fe touched that file at 19:36, so the
+  sentence was false when I read it. It was TRUE when emitted — the notices fired for
+  commits at 19:06 and 19:14 — and expired before delivery.
+COST: The sentence exists to make you suspect your work was swept, and is followed by "your
+  next git commit may say nothing to commit". So a stale one sends you to audit a commit for
+  work that is not in it: `git show --stat 902e9d8` -> 8 insertions, 0 of mine. Two audits of
+  two clean commits. Small each time, but it also cannot distinguish itself from the REAL
+  case — 762e06e genuinely had swept my staged AF-12 work and carried the identical sentence.
+FIX: Re-check at delivery, exactly as c32cf8a did for the decompose nudge (AC-252) and 7504abf
+  for the three other perishable-state nudges. If the reader has committed that path since the
+  notice was queued, drop the sentence or replace it with "you have since committed it in
+  <sha>". The co-edit notice asserts perishable GIT state and was not in that sweep.
+NOTE: distinct from the already-fixed "co-edit notice asks the reader to resolve a condition
+  it is better placed to check". That was the notice ASKING; this is the notice ASSERTING
+  something that has since become false — worse, because an out-of-date question costs a
+  moment while a false statement sends you hunting a defect that does not exist. The emitter
+  is right to be conservative; over-warning about a sweep beats under-warning. Only re-check it.
+
+RELATED LOSS, found 2026-08-11 while validating AC-252: this entry's recorded fix used the
+  same mechanism, and it is gone too. `steer_guard_stale` has zero hits in crates/. So the
+  delivery-time revalidation that c32cf8a/7504abf added no longer exists in the rust server.
+  The entry was already correctly `open`; this records WHY it cannot be closed by pointing at
+  the python fix.
+
+FRESH SPECIMEN 2026-08-18, amux-frustrations — STILL OPEN, and the same class one layer over.
+  The idle guard reported: "You went idle with 2 uncommitted change(s) under your working
+  directory" naming app.js and sw.js. `git status --porcelain` was EMPTY for both and for
+  the whole tree — I had committed them in cd2e017. The two files differed from
+  origin/main only because that commit was unpushed.
+  So the notice compared against origin/main and called the result "uncommitted", which is
+  a different predicate from the one the word means. Same shape as the 2026-08-08 case: a
+  git assertion the reader cannot distinguish from the real thing. Here it is not staleness
+  but a WRONG COMPARISON BASE — and the notice's own body warns at length about exactly
+  this confusion ("a difference from origin/main is not a direction"), then makes it.
+  Cost this time was bounded because the notice also prescribes the ancestry test, which I
+  ran: `git log HEAD..origin/main -- <path>` printed nothing for both, so the safe action
+  was commit-not-restore. Had I taken "uncommitted" at face value and run the remedy it
+  names for the stale case (`git checkout origin/main -- <path>`), I would have reverted 18
+  commits of dashboard work including that day's fix and a peer's feature work.
+  That is the entry's own COST paragraph coming true at a larger blast radius: the sentence
+  cannot distinguish itself from the real case, and its remedy is destructive.
