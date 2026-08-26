@@ -1690,6 +1690,31 @@ pub async fn nudge_tick(state: &AppState, lanes: &[(String, String)], now: f64) 
         if session.is_empty() || dir.is_empty() {
             continue;
         }
+        // AN ISOLATED WORKER IS A RAW AGENT — DO NOT STEER THE HARNESS INTO IT
+        // (Ethan, 2026-08-26: "we have an isolated worker but it still has amux
+        // shit", naming gtm-research, which had CC_ISOLATED=1 and was receiving
+        // this nudge).
+        //
+        // `session_is_isolated`'s own doc calls itself "the single source of
+        // truth every isolation decision consults" and lists seven consumers:
+        // spawn-env suppression, --mcp-config, board auto-capture, the peer
+        // fleet list, the fleet roster, the peer-send guard, and the
+        // status/rate-limit sweep. Every one of those is about what the worker
+        // is TOLD ABOUT or DISCOVERABLE BY. None of them cover what gets typed
+        // INTO its pane, and measured on 2026-08-26 ZERO of the 15
+        // runtime_jobs consulted it at all — while three of them steer.
+        //
+        // So the designation promised "the amux harness stripped" and delivered
+        // env suppression: the worker still got commit nudges. That is ethos
+        // rule 1's exemption question — when you exempt something from a loop,
+        // name what still reaches it — answered the wrong way for two months.
+        //
+        // The owner's own peek/send still work; that is the documented boundary
+        // and it is untouched here. What stops is amux typing at a lane whose
+        // whole point is to run untouched.
+        if crate::api::session_verbs::session_is_isolated(session) {
+            continue;
+        }
         // Filtered against ORIGIN, not local HEAD — see
         // drop_paths_identical_to_origin for why `git status` alone answers the
         // wrong question on a graft-push checkout.

@@ -352,7 +352,28 @@ pub struct LiveFleet {
 
 impl Fleet for LiveFleet {
     fn lanes(&self) -> Vec<String> {
+        // ISOLATED LANES ARE NOT DRIVEN (Ethan, 2026-08-26: "we have an isolated
+        // worker but it still has amux shit", naming gtm-research, which had
+        // CC_ISOLATED=1 and was being auto-picked-up and nudged).
+        //
+        // FILTERED HERE, at the ONLY consumer of `lanes()`, rather than at
+        // `deliver`. Gating the send would let auto-pickup CLAIM a card for an
+        // isolated lane and then silently not deliver it — the card sits in
+        // `doing` with nobody working it, which is worse than the bug. Removing
+        // the lane from consideration means the card is never claimed at all.
+        //
+        // `session_is_isolated`'s doc calls itself "the single source of truth
+        // every isolation decision consults" and lists seven consumers, all
+        // about what the worker is TOLD ABOUT or DISCOVERABLE BY. None covered
+        // what gets typed INTO its pane: measured 2026-08-26, ZERO of the 15
+        // runtime_jobs consulted it, and three of them steer. The designation
+        // promised "the amux harness stripped" and delivered env suppression.
+        //
+        // The owner's peek/send are untouched — that is the documented boundary.
         crate::api::session_verbs::all_lane_names()
+            .into_iter()
+            .filter(|l| !crate::api::session_verbs::session_is_isolated(l))
+            .collect()
     }
     fn auto_pickup_enabled(&self, lane: &str) -> bool {
         crate::api::session_verbs::standing_orders_on(lane, "CC_AUTO_PICKUP")

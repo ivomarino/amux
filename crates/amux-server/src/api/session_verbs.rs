@@ -3392,6 +3392,33 @@ pub(crate) async fn steer_enqueue_precond(
     sender: &str,
     precond: Option<(&str, i64)>,
 ) -> Result<String, &'static str> {
+    // ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26: "isolated =
+    // zero amux harness, just raw LLM pass through"), gated at the CHOKEPOINT
+    // for the same reason AF-188 put the archived refusal here.
+    //
+    // The reported symptom was one nudge in one lane. The cause was that
+    // isolation's consumer list covered what a worker is TOLD ABOUT and
+    // DISCOVERABLE BY, and nothing about what gets TYPED INTO ITS PANE:
+    // measured that day, ZERO of the 15 runtime_jobs consulted
+    // `session_is_isolated`, and SEVEN automated producers reach this function
+    // — commit-nudge, board-drive, staged-guard, accountability, auto-compact,
+    // env-apply-prompt, typo. Fixing the two that were observed would have left
+    // five, which is how the original list went stale in the first place.
+    //
+    // THE DISCRIMINATOR IS `guard`, and it is opt-OUT by construction. Every
+    // automated producer names itself there; the owner's own send
+    // (`send_text_inner`) passes "". So a NEW automated caller is blocked by
+    // default and has to deliberately pass an empty guard to reach an isolated
+    // lane — the inverse of a list somebody must remember to extend (ethos
+    // rule 1).
+    //
+    // Owner peek/send stay working, which is the documented boundary. This
+    // REFUSES rather than silently dropping: a producer that thinks it
+    // delivered is how a board card gets claimed for a lane nobody is driving.
+    if !guard.is_empty() && session_is_isolated(name) {
+        return Err("target is an isolated (raw-agent) worker: amux automation is not \
+                    delivered into it. The owner's own send still works.");
+    }
     // REFUSE A PERMANENT BLOCK HERE, not in the handlers (AF-188).
     //
     // `steer_mutate` and `auto_deliver` each refused archived targets; this
@@ -11498,6 +11525,31 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// function is the single source of truth every isolation decision consults:
 /// spawn-env suppression, `--mcp-config`, board auto-capture, the peer fleet
 /// list, the fleet roster, the peer-send guard, and the status/rate-limit sweep.
+///
+/// AND WHAT GETS TYPED INTO ITS PANE, which that list did not cover for two
+/// months (Ethan, 2026-08-26: "we have an isolated worker but it still has amux
+/// shit", naming gtm-research). Every consumer above is about what the worker is
+/// TOLD ABOUT or DISCOVERABLE BY. Measured that day: ZERO of the 15
+/// `runtime_jobs` consulted this function, and three of them steer text into
+/// sessions — so a lane marked "raw agent, no amux harness" was still receiving
+/// commit nudges and board auto-pickup claims. Now:
+///
+/// - `commit_nudge` skips isolated lanes.
+/// - `board_drive` filters them out of `lanes()` — at the SELECTION, not the
+///   send. Gating delivery would let auto-pickup CLAIM a card for a lane it then
+///   cannot reach, stranding it in `doing`, which is worse than the bug.
+///
+/// THE SCHEDULER IS DELIBERATELY NOT FILTERED, and that is a decision rather
+/// than an omission. A schedule is a standing instruction a HUMAN created
+/// against that session by name; isolation is about amux's own automation not
+/// typing at a raw agent, not about silently cancelling configuration somebody
+/// set up (ethos rule 8). Owner peek/send are untouched for the same reason —
+/// that is the documented boundary.
+///
+/// The lesson, since this list is what was wrong: audit an exemption against
+/// what still REACHES the thing, not against what the list already names.
+/// "Who receives this by default" is ethos rule 1's question, and it applies to
+/// exemptions as much as to features.
 pub(crate) fn session_is_isolated(name: &str) -> bool {
     env_flag_on(parse_env(name).get("CC_ISOLATED"))
 }
@@ -14639,6 +14691,57 @@ mod tests {
             pickup_stale_void("board-drive", "advance BDQ-1 or move it — a nudge, no card sentinel", Some("done"), Some("x"), "x"),
             None,
             "a board-drive NUDGE is not a single-card pickup and must deliver"
+        );
+    }
+
+    /// ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26).
+    ///
+    /// Reported as one nudge in one lane (gtm-research). The cause was that
+    /// isolation's consumer list covered what a worker is TOLD ABOUT and
+    /// DISCOVERABLE BY and nothing about what is TYPED INTO ITS PANE — zero of
+    /// the 15 runtime_jobs consulted `session_is_isolated`, while seven
+    /// automated producers reach this chokepoint.
+    ///
+    /// THE OWNER'S SEND IS THE LOAD-BEARING CELL. A fix that refused everything
+    /// into an isolated lane would pass the first assertion perfectly and mute
+    /// the worker completely — and "the owner can still peek and send" is the
+    /// documented boundary of the whole feature. Asserting only the refusal
+    /// would ship that.
+    #[tokio::test]
+    async fn an_isolated_lane_refuses_amux_automation_and_still_takes_the_owners_send() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_DIR=/tmp\nCC_ISOLATED=\"1\"\n").unwrap();
+        std::fs::write(sessions.join("ordinary.env"), "CC_DIR=/tmp\n").unwrap();
+        assert!(
+            session_is_isolated("raw"),
+            "fixture must actually be isolated, or every assertion below is vacuous"
+        );
+        assert!(!session_is_isolated("ordinary"));
+
+        // AUTOMATION is refused. `guard` is what names the producer, and every
+        // automated one sets it.
+        for src in ["commit-nudge", "board-drive", "staged-guard", "auto-compact"] {
+            let r = steer_enqueue(&st, "raw", "harness text", src, "").await;
+            assert!(r.is_err(), "{src} must not be delivered into an isolated lane");
+        }
+
+        // THE OWNER'S OWN SEND still queues. `send_text_inner` passes an empty
+        // guard, which is the discriminator — and it makes the rule opt-OUT: a
+        // NEW automated caller is blocked by default rather than needing to be
+        // added to a list somebody must remember.
+        assert!(
+            steer_enqueue(&st, "raw", "owner text", "", "").await.is_ok(),
+            "the owner's send must still reach an isolated lane — that is the documented boundary"
+        );
+
+        // CONTROL: an ORDINARY lane still takes automation, or this fix is
+        // "turn the fleet off" and every assertion above would still pass.
+        assert!(
+            steer_enqueue(&st, "ordinary", "harness text", "commit-nudge", "").await.is_ok(),
+            "automation into a NON-isolated lane must be unaffected"
         );
     }
 
