@@ -57,14 +57,28 @@ catch-all as well, so they are listed for completeness.
 | `report` | The harness reporting its own state — D1's exit condition in `ethos.md`, the durable inverse of terminal scraping. |
 | `steer` | How board state reaches a lane at its turn boundary (the 2026-08-03 decision against a global bus). Load-bearing. |
 | `keys` | **Not** a duplicate of `send`: `keys` writes to the terminal, `send` delivers a prompt at a turn boundary. Both are needed and the names should say which is which. |
-| `duplicate` | Survivor of the `clone`/`duplicate` pair. **BLOCKED on [#137](https://github.com/mixpeek/amux/issues/137) — do not promote yet.** See below. |
+| `duplicate` | Survivor of the `clone`/`duplicate` pair. **Precondition [#137](https://github.com/mixpeek/amux/issues/137) is MET — promoted.** See below. |
 | `resize` | Terminal geometry. |
 | `wake` | |
 | `clear` | |
 | `reset` | |
 | `apply-template` | |
 
-### `duplicate` has a precondition, and promoting it is what makes the defect reachable
+### `duplicate` had a precondition; it is met, and the verb is promoted
+
+**SETTLED 2026-08-26 (AF-236).** `register_twin` in `session_verbs.rs` writes the
+`_amux_workers` row for the copy before either verb returns, and rolls the copied env
+file back if the store refuses — so there is no window in which the twin exists
+unregistered. `duplicate` is now in `NATIVE_ONLY_HERE` and reachable on a store-managed
+worker; `clone` shares the same helper rather than being left to be fixed by whoever
+promotes it next, because "slated for retirement" and "cannot mint an invisible session
+today" are different properties. The section below is kept as the reasoning, in the past
+tense, because the ORDER is the reusable part: the registration had to land before the
+exemption, and reversing it re-opens the defect.
+
+The original analysis follows.
+
+### Why it was blocked: promoting it is what made the defect reachable
 
 Reported by @tsukimiya on [#137](https://github.com/mixpeek/amux/issues/137), re-verified
 on current `main` by @esteininger — every claim holds, only the line numbers moved.

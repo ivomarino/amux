@@ -9696,7 +9696,22 @@ async fn dispatch(
     // `send` from this list would hand every one of them the pointer instead.
     // The list shrinks when a verb's legacy spelling has no callers left, not
     // when it gains a modern route.
-    const NATIVE_ONLY_HERE: [&str; 2] = ["peek", "send"];
+    //
+    // `duplicate` joins them on the SAME rule, not as an exception to it: it is
+    // implemented here and has no modern home (there is no
+    // `POST /api/workers/{id}/duplicate`), so a store-managed worker asking to
+    // be duplicated was being handed a pointer to a route that does not
+    // implement the verb.
+    //
+    // ITS PRECONDITION IS NOW MET, which is the only reason this line may
+    // change. #137 (@tsukimiya) filed the ordering explicitly: exempting
+    // `duplicate` is precisely what makes an unregistered twin reachable, so
+    // the exemption had to wait for the registration. `register_twin` writes
+    // the `_amux_workers` row before either verb returns, and rolls the copied
+    // env file back if it cannot — so promoting no longer ships a route that
+    // mints sessions `/api/workers` cannot see. Reversing this order re-opens
+    // the defect; the doc records the same ordering.
+    const NATIVE_ONLY_HERE: [&str; 3] = ["peek", "send", "duplicate"];
     if !NATIVE_ONLY_HERE.contains(&action.as_str()) {
         let is_rust_worker = state
             .store
@@ -11242,7 +11257,27 @@ async fn post_dispatch(
             if std::fs::copy(env_path(name), &new_file).is_err() {
                 return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
             }
-            j200(json!({"ok": true, "message": format!("duplicated as {new_name}")}))
+            let registered = match register_twin(state, name, &new_name) {
+                Ok(applied) => applied,
+                // FAIL WHOLE, NOT HALF. Leaving the copied env file behind after
+                // a failed insert would produce exactly the unregistered twin
+                // this code exists to prevent, and it would do so on the error
+                // path where nobody looks.
+                Err(e) => {
+                    let _ = std::fs::remove_file(&new_file);
+                    return jresp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": format!("could not register '{new_name}' in the worker store; the duplicate was rolled back rather than left invisible: {e}")}),
+                    );
+                }
+            };
+            j200(json!({
+                "ok": true,
+                "message": format!("duplicated as {new_name}"),
+                // Say which shape happened, so a caller can tell a registered
+                // twin from a plain env-file copy without going to the store.
+                "registered": registered,
+            }))
         }
         "clone" => clone_post(state, name, body).await,
         "archive" => {
@@ -11820,6 +11855,73 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     jresp(code, resp)
 }
 
+/// Give a copied session its own `_amux_workers` row, when the source has one.
+///
+/// #137 (@tsukimiya) / AF-236. `duplicate` and `clone` both copy the env file
+/// and, before this, touched the `workers` table nowhere: across the whole of
+/// this module the only `queries::` call that saw it was the dispatch guard's
+/// own read. `list_workers` reads the store, so a copied env file with no row
+/// is a session that can RUN while being absent from `/api/workers` and from
+/// the dashboard. Copying the file and not the row is what makes the twin
+/// invisible rather than merely new.
+///
+/// The reporter filed it as a PRECONDITION rather than a bug, which was the
+/// right call: `dispatch()` answers 501 for every verb on a store-managed
+/// worker, so neither verb was reachable, and exempting one is exactly what
+/// would have made it reachable. That is why this landed BEFORE the promotion
+/// and not after.
+///
+/// ONE helper for both verbs, deliberately. `clone` is slated for retirement in
+/// favour of `duplicate` (docs/workers-verb-classification.md), but "will be
+/// deleted eventually" and "cannot mint an invisible session today" are
+/// different properties, and fixing only the survivor would leave the identical
+/// defect behind the same guard for whoever promotes the other one.
+///
+/// Returns whether a row was written: `false` is the correct, non-error answer
+/// for a plain env-file source. Minting a row for that twin would invent a
+/// worker the original never was — the mirror defect, harder to spot because an
+/// extra row reads as tidiness.
+fn register_twin(state: &AppState, source: &str, twin: &str) -> Result<bool, String> {
+    let src = source.to_string();
+    let twin_name = twin.to_string();
+    let out = state
+        .store
+        .write(move |conn| {
+            let Some(row) = crate::db::queries::get_worker(conn, &src)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let mut config = row.config();
+            config.display_name = twin_name.clone();
+            // Aliases are the SOURCE's former names (Invariant 17). Copying them
+            // would let `get_worker` resolve an old name of the source to the
+            // twin, silently re-pointing every caller still using it — the twin
+            // would answer peeks meant for the original.
+            config.name_aliases.clear();
+            let id = WorkerId::from_ulid(ulid::Ulid::new());
+            let new_row =
+                crate::db::queries::WorkerRow::new(&id, &config, &chrono::Utc::now().to_rfc3339());
+            crate::db::queries::insert_worker(conn, &new_row)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .map_err(|e| e.to_string());
+    match &out {
+        Ok(o) => Ok(o.applied),
+        Err(e) => {
+            // Named marker: the caller rolls the copy back, so without this the
+            // only trace of a store that refused the write would be a 500 among
+            // every other 500 on this route.
+            tracing::warn!(
+                marker = "twin_worker_row_failed",
+                source = %source,
+                twin = %twin,
+                error = %e,
+                "could not register a duplicated session in the worker store (AF-236 / #137)"
+            );
+            Err(e.clone())
+        }
+    }
+}
+
 async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
@@ -11834,6 +11936,22 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
     if std::fs::copy(env_path(name), &new_file).is_err() {
         return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
     }
+    // BEFORE start_session, not after (#137 / AF-236). `clone` is the worse
+    // half of the pair precisely because it then STARTS the copy: an
+    // unregistered twin here is not a dormant file, it is a running session
+    // that /api/workers cannot see. Registering first means the window in
+    // which it exists-and-is-invisible does not open at all, and a store that
+    // refuses the write costs a rolled-back file rather than a live ghost.
+    let cloned_registered = match register_twin(state, name, &new_name) {
+        Ok(applied) => applied,
+        Err(e) => {
+            let _ = std::fs::remove_file(&new_file);
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("could not register '{new_name}' in the worker store; the clone was rolled back rather than started invisible: {e}")}),
+            );
+        }
+    };
     let source_meta = load_meta(name);
     let session_id = {
         let sid = meta_str(&source_meta, "cc_conversation_id");
@@ -11898,7 +12016,7 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
             send_key(&new_name, "Enter").await;
         }
     }
-    j200(json!({"ok": true, "message": format!("cloned as {new_name} (method: {method_used})"), "started": ok}))
+    j200(json!({"ok": true, "message": format!("cloned as {new_name} (method: {method_used})"), "started": ok, "registered": cloned_registered}))
 }
 
 fn find_latest_session_id(work_dir: &str) -> String {
@@ -16001,6 +16119,108 @@ mod tests {
             assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{path} -> {v}");
             assert_eq!(v["hint"], json!("/api/workers/hw"), "{path}");
         }
+    }
+
+    /// AF-236 / #137: `duplicate` must not mint a session the store cannot see.
+    ///
+    /// The twin gets an env file either way. The question is whether it also
+    /// gets a `_amux_workers` row, and the answer has to depend on the SOURCE:
+    /// a store-managed worker's twin must be registered or it is a running
+    /// session absent from /api/workers and from the dashboard, while a plain
+    /// env-file session's twin must NOT be, or the verb invents a worker the
+    /// original never was.
+    ///
+    /// Both cells in one test on purpose. Either alone passes against a build
+    /// that answers unconditionally, in whichever direction it picked.
+    #[tokio::test]
+    async fn duplicate_registers_the_twin_only_when_the_source_is_store_managed() {
+        use amux_core::provider::ProviderId;
+        use amux_core::session::BackendId;
+        use amux_core::worker::WorkerConfig;
+        use crate::db::queries::WorkerRow;
+        use crate::db::WriteOutcome;
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/managed.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(home.path().join("sessions/plain.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+
+        // `managed` is store-managed; `plain` deliberately is not.
+        let id = WorkerId::from_ulid(ulid::Ulid::new());
+        let config = WorkerConfig {
+            display_name: "managed".into(),
+            name_aliases: vec!["oldname".into()],
+            cwd: "/tmp".into(),
+            provider: ProviderId::new("claude"),
+            model: Some("sonnet".into()),
+            backend: BackendId::from("tmux"),
+            environment: Default::default(),
+            permissions: Vec::new(),
+            group: None,
+        };
+        let row = WorkerRow::new(&id, &config, &chrono::Utc::now().to_rfc3339());
+        state
+            .store
+            .write(move |conn| {
+                crate::db::queries::insert_worker(conn, &row)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed the managed worker");
+
+        let app: Router = routes().with_state(state.clone());
+
+        // CELL 1 — store-managed source: the twin is registered and addressable.
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/managed/duplicate",
+            Some(json!({"new_name": "managed-twin"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["registered"], json!(true), "{v}");
+        assert!(env_path("managed-twin").exists(), "the env file is still copied");
+
+        let conn = state.store.read().expect("read store");
+        let twin = crate::db::queries::get_worker(&conn, "managed-twin")
+            .expect("query")
+            .expect(
+                "the twin has no _amux_workers row — it is a session that can run and that \
+                 /api/workers cannot see, which is exactly #137",
+            );
+        assert_eq!(twin.display_name, "managed-twin");
+        assert_ne!(twin.id, id.as_str(), "the twin must be its own worker, not an alias of the source");
+        // Config is inherited...
+        assert_eq!(twin.model.as_deref(), Some("sonnet"), "config must carry over");
+        // ...but NOT the aliases. Copying them would make `get_worker("oldname")`
+        // resolve to whichever row sorts first, silently re-pointing callers that
+        // still use the source's former name at the twin.
+        assert!(twin.name_aliases.is_empty(), "aliases belong to the source: {:?}", twin.name_aliases);
+        assert_eq!(
+            crate::db::queries::get_worker(&conn, "oldname").unwrap().map(|r| r.id),
+            Some(id.as_str().to_string()),
+            "the source's old name must still resolve to the SOURCE"
+        );
+        drop(conn);
+
+        // CELL 2 — plain env-file source: copied, and deliberately unregistered.
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/plain/duplicate",
+            Some(json!({"new_name": "plain-twin"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["registered"], json!(false), "{v}");
+        assert!(env_path("plain-twin").exists());
+        let conn = state.store.read().expect("read store");
+        assert!(
+            crate::db::queries::get_worker(&conn, "plain-twin").unwrap().is_none(),
+            "a plain env-file session's twin must not be invented as a worker"
+        );
     }
 
     #[tokio::test]
