@@ -270,9 +270,39 @@ fallback when a finding needs row-level inspection.
      rule generalises: **a mutating method is not the same as WORK. Before
      flagging, look at what the writes actually were.**
 
-   The sample is also capped: `limit=2000` is the max, and on a busy day that is
-   ~2.7 hours of a 24h window, taken from one end. Say the real span in the
-   summary, or read the store directly for the full window.
+   **PAGE THE WINDOW — do not judge it from one capped read (AF-230).**
+   `limit=2000` is the max, so a single call is a SLICE from the newest end:
+   on 2026-08-26 that was 2,000 of 123,645 rows, spanning **0.48 hours** of the
+   24 this step believed it was judging. This step decides whether a lane is
+   working off-ledger, which the rules above call "the accusation you cannot
+   un-say" — reaching that from 1.6% of the window is not a clean result, it is
+   an unmeasured one.
+
+   `/api/logs` now takes an UPPER bound too, so the window is walkable:
+   `since < ts <= until`. Page backward until the rows run out, passing the
+   oldest `ts` you received as the next `until`:
+
+   ```bash
+   SINCE=$(( $(date +%s) - 86400 )); UNTIL=$(date +%s)
+   while : ; do
+     page=$(curl -sk "$(amux url)/api/logs?since=$SINCE&until=$UNTIL&limit=2000")
+     n=$(printf '%s' "$page" | python3 -c 'import json,sys;print(json.load(sys.stdin)["count"])')
+     [ "$n" -eq 0 ] && break
+     printf '%s\n' "$page" >> /tmp/sweep-pages.jsonl
+     UNTIL=$(printf '%s' "$page" | python3 -c 'import json,sys;print(int(json.load(sys.stdin)["events"][-1]["ts"]))')
+   done
+   ```
+
+   Every response now says whether it is a slice, so this is checkable rather
+   than remembered: `truncated` (you are holding the newest `limit` rows, not
+   the window), `page_span_h` (what the returned rows ACTUALLY cover), and a
+   `note` naming the paging move. `total_matched` remains the pre-LIMIT count
+   and is still the right answer for volume questions — page only when you need
+   the ROWS across more than 2000 of them.
+
+   If you do judge from a single page anyway, say the real span from
+   `page_span_h` and say the step could not discriminate over the rest. A clean
+   29 minutes does not speak for the other 23.5 hours.
 
 6. **Status truth: does the card agree with the pane?** (AMUX-2646)
    `GET /api/health/invariants` (detail: `GET /api/debug/invariants`) — read the

@@ -682,9 +682,18 @@ pub fn routes() -> Router<AppState> {
 ///
 /// Additive params (not sent by the SPA today, needed by the daily sweep —
 /// docs/rust-migration/log-sweep.md): `worker` (the per-worker subset),
-/// `since` (unix ts), `family`, `min_status`, `answered_by`. Additive
-/// response field: `total_matched` — the pre-LIMIT count, so volume
-/// questions are answerable without paging (the page-vs-corpus trap).
+/// `since` + `until` (unix ts, a HALF-OPEN window `since < ts <= until`),
+/// `family`, `min_status`, `answered_by`. Additive response field:
+/// `total_matched` — the pre-LIMIT count, so volume questions are
+/// answerable without paging (the page-vs-corpus trap).
+///
+/// `until` exists because this list used to stop at `since` (AF-230), and a
+/// lower bound alone is not a window: with `ORDER BY ts DESC LIMIT <=2000`
+/// every call returns the same newest rows, so paging backward was
+/// impossible and a caller asking for 24h got an unannounced slice of it.
+/// `total_matched` is the pre-LIMIT count and stays the right answer for
+/// "how many" — `until` is for when you need the ROWS across a window
+/// wider than 2000 of them.
 async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
     let limit: i64 = q
         .get("limit")
@@ -740,6 +749,25 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         clauses.push("ts > ?".into());
         params.push(ts.into());
     }
+    // UPPER bound, so the window is PAGEABLE (AF-230). `since` alone plus
+    // `ORDER BY ts DESC LIMIT <=2000` means every call returns the same newest
+    // N rows and there is no way to walk backward — so a caller asking about a
+    // 24h window silently gets whatever slice 2000 rows happens to cover. On
+    // 2026-08-26 that was 2,000 of 123,645 rows: 0.48 HOURS of the 24 the daily
+    // sweep's step 5 believed it was judging, taken from one end.
+    //
+    // That step decides whether any worker is doing mutating work with no board
+    // trace — an accusation the contract itself calls "the expensive kind" — and
+    // it was reaching that verdict from 1.6% of its window. The endpoint's own
+    // doc comment lists the params added FOR this sweep and this is the one that
+    // was missing, which is why the contract carries a workaround telling the
+    // reader to state the blind spot, or to go read the store directly. Routing
+    // a caller off the sanctioned instrument onto raw SQL is the ethos rule 6
+    // shape; giving the instrument the bound removes the need.
+    if let Some(ts) = q.get("until").and_then(|v| v.parse::<f64>().ok()) {
+        clauses.push("ts <= ?".into());
+        params.push(ts.into());
+    }
     if let Some(ms) = q.get("min_status").and_then(|v| v.parse::<i64>().ok()) {
         clauses.push("status >= ?".into());
         params.push(ms.into());
@@ -779,10 +807,39 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         Ok(v) => v,
         Err(e) => return internal(e),
     };
+    // SAY THAT THIS IS A SLICE (AF-230, the second half). `until` lets a
+    // caller page the window; these fields are what tell them they NEED to.
+    // The 2026-08-26 sweep read 2,000 of 123,645 rows and reported on "the
+    // 24h window" — `total_matched` was right there and disagreed, but
+    // nothing in the body said "you are holding 0.48 hours", so the mismatch
+    // had to be noticed rather than read. `analyze` and `stats` already
+    // publish `scan_truncated`/`actual_window_h` for exactly this reason;
+    // this is the same admission on the endpoint that lacked it, so the next
+    // capped read announces itself in the payload the caller already opens
+    // instead of being inferred by whoever happens to compare two numbers.
+    let truncated = events.len() as i64 == limit && total > events.len() as i64;
+    let span_h = match (events.first(), events.last()) {
+        (Some(a), Some(b)) => {
+            let (hi, lo) = (a["ts"].as_f64().unwrap_or(0.0), b["ts"].as_f64().unwrap_or(0.0));
+            ((hi - lo) / 3600.0 * 100.0).round() / 100.0
+        }
+        _ => 0.0,
+    };
     Json(json!({
         "events": events,
         "count": events.len(),
         "total_matched": total,
+        // True = you are holding the newest `limit` rows, NOT the window you
+        // asked for. Page backward with `until=<oldest ts you got>`.
+        "truncated": truncated,
+        // The span the returned rows ACTUALLY cover, so a window claim can be
+        // checked against the page rather than assumed from `since`.
+        "page_span_h": span_h,
+        "note": if truncated {
+            "TRUNCATED: these are the newest rows, not the whole window. \
+             Page backward with `until=<the oldest ts in this page>`, or read \
+             `total_matched` for volume. Do not describe this page as the window."
+        } else { "" },
     }))
     .into_response()
 }
@@ -2882,6 +2939,95 @@ mod tests {
 
     fn logs_api(store: Arc<crate::db::Store>) -> Router {
         Router::new().nest("/api/logs", routes()).with_state(state(store))
+    }
+
+    /// AF-230, from the 2026-08-26 sweep's own numbers: step 5 asked for a
+    /// 24h window, got 2,000 of 123,645 rows, and that page spanned 0.48
+    /// HOURS. `since` was the only time bound, so with `ORDER BY ts DESC
+    /// LIMIT <=2000` every call returned the same newest rows and paging
+    /// backward was impossible — the step judged "is anyone working
+    /// off-ledger" from 1.6% of its window and could not have known.
+    ///
+    /// The fixture flows through the SHIPPED handler (`logs_api` -> the same
+    /// `routes()` the server mounts), not a re-implementation of the filter:
+    /// the defect is in `get_logs`'s clause list, so a test that rebuilt the
+    /// WHERE clause itself would pin the wrong layer and pass either way.
+    ///
+    /// Both assertions are load-bearing in opposite directions. `until` must
+    /// EXCLUDE the newest rows — the whole point, and the half that fails on
+    /// the pre-fix code, since an ignored param returns everything. And the
+    /// disjoint pages must reassemble the window exactly: `until` that
+    /// overlapped or dropped a row at the seam would still shrink the page
+    /// and look like it worked.
+    #[tokio::test]
+    async fn until_makes_the_window_pageable_backward() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // Six rows, one per hour, newest first at now-1h.
+        for i in 1..=6u32 {
+            seed(&store, now - (i as f64) * 3600.0, "GET", "/api/board", 200, 1.0, "lane", "native", None).await;
+        }
+        let api = logs_api(store.clone());
+        let get = |uri: String| {
+            let api = api.clone();
+            async move {
+                let (st, body) = hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                assert_eq!(st, StatusCode::OK);
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+
+        // Control: the window unbounded above holds all six. Without this, a
+        // seeding failure would make every `until` assertion below pass by
+        // returning nothing (ethos rule 7: confirm the fixture is real).
+        let all = get(format!("/api/logs?since={}&limit=2000", now - 7.0 * 3600.0)).await;
+        assert_eq!(all["total_matched"], 6, "control: all six rows are in the window: {all}");
+
+        // `until` excludes the newest rows. THIS is the assertion that fails
+        // on the pre-fix code, where an unknown param is silently dropped and
+        // the answer is 6.
+        let old = get(format!(
+            "/api/logs?since={}&until={}&limit=2000",
+            now - 7.0 * 3600.0,
+            now - 3.5 * 3600.0
+        ))
+        .await;
+        assert_eq!(old["total_matched"], 3, "until must exclude rows newer than it: {old}");
+        for e in old["events"].as_array().unwrap() {
+            let ts = e["ts"].as_f64().unwrap();
+            assert!(ts <= now - 3.5 * 3600.0, "row newer than `until` leaked through: {e}");
+        }
+
+        // The truncation disclosure: a page that IS the whole window must not
+        // claim otherwise, and one that is a slice must say so in the body.
+        assert_eq!(all["truncated"], false, "6 of 6 rows is not a truncated page: {all}");
+        assert_eq!(all["note"], "", "an untruncated page carries no warning: {all}");
+        let capped = get(format!("/api/logs?since={}&limit=2", now - 7.0 * 3600.0)).await;
+        assert_eq!(capped["truncated"], true, "2 of 6 rows IS truncated: {capped}");
+        assert_eq!(capped["total_matched"], 6, "total_matched stays the pre-LIMIT count");
+        assert!(
+            capped["note"].as_str().unwrap().contains("TRUNCATED"),
+            "a capped page must say so in the body, not leave it to be inferred: {capped}"
+        );
+        // page_span_h describes the ROWS RETURNED, which is the number the
+        // sweep needed and did not have: 2 rows an hour apart span 1h even
+        // though `since` asked for 7.
+        assert_eq!(capped["page_span_h"], 1.0, "span is of the page, not of `since`: {capped}");
+
+        // The seam: two disjoint pages must reassemble the window exactly —
+        // no row counted twice, none lost between them.
+        let newer = get(format!("/api/logs?since={}&limit=2000", now - 3.5 * 3600.0)).await;
+        assert_eq!(newer["total_matched"], 3, "the other half of the split: {newer}");
+        let mut seen: Vec<String> = old["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(newer["events"].as_array().unwrap())
+            .map(|e| e["ts"].to_string())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "the two pages must partition the window, not overlap it");
     }
 
     /// AF-131, rebuilt from the sweep's own numbers: three /api/logs/stats
