@@ -3006,6 +3006,48 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
         report.lanes.push(trace);
     }
     report.finished_at = now_f64();
+    // THE FLEET NUMBER, IN THE LOGS, EVERY TICK (AMUX-3758). A lane going idle
+    // on a full board produces a different local reason per lane — wip-cap,
+    // needsyou-renag-deduped, dep-other-lane — and each reads like a small bug.
+    // Only the aggregate says what is actually happening, and until now it
+    // existed nowhere: measured 2026-08-26, 4.9% of 1039 open cards were in the
+    // one status this loop can dispatch. `assigned=0` on a fleet with 1000 open
+    // cards was the reader's whole signal, and it does not distinguish "the
+    // loop is broken" from "there are 51 workable cards for 52 lanes".
+    //
+    // INFO always (a clean pass must be distinguishable from a census that
+    // measured nothing), WARN only when a LARGE board has almost nothing
+    // workable — the state where the fleet looks busy and is not.
+    if let Ok(conn) = state.store.read() {
+        let shape = fleet_queue_shape(&conn);
+        let (open, pct) = (
+            shape["open_total"].as_i64().unwrap_or(0),
+            shape["dispatchable_pct"].as_f64().unwrap_or(0.0),
+        );
+        tracing::info!(
+            job = "board-drive",
+            open_total = open,
+            dispatchable_todo = shape["dispatchable_todo"].as_i64().unwrap_or(0),
+            dispatchable_pct = pct,
+            needsyou_median_age_d = shape["needsyou_median_age_d"].as_f64(),
+            assigned = report.assigned,
+            "board queue shape"
+        );
+        if open >= 200 && pct < 10.0 {
+            tracing::warn!(
+                job = "board-drive",
+                open_total = open,
+                dispatchable_pct = pct,
+                needsyou = shape["by_status"]["needsyou"].as_i64(),
+                backlog = shape["by_status"]["backlog"].as_i64(),
+                needsyou_median_age_d = shape["needsyou_median_age_d"].as_f64(),
+                "queue_starved: the board is large and almost none of it is dispatchable — \
+                 lanes will idle with full queues and it is not this loop's fault. \
+                 `backlog` needs a trigger, `needsyou` needs a human; neither is amux's to \
+                 clear on its own. GET /api/debug/board-drive -> queue_shape"
+            );
+        }
+    }
     publish(&report);
     report
 }
@@ -3703,6 +3745,7 @@ pub async fn debug_board_drive(
         .filter_map(|v| v["session"].as_str().map(str::to_string))
         .collect();
     let capture_shells = state.store.read().ok().map(|c| capture_shell_cost(&c));
+    let queue_shape = state.store.read().ok().map(|c| fleet_queue_shape(&c));
     let body = json!({
         "note": "per-lane trace of the board -> worker drive loop; `reason` says why a lane \
                  was passed over. A skip that leaves no trace is indistinguishable from a loop \
@@ -3719,8 +3762,77 @@ pub async fn debug_board_drive(
         "backlog": waiting,
         "distinct_lanes_waiting": seen.len(),
         "capture_shells": capture_shells,
+        "queue_shape": queue_shape,
     });
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// The SHAPE of the fleet's open work, beside the loop that consumes it
+/// (AMUX-3758).
+///
+/// Ethan, 2026-08-26: "we need to rethink how we do amux because this isn't
+/// working." Chasing that per-lane finds a different local cause every time —
+/// wip-cap here, needsyou-renag-deduped there, dep-other-lane somewhere else —
+/// and each one reads like a small bug. The fleet number is the argument the
+/// per-lane traces cannot make: measured that day, of 1039 open cards, 48.2%
+/// were `backlog` (parked awaiting a trigger), 37.2% were `needsyou` (blocked
+/// on a human, median 7.2 days old, max 19.7), and **4.9% were `todo`** — the
+/// only status `DISPATCHABLE_WHERE` selects. 51 workable cards across 52 lanes.
+///
+/// So a lane going idle on a full board is mostly not a defect in this loop.
+/// The board is 95% invisible to it BY DESIGN, and the queue that actually
+/// feeds it is nearly empty. Nothing in amux said so, because every view is
+/// per-lane and the answer only exists in aggregate.
+///
+/// Deliberately a MEASUREMENT and not an action: promoting backlog or resolving
+/// needsyou on the fleet's behalf would be an agent deciding a human's work is
+/// unblocked (ethos rule 8). This reports; a human decides.
+///
+/// `dispatchable_pct` is the headline. It reads ZERO in two very different
+/// worlds — a fleet with nothing to do, and a fleet whose whole board is parked
+/// — so `open_total` rides along in the same payload to tell them apart.
+fn fleet_queue_shape(conn: &Connection) -> Value {
+    const OPEN: &str = "('todo','doing','backlog','needsyou','review','armed')";
+    let mut by_status = serde_json::Map::new();
+    let mut total = 0i64;
+    if let Ok(mut st) = conn.prepare(&format!(
+        "SELECT status, COUNT(*) FROM issues WHERE status IN {OPEN} \
+         AND deleted IS NULL AND COALESCE(archived,0)=0 GROUP BY status"
+    )) {
+        if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for (s, n) in rows.flatten() {
+                total += n;
+                by_status.insert(s, json!(n));
+            }
+        }
+    }
+    let todo = by_status.get("todo").and_then(Value::as_i64).unwrap_or(0);
+    // Median age of the human-blocked pile, in days. The COUNT alone reads the
+    // same for 387 questions asked this morning and 387 asked a fortnight ago,
+    // and only the second is a bottleneck.
+    let needsyou_median_age_d: Option<f64> = conn
+        .query_row(
+            "SELECT (strftime('%s','now') - COALESCE(updated, created)) / 86400.0 \
+             FROM issues WHERE status='needsyou' AND deleted IS NULL \
+               AND COALESCE(archived,0)=0 \
+             ORDER BY COALESCE(updated, created) DESC \
+             LIMIT 1 OFFSET (SELECT COUNT(*)/2 FROM issues WHERE status='needsyou' \
+                             AND deleted IS NULL AND COALESCE(archived,0)=0)",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    json!({
+        "open_total": total,
+        "by_status": by_status,
+        "dispatchable_todo": todo,
+        "dispatchable_pct": if total > 0 { (todo as f64 * 1000.0 / total as f64).round() / 10.0 } else { 0.0 },
+        "needsyou_median_age_d": needsyou_median_age_d,
+        "note": "`dispatchable_todo` is the ONLY slice DISPATCHABLE_WHERE selects. A lane idling \
+                 on a full board is usually this: its queue is real and its workable queue is \
+                 empty. `backlog` needs a trigger, `needsyou` needs a human — neither is a defect \
+                 in the drive loop, and neither is amux's to clear on its own.",
+    })
 }
 
 /// What the capture-shell nudge is costing, in one call.
@@ -4979,6 +5091,58 @@ mod tests {
                 claimed(&other)
             ),
         }
+    }
+
+    /// AMUX-3758. The number that answers "we need to rethink how we do amux
+    /// because this isn't working" is a FLEET number, and every existing view
+    /// is per-lane.
+    ///
+    /// The median is hand-rolled SQL (`ORDER BY ... DESC LIMIT 1 OFFSET n/2`),
+    /// which is exactly the kind of expression that returns a plausible number
+    /// while being wrong — so the fixture uses ages whose median is not the
+    /// mean and not an endpoint. 2/10/30 has mean 14 and median 10; an
+    /// off-by-one in the OFFSET lands on 2 or 30, and averaging lands on 14.
+    #[test]
+    fn the_queue_shape_reports_the_dispatchable_slice_and_the_age_of_the_human_backlog() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "T-1", "lane", "todo", "workable", "SCOPE: x");
+        for (n, days) in [("N-1", 2.0), ("N-2", 10.0), ("N-3", 30.0)] {
+            add_card(&conn, n, "lane", "needsyou", "asked a human", "SCOPE: x");
+            conn.execute(
+                "UPDATE issues SET updated=?1 WHERE id=?2",
+                rusqlite::params![(now - days * 86400.0) as i64, n],
+            )
+            .expect("age");
+        }
+        for n in ["B-1", "B-2", "B-3", "B-4", "B-5", "B-6"] {
+            add_card(&conn, n, "lane", "backlog", "parked", "SCOPE: x");
+        }
+        // An ARCHIVED card is cleared, and must not inflate the denominator —
+        // otherwise dispatchable_pct falls as the board is TIDIED, which reads
+        // as the fleet getting worse.
+        add_card(&conn, "Z-1", "lane", "backlog", "cleared", "SCOPE: x");
+        conn.execute("UPDATE issues SET archived=1 WHERE id='Z-1'", []).expect("archive");
+
+        let s = fleet_queue_shape(&conn);
+        assert_eq!(s["open_total"], json!(10), "1 todo + 3 needsyou + 6 backlog: {s}");
+        assert_eq!(s["dispatchable_todo"], json!(1));
+        assert_eq!(s["dispatchable_pct"], json!(10.0), "1 of 10, to one decimal: {s}");
+        assert_eq!(s["by_status"]["backlog"], json!(6));
+        assert_eq!(s["by_status"]["needsyou"], json!(3));
+        let med = s["needsyou_median_age_d"].as_f64().expect("a median");
+        assert!(
+            (med - 10.0).abs() < 0.5,
+            "the MIDDLE of 2/10/30 days, not the mean (14) and not an endpoint: got {med}"
+        );
+
+        // A fleet with a genuinely empty board reads zero for the same headline,
+        // so `open_total` is what tells the two apart (ethos rule 4).
+        let empty = board_db();
+        let e = fleet_queue_shape(&empty);
+        assert_eq!(e["dispatchable_pct"], json!(0.0));
+        assert_eq!(e["open_total"], json!(0), "zero%% with zero open is 'nothing to do': {e}");
+        assert!(e["needsyou_median_age_d"].is_null(), "no pile, no age: {e}");
     }
 
     /// Backend, 2026-08-11 afternoon: 16 claims in one hour, every card
