@@ -4255,6 +4255,19 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     if let Some(inner) = m.strip_prefix("auto-wake failed: ") {
         return send_failure_status(inner);
     }
+    // --- 409: the target exists and is deliberately closed to this caller.
+    //     An isolated lane refuses amux automation and takes the owner's send
+    //     (AMUX-3764), so this is a policy refusal with an obvious next step,
+    //     not a fault. 500 would file it as a bug and send someone debugging.
+    if m.starts_with("target is an isolated (raw-agent) worker") {
+        return (
+            StatusCode::CONFLICT,
+            Some(
+                "this lane is isolated: amux automation is not delivered into it. Send as the \
+                 owner, or clear CC_ISOLATED on the lane if it should take automation.",
+            ),
+        );
+    }
     // --- 404: the target does not exist.
     if m.starts_with("session '") && m.ends_with("not found") {
         return (StatusCode::NOT_FOUND, Some("GET /api/sessions lists the live lanes"));
@@ -4774,7 +4787,13 @@ pub(crate) fn keystroke_lanes(state: &AppState) -> Vec<String> {
     names
 }
 
-async fn send_after_ready(state: AppState, name: String, text: String, timeout_s: u64) {
+async fn send_after_ready(
+    state: AppState,
+    name: String,
+    text: String,
+    timeout_s: u64,
+    origin: SendOrigin,
+) {
     // py:24889 _send_after_ready — wait for Claude's input prompt, then send.
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
     while std::time::Instant::now() < deadline {
@@ -4783,7 +4802,7 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
             let clean = strip_ansi(&out);
             if claude_ui_visible(&clean) && !at_resume_picker(&clean) {
                 sleep_ms(1200).await;
-                let _ = send_text_boxed(&state, &name, &text, false).await;
+                let _ = send_text_boxed(&state, &name, &text, false, origin).await;
                 return;
             }
         }
@@ -4831,8 +4850,49 @@ pub(crate) fn must_paste(generating: bool, chars: usize, picker_shaped: bool) ->
     generating || chars > 400 || picker_shaped
 }
 
-pub(crate) async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
-    send_text_inner(state, name, text, defer_if_busy, false, false, false).await
+/// WHO is putting this text into the pane.
+///
+/// Exists because the isolation gate was one layer too high (AMUX-3764). It sat
+/// on `steer_enqueue`, discriminating on a non-empty `guard`, which is correct
+/// and complete FOR THE QUEUE. But `steer_enqueue` is not where text reaches a
+/// pane — `send_text_inner` is — and three producers call that directly,
+/// walking straight past the gate: `deliver_hot_config` (amux typing a slash
+/// command into the lane), and the two channel notices in `channels.rs`.
+///
+/// Same opt-OUT shape as the guard, deliberately: `Automation` is what a caller
+/// gets by thinking about it, and `Owner` has to be chosen. A new call site
+/// cannot reach an isolated lane by forgetting something.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SendOrigin {
+    /// A person acted: the send API, the deploy button, apply-instructions.
+    Owner,
+    /// amux decided on its own. Refused into an isolated lane.
+    Automation,
+}
+
+/// The `guard` a send carries when a live selector parks it on the queue.
+///
+/// Split out so the shipped path and its test share ONE definition. The park
+/// passed `""` unconditionally, which is the exact value the queue's isolation
+/// gate reads as "the owner", so an automated send that happened to find the
+/// lane at a picker was laundered into an owner send (AMUX-3764). An empty
+/// guard also drops the per-producer dedupe, which is a defect independent of
+/// isolation.
+pub(crate) fn park_guard(origin: SendOrigin) -> &'static str {
+    match origin {
+        SendOrigin::Automation => "deferred-automation",
+        SendOrigin::Owner => "",
+    }
+}
+
+pub(crate) async fn send_text(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    defer_if_busy: bool,
+    origin: SendOrigin,
+) -> (bool, String) {
+    send_text_inner(state, name, text, SendMode::deferring(defer_if_busy, origin)).await
 }
 
 /// WHAT "sent" MEANS, as a pure function of the send's own verdict string.
@@ -4934,7 +4994,11 @@ pub(crate) async fn deliver_automated(
     // that are not running and leaves the row pending, so a queued command for a
     // stopped lane would wait forever while the run row claimed it was pending.
     if !is_running(name).await {
-        let (ok, msg) = send_text(state, name, text, false).await;
+        // AUTOMATION by construction: `auto_deliver`'s own doc two lines up
+        // says "this is an automated producer, and `guard` already names which
+        // one". This branch skipped the queue for a stopped lane, and with it
+        // the queue's isolation gate (AMUX-3764).
+        let (ok, msg) = send_text(state, name, text, false, SendOrigin::Automation).await;
         return classify(ok, msg);
     }
 
@@ -4945,7 +5009,7 @@ pub(crate) async fn deliver_automated(
         // `from_steering = true` makes the callee REFUSE rather than type into a
         // turn that started between the gate and the send. A lost race then
         // falls through to the queue below instead of being reported as failed.
-        let (ok, msg) = send_text_inner(state, name, text, false, true, false, false).await;
+        let (ok, msg) = send_text_inner(state, name, text, SendMode::drained(false, false)).await;
         if ok {
             return classify(ok, msg);
         }
@@ -4989,26 +5053,86 @@ fn send_text_boxed<'a>(
     name: &'a str,
     text: &'a str,
     defer_if_busy: bool,
+    origin: SendOrigin,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (bool, String)> + Send + 'a>> {
-    Box::pin(send_text_inner(state, name, text, defer_if_busy, false, false, false))
+    Box::pin(send_text_inner(state, name, text, SendMode::deferring(defer_if_busy, origin)))
+}
+
+/// How a send should behave, and on whose authority.
+///
+/// Grouped when `origin` made this eight positional arguments, four of them
+/// bools (AMUX-3764). Four adjacent bare `false`s at a call site is how the
+/// wrong flag gets passed, and `allow_mid_turn` in particular decides whether
+/// amux types into a RUNNING turn — not a flag to hand to argument order.
+pub(crate) struct SendMode {
+    pub defer_if_busy: bool,
+    pub from_steering: bool,
+    /// OVERDUE delivery (AMUX-2642): the message has waited past
+    /// `AMUX_STEER_MAX_AGE_S` for a boundary that is not coming, so it goes into
+    /// the running turn and Claude Code folds it in at its own boundary. Only
+    /// the steering tick sets this, and only after the deadline.
+    pub allow_mid_turn: bool,
+    /// The caller already knows the session is idle (e.g. the Stop hook just
+    /// reported it). Skip the pane-based generating checks — the hook report
+    /// IS the authority (D1 exit: reported state outranks the scrape).
+    pub hook_confirmed_idle: bool,
+    pub origin: SendOrigin,
+}
+
+impl SendMode {
+    /// The ordinary send: no deferral, not from the queue, never mid-turn.
+    fn plain(origin: SendOrigin) -> Self {
+        Self {
+            defer_if_busy: false,
+            from_steering: false,
+            allow_mid_turn: false,
+            hook_confirmed_idle: false,
+            origin,
+        }
+    }
+    fn deferring(defer_if_busy: bool, origin: SendOrigin) -> Self {
+        Self { defer_if_busy, ..Self::plain(origin) }
+    }
+    /// A drain off the steering queue. Already gated at enqueue, so the origin
+    /// here is whatever was allowed to queue.
+    fn drained(allow_mid_turn: bool, hook_confirmed_idle: bool) -> Self {
+        Self {
+            defer_if_busy: false,
+            from_steering: true,
+            allow_mid_turn,
+            hook_confirmed_idle,
+            origin: SendOrigin::Owner,
+        }
+    }
 }
 
 async fn send_text_inner(
     state: &AppState,
     name: &str,
     text: &str,
-    defer_if_busy: bool,
-    from_steering: bool,
-    // OVERDUE delivery (AMUX-2642): the message has waited past
-    // `AMUX_STEER_MAX_AGE_S` for a boundary that is not coming, so it goes into
-    // the running turn and Claude Code folds it in at its own boundary. Only
-    // the steering tick sets this, and only after the deadline.
-    allow_mid_turn: bool,
-    // The caller already knows the session is idle (e.g. the Stop hook just
-    // reported it). Skip the pane-based generating checks — the hook report
-    // IS the authority (D1 exit: reported state outranks the scrape).
-    hook_confirmed_idle: bool,
+    mode: SendMode,
 ) -> (bool, String) {
+    let SendMode { defer_if_busy, from_steering, allow_mid_turn, hook_confirmed_idle, origin } =
+        mode;
+    // ZERO AMUX HARNESS INTO AN ISOLATED LANE, AT THE LAYER THAT ACTUALLY TYPES
+    // (AMUX-3764). The gate on `steer_enqueue` is correct and complete for the
+    // QUEUE, and three producers never touch the queue: `deliver_hot_config`
+    // types a slash command straight in, and the two channel notices in
+    // `channels.rs` call `send_text` directly. Gating those three by name would
+    // rebuild the consumer list bc6d3067 was written to delete, so the check
+    // goes where every path to a pane converges.
+    //
+    // It also closes a hole the queue gate could not see: the `defer_if_busy`
+    // park below re-enqueued with an EMPTY guard, so an automated send that
+    // happened to find the lane at a selector was laundered into an owner send.
+    if origin == SendOrigin::Automation && session_is_isolated(name) {
+        return (
+            false,
+            "target is an isolated (raw-agent) worker: amux automation is not delivered into it. \
+             The owner's own send still works."
+                .into(),
+        );
+    }
     let cfg = parse_env(name);
     if !iterm2_id(&cfg).is_empty() {
         return (false, "iTerm2-backed sessions are not supported by the rust origin yet".into());
@@ -5081,7 +5205,7 @@ async fn send_text_inner(
         if boot_in_flight {
             let st2 = state.clone();
             let (n, t) = (name.to_string(), text.to_string());
-            tokio::spawn(async move { send_after_ready(st2, n, t, 30).await });
+            tokio::spawn(async move { send_after_ready(st2, n, t, 30, origin).await });
             return (true, "sent (waiting for in-flight boot)".into());
         }
         if !env_path(name).exists() {
@@ -5094,7 +5218,7 @@ async fn send_text_inner(
         }
         let st2 = state.clone();
         let (n, t) = (name.to_string(), text.to_string());
-        tokio::spawn(async move { send_after_ready(st2, n, t, 60).await });
+        tokio::spawn(async move { send_after_ready(st2, n, t, 60, origin).await });
         return (true, "sent (auto-woke)".into());
     }
     let mut text = text.to_string();
@@ -5292,7 +5416,15 @@ async fn send_text_inner(
     if defer_if_busy && waiting {
         // A live selector parks an automated send (py:25545; the
         // AskUserQuestion kill of 2026-07-15).
-        let _ = steer_enqueue(state, name, &text, "", "").await;
+        //
+        // THE GUARD IS NAMED, not erased (AMUX-3764). This passed `""`, which
+        // is precisely the value the queue's isolation gate reads as "the
+        // owner" — so an automated send that happened to find the lane at a
+        // selector was LAUNDERED into an owner send on its way to the queue.
+        // The gate above already refuses Automation into an isolated lane, so
+        // this is belt-and-braces there; it matters independently because an
+        // empty guard also drops the per-producer dedupe the guard provides.
+        let _ = steer_enqueue(state, name, &text, park_guard(origin), "").await;
         return (true, "queued (steering) — session at a selector, delivers when it resolves".into());
     }
     if waiting && from_steering {
@@ -6588,14 +6720,14 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         let prompt = log_reload_prompt(name, &pending_reason);
         let st2 = state.clone();
         let n = name.to_string();
-        tokio::spawn(async move { send_after_ready(st2, n, prompt, 60).await });
+        tokio::spawn(async move { send_after_ready(st2, n, prompt, 60, SendOrigin::Automation).await });
     }
     // Standing instruction re-send (py:24833). Board digest briefing: gap.
     let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
     if !instr.is_empty() {
         let st2 = state.clone();
         let n = name.to_string();
-        tokio::spawn(async move { send_after_ready(st2, n, instr, 60).await });
+        tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
     }
     emit_event(
         state,
@@ -9107,7 +9239,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // from_steering=true is still passed: it makes the callee REFUSE rather
         // than re-queue if the lane starts generating between this check and the
         // send, so a lost race leaves the row where it is instead of duplicating.
-        let (ok, msg) = send_text_inner(state, &session, &text, false, true, mid_turn, false).await;
+        let (ok, msg) = send_text_inner(state, &session, &text, SendMode::drained(mid_turn, false)).await;
         if !ok {
             skip(&session, &id, &format!("send-refused: {msg}"));
             continue; // NEXT ROW for this lane, not the next lane
@@ -9580,7 +9712,7 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
         // hook_confirmed_idle=true: the Stop hook just reported idle — trust
         // it over the pane scrape. The pane may still show "esc to interrupt"
         // from background agents, which is NOT generation.
-        let (ok, msg) = send_text_inner(state, session, &rtext, false, true, mid, true).await;
+        let (ok, msg) = send_text_inner(state, session, &rtext, SendMode::drained(mid, true)).await;
         if ok {
             id = rid;
             text = rtext;
@@ -11445,11 +11577,11 @@ async fn post_dispatch(
                 let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
                 if !instr.is_empty() {
                     if is_running(name).await {
-                        let _ = send_text(state, name, &instr, false).await;
+                        let _ = send_text(state, name, &instr, false, SendOrigin::Owner).await;
                     } else {
                         let st2 = state.clone();
                         let n = name.to_string();
-                        tokio::spawn(async move { send_after_ready(st2, n, instr, 60).await });
+                        tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
                     }
                     applied = true;
                 }
@@ -11574,7 +11706,7 @@ async fn post_dispatch(
                  Do all steps now. If any step fails, fix it and continue."
                     .to_string()
             };
-            let _ = send_text(state, name, &msg, false).await;
+            let _ = send_text(state, name, &msg, false, SendOrigin::Owner).await;
             j200(json!({"ok": true, "message": "deploy instructions sent to session"}))
         }
         "start" => {
@@ -11611,7 +11743,7 @@ async fn post_dispatch(
                         // the tightest one for the very path most likely to
                         // exceed it (AMUX-3055). The loop still exits the instant
                         // the composer appears, so this only widens the ceiling.
-                        send_after_ready(st2.clone(), n.clone(), prompt, 60).await;
+                        send_after_ready(st2.clone(), n.clone(), prompt, 60, SendOrigin::Owner).await;
                     }
                 } else {
                     // A background failure must still be SEEN (ethos rule 4).
@@ -12195,7 +12327,14 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             );
         }
     }
-    let (ok, msg) = send_text(state, name, &text, defer_busy).await;
+    // A PEER RELAY IS NOT THE OWNER (AMUX-3764). `origin` is the sender's
+    // server-verified session identity, empty only when a person sent it. The
+    // documented boundary for an isolated lane is "the owner's own send still
+    // works" — a peer lane addressing it through amux's messaging is amux
+    // mediation, which is what "raw LLM pass through" excludes.
+    let send_origin =
+        if origin.is_empty() { SendOrigin::Owner } else { SendOrigin::Automation };
+    let (ok, msg) = send_text(state, name, &text, defer_busy, send_origin).await;
     if ok {
         update_meta(
             name,
@@ -13628,7 +13767,7 @@ fn spawn_switch_confirm_watcher(name: &str) {
 /// choreography here would rediscover all of them.
 async fn deliver_hot_config(state: &AppState, name: &str, cmd: &str, ack: &str) -> HotOutcome {
     let before = tmux_capture(name, 40).await;
-    let (sent, msg) = send_text(state, name, cmd, true).await;
+    let (sent, msg) = send_text(state, name, cmd, true, SendOrigin::Automation).await;
     tracing::info!(session = name, cmd, sent, result = %msg, "hot config: delivered");
     if !sent {
         return HotOutcome::Failed(msg);
@@ -15202,6 +15341,76 @@ mod tests {
         assert!(
             steer_enqueue(&st, "ordinary", "harness text", "commit-nudge", "").await.is_ok(),
             "automation into a NON-isolated lane must be unaffected"
+        );
+
+        // AND THE OTHER LAYER (AMUX-3764). Every assertion above is about the
+        // QUEUE, and three producers never touch it: `deliver_hot_config` types
+        // a slash command straight into the pane, and both `channels.rs`
+        // notices call `send_text` directly. So the whole test above passed
+        // while amux automation still reached an isolated lane — the same
+        // shape as the consumer list bc6d3067 deleted, one layer down.
+        //
+        // `send_text` refuses before it touches tmux, so these assert on the
+        // verdict without a live session. A non-isolated lane returns a
+        // DIFFERENT failure (no tmux session), which is what makes the isolated
+        // case discriminating rather than "everything fails in a test".
+        let (ok, msg) = send_text(&st, "raw", "hot config", false, SendOrigin::Automation).await;
+        assert!(!ok);
+        assert!(
+            msg.contains("isolated"),
+            "automation must be refused at the SEND layer too, naming why: {msg}"
+        );
+        let (_, owner_msg) = send_text(&st, "raw", "owner text", false, SendOrigin::Owner).await;
+        assert!(
+            !owner_msg.contains("isolated"),
+            "the owner's send must not be refused by the isolation gate: {owner_msg}"
+        );
+        let (_, ordinary_msg) =
+            send_text(&st, "ordinary", "hot config", false, SendOrigin::Automation).await;
+        assert!(
+            !ordinary_msg.contains("isolated"),
+            "a non-isolated lane must fail for its OWN reason, not this gate: {ordinary_msg}"
+        );
+    }
+
+    /// The `defer_if_busy` park used to erase the guard to `""` on its way to
+    /// the queue, which is exactly the value the queue gate reads as "the
+    /// owner" — so an automated send that happened to find the lane at a
+    /// selector was laundered into an owner send (AMUX-3764).
+    ///
+    /// Asserts on the SHIPPED `park_guard`, not a copy of it: reaching that
+    /// branch for real needs a live pane sitting on a picker, and a local
+    /// re-implementation would stay green against any change to the real one.
+    #[tokio::test]
+    async fn a_parked_automated_send_keeps_a_guard_and_the_owners_does_not() {
+        assert!(
+            !park_guard(SendOrigin::Automation).is_empty(),
+            "a parked automated send must stay guarded, or the queue reads it as the owner"
+        );
+        assert!(
+            park_guard(SendOrigin::Owner).is_empty(),
+            "and the owner's parked send must stay unguarded, or it stops reaching isolated lanes"
+        );
+
+        // The consequence, through the real gate: the guard this produces must
+        // actually be refused by an isolated lane's queue. Asserting the string
+        // is non-empty proves nothing on its own — `steer_enqueue` is what
+        // decides, and that is the coupling worth pinning.
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_DIR=/tmp\nCC_ISOLATED=\"1\"\n").unwrap();
+        assert!(session_is_isolated("raw"), "fixture must be isolated or this is vacuous");
+        assert!(
+            steer_enqueue(&st, "raw", "parked", park_guard(SendOrigin::Automation), "")
+                .await
+                .is_err(),
+            "the parked automated guard must be refused into an isolated lane"
+        );
+        assert!(
+            steer_enqueue(&st, "raw", "parked", park_guard(SendOrigin::Owner), "").await.is_ok(),
+            "the parked owner guard must still get through"
         );
     }
 
