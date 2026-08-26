@@ -2535,7 +2535,8 @@ pub fn select_advance_with(
             "[amux] {card_id} is a capture shell ({why}). Not blocking pickup, but not actionable either.\n\n\
              Not work? `amux board discard {card_id} --outcome-stdin`\n\
              One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
-             Several? `amux board type {card_id} epic` then `amux board add \"<unit>\"`"
+             Several? `amux board type {card_id} epic`, `amux board add \"<unit>\"`, \
+             `amux board epic <NEW-ID> {card_id}`"
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -5224,12 +5225,19 @@ mod tests {
             !text.to_lowercase().contains("wip slot"),
             "the nudge claims a blockage the pickup query exempts: {text}"
         );
-        // And it must still give the lane a REASON to act, or removing the
+        // And it must still give the lane somewhere to GO, or removing the
         // false claim just leaves an unmotivated chore.
-        assert!(
-            text.contains("done or not-done"),
-            "the honest reason must survive the correction: {text}"
-        );
+        //
+        // The exits, not the prose. My first version asserted the literal
+        // phrase "done or not-done" and went red on 03ed2b6c's compression,
+        // which says the same thing in different words. That is the coupling my
+        // own notes warn about — a text assertion measures wording, not
+        // behaviour — and the sibling test one screen down had already learned
+        // it: "a wording rewrite must be free; an exit losing its command must
+        // not be" (AMUX-3707).
+        for cmd in ["amux board discard", "amux board retitle", "amux board type"] {
+            assert!(text.contains(cmd), "the ask must still reach its exit `{cmd}`: {text}");
+        }
     }
 
     /// Backend, 2026-08-11 afternoon: 16 claims in one hour, every card
@@ -5888,7 +5896,17 @@ mod tests {
         let Advance::Nudge { text, .. } = select_advance(&conn, "lane", &[], now_f64()) else {
             panic!("expected a nudge");
         };
-        assert!(text.contains("close it out to done"), "must aim at done: {text}");
+        // ASSERT THE TERM AND ITS ABSENCE, not the sentence around it. The
+        // property is which status the nudge AIMS AT; the phrasing carrying it
+        // is free to change, and did (03ed2b6c compressed "close it out to
+        // done" to "Close to done with evidence"). Pinning the sentence made a
+        // wording pass look like an AMUX-2312 regression.
+        assert!(text.contains("done"), "must aim at done: {text}");
+        assert!(
+            !text.contains("verified"),
+            "and must NOT name verified for a lane that has not opted in — that is the whole \
+             point of AMUX-2312: {text}"
+        );
         // Opt the lane in by tag and the aim becomes verified.
         conn.execute(
             "INSERT INTO status_scope (status,scope_type,scope_value) VALUES ('verified','tag','infra')",
@@ -5901,7 +5919,7 @@ mod tests {
         else {
             panic!("expected a nudge");
         };
-        assert!(text.contains("close it out to verified"), "must aim at verified: {text}");
+        assert!(text.contains("verified"), "must aim at verified once opted in: {text}");
     }
 
     #[test]
