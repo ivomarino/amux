@@ -2903,3 +2903,32 @@ FIX: 1cddf81a — disclosure, not a bigger cap: `elements_total`,
   observation ("my element is not in the list"), and only one was checkable in
   one command: `document.querySelectorAll(SEL).length`. When two explanations
   predict the same failure, reach for the one you can separate cheaply.
+
+---
+## The log sweep's own instrument could only show it 1.6% of the window it was judging
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-26
+SESSION: amux-frustrations
+CARD: AF-230
+SYMPTOM: `GET /api/logs?since=<24h ago>&limit=2000` answered `total_matched: 123645`,
+  `count: 2000`, and the rows it returned spanned 0.48 HOURS. `since` ("ts > ?") was the
+  only time bound, and the query is `ORDER BY ts DESC LIMIT <=2000`, so every call returns
+  the same newest rows and there is no way to page backward. Nothing in the response said
+  the page was a slice — `total_matched` disagreed with the window being described, but the
+  mismatch had to be noticed rather than read.
+COST: Sweep step 5 decides whether a lane is doing mutating work with no board trace — the
+  contract's own words are that this is "the accusation you cannot un-say", and it lists
+  seven qualifications, each added after a false positive. That step has been reaching its
+  verdict from one capped page for as long as it has existed. Today's answer was clean, so
+  the cost was not a wrong accusation; it was that a clean 29 minutes was on its way to
+  being reported as a clean day. The contract already carried a workaround telling the
+  reader to state the blind spot "or read the store directly for the full window" — routing
+  a caller off the sanctioned instrument onto raw SQL, which is the rule 6 shape.
+FIX: fcff219e. `until` ("ts <= ?") makes the window walkable (`since < ts <= until`), and
+  the response now admits when it is a slice: `truncated`, `page_span_h`, and a note naming
+  the paging move. `analyze` and `stats` already publish `scan_truncated`/`actual_window_h`
+  for exactly this reason; this is the same admission on the endpoint that lacked it, so the
+  next capped read announces itself in the payload the caller already opens. The contract's
+  step 5 now carries the paging loop instead of the workaround.
