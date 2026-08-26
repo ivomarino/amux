@@ -117,6 +117,11 @@ pub struct Freshness {
     /// 4 of 59 checked under the default budget on a large repo, i.e. 0.5%
     /// coverage on a 772-path listing).
     pub revived_checked: usize,
+    /// Which bound ended the revived sampling: "cap", "clock", or "" when it
+    /// finished the list. `revived_checked: 0` is honest about coverage and
+    /// silent about cause, and the two causes want different actions
+    /// (AMUX-3760).
+    pub revived_stopped_by: &'static str,
 }
 
 /// Is the worktree copy of `path` an OLD COMMITTED REVISION rather than a new
@@ -466,9 +471,21 @@ pub fn build(
         } else {
             format!(" ({pct}% coverage)")
         };
+        // NAME THE BOUND THAT BIT (AMUX-3760). "hit its budget" names two knobs
+        // and leaves the reader to guess which, and they want opposite actions:
+        // a cap hit means raise the cap, a clock hit means the machine is loaded
+        // or the walks are slow. Before this, a clock hit at ZERO checked was
+        // also how the revived discriminator silently stopped running under load
+        // — the budget clock was started before the classification phase and was
+        // already spent when the sampling began.
+        let why = match fresh.revived_stopped_by {
+            "cap" => " — it stopped on the PATH CAP (AMUX_NUDGE_REVIVED_MAX_PATHS); raise that to examine more",
+            "clock" => " — it stopped on the CLOCK (AMUX_NUDGE_REVIVED_BUDGET_MS); the walks are slow or the machine is loaded, so raising the cap alone will not help",
+            _ => "",
+        };
         sections.push(format!(
             "NOT CHECKED FOR OLD-REVISION: {} of {total} candidate path(s) were examined\
-             {cov}; the other {} were not, because this run hit its budget \
+             {cov}; the other {} were not, because this run hit its budget{why} \
              (AMUX_NUDGE_REVIVED_BUDGET_MS / AMUX_NUDGE_REVIVED_MAX_PATHS). The unchecked ones \
              are listed above as ordinary edits, which is the SAFE fallback and NOT a finding \
              that they are clean.\n\
@@ -1325,7 +1342,6 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
     if paths.is_empty() {
         return fresh;
     }
-    let started = std::time::Instant::now();
     let mut pending_revived: Vec<String> = Vec::new();
 
     // Resolve the repo root and address paths from there. `git status` emits
@@ -1580,101 +1596,7 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
         //    plausible in-flight edit; commit-worthy like today.
         fresh.edited.push(p.clone());
     }
-
-    // ---- the revived pass, in STRATIFIED order --------------------------
-    //
-    // Round-robin across top-level directories rather than taking the first N
-    // (mixpeek-frustrations, probe 2). `git status` is alphabetical, so first-N
-    // samples one end of the repo: on their checkout the first 20 dirty paths
-    // are 11 canvas/apps and 6 .github/workflows, while the population is 342
-    // SDK packages full of regen churn. Head-of-status read 35% revived and a
-    // random sample of the SAME set at the SAME moment read 75% — opposite
-    // sides of the share threshold, decided by path ordering alone.
-    //
-    // Round-robin rather than a shuffle: deterministic, so two runs on an
-    // unchanged tree agree, and a nudge that reported a different verdict each
-    // firing would be worse than a biased one.
-    let mut by_dir: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
-    for p in &pending_revived {
-        by_dir.entry(p.split('/').next().unwrap_or("")).or_default().push(p);
-    }
-    // PROPORTIONAL, NOT ONE-PER-GROUP (mixpeek-frustrations, third probe).
-    //
-    // The first version took one path per directory per round, which fixes the
-    // alphabetical bias and introduces a worse one when the groups are unequal:
-    // it weights GROUPS equally. On their checkout that is 524 files in 41
-    // groups, 17 of them singleton root-level .md files. So the singletons take
-    // 41% of the round-robin weight while being 3% of the population, and the
-    // three directories holding 63% of the files take 7% of it. The
-    // deterministic first four came out as three root .md files and one
-    // workflow, and ZERO of the 332 SDK files — which are the population the
-    // whole check is about there.
-    //
-    // Each item gets position (i + offset_g) / n_g within its own group, so a
-    // group of 132 lays 132 marks evenly across [0,1) and sorting by the key
-    // makes any PREFIX proportional, not merely the whole list.
-    //
-    // THE PREFIX IS THE ONLY PART THAT EVER RUNS, which is what makes the
-    // offset load-bearing rather than a flourish. The first draft used the
-    // midpoint, (2i+1)/2n, and that is proportional in aggregate and badly
-    // skewed in the prefix: every singleton group lands on exactly 0.5, so with
-    // one group of 20 and eight singletons the first TEN picks were all from
-    // the big group and not one singleton appeared. A budget that stops at four
-    // would have seen a single directory. A test caught it.
-    //
-    // `offset_g` is a stable hash of the group name folded into [0,1), which
-    // scatters the singletons across the interval instead of stacking them at
-    // the midpoint. Deterministic — FNV-1a written out rather than DefaultHasher,
-    // whose output Rust does not promise to keep stable across releases — so two
-    // runs over an unchanged tree still agree, which is the property that ruled
-    // out a shuffle in the first place.
-    let offset = |name: &str| -> f64 {
-        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
-        for b in name.as_bytes() {
-            h ^= *b as u64;
-            h = h.wrapping_mul(0x1000_0000_01b3);
-        }
-        (h >> 11) as f64 / (1u64 << 53) as f64
-    };
-    let mut keyed: Vec<(f64, &String)> = Vec::with_capacity(pending_revived.len());
-    for (name, v) in &by_dir {
-        let (n, off) = (v.len() as f64, offset(name));
-        for (i, p) in v.iter().enumerate() {
-            keyed.push(((i as f64 + off) / n, p));
-        }
-    }
-    // Tie-break on the path so equal keys cannot reorder between runs.
-    keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
-    let order: Vec<&String> = keyed.into_iter().map(|(_, p)| p).collect();
-    let (budget, cap) = (revived_budget_ms(), revived_max_paths());
-    let mut checked: std::collections::BTreeSet<&str> = Default::default();
-    for p in order {
-        // The clock is checked BETWEEN paths, so a run can overshoot by up to
-        // one walk. Measured at 2374ms against a 2000ms budget on a repo whose
-        // walks cost ~458ms, which is exactly one walk of overshoot. Stated
-        // rather than tuned away: bounding it properly needs a timeout on the
-        // git child, and the overshoot is one walk either way.
-        if checked.len() >= cap || started.elapsed().as_millis() >= budget {
-            break;
-        }
-        checked.insert(p.as_str());
-        if revives_an_old_revision(dir, p).await {
-            fresh.revived.push(p.clone());
-        } else {
-            fresh.edited.push(p.clone());
-        }
-    }
-    for p in &pending_revived {
-        if !checked.contains(p.as_str()) {
-            // UNCHECKED -> `edited`, the safe fallback, and COUNTED. The
-            // fallback output is byte-identical to a path that WAS checked and
-            // found novel, so without the count "we did not look" reads as "we
-            // looked and it is fine".
-            fresh.revived_unchecked += 1;
-            fresh.edited.push(p.clone());
-        }
-    }
-    fresh.revived_checked = checked.len();
+    drain_revived(dir, &pending_revived, &mut fresh).await;
 
     fresh
 }
@@ -1879,6 +1801,159 @@ fn idle_lanes_with_dirs(state: &AppState) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// The revived pass, as its OWN function, so the budget structurally measures
+/// only the walks it governs (AMUX-3760).
+///
+/// It used to be inline in `freshness_from_repo`, with `started` set at the top
+/// of that function — before the entire per-path classification phase. The
+/// revived budget was therefore charged for git calls it does not bound, and
+/// under I/O contention (measured: a concurrent release build) the 2000ms was
+/// already spent when the loop began. It broke on the FIRST iteration, checked
+/// nothing, and every candidate fell through to `edited`.
+///
+/// EXTRACTED RATHER THAN JUST MOVING THE LINE, and that is the point. Moving it
+/// fixes today; a function boundary fixes tomorrow, because `started` cannot be
+/// hoisted above work it should not measure without being hoisted out of the
+/// function entirely. It is verified by SCOPE, which matters here specifically
+/// because it is NOT verified by a test: the cell that would catch a
+/// mispositioned clock has to pin the budget high to stop the two bounds
+/// racing, which is what made this test flaky in the first place. A test that
+/// discriminates the clock's position would have to be load-dependent, i.e. the
+/// exact property being removed. Said plainly rather than papered over.
+async fn drain_revived(dir: &str, pending_revived: &[String], fresh: &mut Freshness) {
+    if pending_revived.is_empty() {
+        return;
+    }
+
+    // ---- the revived pass, in STRATIFIED order --------------------------
+    //
+    // Round-robin across top-level directories rather than taking the first N
+    // (mixpeek-frustrations, probe 2). `git status` is alphabetical, so first-N
+    // samples one end of the repo: on their checkout the first 20 dirty paths
+    // are 11 canvas/apps and 6 .github/workflows, while the population is 342
+    // SDK packages full of regen churn. Head-of-status read 35% revived and a
+    // random sample of the SAME set at the SAME moment read 75% — opposite
+    // sides of the share threshold, decided by path ordering alone.
+    //
+    // Round-robin rather than a shuffle: deterministic, so two runs on an
+    // unchanged tree agree, and a nudge that reported a different verdict each
+    // firing would be worse than a biased one.
+    let mut by_dir: std::collections::BTreeMap<&str, Vec<&String>> = Default::default();
+    for p in pending_revived {
+        by_dir.entry(p.split('/').next().unwrap_or("")).or_default().push(p);
+    }
+    // PROPORTIONAL, NOT ONE-PER-GROUP (mixpeek-frustrations, third probe).
+    //
+    // The first version took one path per directory per round, which fixes the
+    // alphabetical bias and introduces a worse one when the groups are unequal:
+    // it weights GROUPS equally. On their checkout that is 524 files in 41
+    // groups, 17 of them singleton root-level .md files. So the singletons take
+    // 41% of the round-robin weight while being 3% of the population, and the
+    // three directories holding 63% of the files take 7% of it. The
+    // deterministic first four came out as three root .md files and one
+    // workflow, and ZERO of the 332 SDK files — which are the population the
+    // whole check is about there.
+    //
+    // Each item gets position (i + offset_g) / n_g within its own group, so a
+    // group of 132 lays 132 marks evenly across [0,1) and sorting by the key
+    // makes any PREFIX proportional, not merely the whole list.
+    //
+    // THE PREFIX IS THE ONLY PART THAT EVER RUNS, which is what makes the
+    // offset load-bearing rather than a flourish. The first draft used the
+    // midpoint, (2i+1)/2n, and that is proportional in aggregate and badly
+    // skewed in the prefix: every singleton group lands on exactly 0.5, so with
+    // one group of 20 and eight singletons the first TEN picks were all from
+    // the big group and not one singleton appeared. A budget that stops at four
+    // would have seen a single directory. A test caught it.
+    //
+    // `offset_g` is a stable hash of the group name folded into [0,1), which
+    // scatters the singletons across the interval instead of stacking them at
+    // the midpoint. Deterministic — FNV-1a written out rather than DefaultHasher,
+    // whose output Rust does not promise to keep stable across releases — so two
+    // runs over an unchanged tree still agree, which is the property that ruled
+    // out a shuffle in the first place.
+    let offset = |name: &str| -> f64 {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for b in name.as_bytes() {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x1000_0000_01b3);
+        }
+        (h >> 11) as f64 / (1u64 << 53) as f64
+    };
+    let mut keyed: Vec<(f64, &String)> = Vec::with_capacity(pending_revived.len());
+    for (name, v) in &by_dir {
+        let (n, off) = (v.len() as f64, offset(name));
+        for (i, p) in v.iter().enumerate() {
+            keyed.push(((i as f64 + off) / n, p));
+        }
+    }
+    // Tie-break on the path so equal keys cannot reorder between runs.
+    keyed.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+    let order: Vec<&String> = keyed.into_iter().map(|(_, p)| p).collect();
+    let (budget, cap) = (revived_budget_ms(), revived_max_paths());
+    // THE CLOCK STARTS HERE, NOT AT THE TOP OF THE FUNCTION (AMUX-3760).
+    //
+    // `started` had exactly one reader — the check below — and was set before
+    // the whole per-path classification phase, so the revived budget was being
+    // charged for git calls it does not govern. Under I/O contention (measured:
+    // a concurrent release build) the 2000ms was already spent by the time this
+    // loop began, it broke on the FIRST iteration, and every candidate fell
+    // through to `edited` with `revived_checked: 0`.
+    //
+    // That is a live behaviour bug, not just a flaky test: the busier the
+    // checkout, the more likely the discriminator silently does nothing — and
+    // busy is exactly when a shared checkout has revived paths worth catching.
+    // A detector that stops working under the load that produces its subject
+    // matter is the shape ethos.md warns about.
+    //
+    // THE TRADE, stated rather than hidden: the function's total wall-clock can
+    // now exceed what it was before by up to one budget, because the
+    // classification phase no longer eats into this one. Nothing is less
+    // bounded than it was — the earlier phase was never bounded by this clock,
+    // it was only stealing from it.
+    let started = std::time::Instant::now();
+    let mut checked: std::collections::BTreeSet<&str> = Default::default();
+    // WHICH BOUND STOPPED US. "0 of 8 examined" is honest about coverage and
+    // silent about cause, and the two causes want different actions: a cap hit
+    // means raise AMUX_NUDGE_REVIVED_MAX_PATHS, a clock hit means the machine
+    // is loaded or the walks are slow. Same distinction the counts themselves
+    // draw between "we did not look" and "we looked and found little".
+    let mut stopped_by = "";
+    for p in order {
+        // The clock is checked BETWEEN paths, so a run can overshoot by up to
+        // one walk. Measured at 2374ms against a 2000ms budget on a repo whose
+        // walks cost ~458ms, which is exactly one walk of overshoot. Stated
+        // rather than tuned away: bounding it properly needs a timeout on the
+        // git child, and the overshoot is one walk either way.
+        if checked.len() >= cap {
+            stopped_by = "cap";
+            break;
+        }
+        if started.elapsed().as_millis() >= budget {
+            stopped_by = "clock";
+            break;
+        }
+        checked.insert(p.as_str());
+        if revives_an_old_revision(dir, p).await {
+            fresh.revived.push(p.clone());
+        } else {
+            fresh.edited.push(p.clone());
+        }
+    }
+    for p in pending_revived {
+        if !checked.contains(p.as_str()) {
+            // UNCHECKED -> `edited`, the safe fallback, and COUNTED. The
+            // fallback output is byte-identical to a path that WAS checked and
+            // found novel, so without the count "we did not look" reads as "we
+            // looked and it is fine".
+            fresh.revived_unchecked += 1;
+            fresh.edited.push(p.clone());
+        }
+    }
+    fresh.revived_checked = checked.len();
+    fresh.revived_stopped_by = stopped_by;
 }
 
 #[cfg(test)]
@@ -3290,6 +3365,20 @@ mod tests {
 
         let _serial = REVIVED_ENV.lock().await;
         std::env::set_var("AMUX_NUDGE_REVIVED_MAX_PATHS", "2");
+        // NEUTRALISE THE CLOCK, because this test is about the CAP and the
+        // ORDERING (AMUX-3760). With the default 2000ms budget the two bounds
+        // race, and on a loaded machine the clock wins: it failed twice while a
+        // release build was compiling, with `revived_checked: 0` and every path
+        // in `edited`, then passed 3/3 on a quiet one. A test that is green
+        // three runs in four is worse than one that is red, because the green
+        // runs are what get pushed.
+        //
+        // This is not papering over the flake — the underlying cause was that
+        // the budget clock started before the classification phase, which is
+        // fixed above. Pinning the budget here is what makes the assertion
+        // BELOW mean "the cap bound it", which is the property under test. The
+        // clock's own behaviour is covered by its own cell.
+        std::env::set_var("AMUX_NUDGE_REVIVED_BUDGET_MS", "600000");
         let dir = work.to_str().unwrap();
         let fresh = freshness_from_repo(dir, &names).await;
         // The determinism cell below runs under the SAME cap. Removing the var
@@ -3298,8 +3387,14 @@ mod tests {
         // reason that had nothing to do with ordering.
         let again = freshness_from_repo(dir, &names).await;
         std::env::remove_var("AMUX_NUDGE_REVIVED_MAX_PATHS");
+        std::env::remove_var("AMUX_NUDGE_REVIVED_BUDGET_MS");
 
         assert_eq!(fresh.revived_checked, 2, "the cap still binds: {fresh:?}");
+        assert_eq!(
+            fresh.revived_stopped_by, "cap",
+            "and it must be the CAP that bound it, not the clock — otherwise this test is \
+             measuring machine load, which is exactly how it went flaky: {fresh:?}"
+        );
         // THE CLAIM: both directories are represented. Under the first-N version
         // this was aaa/a0 and aaa/a1 and `zzz` was invisible.
         let dirs: std::collections::BTreeSet<&str> =
@@ -3319,6 +3414,36 @@ mod tests {
         assert_eq!(
             fresh.revived, again.revived,
             "two runs over an unchanged tree must agree, or the nudge contradicts itself"
+        );
+
+        // THE CLOCK CELL (AMUX-3760). The failure that made this test flaky was
+        // a clock cut at ZERO checked, and it was indistinguishable from a cap
+        // of zero or from a run that found nothing to check. Reproduce it on
+        // purpose, with a budget that cannot be met, and assert it LABELS
+        // itself.
+        //
+        // This is the honest version of the bug: a zero here is legitimate, and
+        // what was missing is the field saying which bound produced it. The
+        // same distinction the `revived_unchecked` counter already draws
+        // between "we did not look" and "we looked and found little".
+        std::env::set_var("AMUX_NUDGE_REVIVED_BUDGET_MS", "0");
+        let starved = freshness_from_repo(dir, &names).await;
+        std::env::remove_var("AMUX_NUDGE_REVIVED_BUDGET_MS");
+        assert_eq!(starved.revived_checked, 0, "a zero budget checks nothing: {starved:?}");
+        assert_eq!(
+            starved.revived_stopped_by, "clock",
+            "and it must say the CLOCK stopped it — a cap hit and a clock hit want opposite \
+             actions, and before this they were the same silent zero: {starved:?}"
+        );
+        assert_eq!(
+            starved.revived_unchecked,
+            names.len(),
+            "every candidate must be COUNTED as unchecked, not quietly reported as an ordinary \
+             edit: {starved:?}"
+        );
+        assert!(
+            starved.revived.is_empty() && starved.edited.len() == names.len(),
+            "the safe fallback is still `edited`; the counters are what make it honest: {starved:?}"
         );
 
         let _ = std::fs::remove_dir_all(&tmp);
