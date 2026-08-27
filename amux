@@ -1795,9 +1795,25 @@ if ok:
     for dv in (d.get("diverted_fields") or []):
         if not isinstance(dv, dict):
             continue
+        # QUOTE THE VALUE THE SERVER ECHOED BACK, not a generic noun. The whole
+        # point of this line is that a caller can confirm the write WITHOUT
+        # opening the card, and "the value was recorded" sends them to look
+        # anyway. The first draft reached for the status LABEL here, which
+        # `board backlog` never passes, so every real invocation printed the
+        # generic fallback.
+        #
+        # NO APOSTROPHE OR SINGLE QUOTE BELOW, INCLUDING IN COMMENTS. This
+        # function is a python3 -c block delimited by single quotes, so one
+        # apostrophe anywhere in it takes the fleet CLI down at load. The first
+        # draft of this hunk did exactly that; the save gate caught it and the
+        # CLI was broken fleet-wide until it was stashed.
+        val = dv.get("value") or ""
+        if len(val) > 73:
+            val = val[:72] + "..."
+        shown = "\"" + val + "\"" if val else "the value"
         sys.stderr.write(
             "note: %s was recorded in the card %s, not in `%s` \u2014 %s\n"
-            % (_argv[2] if len(_argv) > 2 and _argv[2] else "the value",
+            % (shown,
                (dv.get("landed_in") or "?").upper(),
                dv.get("field") or "?",
                dv.get("why") or "no reason given"))
