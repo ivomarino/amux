@@ -729,6 +729,38 @@ discriminating coverage" against cells carrying a proper positive AND negative. 
 unapplied mutation and a test that cannot fail produce the identical green, and the
 mutation is the cheaper of the two to check.
 
+**A TEST THAT MINTS ITS OWN INPUT PINS ITSELF, NOT THE PRODUCER** (AF-268,
+2026-08-27). The auto-pickup prompt and the guard that parses it lived in two files.
+The parser held a hand-copied literal of the prompt's wording, and BOTH sides carried a
+comment saying to change them together. `03ed2b6c` shortened the prompt for token cost
+— a correct change — and the parser was not touched, so `pickup_card_id` returned None
+for every real pickup and the AMUX-3052 stale-pickup guard voided nothing for 17 hours.
+The warning comment was three lines above the edit, inside the diff the author was
+looking at.
+
+Every one of the guard's tests stayed green, because each one built its input by
+hand-writing the same retired wording. They were not testing the producer; they were
+testing that the parser agreed with a copy of the parser. The evidence is precise:
+under a mutant restoring the old wording, the new round-trip test fails and the other
+six pickup tests still pass — which IS the state that shipped.
+
+Three checks, in order of strength:
+- Build the input with the PRODUCER, not a literal. If the fixture is a string you
+  typed, you have pinned your own typing.
+- Delete the second copy. The parser also held a TAIL literal purely to find where the
+  id ended; a card id has no spaces, so the first token after the anchor is the id, and
+  the tail was one more thing that could drift alone. Fewer literals, fewer seams.
+- Put the pin in the PRODUCER's file. A test that fails in the file you are editing is
+  a mechanism; one that fails in a file you have never opened is a hope.
+
+**And zero can be the healthy reading of a dead instrument.** The guard's only
+observable was a void event, and a guard that never runs emits exactly what a fleet
+with no stale pickups emits. What made it measurable was the discontinuity: 126 voids
+over 12 days, the last 31 minutes before the reword, then 0 across 100 deliveries.
+Rule 4's demand for an accompaniment applies to guards as much as to reports — a
+detector whose silence is indistinguishable from success needs a rate, a last-fired
+timestamp, or a signal on the path it declines to act on.
+
 ## 8. Are you deciding something that is the human's to decide?
 
 Getting out of the model's way includes getting out of the user's way.
