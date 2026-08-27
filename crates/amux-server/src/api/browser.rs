@@ -60,7 +60,7 @@
 
 use super::AppState;
 use crate::integrations::browser as chrome;
-use axum::extract::{OriginalUri, Path, Query};
+use axum::extract::{OriginalUri, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -222,6 +222,107 @@ fn summarize_pages(targets: &[Value]) -> Vec<(String, String)> {
         .collect()
 }
 
+/// What the request log could say about an UNATTRIBUTED holder's start (AF-183).
+///
+/// 83% of `/api/browser/start` calls carry no `X-Amux-Session` (373 of 447
+/// all-time), so for most collisions the refusal's whole safety property —
+/// naming the owner you are about to destroy — is unavailable and the caller
+/// is handed "(unattributed)", which names nobody and supports no decision.
+///
+/// But the facts are not gone, they are one table away: `_amux_request_log`
+/// records `client_ip` and `user_agent` on every request, and BOTH are present
+/// on all 447 of those rows. That is enough to separate the two cases that
+/// matter and currently look identical:
+///
+///   127.0.0.1    + curl/8.7.1                    -> an agent or script on this box
+///   100.66.26.84 + Mozilla/5.0 (Macintosh; ...)  -> a HUMAN at a browser
+///
+/// Both are real rows from the live log. The second is exactly the case this
+/// entry's COST names — an agent silently destroying a human's signed-in
+/// session — and under "(unattributed)" it is indistinguishable from the first.
+///
+/// THREE STATES, NOT TWO, because "we looked and found nothing" and "we did not
+/// look" must not collapse into the same silence. That collapse is the failure
+/// the `attribution` field below already exists to prevent, one level up.
+enum StartOrigin {
+    /// A start row matched: the caller can be described even if not named.
+    Found { ip: String, ua: String },
+    /// The lookup RAN against the request log and matched no row.
+    NotFound,
+    /// No lookup was attempted — the holder is named, or the store was
+    /// unavailable. Never rendered as "no origin".
+    NotLooked,
+}
+
+impl StartOrigin {
+    /// How the refusal sentence should describe the holder. Returns None only
+    /// for `NotLooked`, where the caller keeps its existing wording.
+    fn clause(&self) -> Option<String> {
+        match self {
+            StartOrigin::Found { ip, ua } => {
+                let ua_short: String = ua.chars().take(48).collect();
+                // The JUDGEMENT, not just the fields. A caller reading an IP and
+                // a user-agent still has to decide what they mean, and the whole
+                // point of this refusal is that it is asked to decide under time
+                // pressure. Loopback plus a CLI agent is the cheap case; anything
+                // from another host in a real browser is a person.
+                let loopback = ip.starts_with("127.") || ip == "::1";
+                let browser_ua =
+                    ua.contains("Mozilla") || ua.contains("Safari") || ua.contains("Chrome");
+                let verdict = if !loopback && browser_ua {
+                    ", which is a REAL BROWSER on another host and so very probably a PERSON: a takeover destroys a human's session and reopening the tab does not undo it"
+                } else if loopback {
+                    ", i.e. loopback and a scripted client, so very probably an agent on this box"
+                } else {
+                    ""
+                };
+                Some(format!(
+                    "an UNATTRIBUTED holder, started from {ip} by {ua_short}{verdict}"
+                ))
+            }
+            StartOrigin::NotFound => Some(
+                "an UNATTRIBUTED holder whose origin the request log cannot recover either (no matching start row)"
+                    .to_string(),
+            ),
+            StartOrigin::NotLooked => None,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            StartOrigin::Found { .. } => "request-log start row",
+            StartOrigin::NotFound => "none — no matching row in the request log",
+            StartOrigin::NotLooked => "not looked up",
+        }
+    }
+}
+
+/// Find the `POST /api/browser/start` row that most likely began this holder.
+///
+/// Matched on the row nearest at-or-before `started_at`, within a 120s window:
+/// the holder's `started_at` is stamped when Chrome comes up, which is after
+/// the request row is written, and a launch has never taken anywhere near two
+/// minutes. A wider window would start attributing one holder's start to an
+/// earlier unrelated call, which is worse than saying nothing.
+fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> StartOrigin {
+    let Ok(conn) = store.read() else {
+        return StartOrigin::NotLooked;
+    };
+    let row = conn.query_row(
+        "SELECT COALESCE(client_ip,''), COALESCE(user_agent,'')          FROM _amux_request_log          WHERE path = '/api/browser/start' AND method = 'POST'            AND ts <= ?1 AND ts >= ?1 - 120          ORDER BY ts DESC LIMIT 1",
+        [started_at as f64],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    );
+    match row {
+        Ok((ip, ua)) if !ip.is_empty() || !ua.is_empty() => StartOrigin::Found { ip, ua },
+        Ok(_) => StartOrigin::NotFound,
+        Err(rusqlite::Error::QueryReturnedNoRows) => StartOrigin::NotFound,
+        // A BROKEN LOOKUP IS NOT AN ABSENT ROW. Reporting "no origin" here would
+        // let a schema change or a locked db read as evidence about the holder.
+        Err(_) => StartOrigin::NotLooked,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn takeover_refusal(
     profile: &str,
@@ -232,6 +333,7 @@ fn takeover_refusal(
     pages: &[(String, String)],
     now: i64,
     requested_by: Option<&str>,
+    origin: StartOrigin,
 ) -> Value {
     let held_s = (now - started_at).max(0);
     let held_h = held_s as f64 / 3600.0;
@@ -310,12 +412,21 @@ fn takeover_refusal(
         // nobody reads — the ethos rule 6 shape, introduced by a change made to
         // fix ethos rule 6. `cross_session_start_refuses_without_takeover_naming_the_owner`
         // caught exactly that in the first draft of this function.
+        // THE FACTS GO IN THE SENTENCE, not only in the body (AF-183). Plenty
+        // of callers print `.error` and nothing else — the same reason the
+        // takeover escape stays here — and "(unattributed)" alone names nobody,
+        // supports no decision, and reads identically whether the holder is a
+        // script on this box or a person signed in from another host.
         "error": format!(
-            "a browser is already running under session '{}' — starting yours would DESTROY its \
+            "a browser is already running under {} — starting yours would DESTROY its \
              state (staged logins included). It is {idle}. Pass {{\"takeover\": true}} to replace \
              it deliberately, or drive the running one via session-scoped verbs; `your_options` \
              below spells out the non-destructive moves.",
-            if named { owner } else { "(unattributed)" }
+            if named {
+                format!("session '{owner}'")
+            } else {
+                origin.clause().unwrap_or_else(|| "session '(unattributed)'".to_string())
+            }
         ),
         "running": {
             "profile": profile,
@@ -328,6 +439,12 @@ fn takeover_refusal(
                 "none — the holder sent no X-Amux-Session header, so it cannot be identified \
                  or messaged".to_string()
             },
+            // WHERE IT CAME FROM, and whether we could tell (AF-183). `origin`
+            // is never absent-by-omission: `origin_source` says which of the
+            // three states produced it, so "we looked and found nothing" cannot
+            // be read as "we did not look".
+            "origin": origin.clause(),
+            "origin_source": origin.label(),
             "started_at": started_at,
             "held_secs": held_s,
             "held_h": (held_h * 10.0).round() / 10.0,
@@ -476,7 +593,11 @@ struct StartBody {
 }
 
 // `HeaderMap` before `Json` — axum requires the body extractor last.
-async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
+async fn start(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Option<Json<StartBody>>,
+) -> Response {
     let Json(body) = body.unwrap_or_default();
     // Viewport request validated BEFORE launching — a 400 must not cost a
     // Chrome start, and the contract wording matches the viewport action's.
@@ -549,6 +670,15 @@ async fn start(headers: HeaderMap, body: Option<Json<StartBody>>) -> Response {
                     &pages,
                     now_epoch(),
                     attrib.as_deref(),
+                    // Only for an UNATTRIBUTED holder. A named one is already
+                    // messageable, so a db read there would buy nothing and the
+                    // NotLooked state says exactly that rather than implying a
+                    // lookup came back empty.
+                    if r_owner.trim().is_empty() {
+                        lookup_start_origin(&state.store, r_started)
+                    } else {
+                        StartOrigin::NotLooked
+                    },
                 ),
             );
         }
@@ -1671,6 +1801,7 @@ mod tests {
             &pages,
             started + 120, // 0.0h, as reported
             Some("amux"),
+            StartOrigin::NotLooked,
         );
         let e = v["error"].as_str().unwrap();
         assert!(
@@ -1713,7 +1844,7 @@ mod tests {
 
         // AND the abandoned case must still read as abandoned, or this fix would
         // just have inverted the bias instead of removing it.
-        let abandoned = takeover_refusal("default", "", started, 9999, Some(4), &[], started + 66_600, None);
+        let abandoned = takeover_refusal("default", "", started, 9999, Some(4), &[], started + 66_600, None, StartOrigin::NotLooked);
         let ae = abandoned["error"].as_str().unwrap();
         assert!(
             ae.contains("ZERO real pages") && ae.contains("no page state to lose"),
@@ -1722,10 +1853,86 @@ mod tests {
     }
 
     #[test]
+    fn an_unattributed_holder_is_described_from_the_request_log_when_it_cannot_be_named() {
+        let started = 1_700_000_000;
+        let now = started + 600;
+
+        // THE CASE THIS ENTRY'S COST IS ABOUT: a real browser on another host,
+        // i.e. a person. Under "(unattributed)" it is indistinguishable from a
+        // curl on loopback, and the caller is asked to decide anyway.
+        let human = takeover_refusal(
+            "default", "", started, 7623, Some(2),
+            &[("Sign in".into(), "accounts.google.com".into())], now, Some("amux"),
+            StartOrigin::Found {
+                ip: "100.66.26.84".into(),
+                ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)".into(),
+            },
+        );
+        let e = human["error"].as_str().unwrap();
+        // IN THE SENTENCE, which is the entry's actual ask — plenty of callers
+        // print `.error` and nothing else.
+        assert!(
+            e.contains("100.66.26.84") && e.contains("Mozilla/5.0"),
+            "the recoverable facts must reach the sentence, not just the body: {e}"
+        );
+        assert!(
+            e.contains("PERSON"),
+            "an IP and a user-agent still leave the caller to judge; the refusal is asked \
+             to decide under time pressure, so it must say what they MEAN: {e}"
+        );
+        assert!(
+            !e.contains("(unattributed)"),
+            "'(unattributed)' names nobody and supports no decision — it must be replaced \
+             once the origin is known: {e}"
+        );
+
+        // The cheap case must read differently, or the verdict is decoration.
+        let agent = takeover_refusal(
+            "default", "", started, 7623, Some(0), &[], now, Some("amux"),
+            StartOrigin::Found { ip: "127.0.0.1".into(), ua: "curl/8.7.1".into() },
+        );
+        let ae = agent["error"].as_str().unwrap();
+        assert!(
+            ae.contains("127.0.0.1") && ae.contains("agent on this box") && !ae.contains("PERSON"),
+            "loopback plus a scripted client is the OTHER verdict; if both render the same \
+             the classification cannot inform anything: {ae}"
+        );
+    }
+
+    #[test]
+    fn a_failed_origin_lookup_is_not_reported_as_an_absent_one() {
+        let started = 1_700_000_000;
+        let now = started + 600;
+        // THREE STATES, and this is the pair that collapses. "we looked and
+        // found nothing" is evidence about the holder; "we did not look" is
+        // evidence about us. Rendering both as no-origin is the one-output-
+        // two-states failure the `attribution` field already guards one level up.
+        let missing =
+            takeover_refusal("default", "", started, 7623, Some(0), &[], now, None,
+                             StartOrigin::NotFound);
+        let absent =
+            takeover_refusal("default", "", started, 7623, Some(0), &[], now, None,
+                             StartOrigin::NotLooked);
+
+        assert_ne!(
+            missing["running"]["origin_source"], absent["running"]["origin_source"],
+            "a lookup that RAN and found nothing must not read the same as one that never ran"
+        );
+        assert_eq!(absent["running"]["origin"], json!(null));
+        assert!(
+            missing["error"].as_str().unwrap().contains("no matching start row"),
+            "when the log cannot recover the origin the refusal says so, rather than \
+             falling back to a bare '(unattributed)' that hides which of the two happened"
+        );
+        // And the not-looked path must still be honest rather than silent.
+        assert_eq!(absent["running"]["origin_source"], json!("not looked up"));
+    }
+
+    #[test]
     fn an_unattributed_holder_is_judgeable_from_the_refusal() {
         let started = 1_787_494_071i64; // 2026-08-23T10:07:51, the reported hold
         let now = started + 66_600; // 18.5h later
-        let v = takeover_refusal("default", "", started, 7623, Some(0), &[], now, None);
+        let v = takeover_refusal("default", "", started, 7623, Some(0), &[], now, None, StartOrigin::NotLooked);
 
         assert_eq!(v["running"]["tabs_open"], json!(0));
         assert_eq!(v["running"]["held_h"], json!(18.5), "{v}");
@@ -1759,6 +1966,7 @@ mod tests {
             &[("Docs".into(), "docs.example.com".into())],
             now,
             Some("amux"),
+            StartOrigin::NotLooked,
         );
         assert_eq!(named["running"]["attribution"], json!("session"));
         let nopts = serde_json::to_string(&named["your_options"]).unwrap();
@@ -1780,7 +1988,7 @@ mod tests {
         assert_eq!(named["running"]["pages_open"], json!(1), "1 page out of 3 targets: {named}");
 
         // CDP SILENT: must not read as zero.
-        let quiet = takeover_refusal("default", "", started, 7623, None, &[], now, None);
+        let quiet = takeover_refusal("default", "", started, 7623, None, &[], now, None, StartOrigin::NotLooked);
         assert!(quiet["running"]["tabs_open"].is_null(), "{quiet}");
         let qe = quiet["error"].as_str().unwrap();
         assert!(
@@ -1833,8 +2041,15 @@ mod tests {
         chrome::test_clear_running();
         assert_eq!(st_anon, StatusCode::CONFLICT, "anonymous-vs-anonymous is not same-session: {v_anon}");
         assert!(
-            v_anon["error"].as_str().unwrap_or("").contains("(unattributed)"),
-            "an unattributed owner is named as such: {v_anon}"
+            v_anon["error"].as_str().unwrap_or("").to_lowercase().contains("unattributed"),
+            // Was `contains("(unattributed)")`. AF-183 replaced that literal with
+            // a description built from the request log, so the exact parenthetical
+            // is no longer the wording — the PROPERTY it was pinning, that an
+            // unattributed holder is visibly flagged rather than silently blank,
+            // is what this now asserts. Deliberately case-insensitive: pinning
+            // the case would re-break on the next rewording without protecting
+            // anything.
+            "an unattributed owner is flagged as such: {v_anon}"
         );
         // The pass-through cases (same session; takeover:true) proceed to a
         // REAL Chrome launch and so cannot run hermetically — they are
