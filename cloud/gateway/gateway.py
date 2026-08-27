@@ -2193,15 +2193,41 @@ class Handler(BaseHTTPRequestHandler):
                         except Exception:
                             pass
                     with _db_lock:
-                        db.execute(
+                        cur = db.execute(
                             "UPDATE orgs SET plan='pro', stripe_customer_id=?, stripe_subscription_id=?, trial_ends_at=? WHERE id=?",
                             (cust_id, sub_id, trial_end, ref_id))
-                        # Also update legacy users table for transition
+                        matched = cur.rowcount
+                        # RESOLVE a client_reference_id that is NOT itself an org id.
+                        # Runtime plan is read from orgs.plan (never users.plan), so a
+                        # reference that matched no orgs row leaves the customer on free
+                        # even though checkout charged them (SP-615). In the personal-org
+                        # model org.id == user.id so the direct match usually works, but a
+                        # team-org checkout, or any future reference shape, must resolve to
+                        # the ACTUAL org(s): membership where the user is owner/admin, and
+                        # any org this id owns.
+                        if matched == 0:
+                            org_ids = [r[0] for r in db.execute(
+                                "SELECT org_id FROM org_memberships WHERE user_id=? AND role IN ('owner','admin') "
+                                "UNION SELECT id FROM orgs WHERE owner_id=?",
+                                (ref_id, ref_id)).fetchall()]
+                            for oid in org_ids:
+                                cur = db.execute(
+                                    "UPDATE orgs SET plan='pro', stripe_customer_id=?, stripe_subscription_id=?, trial_ends_at=? WHERE id=?",
+                                    (cust_id, sub_id, trial_end, oid))
+                                matched += cur.rowcount
+                        # Legacy users row too (transition), best-effort.
                         db.execute(
                             "UPDATE users SET plan='pro', stripe_customer_id=?, stripe_subscription_id=?, trial_ends_at=? WHERE id=?",
                             (cust_id, sub_id, trial_end, ref_id))
                         db.commit()
-                    print(f"[stripe] activated pro for org {ref_id} cust={cust_id} trial_end={trial_end}", flush=True)
+                    # Two-fixes signal: a paid checkout that provisions NOTHING must be
+                    # loud, not a false "activated pro". This WARN is what a log sweep or
+                    # the daily cloud health can catch — the SP-615 silence was that the
+                    # handler never ran AND, had it run on a bad ref, would have lied.
+                    if matched > 0:
+                        print(f"[stripe] activated pro for {matched} org row(s) ref={ref_id} cust={cust_id} trial_end={trial_end}", flush=True)
+                    else:
+                        print(f"[stripe] WARN provisioned NOTHING for paid checkout ref={ref_id} cust={cust_id} sub={sub_id} — no orgs row matched directly or via membership/owner; customer CHARGED but on free plan", flush=True)
             elif etype == "invoice.paid":
                 cust_id = obj.get("customer")
                 if cust_id:
