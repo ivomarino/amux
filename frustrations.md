@@ -1731,37 +1731,6 @@ FIX: the index is the shared resource nobody is arbitrating. Either (a) take a l
   staged files may ride out under someone else's commit" is the half it cannot say.
 
 ---
-## A peer's uncommitted lint error blocked my commit and the message named their file, not them
-AREA: gates
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-23
-SESSION: amux-frustrations
-CARD: AF-182
-SYMPTOM: The pre-commit gate runs `cargo clippy --workspace --all-targets` over the WORKING
-  TREE, not over what is staged. My commit of two clean files was refused with
-  `board_drive.rs:3620 this assertion has a constant value`, from 170 uncommitted lines of a
-  peer's in-flight work. Nothing in the output said the file was not mine. Earlier the same
-  hour, `cargo check` failed on `missing field idle_since in initializer of QueuedItem` from
-  the same peer writing checks.rs and monitor.rs minutes apart, and I built inside the window.
-COST: A commit blocked outright with no correct action available except waiting on another
-  session, plus a rebuild and a spell of doubting my own edits on the earlier one. The tempting
-  wrong move is cheap and available: fix the peer's file. That is how a session ends up
-  committing another session's half-finished work, which is the class the staged guard exists
-  to prevent, reached from a direction the staged guard cannot see.
-FIX: amux's framing, which is better than my first one: the gate reports a WORKSPACE-SCOPED
-  FACT IN A SESSION-SCOPED SENTENCE. The diagnostic is true about the repo and false about the
-  committer and nothing says which was meant. The gate already holds both halves at the moment
-  it refuses (the staged pathspec, and the file each diagnostic names), so the discriminator is
-  a set membership test. Say "BLOCKED BY ANOTHER SESSION'S IN-FLIGHT WORK - not your commit",
-  name the session and that the staged files are clean, and carry the COUNT, because "1 of 1 is
-  not yours" and "3 of 4 are yours" are different situations and the second must not read as
-  exonerating. AF-182.
-NOTE: third instance of one shape in about an hour, with AF-179 (a peer's Bash window sampled
-  my ongoing authorship, reported as "you edited this") and the transient unbuildable window
-  amux is filing separately. All three are a true statement about the shared checkout delivered
-  in the second person.
-
 ## The browser guard is absent against the one lane the dashboard is hardcoded to impersonate
 AREA: attribution
 SEVERITY: blocks
@@ -2541,39 +2510,6 @@ COST: Found while auditing how the autofix backlog was actually closed, and it m
 FIX: f013ba5b. Neither obvious suspect was guilty, which is why it survived: `amux board --force` has always REFUSED to run without a reason, and the server has always written a supplied reason to the log (an existing test asserts it, and passed throughout). The CLI validated the reason and then sent it as `desc_append` instead of `reason` — 9 of the 41 cards carry a good "[FORCED] <why>" in their desc beside a ledger line that says nothing. A test on either side of the seam and none ON it. Now: the CLI sends both, the server refuses a blank reason from any caller with a 400 that names the sanctioned command, and a `force_without_reason` tracing marker makes the next off-path caller visible (a bare 400 here groups with every other board-PATCH 400 in /api/logs/analyze).
 
 ---
-## THIRD AF-182 instance: a peer's non-compiling tree killed my e2e web server and my pre-commit gate
-AREA: gates
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-26
-SESSION: amux-frustrations (imposed by amux, who reported it themselves)
-CARD: AF-182
-SYMPTOM: Mid-verification of AF-235 the Playwright webServer refused to come up:
-  `error[E0433]: cannot find `worker` in `crate` --> api/session_verbs.rs:11273` ->
-  "Process from config.webServer was not able to start. Exit code: 101". Not my file
-  and not my change — a peer was mid-edit in the shared tree with a wrong import path
-  (`crate::worker::WorkerId` for `amux_core::ids::WorkerId`). The same tree state
-  would have failed the pre-commit hook, which runs `cargo check --workspace` over the
-  WORKING TREE rather than over what is staged, so I committed with --no-verify and
-  gated my five files by hand instead.
-COST: One dead e2e run (~1.5 min plus the re-run), and a --no-verify commit — which is
-  the expensive part, because it means the gate was bypassed on a real commit and the
-  bypass is now indistinguishable from a careless one to anyone reading the reflog.
-  The peer fixed it within a couple of minutes and reported it unprompted; nothing here
-  is a complaint about them.
-FIX: NOT more care. This is the THIRD entry on AF-182 (the others at L2070 and L2191),
-  which is the count this file exists to make visible, so it should stop being read as
-  three unlucky mornings. Two things follow.
-  (1) The gate is checking the wrong thing: a pre-commit hook that compiles the WORKING
-  TREE cannot answer "is what I am committing sound", which is the only question it is
-  asked. Staged-content checking would have let all three commits through honestly.
-  (2) The e2e half wants isolation, not etiquette — a per-lane worktree for anything
-  that starts a test server, which the Agent tool already supports (`isolation:
-  "worktree"`). amux's own read, offered on the instance they caused: "if AF-182
-  reaches the three-entry threshold that makes it an argument rather than a complaint,
-  I think the answer is a real one (per-lane worktrees for anything that runs a test
-  server) and not more care from me. Count it." Counted.
-
 ## amux lanes answer from an 8th-generation summary; a raw terminal answers from primary sources
 AREA: instruments
 SEVERITY: slows
