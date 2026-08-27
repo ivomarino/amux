@@ -172,19 +172,54 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
 fi
 
 # ── 5. Service ──────────────────────────────────────────────────────────────
+if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
+  # Create systemd user services from templates.
+  SYSTEMD_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$SYSTEMD_DIR"
+
+  # Substitute variables in service templates and write to systemd directory.
+  # Export variables so envsubst can find them.
+  export BIN_DIR PORT AMUX_HOME SCRIPT_DIR
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-server.service.template" \
+    > "$SYSTEMD_DIR/amux-server.service" || die "failed to create amux-server.service"
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-builder.service.template" \
+    > "$SYSTEMD_DIR/amux-builder.service" || die "failed to create amux-builder.service"
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-builder.timer.template" \
+    > "$SYSTEMD_DIR/amux-builder.timer" || die "failed to create amux-builder.timer"
+
+  # Reload systemd to recognize the new units.
+  systemctl --user daemon-reload || die "systemctl daemon-reload failed"
+
+  say "systemd user services created:"
+  say "  $SYSTEMD_DIR/amux-server.service"
+  say "  $SYSTEMD_DIR/amux-builder.service"
+  say "  $SYSTEMD_DIR/amux-builder.timer"
+  echo ""
+  say "Next: enable and start the services"
+  echo "  ${DIM}systemctl --user enable amux-server${RESET}"
+  echo "  ${DIM}systemctl --user enable amux-builder.timer${RESET}"
+  echo "  ${DIM}systemctl --user start amux-server${RESET}"
+  echo ""
+  say "View logs: ${DIM}journalctl --user -u amux-server -f${RESET}"
+  echo ""
+  echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
+  echo ""
+  say "See docs/systemd-setup.md for full documentation"
+  exit 0
+fi
+
+# Non-systemd Linux or unsupported OS.
 if [[ "$OS" != "Darwin" ]]; then
-  # Honest degrade: no launchd here, and pretending to manage systemd from a
-  # bash installer is how services half-exist. Print exactly what to run.
-  warn "$OS: no service manager configured by this installer."
+  warn "$OS: systemd not detected. No service manager configured."
   echo ""
   echo "Run the server in the foreground:"
   echo "    AMUX_RS_PORT=$PORT $BIN_DIR/amux-server-rs"
   echo ""
   echo "Or wrap it in a systemd user unit (~/.config/systemd/user/amux.service):"
-  echo "    [Service]"
-  echo "    ExecStart=$BIN_DIR/amux-server-rs"
-  echo "    Environment=AMUX_RS_PORT=$PORT"
-  echo "    Restart=always"
+  echo "    See docs/systemd-setup.md for template"
   echo ""
   echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
   exit 0
