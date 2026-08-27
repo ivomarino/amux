@@ -4499,7 +4499,11 @@ async fn reactive_pickup(state: &AppState, session: &str) {
         // claim+dispatch could re-open and re-run a card closed in the gap.
         if crate::runtime_jobs::board_drive::claim_card(state, session, &card).await {
             let _ = crate::api::session_verbs::steer_enqueue(
-                state, session, &prompt, "board-drive:reactive", "",
+                state,
+                session,
+                &prompt,
+                &format!("{}:reactive", crate::api::session_verbs::BOARD_DRIVE_GUARD),
+                "",
             )
             .await;
             tracing::info!(

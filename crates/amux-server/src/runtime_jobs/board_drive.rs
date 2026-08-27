@@ -87,6 +87,10 @@ use amux_core::board::TaskStatus;
 /// cooldowns above, not by the tick, so the tick can be honest about latency.
 pub const BOARD_DRIVE_TICK_SECS: u64 = 60;
 
+/// Local alias for the steering guard these deliveries carry. The string
+/// lives once, in session_verbs, because that is where it is READ.
+use crate::api::session_verbs::BOARD_DRIVE_GUARD as GUARD;
+
 /// py:12961 `_ADVANCE_COOLDOWN` — never push the same lane twice inside this.
 const ADVANCE_COOLDOWN_S: f64 = 15.0 * 60.0;
 /// py:12855 `_DECOMPOSE_NUDGE_COOLDOWN`.
@@ -409,12 +413,12 @@ impl Fleet for LiveFleet {
         crate::api::session_verbs::steer_lane_at_boundary(&self.state, lane).await
     }
     async fn deliver(&self, lane: &str, text: &str) {
-        let _ = crate::api::session_verbs::steer_enqueue(&self.state, lane, text, "board-drive", "").await;
+        let _ = crate::api::session_verbs::steer_enqueue(&self.state, lane, text, GUARD, "").await;
         self.record_prompt(lane, text).await;
     }
     async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) {
         let _ = crate::api::session_verbs::steer_enqueue_precond(
-            &self.state.store, lane, text, "board-drive", "", Some((card, rev)),
+            &self.state.store, lane, text, GUARD, "", Some((card, rev)),
         )
         .await;
         self.record_prompt(lane, text).await;

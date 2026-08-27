@@ -8889,6 +8889,24 @@ fn looks_like_pickup(text: &str) -> bool {
     text.contains(crate::runtime_jobs::board_drive::PICKUP_ANCHOR)
 }
 
+/// The `guard` label every board-drive steering row carries, and the ONLY thing
+/// that routes a queued row into the AMUX-3052 stale-pickup check.
+///
+/// SAME DEFECT AS AF-268, ONE LAYER UP, caught before it fired. The string had
+/// five copies in this seam: two enqueue sites (`board_drive::deliver`,
+/// `deliver_about`), the reactive dispatch in `api/board.rs`, and two readers
+/// here. Rename any producer's copy and `pickup_stale_void` returns None on the
+/// first line, before the parser is ever consulted — so the parse-failure WARN
+/// that catches template drift cannot fire, because the row never reaches it.
+///
+/// That is the residual `amux` named on AF-268 and proposed covering with a
+/// last-evaluated timestamp. A shared const is the cheaper half of it: this
+/// drift becomes impossible rather than observable. The other half, "delivery
+/// stops routing through pickup_stale_void at all", is already covered by
+/// `a_stale_auto_pickup_is_voided_at_the_delivery_boundary`, which drives the
+/// real `steer_deliver_tick` and would fail if the call were removed.
+pub(crate) const BOARD_DRIVE_GUARD: &str = "board-drive";
+
 /// AMUX-3052 void decision, extracted from `steer_deliver_tick` so BOTH legs are
 /// unit-testable in isolation (a drop-guard that silently drops everything passes
 /// a drop-only suite — gtm-engine's negative control). Given a queued message's
@@ -8916,7 +8934,7 @@ fn pickup_stale_void(
     card_session: Option<&str>,
     recipient: &str,
 ) -> Option<String> {
-    if !guard.starts_with("board-drive") {
+    if !guard.starts_with(BOARD_DRIVE_GUARD) {
         return None; // not a board-drive delivery — never void a user/inter-session message
     }
     let card = pickup_card_id(text)?; // not a single-card pickup (e.g. a nudge) — deliver
@@ -9063,7 +9081,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // The re-check reads the LIVE issues.status row — NOT session_events
         // (records the claim but not the close on this path) and NOT
         // issues.updated (stale at the claim second), per gtm-engine's forensics.
-        if guard.starts_with("board-drive") {
+        if guard.starts_with(BOARD_DRIVE_GUARD) {
             if let Some(card_id) = pickup_card_id(&text) {
                 // Ok(Some(status)) found · Ok(None) deleted · Err → read failed,
                 // so DO NOT void — delivering a valid pickup beats dropping one on
@@ -16325,15 +16343,18 @@ mod tests {
                     &format!("{PICKUP_ANCHOR}GV-648 — work it now.");
                 let live =
                     &format!("{PICKUP_ANCHOR}AMUX-9 — work it now.");
+                // Guard from the const, never a literal: a fixture that types
+                // its own guard stays green through exactly the drift this
+                // test exists to catch (AF-268's lesson, applied to itself).
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
-                     VALUES('s1','lane-stale',?1,?2,'board-drive')",
-                    rusqlite::params![stale, now - 20.0],
+                     VALUES('s1','lane-stale',?1,?2,?3)",
+                    rusqlite::params![stale, now - 20.0, BOARD_DRIVE_GUARD],
                 )?;
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
-                     VALUES('s2','lane-live',?1,?2,'board-drive')",
-                    rusqlite::params![live, now - 20.0],
+                     VALUES('s2','lane-live',?1,?2,?3)",
+                    rusqlite::params![live, now - 20.0, BOARD_DRIVE_GUARD],
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
