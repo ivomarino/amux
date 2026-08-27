@@ -1396,6 +1396,50 @@ NOTE (2026-08-24, amux-frustrations — author): ROOT CAUSE FIXED (6a518e41), EN
   `hooks.shared_guard_matches_committed` was correctly green throughout. What I had measured
   was my own uncommitted edit.
 
+NOTE (2026-08-27, amux-frustrations — author). THE OBSERVABLE STILL HAS NOT DROPPED, three
+  days on, and I can now say exactly why. The entry above predicted the volume "decays only
+  as each checkout updates". That was right about the mechanism and wrong about the size of
+  the population: it is not a slow decay across many checkouts, it is ONE FILE.
+  MEASURED, `OUTDATED HOOK` WARN lines per day in ~/.amux/logs/server-rs.log:
+    2026-08-24  25   (the fix, 6a518e41, landed this day)
+    2026-08-25 288
+    2026-08-26 342
+    2026-08-27 272
+  So the cost this entry records is undiminished. But THIS checkout now emits ZERO of them:
+  all 272 of today's come from lanes whose cwd is under /Users/ethan/Dev/mixpeek/* — nissan,
+  mixpeek-docs, social-media, paid-social, mvs-infra, mixpeek-security and ~10 more. The
+  amux-side fix works; it simply never reached the population.
+  AND THEY ARE NOT FIFTEEN CHECKOUTS. `git rev-parse --show-toplevel` from
+  mixpeek/server/mvs returns /Users/ethan/Dev/mixpeek — one repo, one .git, one hooks dir.
+  Every one of those lanes runs the SAME installed file:
+    /Users/ethan/Dev/mixpeek/.git/hooks/amux-staged-guard   23039 bytes, Aug 20 21:28
+    scripts/git-hooks/amux-staged-guard (source)            43611 bytes, Aug 24 19:46
+    GUARD_VERSION = 4  vs  GUARD_VERSION = 10
+  Six versions behind, and it posts to /api/git/staged-guard only — the source also posts
+  /api/git/guard-outcome. guard_version appears 3 times in source and 2 in the installed
+  copy, so one POST body omits it, which is this entry's original mechanism verbatim.
+  THE REMEDY IS NOT MERELY THEATRE, IT IS UNFOLLOWABLE. git_guard.rs:1853 tells that lane
+  "Reinstall: scripts/install-hooks.sh". From /Users/ethan/Dev/mixpeek that path does not
+  exist — `find /Users/ethan/Dev/mixpeek -maxdepth 3 -name install-hooks.sh` returns nothing.
+  100% of today's recipients are given an instruction they cannot execute. The entry called
+  this AMUX-2140's shape (the sanctioned instruction is theatre); it is a step worse, because
+  theatre at least runs.
+  THE CORRECT INSTRUCTION EXISTS AND THE SERVER ALREADY HOLDS ITS ARGUMENT. install-hooks.sh
+  has had a foreign-checkout mode since the python generator was deleted — `install-hooks.sh
+  <dir>` installs the guard into another repo and, by its own header, "NEVER writes
+  pre-commit" there. So the followable remedy for that warn is
+  `/Users/ethan/Dev/amux/scripts/install-hooks.sh /Users/ethan/Dev/mixpeek` — and the warn
+  line ALREADY PRINTS the directory it would pass ("mvs-infra in /Users/ethan/Dev/mixpeek/
+  server/mvs"). The fix is to emit the remedy the server can already compute, rather than a
+  constant that is only correct for callers inside the amux checkout. Ethos rule 3: a
+  constraint must have a truthful path forward in every legitimate state.
+  NOT RUN BY ME, and this is the part that is not mine to decide. One command would end the
+  272/day. It would also upgrade a COMMIT GATE from version 4 to version 10 underneath ~15
+  lanes that are actively committing in that repo right now, with no warning to any of them.
+  Six versions of gate behaviour arriving mid-work is not a change I can spring on other
+  lanes (ethos rule 8). Routed to amux, who owns git_guard.rs and the hooks, with the
+  measurement and the exact command. STAYS OPEN.
+
 ## Every checkout's git hooks are 18 days stale, and amux has been saying so into a log for 11
 AREA: instruments
 SEVERITY: blocks
