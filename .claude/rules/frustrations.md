@@ -21,8 +21,20 @@ git rev-list --count origin/main..HEAD   # unpushed commits here
 git rev-list --count HEAD..origin/main   # how far behind
 ```
 
-If BOTH are non-zero the checkout has diverged, cannot fast-forward, and nothing
-will carry your entry upstream — append to a clone that is current instead. The
+If BOTH are non-zero the checkout has diverged and cannot fast-forward. That is a
+REPORT, not a verdict, and the difference cost a review pass on 2026-08-27
+(AF-272): the two counts cannot tell a stranded clone from the canonical one.
+A checkout that MERGES A PR ON GITHUB goes "behind" by that merge commit
+immediately, so the canonical repo — the one whose 255 unpushed commits every
+lane is working in — reads as stranded by exactly this test, and the honest
+reading is the opposite one.
+
+Ask what put you behind. Commits that are peers' work landing on origin while
+yours sit unpushed means stranded, and the entry belongs in a current clone.
+Commits that are YOUR OWN merges of PRs you just reviewed mean the opposite:
+this is the checkout everything flows through. When the answer is not obvious,
+`git log --oneline HEAD..origin/main` names them, and a name settles it where a
+count cannot. The
 SessionStart freshness hook now says this out loud when it applies, because a
 rule that only asks you to remember is the kind ethos rule 6 warns about.
 
