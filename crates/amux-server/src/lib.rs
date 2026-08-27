@@ -499,6 +499,27 @@ async fn async_main() {
         );
     }
 
+    // GOOGLE CALENDAR SYNC (Phase 5). `sync_google_calendars` existed, was
+    // documented as running "every 15 minutes" — and had ZERO call sites, so
+    // calendar data only ever updated via a manual POST /api/gcal/sync. Same
+    // shape as AMUX-2647's scheduler loop and AMUX-2637's board-drive loop
+    // above: nothing errored, because the failure is pure absence. The inner
+    // loop never returns (errors are caught and logged per-account, per
+    // cycle), so this is spawned once and left running for the process
+    // lifetime, same as every other loop in this block.
+    {
+        let store = store.clone();
+        jobs::spawn_loop(
+            jobs::ids::GCAL_SYNC,
+            Some(secs(15 * 60)),
+            async move {
+                if let Err(e) = runtime_jobs::gcal_sync_job::sync_google_calendars(store).await {
+                    tracing::error!("gcal-sync loop exited unexpectedly: {}", e);
+                }
+            },
+        );
+    }
+
     let app = api::router(state);
 
     // SNI dual-cert: Tailscale LE cert for the tailnet hostname, self-signed

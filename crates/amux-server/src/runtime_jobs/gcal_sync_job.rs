@@ -127,6 +127,14 @@ pub async fn sync_account(store: &SharedStore, account_id: &str, email: &str) ->
 
             let count = stored_w.load(std::sync::atomic::Ordering::Relaxed);
             let _ = calendar::mark_sync_complete(conn, &aid, count);
+            // Keeps `calendar_sync_metadata` (owner/purpose/total_events,
+            // surfaced by GET /api/gcal/status) current — it was written
+            // once at boot by calendar_init and never touched again
+            // otherwise, so total_events/last_full_sync_at would silently
+            // go stale forever. `mark_sync_complete` above updates the
+            // separate `calendar_accounts` row this loop actually reads
+            // its own state from; this is additive, not a replacement.
+            let _ = calendar::update_sync_metadata(conn, &aid, count, true);
             Ok(WriteOutcome { applied: true, events: vec![] })
         })
         .await?;

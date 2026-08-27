@@ -44,6 +44,12 @@ pub struct SyncStatusResponse {
     status: String,
     event_count: i32,
     last_sync: Option<String>,
+    /// From `calendar_sync_metadata` (populated at boot by calendar_init) —
+    /// who this sync belongs to and why, if that was ever set. `None` when
+    /// there's no metadata row for the account yet, not on any query error;
+    /// a missing owner/purpose is not worth failing the whole status call.
+    owner: Option<String>,
+    purpose: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -138,10 +144,8 @@ pub async fn create_event(
         .read()
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let account = calendar::get_accounts(&conn)
+    let account = calendar::get_account(&conn, &req.account_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_iter()
-        .find(|a| a.id == req.account_id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Account not found".to_string()))?;
 
     // Load OAuth token for this account
@@ -189,10 +193,8 @@ pub async fn update_event(
         .find(|e| e.id.contains(&event_id))
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
 
-    let account = calendar::get_accounts(&conn)
+    let account = calendar::get_account(&conn, &event.account_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_iter()
-        .find(|a| a.id == event.account_id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Account not found".to_string()))?;
 
     // Load OAuth token for this account
@@ -236,10 +238,8 @@ pub async fn delete_event(
         .find(|e| e.id.contains(&event_id))
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Event not found".to_string()))?;
 
-    let account = calendar::get_accounts(&conn)
+    let account = calendar::get_account(&conn, &event.account_id)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?
-        .into_iter()
-        .find(|a| a.id == event.account_id)
         .ok_or_else(|| (StatusCode::NOT_FOUND, "Account not found".to_string()))?;
 
     // Load OAuth token for this account
@@ -273,15 +273,26 @@ pub async fn sync_status(
     let accounts = calendar::get_accounts(&conn)
         .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
 
-    let responses: Vec<SyncStatusResponse> = accounts
-        .into_iter()
-        .map(|acc| SyncStatusResponse {
+    let mut responses = Vec::with_capacity(accounts.len());
+    for acc in accounts {
+        // Best-effort: a metadata query failure or missing row degrades to
+        // owner/purpose: None rather than failing the whole status list —
+        // sync_status/event_count/last_sync (the fields this endpoint
+        // existed for) come from `acc` regardless of this lookup.
+        let (owner, purpose) = calendar::get_sync_metadata(&conn, &acc.id)
+            .ok()
+            .flatten()
+            .map(|m| (Some(m.owner), Some(m.purpose)))
+            .unwrap_or((None, None));
+        responses.push(SyncStatusResponse {
             account_id: acc.id.clone(),
             status: acc.sync_status.clone(),
             event_count: acc.event_count,
             last_sync: acc.synced_at.clone(),
-        })
-        .collect();
+            owner,
+            purpose,
+        });
+    }
 
     Ok(Json(responses))
 }
