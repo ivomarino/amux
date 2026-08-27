@@ -931,6 +931,35 @@ NOTE (2026-08-24, amux-frustrations): STAYS OPEN, and the reason is a trap worth
   race in one session, which is not a fix, and no fix was ever made — so it stays open
   until either the race recurs or someone changes how concurrent builds share the dir.
 
+NOTE (2026-08-27, amux-frustrations, card AF-265): OPTION (c) IS DEAD, and two new facts.
+  The FIX above says "(c) is worth checking first because it would be a one-line fix,
+  and nobody has established WHICH of the three is happening — the diagnosis is missing,
+  not the remedy." Checked, and it is not cargo GC:
+    cargo 1.97.1 — `-Z gc` ("Track cache usage and garbage collect unused files") is
+    UNSTABLE, so it is nightly-gated and off on this toolchain, and there is no gc or
+    cache setting in ~/.cargo/config.toml (no such file). Cargo's stable auto-clean
+    covers the CARGO_HOME registry/src cache, not a target dir; `cargo clean` is the
+    only thing that removes one and it is manual.
+  So the one-line fix does not exist, and (a) leave it / (b) give the auto-builder its
+  own dir are the surviving options. Recording the DEAD one so nobody re-runs it — it
+  was the cheapest to check and therefore the most likely to be checked twice.
+
+  NEW FACT 1, and it points at (b): the shared dir is 156GB (155G debug, 1.1G release,
+  839 fingerprint entries), against the 10-15GB-per-tree figure CLAUDE.md uses to justify
+  sharing it. Not urgent — 226GiB free, 88% capacity, and zero stray /private/tmp target
+  trees — but the disk argument FOR one shared dir is weakening as that one dir grows,
+  and (b) costs ~15GB against a 156GB status quo, which is a different trade than the
+  entry assumed.
+
+  NEW FACT 2, and it makes the race MORE likely rather than less: PR #158 (merged today,
+  cad635ea) made the pre-commit hook build into this same shared dir, where it previously
+  used a repo-local ./target. That is correct on CLAUDE.md's disk rule. But amux's own
+  measurement for the staged-recheck is that a build from a DIFFERENT PATH re-fingerprints
+  the workspace crates — and the staged recheck builds a scratch worktree, so it is a new
+  distinct path writing into the shared dir on every Rust commit where a peer's file is
+  the offender. More writers at more paths is exactly the condition this entry describes,
+  so if the race recurs, that is the first change to correlate against.
+
 ## staged-guard can't see a subagent's own edits, so it blocks the subagent's real work as "foreign"
 AREA: attribution
 SEVERITY: slows
