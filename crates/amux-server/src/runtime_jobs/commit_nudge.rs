@@ -1281,19 +1281,63 @@ fn demote_settled_shared(own: &mut Ownership, settled: &BTreeSet<String>) {
 /// make the difference SMALLER, and a smaller difference is what unlocks the
 /// downgrade — so the caller pairs this with `Some(0)` only, never with a
 /// threshold.
-async fn worktree_lines_absent_from_origin(dir: &str, p: &str) -> Option<usize> {
+/// How many line INSTANCES of `want` are not covered by `have`.
+///
+/// ONE PRODUCER FOR BOTH DIRECTIONS, deliberately. The two callers below ask
+/// mirror questions and must not answer them by different rules: a downgrade is
+/// only sound if "nothing is at risk" means the same thing in each arm. They
+/// were two hand-written loops for two days and had already drifted in the way
+/// that matters, because the second was written by copying the first.
+///
+/// MULTISET, NOT SET (gtm-media-assets, 2026-08-26, reviewing 90eaa6dc). Set
+/// membership ignores multiplicity, so dropping ONE of a repeated line scores
+/// zero: origin `x = 1 / } / }` against worktree `x = 1 / } / novel` reported
+/// nothing missing while a closing brace was being deleted. Counting instances
+/// keeps the property the set was chosen for — a line MOVED within the file is
+/// not a loss — and drops the one it was not chosen for.
+///
+/// RAW LINES, NOT TRIMMED, same report. `str::trim` makes indentation
+/// invisible, and in Python or YAML an indent change IS a semantic change, so
+/// origin re-indenting a block scored zero and the owner was told that
+/// committing reverts nothing. Whitespace-only lines are still skipped: a lost
+/// blank line is not lost work, and `str::lines` already strips the `\r` of a
+/// CRLF ending, so trimming was buying nothing else.
+///
+/// BOTH CHANGES TIGHTEN, which is why they are safe to make together on an arm
+/// that has shipped since 2026-08-24. Each caller downgrades only on a zero, so
+/// counting more losses can only mean FEWER downgrades and more of the loud
+/// verdict. The failure mode stays "warned too loudly" rather than "prescribed a
+/// remedy that ate committed work".
+fn missing_line_instances(have: &str, want: &str) -> usize {
+    let mut pool: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for l in have.lines().filter(|l| !l.trim().is_empty()) {
+        *pool.entry(l).or_default() += 1;
+    }
+    let mut missing = 0usize;
+    for l in want.lines().filter(|l| !l.trim().is_empty()) {
+        match pool.get_mut(l) {
+            Some(n) if *n > 0 => *n -= 1,
+            _ => missing += 1,
+        }
+    }
+    missing
+}
+
+async fn read_origin_and_worktree(dir: &str, p: &str) -> Option<(String, String)> {
     let origin = tokio::process::Command::new("git")
         .args(["-C", dir, "show", &format!("origin/main:{p}")])
         .output()
         .await
         .ok()
         .filter(|o| o.status.success())?;
-    let origin = String::from_utf8_lossy(&origin.stdout);
-    let theirs: std::collections::HashSet<&str> =
-        origin.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-
+    let origin = String::from_utf8_lossy(&origin.stdout).into_owned();
     let mine = tokio::fs::read_to_string(std::path::Path::new(dir).join(p)).await.ok()?;
-    Some(mine.lines().map(str::trim).filter(|l| !l.is_empty()).filter(|l| !theirs.contains(l)).count())
+    Some((origin, mine))
+}
+
+async fn worktree_lines_absent_from_origin(dir: &str, p: &str) -> Option<usize> {
+    let (origin, mine) = read_origin_and_worktree(dir, p).await?;
+    Some(missing_line_instances(&origin, &mine))
 }
 
 /// The MIRROR of [`worktree_lines_absent_from_origin`], and the half the
@@ -1328,30 +1372,12 @@ async fn worktree_lines_absent_from_origin(dir: &str, p: &str) -> Option<usize> 
 /// and sends them to a manual reconciliation, which is the operation most
 /// likely to lose the work the warning was protecting.
 ///
-/// Set semantics, deliberately the same as the mirror: trimmed, blank lines
-/// dropped, order ignored. A line MOVED within the file is not a loss, and a
-/// diff-based count would report it as one.
+/// Shares [`missing_line_instances`] with its mirror, with the arguments the
+/// other way round. Order ignored, multiplicity counted, indentation
+/// significant.
 async fn origin_lines_absent_from_worktree(dir: &str, p: &str) -> Option<usize> {
-    let origin = tokio::process::Command::new("git")
-        .args(["-C", dir, "show", &format!("origin/main:{p}")])
-        .output()
-        .await
-        .ok()
-        .filter(|o| o.status.success())?;
-    let origin = String::from_utf8_lossy(&origin.stdout);
-
-    let mine = tokio::fs::read_to_string(std::path::Path::new(dir).join(p)).await.ok()?;
-    let ours: std::collections::HashSet<&str> =
-        mine.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
-
-    Some(
-        origin
-            .lines()
-            .map(str::trim)
-            .filter(|l| !l.is_empty())
-            .filter(|l| !ours.contains(l))
-            .count(),
-    )
+    let (origin, mine) = read_origin_and_worktree(dir, p).await?;
+    Some(missing_line_instances(&mine, &origin))
 }
 
 /// When it cannot classify a path (git error, no origin/main ref) it treats the
@@ -3802,5 +3828,146 @@ mod tests {
             "it is an ordinary worktree change against agreeing refs: {del:?}"
         );
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// SET SEMANTICS HID TWO REAL LOSSES (gtm-media-assets, 2026-08-26,
+    /// reviewing 90eaa6dc). Both downgrade arms asked "is any line of X absent
+    /// from Y" with a `HashSet` of trimmed lines, which cannot see:
+    ///
+    ///   MULTIPLICITY  dropping ONE of a repeated line. Origin `x = 1 / } / }`
+    ///                 against a worktree holding a single `}` scored zero, so
+    ///                 the nudge said committing reverts nothing while a closing
+    ///                 brace was being deleted.
+    ///   INDENTATION   `str::trim` makes leading whitespace invisible, and in
+    ///                 Python or YAML an indent change IS a semantic change.
+    ///
+    /// They found it by reading the code and reproducing it against their own
+    /// reimplementation, and flagged it as a hypothesis until a real harness
+    /// agreed. This is that harness: these cells run the shipped functions
+    /// through `freshness_from_repo` against a constructed repo.
+    ///
+    /// THE LAST CELL IS THE CONTROL and it is the reason this test cannot be
+    /// satisfied by making the counters pessimistic. A genuine superset must
+    /// still downgrade; a fix that simply counted more would fail there.
+    ///
+    /// PRECONDITION ASSERTED, not assumed: every path must read local-ahead by
+    /// sha, or the DIVERGED arm is never reached and the whole test degenerates
+    /// into an ordinary-STALE case that passes for the wrong reason.
+    #[tokio::test]
+    async fn a_dropped_duplicate_and_a_reindent_are_losses_the_set_could_not_see() {
+        let tmp = std::env::temp_dir().join(format!("amux-multiset-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let (bare, work, peer) = (tmp.join("origin.git"), tmp.join("work"), tmp.join("peer"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out =
+                std::process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(out.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+
+        // BASE, pushed. braces.md carries a REPEATED line; indent.py carries a
+        // block whose meaning is its leading whitespace.
+        std::fs::write(work.join("braces.md"), "x = 1\n}\n}\n").unwrap();
+        std::fs::write(work.join("indent.py"), "def f():\n    if a:\n        g()\n").unwrap();
+        std::fs::write(work.join("superset-ctl.md"), "entry A\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "base"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // LOCAL commits that never reach origin under this sha — the graft shape
+        // that makes every path read local-ahead.
+        std::fs::write(work.join("braces.md"), "x = 1\n}\n}\nLOCAL\n").unwrap();
+        std::fs::write(work.join("indent.py"), "def f():\n    if a:\n        g()\nLOCAL\n")
+            .unwrap();
+        std::fs::write(work.join("superset-ctl.md"), "entry A\nentry LOCAL\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "local"]);
+
+        // A peer moves origin ahead of HEAD on all three paths.
+        std::process::Command::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap()])
+            .arg(&peer)
+            .output()
+            .unwrap();
+        git(&peer, &["config", "user.email", "t@t"]);
+        git(&peer, &["config", "user.name", "t"]);
+        std::fs::write(peer.join("braces.md"), "x = 1\n}\n}\nPEER\n").unwrap();
+        std::fs::write(peer.join("indent.py"), "def f():\n    if a:\n        g()\nPEER\n").unwrap();
+        std::fs::write(peer.join("superset-ctl.md"), "entry A\nentry PEER\n").unwrap();
+        git(&peer, &["add", "-A"]);
+        git(&peer, &["commit", "-m", "peer"]);
+        git(&peer, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin"]);
+
+        // WORKTREES. Each holds novel lines (so arm 3c cannot downgrade it and
+        // the mirror question is actually asked), and each loses something of
+        // origin's that set-of-trimmed-lines cannot see.
+        std::fs::write(work.join("braces.md"), "x = 1\n}\nPEER\nLOCAL\nNOVEL\n").unwrap(); // one } gone
+        std::fs::write(
+            work.join("indent.py"),
+            "def f():\n    if a:\n    g()\nPEER\nLOCAL\nNOVEL\n", // g() dedented 8 -> 4
+        )
+        .unwrap();
+        // CONTROL: loses nothing of origin's.
+        std::fs::write(work.join("superset-ctl.md"), "entry A\nentry PEER\nentry LOCAL\n").unwrap();
+
+        let dir = work.to_str().unwrap();
+        let names = s(&["braces.md", "indent.py", "superset-ctl.md"]);
+        for p in &names {
+            let ahead = std::process::Command::new("git")
+                .args(["-C", dir, "log", "--oneline", "origin/main..HEAD", "--", p])
+                .output()
+                .unwrap();
+            assert!(
+                !String::from_utf8_lossy(&ahead.stdout).trim().is_empty(),
+                "premise: {p} must be local-ahead by sha, or the DIVERGED arm is never reached \
+                 and this cell is vacuous"
+            );
+        }
+
+        let fresh = freshness_from_repo(dir, &names).await;
+
+        assert_eq!(
+            fresh.diverged,
+            s(&["braces.md", "indent.py"]),
+            "dropping one of a repeated line, and re-indenting a block, are both losses of \
+             origin content — committing reverts them, so DIVERGED must stand: {fresh:?}"
+        );
+        assert_eq!(
+            fresh.edited,
+            s(&["superset-ctl.md"]),
+            "and the control must still downgrade, or the fix is just a pessimistic counter: \
+             {fresh:?}"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// The shared counter's own contract, at the unit level, so a future edit
+    /// cannot satisfy the fixture test by coincidence. Order-insensitivity is
+    /// the property the set was chosen for and must survive.
+    #[test]
+    fn missing_line_instances_counts_instances_and_respects_indentation() {
+        assert_eq!(missing_line_instances("a\nb\n", "b\na\n"), 0, "a MOVED line is not a loss");
+        assert_eq!(missing_line_instances("}\n", "}\n}\n"), 1, "one of two braces is missing");
+        assert_eq!(missing_line_instances("}\n}\n", "}\n"), 0, "a spare copy is not a loss");
+        assert_eq!(
+            missing_line_instances("    g()\n", "        g()\n"),
+            1,
+            "a re-indent is a real change wherever whitespace carries meaning"
+        );
+        assert_eq!(
+            missing_line_instances("a\n\n   \nb\n", "a\nb\n"),
+            0,
+            "blank and whitespace-only lines are not content"
+        );
     }
 }
