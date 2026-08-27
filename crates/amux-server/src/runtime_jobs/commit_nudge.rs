@@ -1309,15 +1309,33 @@ fn demote_settled_shared(own: &mut Ownership, settled: &BTreeSet<String>) {
 /// verdict. The failure mode stays "warned too loudly" rather than "prescribed a
 /// remedy that ate committed work".
 fn missing_line_instances(have: &str, want: &str) -> usize {
-    // `trim_end`, not `trim`: the two ends of a line are not the same kind of
-    // thing. LEADING whitespace is content wherever indentation carries meaning
+    // `trim_end`, not `trim` (AMUX-3786). The two ends of a line are treated
+    // differently here, and the justification is a COST COMPARISON, not a fact
+    // about languages. The first version of this comment claimed the latter and
+    // was wrong; a premise in a codebase outlives the decision it justified, so
+    // it is written as the trade it actually is.
+    //
+    // LEADING whitespace is content wherever indentation carries meaning
     // (Python, YAML), and erasing it was the second half of the bug this
-    // function was rewritten for. TRAILING whitespace is content in no language
-    // anyone writes here, and gtm-media-assets flagged the consequence of
-    // treating it as content when they signed off e5c37bb9: an editor that
-    // strips trailing whitespace on save would hold DIVERGED open on a
-    // whitespace-only delta. Splitting the two ends keeps the axis and drops the
-    // false positive (AMUX-3786).
+    // function was rewritten for. That one is not a trade: an indent change is a
+    // behaviour change, so it stays significant.
+    //
+    // TRAILING whitespace IS content too. Markdown's hard line break is two
+    // trailing spaces, and Markdown is the most common file type this nudge
+    // touches. Measured by gtm-media-assets while reviewing this change, and
+    // reproduced: `git grep -IP '\S  +$' -- '*.md'` finds 3 lines in this repo
+    // and 294 FILES on the mixpeek checkout.
+    //
+    // We drop it anyway, because the two failures are not the same size. Losing
+    // it costs a line break in rendered output. Treating it as content holds
+    // DIVERGED open every time an editor strips trailing whitespace on save,
+    // across those 294 files — the noisier failure, and the one this card was
+    // filed for. Special-casing two trailing spaces in .md is more machinery
+    // than a rendering nit deserves.
+    //
+    // REVISIT IF this ever runs against files where trailing whitespace is
+    // load-bearing rather than cosmetic: a .patch fixture, a golden file, a
+    // snapshot test. That is what would change the answer.
     let mut pool: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
     for l in have.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
         *pool.entry(l).or_default() += 1;
@@ -3986,7 +4004,10 @@ mod tests {
         assert_eq!(
             missing_line_instances("g()\n", "g()   \n"),
             0,
-            "TRAILING whitespace is content in no language written here"
+            "TRAILING whitespace is dropped ON PURPOSE, not because it is meaningless — a \
+             Markdown hard break is two trailing spaces. Losing it costs a rendered line break; \
+             keeping it holds DIVERGED open on every strip-on-save. See the trade in \
+             missing_line_instances"
         );
         assert_eq!(
             missing_line_instances("g()\n", "    g()\n"),
