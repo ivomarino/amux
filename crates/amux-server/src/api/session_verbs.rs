@@ -10921,8 +10921,15 @@ async fn post_dispatch(
             let cfg = parse_env(name);
             let wd0 = cfg.get_or("CC_DIR", "").trim().to_string();
             if !wd0.is_empty() && !expanduser(&wd0).is_dir() {
+                // Missing work directory is a CLIENT validation error (4xx), not a
+                // server error (5xx). AMUX-378: this was returning 500 which masked the
+                // actual refusal — a client misconfiguration — as a server fault. Return
+                // 400 (Bad Request) instead, matching the pattern for other precondition
+                // failures on this endpoint (cf. start_block_reason @ line 10918 which
+                // returns 409 Conflict). Log the refusal so a sweep can find it.
+                tracing::warn!(session = %name, dir = %wd0, "session_start_refused: work directory missing (client config error)");
                 return jresp(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::BAD_REQUEST,
                     json!({"ok": false, "message": format!("work dir missing: {wd0}")}),
                 );
             }
