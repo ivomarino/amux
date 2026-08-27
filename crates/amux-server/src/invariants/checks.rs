@@ -86,13 +86,27 @@ pub(crate) fn gateway_owned(path: &str) -> bool {
 /// answer honestly, which is all this invariant asks.
 const CALLER_GUARDED_ABSENT: &[&str] = &[];
 
-fn caller_guarded_absent(path: &str) -> bool {
-    CALLER_GUARDED_ABSENT.iter().any(|p| path.starts_with(p))
-}
+
 
 pub fn route_callers_have_routes(
     mounted: &[(&str, &[&str])],
     callers: &[CallerPath],
+) -> Vec<InvariantResult> {
+    route_callers_have_routes_with(mounted, callers, CALLER_GUARDED_ABSENT)
+}
+
+/// The same census with the exempt list INJECTED (AMUX-3812).
+///
+/// The negative control for the self-expiring exemption used to read the live
+/// `CALLER_GUARDED_ABSENT` and hardcode `/api/tunnel/` as its fixture. When that
+/// entry retired — because the family got mounted, exactly as designed — the
+/// test went red, and it went red about production DATA rather than about the
+/// behaviour it exists to pin. A control that breaks when an unrelated constant
+/// changes is not testing the mechanism.
+pub fn route_callers_have_routes_with(
+    mounted: &[(&str, &[&str])],
+    callers: &[CallerPath],
+    guarded_absent: &[&str],
 ) -> Vec<InvariantResult> {
     const ID: &str = "route.callers_have_routes";
     if callers.is_empty() {
@@ -129,7 +143,7 @@ pub fn route_callers_have_routes(
         // EXPECTED state and passes with the license named; anything else
         // (the family got mounted, or a verb mismatch) means the exclusion
         // is STALE and must fail so the entry gets deleted.
-        if caller_guarded_absent(&c.path) {
+        if guarded_absent.iter().any(|p| c.path.starts_with(p)) {
             match verdict {
                 RouteMatch::Missing => {
                     out.push(InvariantResult::pass(ID).entity(format!("{} {}", c.method, c.path)));
@@ -3577,7 +3591,10 @@ mod negative_controls {
             CallerPath { method: "GET".into(), path: "/api/tunnel2/x".into(),
                          source: "amux-cli".into(), interpolated: false, method_known: true },
         ];
-        let rs = route_callers_have_routes(&mounted, &callers);
+        // Its OWN exempt list, not the live one: this pins the MECHANISM, and
+        // the live list legitimately empties as families get mounted.
+        let guarded: &[&str] = &["/api/tunnel/"];
+        let rs = route_callers_have_routes_with(&mounted, &callers, guarded);
         let by_ent = |e: &str| rs.iter().find(|r| r.entity_key == e).unwrap();
         assert_eq!(by_ent("POST /api/tunnel/start").status, Status::Pass,
                    "documented absence with a preflighting caller must not be a permanent red");
@@ -3586,7 +3603,7 @@ mod negative_controls {
         // Mount the family: the exclusion is now stale and must SAY SO.
         let mounted2: Vec<(&str, &[&str])> =
             vec![("/api/board", &["GET"]), ("/api/tunnel/start", &["POST"])];
-        let rs2 = route_callers_have_routes(&mounted2, &callers);
+        let rs2 = route_callers_have_routes_with(&mounted2, &callers, guarded);
         let row = rs2.iter().find(|r| r.entity_key == "POST /api/tunnel/start").unwrap();
         assert_eq!(row.status, Status::Fail);
         assert!(row.observed.contains("STALE"), "{}", row.observed);
