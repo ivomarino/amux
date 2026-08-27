@@ -82,8 +82,25 @@ def parse(md):
 
 
 def field(block, key):
-    """One `KEY:` field out of an entry block, continuation lines included."""
-    m = re.search(rf"^{key}:\s*((?:.|\n  )+?)(?=\n[A-Z_]+:|\n## |\Z)", block, re.M)
+    """One `KEY:` field out of an entry block, continuation lines included.
+
+    THE TERMINATOR ACCEPTS A HYPHEN, and it must (AF-264). It used to be
+    `[A-Z_]+:`, so a field whose NAME contained a hyphen was not recognised as
+    the start of the next field — and because the body pattern is non-greedy and
+    needs the lookahead to stop, the match failed entirely and the field BEFORE
+    it came back EMPTY.
+
+    Measured the day it was written: an entry carrying `CARD: AF-242` followed by
+    a `NOTE-CARD:` line reported "no CARD field", so the entry was archived with
+    its symptom never reaching the card — the AF-38 guarantee that AF-239 exists
+    to keep, silently unmet by a field name.
+
+    The failure is one field UPSTREAM of the cause, which is what makes it worth
+    a comment: nothing about reading the `NOTE-CARD:` line suggests it could
+    blank `CARD:` above it, and the tool's only symptom was a correct-sounding
+    "no CARD field".
+    """
+    m = re.search(rf"^{key}:\s*((?:.|\n  )+?)(?=\n[A-Z][A-Z_-]*:|\n## |\Z)", block, re.M)
     return m.group(1).strip() if m else ""
 
 

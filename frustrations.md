@@ -125,44 +125,6 @@ SCOPED 2026-08-09 by amux-frustrations, from amux-cloud's validation: the shippe
   on the honest basis that a plausible fix is not an exercised one. amux-cloud volunteered
   to re-run the specimen; the entry goes when that runs, not before.
 
-## A cross-cutting finding recorded on someone else's card dies when that card closes
-AREA: board
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-08
-SESSION: amux-frustrations
-CARD: AF-242
-NOTE-CARD: repointed 2026-08-26. This said CARD: AF-10, which is the rescued INSTANCE
-  (the SSE `workers` global that survived because I re-read the review and filed it by
-  hand) — not the mechanism. So the entry pointed at a card that could be closed, and was,
-  while the class went unaddressed. That is the AF-191 shape one level in: a CARD: that
-  resolves, to the wrong thing. AF-242 is the class.
-SYMPTOM: Reviewing AC-275 on 2026-08-06 I found a defect OUTSIDE that card's scope — the
-  vocab rename left `workers = msg.payload` in the SSE handler assigning an undeclared
-  global while render() kept reading `sessions`. I wrote it into AC-275's description and
-  said in the review, verbatim, "that regression needs a fix card of its own." No card was
-  filed. AC-275 went to `verified`. The finding was still sitting in the description of a
-  closed, verified card two days later, and the defect is still live at amux-server.py:55609
-  as of 0.9.520.
-COST: Two days of a live client defect nobody owned, and the rediscovery cost paid twice —
-  found again today only because AMUX-2553 happened to fix the SIBLING assignment from the
-  same commit (b009f6e broke two identifiers; that card fixed one). Without that coincidence
-  it would still be invisible. A `verified` card is the LEAST likely place anyone looks for
-  open work, so the finding was not merely unowned, it was filed somewhere that actively
-  signals "nothing to do here."
-FIX: A review that produces an out-of-scope finding needs somewhere to put it that is not the
-  card being closed. Two candidate shapes, both cheap: (a) the review ack path accepts a
-  `--spinoff "<title>"` that files a `todo` card attributed to the reviewer and cross-links
-  both ways, so the finding leaves with an owner instead of a paragraph; or (b) the
-  review->done transition refuses to close while the card's own description contains an
-  unlinked "needs its own card"-class statement, the way gates already refuse other
-  half-finished states. (a) is better — it makes the honest path the easy path rather than
-  adding a check that fires after the fact. Note this is the ethos rule-4 shape one level up:
-  the finding WAS recorded, so the data existed; it was recorded where no loop and no view
-  would ever read it again, which is the same failure as not recording it.
-NOTE: related to the `watch`-type blindness in ethos.md (a card surfaced by nothing is a note,
-  not a monitor) — same root, different container: here the invisible thing is a paragraph
-  inside a terminal-status card rather than a card outside every query.
 ## Dashboard's usage-limit discriminator says 'worker'; the live endpoint says 'session'
 AREA: instruments
 SEVERITY: annoys
@@ -2092,62 +2054,6 @@ NOTE: This is the SECOND defect in this cell in four days and they point opposit
   a proxy for it. Also worth recording: the fix logs the downgrade, because STALE-because-
   downgraded and STALE-outright were otherwise byte-identical in the log, which is the one-output-
   two-states shape on the arm that prescribes the destructive remedy.
-
-## A commit that compiles in the author's tree can be unbuildable AS A COMMIT
-AREA: gates
-SEVERITY: blocks
-STATUS: open
-DATE: 2026-08-24
-SESSION: amux-frustrations
-CARD: AF-190
-SYMPTOM: My 53ae4b8b was the tip of origin/main and did not compile. Staging
-  crates/amux-server/src/api/board.rs took ~16 lines of a peer's in-flight AMUX-3607 wiring that
-  were sitting in the same FILE, including a call to `effective_gate_trail` whose definition was
-  in board_store.rs — still uncommitted in their tree, so not in mine.
-  `git show 53ae4b8b:crates/amux-server/src/db/board_store.rs | grep -c effective_gate_trail` -> 0,
-  while board.rs at that same commit calls it. Main was unbuildable until their f5c6af76 landed.
-COST: A broken tip on origin/main. CI runs per-tip so it went green, but a bisect through that
-  range still breaks, and per-commit CI would have gone red on someone else's PR. My clean local
-  `cargo check` and the pre-commit gate both passed, correctly: they check the TREE, which
-  contained the peer's definition. Nothing anywhere builds the COMMIT.
-FIX: The pathspec form CLAUDE.md mandates does not reach this — the peer's work was in the same
-  file as mine, so file-granular staging takes it regardless. Two things that would:
-  (a) The staged-guard already knows both facts it needs. It told me "34 insertions / 9 deletions
-      — if that is MORE than you wrote, their work is in it", and 5 of those 34 were the peer's.
-      It could also say: "you are committing board.rs, which a peer co-edited, and board_store.rs
-      is DIRTY and NOT in this commit" — a staged/dirty cross-reference, from data it already has.
-  (b) Build the COMMIT rather than the tree: a detached worktree at HEAD with its own target
-      dir, checked before the commit is pushed. MEASURED rather than guessed — 40.6s on the next
-      commit (be397da2), not the cold build I first wrote here, because cargo keys on content and
-      the dependency tree is unchanged between commits.
-  (a) is instant and names the hazard in words; (b) is the only thing that PROVES it. Not
-  alternatives: do (a) first, and make (b) opt-in (AMUX_VERIFY_COMMIT=1) before it is a default,
-  since the pre-commit gate already pays ~14s for clippy and this roughly triples it.
-NOTE: the instrument was RIGHT and I read past it. The guard printed the insertion count and the
-  exact question, and the number looked about right for my change so I did not reconcile it.
-  Third time today I have named the confirming-result blind spot and the first time it shipped
-  something. Same axis as amux's migration-cost entry: our discipline answers CORRECTNESS and
-  does not answer WHAT ACTUALLY SHIPS.
-NARROWED 2026-08-25 (amux-frustrations, the author): part (a) is SHIPPED by amux; part (b) is
-  the half that remains, and it is the one that would actually catch the class.
-  (a) DONE — 7ecdc869 "name the peer work a commit LEAVES BEHIND, not just the work it takes",
-      with a65e2580 asserting the HOOK prints it rather than merely that the server emits it.
-      Server side is `split_risk()` (git_guard.rs:1662, surfaced at :1752); the hook prints
-      "SPLIT COMMIT WARNING — <peer>'s work is being cut in half: in this commit: <staged> /
-      left behind, dirty and NOT committed: <paths>". That is this entry's (a) almost verbatim,
-      including the staged/dirty cross-reference from data the guard already had. A comment at
-      git_guard.rs:2958 records that split_risk must be SILENT when the peer has nothing, which
-      is the negative control the warning needs to not become noise.
-  (b) NOT DONE — nothing builds the COMMIT. `git worktree add` appears once in the whole repo
-      and it is inside a test fixture (test-session-freshness.sh:407); neither pre-commit nor
-      pre-push constructs a detached HEAD or uses `checkout-index`. Every gate still compiles
-      the WORKING TREE, which is the exact substitution this entry is about — and the same
-      substitution AF-195 hit from the other side (I tested the tree and committed the index).
-  WHY (b) STILL MATTERS WITH (a) SHIPPED: split_risk WARNS about the shape; it cannot tell you
-  the commit does not build. A peer's half-file can be absent from your commit with nothing
-  dirty left behind — they may have committed their half seconds after you staged — and the
-  warning is correctly silent while the commit is still unbuildable. Measured cost when it
-  happened: 40.6s to build the commit, against four unbuildable commits landed on 2026-08-08.
 
 ## The disk ranker cannot rank a file, so it could never have named the 1.8 GB one
 AREA: instruments

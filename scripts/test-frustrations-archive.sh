@@ -176,6 +176,35 @@ want "(e) and the ledger is untouched" "$after" "$before"
 [ -n "$before" ] && ok "(e) the hash is non-empty, so that comparison could have failed" \
                  || bad "(e) hash was empty — the check could not fail"
 
+# ---- (y) A HYPHENATED FIELD MUST NOT BLANK THE FIELD ABOVE IT (AF-264) -------
+# The field terminator was `[A-Z_]+:`, so a field NAME containing a hyphen was
+# not seen as the start of the next field — and because the body pattern is
+# non-greedy and needs that lookahead to stop, the match failed outright and the
+# PRECEDING field came back empty. An entry with `CARD:` followed by
+# `NOTE-CARD:` reported "no CARD field" and was archived with its symptom never
+# reaching the card, which is the exact AF-38 guarantee AF-239 exists to keep.
+#
+# The failure lands one field UPSTREAM of its cause, so the cell seeds the
+# hyphenated field and asserts on the one ABOVE it.
+Y="$TMP/y"; build "$Y"
+# sed, not an embedded python heredoc: the first version of this fixture was
+# written by a python script whose OWN string ate the \n escapes, so the
+# heredoc it emitted was a syntax error and applied nothing. The three cells
+# below then passed for the wrong reason — with no hyphenated field present,
+# CARD parses fine. The fixture guard is what caught it, which is why it is
+# here rather than assumed.
+sed -i.bak 's|^CARD: X-2$|CARD: X-2\
+NOTE-CARD: repointed, and this line used to blank CARD above it|' "$Y/frustrations.md"
+grep -q '^NOTE-CARD:' "$Y/frustrations.md" && ok "(y) fixture: the hyphenated field is present" \
+                                           || bad "(y) fixture did not apply — the cell proves nothing"
+LN=$(cd "$Y" && python3 scripts/frustrations-archive.py --list | grep -F "TARGET entry" | awk '{print $1}' | tr -d 'L')
+rc=$(run "$Y" "$LN" lane-b --evidence-stdin <<< "hyphen check")
+want "(y) exits 0" "$rc" 0
+# The tool cannot reach a card here (dead port), but it must have RESOLVED the
+# id — "no CARD field" is the bug's signature and must not appear.
+lacks "(y) CARD: is still parsed with a hyphenated field beneath it" "no CARD field" "$Y/out.txt"
+has   "(y) and the card id it resolved is named" "X-2" "$Y/out.txt"
+
 # ---- (z) THE ISOLATION ITSELF -----------------------------------------------
 # Without this, a stub that stops being found leaves every cell above green while
 # the tool writes to the REAL board again — which is precisely how the X-2 rows
