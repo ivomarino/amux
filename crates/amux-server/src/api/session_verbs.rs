@@ -9475,7 +9475,17 @@ async fn dispatch(
     let qs = parse_qs(q.as_deref().unwrap_or(""));
     let body: Value = match parse_body(&body_bytes) {
         Ok(v) => v,
-        Err(e) => return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+        Err(e) => {
+            tracing::warn!(
+                session = %name,
+                method = %method.as_str(),
+                action = %action,
+                body_sample = %String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(100)]),
+                parse_error = %e,
+                "malformed_request_body: JSON parsing failed"
+            );
+            return jresp(StatusCode::BAD_REQUEST, json!({"error": e}));
+        }
     };
     // Validate session exists (py:74882) — for every action, share included.
     // ONE exception: a RETRY of a partially-completed rename addresses the
