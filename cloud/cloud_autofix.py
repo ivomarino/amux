@@ -246,6 +246,50 @@ def check_envs(retries=1):
     return last
 
 
+def check_deploy_freshness():
+    """Is the cloud image behind origin/main, and WHY (AC-344). The auto-deploy
+    (deploy-cloud.yml) is gated on green rust CI via workflow_run, so when main CI
+    is RED the deploy shows 'skipped' — byte-identical to 'nothing to deploy'. The
+    image then freezes and falls behind, invisibly, until a human notices; the card
+    records this happening 3x, each caught by hand. This joins the three signals no
+    single view joins — last successful deploy sha, origin/main tip, and rust CI
+    status — and names the cause: FROZEN (behind + CI red) vs normal lag (behind +
+    CI green, auto-deploy will catch up) vs current. Runs locally (gh + git)."""
+    def sh(*a):
+        try:
+            return subprocess.run(a, capture_output=True, text=True, timeout=30, cwd=REPO).stdout.strip()
+        except Exception:
+            return ""
+    sh("git", "fetch", "origin", "-q")
+    deployed = sh("gh", "run", "list", "--workflow=deploy-cloud.yml", "-L", "20",
+                  "--json", "headSha,conclusion", "-q",
+                  'map(select(.conclusion=="success"))[0].headSha')
+    if not deployed:
+        return {"error": "no successful deploy-cloud run found (gh failed?)"}
+    behind = sh("git", "rev-list", "--count", "%s..origin/main" % deployed)
+    behind = int(behind) if behind.isdigit() else -1
+    res = {"deployed": deployed[:12], "behind": behind}
+    if behind <= 0:
+        res["state"] = "current"
+        return res
+    # Behind — is main CI red (frozen) or green (normal lag)?
+    ci = sh("gh", "run", "list", "--workflow=rust.yml", "--branch=main", "-L", "1",
+            "--json", "conclusion,headSha,status", "-q", ".[0]")
+    try:
+        ci = json.loads(ci) if ci else {}
+    except Exception:
+        ci = {}
+    concl = ci.get("conclusion")
+    res["ci_conclusion"] = concl
+    if concl == "failure":
+        res["state"] = "FROZEN"  # behind AND CI red -> auto-deploy is silently skipping
+    elif ci.get("status") in ("in_progress", "queued"):
+        res["state"] = "deploying"  # CI running, catch-up in flight
+    else:
+        res["state"] = "lag"  # behind but CI green -> normal, will catch up
+    return res
+
+
 def check_disk():
     """Root-disk usage AND a breakdown of the top consumers when it is high.
     AC-348: the disk-full alarm fires but names no cause, so every incident meant
@@ -441,6 +485,24 @@ def main():
         # Backup freshness (AMUX-2802): litestream->S3 is the real customer-DB
         # backup; nine days of silent backup absence is the incident this check
         # exists to make impossible to repeat.
+        # Deploy freshness + WHY-behind (AC-344): a silent freeze self-announces.
+        result["deploy"] = check_deploy_freshness()
+        _dep = result["deploy"]
+        if _dep.get("error"):
+            trace("deploy", "freshness probe: %s" % _dep["error"], None)
+        else:
+            trace("deploy", "deployed=%s behind=%s state=%s%s" % (
+                _dep.get("deployed"), _dep.get("behind"), _dep.get("state"),
+                (" ci=%s" % _dep.get("ci_conclusion")) if _dep.get("ci_conclusion") else ""),
+                _dep.get("state") != "FROZEN")
+            if _dep.get("state") == "FROZEN" and not env_problem:
+                env_problem = ("cloud image FROZEN — %s commits behind, main CI is RED" % _dep.get("behind"),
+                               "deploy-cloud auto-deploy is gated on green rust CI, so a red main freezes the "
+                               "image and shows 'skipped' (looks like nothing-to-deploy). deployed=%s, behind=%s, "
+                               "rust.yml main conclusion=failure. Fix the red main, or dispatch deploy-cloud manually "
+                               "once it is green. This is AC-344's exact failure, now self-announcing."
+                               % (_dep.get("deployed"), _dep.get("behind")))
+
         # Root-disk usage + top-consumer breakdown when high (AC-348).
         result["disk"] = check_disk()
         _disk = result["disk"]
