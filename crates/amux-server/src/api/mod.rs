@@ -375,6 +375,7 @@ pub fn router(state: AppState) -> Router {
         // deviation). Advertised in ethos.md and the job registry but unrouted
         // until now. Public like its debug siblings (lane names and timings).
         .route("/api/debug/scan", axum::routing::get(health::debug_scan))
+        .route("/api/debug/sse", axum::routing::get(debug_sse))
         .route("/api/debug/downtime", axum::routing::get(health::debug_downtime))
         // Per-session logging health + a computed stale verdict (AMUX-2628).
         // Public like its debug siblings: session names and byte counts only.
@@ -587,6 +588,73 @@ pub(crate) fn py_truthy(v: &serde_json::Value) -> bool {
 /// written on every POST, and this ring exists so a session can ask a question
 /// instead of grepping. Do not promote it to a source of truth without giving
 /// it a table (D1: "in-memory state is fiction").
+/// GET /api/debug/sse — is the realtime backbone actually carrying the fleet?
+///
+/// AF-262. `.claude/rules/sse-realtime.md` states the failure mode plainly:
+/// clients declare SSE stale after 18s of silence and FALL BACK TO POLLING,
+/// and the fallback fetches both sessions and board. So an SSE degradation
+/// shows up as a rise in ordinary poll traffic, which is indistinguishable
+/// from "more browser tabs are open" — and it was, on 2026-08-27, when a 63%
+/// rise in `/api/sessions` with 90% of it unattributed could not be attributed
+/// to either cause because nothing anywhere counted SSE.
+///
+/// JOINED ON PURPOSE, rather than shipped as two numbers in two places. The
+/// server knows how many streams are attached; only the CLIENT knows it gave
+/// up and started polling. Either alone leaves the question open — a low live
+/// count could be a quiet night, and stale-reconnect beacons could be one bad
+/// phone. Together they separate "nobody is connected" from "everybody
+/// reconnects constantly" from "healthy". That is rule 4's second layer: the
+/// discriminator has to reach the reader in one place they already look.
+async fn debug_sse(
+    axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> axum::Json<serde_json::Value> {
+    let (live, opened) = crate::api::sse::conn_stats();
+    let since_h: f64 = q.get("since_h").and_then(|v| v.parse().ok()).unwrap_or(24.0);
+    let cutoff = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+        - since_h * 3600.0;
+    // The client half: stale-reconnect beacons already ride /api/client-debug,
+    // which is the existing primitive for "the browser wants to tell the server
+    // something". No new endpoint, no new store.
+    let (stale, sample) = match CLIENT_DEBUG_RING.lock() {
+        Ok(ring) => {
+            let hits: Vec<&serde_json::Value> = ring
+                .iter()
+                .filter(|v| {
+                    v.get("kind").and_then(|k| k.as_str()) == Some("sse-stale-reconnect")
+                        && v.get("ts").and_then(serde_json::Value::as_f64).unwrap_or(0.0) >= cutoff
+                })
+                .collect();
+            let n = hits.len();
+            (n, hits.into_iter().rev().take(5).cloned().collect::<Vec<_>>())
+        }
+        Err(_) => (0, Vec::new()),
+    };
+    axum::Json(serde_json::json!({
+        "live_connections": live,
+        "opened_total": opened,
+        // opened >> live within one process is reconnect churn, which is the
+        // shape a degrading backbone makes.
+        "reconnect_churn_ratio": if live > 0 { opened as f64 / live as f64 } else { 0.0 },
+        "stale_reconnects": stale,
+        "stale_window_h": since_h,
+        "recent_stale_beacons": sample,
+        // VOLATILE, and said out loud rather than left to be assumed: the
+        // builder swaps this binary on every commit and every SSE connection
+        // dies with it, so both counters are per-PROCESS. A zero here after a
+        // deploy is a restart, not an outage — read /health `uptime_s` beside
+        // it. (D1: in-memory state is fiction; this is a gauge, not a source of
+        // truth, and it is not allowed to become one without a table.)
+        "note": "per-PROCESS and volatile — the builder restarts this binary on every \
+                 commit and all SSE connections die with it. Read /health uptime_s beside \
+                 a low live_connections before calling it an outage. stale_reconnects \
+                 counts client beacons in the volatile /api/client-debug ring (cap 500), \
+                 so it undercounts on a busy day rather than over.",
+    }))
+}
+
 static CLIENT_DEBUG_RING: std::sync::Mutex<Vec<serde_json::Value>> =
     std::sync::Mutex::new(Vec::new());
 const CLIENT_DEBUG_RING_MAX: usize = 500;

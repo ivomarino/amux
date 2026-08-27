@@ -1062,6 +1062,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/calendar.ics", methods: &["GET"] },
     RouteEntry { path: "/api/debug/tmux", methods: &["GET"] },
     RouteEntry { path: "/api/debug/scan", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/sse", methods: &["GET"] },
     RouteEntry { path: "/api/debug/downtime", methods: &["GET"] },
     RouteEntry { path: "/api/debug/logs", methods: &["GET"] },
     RouteEntry { path: "/api/debug/context-health", methods: &["GET"] },

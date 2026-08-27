@@ -7938,7 +7938,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.742';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.743';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -27542,6 +27542,38 @@ function _sseLooksStale() {
 }
 function _forceSseReconnect(reason) {
   _dbgLog('SSE reconnect: ' + reason);
+  // BEACON THE GIVE-UP (AF-262). This is the single choke point where a client
+  // decides the realtime backbone has failed it, and until now that decision
+  // was invisible to the server: /api/events is excluded from the request log
+  // by design, so a fleet-wide SSE degradation showed up only as a rise in
+  // ordinary poll traffic — indistinguishable from more browser tabs being
+  // open, which is exactly the call that could not be made on 2026-08-27.
+  //
+  // The server half (a live-connection gauge) cannot see this on its own: from
+  // there a reconnect looks like one stream closing and another opening, which
+  // is also what a laptop lid does. Only the CLIENT knows it declared the
+  // stream stale. Joined at /api/debug/sse.
+  //
+  // Rides the existing /api/client-debug beacon rather than a new endpoint —
+  // same primitive the peek-poller lifecycle already uses.
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({
+        kind: 'sse-stale-reconnect', reason: reason || '?',
+        // How long the stream had actually been silent. `stale_ms` past
+        // _SSE_STALE_MS is a zombie; well under it means something else forced
+        // the bounce (a resume, an `online` event) and is NOT backbone trouble.
+        // Without it every reconnect reads the same and the counter would
+        // conflate the two.
+        stale_ms: Math.round(Date.now() - (_lastDataTime || _pageLoadTime)),
+        had_data: _lastDataTime ? 1 : 0,
+        retries: _sseRetries,
+        ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?'),
+        hidden: document.hidden ? 1 : 0
+      })
+    }).catch(() => {});
+  } catch (e) {}
   if (_sse) { try { _sse.close(); } catch(e) {} _sse = null; }
   _sseRetries = 0;
   _liveSSE = false;
