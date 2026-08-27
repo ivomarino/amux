@@ -264,3 +264,11 @@ jobs:
           # past Amux-Conversation before it was written. All three mutants were
           # confirmed to fail the intended cell and only that cell.
           ./scripts/test-graft-stamp.sh
+          # AMUX-3789: the gh shim decides which IDENTITY every fleet gh call
+          # uses, so its two failure directions are both expensive. Cell 5 is the
+          # control — a shim that always injected would pass every other cell and
+          # silently replace a CI token. Cell 4 pins FAIL-OPEN: a broken minter
+          # must still run gh, because a shim that can take gh away from the
+          # fleet on a bad network is worse than the contention it fixes. Runs
+          # against a fake gh and a fake minter, so no cell touches GitHub.
+          ./scripts/test-gh-shim.sh
