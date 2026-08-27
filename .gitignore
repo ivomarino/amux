@@ -62,3 +62,6 @@ crates/amux-dashboard/eslint.globals.generated.json
 # never be committed — a baked-in home directory would send another machine's
 # builds somewhere it cannot write.
 /.cargo/config.toml
+
+secrets/amux-secrets.yaml
+secrets/*.yaml

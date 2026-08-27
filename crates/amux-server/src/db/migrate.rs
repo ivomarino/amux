@@ -267,6 +267,20 @@ const MIGRATIONS: &[Migration] = &[
         name: "0048_issues_waiting_on",
         sql: include_str!("../../migrations/0048_issues_waiting_on.sql"),
     },
+    // Renumbered from 34/35 (collision with main's own 0034/0035, which had
+    // moved on to request_log_load1/regenerable_samples by the time this
+    // merged) per the contributor-collision case this test's own message
+    // documents — see versions_are_dense_and_match_their_filenames below.
+    Migration {
+        version: 49,
+        name: "0049_google_calendar_sync",
+        sql: include_str!("../../migrations/0049_google_calendar_sync.sql"),
+    },
+    Migration {
+        version: 50,
+        name: "0050_gcal_event_details",
+        sql: include_str!("../../migrations/0050_gcal_event_details.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
