@@ -69,6 +69,7 @@ Use the server's diagnostic endpoints before writing a grep:
 | `GET /api/logs/stats?since_h=24` | Traffic/latency rollup |
 | `GET /api/debug/routes` | Route table as JSON |
 | `GET /api/health/invariants` | Failing invariants (passing ones only visible in `/api/debug/invariants`) |
+| `GET /api/debug/sse?since_h=24` | Is the realtime backbone carrying the fleet, or has it dropped clients onto polling? `live_connections` + `opened_total` (per-PROCESS: the builder restarts this binary on every commit and all SSE connections die with it) joined with `stale_reconnects`, the client-side beacon fired at the 18s zombie trigger. Neither half answers alone — from the server a reconnect looks like a laptop lid; only the client knows it declared the stream stale. A 0 shortly after a deploy is a ramp-up, not a verdict; `live_connections` is the discriminator. |
 | `GET /api/debug/tmux` | Fleet discovery from inside the server |
 
 Raw logs: `~/.amux/logs/server-rs.log`
