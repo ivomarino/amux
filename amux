@@ -1781,6 +1781,26 @@ if ok:
     # misread, then routed around a working command with a raw PATCH.
     label = (_argv[2] if len(_argv) > 2 else "") or d.get("status") or d.get("title") or "ok"
     print(d.get("id", "?"), "\u2192", label)
+    # DIVERTED is not IGNORED, and the difference is what the caller does next
+    # (AMUX-3791). Ignored means "set it somewhere else"; diverted means "it IS
+    # set, stop looking in the field you named". `board backlog --trigger` on an
+    # autofix-filed card writes the condition into the card BODY, because
+    # source_ref holds the dedupe signature that stops the detector re-filing.
+    # Without this line the command printed "<id> -> backlog", and verifying the
+    # way the flag implies \u2014 read back source_ref \u2014 returned the old value and
+    # read as a silent drop. That false negative cost a probe against a live
+    # card and nearly a bug report against code behaving correctly. stderr and
+    # exit 0: nothing went wrong, so it must not look like a failure or change
+    # the stdout shape any script is parsing.
+    for dv in (d.get("diverted_fields") or []):
+        if not isinstance(dv, dict):
+            continue
+        sys.stderr.write(
+            "note: %s was recorded in the card %s, not in `%s` \u2014 %s\n"
+            % (_argv[2] if len(_argv) > 2 and _argv[2] else "the value",
+               (dv.get("landed_in") or "?").upper(),
+               dv.get("field") or "?",
+               dv.get("why") or "no reason given"))
     # A 200 does not mean the server applied everything you sent. Reported by
     # mixpeek-frustrations: `board backlog --trigger` stored source_ref but
     # silently dropped last_verified_at, so the card parked with a good trigger

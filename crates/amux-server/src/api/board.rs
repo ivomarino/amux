@@ -2307,6 +2307,14 @@ enum PatchOut {
     Applied {
         body: Value,
         ignored: Vec<String>,
+        /// Fields whose value was APPLIED, but not to the field the caller
+        /// named (AMUX-3791). Distinct from `ignored` on purpose: ignored
+        /// means "this did not happen", diverted means "this happened
+        /// somewhere else". Reporting a diversion as ignored would be a lie in
+        /// the more damaging direction — a caller told their trigger was
+        /// dropped goes and sets it again, or files a bug against working
+        /// code, which is exactly what this card was.
+        diverted: Vec<Value>,
         /// (session, from_status, to_status) when a status change happened,
         /// for reactive pickup: if the transition freed the lane (done/verified/
         /// discarded), fire an immediate pickup instead of waiting 60s.
@@ -2763,6 +2771,9 @@ pub async fn patch_item(
                 })
                 .cloned()
                 .collect();
+            // Filled by the source_ref arm below when a trigger is rerouted to
+            // the card body. Empty on every other write.
+            let mut diverted: Vec<Value> = Vec::new();
             // EVERY key unwritable = the request was unusable (AEAB/#134 review,
             // reported by tsukimiya). Narrow on purpose: a MIXED body such as
             // {"status":"done","item_type":"code"} where the card is already
@@ -3077,6 +3088,25 @@ pub async fn patch_item(
                         if !changed.iter().any(|c| c == "desc") {
                             changed.push("desc".into());
                         }
+                        // AND TELL THE CALLER, not only the card (AMUX-3791).
+                        // The WARN above reaches a log nobody is tailing and
+                        // the note reaches a reader who opens the card; the
+                        // operator who ran the command saw "→ backlog" and
+                        // nothing else. This is the ONE write where the field
+                        // you named is deliberately not the field that
+                        // changed, so verifying the obvious way — read back
+                        // source_ref — returns the old value and reads as a
+                        // silent drop. That false negative cost a probe
+                        // against a live card and very nearly a bug report
+                        // against code doing exactly the right thing.
+                        diverted.push(json!({
+                            "field": "source_ref",
+                            "landed_in": "desc",
+                            "value": t,
+                            "why": "this card's autofix dedupe signature occupies source_ref \
+                                    and overwriting it would let the detector file duplicates \
+                                    (AMUX-3686)",
+                        }));
                     }
                     _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
                 }
@@ -4298,6 +4328,7 @@ pub async fn patch_item(
                 PatchOut::Applied {
                     body: detail_body(&next),
                     ignored,
+                    diverted,
                     status_transition: st,
                     progress_notify,
                 },
@@ -4347,9 +4378,22 @@ pub async fn patch_item(
             let code = if all_ignored { StatusCode::UNPROCESSABLE_ENTITY } else { StatusCode::OK };
             (code, Json(body)).into_response()
         }
-        Some(PatchOut::Applied { mut body, ignored, status_transition, progress_notify }) => {
+        Some(PatchOut::Applied {
+            mut body,
+            ignored,
+            diverted,
+            status_transition,
+            progress_notify,
+        }) => {
             body["applied"] = json!(true);
             body["global_rev"] = json!(reply.rev.0);
+            // SEPARATE KEY FROM `ignored_fields`, because they are opposite
+            // facts and a caller acts differently on each: ignored means set it
+            // somewhere else, diverted means it is already set, stop looking in
+            // the field you named (AMUX-3791).
+            if !diverted.is_empty() {
+                body["diverted_fields"] = json!(diverted);
+            }
             if !ignored.is_empty() {
                 body["ignored_fields"] = json!(ignored);
                 body["ignored_note"] = json!(

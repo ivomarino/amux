@@ -2517,6 +2517,34 @@ async fn a_trigger_cannot_overwrite_an_autofix_signature_but_can_replace_a_trigg
     .await;
     assert!(st.is_success(), "parking must still succeed: {body}");
 
+    // 0. THE CALLER IS TOLD (AMUX-3791). Everything below asserts the value was
+    //    preserved somewhere; none of it reaches the operator who ran the
+    //    command. This is the one write where the field you NAMED is
+    //    deliberately not the field that changed, so a caller verifying the
+    //    obvious way reads back source_ref, sees the old value, and concludes
+    //    the trigger was silently dropped. That false negative cost a probe
+    //    against a live card and nearly a bug report against this very code.
+    let dv = &body["diverted_fields"][0];
+    assert_eq!(
+        dv["field"].as_str().unwrap_or(""),
+        "source_ref",
+        "the response must name the field the caller asked for: {body}"
+    );
+    assert_eq!(
+        dv["landed_in"].as_str().unwrap_or(""),
+        "desc",
+        "and where it actually went: {body}"
+    );
+    assert_eq!(
+        dv["value"].as_str().unwrap_or(""),
+        trigger,
+        "and the value, so the caller can confirm it without re-reading the card: {body}"
+    );
+    assert!(
+        dv["why"].as_str().unwrap_or("").contains("AMUX-3686"),
+        "and WHY, or the next reader re-derives the dedupe-signature reasoning: {body}"
+    );
+
     let (_s, _h, card) = send_with(&app, "GET", &format!("/api/board/{id}"), None, &[]).await;
     // 1. The dedupe key SURVIVES.
     assert_eq!(
@@ -2548,7 +2576,7 @@ async fn a_trigger_cannot_overwrite_an_autofix_signature_but_can_replace_a_trigg
     .await;
     let pid = plain["id"].as_str().unwrap().to_string();
     for cond in ["waiting on vendor", "waiting on the deploy"] {
-        let (st, _h, _b) = send_with(
+        let (st, _h, pb) = send_with(
             &app,
             "PATCH",
             &format!("/api/board/{pid}"),
@@ -2557,6 +2585,15 @@ async fn a_trigger_cannot_overwrite_an_autofix_signature_but_can_replace_a_trigg
         )
         .await;
         assert!(st.is_success());
+        // CONTROL for the diverted_fields assertions above: an ORDINARY trigger
+        // write went exactly where the caller asked, so there is nothing to
+        // announce. Without this, a version that emitted the advisory on every
+        // source_ref write would pass every cell above and train readers to
+        // ignore a line that cries wolf.
+        assert!(
+            pb.get("diverted_fields").is_none(),
+            "a trigger that landed in source_ref must NOT report a diversion: {pb}"
+        );
     }
     let (_s, _h, pcard) = send_with(&app, "GET", &format!("/api/board/{pid}"), None, &[]).await;
     assert_eq!(
