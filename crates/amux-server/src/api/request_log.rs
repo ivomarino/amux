@@ -1275,6 +1275,13 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/proxies/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/proxies/{id}/start", methods: &["POST"] },
     RouteEntry { path: "/api/proxies/{id}/stop", methods: &["POST"] },
+    // AMUX-2888: mounted ahead of the tunnel client port so the SPA panel and
+    // `amux tunnel` stop getting a 404 (status) and a 405 (the POSTs, from the
+    // GET-only SPA catch-all) — neither of which a caller can tell from "amux
+    // is broken".
+    RouteEntry { path: "/api/tunnel/status", methods: &["GET"] },
+    RouteEntry { path: "/api/tunnel/start", methods: &["POST"] },
+    RouteEntry { path: "/api/tunnel/stop", methods: &["POST"] },
     // The D1-exit pair. Reached by the bash CLI's own curl, which the caller
     // census does not enumerate — so these 405'd for the whole cutover while
     // every layer that mentions them kept routing sessions at them.

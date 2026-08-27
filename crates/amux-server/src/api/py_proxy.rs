@@ -76,6 +76,11 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/orchestrate", "voice fleet-orchestrator: transcript -> helper-model routing plan (api/orchestrate.rs, AMUX-3074)"),
     ("/api/skin", "resolved skin (terms/colours/tabs) for a worker"),
     ("/api/config", "declarative instance config: export + idempotent apply"),
+    // AMUX-2888. Native and HONEST rather than native and complete: status
+    // answers 200 with `ported:false`, start/stop answer 501. Claimed here
+    // because the family IS ours — the relay client is the unported half, not
+    // the routing.
+    ("/api/tunnel", "tunnel client controls: status is native, start/stop 501 until the relay is ported (AMUX-2888)"),
     // ---- Mounted in mod.rs but never declared here, so
     // `every_mounted_api_family_is_claimed_by_the_registry` was RED on main and
     // CI could not go green for anyone. Native like everything else:

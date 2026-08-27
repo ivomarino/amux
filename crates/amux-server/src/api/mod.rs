@@ -51,6 +51,7 @@ pub mod messages;
 pub mod org;
 pub mod prefs;
 pub mod proxies;
+pub mod tunnel;
 pub mod py_proxy;
 pub mod reclaim;
 pub mod request_log;
@@ -230,6 +231,9 @@ pub fn router(state: AppState) -> Router {
         .merge(connectors::routes())
         .merge(self_update::routes())
         .nest("/api/proxies", proxies::routes())
+        // AMUX-2888: the client controls the SPA and CLI already call. Status
+        // answers 200 with ported:false; start/stop answer an honest 501.
+        .nest("/api/tunnel", tunnel::routes())
         // Skills / slash-commands / map: the SPA tabs' data (AMUX-2586 #6).
         .nest("/api/skills", skills::routes())
         .nest("/api/mcp", mcp::routes())
