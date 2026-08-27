@@ -1,0 +1,19 @@
+[Unit]
+Description=amux Server Builder (watches git commits)
+Documentation=https://amux.dev/docs
+PartOf=amux-server.service
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$SCRIPT_DIR/rust-auto-build.sh
+Environment="CARGO_TARGET_DIR=$HOME/.amux/rust-build-target"
+WorkingDirectory=$SCRIPT_DIR
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=amux-builder
+
+[Install]
+WantedBy=default.target
