@@ -126,6 +126,31 @@ else
   bad "8: percentage is truncated: [$(echo "$out" | grep NEVER)]"
 fi
 
+# 9 — THE SECOND REFUSAL, which was written and never written down
+#     (amux-frustrations, reviewing AMUX-3797). Cell 3 covers an ABSENT log.
+#     unbuilt-commits.sh:76 refuses a second way: a log that EXISTS and is
+#     readable but carries no `building <sha>` line at all — a truncated log, a
+#     rotated one, a builder that has only ever logged SKIPs. The built set is
+#     then empty and every commit in range reads as never built, which is cell
+#     3's failure reached through a file that is present rather than missing.
+#
+#     It is the harder of the two to notice precisely because the log is THERE:
+#     `[ -r "$LOG" ]` passes, nothing looks wrong, and the answer is 100%.
+#
+#     A SKIP-only log is the realistic shape, not a contrived empty file: it is
+#     what a fresh rotation looks like when the first thing after it is a
+#     duplicate wakeup. So the fixture is a SKIP line, which also proves the
+#     refusal keys on `building` rather than on the file being non-empty.
+cat > "$D/log4" <<EOF
+== 2026-08-27 07:00:00 SKIP $C3 — build already running (pid 1)
+EOF
+out9=$(AMUX_RS_BUILD_LOG="$D/log4" "$SCRIPT" base..HEAD 2>&1); rc9=$?
+if [ "$rc9" = 2 ] && ! echo "$out9" | grep -q "NEVER built"; then
+  ok "9: a log with no 'building' line refuses (exit 2) rather than reporting 100%"
+else
+  bad "9: log with no build lines produced a count: rc=$rc9 out=[$(echo "$out9" | tr '\n' ' ')]"
+fi
+
 echo
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" = 0 ]
