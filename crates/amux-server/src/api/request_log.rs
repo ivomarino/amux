@@ -2102,7 +2102,8 @@ async fn stats(
             let threshold = 5.0 * p50;
             let r = (|| -> rusqlite::Result<()> {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT ts, method, path, status, latency_ms, worker, boot_at \
+                    "SELECT ts, method, path, status, latency_ms, worker, boot_at, \
+                            amux_session, client_ip \
                      FROM _amux_request_log \
                      WHERE family = ?1 AND ts >= ?2 AND latency_ms > ?3 \
                      ORDER BY latency_ms DESC LIMIT ?4",
@@ -2117,6 +2118,8 @@ async fn stats(
                     let latency_ms: f64 = r.get(4)?;
                     let worker: Option<String> = r.get(5)?;
                     let row_boot: Option<f64> = r.get(6)?;
+                    let amux_session: Option<String> = r.get(7)?;
+                    let client_ip: Option<String> = r.get(8)?;
                     // The same exclusion as the first pass (AF-186). Applied
                     // here TOO rather than relying on the pass above, because
                     // this is a separate re-read: on 2026-08-24 the outlier
@@ -2137,6 +2140,21 @@ async fn stats(
                             "status": status, "latency_ms": round2(latency_ms),
                             "family": family, "family_p50_ms": round2(p50),
                             "ratio": round2(latency_ms / p50), "worker": worker,
+                            // WHO MADE THE CALL (AF-260). The row already carries
+                            // `amux_session` and `client_ip` — this list shipped
+                            // neither, so the one question you ask of a latency
+                            // outlier could not be answered from it. Only `worker`
+                            // was here, and the sweep contract says in as many
+                            // words: "Attribute on `amux_session` ONLY. Never fall
+                            // back to `worker`" — because `worker` is PATH-derived,
+                            // so it is null for every /api/board row and names the
+                            // SUBJECT rather than the caller for /api/sessions/{n}.
+                            //
+                            // Measured on the 2026-08-27 sweep: all 20 outliers
+                            // reported worker=null, including five /api/board GETs
+                            // at 24-32s inside one 90-second window. The cluster is
+                            // real and it is still unattributed.
+                            "amux_session": amux_session, "client_ip": client_ip,
                             // AMUX-3647: how far into its own process's life this
                             // request ARRIVED. A row a few seconds in was competing
                             // with a cold cache, migrations and ~15 background
@@ -3034,6 +3052,67 @@ mod tests {
 
     fn logs_api(store: Arc<crate::db::Store>) -> Router {
         Router::new().nest("/api/logs", routes()).with_state(state(store))
+    }
+
+    /// AF-260 — a latency outlier you cannot attribute is half an instrument.
+    ///
+    /// The list shipped `worker` and nothing else. `worker` is PATH-derived, so it
+    /// is NULL for every `/api/board` row and names the SUBJECT rather than the
+    /// caller for `/api/sessions/{name}/*`. The sweep contract says it outright —
+    /// "Attribute on `amux_session` ONLY. Never fall back to `worker`" — and this
+    /// endpoint offered only the field the contract forbids.
+    ///
+    /// Measured on the 2026-08-27 sweep: all 20 outliers reported worker=null,
+    /// among them five /api/board GETs at 24-32s inside one 90-second window. The
+    /// cluster is real, and it could not be pinned on a caller.
+    ///
+    /// The control matters as much as the assertion: a row with NO session must
+    /// still say so honestly rather than borrow the worker, because 90% of
+    /// /api/sessions traffic is unattributed dashboard polling and a fallback
+    /// would label all of it with whatever the path happened to contain.
+    #[tokio::test]
+    async fn slow_outliers_name_the_caller_not_just_the_path_derived_worker() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // A fast baseline so p50 is small and the slow rows clear 5x.
+        for i in 0..40u32 {
+            seed(&store, now - 300.0 - f64::from(i), "GET", "/api/board", 200, 1.0, "", "native", None).await;
+        }
+        // Slow, WITH a session. `/api/board` is deliberately a family whose
+        // `worker` is always null, which is the case that had no attribution at all.
+        seed(&store, now - 60.0, "GET", "/api/board", 200, 9000.0, "mvs-infra", "native", None).await;
+        // Slow, with NO session: the honest-absence control.
+        seed(&store, now - 50.0, "GET", "/api/board", 200, 9500.0, "", "native", None).await;
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let outs = v["slow_outliers"].as_array().expect("slow_outliers");
+        assert!(!outs.is_empty(), "the seeded slow rows must appear: {v}");
+
+        let attributed = outs
+            .iter()
+            .find(|o| o["latency_ms"].as_f64().unwrap_or(0.0) > 8500.0
+                && o["latency_ms"].as_f64().unwrap_or(0.0) < 9200.0)
+            .expect("the 9000ms row");
+        assert_eq!(
+            attributed["amux_session"], "mvs-infra",
+            "an outlier must name the CALLER; `worker` is path-derived and null here: {attributed}"
+        );
+
+        let anon = outs
+            .iter()
+            .find(|o| o["latency_ms"].as_f64().unwrap_or(0.0) > 9200.0)
+            .expect("the 9500ms row");
+        assert!(
+            anon["amux_session"].is_null() || anon["amux_session"] == "",
+            "an unattributed row must say so, never borrow the path-derived worker: {anon}"
+        );
     }
 
     /// AF-253 — the CLASS guard, not another instance.

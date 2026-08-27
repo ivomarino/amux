@@ -20,6 +20,24 @@
 # holds — the entry must still move, and the failure must be REPORTED rather than
 # swallowed.
 #
+# HOW THE ISOLATION IS ACHIEVED, and the first version got this WRONG. Setting
+# AMUX_URL does NOT work: `_api()` in the tool runs `amux url` first and falls back to
+# a hardcoded literal, and never reads AMUX_URL at all. That is CORRECT of the tool —
+# CLAUDE.md mandates `$(amux url)` over `$AMUX_URL` precisely because a lane's env can
+# carry a stale port (AMUX-3046) — so the fix belongs here, not there.
+#
+# The cost of getting it wrong was visible in the live request log the next morning:
+# `404 PATCH /api/board/{id}` with the literal `X-2` twelve times, this harness's own
+# fixture id, hitting the REAL board. Harmless only because X-1/X-2/X-3 do not exist.
+# A fixture that reused a real card id would have mutated production, and cell (c)
+# would have passed either way — it asserted the write was reported as failed, which
+# a 404 from the live board satisfies just as well as a dead port.
+#
+# So the isolation is now STRUCTURAL: a stub `amux` earlier on PATH answers `url` with
+# a closed port, which exercises the tool's REAL resolution path and yields a dead
+# endpoint. Cell (z) asserts the stub is the one being resolved, because an isolation
+# that silently stops working is exactly what happened last time.
+#
 # Exit 0 = all pass, 1 = a failure.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -27,6 +45,16 @@ cd "$(dirname "$0")/.."
 ARCHIVE_TOOL="${FRUSTRATIONS_ARCHIVE:-$(pwd)/scripts/frustrations-archive.py}"
 PASS=0; FAIL=0
 TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
+STUBBIN="$TMP/stubbin"
+mkdir -p "$STUBBIN"
+cat > "$STUBBIN/amux" <<'STUB'
+#!/usr/bin/env bash
+# Test stub: only `url` is needed, and it must answer a CLOSED port.
+[ "${1:-}" = "url" ] && { echo "https://127.0.0.1:9"; exit 0; }
+exit 0
+STUB
+chmod +x "$STUBBIN/amux"
+export PATH="$STUBBIN:$PATH"
 
 ok()   { PASS=$((PASS+1)); printf '  ok   — %s\n' "$1"; }
 bad()  { FAIL=$((FAIL+1)); printf '  FAIL — %s\n' "$1"; }
@@ -84,7 +112,12 @@ LEDGER
 
 run() { # dir args...
   local d="$1"; shift
-  ( cd "$d" && AMUX_URL="https://127.0.0.1:9" python3 scripts/frustrations-archive.py "$@" ) \
+  # NO inline PATH here on purpose: the isolation must come from ONE place (the
+  # exported PATH above) so cell (z) can actually fail when it breaks. The first
+  # version set it both here and in (z), which made (z) a check on its own inline
+  # prefix — it passed with the export deleted, which is the regression it exists
+  # to catch.
+  ( cd "$d" && python3 scripts/frustrations-archive.py "$@" ) \
     > "$d/out.txt" 2>&1
   echo $?
 }
@@ -142,6 +175,14 @@ after=$(shasum -a 256 "$E/frustrations.md" | cut -d' ' -f1)
 want "(e) and the ledger is untouched" "$after" "$before"
 [ -n "$before" ] && ok "(e) the hash is non-empty, so that comparison could have failed" \
                  || bad "(e) hash was empty — the check could not fail"
+
+# ---- (z) THE ISOLATION ITSELF -----------------------------------------------
+# Without this, a stub that stops being found leaves every cell above green while
+# the tool writes to the REAL board again — which is precisely how the X-2 rows
+# reached production. Assert what the tool would actually resolve.
+resolved=$(amux url 2>/dev/null)
+want "(z) the tool resolves amux-url to the CLOSED port, not the live server" \
+     "$resolved" "https://127.0.0.1:9"
 
 printf '\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
