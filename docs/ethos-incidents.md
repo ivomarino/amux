@@ -490,6 +490,87 @@ on the token pair that cannot be split. The sharper version of the precondition:
 form a probe excludes is often the form the thing you are looking for MUST take, because
 the option you left out is what makes the caller the kind of caller you want.
 
+**The tell is the MISSING ACCOMPANIMENT, not the answer** (amux-frustrations, SIX in one
+night, 2026-08-20). The count is the argument: any one of these reads as carelessness, and
+six in a night is a property of the surfaces. Every one returned something answer-SHAPED —
+an empty string, a reversed label, `ok:true`, `exit 0`, a plausible zero — and in no case
+was the result itself the tell.
+
+- an `until [ "$(curl .../health | py 'print(d["build"])')" != "$OLD" ]` wait loop: the
+  health call failed mid-restart, python raised, the expression was EMPTY, empty != old,
+  and the loop exited printing "ADOPTED". A WARN storm was then measured against the OLD
+  binary. *Missing: it never printed the hash it had supposedly adopted.*
+- `git diff --numstat origin/main...main -- <file>` labelled "what origin added that I
+  lack". Three dots diffs merge-base -> main, so those were MY changes with the label
+  reversed, and another session was seconds from being told their gate was still live.
+  *Missing: `behind=0`, already on screen, said origin had nothing.*
+- filtering `/api/logs` rows on `ts` inside an outage window and getting zero, from a page
+  that is newest-first and capped at 2000, every row of which post-dated the window.
+  *Missing: no count of how many rows the page could even span.*
+- reading a schedule's `last_run_at` when the field is `last_run`: three schedules
+  reported `None` and a 12.6h outage was briefly believed. *Missing: no key listing next
+  to the value.*
+- grepping `/api/debug/boundary` for a `families` key that does not exist, and printing
+  "families tracked: 0" against a live, correct response.
+- importing `git-shared-guard.py` to A/B it. A module-level `sys.exit(main())` exits the
+  IMPORTER with code 0; a peer's whole test suite printed NOTHING and exited 0 with every
+  assertion unreached. *Missing: no PASS line, from a suite that "passed".*
+
+Four of the six had already produced a stated conclusion about to be acted on. None was
+caught by instrumentation; each was caught by a second look, which is a habit rather than
+a property. So the precondition is not "be careful" and not "check the result" — it is
+rule 4's accompaniment test: name what should appear BESIDE the answer if the probe really
+ran, and check for that.
+
+Two of the six were amux defects and have their own fixes (the module-level `sys.exit`, now
+`__name__`-gated, and `/api/browser/start` silently accepting unknown fields, AMUX-3403).
+The `/api/logs` surface is fixed too: it now publishes `truncated`, `page_span_h`,
+`total_matched` and a `note` naming the `until` parameter to page backward, so the capped
+newest-first page states its own span instead of letting a zero pass for an answer. The
+remaining two are field names differing by a suffix, which no surface can currently tell a
+caller they misread.
+
+**A COMPOUND OPERATION TAKES ITS SUCCESS SIGNAL FROM THE PARTS THAT WORKED** (three defects
+in two days, 2026-08-23). The sibling of the accompaniment test, and the reason it needs its
+own name: here nothing is missing from the output. The operation genuinely succeeded, one
+step inside it did nothing, and the success of the whole is what got reported.
+
+- mutation-testing a guard by disabling `if !p.is_absolute()`: the test then did what the
+  unguarded code says and CREATED a directory in the shared checkout. The FILE was reverted
+  and the mutation reported clean; the directory outlived the revert and failed every later
+  local run while CI stayed green. The revert succeeded at its visible half.
+- a version bump written as a literal replace, `'0.9.701' -> '0.9.702'`, matched nothing
+  because a peer had moved both files to 0.9.708 between the read and the write. The same
+  edit pass made the functional changes and printed "patched", and those were what got
+  asserted on. The UI fix reached no browser holding the cached script.
+- a recovery sweep classifying on `desc` after the default board list went slim, which does
+  not carry it. `.get("desc") or ""` was empty for every row, so it printed "0 to do" on a
+  schedule while 76 unowned reports sat there. The FETCH succeeded, and the fetch is what
+  the sweep reported on.
+
+Three habits, and all three are listed because each catches exactly one of the above and
+none of the others:
+
+- **assert the WRITE changed something**, not that the code ran (`assert new != old`, per
+  file) — a literal replace that matches nothing is indistinguishable from one that matched;
+- **after mutating a guard OFF, ask what the code does WITHOUT it.** That is precisely what
+  the guard prevents, so the answer is never "nothing", and the side effect outlives the
+  revert of the file;
+- **when classifying on a field, confirm the field is PRESENT before concluding from its
+  absence** — an empty classification over a non-empty fetch is the loud-wrong-probe shape,
+  answering confidently from a column that was never there.
+
+All three have shipped fixes (7759b36 the APP_VER/CACHE mover, c207339 the sweep refusing an
+absent desc, 1998c75 `scripts/test-tree-clean.sh`). The last is the one with a design point
+worth keeping: `git status --porcelain` reports ZERO LINES for an empty-directory residue,
+and so does `-uall`, because git does not track empty directories — so the OBVIOUS guard
+would have been green and unable to fail on its own motivating incident. `git clean -nd`
+sees it and cannot see a modification to a tracked file, so the snapshot is the union of
+both. It ships a `--self-test` negative control, and .github/workflows/rust.yml runs that
+control FIRST, before the wrapped `cargo test`, because a guard nobody has watched fail is
+a guard nobody should trust — this one's self-test shipped once asserting merely "non-zero",
+which passed while carrying the exact bug the control existed to catch.
+
 **The fixture must live in the same DOMAIN as the defect, not merely exhibit its shape.**
 The mutation-strength rule above says to mutate the arithmetic rather than the wording;
 this is its companion, and it is the one that lets a green suite coexist with a live bug.

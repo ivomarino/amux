@@ -1436,3 +1436,193 @@ WHAT IS ACTUALLY LEFT, measured rather than argued (amux's AMUX-3797, evidence c
   962c15d79) is preceded four seconds earlier by `07:45:44 building 962c15d79` — that sha was
   built. Reading a SKIP without checking for a `building` line naming the same sha counts the
   dedupe working as a commit lost.
+
+## A page.route stub defeated by a service worker fails LOUDLY and blames the wrong subsystem
+VALIDATED: amux-frustrations | FIXED 5e07e88a, the CLASS the entry left open: "nothing warns that a page.route stub never matched a request".
+
+e2e/fixtures.ts wraps page.route so each stub counts hits and teardown fails the test naming the stub. Silent when the test already failed, because an unhit stub is usually downstream of whatever actually broke and reporting it there would be this entry's own defect committed by its own fix. allowUnusedRoute(page, matcher) is the declared opt-out, so "may not fire" gets written down rather than assumed.
+
+Reaching every spec, not just the four converted: crates/amux-server/tests/e2e_route_stub_guard.rs fails the build when a spec stubs a request while importing test from '@playwright/test'. Mutation confirmed — reverting one import fails the guard by file name with the fix instruction. It also flags context.route, which the fixture does NOT wrap, rather than letting an unguarded stub look guarded.
+
+The wrapper itself is tested against the real runner (e2e/route-stub-guard.spec.ts, 3 passed on desktop), because importing the fixture is not the same as the fixture working and the defect lives in the teardown path: a dead stub fails (test.fail inverts it), allowUnusedRoute suppresses it, and a stub that DOES match does not fail. That third cell is the control — without it cell 1 is equally consistent with a wrapper that breaks all four real stubs.
+
+The entry's own instance was already fixed in b31bcac, and the service-worker half generalised into playwright.config.ts as serviceWorkers: 'block' by default.
+DATE: 2026-08-13
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+SESSION: amux-frustrations
+CARD: AF-47
+SYMPTOM: Isolation gave each project a CLEAN browser profile, which surfaced two failures the
+  shared one had masked — and both lied about where the fault was. (1) system-jobs.spec.ts
+  stubs /api/system-jobs with page.route; a registered service worker defeats that, because
+  the request passes through the worker's fetch handler where page.route cannot see it. It
+  did not error — it rendered the REAL job list and diffed it against the stub, so it read as
+  "the stalled-row styling is broken under WebKit". (2) sw.js reloads the page on
+  `controllerchange` as soon as a fresh worker claims the client, landing mid-page.evaluate:
+  "Execution context was destroyed" on two specs about CSS geometry.
+COST: Both point at the wrong subsystem by construction. (1) is the dangerous one: a stub
+  that silently does not apply produces a confident, specific, wrong failure about rendering,
+  and the natural response is to go read the CSS. Roughly an hour across the two before the
+  common cause was visible.
+FIX: `test.use({ serviceWorkers: 'block' })` on the specs that do not test the worker, in
+  b31bcac. STILL OPEN as a class: nothing warns that a page.route stub never matched a
+  request. A stub that matches zero requests is almost always a bug and is currently
+  indistinguishable from one that matched — same green-looking machinery, no output either
+  way. The generalisable guard is an assertion that each route was actually hit; amux has no
+  such helper today and every future page.route stub inherits the same silence.
+
+---
+
+## SIX answer-shaped wrong results in one night, and in every one the tell was a MISSING ACCOMPANIMENT rather than the answer
+VALIDATED: amux-frustrations | The GENERALISATION is now encoded in the rules, which is what the entry asked for: "ethos rule 7 already carries this family... What it does not yet carry is the accompaniment test, which is the cheap mechanical version."
+
+ethos.md rule 4 now carries it in one sentence: "A wrong answer is rarely wrong-LOOKING, so name what should appear BESIDE the answer if the probe really ran and check for THAT: a count beside a zero, a hash beside 'adopted', a PASS line beside a green suite, a key listing beside a None." Those four forms are the four specimens whose tell was an absence.
+
+The SIXFOLD count moved to docs/ethos-incidents.md with all six specimens intact, which is the entry's other requirement — "so the SIXFOLD count is somewhere countable rather than spread across six cards nobody joins up". It sits beside the nine-instance probe-defect cluster and the -S/-G pickaxe case, where the argument that these are one family is readable.
+
+SPECIMEN 3'S SURFACE IS FIXED, not just written down. /api/logs was "a capped newest-first page with no upper bound" and now publishes its own span. Live: truncated=true, page_span_h, total_matched, and note="TRUNCATED: these are the newest rows, not the whole window. Page backward with `until=<the oldest ts in this page>`". The zero that started this can no longer be returned without the payload saying the measurement was partial. That was AF-230's fix.
+
+Two of the six were amux defects with their own fixes already (module-level sys.exit now __name__-gated; /api/browser/start unknown fields, AMUX-3403). The remaining two are field names differing by a suffix (last_run_at vs last_run), which no surface can currently tell a caller they misread - stated as a known gap in the incidents file rather than left implied.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-20
+SESSION: amux-frustrations
+CARD: AF-107
+SYMPTOM: Six probes in one sweep returned something that LOOKED like an answer and was
+  wrong. Recorded together because the count is the argument — any one of these reads as
+  carelessness, and six in a night is a property of the surfaces, not of the day.
+
+  1. `until [ "$(curl .../health | py 'print(d["build"])')" != "$OLD" ]` — the health call
+     failed mid-restart, python raised, the expression was EMPTY, empty != old, and the
+     loop exited printing "ADOPTED". I then measured a WARN storm against the old binary.
+     Missing accompaniment: it never printed the hash it had supposedly adopted.
+  2. `git diff --numstat origin/main...main -- <file>` labelled "what origin added that I
+     lack". Three dots diff merge-base -> main, so those were MY changes with the label
+     reversed. I nearly told amux their AMUX-3110 gate was still live. Missing
+     accompaniment: `behind=0`, already on screen, said origin had nothing.
+  3. Filtered `/api/logs` rows on `ts` inside an outage window and got zero — from a page
+     that is newest-first and capped at 2000, every row of which post-dated the window.
+     Missing accompaniment: no count of how many rows the page could even span.
+  4. Read a schedule's `last_run_at`; the field is `last_run`. Three schedules reported
+     `None` and I briefly believed a 12.6h outage had eaten the day's fires. Missing
+     accompaniment: no key listing next to the value.
+  5. Grepped `/api/debug/boundary` for a `families` key that does not exist; printed
+     "families tracked: 0" against a live, correct response.
+  6. Imported `git-shared-guard.py` to A/B its behaviour. It carried a module-level
+     `sys.exit(main())`, so the import exits the importer with code 0. I wrapped it in
+     `except SystemExit: pass` and moved on. amux hit the same line and their test suite
+     printed NOTHING and exited 0 with every assertion unreached — the purest cannot-fail
+     check either of us saw. Missing accompaniment: no PASS line, from a suite that
+     "passed".
+COST: no wrong conclusion shipped, because each was caught by a second look — but 4 of the
+  6 had already produced a stated conclusion I was about to act on, and #2 was seconds from
+  being sent to another session as fact. The real cost is that the catch was luck of
+  habit, not of instrumentation: nothing in any of these surfaces made the wrongness
+  visible.
+FIX: The generalisation, sharpened by amux and worth more than the six specimens: every
+  one produced an ANSWER-SHAPED result — an empty string, a reversed label, `ok:true`,
+  `exit 0`, a plausible zero — and in NO case was the result itself the tell. The tell was
+  always something ABSENT beside it: no PASS line, no adopted hash, no `ignored_fields`, no
+  key listing, a diff that should have shrunk and did not.
+  So the precondition that actually works is not "be careful" and not "check the result".
+  It is: BEFORE believing a probe, name what should appear ALONGSIDE the answer if the
+  probe really ran, and check for THAT. A count next to a zero. A hash next to "adopted".
+  A PASS line next to a green suite. A key listing next to a None.
+  ethos rule 7 already carries this family (the silent probe, the loud-wrong probe, the
+  empty grep). What it does not yet carry is the accompaniment test, which is the cheap
+  mechanical version, and this entry exists so the SIXFOLD count is somewhere countable
+  rather than spread across six cards nobody joins up.
+  Two of the six are amux defects with their own fixes: the module-level `sys.exit`
+  (now __name__-gated) and `/api/browser/start` silently accepting unknown fields
+  (AMUX-3403). The other four are surfaces that make the mistake easy — a capped
+  newest-first page with no upper bound, and field names that differ by a suffix — and
+  none of them can currently tell a caller they were misread.
+
+---
+
+## Three defects in two days where a compound operation reported success from the parts that worked
+VALIDATED: amux-frustrations | All three specimens have SHIPPED fixes, the CI wiring the entry said was pending has LANDED, and the general half is now encoded.
+
+SHIPPED, per the entry's own FIX block: 7759b36 (APP_VER/CACHE must MOVE when the file moves, not merely agree), c207339 (the sweep refuses when a full fetch returns no desc), 1998c75 (scripts/test-tree-clean.sh).
+
+THE PART THE ENTRY LEFT OPEN IS CLOSED. It said: "Wiring it into .github/workflows/rust.yml is NOT mine to do: that file gates every lane's push. Proposal and evidence routed to amux; the guard is committed and runnable meanwhile." It is wired — rust.yml:67 runs `--self-test` as a negative control FIRST, and :82 wraps `cargo test --workspace` in the guard rather than running it after, so the guard cannot drift from what it guards.
+
+MEASURED QUIET, with the probe's own capability confirmed: 25 rust.yml runs (2026-08-24..2026-08-27), 50 jobs, 298 annotation rows read, ZERO mentioning residue. The first pass of that probe read `.title`, which is empty on every annotation this repo produces, so it was structurally incapable of a hit; re-run on `.message` it returns 298 readable rows including eslint and Node-deprecation warnings. Step-level confirmation that it was not skipped: the latest run shows both "Tree-residue guard — self-test (negative control)" and "cargo test (workspace) — tree-residue guarded" as `success`.
+
+THE GENERAL HALF IS ENCODED. docs/ethos-incidents.md now carries the family under its own name, "a compound operation takes its success signal from the parts that worked", with all three specimens and all three habits verbatim — kept as three because each catches exactly one of them and none of the others. It sits beside the accompaniment-test cluster, which is its sibling and needed distinguishing: there the tell is something ABSENT from the output, here nothing is missing at all and the operation genuinely succeeded.
+
+ONE FOLLOW-UP, NOT MINE AND NOT THIS ENTRY'S FRICTION: rust.yml downgrades the guard's exit 3 to a warning, and its comment sets the exit condition itself — "flip to blocking (delete the `if`) once it has been quiet for a few days; leaving it advisory forever would make it decoration." The condition is met on the measurement above. Routed to amux with the evidence rather than flipped here, because that file gates every lane's push (ethos rule 8), which is the same reason the entry gave for not wiring it itself.
+AREA: silent-partial
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-150
+SYMPTOM: amux noticed the cluster and it is right, though not quite as "three invisible
+  no-ops" — one of the three is the opposite of a no-op. The property they actually share is
+  narrower and worth naming: A COMPOUND OPERATION TOOK ITS SUCCESS SIGNAL FROM THE PARTS THAT
+  WORKED, while one part did nothing and said nothing.
+    1. 1a7d215 (mine). Mutation-testing a guard, I disabled `if !p.is_absolute()` to prove the
+       test could fail. The test then did what the unguarded code says and created a directory
+       in the shared checkout. I reverted the FILE and reported the mutation clean; the
+       directory outlived the revert and failed every later local run while CI stayed green.
+       The revert succeeded at its visible half.
+    2. 24fc2b4 (mine). A version bump written as a literal find-and-replace — '0.9.701' ->
+       '0.9.702' — matched nothing, because a peer had moved both files to 0.9.708 between my
+       read and my write. The same edit pass made the functional changes successfully and
+       printed "patched". I had asserted on those and not on the bump.
+    3. c207339 (amux). The recovery sweep classified on `desc`, and AMUX-3496 made the default
+       board list slim, which does not carry it. `.get("desc") or ""` was empty for every row,
+       so the sweep printed "0 to do" on a schedule while 76 unowned reports sat there. The
+       FETCH succeeded, and the fetch is what the sweep reported on.
+COST: measured, not estimated. (1) a red test on correct code that a peer hit while it blocked
+  their gate. (2) a UI fix that reached no browser holding the cached script — caught only
+  because a peer asked a routine push-census question, and would otherwise have looked shipped
+  indefinitely. (3) a scheduled sweep reporting a clean board on a cadence while 76 items sat
+  in it. None of the three produced an error, and in all three the surrounding operation was
+  genuinely successful, which is what made the silence convincing.
+FIX: two shipped and one general.
+  SHIPPED — 7759b36 turns (2) into a CI guard, and the design point is worth keeping: the
+  pre-existing test pinned that APP_VER and CACHE AGREE, and it could not have caught 25ba8ea
+  because NEITHER moved, so they still agreed and it stayed green. Agreement was never the
+  invariant; MOVING WHEN THE FILE MOVES is. Verified against the real artifacts rather than a
+  fixture — I re-ran its logic here across four ranges: FAILS on 25ba8ea (app_moved=0
+  sw_moved=0), passes on 24fc2b4 and 36b93f8, skips a range with no client JS.
+  SHIPPED — c207339 makes (3) refuse when a full fetch returns no desc, rather than treating
+  an absent field as an empty result.
+  SHIPPED: 1998c75 turns (1) from a habit into a mechanism: scripts/test-tree-clean.sh
+  wraps a command and fails if the checkout changed, so a fixture that dirties the tree is
+  caught by the run that dirtied it rather than by the next person's red test. The design
+  point is the one that nearly went the other way. `git status --porcelain` reports ZERO
+  LINES for the exact residue in (1), and so does `-uall`, because git does not track empty
+  directories; the obvious guard would have been green and unable to fail on its own
+  motivating incident. `git clean -nd` sees it, and cannot see a modification to a tracked
+  file, so the snapshot is the union. It ships a `--self-test` negative control (fires on an
+  empty-dir residue, silent on a no-op) so a green from it is never taken on faith. Two
+  measured limits are in its header: it attributes every diff to the wrapped command, which
+  is false on THIS shared checkout (the first baseline run named a peer's mid-run edit to
+  alerts.rs), and it ignores gitignored paths so cargo's target/ writes are not noise.
+  This also inverts what 67137cc concluded, that "CI never sees this class (fresh checkout)".
+  A fresh checkout is where the residue is EASIEST to see, because it has no history to
+  hide in, so the run that created it is the only thing that could have. Wiring it into
+  .github/workflows/rust.yml is NOT mine to do: that file gates every lane's push. Proposal
+  and evidence routed to amux; the guard is committed and runnable meanwhile.
+  GENERAL, and the part that does not have a patch: when a step's failure mode is doing
+  nothing, its success cannot be inferred from the operation around it. Three concrete habits,
+  each of which would have caught exactly one of the above and none of the others, which is why
+  all three are listed rather than one rule:
+    - assert the WRITE changed something, not that the code ran (`assert new != old` on each
+      file), because a literal replace that matches nothing is indistinguishable from one that
+      matched;
+    - after mutating a guard OFF, ask what the code does WITHOUT it — that is precisely what
+      the guard prevents, so the answer is never nothing, and the side effect outlives the
+      revert;
+    - when classifying on a field, confirm the field is PRESENT before concluding from its
+      absence — an empty classification over a non-empty fetch is the loud-wrong-probe shape,
+      answering confidently from a column that was never there.
+
+---
+
+---

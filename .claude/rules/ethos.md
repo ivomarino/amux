@@ -32,7 +32,10 @@ already look? Any output that can read zero or empty must publish, in the same
 payload, whether the measurement ran. Ask what your comparison cannot express
 (a diff has no MOVE, a count has no identity, a status code has no operand).
 Before believing a negative, say what a positive would look like and confirm
-the probe could produce it.
+the probe could produce it. A wrong answer is rarely wrong-LOOKING, so name what
+should appear BESIDE the answer if the probe really ran and check for THAT: a
+count beside a zero, a hash beside "adopted", a PASS line beside a green suite,
+a key listing beside a None.
 
 **5. Does it accumulate, or does it discriminate?**
 At 100x the current volume, is this still coherent? If it becomes a log, it
