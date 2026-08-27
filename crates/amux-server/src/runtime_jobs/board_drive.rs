@@ -152,6 +152,28 @@ const BACKLOG_TRIAGE_COOLDOWN_S: f64 = 72.0 * 3600.0;
 const BACKLOG_TRIAGE_THRESHOLD: usize = 10;
 /// Cards older than this (created_at) are considered stale backlog.
 const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
+/// A `source_ref` trigger not re-verified within this window is STALE, and the
+/// idle-drain gate now treats it exactly like no trigger at all. Matches the
+/// dashboard's `is:sourcestale` definition (app.js) so "detectable by search"
+/// and "detectable by the drain nudge" agree on what stale means.
+///
+/// Without this, `--trigger` is a one-way switch: a lane nudged to drain its
+/// backlog can silence the nudge forever by writing ANY text into source_ref —
+/// including a self-note ("do this later") rather than a genuine external
+/// blocker — because `parked_on_live_trigger`-style checks only ever asked
+/// "is source_ref non-empty", never "is it still true". Measured 2026-08-27:
+/// 509 of 514 fleet-wide backlog cards carried a source_ref, 450 of those
+/// (88%) had gone unverified >24h, several past 50 days — the idle-drain gate
+/// built for exactly this stall (AMUX-3006) had been silently defeated by its
+/// own escape hatch on nearly the whole fleet's backlog. This constant does
+/// NOT touch `parked_on_live_trigger` (the depends_on auto-promotion guard,
+/// board_drive.rs:1102) — that path stays conservative on purpose (MG-1388,
+/// 2026-08-15: auto-promoting a parked card re-activated it five times against
+/// the owner's explicit re-park). This only widens what counts as
+/// un-drained for a NON-destructive NUDGE, which the owning session can
+/// answer by either re-confirming the trigger (bumps `last_verified_at`) or
+/// finally acting on the card — never by an automated status change.
+const SOURCE_REF_STALE_S: i64 = 24 * 3600;
 /// Idle-backlog DRAIN nudge cooldown, SCALED TO THE BACKLOG SIZE. Distinct from
 /// the 72h stale-triage above — this fires when a lane is idle (no doing) with an
 /// empty todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
@@ -1929,7 +1951,11 @@ fn stale_backlog_candidates(
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
-    // types (tripwire/watch) and no card parked on a live source_ref trigger.
+    // types (tripwire/watch) and no card parked on a LIVE source_ref trigger.
+    // "Live" means re-verified within SOURCE_REF_STALE_S — a trigger nobody has
+    // re-checked in 24h+ is treated as if it were never set, so `--trigger`
+    // cannot be used to permanently exit the drain nudge on a card the owner
+    // is not actually revisiting (see SOURCE_REF_STALE_S doc for the incident).
     // OLDEST-first (AMUX-3779): the idle-drain nudge now lists the same
     // oldest-first order the todo scorer works in, so "what gets attention next"
     // reads one way across todo and backlog instead of newest-here/oldest-there.
@@ -1937,11 +1963,12 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
         "SELECT id, title, created FROM issues \
          WHERE session=?1 AND status='backlog' AND deleted IS NULL \
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
-         AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')='' \
+         AND type NOT IN ('tripwire','watch','epic') \
+         AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2) \
          ORDER BY created ASC LIMIT 8",
     )
     .and_then(|mut st| {
-        st.query_map(rusqlite::params![session], |r| {
+        st.query_map(rusqlite::params![session, now - SOURCE_REF_STALE_S], |r| {
             let created: i64 = r.get(2)?;
             let age_days = (now - created) / 86400;
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, age_days))
@@ -1970,6 +1997,7 @@ fn backlog_drain_text(cards: &[(String, String, i64)], drainable: i64) -> String
     // work"). Bounded 3..10 so the worker is never asked to bite off more than it
     // can honestly triage.
     let batch = (drainable / 10).clamp(3, 10);
+    let stale_h = SOURCE_REF_STALE_S / 3600;
     format!(
         "[amux] You are idle with {drainable} drainable card(s) in `backlog` and nothing in \
          `todo` or `doing`. board-drive only dispatches `todo`, so this queue will not move \
@@ -1980,10 +2008,14 @@ fn backlog_drain_text(cards: &[(String, String, i64)], drainable: i64) -> String
          relevant, say so and move it (review / done / archive). A card genuinely parked on a \
          condition (a dependency, an owner decision, a dedicated focused turn) belongs in \
          `backlog` WITH a trigger: `amux board <status> <id> --trigger \"what unblocks it\"` \
-         records the condition and EXCLUDES the card from this nudge, so escalation counts only \
-         un-parked work — reach for it instead of leaving a parked card to be re-listed. Do not \
-         leave the whole backlog sitting while you idle — drain it. This nudge repeats faster \
-         the larger your DRAINABLE backlog is, until it moves."
+         records the condition and EXCLUDES the card from this nudge for {stale_h}h, so escalation \
+         counts only un-parked work — reach for it instead of leaving a parked card to be \
+         re-listed. That exclusion EXPIRES: a trigger you have not re-confirmed in {stale_h}h is \
+         treated as un-set and the card returns here, because a trigger is a claim someone is \
+         still watching for the condition, not a permanent opt-out. If it is still genuinely \
+         blocked, re-run `--trigger` to refresh it; if not, act on the card. Do not leave the \
+         whole backlog sitting while you idle — drain it. This nudge repeats faster the larger \
+         your DRAINABLE backlog is, until it moves."
     )
 }
 
@@ -3551,15 +3583,20 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 // none of which have an honest path to `todo`). Exclude the same
                 // two things auto-pickup excludes: the dormant/armed types
                 // (tripwire, watch — they fire on an event, `is:armed`), and any
-                // card with a live `source_ref` trigger (parked on an external
-                // condition). If nothing drainable remains, the lane's backlog is
-                // all correctly parked and the drain nudge must stay quiet.
+                // card with a LIVE `source_ref` trigger (parked on an external
+                // condition, re-verified within SOURCE_REF_STALE_S). A trigger
+                // older than that is treated as un-set — see SOURCE_REF_STALE_S
+                // for why a fleet-wide sweep found this had gone to ~0 drainable
+                // almost everywhere despite hundreds of un-worked backlog cards.
+                // If nothing drainable remains, the lane's backlog is all
+                // correctly and CURRENTLY parked, and the drain nudge stays quiet.
                 let drainable_backlog: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
                          AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
-                         AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')=''",
-                        rusqlite::params![lane],
+                         AND type NOT IN ('tripwire','watch','epic') \
+                         AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2)",
+                        rusqlite::params![lane, now_i - SOURCE_REF_STALE_S],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
@@ -4859,9 +4896,10 @@ mod tests {
 
         // CORRECTLY-PARKED backlog is NOT drainable (mixpeek-autopilot, AMUX-3006):
         // a standing tripwire (fires on a condition, no honest path to todo) and a
-        // card armed on a live source_ref trigger must NOT appear as drain
-        // candidates — nudging them churns a compliant lane with no exit but a
-        // false close. Add both to a fresh lane whose ONLY other cards are parked.
+        // card armed on a FRESH (recently re-verified) source_ref trigger must NOT
+        // appear as drain candidates — nudging them churns a compliant lane with no
+        // exit but a false close. Add both to a fresh lane whose ONLY other cards
+        // are parked. CH-1's last_verified_at is `now`, i.e. re-confirmed today.
         conn.execute(
             "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
              VALUES ('TW-1','burn>=90% page watch','x','backlog','parked',?1,?1,'agent','tripwire')",
@@ -4869,15 +4907,34 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,source_ref) \
-             VALUES ('CH-1','chore blocked on a credential','x','backlog','parked',?1,?1,'agent','chore','clickhouse://blocked')",
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,source_ref,last_verified_at) \
+             VALUES ('CH-1','chore blocked on a credential','x','backlog','parked',?1,?1,'agent','chore','clickhouse://blocked',?1)",
             rusqlite::params![now as i64],
         )
         .unwrap();
         let parked = backlog_candidates(&conn, "parked", now as i64);
         assert!(
             parked.is_empty(),
-            "a tripwire and a source_ref-triggered card are correctly parked, not drainable: {parked:?}"
+            "a tripwire and a FRESHLY-verified source_ref-triggered card are correctly parked, not drainable: {parked:?}"
+        );
+
+        // SOURCE_REF_STALE_S: a trigger nobody has re-checked in 24h+ is NOT a
+        // live park — it must return as a drain candidate exactly like an
+        // unset source_ref would (AMUX-2984 shape: a card sat 56 days behind a
+        // `--trigger` nobody ever refreshed, invisible to this nudge the whole
+        // time). CH-2 carries a source_ref but NO last_verified_at at all
+        // (NULL — never even stamped once), which must count as stale, not live.
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,source_ref) \
+             VALUES ('CH-2','self-noted, not an external trigger','x','backlog','parked',?1,?1,'agent','chore','do this later when convenient')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        let parked_with_stale = backlog_candidates(&conn, "parked", now as i64);
+        assert_eq!(
+            parked_with_stale.iter().map(|(id, _, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["CH-2"],
+            "a source_ref never re-verified must drain like an unset one, and CH-1/TW-1 must stay excluded: {parked_with_stale:?}"
         );
     }
 
