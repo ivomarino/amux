@@ -33,7 +33,10 @@ owes two things: the fix, and a log signal so the next instance self-announces
 - `crates/amux-server` -- axum server: `src/api/`, `src/db/`, `migrations/`, `src/runtime_jobs/`
 - `crates/amux-dashboard` -- SPA: `static/` (`index.html`, `app.js`, `app.css`, `sw.js`)
 - `crates/amux-core` / `crates/amux-cli` -- shared types; Rust CLI
-- `amux` -- bash CLI (SYMLINK to `~/.local/bin/amux`, live on save, not on commit)
+- `amux` -- bash CLI. This file IS the fleet's CLI: `~/.local/bin/amux` is a
+  symlink pointing HERE, not the other way round. Live on save, not on commit —
+  and so also live on `git checkout`, `stash`, or a branch switch, which swap it
+  for all lanes with no save involved.
 - `e2e/` -- Playwright; `crates/amux-server/tests/` -- integration tests
 - `cloud/` -- cloud.amux.io (read `cloud/README.md` first)
 
