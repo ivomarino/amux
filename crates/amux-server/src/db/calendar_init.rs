@@ -147,7 +147,8 @@ mod tests {
     fn test_load_config_missing_file() {
         let config = load_config(Some("/nonexistent/path.json"));
         // Missing file should be treated as no accounts (not an error)
-        assert!(config.is_err()); // Actually it will error, let me check
+        assert!(config.is_ok());
+        assert_eq!(config.unwrap().accounts.len(), 0);
     }
 
     #[test]
