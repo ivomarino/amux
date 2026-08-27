@@ -835,6 +835,7 @@ mod tests {
         let store = crate::db::Store::open(&dir.path().join("g.db")).unwrap();
         (
             AppState {
+                secrets: std::sync::Arc::new(crate::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
                 store: Arc::new(store),
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
@@ -1102,6 +1103,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = crate::db::Store::open(&dir.path().join("full.db")).unwrap();
         let state = AppState {
+            secrets: std::sync::Arc::new(crate::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
             store: Arc::new(store),
             started: std::time::Instant::now(),
             build_hash: "test".into(),

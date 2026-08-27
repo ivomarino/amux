@@ -262,7 +262,7 @@ fn schema_only(value: &Value) -> Value {
         Value::Array(arr) => {
             Value::Array(
                 arr.iter()
-                    .map(|v| schema_only(v))
+                    .map(schema_only)
                     .collect(),
             )
         }

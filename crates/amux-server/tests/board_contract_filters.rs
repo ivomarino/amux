@@ -25,6 +25,7 @@ async fn contract() -> Value {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("contract-test.db")).unwrap();
     let state = AppState {
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
         store: std::sync::Arc::new(store),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
@@ -157,6 +158,7 @@ async fn contract_serves_the_enforced_gate_not_just_type_defaults() {
     let store = Store::open(&dir.path().join("contract-gate-test.db")).unwrap();
     let store = std::sync::Arc::new(store);
     let state = AppState {
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
         store: store.clone(),
         started: std::time::Instant::now(),
         build_hash: "test".into(),
