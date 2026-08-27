@@ -728,7 +728,13 @@
     position: sticky; bottom: 0; z-index: 3; flex-shrink: 0;
     background: var(--card);
     border-top: 1px solid var(--border);
-    margin: 12px calc(-1 * var(--modal-pad)) calc(-1 * var(--modal-pad));
+    /* 20px top margin, not 12px: the NEGATIVE bottom margin below pulls the
+       footer flush with the box edge, and it shortens the scroller by exactly
+       that much — so at full scroll the last field still sat 7px under the
+       button bar (measured live, 2026-08-27). The bottom bleed is what makes
+       the footer flush and is worth keeping; the top margin buys the scroll
+       distance back without adding a gap under the buttons. */
+    margin: 20px calc(-1 * var(--modal-pad)) calc(-1 * var(--modal-pad));
     padding: 10px var(--modal-pad);
     /* iPhone PWA: clear the home indicator (.claude/rules/css-mobile.md) */
     padding-bottom: max(var(--modal-pad), env(safe-area-inset-bottom));
