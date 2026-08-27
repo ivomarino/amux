@@ -95,11 +95,30 @@ fi
 # could not read a JSON file would be a worse bug than the one it fixes, and a
 # human commit ("(human)") has no conversation to name.
 #
-# WHAT THIS DOES NOT FIX, stated so nobody reads the trailer as complete:
-# `git commit-tree` fires no hooks, and graft-push is built on it. A grafted
-# commit carries NEITHER trailer, so absence still has several causes that read
-# identically. That axis is a recipe change, not a hook change — a hook cannot
-# repair a path that never invokes it.
+# THE GRAFT PATH, which invokes no hook at all (AMUX-3782). `git commit-tree`
+# is plumbing and fires nothing, so a graft-pushed commit carries neither
+# trailer. Measured 2026-08-26, last 400 commits on each repo's origin/main:
+# amux 380/400 stamped (95%, lanes here use `git commit`), mixpeek 202/400
+# (50%, the repo where grafting past a peer's dirty worktree is routine).
+#
+# The answer is not a second producer of the trailer block. Run THIS FILE by
+# hand on the message you are about to hand to commit-tree:
+#
+#     .git/hooks/prepare-commit-msg "$MSG"
+#     SHA=$(git commit-tree -p origin/main -F "$MSG" "$TREE")
+#
+# It takes a message file and stamps it in place, so a graft gets exactly what
+# `git commit` would have given it: both fields, the final-newline guard above,
+# and an existing peer's trailer left alone. The alternative, a hand-rolled
+# `git interpret-trailers --trailer "Amux-Session: $AMUX_SESSION"` line, had
+# already drifted before it was proposed — it stamps the session and drops the
+# conversation, because a one-liner carries only the fields its author knew
+# about. `scripts/test-graft-stamp.sh` pins the recipe above cell by cell, and
+# its cell D is exactly that difference.
+#
+# A STALE vendored copy under .git/hooks stamps a graft with whatever it would
+# have stamped a commit in the same checkout — no worse than the commit path,
+# and the SessionStart freshness hook already reports that drift by name.
 conv=""
 if [ "$stamp" != "(human)" ]; then
   _meta="${AMUX_HOME:-$HOME/.amux}/sessions/${stamp}.meta.json"

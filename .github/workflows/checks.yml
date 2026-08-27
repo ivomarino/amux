@@ -255,3 +255,12 @@ jobs:
           # nobody sets is decoration (ethos rule 1), and an export placed after
           # serve-head.sh's `exec` would look correct in a diff and never run.
           ./scripts/test-e2e-no-self-adopt.sh
+          # AMUX-3782: a GRAFTED commit must be as attributable as a committed
+          # one. Cell B is the control — every other cell asserts a trailer is
+          # present, so without B a version that stamped nothing would pass.
+          # Cell D is the one that decides the design: it is green for "call the
+          # shipped hook" and red for a hand-rolled interpret-trailers line,
+          # because a second producer of the trailer block had already drifted
+          # past Amux-Conversation before it was written. All three mutants were
+          # confirmed to fail the intended cell and only that cell.
+          ./scripts/test-graft-stamp.sh
