@@ -1093,7 +1093,20 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         log: r.get(21)?,
         rev: r.get(22)?,
         source_ref: r.get(23)?,
-        last_verified_at: r.get(24)?,
+        // Some Python-era databases stored this column as TEXT despite the
+        // schema saying INTEGER (legacy-data mismatch, not a live schema
+        // bug) — rusqlite's FromSql is strict per storage type, so EITHER
+        // `Option<i64>` alone (fails on legacy TEXT) or `Option<String>`
+        // alone (fails on the normal, correct INTEGER case — the majority)
+        // errors on one side or the other. Reading as the type-erased
+        // `Value` and matching both storage shapes is the only form that
+        // works for both; unparseable/other becomes None rather than
+        // crashing on startup.
+        last_verified_at: match r.get::<_, rusqlite::types::Value>(24)? {
+            rusqlite::types::Value::Integer(n) => Some(n),
+            rusqlite::types::Value::Text(s) => s.trim().parse::<i64>().ok(),
+            _ => None,
+        },
         version: r.get(25)?,
         epic: r.get(26)?,
         closed_at: r.get(27)?,
