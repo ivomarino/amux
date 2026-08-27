@@ -13231,8 +13231,52 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                 let action = crate::orchestrator::compaction::compaction_action(pct);
                 use crate::orchestrator::compaction::CompactionAction as CA;
                 if matches!(action, CA::Compact | CA::ForceCompact) {
+                    // THE COMMAND COMES FROM THE PROVIDER, NOT FROM HERE
+                    // (AMUX-3807). This line used to be the literal "/compact",
+                    // a Claude Code slash command sent with no provider check —
+                    // exactly the `if provider == "x"` branch that
+                    // provider/mod.rs's header forbids, written as a constant so
+                    // it did not look like one.
+                    //
+                    // Harmless only by accident so far: `used_tokens` arrives in
+                    // a Claude-shaped hook report, so no Gemini or Codex lane has
+                    // ever reached this code (measured 2026-08-27 — zero
+                    // auto-compacts, ever, across all seven non-Claude lanes).
+                    // The moment amux gains a provider-independent context signal
+                    // (AMUX-3806), every one of them would have started receiving
+                    // `/compact` as literal text.
+                    let provider = provider_of(&parse_env(name));
+                    let compaction = crate::provider::default_registry()
+                        .resolve(&provider)
+                        .map(|a| a.compaction())
+                        .unwrap_or(crate::provider::Compaction::Unsupported);
+                    let cmd_opt = match compaction {
+                        crate::provider::Compaction::Command(c) => Some(c),
+                        // TYPE NOTHING. A borrowed command lands in the
+                        // conversation as literal text and consumes the context
+                        // it was sent to reclaim, so the lane is left worse off
+                        // AND told nothing. Silence plus a WARN is the honest
+                        // state: amux cannot compact this provider, and that gap
+                        // is now visible instead of being hidden behind a command
+                        // that appears to work.
+                        crate::provider::Compaction::Unsupported => {
+                            tracing::warn!(
+                                target: "compaction",
+                                session = %name, %provider, pct, used,
+                                "context low but amux has NO compaction path for this provider — \
+                                 nothing sent. This lane will run out unassisted (AMUX-3807); \
+                                 give its adapter a Compaction::Command once someone has \
+                                 verified the command, or it needs a different remedy."
+                            );
+                            None
+                        }
+                    };
+                    // Everything below sends. Skipped entirely when the provider
+                    // has no compaction path, so `Unsupported` is a no-op that
+                    // announced itself rather than a message nobody can use.
+                    if let Some(cmd) = cmd_opt {
                     let msg = format!(
-                        "/compact\n\nContext is at {pct}% remaining ({used} tokens of a \
+                        "{cmd}\n\nContext is at {pct}% remaining ({used} tokens of a \
                          {} window). Compacting now keeps you working — running out is not a \
                          reason to stop. If you are mid-task, compact and continue where you \
                          left off.",
@@ -13280,6 +13324,7 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                         already_pending = pending_age_s.is_some(),
                         "auto-compact queued — context low"
                     );
+                    }
                     emit_event(
                         state,
                         name,
