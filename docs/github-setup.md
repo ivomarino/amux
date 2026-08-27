@@ -7,8 +7,8 @@ Configure these secrets for GitHub integration (Phase 7):
 Visit: https://github.com/settings/developers/new
 
 - **Application name:** amux-github-connector
-- **Homepage URL:** https://localhost:8824
-- **Authorization callback URL:** http://localhost:8824/api/github/callback
+- **Homepage URL:** https://localhost:8823
+- **Authorization callback URL:** http://localhost:8823/api/github/callback
 - **Description:** Local amux GitHub integration
 
 ## 2. Store Credentials in Secrets
@@ -19,7 +19,7 @@ Update `~/.amux/server.env` with your GitHub OAuth credentials:
 # GitHub OAuth (for Phase 7 connector)
 EXTERNAL_SERVICES_GITHUB_CLIENT_ID=Ov23liXXXXXXX
 EXTERNAL_SERVICES_GITHUB_CLIENT_SECRET=<client_secret>
-EXTERNAL_SERVICES_GITHUB_REDIRECT_URI=http://localhost:8824/api/github/callback
+EXTERNAL_SERVICES_GITHUB_REDIRECT_URI=http://localhost:8823/api/github/callback
 ```
 
 Or encrypt in secrets store:
@@ -30,17 +30,17 @@ oauth:
   github:
     client_id: Ov23liXXXXXXX
     client_secret: <secret>
-    redirect_uri: http://localhost:8824/api/github/callback
+    redirect_uri: http://localhost:8823/api/github/callback
 ```
 
 ## 3. Test Connection
 
 ```bash
 # Check GitHub connector status
-curl -sk https://localhost:8824/api/github/status
+curl -sk https://localhost:8823/api/github/status
 
 # Start OAuth flow
-curl -sk https://localhost:8824/api/github/auth/start
+curl -sk https://localhost:8823/api/github/auth/start
 ```
 
 ## 4. Features Enabled
