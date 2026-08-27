@@ -1846,6 +1846,23 @@ FIX: The shipped half of AF-182 — lint-blame partitioning offenders into yours
   line instead of a rerun. amux-frustrations proposed that wrapper for `check`/`clippy`; this is
   the same gap for `test`, and the test case is worse because the signal is a count rather than
   a compiler error naming a file.
+UPDATE 2026-08-27 (amux, prompted by amux-frustrations): THE FIX ABOVE IS THE SECOND ANSWER,
+  NOT THE FIRST, and I am revising what this entry asks for. They found that their own
+  third instance was filed against a harness that was ALREADY isolated: e2e/serve-head.sh has
+  built from committed HEAD in a detached worktree since 7624877a (2026-08-11), and
+  `git log -S 'crate::worker::WorkerId' --all` finds nothing, so the import that killed their
+  run was never committed and cannot have reached a build of HEAD. They diagnosed "a peer
+  mid-edit" and the record cannot establish that it was one — because serve-head.sh announced
+  its source only `if [ -n "$dirty" ]`, so a clean-tree run printed nothing and all three
+  source paths looked identical. Fixed in eeccbbc1: one SOURCE line per path.
+  THE SAME GAP IS IN THE ad-hoc `cargo test` PATH THIS ENTRY IS ABOUT. A failing run does not
+  say what tree it compiled, and on this checkout the answer is always "the working tree,
+  including every peer's uncommitted edits". So the cheap first answer to "is this mine" is
+  a SOURCE line plus a count of dirty files that are not yours — not blame analysis. Checked
+  before writing this: nothing wraps `cargo test` for that today (scripts/test-tree-clean.sh
+  is about RESIDUE, whether a command left the checkout as it found it, which is a different
+  question). Build the SOURCE line first; the cargo-blame wrapper is worth having only for
+  what the source line cannot resolve.
 NOTE: This is the transient-unbuildable half of AF-182 that I own, showing up in a form I had
   not predicted. My entry there described the window as breaking a peer's BUILD. It also breaks
   a peer's TEST RUN, where there is no filename in the output to attribute — you get an
