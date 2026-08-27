@@ -272,6 +272,15 @@ jobs:
           # fleet on a bad network is worse than the contention it fixes. Runs
           # against a fake gh and a fake minter, so no cell touches GitHub.
           ./scripts/test-gh-shim.sh
+          # AMUX-3797: "which commits were never compiled as committed" must be
+          # answerable, and must REFUSE when it cannot be. Cell 3 is the control
+          # - with no builder log the naive version reports EVERY commit as
+          # unbuilt, which is absence read as emptiness. Cell 5 pins the
+          # non-Rust exclusion: the builder targets `git log -1 -- crates/
+          # Cargo.toml Cargo.lock`, so counting docs commits as misses read
+          # 83-of-235 against a true 0-of-152. Cell 2 pins that a SKIP line is
+          # the dedupe, not a missed build.
+          ./scripts/test-unbuilt-commits.sh
           # install-hooks.sh must work FROM A LINKED WORKTREE — CLAUDE.md tells
           # every session to develop in one, and `.git` is a FILE there, so the
           # hardcoded "$ROOT/.git/hooks" died mid-run and left the checkout with
