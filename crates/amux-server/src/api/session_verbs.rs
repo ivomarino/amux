@@ -7983,6 +7983,25 @@ fn list_session_transcripts(name: &str) -> Vec<Value> {
 const MEM_MARKER: &str = "<!-- amux:session-memory -->";
 const MEM_TOPIC_FILE: &str = "amux-api.md";
 
+/// The roster's preamble and table header, split out of `fleet_roster` so a test
+/// can read it without a live fleet on disk (ethos rule 7 — `fleet_roster()`
+/// returns an empty string when no peers exist, so a test that only called it
+/// would pass on an empty machine while asserting nothing).
+///
+/// EVERY LINE HERE STARTS AT COLUMN 0 IN THE OUTPUT. Rust keeps a plain
+/// multi-line literal's indentation, so each source line ends with a `\`
+/// continuation. Without it the leading spaces are baked into the value, and
+/// this string is written into every worker's MEMORY.md: the two prose lines
+/// shipped indented by nine spaces, and so did the table HEADER, which in
+/// markdown is an indented code block and breaks the table it heads (AMUX-3810).
+const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-generated, do not edit)\n\n\
+     Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
+     this directory, so it cannot omit the reader. You are the one whose name matches \
+     $AMUX_SESSION.\n\n\
+     Reach any of them with `amux send <name> --stdin` (origin-stamped). Peek before \
+     interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n\
+     | worker | groups | description |\n|---|---|---|\n";
+
 /// The fleet roster every worker gets, regenerated on each write.
 ///
 /// Ethan: "make sure all workers are always aware of each others: name, groups,
@@ -8047,11 +8066,7 @@ fn fleet_roster() -> String {
     if rows.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "\n## Fleet — who else is running (auto-generated, do not edit)\n\n         Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
-this directory, so it cannot omit the reader. You are the one whose name matches $AMUX_SESSION.\n\n\
-Reach any of them with `amux send <name> --stdin` (origin-stamped).          Peek before interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n         | worker | groups | description |\n|---|---|---|\n",
-    );
+    let mut out = String::from(FLEET_ROSTER_HEADER);
     for (n, g, d) in rows.iter().take(120) {
         let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
         out.push_str(&format!("| `{n}` | {} | {} |\n", if g.is_empty() { "—" } else { g }, if d.is_empty() { "—" } else { &d }));
@@ -8117,7 +8132,8 @@ fn compose_worker_block(name: &str, session_content: &str) -> String {
         return String::new();
     }
     format!(
-        "## Worker memory — `{name}`\n\n         <!-- Written by the {name} lane. If you are not {name}, this is a peer's \
+        "## Worker memory — `{name}`\n\n\
+         <!-- Written by the {name} lane. If you are not {name}, this is a peer's \
          memory: useful context, not your own notes. Your own is at \
          ~/.amux/memory/<your-worker>.md and reaches this file when you write it. -->\n\n{}",
         session_content.trim()
@@ -20042,6 +20058,46 @@ mod roster_tests {
             "a peer reading this must be told it is not theirs; got:\n{b}"
         );
         assert!(b.contains("remember: the thing"), "content must survive labelling");
+    }
+
+    /// Nothing amux writes into MEMORY.md may carry SOURCE indentation (AMUX-3810).
+    ///
+    /// A plain multi-line Rust literal keeps its indentation, so a forgotten `\`
+    /// bakes the code's leading spaces into the value. Both of these strings had
+    /// one, and the damage is not cosmetic: the roster's TABLE HEADER shipped
+    /// with nine leading spaces, which markdown reads as an indented code block,
+    /// so the header of the fleet table was not part of the table in any of the
+    /// ~224 MEMORY.md files that carry it.
+    ///
+    /// This asserts the OUTPUT rather than the source, so it survives any future
+    /// reflow of the literal. The control is the last cell: a check that only
+    /// looked for leading spaces would miss the mid-line run, and a check that
+    /// only looked mid-line would miss the table header.
+    #[test]
+    fn memory_blocks_carry_no_baked_in_source_indentation() {
+        for (what, text) in [
+            ("fleet roster header", FLEET_ROSTER_HEADER.to_string()),
+            ("worker memory block", compose_worker_block("amux", "note")),
+        ] {
+            for (i, line) in text.lines().enumerate() {
+                assert!(
+                    !line.starts_with(' '),
+                    "{what} line {i} is indented, which markdown reads as a code block: {line:?}"
+                );
+                assert!(
+                    !line.contains("   "),
+                    "{what} line {i} carries a swallowed line-continuation: {line:?}"
+                );
+            }
+        }
+        // CONTROL: the assertion above can fail. A literal written the broken way
+        // trips both arms, so neither is decorative.
+        let broken = "ok\n         indented\nrun    of    spaces";
+        assert!(broken.lines().any(|l| l.starts_with(' ')));
+        assert!(broken.lines().any(|l| l.contains("   ")));
+        // And the header still says the things it exists to say.
+        assert!(FLEET_ROSTER_HEADER.contains("| worker | groups | description |"));
+        assert!(FLEET_ROSTER_HEADER.contains("INCLUDING YOU"));
     }
 
     /// A header over nothing is itself a claim ("this lane recorded nothing").

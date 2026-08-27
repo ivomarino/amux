@@ -153,7 +153,8 @@ pub fn route_callers_have_routes_with(
                         ID,
                         format!("{} stays in CALLER_GUARDED_ABSENT only while unrouted", c.path),
                         format!(
-                            "{} now has a mounted route — the CALLER_GUARDED_ABSENT entry is                              STALE; delete it so the census guards this family again",
+                            "{} now has a mounted route — the CALLER_GUARDED_ABSENT entry is \
+                             STALE; delete it so the census guards this family again",
                             c.path
                         ),
                     )
