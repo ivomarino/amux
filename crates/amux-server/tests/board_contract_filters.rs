@@ -274,6 +274,7 @@ async fn contract_and_rows() -> (Value, Value, Value) {
         started: std::time::Instant::now(),
         build_hash: "test".into(),
         auth_token: None,
+        secrets: std::sync::Arc::new(amux_server::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
     };
     let app = router(state);
     let get = |uri: String, method: &'static str, body: Body| {
