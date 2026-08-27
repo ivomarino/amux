@@ -88,6 +88,31 @@ async fn get_history_item(
             let mtype = d.get("type").and_then(Value::as_str).unwrap_or("").to_string();
             d["kind"] = json!(msg_kind(&mtype));
             d["queued"] = json!(msg_is_queued(&mtype));
+            // JOIN THE INSTRUMENT THAT CAN ACTUALLY ANSWER. Matched on session
+            // and a +/-10s window around `ts`, never on text: cmd_history keeps
+            // the "[08:19 AM] " prefix the composer adds and steering_history
+            // does not, so a text match silently misses the rows that matter.
+            let delivery = d.get("delivery").and_then(Value::as_str).unwrap_or("").to_string();
+            let steering = if delivery == "direct" {
+                None
+            } else {
+                let sess = d.get("session").and_then(Value::as_str).unwrap_or("").to_string();
+                let ts_s = d.get("ts").and_then(Value::as_i64).unwrap_or(0) as f64 / 1000.0;
+                conn.query_row(
+                    "SELECT delivered_at FROM steering_history \
+                     WHERE session = ?1 AND ABS(queued_at - ?2) <= 10 \
+                     ORDER BY ABS(queued_at - ?2) LIMIT 1",
+                    rusqlite::params![sess, ts_s],
+                    |r| r.get::<_, Option<f64>>(0),
+                )
+                .ok()
+            };
+            let (verdict, source) = delivery_truth(&delivery, steering);
+            d["delivered"] = json!(verdict);
+            d["delivered_source"] = json!(source);
+            if let Some(Some(t)) = steering {
+                d["delivered_at_actual"] = json!((t * 1000.0) as i64);
+            }
         }
         Ok(rows.into_iter().next())
     })
@@ -97,6 +122,51 @@ async fn get_history_item(
         Ok(Ok(None)) => err(StatusCode::NOT_FOUND, json!({ "error": format!("MSG-{nid} not found") })),
         Ok(Err(e)) => internal(e),
         Err(e) => internal(e),
+    }
+}
+
+/// Whether a recorded message was actually DELIVERED, and which instrument says so.
+///
+/// `cmd_history` CANNOT answer this and has now misled in both directions on the
+/// same column:
+///
+///   - AF-159 read "all 144 have delivered_at set, so these landed". False —
+///     the column was a copy of the insert time (AMUX-3541 stopped the copy).
+///   - A frustration sweep on 2026-08-27 read "92 of 92 queued rows have a NULL
+///     delivered_at, so none landed" and nearly filed 92 lost messages. Also
+///     false — nothing stamps the column on delivery, which AMUX-3541's own
+///     comment says in as many words. steering_history showed both specimens
+///     delivered in 2-3 seconds.
+///
+/// A NULL that means "not delivered" and a NULL that means "nobody writes here"
+/// are the same bytes, so every reader has to know a fact that is not in the
+/// payload. `steering_history` IS stamped by the deliverer, so it can answer —
+/// and this joins the two rather than waiting for the deliverer to backfill.
+///
+/// `steering` encodes THREE input states, because collapsing the last two is the
+/// whole defect: None = no matching row; Some(None) = row found, unstamped;
+/// Some(Some(t)) = row found, delivered at t.
+fn delivery_truth(cmd_delivery: &str, steering: Option<Option<f64>>) -> (&'static str, &'static str) {
+    // A DIRECT send really was delivered when it was recorded — AMUX-3541 kept
+    // `now_ms` there for exactly that reason, so cmd_history is authoritative
+    // for this case and no join is needed.
+    if cmd_delivery == "direct" {
+        return ("delivered", "cmd_history — a direct send is delivered when it is recorded");
+    }
+    match steering {
+        Some(Some(_)) => ("delivered", "steering_history — stamped by the deliverer when it landed"),
+        Some(None) => (
+            "not delivered",
+            "steering_history — the deliverer holds this row and has not stamped it",
+        ),
+        // NOT "not delivered". The absence of a steering row is a fact about our
+        // lookup, not about the message, and reporting it as a negative is the
+        // exact misreading this function exists to stop.
+        None => (
+            "unknown",
+            "no matching steering_history row — and cmd_history.delivered_at is NOT stamped \
+             for queued rows (AMUX-3541), so its NULL is not evidence either way",
+        ),
     }
 }
 
@@ -860,6 +930,56 @@ mod tests {
         for a in AMUX_TYPES {
             assert!(!UNSTAMPED_TYPES.contains(&a), "{a:?} cannot be both amux and unstamped");
         }
+    }
+
+    /// The sweep instrument that misled in both directions must now be unable to.
+    ///
+    /// Both historical misreadings were of the SAME column and pointed opposite
+    /// ways, which is the tell that the column cannot answer the question at
+    /// all: AF-159 concluded "delivered" from a non-NULL that was a copy of the
+    /// insert time; a 2026-08-27 sweep nearly concluded "92 lost messages" from
+    /// a NULL that only means nobody writes there.
+    #[test]
+    fn an_unstamped_column_is_never_read_as_a_delivery_verdict() {
+        // The case that nearly produced a false finding: queued, cmd_history
+        // silent, and the deliverer's own table says it landed in 2 seconds.
+        let (v, src) = delivery_truth("queued", Some(Some(1_787_779_179.0)));
+        assert_eq!(v, "delivered");
+        assert!(src.contains("steering_history"), "must name the instrument that answered: {src}");
+
+        // A row the deliverer HOLDS and has not stamped is real evidence of
+        // non-delivery, and must not be flattened into the unknown case.
+        assert_eq!(delivery_truth("queued", Some(None)).0, "not delivered");
+
+        // NO ROW IS NOT A NEGATIVE. This is the assertion that stops the whole
+        // class: absence of a lookup result is a fact about the lookup.
+        let (v3, src3) = delivery_truth("queued", None);
+        assert_eq!(v3, "unknown", "no steering row means we cannot tell, not that it failed");
+        assert_ne!(v3, "not delivered");
+        assert!(
+            src3.contains("NOT stamped"),
+            "the reader must be told WHY the obvious column cannot be used, or they will \
+             use it: {src3}"
+        );
+
+        // The three inputs must not collapse into two outputs — if any pair
+        // renders alike, the join has bought nothing over reading the column.
+        let all = [
+            delivery_truth("queued", Some(Some(1.0))).0,
+            delivery_truth("queued", Some(None)).0,
+            delivery_truth("queued", None).0,
+        ];
+        let mut uniq = all.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "three input states must yield three verdicts: {all:?}");
+
+        // A direct send is honestly answerable from cmd_history alone (AMUX-3541
+        // kept `now_ms` there deliberately), so it must NOT be reported as
+        // unknown merely because no steering row was looked up.
+        let (v4, src4) = delivery_truth("direct", None);
+        assert_eq!(v4, "delivered");
+        assert!(src4.contains("cmd_history"), "and it must say which instrument: {src4}");
     }
 
     #[test]
