@@ -32,7 +32,7 @@
 //!
 //! # The two-process race is the dedupe
 //!
-//! Two amux-server processes share one DB (8823 and 8824), so a naive
+//! Two amux-server processes share one DB (8824 and 8824), so a naive
 //! "read stamp, then write stamp" would have both report the same outage. The
 //! read and the write happen inside ONE [`crate::db::Store::write`] closure,
 //! which the writer thread runs under `BEGIN IMMEDIATE` — atomic across
@@ -614,7 +614,7 @@ mod tests {
         assert!(boot_tx(&c, 120.5, 120.0, 1, None).unwrap().is_some(), "past the floor is");
     }
 
-    /// The two-process dedupe. 8823 and 8824 share one DB and boot together;
+    /// The two-process dedupe. 8824 and 8824 share one DB and boot together;
     /// the writer thread's BEGIN IMMEDIATE serialises these two calls, so the
     /// second must see the FRESH stamp the first just wrote and stay quiet.
     /// Without this the fleet would file every outage twice.
@@ -623,7 +623,7 @@ mod tests {
         let c = db();
         stamp(&c, 0.0).unwrap();
         let first = boot_tx(&c, 10_000.0, 120.0, 8824, None).unwrap();
-        let second = boot_tx(&c, 10_000.1, 120.0, 8823, None).unwrap();
+        let second = boot_tx(&c, 10_000.1, 120.0, 8824, None).unwrap();
         assert!(first.is_some(), "the first process through sees the stale stamp");
         assert!(second.is_none(), "the second sees a stamp 0.1s old — no second row");
         assert_eq!(outages(&c).len(), 1);

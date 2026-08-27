@@ -156,11 +156,11 @@ mod tests {
 
         let temp_file = NamedTempFile::new().unwrap();
         let secrets_path = temp_file.path();
-        let age_key_path = PathBuf::from(
-            std::env::var("AGE_KEY_PATH").unwrap_or_else(|_| {
-                "~/.config/sops/age/keys.txt".to_string()
-            }),
-        );
+        let age_key_path = std::env::var("AMUX_AGE_KEY_PATH")
+            .ok()
+            .filter(|p| !p.trim().is_empty())
+            .unwrap_or_else(|| "~/.config/sops/age/keys.txt".to_string());
+        let age_key_path = PathBuf::from(shellexpand::tilde(&age_key_path).as_ref());
 
         // Try to encrypt
         match encrypt_and_persist(&test_secrets, secrets_path, &age_key_path).await {

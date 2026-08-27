@@ -10,13 +10,13 @@ All workers should know how to add, fetch, update, and manage secrets. This is t
 
 ```bash
 # View all secrets with metadata
-curl -sk https://localhost:8823/api/secrets/manifest | python3 -m json.tool
+curl -sk https://localhost:8824/api/secrets/manifest | python3 -m json.tool
 
 # Get a specific secret
-curl -sk https://localhost:8823/api/secrets/oauth.google.main
+curl -sk https://localhost:8824/api/secrets/oauth.google.main
 
 # Get metadata for a secret
-curl -sk https://localhost:8823/api/secrets/oauth.google.main/metadata
+curl -sk https://localhost:8824/api/secrets/oauth.google.main/metadata
 
 # Update metadata
 curl -sk -X POST -H 'Content-Type: application/json' \
@@ -27,7 +27,7 @@ curl -sk -X POST -H 'Content-Type: application/json' \
     "used_by":["dashboard","api"],
     "owner":"platform-team",
     "rotation_days":90
-  }' https://localhost:8823/api/secrets/oauth.google.main/metadata
+  }' https://localhost:8824/api/secrets/oauth.google.main/metadata
 ```
 
 ---
@@ -38,7 +38,7 @@ curl -sk -X POST -H 'Content-Type: application/json' \
 
 ```
 ┌─────────────────────────────────────────┐
-│         REST API (Port 8823)            │
+│         REST API (Port 8824)            │
 │  /api/secrets/manifest                  │
 │  /api/secrets/{path}                    │
 │  /api/secrets/{path}/metadata           │
@@ -79,7 +79,7 @@ amux-secrets   secret_metadata
 # Via API (recommended)
 curl -sk -X POST -H 'Content-Type: application/json' \
   -d '{"value":"<actual-secret-value>"}' \
-  https://localhost:8823/api/secrets/my.new.secret
+  https://localhost:8824/api/secrets/my.new.secret
 ```
 
 **Step 2: Add metadata**
@@ -93,26 +93,26 @@ curl -sk -X POST -H 'Content-Type: application/json' \
     "used_by": ["service1", "service2"],
     "owner": "team-name",
     "rotation_days": 90
-  }' https://localhost:8823/api/secrets/my.new.secret/metadata
+  }' https://localhost:8824/api/secrets/my.new.secret/metadata
 ```
 
 ### Fetch a Secret
 
 **Get the actual secret value:**
 ```bash
-curl -sk https://localhost:8823/api/secrets/oauth.google.main
+curl -sk https://localhost:8824/api/secrets/oauth.google.main
 # Returns: {"value":"<decrypted-secret>"}
 ```
 
 **Get metadata about a secret:**
 ```bash
-curl -sk https://localhost:8823/api/secrets/oauth.google.main/metadata
+curl -sk https://localhost:8824/api/secrets/oauth.google.main/metadata
 # Returns: service, purpose, owner, rotation info, dependencies
 ```
 
 **List all secrets with metadata:**
 ```bash
-curl -sk https://localhost:8823/api/secrets/manifest
+curl -sk https://localhost:8824/api/secrets/manifest
 # Returns: Array of all secrets with full metadata
 ```
 
@@ -129,7 +129,7 @@ curl -sk -X POST -H 'Content-Type: application/json' \
     "used_by": ["dashboard", "api-gateway", "mobile"],
     "owner": "security-team",
     "rotation_days": 60
-  }' https://localhost:8823/api/secrets/oauth.google.main/metadata
+  }' https://localhost:8824/api/secrets/oauth.google.main/metadata
 ```
 
 **Note:** Metadata updates do NOT change the secret value itself. To change a secret value, use the POST to `/api/secrets/{path}` endpoint.
@@ -173,7 +173,7 @@ The system automatically calculates:
 
 ## Dashboard UI
 
-The web dashboard (https://localhost:8823) shows:
+The web dashboard (https://localhost:8824) shows:
 - Secret names and paths
 - Associated service name
 - Purpose and description
@@ -188,21 +188,21 @@ The web dashboard (https://localhost:8823) shows:
 
 **Find secrets by service:**
 ```bash
-curl -sk https://localhost:8823/api/secrets/manifest | \
+curl -sk https://localhost:8824/api/secrets/manifest | \
   python3 -c "import json,sys; d=json.load(sys.stdin); \
   [print(s['path']) for s in d['secrets'] if 'oauth' in s['service']]"
 ```
 
 **Find secrets needing rotation:**
 ```bash
-curl -sk https://localhost:8823/api/secrets/manifest | \
+curl -sk https://localhost:8824/api/secrets/manifest | \
   python3 -c "import json,sys; d=json.load(sys.stdin); \
   [print(s['path']) for s in d['secrets'] if s.get('needs_rotation')]"
 ```
 
 **Search by owner:**
 ```bash
-curl -sk https://localhost:8823/api/secrets/manifest | \
+curl -sk https://localhost:8824/api/secrets/manifest | \
   python3 -c "import json,sys; d=json.load(sys.stdin); \
   [print(s['path']) for s in d['secrets'] if 'security' in s.get('owner','').lower()]"
 ```
@@ -250,10 +250,10 @@ GET /api/secrets/{path}/metadata
 - Neither value nor metadata exists
 - Add the secret value first via POST to `/api/secrets/{path}`
 
-**Port 8823 not responding**
+**Port 8824 not responding**
 - Check: `ps aux | grep amux-server-rs`
 - Restart: `pkill -9 amux-server-rs && ~/.local/bin/amux-server-rs &`
-- Verify: `curl -sk https://localhost:8823/health`
+- Verify: `curl -sk https://localhost:8824/health`
 
 **"Permission denied" during build**
 - Server binary lost execute permissions

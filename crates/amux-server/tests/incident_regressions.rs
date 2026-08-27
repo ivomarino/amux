@@ -45,7 +45,7 @@
 //!                        covering every exclusion: needs:you, wip-cap, archived,
 //!                        human-owned, dormant, reclaim-cooldown).
 //!     - AMUX-2672     port default. CAUTION recorded for the next reader:
-//!                     DEFAULT_PORT is 8823 BY DESIGN (install.sh sets 8824), so
+//!                     DEFAULT_PORT is 8824 BY DESIGN (install.sh sets 8824), so
 //!                     a "default == 8824" test is WRONG — the pinned invariant
 //!                     is default == DEFAULT_PORT.
 //!                     -> config::tests::defaults_when_nothing_set.

@@ -2,7 +2,7 @@
 //!
 //! At server startup:
 //! 1. Read secrets/amux-secrets.yaml (encrypted with age)
-//! 2. Decrypt using age key from ~/.config/sops/age/keys.txt
+//! 2. Decrypt using age key from ~/.config/sops/age/keys.txt (or AMUX_AGE_KEY_PATH env var)
 //! 3. Parse YAML into in-memory SecretStore
 //! 4. Expose via environment variables and API
 //!
