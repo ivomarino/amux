@@ -1925,12 +1925,27 @@ pub(crate) fn worker_model_env(
     default_model: &str,
 ) -> (String, String, String) {
     let is_ollama = provider == "ollama";
-    let model = if is_ollama {
+    // THE CLAUDE DEFAULT MODEL BELONGS TO CLAUDE ONLY (Ethan, 2026-08-27,
+    // screenshot of gtm-researcher-gemini).
+    //
+    // AMUX-3182 fixed this for ollama BY NAME — `is_ollama` — and left the same
+    // defect for every other non-Claude provider. A gemini worker created with
+    // no model got CC_FLAGS="--model sonnet", and a Claude model name is not a
+    // thing the Gemini API can be asked for: every request died with
+    // `models/sonnet is not found for API version v1beta`. The worker was dead
+    // on arrival and the failure named a model the user never chose.
+    // Reproduced before fixing: POST {"provider":"gemini"} -> "--model sonnet".
+    //
+    // An UNSPECIFIED model now means "let the provider's own CLI decide", which
+    // is the only answer that is right for a provider amux does not have a
+    // model table for. Guessing a gemini model name here would be the same bug
+    // one name over — the enumeration is what failed, not the value in it.
+    let model = if is_ollama || !raw_model.is_empty() {
         raw_model.to_string()
-    } else if raw_model.is_empty() {
+    } else if provider == "claude" {
         default_model.to_string()
     } else {
-        raw_model.to_string()
+        String::new()
     };
     let cc_flags = if !explicit_flags.is_empty() {
         explicit_flags.to_string()
@@ -3007,6 +3022,40 @@ mod tests {
     /// never as `--model` in CC_FLAGS, and the CLAUDE default model must never
     /// be applied to a local-model worker. Each assertion carries a positive
     /// control on the SAME inputs so a vacuous pass is impossible (ethos rule 7).
+    /// Ethan, 2026-08-27: a gemini worker was launched with `--model sonnet` and
+    /// every request died with `models/sonnet is not found for API version
+    /// v1beta`. AMUX-3182 fixed this for ollama BY NAME and left it for every
+    /// other non-Claude provider.
+    ///
+    /// The last two cells are the controls and they are what stop the obvious
+    /// wrong fix: "never default a model" would break Claude, and an explicit
+    /// model must still win for any provider. Without them a version that just
+    /// deleted the default would look correct.
+    #[test]
+    fn the_claude_default_model_never_reaches_another_providers_worker() {
+        for p in ["gemini", "codex", "grok", "whatever-ships-next"] {
+            let (flags, ccm, resolved) = worker_model_env(p, "", "", "sonnet");
+            assert_eq!(
+                flags, "",
+                "{p} with no model must get NO --model flag, not the Claude default: {flags:?}"
+            );
+            assert_eq!(ccm, "", "{p} must not get CC_MODEL either: {ccm:?}");
+            assert_eq!(resolved, "", "and nothing to display as its model: {resolved:?}");
+        }
+
+        // CONTROL 1: an EXPLICIT model still wins, for any provider. The fix
+        // must not make non-Claude workers unconfigurable.
+        let (flags, _, resolved) = worker_model_env("gemini", "gemini-2.5-flash", "", "sonnet");
+        assert_eq!(flags, "--model gemini-2.5-flash");
+        assert_eq!(resolved, "gemini-2.5-flash");
+
+        // CONTROL 2: claude with no model STILL inherits the default. This is
+        // the cell that fails if someone "fixes" this by deleting the default.
+        let (flags, _, resolved) = worker_model_env("claude", "", "", "sonnet");
+        assert_eq!(flags, "--model sonnet", "claude must still get its default");
+        assert_eq!(resolved, "sonnet");
+    }
+
     #[test]
     fn worker_model_env_wires_ollama_to_cc_model_not_flags() {
         // Ollama + a chosen model -> CC_MODEL, and NO --model in CC_FLAGS.
