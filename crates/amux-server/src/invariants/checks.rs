@@ -65,18 +65,26 @@ pub(crate) fn gateway_owned(path: &str) -> bool {
 }
 
 /// Families whose ABSENCE is a documented product state with a GUARDED caller
-/// (AMUX-3468). `/api/tunnel/*`: the python-era tunnel API was never ported;
-/// the one caller (`amux tunnel`, AF-63) PREFLIGHTS /api/tunnel/status and
-/// prints "not available in this server build" instead of failing blind — so
-/// the census's own why_it_matters ("silent capability loss unless the client
-/// fails loudly") does not apply, and a permanent red here trains readers to
-/// skim the rows that matter (the AF-132 lesson). Entries are prefixes ending
-/// in `/`. The exclusion is SELF-EXPIRING both ways: if the family gets
-/// mounted, the stale entry FAILS the census naming itself for deletion; and
-/// if the guarded caller is ever removed, the call site disappears from the
-/// census with it. Porting-or-removing tunnel is a product call (Ethan's),
-/// tracked on AMUX-3468.
-const CALLER_GUARDED_ABSENT: &[&str] = &["/api/tunnel/"];
+/// (AMUX-3468). Entries are prefixes ending in `/`. The exclusion is
+/// SELF-EXPIRING both ways: if the family gets mounted, the stale entry FAILS
+/// the census naming itself for deletion; and if the guarded caller is ever
+/// removed, the call site disappears from the census with it.
+///
+/// EMPTY SINCE 2026-08-27, and the way it emptied is the point. Its one entry
+/// was `/api/tunnel/`, exempted because the python-era tunnel API was never
+/// ported and `amux tunnel` preflighted `/api/tunnel/status` rather than
+/// failing blind. c703c34b mounted that family — status answers 200 with
+/// `ported:false`, start/stop answer an honest 501 — so the exemption went
+/// stale, and the census did exactly what this doc-comment promised: it failed,
+/// 62504 evaluations deep, naming itself for deletion (AMUX-3812). A guard that
+/// describes its own retirement condition and then executes it is worth keeping
+/// even with nothing in it.
+///
+/// The family is now MOUNTED but still not PORTED — the relay client is
+/// unwritten and AMUX-2888 carries it. That is a capability gap, not a routing
+/// one, and the census is the wrong instrument for it: these routes exist and
+/// answer honestly, which is all this invariant asks.
+const CALLER_GUARDED_ABSENT: &[&str] = &[];
 
 fn caller_guarded_absent(path: &str) -> bool {
     CALLER_GUARDED_ABSENT.iter().any(|p| path.starts_with(p))
