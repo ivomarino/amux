@@ -830,34 +830,6 @@ FIX: AC-344 — a signal that joins live-cloud-build-hash vs latest-green-main a
 
 ---
 
-## A page.route stub defeated by a service worker fails LOUDLY and blames the wrong subsystem
-DATE: 2026-08-13
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-SESSION: amux-frustrations
-CARD: AF-47
-SYMPTOM: Isolation gave each project a CLEAN browser profile, which surfaced two failures the
-  shared one had masked — and both lied about where the fault was. (1) system-jobs.spec.ts
-  stubs /api/system-jobs with page.route; a registered service worker defeats that, because
-  the request passes through the worker's fetch handler where page.route cannot see it. It
-  did not error — it rendered the REAL job list and diffed it against the stub, so it read as
-  "the stalled-row styling is broken under WebKit". (2) sw.js reloads the page on
-  `controllerchange` as soon as a fresh worker claims the client, landing mid-page.evaluate:
-  "Execution context was destroyed" on two specs about CSS geometry.
-COST: Both point at the wrong subsystem by construction. (1) is the dangerous one: a stub
-  that silently does not apply produces a confident, specific, wrong failure about rendering,
-  and the natural response is to go read the CSS. Roughly an hour across the two before the
-  common cause was visible.
-FIX: `test.use({ serviceWorkers: 'block' })` on the specs that do not test the worker, in
-  b31bcac. STILL OPEN as a class: nothing warns that a page.route stub never matched a
-  request. A stub that matches zero requests is almost always a bug and is currently
-  indistinguishable from one that matched — same green-looking machinery, no output either
-  way. The generalisable guard is an assertion that each route was actually hit; amux has no
-  such helper today and every future page.route stub inherits the same silence.
-
----
-
 ## Verified gate rejects a cross-group reporter's verification, so the strongest evidence cannot close the card
 AREA: gates
 SEVERITY: slows
@@ -950,6 +922,33 @@ NOTE (2026-08-27, amux-frustrations, card AF-265): OPTION (c) IS DEAD, and two n
   trees — but the disk argument FOR one shared dir is weakening as that one dir grows,
   and (b) costs ~15GB against a 156GB status quo, which is a different trade than the
   entry assumed.
+
+  HYPOTHESIS (d), WHICH THE ENTRY NEVER NAMED, IS ALSO DEAD — and it was the strongest
+  looking one. amux's OWN server runs a `reclaim` job on a `disk-watch` trigger, and
+  `crates/amux-server/src/api/reclaim.rs:395` lists `~/.amux/rust-build-target` by name,
+  labelled "Shared cargo target dir". A server job holding a list that contains the exact
+  directory, firing unattended, is precisely the shape of "artifacts deleted underneath an
+  in-flight build" — and it is a much better candidate than cargo GC ever was, because it
+  demonstrably runs on this machine every boot. I only saw it because an unrelated e2e run
+  printed `reclaim scan started ... roots=3 by=disk-watch` in its server log.
+  IT IS NOT THE EVICTOR, and the probe can express a positive. Scanning is read-only; the
+  only operation that MOVES a file is quarantine (`std::fs::rename`, :1827) and the only
+  one that deletes is purge, which requires `?confirm=<batch_id>` and only ever removes
+  from the quarantine root. So the quarantine ledger is the complete record of anything
+  reclaim has relocated. Live: 2 batches, both by session `desktop`, both purged —
+  `/Users/ethan/.cache/huggingface` (41.1GB) and `/Users/ethan/.cache/whisper` (5.5GB).
+  Nothing under `rust-build-target`. The ledger is not pruned (the only DELETE in the file
+  is on `reclaim_skipped`, :1621/:2421), so the absence is real history, not a short window.
+  WHAT THIS LEAVES, and it is now a narrower claim than the entry started with: nothing
+  EXTERNAL is deleting these artifacts. Both "something else is cleaning up behind me"
+  candidates — cargo's own GC (c) and amux's reclaim (d) — are ruled out with evidence, so
+  the evictor is cargo responding to concurrent builds from DIFFERENT PATHS into one dir,
+  which is what the SYMPTOM described before anyone went looking for a tidier explanation.
+  That strengthens (b): if the cause is path-diverse concurrent writers, giving the one
+  unattended every-60s builder its own dir removes a writer rather than papering over a
+  cleanup job. Still not mine to decide — it changes a CLAUDE.md-mandated policy for every
+  lane (ethos rule 8) — but the decision is now between two options with a known mechanism
+  instead of four with none.
 
   NEW FACT 2, and it makes the race MORE likely rather than less: PR #158 (merged today,
   cad635ea) made the pre-commit hook build into this same shared dir, where it previously
