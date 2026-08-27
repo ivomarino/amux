@@ -74,16 +74,38 @@ fallback when a finding needs row-level inspection.
    with `since_h=192` and compare. Finding = today's p95 > ~2x trailing p95
    (use judgment on low-volume families; never conclude from n < 20 requests).
 
-   **The trailing norm is still capped, but the cap no longer lies (AR-134,
-   fixed AF-131 on 2026-08-22).** `stats` scans at most 200,000 rows, so a busy
-   `since_h=192` still comes back `scan_truncated: true` with identical counts
-   for 192h, 336h and 720h. What changed is that the scan now keeps the NEWEST
-   rows and `actual_window_h` is computed from them, so it reports the span that
-   was actually read — measured live at the fix: 96h, 192h, 336h and 720h all
-   returned `actual_window_h: 84.56`, which is the truth, where the day before
-   they returned 96.0, 191.98, 299.81 and 299.81.
+   **The trailing norm is SAMPLED, not truncated (AF-261, 2026-08-27).** `stats`
+   reads at most 200,000 rows. When the requested window holds more than that it
+   now takes every Nth row ACROSS THE WHOLE WINDOW instead of all of the newest
+   ones, so `actual_window_h` reports the window you ASKED for and the norm is a
+   norm again. The response says which mode it used:
 
-   Read `actual_window_h` and BELIEVE it now; it is no longer a number to route
+   - `sampled` / `sample_stride` / `window_rows` — sampling happened, the factor,
+     and the true pre-sample row count for the window.
+   - `scan_truncated` — the answer covers LESS than you asked for. It is now
+     FALSE while sampling, because a sampled read covers the whole window.
+     Truncated and sampled are different facts and the response keeps them apart.
+
+   **Family `count` is the SAMPLED count when `sampled` is true.** Multiply by
+   `sample_stride` for volume, or read `window_rows`. The contract's "never
+   conclude from n < 20" rule applies to the SAMPLED count, which is the
+   conservative direction. Percentiles are unbiased under uniform sampling,
+   which is why this is the right trade for a p95 comparison.
+
+   Why it changed: on 2026-08-27 a single day exceeded the cap for the first
+   time (214,320 rows, +74% in a day), so `since_h=24` and `since_h=192`
+   returned the SAME 200,000 newest rows — identical `actual_window_h` of 21.52
+   and every family's ratio exactly `1.00x`. The comparator was gone, and
+   "1.00x everywhere" is the most reassuring output a dead check can produce.
+   Raising the cap would only have deferred that to the next volume step.
+
+   **`analyze` still truncates, and that is fine.** It filters `status >= 400`
+   in SQL, so it scans error rows only — 511 on the day this was written against
+   a 200k cap. Its cap binds when errors exceed 200k in the window, which is a
+   different and much louder problem. Named here so the two endpoints are not
+   assumed to behave the same.
+
+   Read `actual_window_h` and BELIEVE it; it is no longer a number to route
    around. `analyze` carries the same field for the same reason.
 
    What that fix repaired, and why the field is worth trusting rather than

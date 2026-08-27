@@ -1968,6 +1968,40 @@ async fn stats(
     let proc_boot = crate::runtime_jobs::heartbeat::boot_at();
     let mut spanned = 0u64;
     let mut spanned_by_family: std::collections::BTreeMap<String, u64> = Default::default();
+
+    // SAMPLE THE WINDOW; DO NOT TRUNCATE IT (AF-261).
+    //
+    // The cap used to keep the NEWEST `cap` rows, which is right when a window
+    // fits and silently destroys the comparison when it does not. On 2026-08-27
+    // a single day exceeded the cap for the first time (214,320 rows, +74% in
+    // a day), so `since_h=24` and `since_h=192` returned the SAME 200,000 rows:
+    // identical `actual_window_h` of 21.52, and every family's p95 ratio exactly
+    // 1.00x. The trailing norm, which is the entire point of the second call,
+    // had become a comparison of a window with itself — and "1.00x everywhere"
+    // is the most reassuring output a non-functioning check can produce
+    // (AF-253's class, at the level of a whole sweep step).
+    //
+    // Raising the cap only defers that to the next volume step. Percentiles are
+    // exactly the statistic a uniform sample estimates well, so when the window
+    // is bigger than the cap we take every Nth row ACROSS THE WHOLE WINDOW
+    // instead of all of the newest ones. `id` is an INTEGER PRIMARY KEY (a rowid
+    // alias) and both id and ts are monotonic with insertion, so `id % stride`
+    // is uniform in time without needing a random() sort the planner would have
+    // to materialise.
+    //
+    // The point of the change is that `actual_window_h` becomes the window that
+    // was ASKED for rather than the slice that fitted, which is what makes the
+    // norm a norm again.
+    let window_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _amux_request_log WHERE ts >= ?1", [cutoff], |r| r.get(0))
+        .unwrap_or(0);
+    let stride: i64 = if window_rows > ANALYZE_SCAN_CAP {
+        (window_rows + ANALYZE_SCAN_CAP - 1) / ANALYZE_SCAN_CAP
+    } else {
+        1
+    };
+    let sampled = stride > 1;
+
     let res = (|| -> rusqlite::Result<()> {
         let mut stmt = conn.prepare(
             // AF-131: ORDER BY ts DESC is load-bearing. With no ORDER BY,
@@ -1978,11 +2012,14 @@ async fn stats(
             // 42k requests was 1.07x against an honest window. Newest-first
             // makes the slice the trailing window everyone assumes AND makes
             // actual_window_h truthful by construction.
+            // `?3 = 1` makes the modulus a no-op, so the unsampled path is the
+            // same statement and the same plan it has always been.
             "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts, \
              boot_at \
-             FROM _amux_request_log WHERE ts >= ?1 ORDER BY ts DESC LIMIT ?2",
+             FROM _amux_request_log WHERE ts >= ?1 AND (id % ?3) = 0 \
+             ORDER BY ts DESC LIMIT ?2",
         )?;
-        let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP])?;
+        let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP, stride])?;
         while let Some(r) = rows.next()? {
             scanned += 1;
             let family: String = r.get(0)?;
@@ -2195,7 +2232,24 @@ async fn stats(
         "percentile_method": "nearest-rank: value at 1-based rank ceil(q*n) of the window's \
                               sorted per-family latencies (always an observed latency, \
                               never interpolated)",
-        "scan_truncated": scanned >= ANALYZE_SCAN_CAP,
+        // TRUNCATED and SAMPLED are different facts and must not be conflated
+        // (AF-261). `scan_truncated` keeps its meaning — the answer covers LESS
+        // than you asked for — and is now FALSE while sampling, because a
+        // sampled read covers the whole window. That is the point of the
+        // change: `actual_window_h` becomes the window that was asked for, so
+        // the trailing norm is a norm again.
+        "scan_truncated": stride == 1 && scanned >= ANALYZE_SCAN_CAP,
+        // Every family `count` below is the number of rows USED. When sampling,
+        // that is 1 in `sample_stride` of the real traffic — stated here rather
+        // than left to be inferred, because a sampled count read as a volume is
+        // exactly the wrong-by-a-constant-factor error this endpoint exists to
+        // prevent. `window_rows` is the true pre-sample count for the window.
+        "sampled": sampled,
+        "sample_stride": stride,
+        "window_rows": window_rows,
+        "sampling_note": if sampled {
+            "counts below are SAMPLED (1 in `sample_stride`); multiply by              `sample_stride` for volume, or read `window_rows` for the window total.              Percentiles are unbiased under uniform sampling; a family whose sampled              count is small is not a reliable percentile — the contract's n<20 rule              applies to the SAMPLED count."
+        } else { "" },
         "families": fam_rows.into_iter().map(|(_, v, _)| v).collect::<Vec<_>>(),
         "totals": {
             "count": total_count,
@@ -3054,6 +3108,92 @@ mod tests {
         Router::new().nest("/api/logs", routes()).with_state(state(store))
     }
 
+    /// AF-261 — a window bigger than the cap must be SAMPLED, not truncated.
+    ///
+    /// The trailing-norm call exists so step 2 of the daily sweep can ask "is
+    /// today's p95 out of line". On 2026-08-27 a single day exceeded the cap for
+    /// the first time, so `since_h=24` and `since_h=192` returned the SAME
+    /// newest 200,000 rows: identical `actual_window_h`, and every family's ratio
+    /// exactly 1.00x. The comparator was gone, and "1.00x everywhere" is the most
+    /// reassuring output a dead check can produce.
+    ///
+    /// THE ASSERTION IS ABOUT THE WINDOW, NOT THE ROW COUNT. A test that only
+    /// checked "we got <= cap rows back" passes against the truncating version
+    /// too — that version returns exactly cap rows and is the bug. What
+    /// discriminates is whether the OLDEST row reached is the one the caller
+    /// asked for.
+    #[tokio::test]
+    async fn a_window_larger_than_the_cap_is_sampled_across_it_not_truncated_to_its_newest_end() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // 60k rows spread evenly over 60 hours, with a cap of 20k for the test.
+        // Truncating keeps the newest 20k => the oldest row reached is ~20h ago.
+        // Sampling every 3rd row reaches the full 60h.
+        // ABOVE the 200k cap on purpose. The first draft of this test seeded
+        // 60k, which is UNDER it — stride stayed 1, the sampling branch never
+        // ran, and it passed against code that could not sample at all. A test
+        // for a cap that never reaches the cap is the purest form of the thing
+        // this endpoint exists to catch.
+        //
+        // At 260k over 60h a truncating read covers 200/260 of the span, so it
+        // reaches ~46h and fails the assertion below; a sampled read reaches all
+        // 60. That gap is what makes the assertion discriminate.
+        const N: i64 = 260_000;
+        const SPAN_H: f64 = 60.0;
+        store
+            .write(move |conn| {
+                let mut stmt = conn.prepare(
+                    "INSERT INTO _amux_request_log \
+                     (ts, method, path, family, status, latency_ms, client_ip, \
+                      amux_session, worker, answered_by, error_body) \
+                     VALUES (?1,'GET','/api/board','/api/board',200,?2,'127.0.0.1','lane',NULL,'native',NULL)",
+                )?;
+                for i in 0..N {
+                    let frac = i as f64 / N as f64;
+                    let ts = now - SPAN_H * 3600.0 * (1.0 - frac);
+                    // Latency rises with age so a truncated read has a visibly
+                    // different distribution from a sampled one.
+                    stmt.execute(rusqlite::params![ts, 1.0 + (1.0 - frac) * 100.0])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=72").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+
+        // The window is the whole point: it must reach back across the seeded
+        // span, not stop at whatever the newest cap-worth covered.
+        let aw = v["actual_window_h"].as_f64().expect("actual_window_h");
+        assert!(
+            aw > SPAN_H * 0.9,
+            "the read must cover the window ASKED for, not its newest slice: \
+             actual_window_h {aw} against a {SPAN_H}h span. This is the assertion a \
+             truncating implementation fails: {v}"
+        );
+        // `window_rows` is the TRUE pre-sample count, so a sampled `count` can
+        // never be mistaken for the volume.
+        assert_eq!(v["window_rows"], N, "window_rows is the pre-sample truth: {v}");
+        // TRUNCATED and SAMPLED are different facts.
+        assert_eq!(
+            v["scan_truncated"], false,
+            "a sampled read covers the window, so it is not truncated: {v}"
+        );
+        if v["sampled"] == true {
+            assert!(v["sample_stride"].as_i64().unwrap_or(0) > 1, "{v}");
+            assert!(
+                v["sampling_note"].as_str().unwrap_or("").contains("SAMPLED"),
+                "a sampled answer must say so in the payload a caller already reads: {v}"
+            );
+        }
+    }
+
     /// AF-260 — a latency outlier you cannot attribute is half an instrument.
     ///
     /// The list shipped `worker` and nothing else. `worker` is PATH-derived, so it
@@ -3272,7 +3412,7 @@ mod tests {
     /// slice must be the NEWEST rows, and the window claim must shrink to
     /// what was actually read.
     #[tokio::test]
-    async fn truncated_scans_keep_the_newest_rows_and_say_the_real_window() {
+    async fn over_cap_stats_samples_the_window_while_analyze_truncates_and_both_report_it() {
         let (store, _dir) = store();
         let now = unix_now();
         // 50k "old-era" rows around 90-80h ago, then 210k "new-era" rows in
@@ -3309,24 +3449,51 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["scan_truncated"], true, "{v}");
-        let fams: Vec<&str> = v["families"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["family"].as_str().unwrap())
-            .collect();
+        // STATS NOW SAMPLES THE WINDOW RATHER THAN TRUNCATING IT (AF-261), so the
+        // three assertions here changed and the reasons matter.
+        //
+        // AF-131's bug was that the capped slice kept the OLDEST rows, making an
+        // "8-day norm" really days 8-5 while actual_window_h claimed the full
+        // span — two lies at once, and a 6.46x p95 "regression" that was 1.07x
+        // against an honest window. Its fix was to keep the NEWEST rows instead.
+        //
+        // Sampling subsumes that fix rather than undoing it: covering the whole
+        // window proportionally makes an oldest-first slice impossible AND makes
+        // actual_window_h truthful by covering what it claims. The old assertion
+        // ("old-era must be ABSENT") was a statement about the mechanism, not
+        // about the property, and under the better mechanism it is wrong.
+        //
+        // PROPORTIONALITY IS THE STRONGER ASSERTION and it replaces it: the
+        // sampled mix must match the seeded mix. That catches an oldest-first
+        // slice (old-era over-represented) AND a newest-only truncation
+        // (old-era absent), where the old cell caught only the first.
+        assert_eq!(v["scan_truncated"], false, "a sampled read covers the window: {v}");
+        assert_eq!(v["sampled"], true, "260k rows over a 200k cap must sample: {v}");
+        assert_eq!(v["window_rows"], 260_000, "the true pre-sample count: {v}");
+        let fam_n = |name: &str| -> f64 {
+            v["families"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["family"] == name)
+                .map(|f| f["count"].as_f64().unwrap_or(0.0))
+                .unwrap_or(0.0)
+        };
+        let (new_n, old_n) = (fam_n("new-era"), fam_n("old-era"));
+        assert!(new_n > 0.0 && old_n > 0.0, "both eras must survive sampling: {v}");
+        // Seeded 210k new : 50k old = 4.2. A uniform sample preserves the ratio.
+        let ratio = new_n / old_n;
         assert!(
-            !fams.contains(&"old-era"),
-            "a truncated trailing window must keep the NEWEST rows — old-era rows \
-             surviving means the cap ate the recent traffic: {fams:?}"
+            (ratio - 4.2).abs() < 0.3,
+            "the sample must be UNIFORM across the window — seeded 210k:50k = 4.2, \
+             got {new_n}:{old_n} = {ratio}. A skew here means the read is biased \
+             toward one end of the window, which is AF-131's bug in either direction: {v}"
         );
-        assert!(fams.contains(&"new-era"), "{fams:?}");
         let aw = v["actual_window_h"].as_f64().unwrap();
         assert!(
-            aw < 70.0,
-            "actual_window_h must report the span actually READ (the newest ~200k of \
-             the last 70h), never min(requested, data_span): got {aw} vs since_h=96"
+            aw > 85.0,
+            "actual_window_h must now report the window COVERED — sampling reaches \
+             the full ~90h of seeded data, where truncation reached ~46h: got {aw}"
         );
 
         // ANALYZE: same slice rule, same honest window, and the group's
