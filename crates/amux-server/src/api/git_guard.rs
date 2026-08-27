@@ -1852,10 +1852,38 @@ fn warn_outdated_hook(session: &str, dir: &str) {
         target: "staged_guard",
         "[staged-guard] OUTDATED HOOK: {} in {} sent no guard_version — that hook swallows \
          server errors (`except Exception: return 0`) and printed nothing for the whole \
-         405 window. Reinstall: scripts/install-hooks.sh",
+         405 window. Reinstall: {}",
         if session.is_empty() { "(no session)" } else { session },
-        dir
+        dir,
+        outdated_hook_remedy(dir)
     );
+}
+
+/// The command that actually reinstalls the guard IN `dir` (AF-156).
+///
+/// This used to be the constant `scripts/install-hooks.sh`, which is only
+/// correct for a caller already inside the amux checkout. Measured 2026-08-27 by
+/// amux-frustrations: this checkout emits ZERO of these warnings. All 272 in one
+/// day came from lanes under /Users/ethan/Dev/mixpeek, where
+/// `scripts/install-hooks.sh` does not exist at any path — so 100% of recipients
+/// were handed an instruction that cannot resolve. A remedy that cannot be run
+/// is worse than none: it reads as actionable and costs the reader the attempt.
+/// Ethos rule 3 wants a truthful path forward in every legitimate state.
+///
+/// `install-hooks.sh <dir>` is the foreign-checkout mode, which by its own header
+/// installs the guard and NEVER writes the other repo's `pre-commit`. `dir` is
+/// already in the warn line, so the server had the data and was printing a
+/// constant beside it.
+///
+/// Honest in both states: a runnable absolute command when `AMUX_REPO` names the
+/// checkout, and a visibly-unfilled placeholder when it does not — never a
+/// plausible path that silently resolves to nothing.
+pub(crate) fn outdated_hook_remedy(dir: &str) -> String {
+    let base = std::env::var("AMUX_REPO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "<your amux checkout>".to_string());
+    format!("{base}/scripts/install-hooks.sh {dir}")
 }
 
 /// The HTTP entry point — a REAL commit attempt, so owners get notified.
@@ -4002,6 +4030,42 @@ mod tests {
     /// not prove ownership, so the tie still BLOCKS. (The original fixture used a
     /// clearly-fresher committer, which AF-27 showed is a different case that must
     /// NOT block — see `a_clearly_fresher_self_edit_beats_a_stale_firsthand_peer`.)
+    /// AF-156: the OUTDATED HOOK remedy must be runnable BY ITS AUDIENCE.
+    ///
+    /// The old constant `scripts/install-hooks.sh` resolved for nobody who
+    /// received it — every one of 272 warnings in a day came from lanes under
+    /// /Users/ethan/Dev/mixpeek, where that path does not exist. The remedy must
+    /// therefore carry the TARGET DIR (install-hooks.sh's foreign-checkout mode,
+    /// which never writes the other repo's pre-commit).
+    ///
+    /// The second cell is the one that matters: with no AMUX_REPO the string
+    /// must be VISIBLY unfilled, not a plausible relative path that silently
+    /// resolves to nothing. A remedy that looks runnable and is not costs the
+    /// reader the attempt, which is worse than printing none.
+    #[test]
+    fn the_outdated_hook_remedy_names_the_target_dir_and_never_fakes_a_path() {
+        let d = "/Users/ethan/Dev/mixpeek/server/mvs";
+        // SAFETY: single-threaded unit test, restored below.
+        let prev = std::env::var("AMUX_REPO").ok();
+        std::env::set_var("AMUX_REPO", "/Users/ethan/Dev/amux");
+        let r = super::outdated_hook_remedy(d);
+        assert_eq!(r, format!("/Users/ethan/Dev/amux/scripts/install-hooks.sh {d}"));
+        assert!(r.contains(d), "the remedy must name the dir it is fixing: {r}");
+
+        std::env::remove_var("AMUX_REPO");
+        let bare = super::outdated_hook_remedy(d);
+        assert!(
+            bare.starts_with("<your amux checkout>"),
+            "with no AMUX_REPO the path must be visibly unfilled, not a plausible \
+             relative path that resolves nowhere: {bare}"
+        );
+        assert!(bare.contains(d), "and it must still name the target dir: {bare}");
+        match prev {
+            Some(v) => std::env::set_var("AMUX_REPO", v),
+            None => std::env::remove_var("AMUX_REPO"),
+        }
+    }
+
     #[test]
     fn inferred_self_claim_no_fresher_than_the_peer_still_blocks() {
         let mut inp = peer_wrote("test_x.py", "peer-lane", 1000.0);
