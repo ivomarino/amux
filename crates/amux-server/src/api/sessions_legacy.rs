@@ -2048,6 +2048,20 @@ pub async fn create_session_legacy(
     if !cc_flags.is_empty() {
         pairs.push(("CC_FLAGS", cc_flags.clone()));
     }
+    // ISOLATED AT CREATE TIME (Ethan, 2026-08-27). `CC_ISOLATED` was settable
+    // only by hand-editing the env file after the fact, so the one decision
+    // that has to be true from the FIRST launch — spawn injects no
+    // AMUX_SESSION/AMUX_URL and no --mcp-config for an isolated lane
+    // (AMUX-3232) — could not be made at the moment the lane is created. A
+    // worker created normally and isolated afterwards has already started with
+    // the harness attached.
+    //
+    // Written only when true: absent means "not isolated", which is what every
+    // reader already assumes (`env_flag_on(cfg.get("CC_ISOLATED"))`), so an
+    // explicit CC_ISOLATED=0 would add a second spelling of the default.
+    if body.get("isolated").map(crate::api::py_truthy).unwrap_or(false) {
+        pairs.push(("CC_ISOLATED", "1".to_string()));
+    }
     // ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
     // (AMUX-3114). `s("tags")` only matched a STRING, so `{"tags":["gtm"]}` read
     // "" and the worker was created with NO groups, the same silent drop the

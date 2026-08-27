@@ -7938,7 +7938,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.743';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.744';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -18030,6 +18030,8 @@ function openCreate() {
   document.getElementById('create-provider-claude').classList.add('selected');
   document.getElementById('create-provider-codex').classList.remove('selected');
   document.getElementById('create-provider-gemini').classList.remove('selected');
+  const _iso0 = document.getElementById('create-isolated');
+  if (_iso0) { _iso0.checked = false; _toggleIsolated(false); }
   const _ollamaBtn0 = document.getElementById('create-provider-ollama');
   if (_ollamaBtn0) _ollamaBtn0.classList.remove('selected');
   const _omField0 = document.getElementById('create-ollama-model-field');
@@ -18211,6 +18213,16 @@ function _toggleCreateBranch(on) {
     setTimeout(() => inp.focus({preventScroll: true}), 50);
   }
 }
+// Isolation is the one create-time choice that cannot be changed later without
+// relaunching: spawn injects no AMUX_SESSION/AMUX_URL and no --mcp-config for an
+// isolated lane (AMUX-3232), so a worker isolated after the fact has already
+// started with the harness attached. The panel spells out what it gives up,
+// because "isolated" reads like a mild sandbox and it is not.
+function _toggleIsolated(on) {
+  const el = document.getElementById('create-isolated-info');
+  if (el) el.style.display = on ? '' : 'none';
+}
+
 function _toggleWorktree(on) {
   document.getElementById('create-worktree-info').style.display = on ? '' : 'none';
   if (on) {
@@ -18293,6 +18305,11 @@ async function submitCreate() {
     if (_m) createBody.model = _m;
   }
   if (worktreeEnabled) createBody.worktree = true;
+  // ISOLATED (Ethan, 2026-08-27). Sent only when true: the server writes
+  // CC_ISOLATED=1 and absence already means "not isolated" to every reader, so
+  // an explicit false would be a second spelling of the default.
+  const _isoEl = document.getElementById('create-isolated');
+  if (_isoEl && _isoEl.checked) createBody.isolated = true;
   let r;
   try {
     r = await fetch(API + '/api/sessions', {

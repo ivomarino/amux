@@ -264,7 +264,20 @@
   .edit-box {
     background: var(--card); border: 1px solid var(--border); border-radius: 12px;
     padding: 20px; width: 100%; max-width: 380px;
-    max-height: calc(100dvh - 40px); overflow-y: auto;
+    /* 92dvh, not the full 100dvh-40px, so overflow ENGAGES BEFORE the content
+       reaches the window edge (Ethan, 2026-08-27, screenshot of New worker).
+       The bug is the boundary case, not tall content: measured at 620px of
+       content in 634px of room, the box "fits", `overflow-y:auto` never turns
+       on, and the box is NOT scrollable — while `.edit-actions` is an 85px
+       STICKY footer that overlays the bottom of that content regardless. So
+       the last field sits under the button bar with no way to scroll to it,
+       which is exactly what the screenshot shows: `Use worktree` cut in half
+       by the Cancel/Create bar. Content that is merely CLOSE to the limit is
+       the dangerous size; content well past it always scrolled fine.
+       Reserving 8dvh guarantees the scroll affordance exists whenever the
+       content is anywhere near full height. */
+    max-height: min(92dvh, calc(100dvh - 40px)); overflow-y: auto;
+    overscroll-behavior: contain; -webkit-overflow-scrolling: touch;
   }
   .edit-box h3 { font-size: 1rem; margin-bottom: 14px; }
 
