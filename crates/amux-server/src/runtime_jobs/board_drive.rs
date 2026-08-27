@@ -2246,6 +2246,22 @@ fn continue_nudge_text(
     )
 }
 
+/// The opening literal of every auto-pickup prompt, and the seam the AMUX-3052
+/// stale-pickup guard reads the card id out of (`session_verbs::pickup_card_id`
+/// takes the first token after it).
+///
+/// IT IS A SHARED CONST BECAUSE A COMMENT WAS NOT ENOUGH. The old template said
+/// "Claimed board card <ID> from your queue" and the parser held its own copy of
+/// that wording, with a comment on BOTH sides saying to change them together.
+/// 03ed2b6c shortened the prompt for token cost — a correct change, made with
+/// that very comment three lines above the edit — and the parser was not
+/// touched. From then on `pickup_card_id` returned None for every real pickup,
+/// so the guard delivered 100% of stale pickups while its own unit tests, which
+/// fed the RETIRED wording, stayed green. Interpolating the const means the
+/// anchor cannot drift; `pickup_prompt_round_trips_through_the_stale_guard`
+/// covers the rest of the shape.
+pub(crate) const PICKUP_ANCHOR: &str = "[amux auto-pickup] Claimed ";
+
 /// py:14713 — the claim prompt.
 ///
 /// Provenance framing is load-bearing: card descs often embed quoted messages
@@ -2301,12 +2317,11 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
             );
         }
     }
-    // The delivery boundary parses the card id back out of this exact template
-    // to void a stale pickup (AMUX-3052, session_verbs::pickup_card_id keyed on
-    // "Claimed board card <ID> from your queue"). If you reword this line, update
-    // that parser or the stale-pickup guard silently stops firing.
+    // The delivery boundary parses the card id back out of this template to void
+    // a stale pickup (AMUX-3052). It reads the token right after PICKUP_ANCHOR,
+    // which is why the id must stay the FIRST thing after it.
     let mut prompt = format!(
-        "[amux auto-pickup] Claimed {} — work it now. Card text below is historical, \
+        "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
          not a live message. If blocked on an owner decision, move to review (not todo, \
          which re-queues after 24h cooldown):\n{}{}",
         row.id,
@@ -5634,6 +5649,50 @@ mod tests {
         assert!(
             quoted > 3000,
             "the excerpt must carry the card, not a 500-char stub (got {quoted} body chars)"
+        );
+    }
+
+    /// THE PICKUP PROMPT MUST STAY READABLE BY THE STALE-PICKUP GUARD, and this
+    /// is deliberately in board_drive.rs rather than beside the parser: it fails
+    /// in the file someone is editing when they reword the template.
+    ///
+    /// Its predecessor lived next to `pickup_card_id` and fed a HAND-WRITTEN
+    /// copy of the template, which is why it was green for the entire outage.
+    /// 03ed2b6c (2026-08-26 17:36) shortened "Claimed board card <ID> from your
+    /// queue" to "Claimed <ID> —", the parser kept the old literal, and from
+    /// that commit `pickup_card_id` returned None for every real pickup: the
+    /// AMUX-3052 guard voided nothing for 17 hours across 97 deliveries. Three
+    /// were provably stale on arrival (AF-267/amux-frustrations 44s, TUBES-2242
+    /// 33s, NISSA-89 18s after their cards closed) and each cost a lane a turn
+    /// being told to redo finished work.
+    ///
+    /// A test that mints its own input can only ever pin ITSELF. This one runs
+    /// the real producer into the real parser.
+    #[test]
+    fn pickup_prompt_round_trips_through_the_stale_guard() {
+        let conn = board_db();
+        add_card(&conn, "RT-42", "lane", "doing", "round trip", "SCOPE: whatever\n- [ ] x");
+        let row = bs::get_issue(&conn, "RT-42").unwrap().unwrap();
+        let prompt = pickup_prompt(&conn, "lane", &row);
+
+        assert_eq!(
+            crate::api::session_verbs::pickup_card_id(&prompt).as_deref(),
+            Some("RT-42"),
+            "the stale-pickup guard cannot read the id out of the prompt this file mints, \
+             so it will void nothing and every stale pickup ships: {}",
+            &prompt[..prompt.len().min(200)]
+        );
+
+        // The id must be the FIRST token after the anchor — the property the
+        // parser actually depends on, and the one a reword breaks silently.
+        let after = prompt
+            .split_once(PICKUP_ANCHOR)
+            .expect("the prompt must open with PICKUP_ANCHOR")
+            .1;
+        assert!(
+            after.starts_with("RT-42"),
+            "the card id must be the first token after the anchor: {}",
+            &after[..after.len().min(80)]
         );
     }
 

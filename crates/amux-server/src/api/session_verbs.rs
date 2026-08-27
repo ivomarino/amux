@@ -8848,20 +8848,45 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
 /// a loop whose only evidence is "no rows left" cannot distinguish delivered
 /// from dropped).
 /// Pull the board card id out of an auto-pickup "work it now" prompt, if this
-/// text IS one. Keyed on the literal template minted by `board_drive.rs` (the
-/// sole producer of "[amux auto-pickup] Claimed board card <ID> from your
-/// queue"); any other steering text returns None, so a non-pickup message is
-/// never voided. KEEP IN STEP with that template: if its wording changes this
-/// returns None and the AMUX-3052 stale-pickup guard silently goes dark, so the
-/// two are commented as a pair and pinned by `pickup_card_id_parses_the_template`.
-fn pickup_card_id(text: &str) -> Option<String> {
-    const ANCHOR: &str = "Claimed board card ";
-    const TAIL: &str = " from your queue";
-    let start = text.find(ANCHOR)? + ANCHOR.len();
-    let rest = text.get(start..)?;
-    let end = rest.find(TAIL)?;
-    let id = rest.get(..end)?.trim();
-    (!id.is_empty()).then(|| id.to_string())
+/// text IS one. Anything else returns None, so a non-pickup message is never
+/// voided.
+///
+/// KEYED ON THE PRODUCER'S OWN CONST, not on a copy of its wording. It used to
+/// hold its own literal ("Claimed board card <ID> from your queue") with a
+/// comment on both sides saying to change them together; 03ed2b6c reworded the
+/// prompt and this stayed behind, and the AMUX-3052 guard was dark for 17 hours
+/// with every one of its tests green (they fed the retired wording too).
+///
+/// The TAIL is gone as well: it only existed to find where the id ended, and it
+/// was a second literal that could drift on its own. A card id has no spaces, so
+/// the first token after the anchor IS the id — provided it looks like one. The
+/// shape check is what lets the caller tell "not a pickup" from "a pickup whose
+/// id I could not read", which is the state that used to be silent.
+pub(crate) fn pickup_card_id(text: &str) -> Option<String> {
+    let start = text.find(crate::runtime_jobs::board_drive::PICKUP_ANCHOR)?
+        + crate::runtime_jobs::board_drive::PICKUP_ANCHOR.len();
+    let tok = text.get(start..)?.split_whitespace().next()?;
+    // A board id is `<PREFIX>-<n>`: uppercase/digit prefix, a hyphen, digits.
+    // Rejecting anything else is deliberate — a void is a DROPPED message, so a
+    // parse that is merely plausible must not authorise one.
+    let (prefix, num) = tok.split_once('-')?;
+    let shaped = !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit());
+    shaped.then(|| tok.to_string())
+}
+
+/// Does this text CLAIM to be an auto-pickup? Separate from `pickup_card_id` on
+/// purpose: together they distinguish "not a pickup, deliver it" from "a pickup
+/// the guard could not read", and only the second is a defect worth a WARN.
+///
+/// This is the two-fixes half. The failure being fixed here was invisible
+/// precisely because a dark guard and a fleet with no stale pickups produce the
+/// same observation — zero voids. With this, the next drift announces itself in
+/// the log the first time a pickup is delivered.
+fn looks_like_pickup(text: &str) -> bool {
+    text.contains(crate::runtime_jobs::board_drive::PICKUP_ANCHOR)
 }
 
 /// AMUX-3052 void decision, extracted from `steer_deliver_tick` so BOTH legs are
@@ -9144,6 +9169,24 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     )
                     .await;
                 }
+            } else if looks_like_pickup(&text) {
+                // THE GUARD IS DARK FOR THIS ROW and would otherwise say nothing.
+                // A parser that returns None reads exactly like "this was a nudge,
+                // not a pickup" — which is how the 03ed2b6c drift survived 17
+                // hours and 97 deliveries with a green suite: no void ever fired,
+                // and zero voids is also what a healthy fleet looks like.
+                //
+                // Reached only when the text carries PICKUP_ANCHOR (so it IS a
+                // pickup) and the id after it did not parse. Delivering is still
+                // right — fail-open, same posture as the read-failure leg above —
+                // but it must not be silent.
+                tracing::warn!(
+                    session = %session, id = %id,
+                    preview = %chars_truncate(&text, 120),
+                    "auto-pickup prompt carries the anchor but NO parsable card id — \
+                     the AMUX-3052 stale guard cannot run on it (template drift: the id \
+                     must be the first token after board_drive::PICKUP_ANCHOR)"
+                );
             }
         }
         // Per-lane preconditions are evaluated once, not per row — via the SAME
@@ -15292,8 +15335,8 @@ mod tests {
     /// (still `doing` at delivery after 578s) delivers.
     #[test]
     fn stale_pickup_voids_iff_card_left_doing_not_by_how_long_it_waited() {
-        let pick =
-            "[amux auto-pickup] Claimed board card GE-626 from your queue — work it now.";
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
+        let pick = &format!("{PICKUP_ANCHOR}GE-626 — work it now.");
         // DROP leg — card closed/moved in the claim->delivery gap.
         assert_eq!(
             pickup_stale_void("board-drive", pick, Some("done"), Some("gtm-engine"), "gtm-engine").as_deref(),
@@ -16125,20 +16168,42 @@ mod tests {
         assert_eq!(msgs, 1, "the prompt is still recorded in cmd_history (Messages ledger)");
     }
 
-    // The stale-pickup guard (AMUX-3052) keys on the EXACT template board_drive.rs
-    // mints. This pins that the parser finds the id (anchor + tail both precede
-    // the "— work it now" separator, so the dash is irrelevant) and returns None
-    // for anything that is not a pickup — a non-pickup steering message must never
-    // be voided. If the template is reworded and this test is not, the guard goes
-    // dark; that is what this catches.
+    // The stale-pickup guard (AMUX-3052) reads the card id out of the prompt
+    // board_drive.rs mints. THE PREVIOUS VERSION OF THIS TEST WAS GREEN THROUGH
+    // THE WHOLE OUTAGE: it fed a hand-written copy of the RETIRED wording
+    // ("Claimed board card GV-648 from your queue"), so it pinned the parser to
+    // a string no producer had emitted since 03ed2b6c. A test that mints its own
+    // input cannot notice the producer moving.
+    //
+    // So the round-trip against the real `pickup_prompt` now lives in
+    // board_drive.rs, where the producer is in scope and a reword fails the test
+    // in the file being edited. What is left here is the half that belongs to
+    // the parser: everything it must REFUSE. A void drops a message, so a
+    // false positive is the expensive direction.
     #[test]
-    fn pickup_card_id_parses_the_template() {
-        let real = "[amux auto-pickup] Claimed board card GV-648 from your queue - work it now. \
-                    Anything quoted below is the CARD's stored text";
-        assert_eq!(pickup_card_id(real).as_deref(), Some("GV-648"));
+    fn pickup_card_id_refuses_everything_that_is_not_a_pickup() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
+
+        // Built from the const, never from a copy of the wording.
+        let real = format!("{PICKUP_ANCHOR}GV-648 — work it now. Card text below is historical");
+        assert_eq!(pickup_card_id(&real).as_deref(), Some("GV-648"));
+
         assert_eq!(pickup_card_id("hey, can you rebase and push?"), None);
         assert_eq!(pickup_card_id("[Ethan] decision on AMUX-1: APPROVED"), None);
-        assert_eq!(pickup_card_id("Claimed board card  from your queue"), None);
+        // The retired wording must NOT parse: it is not what ships, and quietly
+        // accepting both is how nobody notices which one is live.
+        assert_eq!(
+            pickup_card_id("[amux auto-pickup] Claimed board card GV-648 from your queue"),
+            None,
+            "the pre-03ed2b6c wording is dead; parsing it would hide the next drift"
+        );
+        // Anchor present, id missing or malformed -> None, which is what routes
+        // the WARN. Each of these would have been a plausible-looking void.
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}— work it now")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}the next card")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}lower-9 — work it now")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}AF- — work it now")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}AF-x1 — work it now")), None);
     }
 
     // AMUX-3659, rebuilt from the MR-2 timeline to the second.
@@ -16237,6 +16302,7 @@ mod tests {
     // been RED before the guard existed (the row would have stayed for delivery).
     #[tokio::test]
     async fn a_stale_auto_pickup_is_voided_at_the_delivery_boundary() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
         let (st, _dir) = state();
         let now = now_f64();
         let _ = st
@@ -16256,9 +16322,9 @@ mod tests {
                     [],
                 )?;
                 let stale =
-                    "[amux auto-pickup] Claimed board card GV-648 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}GV-648 — work it now.");
                 let live =
-                    "[amux auto-pickup] Claimed board card AMUX-9 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}AMUX-9 — work it now.");
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
                      VALUES('s1','lane-stale',?1,?2,'board-drive')",
@@ -16358,6 +16424,7 @@ mod tests {
     /// carried the producer positionally would break here first.
     #[tokio::test]
     async fn a_row_leaving_the_queue_keeps_the_guard_it_was_enqueued_with() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
         let (st, _dir) = state();
         let now = now_f64();
         let _ = st
@@ -16371,7 +16438,7 @@ mod tests {
                     [],
                 )?;
                 let stale =
-                    "[amux auto-pickup] Claimed board card AMUX-8 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}AMUX-8 — work it now.");
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard, sender) \
                      VALUES('v1','lane-v',?1,?2,'board-drive','')",
@@ -16405,6 +16472,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_error_at_the_stale_check_signals_and_still_delivers() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
         let (st, _dir) = state();
         let now = now_f64();
         let _ = st
@@ -16412,7 +16480,7 @@ mod tests {
             .write_async(move |conn| {
                 ensure_fleet_tables(conn)?;
                 let pick =
-                    "[amux auto-pickup] Claimed board card BET-6 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}BET-6 — work it now.");
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
                      VALUES('r1','lane-x',?1,?2,'board-drive')",
