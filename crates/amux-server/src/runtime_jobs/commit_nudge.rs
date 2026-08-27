@@ -1323,8 +1323,12 @@ fn missing_line_instances(have: &str, want: &str) -> usize {
     // TRAILING whitespace IS content too. Markdown's hard line break is two
     // trailing spaces, and Markdown is the most common file type this nudge
     // touches. Measured by gtm-media-assets while reviewing this change, and
-    // reproduced: `git grep -IP '\S  +$' -- '*.md'` finds 3 lines in this repo
-    // and 294 FILES on the mixpeek checkout.
+    // reproduced 2026-08-26. The two commands report different UNITS, so both
+    // are given: quoting one and citing the other's number makes a reader who
+    // runs it think the comment is stale.
+    //
+    //     git grep -IP  '\S  +$' -- '*.md'   # LINES:  amux 3,  mixpeek 1986
+    //     git grep -IlP '\S  +$' -- '*.md'   # FILES:  amux 1,  mixpeek 294
     //
     // We drop it anyway, because the two failures are not the same size. Losing
     // it costs a line break in rendered output. Treating it as content holds
