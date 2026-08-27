@@ -1309,12 +1309,21 @@ fn demote_settled_shared(own: &mut Ownership, settled: &BTreeSet<String>) {
 /// verdict. The failure mode stays "warned too loudly" rather than "prescribed a
 /// remedy that ate committed work".
 fn missing_line_instances(have: &str, want: &str) -> usize {
+    // `trim_end`, not `trim`: the two ends of a line are not the same kind of
+    // thing. LEADING whitespace is content wherever indentation carries meaning
+    // (Python, YAML), and erasing it was the second half of the bug this
+    // function was rewritten for. TRAILING whitespace is content in no language
+    // anyone writes here, and gtm-media-assets flagged the consequence of
+    // treating it as content when they signed off e5c37bb9: an editor that
+    // strips trailing whitespace on save would hold DIVERGED open on a
+    // whitespace-only delta. Splitting the two ends keeps the axis and drops the
+    // false positive (AMUX-3786).
     let mut pool: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
-    for l in have.lines().filter(|l| !l.trim().is_empty()) {
+    for l in have.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
         *pool.entry(l).or_default() += 1;
     }
     let mut missing = 0usize;
-    for l in want.lines().filter(|l| !l.trim().is_empty()) {
+    for l in want.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
         match pool.get_mut(l) {
             Some(n) if *n > 0 => *n -= 1,
             _ => missing += 1,
@@ -3968,6 +3977,21 @@ mod tests {
             missing_line_instances("a\n\n   \nb\n", "a\nb\n"),
             0,
             "blank and whitespace-only lines are not content"
+        );
+        // THE TWO ENDS OF A LINE ARE NOT THE SAME KIND OF THING (AMUX-3786).
+        // These two cells must hold TOGETHER: dropping the second would let a
+        // full `trim` back in and re-open the re-indent bug, and dropping the
+        // first would hold DIVERGED open every time an editor strips trailing
+        // whitespace on save.
+        assert_eq!(
+            missing_line_instances("g()\n", "g()   \n"),
+            0,
+            "TRAILING whitespace is content in no language written here"
+        );
+        assert_eq!(
+            missing_line_instances("g()\n", "    g()\n"),
+            1,
+            "LEADING whitespace is content wherever indentation carries meaning"
         );
     }
 }
