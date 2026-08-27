@@ -1296,6 +1296,64 @@ async fn worktree_lines_absent_from_origin(dir: &str, p: &str) -> Option<usize> 
     Some(mine.lines().map(str::trim).filter(|l| !l.is_empty()).filter(|l| !theirs.contains(l)).count())
 }
 
+/// The MIRROR of [`worktree_lines_absent_from_origin`], and the half the
+/// DIVERGED verdict never asked (gtm-media-assets, 2026-08-26).
+///
+/// DIVERGED tells the owner that both single-arm remedies destroy landed work,
+/// so they must hand-merge. That claim has TWO independent halves, and only one
+/// of them was ever measured:
+///
+///   restore risk  the worktree holds lines origin lacks, so
+///                 `git checkout origin/main -- <path>` destroys them.
+///                 Measured, by the function above.
+///   commit  risk  origin holds lines the worktree lacks, so committing the
+///                 worktree REVERTS them.  NEVER MEASURED — inferred from sha
+///                 ancestry, which is exactly what a graft-push replay breaks.
+///
+/// A path can fail the first test and pass the second, and on a fleet that
+/// graft-pushes that is the COMMON case rather than a corner: graft-push lands
+/// the work under a new sha and leaves the local commit object behind, so
+/// `origin/main..HEAD` prints commits for a path whose content origin already
+/// has. Both arms fire, and the verdict is "novel and stale at once".
+///
+/// THE LIVE SPECIMEN, server/mvs/shard-rs/src/grpc.rs on the mixpeek checkout:
+/// both ancestry arms print commits, and `git diff --numstat origin/main` reads
+/// 42 added, ZERO deleted. The worktree is a strict SUPERSET of origin — it
+/// already contains origin's newest commit on that path. Nothing to merge,
+/// nothing of origin's at risk, and the correct action was the ordinary commit
+/// that DIVERGED told them not to make.
+///
+/// The cost of being wrong in that direction is what makes this worth a second
+/// subprocess: a false DIVERGED tells the owner both remedies are destructive
+/// and sends them to a manual reconciliation, which is the operation most
+/// likely to lose the work the warning was protecting.
+///
+/// Set semantics, deliberately the same as the mirror: trimmed, blank lines
+/// dropped, order ignored. A line MOVED within the file is not a loss, and a
+/// diff-based count would report it as one.
+async fn origin_lines_absent_from_worktree(dir: &str, p: &str) -> Option<usize> {
+    let origin = tokio::process::Command::new("git")
+        .args(["-C", dir, "show", &format!("origin/main:{p}")])
+        .output()
+        .await
+        .ok()
+        .filter(|o| o.status.success())?;
+    let origin = String::from_utf8_lossy(&origin.stdout);
+
+    let mine = tokio::fs::read_to_string(std::path::Path::new(dir).join(p)).await.ok()?;
+    let ours: std::collections::HashSet<&str> =
+        mine.lines().map(str::trim).filter(|l| !l.is_empty()).collect();
+
+    Some(
+        origin
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .filter(|l| !ours.contains(l))
+            .count(),
+    )
+}
+
 /// When it cannot classify a path (git error, no origin/main ref) it treats the
 /// path as ordinary work, never STALE, so a failure degrades to today's
 /// behaviour rather than inventing a revert warning.
@@ -1576,14 +1634,51 @@ async fn freshness_from_repo(dir: &str, paths: &[String]) -> Freshness {
                         fresh.stale.push(p.clone());
                     }
                     other => {
-                        tracing::info!(
-                            target: "autofix",
-                            path = %p,
-                            dir = %dir,
-                            novel_lines = ?other,
-                            "commit-nudge: DIVERGED stands — content differs in both directions"
-                        );
-                        fresh.diverged.push(p.clone());
+                        // 3d. THE OTHER HALF OF THE CLAIM, which nothing here
+                        //     had ever measured (gtm-media-assets, 2026-08-26).
+                        //     Reaching this arm proves only that the worktree
+                        //     holds lines origin lacks — the RESTORE is unsafe.
+                        //     DIVERGED additionally asserts that COMMITTING is
+                        //     unsafe, and that half was inferred from sha
+                        //     ancestry, which a graft-push replay breaks for
+                        //     every path on the checkout.
+                        //
+                        //     If origin holds no line the worktree lacks, the
+                        //     worktree is a strict SUPERSET of origin: the
+                        //     commit reverts nothing, so the honest class is an
+                        //     ordinary edit and the honest advice is to commit.
+                        //     Not STALE — STALE prescribes the restore that
+                        //     would eat the local lines counted just above.
+                        //
+                        //     SAME ONE-SIDED SHAPE as 3c: it can only downgrade,
+                        //     only on a readable positive zero, and any error or
+                        //     unreadable side leaves DIVERGED standing.
+                        match origin_lines_absent_from_worktree(dir, p).await {
+                            Some(0) => {
+                                tracing::info!(
+                                    target: "autofix",
+                                    path = %p,
+                                    dir = %dir,
+                                    novel_lines = ?other,
+                                    "commit-nudge: DIVERGED downgraded to EDITED — the worktree \
+                                     is a strict superset of origin, so committing reverts \
+                                     nothing and there is nothing to hand-merge"
+                                );
+                                fresh.edited.push(p.clone());
+                            }
+                            lost => {
+                                tracing::info!(
+                                    target: "autofix",
+                                    path = %p,
+                                    dir = %dir,
+                                    novel_lines = ?other,
+                                    origin_lines_at_risk = ?lost,
+                                    "commit-nudge: DIVERGED stands — content differs in both \
+                                     directions"
+                                );
+                                fresh.diverged.push(p.clone());
+                            }
+                        }
                     }
                 }
             } else {
@@ -3558,6 +3653,10 @@ mod tests {
         std::fs::write(work.join("truly-diverged.md"), "entry A\n").unwrap();
         // BLOB TWIN + local deletion (mixpeek-frustrations' second report).
         std::fs::write(work.join("twin.md"), "entry A\n").unwrap();
+        // STRICT SUPERSET (gtm-media-assets' report, 2026-08-26): the worktree
+        // ends up holding everything origin has PLUS local lines, while both
+        // ancestry arms print commits.
+        std::fs::write(work.join("superset.md"), "entry A\n").unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-m", "base"]);
         git(&work, &["push", "-q", "origin", "main"]);
@@ -3567,6 +3666,7 @@ mod tests {
         std::fs::write(work.join("replayed.md"), "entry A\nentry B\n").unwrap();
         std::fs::write(work.join("truly-diverged.md"), "entry A\nentry B\n").unwrap();
         std::fs::write(work.join("twin.md"), "entry A\nentry B\n").unwrap();
+        std::fs::write(work.join("superset.md"), "entry A\nentry LOCAL\n").unwrap();
         git(&work, &["add", "-A"]);
         git(&work, &["commit", "-m", "local: entry B"]);
 
@@ -3584,6 +3684,8 @@ mod tests {
         // The peer lands the SAME BYTES local already committed, under a
         // different sha: the graft twin. HEAD:twin.md == origin/main:twin.md.
         std::fs::write(peer.join("twin.md"), "entry A\nentry B\n").unwrap();
+        // Origin moves on superset.md with a line the LOCAL commit never had.
+        std::fs::write(peer.join("superset.md"), "entry A\nentry PEER\n").unwrap();
         git(&peer, &["add", "-A"]);
         git(&peer, &["commit", "-m", "peer: entries B and C"]);
         git(&peer, &["push", "-q", "origin", "main"]);
@@ -3597,6 +3699,9 @@ mod tests {
             "entry A\nentry B\nentry LOCAL-ONLY\n",
         )
         .unwrap();
+        // The superset specimen: everything origin has, plus a local line. This
+        // is the shape `git diff --numstat origin/main` reports as "N  0".
+        std::fs::write(work.join("superset.md"), "entry A\nentry PEER\nentry LOCAL\n").unwrap();
 
         let dir = work.to_str().unwrap();
 
@@ -3604,7 +3709,7 @@ mod tests {
         // or this test proves nothing about the downgrade — it would just be
         // exercising the ordinary STALE path. "I built the specimen" is a claim,
         // not a premise.
-        for p in ["replayed.md", "truly-diverged.md"] {
+        for p in ["replayed.md", "truly-diverged.md", "superset.md"] {
             let ahead = std::process::Command::new("git")
                 .args(["-C", dir, "log", "--oneline", "origin/main..HEAD", "--", p])
                 .output()
@@ -3616,8 +3721,29 @@ mod tests {
             );
         }
 
-        let fresh = freshness_from_repo(dir, &s(&["replayed.md", "truly-diverged.md"])).await;
+        let fresh =
+            freshness_from_repo(dir, &s(&["replayed.md", "truly-diverged.md", "superset.md"]))
+                .await;
 
+        // A STRICT SUPERSET OF ORIGIN IS NOT DIVERGED (gtm-media-assets, 2026-08-26).
+        // Both ancestry arms print commits — the premise loop above proves it —
+        // and the worktree still holds every line origin has. Committing reverts
+        // nothing, so telling the owner that both remedies destroy landed work
+        // sends them to a hand-merge that can only lose work.
+        //
+        // NOT STALE EITHER, and that is the trap in this cell: STALE prescribes
+        // `git checkout origin/main -- <path>`, which would delete `entry LOCAL`.
+        // A downgrade to the nearer-looking class would still destroy the work.
+        assert_eq!(
+            fresh.edited,
+            s(&["superset.md"]),
+            "a worktree containing every line origin has, plus local ones, is an ordinary EDIT: \
+             {fresh:?}"
+        );
+
+        // The two assertions below are also the control for the cell above: they
+        // are exact-equality, so a downgrade that fired unconditionally would
+        // empty them and fail here rather than passing quietly.
         assert_eq!(
             fresh.stale,
             s(&["replayed.md"]),
