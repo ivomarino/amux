@@ -13245,6 +13245,55 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                     // The moment amux gains a provider-independent context signal
                     // (AMUX-3806), every one of them would have started receiving
                     // `/compact` as literal text.
+                    // ONE COMPACT PER READING (AMUX-3805).
+                    //
+                    // The trigger re-evaluates on EVERY state report, and a
+                    // report can carry a reading amux has already acted on. It
+                    // then queues a second compact against a number that
+                    // predates the first one executing. gtm-videos received
+                    // THREE identical `/compact` messages, all carrying
+                    // used=889866: the first compacted, the other two were typed
+                    // into the prompt for nothing and sat directly above Ethan's
+                    // own message. Fleet-wide the same day: 352 re-queues
+                    // against 98 genuine ones (78%), worst pending age 599s.
+                    //
+                    // AMUX-3557 measured this exact loop ("300 times on backend,
+                    // 78 in one hour") and shipped `pending_age_s` LOGGING. The
+                    // `auto-compact` guard is at-most-one-PENDING, which is a
+                    // different fact: once a pending is DELIVERED it clears and
+                    // the next stale report queues a fresh one. Pending-ness is
+                    // not reading-freshness.
+                    //
+                    // THE DISCRIMINATOR IS THE READING ITSELF, not a clock and
+                    // not a cooldown. `used` DROPS when a compact succeeds, so
+                    // "same number I last acted on" means "no new information
+                    // since I acted". A cooldown would be wrong in the other
+                    // direction: a lane STILL low after a successful compact
+                    // must be able to compact again at once, and it can, because
+                    // its `used` will have changed.
+                    //
+                    // Provider-agnostic by construction: it reasons about the
+                    // measurement's freshness, never about who produced it.
+                    let fresh_reading = {
+                        static LAST_ACTED: std::sync::OnceLock<
+                            std::sync::Mutex<std::collections::HashMap<String, u64>>,
+                        > = std::sync::OnceLock::new();
+                        let map = LAST_ACTED.get_or_init(Default::default);
+                        let mut g = map.lock().unwrap_or_else(|e| e.into_inner());
+                        if g.get(name) == Some(&used) {
+                            tracing::debug!(
+                                target: "compaction",
+                                session = %name, used, pct,
+                                "auto-compact SKIPPED — same reading already acted on \
+                                 (AMUX-3805); waiting for a fresh one"
+                            );
+                            false
+                        } else {
+                            g.insert(name.to_string(), used);
+                            true
+                        }
+                    };
+                    if fresh_reading {
                     let provider = provider_of(&parse_env(name));
                     let compaction = crate::provider::default_registry()
                         .resolve(&provider)
@@ -13324,6 +13373,7 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
                         already_pending = pending_age_s.is_some(),
                         "auto-compact queued — context low"
                     );
+                    }
                     }
                     emit_event(
                         state,
