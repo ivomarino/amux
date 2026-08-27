@@ -72,6 +72,46 @@ if [ -s "$msg_file" ] && [ -n "$(tail -c 1 "$msg_file")" ]; then
   echo >> "$msg_file"
 fi
 
+# WHICH REASONING PROCESS, not merely which lane (AMUX-3780).
+#
+# mixpeek-homepage-claude was credited with a commit they did not write: two
+# distinct Claude sessions ran under that ONE lane name on 2026-08-26 and both
+# committed, and `Amux-Session` records the lane. Their framing is the sharp
+# one — a trailer that names the lane reads exactly like a trailer that names
+# the author — and a reviewer (me) routed questions about that change to the
+# wrong party as a result.
+#
+# THE FIELD HAS TO BE ONE AMUX OWNS. Their suggested fix was to promote the
+# `Claude-Session` trailer, which b1f5a478 happened to carry. Measured: only
+# 30% of commits since that field first appeared carry it at all, because it is
+# written by Claude Code's own trailer feature and not by any amux hook. A
+# discriminator present on 30% of commits cannot answer "whose is this".
+#
+# `cc_conversation_id` is amux's own: it is the lane's transcript identity, it
+# is already maintained in the session meta, and `amux fresh` rotates it — so
+# it separates reasoning processes by construction rather than by luck.
+#
+# FAIL-OPEN, and silent when absent. A hook that blocks a commit because it
+# could not read a JSON file would be a worse bug than the one it fixes, and a
+# human commit ("(human)") has no conversation to name.
+#
+# WHAT THIS DOES NOT FIX, stated so nobody reads the trailer as complete:
+# `git commit-tree` fires no hooks, and graft-push is built on it. A grafted
+# commit carries NEITHER trailer, so absence still has several causes that read
+# identically. That axis is a recipe change, not a hook change — a hook cannot
+# repair a path that never invokes it.
+conv=""
+if [ "$stamp" != "(human)" ]; then
+  _meta="${AMUX_HOME:-$HOME/.amux}/sessions/${stamp}.meta.json"
+  if [ -r "$_meta" ]; then
+    conv="$(python3 -c 'import json,sys
+try:
+    print((json.load(open(sys.argv[1])).get("cc_conversation_id") or "").strip())
+except Exception:
+    pass' "$_meta" 2>/dev/null)"
+  fi
+fi
+
 git interpret-trailers --in-place --if-exists doNothing \
   --trailer "Amux-Session: $stamp" "$msg_file" 2>/dev/null || {
   # Ancient git without interpret-trailers: fall back to a plain paragraph
@@ -79,4 +119,15 @@ git interpret-trailers --in-place --if-exists doNothing \
   grep -q "^Amux-Session: " "$msg_file" 2>/dev/null \
     || printf '\nAmux-Session: %s\n' "$stamp" >> "$msg_file"
 }
+
+# Stamped SEPARATELY and only when known, so a missing conversation id can
+# never cost the session stamp above — the field that already works must not
+# become conditional on the field being added.
+if [ -n "$conv" ]; then
+  git interpret-trailers --in-place --if-exists doNothing \
+    --trailer "Amux-Conversation: $conv" "$msg_file" 2>/dev/null || {
+    grep -q "^Amux-Conversation: " "$msg_file" 2>/dev/null \
+      || printf 'Amux-Conversation: %s\n' "$conv" >> "$msg_file"
+  }
+fi
 exit 0
