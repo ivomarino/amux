@@ -1,5 +1,32 @@
 [
   {
+    "hash": "0ae647b1",
+    "short": "0ae647b",
+    "title": "Real-time backbone health is now visible in the dashboard",
+    "date": "2026-08-27",
+    "type": "feat",
+    "tags": ["dashboard", "observability"],
+    "description": "The SSE realtime backbone now publishes a joined health signal — server-side connection count meets the client-side reconnect beacon count. The dashboard can now show whether your fleet is truly live-connected or silently polling. A near-zero stale reconnect count shortly after a deploy is expected (ramp-up); the live connections metric is the discriminator. Check GET /api/debug/sse for the full breakdown."
+  },
+  {
+    "hash": "7f197c13",
+    "short": "7f197c1",
+    "title": "Every fleet gh call now uses your GitHub App token automatically",
+    "date": "2026-08-27",
+    "type": "feat",
+    "tags": ["github", "fleet"],
+    "description": "A token shim now sits in front of every `gh` CLI call made by an agent in the fleet. When a GitHub App is configured in amux, its installation token is injected automatically — no per-session credential setup, no agent-by-agent authentication. Teams using GitHub Apps for CI, PR creation, or repository access get fleet-wide coverage without touching each worker's environment."
+  },
+  {
+    "hash": "b1f5a478",
+    "short": "b1f5a47",
+    "title": "Board pickup scoring now weights by task age — older tasks surface first",
+    "date": "2026-08-26",
+    "type": "feat",
+    "tags": ["board", "fleet"],
+    "description": "The board drive previously picked up todo items in pos-LIFO order, which meant tasks added early could be buried under newer ones indefinitely. Age-weighted pickup scoring now blends position with how long a card has been waiting. Tasks that have sat in todo for hours or days score higher and get claimed sooner, keeping the backlog moving rather than stacking."
+  },
+  {
     "hash": "bfd8d78c",
     "short": "bfd8d78",
     "title": "Duplicate / clone any live session",
