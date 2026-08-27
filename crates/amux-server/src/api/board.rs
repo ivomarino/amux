@@ -240,7 +240,7 @@ async fn get_contract(
             "where": "_amux_state_events rows carry the FULL pre-mutation card snapshot in                       their payload, so a description overwritten by a PATCH is recoverable                       without any backup",
             "how": "find the row for the mutation (by card id and timestamp) and read the                     snapshot out of its payload",
             "prevention": "PATCH refuses two acts and the refusal body names which via `rule`: SIZE — a replace dropping a strict majority of a desc of 500+ chars, any writer; and AUTHORSHIP — a replace by a DIFFERENT session in which NONE of the card owner's lines survive, at any magnitude and in either direction. Length is not the test: a 54-char desc replaced by 17 chars and a 264-char desc replaced by 392 both destroyed everything and both passed the old size floors (AF-191). Both escape via desc_shrink_ack. To ADD rather than replace — almost always what a reviewer means — send PATCH /api/board/<id> {\"desc_append\": \"your note\"}. `desc_append` is a FIELD in the PATCH body, not a sub-path: POST /api/board/<id>/desc-append is NOT routed and a lane guessed it twice on 2026-08-24 (AF-187)",
-            "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head and \"slim\": 1). An ABSENT field is not an empty                                  one, and .get(\"desc\") returns None either way — read                                  desc_len, or GET the single card",
+            "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head, and a `slim` key holding the ARRAY of dropped                                  field names — not the flag `1` this line claimed until                                  2026-08-27). An ABSENT field is not an empty one, and                                  .get(\"desc\") returns None either way — read desc_len,                                  read `slim` to see everything else that was dropped, or                                  GET the single card",
         },
         "list": {
             "endpoint": "GET /api/board",
@@ -258,9 +258,14 @@ async fn get_contract(
                 "limit": "page size, applied AFTER done_limit",
                 "offset": "page offset",
                 "slim": "1 = trimmed item bodies (desc_head/desc_len/log_n/folded_n instead of \
-                        prose) — the DEFAULT shape since AMUX-3496. Slim rows carry \
-                        \"slim\": 1 so a consumer can tell a dropped field from an empty one \
-                        (AF-161: a census read absence as emptiness and was 100% wrong)",
+                        prose) — the DEFAULT shape since AMUX-3496. Each slim row carries a \
+                        `slim` key whose VALUE IS THE ARRAY of field names that row dropped \
+                        (see slim_omits), so a consumer can tell a dropped field from an empty \
+                        one (AF-161: a census read absence as emptiness and was 100% wrong). \
+                        This said \"slim\": 1 until 2026-08-27, describing a flag where the code \
+                        ships the answer — a reader who trusted it would never think to look \
+                        there for WHICH fields went missing, which is the AF-161 failure with \
+                        the remedy already built",
                 "full": "1 = full prose bodies (desc + log). The default list is slim; a \
                          reader that needs desc/log must ask (slim=0 also honored)",
                 "quota": "1 = per-status terminal quotas (verified floor 300; done/discarded \
