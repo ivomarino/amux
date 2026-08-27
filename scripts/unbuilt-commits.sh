@@ -76,6 +76,28 @@ trap 'rm -f "$BUILT"' EXIT
 grep -o "building [0-9a-f]\{40\}" "$LOG" 2>/dev/null | awk '{print $2}' | sort -u > "$BUILT"
 [ -s "$BUILT" ] || { echo "builder log has no 'building <sha>' lines — refusing to guess." >&2; exit 2; }
 
+# CAN THE LOG EVEN SEE THIS RANGE? (amux-frustrations, reviewing 12627007.)
+# The refusal above covers an ABSENT log. A TRUNCATED or ROTATED one is the same
+# defect wearing a different hat: every commit predating the surviving log has no
+# `building` line, so it reports NEVER BUILT with no signal, and a measurement
+# gap reads as a large regression. That is this tool's own class one layer up —
+# it refuses to let absence read as emptiness for the log, then lets it read as
+# emptiness for the log's WINDOW.
+#
+# Today the log opens at `2026-08-09 14:23:16 building 7253465c`, the builder's
+# own first commit, and nothing in rust-auto-build.sh rotates it. Which is
+# exactly why it would not announce itself the day something does.
+LOG_START=$(grep -m1 -o '^== [0-9][0-9-]* [0-9:]*' "$LOG" 2>/dev/null | sed 's/^== //')
+OLDEST=$(git log --reverse --format='%cd' --date=format:'%Y-%m-%d %H:%M:%S' \
+           "$RANGE" -- crates/ Cargo.toml Cargo.lock 2>/dev/null | head -1)
+COVERAGE_WARN=""
+if [ -n "$LOG_START" ] && [ -n "$OLDEST" ]; then
+  # Lexical compare is correct for zero-padded `YYYY-MM-DD HH:MM:SS`.
+  if [ "$LOG_START" \> "$OLDEST" ]; then
+    COVERAGE_WARN="the builder log begins $LOG_START but this range begins $OLDEST — commits before the log opens CANNOT be seen and are counted as never built"
+  fi
+fi
+
 total=0; unbuilt=0
 UNBUILT_LIST=$(mktemp) || exit 2
 trap 'rm -f "$BUILT" "$UNBUILT_LIST"' EXIT
@@ -89,7 +111,16 @@ done < <(git rev-list "$RANGE" -- crates/ Cargo.toml Cargo.lock 2>/dev/null)
 
 echo "range $RANGE — $total commit(s)"
 echo "  built as committed: $((total-unbuilt))"
-echo "  NEVER built:        $unbuilt ($(( unbuilt * 100 / total ))%)"
+# ONE DECIMAL, ROUNDED. Integer truncation printed 125/839 as "14%" when it is
+# 14.9 — understating, which is the wrong direction for a how-bad-is-this
+# number (amux-frustrations).
+_tenths=$(( (unbuilt * 1000 + total / 2) / total ))
+echo "  NEVER built:        $unbuilt ($(( _tenths / 10 )).$(( _tenths % 10 ))%)"
+if [ -n "$COVERAGE_WARN" ]; then
+  echo
+  echo "  ** COVERAGE GAP: $COVERAGE_WARN"
+  echo "  ** The count above is an UPPER BOUND, not a measurement."
+fi
 
 if [ "$unbuilt" -eq 0 ]; then
   echo "every commit in this range has been compiled as committed."

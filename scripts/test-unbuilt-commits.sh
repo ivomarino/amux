@@ -95,6 +95,37 @@ else
   bad "5: docs-only commit counted as a miss: rc=$rc5 out=[$(echo "$out5" | tr '\n' ' ')]"
 fi
 
+# 6 — A TRUNCATED/ROTATED LOG MUST ANNOUNCE ITSELF (amux-frustrations, reviewing
+#     12627007). The absent-log refusal at cell 3 does not cover a log that
+#     exists but starts AFTER the range: every commit before it has no
+#     `building` line and reports as never built, so a measurement gap reads as
+#     a large regression. This is the tool's own class one layer up.
+cat > "$D/log3" <<EOF
+== 2099-01-01 00:00:00 building $C3 (trigger: $C3, previous stamp: x)
+EOF
+out6=$(AMUX_RS_BUILD_LOG="$D/log3" "$SCRIPT" base..HEAD 2>&1)
+if echo "$out6" | grep -q "COVERAGE GAP" && echo "$out6" | grep -q "UPPER BOUND"; then
+  ok "6: a log starting after the range prints a coverage gap and calls the count a bound"
+else
+  bad "6: silent on a log that cannot see the range: [$(echo "$out6" | tr '\n' ' ')]"
+fi
+
+# 7 — CONTROL for cell 6: a log that DOES cover the range must stay quiet. A
+#     warning that always fires is one people stop reading.
+if ! echo "$out" | grep -q "COVERAGE GAP"; then
+  ok "7: control — a log covering the range prints no coverage gap"
+else
+  bad "7: coverage gap fired on a log that covers the range"
+fi
+
+# 8 — the percentage must ROUND, not truncate. 125/839 is 14.9 and printed as
+#     "14%", understating — the wrong direction for a how-bad-is-this number.
+if echo "$out" | grep -qE "NEVER built: +[0-9]+ \([0-9]+\.[0-9]%\)"; then
+  ok "8: the percentage carries a decimal instead of truncating"
+else
+  bad "8: percentage is truncated: [$(echo "$out" | grep NEVER)]"
+fi
+
 echo
 echo "pass=$PASS fail=$FAIL"
 [ "$FAIL" = 0 ]
