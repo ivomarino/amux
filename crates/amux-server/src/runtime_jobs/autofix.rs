@@ -2926,6 +2926,37 @@ fn is_big_file(e: &std::fs::DirEntry, floor: u64) -> bool {
     }
 }
 
+/// Which top-level `/private/tmp` entries are worth ranking.
+///
+/// THE FOURTH INSTANCE OF THE SHAPE THIS FUNCTION ALREADY NAMES TWICE, and the
+/// comment in `disk_candidates` predicted it: "after adding a surfacing
+/// mechanism, ask what the mechanism itself cannot express — and then ask it
+/// again about the answer you just gave." The answer given by AEAB-42 (files)
+/// and AMUX-3665 (checkout build trees) still could not express the AGENT
+/// SCRATCH ROOT, which is the one directory every session is *told* to write to.
+///
+/// The filter was `n.contains("target")`. Agent scratch lives at
+/// `/private/tmp/claude-<uid>`, and "claude-501" contains no "target", so the
+/// whole tree was unrankable BY CONSTRUCTION — not skipped for budget, not for
+/// permissions, never a candidate. Measured on this machine the day this was
+/// written: 18 GB total, 12 GB of it in a single lane. On another machine the
+/// same tree took the root volume to 0 bytes free and the lane sitting on it
+/// could not open a file to find out why — it had to ask a human, because
+/// amux's own disk report structurally could not name it.
+///
+/// Matching the `claude-` PREFIX rather than a literal uid keeps it correct on
+/// any machine; the uid differs per host and hardcoding this one is the
+/// "fact about one machine compiled into a public server" mistake the codebase
+/// has a name for.
+///
+/// Nesting is worth stating: this scan reads only the TOP level of
+/// `/private/tmp`, so a build tree INSIDE the scratch root was invisible twice
+/// over — its parent did not match and it was never itself a top-level entry.
+/// Adding the root fixes both, because the root is where `du` then descends.
+fn tmp_candidate_name(n: &str) -> bool {
+    n.contains("target") || n.starts_with("claude-")
+}
+
 fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
     let mut v: Vec<std::path::PathBuf> = Vec::new();
     // AEAB-42: FILES count, not only directories. Every branch of this function
@@ -2956,11 +2987,11 @@ fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
             }
         }
     }
-    // Build trees, wherever sessions put them.
+    // Build trees AND agent scratch, wherever sessions put them.
     if let Ok(rd) = std::fs::read_dir("/private/tmp") {
         for e in rd.flatten() {
             let n = e.file_name().to_string_lossy().into_owned();
-            if n.contains("target") && e.metadata().map(|m| m.is_dir()).unwrap_or(false) {
+            if tmp_candidate_name(&n) && e.metadata().map(|m| m.is_dir()).unwrap_or(false) {
                 v.push(e.path());
             }
         }
@@ -5777,6 +5808,40 @@ mod tests {
         assert!(has("big.db"), "a 2MB file above a 1MB floor must be a candidate: {got:?}");
         assert!(has("a-directory"), "directories must STILL be candidates: {got:?}");
         assert!(!has("small.txt"), "a file below the floor is noise, not a candidate: {got:?}");
+    }
+
+    /// The agent scratch root must be rankable (AF-275).
+    ///
+    /// The filter was `n.contains("target")`, and every session's scratch lives
+    /// at `/private/tmp/claude-<uid>`. "claude-501" contains no "target", so 18
+    /// GB on this machine — and a 100%-full root volume on another, where the
+    /// blocked lane could not open a file to find out why — was unrankable BY
+    /// CONSTRUCTION. It had to ask a human what was eating the disk, because
+    /// amux's own report could not name the directory amux tells it to use.
+    ///
+    /// A NAME PREDICATE rather than a filesystem fixture on purpose: the branch
+    /// reads the real `/private/tmp`, so a directory-based test would assert
+    /// against whatever the host happens to have and pass vacuously in CI,
+    /// where no `claude-<uid>` exists. This pins the shipped decision itself.
+    ///
+    /// The `target` cells are the control. A fix that swapped one exclusion for
+    /// its opposite would satisfy the scratch cell alone while silently
+    /// dropping every build tree — the same defect with the sign flipped, which
+    /// this file has shipped in both directions before.
+    #[test]
+    fn the_agent_scratch_root_is_rankable_and_build_trees_still_are() {
+        // Treatment: the specimen from the incident, and the shape on any host.
+        assert!(tmp_candidate_name("claude-501"), "the agent scratch root on this machine");
+        assert!(tmp_candidate_name("claude-0"), "and on a host with a different uid");
+
+        // Control: the behaviour that already existed must survive.
+        assert!(tmp_candidate_name("amux-build-target"), "build trees must STILL rank");
+        assert!(tmp_candidate_name("target"), "and a bare target dir");
+
+        // Neither arm may become a catch-all: ranking all of /private/tmp would
+        // spend the whole `du` budget on OS noise and crowd out real findings.
+        assert!(!tmp_candidate_name("com.apple.launchd.abc123"));
+        assert!(!tmp_candidate_name("tmux-501"), "the tmux socket dir is tiny and not ours to rank");
     }
 
     /// AMUX-3667 follow-up, rebuilt from the eight cards themselves.
