@@ -8268,6 +8268,29 @@ fn jresp(status: StatusCode, v: Value) -> Response {
 fn j200(v: Value) -> Response {
     jresp(StatusCode::OK, v)
 }
+
+/// A 200 that tells the latency detectors this request was SUPPOSED to be slow
+/// (AMUX-3801).
+///
+/// A config change that swaps provider/model/effort/yolo does not write a file
+/// and return — it runs `restart_for_swap`: stop the session, kill the tmux
+/// pane, start it again. Seconds is the correct duration for that. Measured
+/// 2026-08-27: PATCH on a session path averaged 5161ms over 7 calls with a
+/// 22154ms worst, and autofix filed the 22s one as a latency defect against a
+/// flat 10s threshold that knows nothing about what the route DOES.
+///
+/// PER-REQUEST, NOT PER-ROUTE, which is the whole reason to use the existing
+/// `x-amux-slow-ok` mechanism (AMUX-3513) rather than exempting the path. The
+/// same endpoint answers config changes that restart nothing, and those must
+/// STILL be measured — a tag rename taking 22s is a real defect. Only the call
+/// that actually restarted a worker declares itself.
+fn j200_slow_ok(v: Value, why: &str) -> Response {
+    let mut r = jresp(StatusCode::OK, v);
+    if let Ok(hv) = axum::http::HeaderValue::from_str(why) {
+        r.headers_mut().insert("x-amux-slow-ok", hv);
+    }
+    r
+}
 fn not_found() -> Response {
     jresp(StatusCode::NOT_FOUND, json!({"error": "not found"}))
 }
@@ -14186,7 +14209,8 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         }
         let restarted = if was_running { restart_for_swap(state, name, &old_provider).await } else { false };
         let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
-        return j200(json!({"ok": true, "message": format!("provider set to {}{suffix}", provider_label(&provider_val))}));
+        let body = json!({"ok": true, "message": format!("provider set to {}{suffix}", provider_label(&provider_val))});
+        return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
 
     // Change model (py:76496), with optional inline effort.
@@ -14267,7 +14291,14 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         if let Some(e) = rep.hot_error {
             out["hot_error"] = json!(e);
         }
-        return j200(out);
+        // A RESTART that actually happened is the expensive path (AMUX-3801).
+        // `applied` alone is not the test: an EnvOnly or hot swap also applies
+        // and costs milliseconds — only Restart tears down and relaunches.
+        return if matches!(rep.mode, SwapMode::Restart) && rep.applied {
+            j200_slow_ok(out, "worker-restart")
+        } else {
+            j200(out)
+        };
     }
 
     // Change effort only (py:76570).
@@ -14313,7 +14344,14 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         if let Some(e) = rep.hot_error {
             out["hot_error"] = json!(e);
         }
-        return j200(out);
+        // A RESTART that actually happened is the expensive path (AMUX-3801).
+        // `applied` alone is not the test: an EnvOnly or hot swap also applies
+        // and costs milliseconds — only Restart tears down and relaunches.
+        return if matches!(rep.mode, SwapMode::Restart) && rep.applied {
+            j200_slow_ok(out, "worker-restart")
+        } else {
+            j200(out)
+        };
     }
 
     // Toggle YOLO (py:76608).
@@ -14344,7 +14382,8 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         let restarted = if was_running { restart_for_swap(state, name, &provider).await } else { false };
         let state_word = if enabled { "enabled" } else { "disabled" };
         let suffix = if restarted { " (session restarted; log reload queued)" } else { "" };
-        return j200(json!({"ok": true, "message": format!("yolo {state_word}{suffix}")}));
+        let body = json!({"ok": true, "message": format!("yolo {state_word}{suffix}")});
+        return if restarted { j200_slow_ok(body, "worker-restart") } else { j200(body) };
     }
 
     // Change directory (py:76646): hard restart in the new dir when running.
@@ -15520,6 +15559,33 @@ mod tests {
     /// the right weight here: the strong version needs a tmux seam this module
     /// does not have, and a weak check that names the hazard beats the nothing
     /// that was there when it happened (AMUX-3765).
+    /// AMUX-3801: a config change that RESTARTS a worker must tell the latency
+    /// detectors it was supposed to be slow, and one that does not must stay
+    /// measured.
+    ///
+    /// The second half is the control and it is the whole reason this is
+    /// per-request rather than a path exemption: the same endpoint answers
+    /// changes that restart nothing, and a tag rename taking 22s is a real
+    /// defect. Exempting `PATCH /api/sessions/{name}/config` wholesale would
+    /// have passed the first cell and blinded the endpoint permanently.
+    #[test]
+    fn only_a_config_change_that_actually_restarted_declares_itself_slow() {
+        let hdr = |r: &axum::response::Response| {
+            r.headers().get("x-amux-slow-ok").map(|v| v.to_str().unwrap_or("").to_string())
+        };
+        let restarted = j200_slow_ok(serde_json::json!({"ok": true}), "worker-restart");
+        assert_eq!(
+            hdr(&restarted).as_deref(),
+            Some("worker-restart"),
+            "a restart must carry the header the detectors read"
+        );
+        let plain = j200(serde_json::json!({"ok": true}));
+        assert!(
+            hdr(&plain).is_none(),
+            "a config change that restarted NOTHING must still be measured"
+        );
+    }
+
     #[test]
     fn no_test_in_this_module_sends_into_a_lane_that_could_be_auto_woken() {
         let src = include_str!("session_verbs.rs");
