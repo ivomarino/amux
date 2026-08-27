@@ -2217,7 +2217,7 @@ pub(crate) mod tests {
         for (a, b, want) in [
             ("mbsinfra", "mvsinfra", 0.875),
             ("tsgke", "tsgke", 1.0),
-            ("amuxcloud", "muxcloud", 0.9411764705882453),
+            ("amuxcloud", "muxcloud", 0.9411764705882353),
             ("abcd", "", 0.0),
             ("", "", 1.0),
             ("mixbeak", "mixpeek", 0.7142857142857143),

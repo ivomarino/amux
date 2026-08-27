@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 
 /// The port a server binds when nothing says otherwise.
 ///
-/// 8824 originally meant "not 8822, which Python owns". Python retired
+/// 8823 originally meant "not 8822, which Python owns". Python retired
 /// (792ce1f) and the installed service now answers 8822 AND 8824 — but the
 /// value stays, for a different and still-live reason: `cargo run -p
 /// amux-server` on a dev machine must not collide with the running service.
@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 /// that IS running, and pointing it here is what made every bare `amux-rs`
 /// invocation fail with a connection error indistinguishable from the server
 /// being down (AMUX-2672).
-pub const DEFAULT_PORT: u16 = 8824;
+pub const DEFAULT_PORT: u16 = 8823;
 
 /// The port THIS server is actually answering on — the one a client should be
 /// told to call.

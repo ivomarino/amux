@@ -227,9 +227,9 @@ fn restore_default_sigpipe() {}
 
 /// Where a client should look for the server, in order (AMUX-2672).
 ///
-/// The old default was `https://localhost:8824` — the port the Rust server used
+/// The old default was `https://localhost:8823` — the port the Rust server used
 /// while Python still owned 8822. Python retired and the Rust server took over
-/// BOTH 8822 and 8824, so nothing has listened on 8824 since, and every bare
+/// BOTH 8822 and 8824, so nothing has listened on 8823 since, and every bare
 /// `amux-rs <verb>` failed with a connection error.
 ///
 /// That is worse than it sounds: a connection error is indistinguishable from
@@ -243,7 +243,7 @@ fn restore_default_sigpipe() {}
 /// not localhost. The literal is only the last resort.
 ///
 /// Note this is the CLIENT's default and deliberately differs from the SERVER's
-/// `DEFAULT_PORT` (8824), which stays put so a dev `cargo run -p amux-server`
+/// `DEFAULT_PORT` (8823), which stays put so a dev `cargo run -p amux-server`
 /// binds a free port instead of colliding with the running service.
 ///
 /// 8824, not 8822 (2026-08-10): 8824 is what `install.sh` sets

@@ -1,8 +1,8 @@
 //! AMUX-2672: a bare `amux-rs <verb>` must reach the server that is running.
 //!
-//! The default was `https://localhost:8824`, the port the Rust server used while
+//! The default was `https://localhost:8823`, the port the Rust server used while
 //! Python owned 8822. Python retired, the Rust server took over 8822 AND 8824,
-//! and nothing has listened on 8824 since — so every bare invocation died on
+//! and nothing has listened on 8823 since — so every bare invocation died on
 //! connect. The failure mode is what made it expensive: a connection error looks
 //! exactly like the server being down, so the CLI's own misconfiguration reads as
 //! a server fault (it cost a wrong diagnosis on AMUX-2653).
@@ -45,7 +45,7 @@ fn health_stderr(env: &[(&str, Option<&str>)]) -> String {
 fn bare_invocation_targets_neither_retired_port() {
     let err = health_stderr(&[]);
     assert!(
-        !err.contains(":8824"),
+        !err.contains(":8823"),
         "bare invocation must not target the dead dev port; stderr: {err}"
     );
     // 8822 is the retired legacy address. Defaulting there works today and
