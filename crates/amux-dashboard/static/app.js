@@ -173,11 +173,34 @@ function _applyTheme(light) {
   if (meta) meta.content = light ? '#ffffff' : '#0d1117';
   _hljsApplyTheme(light);
 }
-// Swap the highlight.js theme stylesheet to match amux's light/dark mode.
-function _hljsApplyTheme(light) {
+// The highlight.js theme is ALWAYS the dark one, because its only consumer is
+// always dark (Ethan, 2026-08-25: "when i open a python file it's just dark i
+// cant read it").
+//
+// This used to swap to `github.min.css` in light mode, to "match amux's
+// light/dark mode". But hljs markup is produced in exactly one place —
+// `_fileHighlightHTML` — and every rule styling it is scoped to
+// `.file-overlay-body.file-code`, which keeps a DARK body in light mode by
+// deliberate design. app.css says so a few rules down, where the GUTTER was
+// given a light-mode override for exactly that reason: "The light-mode file
+// viewer keeps a DARK body (#1c2128), so the gutter must match that, not the
+// page background." The gutter was fixed for the dark body and the syntax
+// colours were not.
+//
+// So in light mode the viewer loaded a stylesheet designed for a WHITE
+// background and painted it onto #1c2128. Measured on the shipped build:
+//   hljs-subst   rgb(36,41,46)  on rgb(28,33,40)  -> ~1.1:1 contrast
+//   hljs-string  rgb(3,47,98)   on rgb(28,33,40)  -> ~1.2:1 contrast
+// WCAG's floor for body text is 4.5:1. That is not "hard to read", it is
+// invisible, and it is why the report was "just dark".
+//
+// The theme is not a preference here, it is a property of the one surface that
+// renders it. If a light-background hljs consumer is ever added, this becomes a
+// per-surface class rather than a document-level stylesheet swap.
+function _hljsApplyTheme() {
   const l = document.getElementById('hljs-theme');
-  if (l) l.href = 'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/'
-    + (light ? 'github.min.css' : 'github-dark.min.css');
+  if (l) l.href =
+    'https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css';
 }
 function toggleTheme(checked) {
   const isLight = checked !== undefined ? checked : !document.body.classList.contains('light');
@@ -3048,7 +3071,7 @@ function render() {
       <div class="card-header" onclick="headerTap('${s.name}', event)" onmousedown="tileMouseDown(event,'${s.name}')">
         <div class="card-header-top">
           <div class="card-drag-handle" title="Drag to reorder"><svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="3" cy="3" r="1.3"/><circle cx="7" cy="3" r="1.3"/><circle cx="3" cy="8" r="1.3"/><circle cx="7" cy="8" r="1.3"/><circle cx="3" cy="13" r="1.3"/><circle cx="7" cy="13" r="1.3"/></svg></div>
-          <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
+          <div class="card-name">${s.pinned ? '<span class="pin-icon">&#x1F4CC;</span> ' : ''}${s.isolated ? '<span class="card-isolated" title="ISOLATED (raw agent): tmux plus the CLI, no amux harness — no AMUX_SESSION/AMUX_URL, no MCP config, no self-report hooks. Undiscoverable to peers: hidden from their fleet list and roster, and peer sends are refused. You can still peek and send from here. Applies at the next spawn.">ISOLATED</span> ' : ''}${esc(s.name)}${offCached ? ' <span class="card-offline-dot" title="Scrollback saved on this device — readable offline">&#x2B07;</span>' : ''}</div>
           <button class="card-menu-btn" onclick="event.stopPropagation();toggleMenu('${s.name}')" title="Options">&#x22EF;</button>
           <div class="card-menu" id="menu-${s.name}">
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','task','${escJs(s.task_name||"")}')"><span class="mi">&#x270F;</span> Task label${s.task_name ? '' : ' (none)'}</div>
@@ -3077,7 +3100,7 @@ function render() {
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();clearScrollback('${s.name}')"><span class="mi">&#x239A;</span> Clear scrollback</div>` : ''}
           <div class="card-menu-item" onclick="event.stopPropagation();duplicateSession('${s.name}')"><span class="mi">&#x2398;</span> Duplicate</div>
-          ${!s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();newConversation('${s.name}')"><span class="mi">&#x1F195;</span> New conversation</div>` : ''}
+          <div class="card-menu-item" onclick="event.stopPropagation();newConversation('${s.name}', ${s.running ? 'true' : 'false'})"><span class="mi">&#x1F195;</span> New conversation</div>
           <div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();shareSession('${s.name}')"><span class="mi">&#x1F517;</span> Share link</div>
           <div class="card-menu-item" onclick="event.stopPropagation();archiveSession('${s.name}')"><span class="mi">&#x1F4E6;</span> Archive</div>
           <div class="card-menu-sep"></div>
@@ -5157,15 +5180,40 @@ function cloneSession(session) {
   editField(session, 'clone', '');
 }
 
-async function newConversation(session) {
+// AMUX-3742: this used to be rendered ONLY on a stopped worker, and the API
+// refused while running — so on every live lane the one control that fixes a
+// degraded conversation was both hidden and refused. A lane resumes forever
+// and accumulates compaction generations (measured: amux median 8, max 215; a
+// raw terminal 0), which is what "raw claude performs better than amux claude"
+// turned out to be. It is available on a running worker now, and it says how
+// many generations deep the conversation is, because that number is what makes
+// this a decision rather than a guess.
+async function newConversation(session, running) {
   closeAllMenus();
-  // was `worker` — undefined here, so the click died as an invisible rejected
-  // promise (the exact bug class this gate exists for; caught by no-undef)
-  if (!await showConfirm('Start a fresh conversation for "' + session + '"?\n\nThe next time you start this worker, it will begin a new Claude conversation (history in the old conversation is preserved but won\'t be continued).', 'Reset', true)) return;
-  await apiCall(API + '/api/sessions/' + session + '/config', {
+  let gens = null;
+  try {
+    const r = await apiCall(API + '/api/debug/context-health');
+    if (r) {
+      const d = await r.json();
+      const lane = (d.lanes || []).find(l => l.session === session);
+      // `measured` is carried separately on purpose: never-compacted and
+      // could-not-measure both arrive as a missing count otherwise.
+      if (lane && lane.measured) gens = lane.generations;
+    }
+  } catch (e) { /* the count is context, not a precondition — proceed without it */ }
+  const depth = gens === null ? 'Its compaction depth could not be measured.'
+                              : 'It has been compacted ' + gens + ' time(s).';
+  const tail = running
+    ? '\n\nThis STOPS the worker now and restarts it on a new conversation. Anything it is mid-turn on is lost.'
+    : '\n\nThe next time you start this worker, it will begin a new conversation.';
+  if (!await showConfirm('Start a fresh conversation for "' + session + '"?\n\n' + depth
+      + ' The worker keeps its env, board cards, memory and groups — only the conversation restarts.'
+      + '\n\nThe old transcript is preserved, just not continued.' + tail, 'Reset', true)) return;
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
     method: 'PATCH', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ new_conversation: true })
+    body: JSON.stringify({ new_conversation: true, restart: !!running })
   });
+  if (r) showToast(running ? 'Restarting ' + session + ' on a fresh conversation' : 'Conversation reset');
 }
 
 async function shareSession(session) {
@@ -5586,7 +5634,7 @@ async function sendFromInput(name) {
   // peek composer (sendPeekCmd). Block while any is still uploading; a
   // files-only send (no text) is allowed.
   const _cf = _cardFiles[name] || [];
-  if (_cf.some(f => f.path == null)) { if (typeof showToast === 'function') showToast('Wait for upload to finish'); return; }
+  if (_blockedByAttachment(_cf)) return;
   const _files = _cf.filter(f => f.path);
   if (!text && _files.length === 0) {
     // Empty send = extract + submit the suggested prompt from the session
@@ -7890,7 +7938,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.721';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.746';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -9083,16 +9131,30 @@ function _resolveOutputPath(p) {
   return base ? base + '/' + rel : rel;
 }
 
-// Click target for a path in session output: open the FILE BROWSER at it.
+// Click target for a path in session output: a FILE opens the file, a DIRECTORY
+// opens the file browser.
 //
-// The browser is a directory view, so a file path opens its containing folder —
-// you land looking at the file, in context, with the session's shortcuts loaded
-// and the "back to <session>" affordance wired up. A path with no extension in
-// its last segment is treated as a directory and opened directly.
+// SCOPE, because this is narrower than it looks and I got it wrong first.
+// ABSOLUTE paths never reach here: `ansiToHtml`'s own `linkChunk` matches
+// `/abs/x.py` and `./rel/x.py` and wires them straight to `openFilePreview`, and
+// `_linkifyPaths` skips what is already inside a tag. So absolute paths have
+// always opened the file. This handler serves what that regex cannot see — the
+// bare `customers/rothco/data/x.csv` a worker writes inside its own cwd — and
+// THAT branch sent every click to the browser instead. Same blue span, two
+// behaviours, decided by whether the path happened to start with a slash.
 //
-// Deliberately the browser rather than the file-preview overlay: peek output is
-// most often naming a file so you can go LOOK at it and what is around it, and
-// the browser is reachable from a preview while the reverse costs a round trip.
+// The old comment defended the browser as deliberate: "peek output is most often
+// naming a file so you can go LOOK at it and what is around it, and the browser
+// is reachable from a preview while the reverse costs a round trip."
+//
+// Ethan, 2026-08-24 (AMUX-3663, screenshot of these links): "make sure i can
+// click the links and they work / open the files."
+//
+// The half of that rationale worth keeping is "see what is around it", and the
+// comment was ALREADY claiming the way back existed. It did not: `#file-subpath`
+// was dim text with no handler (ethos rule 6 — a claim that justifies a design
+// and is not implemented). It is a real button now, so the round trip the
+// comment promised is one click and the folder is never more than that away.
 async function _openPathFromOutput(p) {
   if (window.getSelection && String(window.getSelection()) !== '') return;  // a drag-select is not a click
   let full = _resolveOutputPath(p);
@@ -9116,8 +9178,15 @@ async function _openPathFromOutput(p) {
   } catch (e) {}
   const lastSeg = full.slice(full.lastIndexOf('/') + 1);
   const looksLikeFile = /\.[A-Za-z0-9]{1,8}$/.test(lastSeg);
-  const dir = looksLikeFile ? (full.slice(0, full.lastIndexOf('/')) || '/') : full;
-  openExplore(dir, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
+  if (looksLikeFile) {
+    // No `:linenum` strip needed here: `_resolveOutputPath` already did it
+    // (and `_linkifyPaths` captures the suffix as a separate group, so `p`
+    // never carried one either). Said out loud so it does not get "fixed" back
+    // in as defensive noise.
+    openFilePreview(full);
+    return;
+  }
+  openExplore(full, (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
 }
 
 // Turn file paths in ALREADY-ESCAPED peek HTML into links to the file browser.
@@ -9956,14 +10025,21 @@ function renderPeekFiles() {
   if (!bar) return;
   bar.classList.toggle('has-files', peekFiles.length > 0);
   if (peekFiles.length > 12) {
-    const uploading = peekFiles.filter(f => !f.path).length;
-    const done = peekFiles.length - uploading;
+    // A blocker must not hide behind a collapsed summary. Past 12 files the
+    // chips are folded away, so a row reporting only progress would show a
+    // cheerful percentage while one failed chip held the send guard shut.
+    const failed = peekFiles.filter(f => !f.path && f.error).length;
+    const uploading = peekFiles.filter(f => !f.path && !f.error).length;
+    const done = peekFiles.length - uploading - failed;
     const totalMB = peekFiles.reduce((a, f) => a + (parseFloat(f.sizeMB) || 0), 0);
     const queued = _uploadQueue.length;
     let status = '';
+    const failHtml = failed ? `<span style="color:var(--red)">${failed} failed</span>` : '';
     if (uploading > 0) {
-      const avgPct = peekFiles.filter(f => !f.path).reduce((a, f) => a + (f.totalChunks ? f.chunk / f.totalChunks : 0), 0) / (uploading || 1);
-      status = `<span style="color:var(--dim)">${done}/${peekFiles.length} done (${Math.round(avgPct * 100)}%)${queued ? ', ' + queued + ' queued' : ''}</span>`;
+      const avgPct = peekFiles.filter(f => !f.path && !f.error).reduce((a, f) => a + (f.totalChunks ? f.chunk / f.totalChunks : 0), 0) / (uploading || 1);
+      status = `<span style="color:var(--dim)">${done}/${peekFiles.length} done (${Math.round(avgPct * 100)}%)${queued ? ', ' + queued + ' queued' : ''}</span>` + failHtml;
+    } else if (failed > 0) {
+      status = failHtml;
     } else {
       status = `<span style="color:var(--green)">all uploaded</span>`;
     }
@@ -9986,30 +10062,68 @@ function _renderPeekFileChips() {
     } else {
       thumb = `<span class="chip-icon">${_fileIcon(f.name)}</span>`;
     }
+    // THE × IS ON EVERY CHIP IN EVERY STATE. It used to render only in the
+    // `done` branch, so the one state where you need it most — an upload that
+    // will never finish — had no remove control at all, and `sendPeekCmd`
+    // refuses while any chip lacks a `.path`. One stranded chip therefore made
+    // the composer permanently unsendable with no way out (AF-235). The card
+    // composer got this right at AMUX-3372, citing "the peek's own AMUX-85
+    // lesson" — the lesson reached the new surface and never came back to fix
+    // the one that taught it.
     let statusHtml = '';
-    if (isUploading) {
+    if (f.error) {
+      statusHtml = `<span class="chip-err" title="${esc(f.error)}">!</span>` +
+        `<span class="chip-retry" onclick="event.stopPropagation();retryPeekFile(${i})" title="Retry upload">↻</span>`;
+    } else if (isUploading) {
       const pct = f.totalChunks ? Math.round(f.chunk / f.totalChunks * 100) : 0;
       statusHtml = `<span style="color:var(--dim);font-size:0.6rem;">${pct}%</span>`;
     } else {
-      statusHtml = `<span style="color:var(--green);font-size:0.75rem;margin-right:2px;">✓</span><span class="chip-remove" onclick="removePeekFile(${i})">×</span>`;
+      statusHtml = `<span style="color:var(--green);font-size:0.75rem;margin-right:2px;">✓</span>`;
     }
-    return `<div class="peek-attach-chip${isUploading ? ' uploading' : ''}">
+    const cls = f.path ? '' : (f.error ? ' failed' : ' uploading');
+    return `<div class="peek-attach-chip${cls}">
       ${thumb}
       <span class="chip-name">${esc(f.name)}</span>
       ${statusHtml}
+      <span class="chip-remove" onclick="event.stopPropagation();removePeekFile(${i})" title="Remove">×</span>
     </div>`;
   }).join('');
 }
 
 function removePeekFile(idx) {
   const f = peekFiles[idx];
+  // Cancel BEFORE splicing. Removing the chip no longer stops the transfer by
+  // itself — that was the membership inference this fix removed — so the intent
+  // has to be stated (AF-235).
+  _cancelUpload(f);
   if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl);
   peekFiles.splice(idx, 1);
   renderPeekFiles();
 }
 
+// Say "stop" explicitly, and abort the in-flight request so a large chunk is not
+// still on the wire after the chip is gone.
+function _cancelUpload(f) {
+  if (!f) return;
+  f.cancelled = true;
+  try { if (f.aborter) f.aborter.abort(); } catch (e) {}
+  f.inflight = false;
+}
+
+function retryPeekFile(idx) {
+  const f = peekFiles[idx];
+  if (!f || f.inflight || f.path) return;
+  _runUpload(f, _peekSink());
+}
+
+function retryCardFile(name, idx) {
+  const f = (_cardFiles[name] || [])[idx];
+  if (!f || f.inflight || f.path) return;
+  _runUpload(f, _cardSink(name));
+}
+
 function clearPeekFiles() {
-  peekFiles.forEach(f => { if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+  peekFiles.forEach(f => { _cancelUpload(f); if (f && f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
   peekFiles = [];
   // Drop the stash too, or a send would clear the bar and the next open would
   // resurrect the files that were just sent.
@@ -10035,6 +10149,13 @@ function _peekFilesStash(session) {
 
 function _peekFilesRestore(session) {
   peekFiles = (session && _peekFilesBySession[session]) || [];
+  // AN ORPHAN PRESENTS AS SOMETHING TO ACT ON, NOT AS FROZEN PROGRESS (AF-235).
+  // A chip with no path that nothing is driving any more is the exact artifact
+  // the reporting user was staring at — it rendered "0%" forever, which reads
+  // as "still working" and is why they waited instead of removing it.
+  peekFiles.forEach(f => {
+    if (!f.path && !f.inflight && !f.error) f.error = 'upload did not finish — retry or remove';
+  });
   renderPeekFiles();
 }
 
@@ -10072,7 +10193,8 @@ function _renderCardFileChips(name) {
     else thumb = `<span class="chip-icon">${_fileIcon(f.name)}</span>`;
     let status;
     if (f.path) status = `<span style="color:var(--green);font-size:0.75rem;">✓</span>`;
-    else if (f.error) status = `<span class="chip-err" title="${esc(f.error)}">!</span>`;
+    else if (f.error) status = `<span class="chip-err" title="${esc(f.error)}">!</span>` +
+      `<span class="chip-retry" onclick="event.stopPropagation();retryCardFile('${name}',${i})" title="Retry upload">↻</span>`;
     else { const pct = f.totalChunks ? Math.round(f.chunk / f.totalChunks * 100) : 0;
            status = `<span style="color:var(--dim);font-size:0.6rem;">${pct}%</span>`; }
     // The × is on EVERY chip in EVERY state — an escape hatch that only exists
@@ -10085,12 +10207,13 @@ function removeCardFile(name, idx) {
   const a = _cardFiles[name] || [];
   const f = a[idx];
   if (!f) return;
+  _cancelUpload(f);
   if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
   a.splice(idx, 1);
   renderCardFiles(name);
 }
 function _clearCardFiles(name) {
-  (_cardFiles[name] || []).forEach(f => { if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
+  (_cardFiles[name] || []).forEach(f => { _cancelUpload(f); if (f.previewUrl) URL.revokeObjectURL(f.previewUrl); });
   delete _cardFiles[name];
   renderCardFiles(name);
 }
@@ -10121,6 +10244,39 @@ let _uploadActive = 0;
 // it. The peek composer and each home card are separate sinks, so a file lands in
 // the surface it was dropped/pasted/picked on. This is the one seam that lets the
 // card list reuse the chunked-upload core instead of copying it.
+// THE SEND GUARD NAMES THE FILE AND SAYS WHAT TO DO (AF-235).
+//
+// Both composers used to refuse with a flat "Wait for upload to finish" on
+// `f.path == null`. That predicate cannot tell a transfer in progress from one
+// that died, and the message is a LIE in the second case — nothing is
+// transferring and waiting will never help. It is what kept the reporting user
+// waiting on an upload that was never going to complete, and since AMUX-3372
+// copied the guard to the card composer it was being told from two code paths.
+//
+// Returns true if the send must be blocked, having already explained why.
+function _blockedByAttachment(files) {
+  const arr = files || [];
+  const pending = arr.filter(f => !f.path);
+  if (!pending.length) return false;
+  const inflight = pending.filter(f => f.inflight);
+  const stuck = pending.filter(f => !f.inflight);
+  const say = (typeof showToast === 'function') ? showToast : function () {};
+  if (stuck.length) {
+    // Name the FIRST stuck file — a count alone does not tell you which chip to
+    // press, and past 12 files the chips are collapsed behind a summary row.
+    const n = stuck[0].name;
+    say(stuck.length === 1
+      ? `"${n}" did not upload — Retry (↻) or remove (×) it to send`
+      : `${stuck.length} attachments did not upload, starting with "${n}" — Retry (↻) or remove (×) them to send`);
+    return true;
+  }
+  const n = inflight[0].name;
+  say(inflight.length === 1
+    ? `Still uploading "${n}" — or remove (×) it to send now`
+    : `Still uploading ${inflight.length} attachments, starting with "${n}"`);
+  return true;
+}
+
 function _peekSink() {
   return {
     push: (p) => peekFiles.push(p),
@@ -10174,51 +10330,100 @@ async function uploadAndAttach(file, sink) {
   // another chip, a second attach, a failed-chunk retry that splices — so a
   // numeric index goes stale and the finished file writes to the wrong slot or a
   // placeholder never gets its .path (send then stalls on "wait for upload").
-  const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB, chunk: 0, totalChunks };
+  // `file` is RETAINED so a failed upload can be retried from the chip itself,
+  // and `cancelled`/`inflight` are EXPLICIT rather than inferred (AF-235).
+  const placeholder = { name: file.name, path: null, url: null, isImage, previewUrl, sizeMB,
+                        chunk: 0, totalChunks, file, error: null, inflight: false,
+                        cancelled: false, aborter: null };
   sink.push(placeholder);
   sink.render();
-  const _present = () => sink.has(placeholder);
+  await _runUpload(placeholder, sink);
+}
+
+// Drive one attachment to completion. Safe to call again on a failed chip.
+//
+// CANCELLATION IS AN EXPLICIT FLAG, NOT ARRAY MEMBERSHIP (AF-235, diagnosed by
+// @Dygreens on #124 from a user report: "no delete button. No remove button no
+// way for me to send this prompt"). This loop used to ask `sink.has(placeholder)`
+// — i.e. "is this still in peekFiles?" — to decide whether the user had removed
+// the chip. But `_peekFilesStash` HANDS THE WHOLE ARRAY OFF (`peekFiles = []`)
+// when the peek closes or switches worker, so merely closing the peek read as a
+// removal: the transfer returned at i = 0 and the placeholder was left sitting
+// in the stashed array at 0% with nothing left to drive it. The artifact matched
+// exactly — four EMPTY `.chunked-*` dirs under ~/.amux/uploads, meaning
+// /api/upload/start had succeeded and chunk 0 never wrote.
+//
+// Progress is written by MUTATING `f` IN PLACE, so the transfer does not care
+// which array `f` currently lives in: close the peek, switch worker, reopen, and
+// the chip still lands on its path. That was already the right shape against one
+// array; since AMUX-3372 added card composers there are now several sinks, and it
+// is the only shape that works.
+async function _runUpload(f, sink) {
+  const file = f.file;
+  if (!file) { f.error = 'file no longer held — re-attach it'; f.inflight = false; sink.render(); return; }
+  f.error = null; f.cancelled = false; f.inflight = true; f.chunk = 0;
+  f.aborter = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+  const _sig = f.aborter ? f.aborter.signal : undefined;
+  const totalChunks = f.totalChunks;
+  sink.render();
 
   try {
     const startR = await fetch(API + '/api/upload/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: file.name, size: file.size, chunks: totalChunks })
+      body: JSON.stringify({ name: file.name, size: file.size, chunks: totalChunks }),
+      signal: _sig
     });
     const startD = await startR.json();
     if (!startR.ok || startD.error) throw new Error(startD.error || 'start failed');
     const uploadId = startD.id;
 
     for (let i = 0; i < totalChunks; i++) {
-      if (!_present()) return;
+      if (f.cancelled) return;
       const start = i * CHUNK_SIZE;
       const end = Math.min(start + CHUNK_SIZE, file.size);
       const blob = file.slice(start, end);
       const r = await fetch(API + '/api/upload/' + uploadId + '/chunk/' + i, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/octet-stream' },
-        body: blob
+        body: blob,
+        signal: _sig
       });
       if (!r.ok) {
         const d = await r.json().catch(() => ({}));
         throw new Error(d.error || 'chunk ' + i + ' failed');
       }
-      placeholder.chunk = i + 1;
+      f.chunk = i + 1;
       sink.render();
     }
 
-    const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST' });
+    const finR = await fetch(API + '/api/upload/' + uploadId + '/finish', { method: 'POST', signal: _sig });
     const finD = await finR.json();
     if (!finR.ok || finD.error) throw new Error(finD.error || 'finalize failed');
-    if (!_present()) return;
-    placeholder.path = finD.path;
-    placeholder.url = finD.url;
+    if (f.cancelled) return;
+    f.path = finD.path;
+    f.url = finD.url;
+    f.error = null;
   } catch(e) {
+    // A DELIBERATE CANCEL IS NOT A FAILURE — it has already removed the chip.
+    if (f.cancelled || (e && e.name === 'AbortError')) return;
     console.error('Upload error:', e);
-    showToast('Upload failed: ' + e.message);
-    sink.drop(placeholder);
+    // KEEP THE CHIP. This used to `sink.drop(placeholder)` behind a single
+    // toast, which silently lost the file: the only record that you had
+    // attached anything was a message that disappears. The chip now presents
+    // as something to act on, and `file` above is what makes Retry real.
+    //
+    // Note the card composer has rendered an `f.error` state since AMUX-3372
+    // and NOTHING HAS EVER SET IT — the sole failure path dropped the chip, so
+    // that branch and its `.failed` style were unreachable. This is the write
+    // that makes them live.
+    f.error = (e && e.message) ? e.message : 'upload failed';
+    showToast('Upload failed: ' + f.error + ' — use Retry on the chip');
+  } finally {
+    f.inflight = false;
+    f.aborter = null;
+    sink.render();
   }
-  sink.render();
 }
 
 function handlePeekFileInput(e) {
@@ -10317,7 +10522,7 @@ setTimeout(_updateSendSplit, 0);
 
 async function sendPeekCmd() {
   if (!peekSession) return;
-  if (peekFiles.some(f => !f.path)) { showToast('Wait for upload to finish'); return; }
+  if (_blockedByAttachment(peekFiles)) return;
   const inp = document.getElementById('peek-cmd-input');
   const text = inp.value.trim();
   const files = peekFiles.filter(f => f.path);
@@ -11016,14 +11221,55 @@ async function _approvalsRefresh() {
     const d = await r.json();
     const pending = Array.isArray(d.pending) ? d.pending : [];
     if (!pending.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    // COLLAPSIBLE (Ethan, 2026-08-25: "i should be able to collapse this").
+    //
+    // This is a full-width block at the top of a mobile-first dashboard, and it
+    // stays as long as anything is held — which, with a lane probing the gate,
+    // was two rows plus a footer for an hour. There was no way to fold it.
+    //
+    // COLLAPSED STILL SHOWS THE COUNT, deliberately. A queue of pending external
+    // sends that can be hidden completely is worse than one that takes space:
+    // the whole point of the banner is that a human sees there is something
+    // waiting. Folding trades the previews for one line, never the fact.
+    //
+    // The preference is per-device (localStorage), because "I have seen these"
+    // is a property of the person looking, not of the server's queue.
+    const collapsed = localStorage.getItem('amuxApprCollapsed') === '1';
+    // COLLAPSING THE ROWS IS NOT COLLAPSING THE BANNER (Ethan: "its still taking
+    // up space"). The first version folded the CONTENT and left the container's
+    // padding and the header's 6px margin, so one line of text still sat in a
+    // ~90px red block. The container has to shrink too.
+    //
+    // 44px stays the floor on the clickable row: css-mobile.md requires it and
+    // this is the only control in the strip. So the padding moves onto the row
+    // instead of the wrapper: 8 (pad) + 44 (row) + 6 (margin) + 8 (pad) = 66px
+    // becomes 44. Derived from these declarations rather than measured off the
+    // screenshot — I first wrote "~90px" from eyeballing the image, which is a
+    // number I could not have justified.
+    el.style.padding = collapsed ? '0 16px' : '8px 16px';
     let html = '<div style="max-width:860px;margin:0 auto;">'
-      + '<div style="font-weight:600;margin-bottom:6px;">&#x2709;&#xFE0F; '
-      + pending.length + ' external email' + (pending.length === 1 ? '' : 's')
-      + ' held for your approval</div>';
+      + '<div onclick="_apprToggle()" role="button" tabindex="0" '
+      + 'style="font-weight:600;cursor:pointer;display:flex;'
+      + 'align-items:center;gap:8px;min-height:44px;'
+      + (collapsed ? '' : 'margin-bottom:6px;') + '" '
+      + 'title="' + (collapsed ? 'Show the drafts' : 'Collapse') + '">'
+      + '<span style="display:inline-block;width:1em;transition:transform .12s;'
+      + 'transform:rotate(' + (collapsed ? '-90' : '0') + 'deg);">&#x25BE;</span>'
+      + '<span>&#x2709;&#xFE0F; ' + pending.length + ' external email'
+      + (pending.length === 1 ? '' : 's') + ' held for your approval</span></div>';
+    if (collapsed) {
+      el.innerHTML = html + '</div>';
+      el.style.display = 'block';
+      return;
+    }
     for (const p of pending) {
       const pv = p.preview || {};
       const mins = Math.max(1, Math.round((p.expires_in_s || 0) / 60));
-      html += '<details style="margin:4px 0;text-align:left;">'
+      // OPEN BY DEFAULT (Ethan: "i should be able to see the draft email").
+      // The body was behind a second click, so the banner told you a draft
+      // existed and made you hunt for what it said — on the one surface whose
+      // entire job is letting a human judge the content before it sends.
+      html += '<details open style="margin:4px 0;text-align:left;">'
         + '<summary style="cursor:pointer;display:flex;align-items:center;gap:10px;min-height:34px;">'
         + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
         + '<b>' + esc(p.session || '?') + '</b> &rarr; ' + esc(pv.to || '?')
@@ -11032,22 +11278,52 @@ async function _approvalsRefresh() {
         + '<button onclick="event.preventDefault();_apprApprove(\'' + esc(p.id) + '\',this)" '
         + 'style="background:#16a34a;color:#fff;border:none;border-radius:6px;'
         + 'padding:8px 14px;font-size:0.8rem;cursor:pointer;min-height:34px;">Approve &amp; send</button>'
+        // DISCARD (AMUX-3698). Until this existed the only button here was
+        // "Approve & send", so a human looking at a draft they did not want had
+        // one move: wait an hour. Ethan hit it directly — two of autodesk's
+        // example.invalid gate probes sitting in his banner, approve-or-wait.
+        // 44x34 keeps it over the mobile touch floor (css-mobile.md).
+        + '<button onclick="event.preventDefault();_apprReject(\'' + esc(p.id) + '\',this)" '
+        + 'style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.45);'
+        + 'border-radius:6px;padding:8px 14px;font-size:0.8rem;cursor:pointer;'
+        + 'min-height:34px;min-width:44px;">Discard</button>'
         + '</summary>'
         + '<div style="white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.25);'
-        + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:180px;overflow:auto;">'
+        + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:320px;overflow:auto;">'
         + (pv.cc ? 'cc: ' + esc(pv.cc) + '\n' : '')
         + esc(pv.body || '') + '</div></details>';
     }
-    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">Unapproved drafts expire on their own; nothing sends without the button.</div></div>';
+    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">Nothing sends without Approve. Discard drops a draft now and records who dropped it; unapproved drafts also expire on their own.</div></div>';
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
 }
+function _apprToggle() {
+  const now = localStorage.getItem('amuxApprCollapsed') === '1' ? '0' : '1';
+  localStorage.setItem('amuxApprCollapsed', now);
+  _approvalsRefresh();
+}
+async function _apprReject(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Discarding…'; }
+  try {
+    const r = await fetch(API + '/api/email/reject/' + encodeURIComponent(id), {
+      method: 'POST', headers: { ..._authHeaders(), 'X-Amux-Approver': 'dashboard' },
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok) showToast('Discarded — nothing was sent' + (d.was_for_session ? ' (' + d.was_for_session + ')' : ''));
+    else showToast('Discard failed: ' + (d.error || r.status));
+  } catch (e) { showToast('Discard failed: ' + e); }
+  _approvalsRefresh();
+}
 async function _apprApprove(id, btn) {
   if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
   try {
+    // AUTOD-48: approve now authorizes on a POSITIVE marker. Absence used to
+    // mean "a human at the dashboard", which a worker produces by sending no
+    // headers at all — and the ledger then recorded that inference as fact.
+    // This names the approver in the send-audit ledger; it is not a password.
     const r = await fetch(API + '/api/email/approve/' + encodeURIComponent(id), {
-      method: 'POST', headers: _authHeaders(),
+      method: 'POST', headers: { ..._authHeaders(), 'X-Amux-Approver': 'dashboard' },
     });
     const d = await r.json().catch(() => ({}));
     if (r.ok) showToast('Approved — sent for ' + (d.sent_for_session || 'worker'));
@@ -12343,7 +12619,11 @@ function openCmdHistoryModal(scopeSession) {
   // Drop the previous open's window/counts — they were fetched for a different
   // scope, and reusing them would show one session's rows under another's
   // heading until the refetch lands.
+  // Reset the PAGE cursor too (AF-213), not just the rows. Leaving _cmdHistOffset
+  // set would make the next open's first fetch start mid-history under a heading
+  // that says it is showing the newest.
   _cmdHistRows = null; _cmdHistCounts = null;
+  _cmdHistRaw = []; _cmdHistOffset = 0; _cmdHistDone = false;
   _populateCmdHistorySessions(_ctx);
   _renderCmdHistoryList();
   // History is server-side, but this page only pulled it once at load — a
@@ -12389,36 +12669,70 @@ let _cmdHistRows = null;      // server window for the CURRENT kind+session, or 
 // out of 2783 — the human messages had been crowded out of the window by
 // session and schedule traffic before the filter ever ran.
 let _cmdHistCounts = null;    // true per-kind totals from the server
-async function _cmdHistFetch() {
+// PAGINATED, like the other two /api/history consumers (AF-213). This asked for
+// `limit=500` in ONE shot with no offset — 852 KB global, 454 KB session-scoped,
+// on every open and on every kind/session change. `_messagesLoad` and the peek
+// Messages tab have both paged at 200 for a while; this surface kept the flat
+// fetch and was the odd one out of the three the comment above already counted.
+//
+// Accumulates the RAW newest-first pages and reverses once at the end. The
+// server returns newest-first and `_cmdHistRows` is held oldest-first (the
+// renderer flips it), so appending a page of OLDER rows to the reversed array
+// would interleave them backwards.
+const _CMDHIST_PAGE = 200;
+let _cmdHistRaw = [];      // accumulated pages, newest-first, pre-merge
+let _cmdHistOffset = 0;
+let _cmdHistDone = false;
+let _cmdHistLoading = false;
+
+async function _cmdHistFetch(more) {
+  if (_cmdHistLoading) return;
+  if (more && _cmdHistDone) return;
+  _cmdHistLoading = true;
+  if (!more) { _cmdHistRaw = []; _cmdHistOffset = 0; _cmdHistDone = false; }
   const sess = document.getElementById('cmd-history-session-filter')?.value || '';
   const qsess = sess ? '&session=' + encodeURIComponent(sess) : '';
-  let u = API + '/api/history?limit=500' + qsess;
+  let u = API + '/api/history?limit=' + _CMDHIST_PAGE + '&offset=' + _cmdHistOffset + qsess;
   if (_cmdHistKind !== 'all') u += '&kind=' + encodeURIComponent(_cmdHistKind);
   try {
     const [r, rc] = await Promise.all([
       fetch(u, { headers: _authHeaders() }),
-      fetch(API + '/api/history?counts=1' + qsess, { headers: _authHeaders() }),
+      // Totals are for the CHIPS and must stay unpaged — a tally of the loaded
+      // page would read 0 for every kind not on it.
+      _cmdHistOffset === 0
+        ? fetch(API + '/api/history?counts=1' + qsess, { headers: _authHeaders() })
+        : Promise.resolve(null),
     ]);
     if (r.ok) {
       const rows = (await r.json()).map(_msgNorm);
-      _cmdHistRows = _mergeUnechoed(rows.reverse(), sess);
+      _cmdHistDone = rows.length < _CMDHIST_PAGE;
+      _cmdHistOffset += rows.length;
+      _cmdHistRaw = _cmdHistRaw.concat(rows);
+      _cmdHistRows = _mergeUnechoed(_cmdHistRaw.slice().reverse(), sess);
     }
-    if (rc.ok) _cmdHistCounts = await rc.json();
+    if (rc && rc.ok) _cmdHistCounts = await rc.json();
   } catch(e) { /* keep whatever we had; render falls back to the shared cache */ }
+  _cmdHistLoading = false;
   _renderCmdHistoryList();
 }
+function _cmdHistMore() { _cmdHistFetch(true); }
 function _cmdHistSetKind(k) { _cmdHistKind = k; _renderCmdHistoryList(); _cmdHistFetch(); }
 function _cmdHistRenderChips(items) {
   const bar = document.getElementById('cmd-history-filter');
   if (!bar) return;
   // Server totals when we have them; local tally only as a pre-fetch placeholder.
+  // SEEDED FROM _MSG_KIND_ORDER, never from a hand-written list. Both branches
+  // used to enumerate four kinds inline, so adding a fifth made
+  // `counts[_msgKind(e)]++` increment `undefined` and the chip render NaN —
+  // a new kind would have broken the bar it was added to (AMUX-3737).
+  const _zero = () => _MSG_KIND_ORDER.reduce((a, k) => (a[k] = 0, a), {});
   let counts;
   if (_cmdHistCounts) {
-    counts = { all: _cmdHistCounts.all || 0, human: _cmdHistCounts.human || 0, amux: _cmdHistCounts.amux || 0,
-               session: _cmdHistCounts.session || 0, schedule: _cmdHistCounts.schedule || 0 };
+    counts = Object.assign(_zero(), { all: _cmdHistCounts.all || 0 });
+    _MSG_KIND_ORDER.forEach(k => { counts[k] = _cmdHistCounts[k] || 0; });
   } else {
-    counts = { all: items.length, human: 0, session: 0, schedule: 0, amux: 0 };
-    items.forEach(e => { counts[_msgKind(e)]++; });
+    counts = Object.assign(_zero(), { all: items.length });
+    items.forEach(e => { const k = _msgKind(e); if (k in counts) counts[k]++; });
   }
   const chips = [['all','All']].concat(_MSG_KIND_ORDER.map(k => [k, _MSG_KIND[k].label]));
   bar.innerHTML = chips.map(([k, lbl]) => {
@@ -12456,7 +12770,18 @@ function _renderCmdHistoryList() {
   // Was a second hand-maintained copy of the row markup, which is why this
   // list and the peek/Messages tabs showed the same rows with different
   // badges, no card chip and no search highlighting (AMUX-2334).
-  list.innerHTML = filtered.map(e => _cmdHistItemHTML(e, _msgCtxHistory())).join('');
+  // LOAD MORE (AF-213). Only when the server window is what we are showing —
+  // the shared global cache has no offset to continue from, and offering the
+  // button there would page a list this function is not driving.
+  const _more = (_cmdHistRows && !_cmdHistDone)
+    ? '<div style="padding:12px;text-align:center;">'
+      + '<button class="btn" onclick="_cmdHistMore()" '
+      + 'style="min-height:44px;min-width:44px;padding:10px 18px;">'
+      + (_cmdHistLoading ? 'Loading…' : 'Load older messages') + '</button>'
+      + '<div style="color:var(--dim);font-size:0.75rem;margin-top:6px;">showing '
+      + _cmdHistRaw.length + '</div></div>'
+    : '';
+  list.innerHTML = filtered.map(e => _cmdHistItemHTML(e, _msgCtxHistory())).join('') + _more;
 }
 // ── Peek Messages tab: the message history, scoped to the open session ──
 // One entry → its card HTML (same look as the Message-history modal). Kept as a
@@ -12479,7 +12804,13 @@ function _msgKind(e) {
   // verified (keystrokes reached a pane; a picker may have eaten them) and its
   // origin is the CLI's word, not a server-side stamp.
   if (t === 'raw-tmux-fallback') return 'unstamped';
-  return 'human';   // direct / steering / user / '' — all a person typing
+  if (t === 'pickup') return 'amux';   // board-drive's auto-pickup prompt
+  // ALLOWLIST, matching the server's msg_kind (AMUX-3737). This used to
+  // `return 'human'` for anything unrecognised, which is how `pickup` wore a
+  // Human badge in 355 rows. Falling through to `unknown` is just as visible
+  // and does not put a person's name on a machine's text.
+  if (t === 'direct' || t === 'steering' || t === 'user' || t === '') return 'human';
+  return 'unknown';
 }
 // Queued vs direct is a DELIVERY detail of a human message, not a fourth kind:
 // same person, same authority, one just waited for the session to free up.
@@ -12576,8 +12907,21 @@ const _MSG_KIND = {
   session:  { label: 'Session',   color: '#8957e5', bg: 'rgba(137,87,229,0.16)' },
   schedule: { label: 'Scheduled', color: '#3fb950', bg: 'rgba(63,185,80,0.15)' },
   amux:     { label: 'amux',      color: '#8b949e', bg: 'rgba(139,148,158,0.14)' },
+  // A send that reached the pane as raw keystrokes while the server was
+  // unreachable (AMUX-2670). `_msgKind` has returned 'unstamped' for it since
+  // that card, and this entry never existed — so it fell through to Human, the
+  // exact rendering that card exists to prevent. The branch also never ran,
+  // because the server's `kind` wins and the server said human. Both halves
+  // fixed together; either alone changes nothing on screen.
+  unstamped:{ label: 'Unstamped',    color: '#db6d28', bg: 'rgba(219,109,40,0.14)' },
+  // AMUX-3737: a kind THIS BUILD does not know. Amber because it is a prompt to
+  // go and classify the type, not a normal resting state. Without this entry
+  // the fallback below painted it blue and called it Human, which is the server
+  // bug reproduced client-side — so fixing only the server would have changed
+  // nothing on screen.
+  unknown:  { label: 'Unclassified', color: '#d29922', bg: 'rgba(210,153,34,0.14)' },
 };
-const _MSG_KIND_ORDER = ['human', 'session', 'schedule', 'amux'];
+const _MSG_KIND_ORDER = ['human', 'session', 'schedule', 'amux', 'unstamped', 'unknown'];
 // Back-compat shim: _msgOrigin was the old 4-way classifier. Anything still
 // calling it gets the canonical kind.
 function _msgOrigin(e) { return _msgKind(e); }
@@ -12721,7 +13065,12 @@ function _cmdHistItemHTML(e, ctx) {
   const _mq = (document.getElementById(ctx.searchId) || {}).value || '';
   const enc = encodeURIComponent(text).replace(/'/g, '%27');   // ' survives encodeURIComponent and breaks inline onclick
   const kind = _msgKind(e);
-  const km = _MSG_KIND[kind] || _MSG_KIND.human;
+  // FALL BACK TO `unknown`, NEVER TO `human` (AMUX-3737). A kind this build
+  // does not recognise is exactly the case where the honest answer is "I do not
+  // know who wrote this", and defaulting it to Human is how a machine nudge
+  // ends up wearing a person's badge — the same defect the server-side
+  // classifier had, one layer out.
+  const km = _MSG_KIND[kind] || _MSG_KIND.unknown;
   // Badge carries the specific origin: "Session · mvs-infra", "Scheduled · Nightly gate".
   // For a human message the origin is you, so instead we surface the delivery
   // path — "Human · queued" vs plain "Human".
@@ -14902,7 +15251,20 @@ async function openFilePreview(path) {
   document.getElementById('file-title').textContent = path.split('/').pop();
   // Title bar shows the file name plus the folder it lives in, like a file manager.
   const _subEl = document.getElementById('file-subpath');
-  if (_subEl) { const _dir = path.slice(0, path.lastIndexOf('/')) || '/'; _subEl.textContent = _dir; _subEl.title = path; }
+  if (_subEl) {
+    const _dir = path.slice(0, path.lastIndexOf('/')) || '/';
+    _subEl.textContent = _dir;
+    // THE WAY BACK TO THE FOLDER (AMUX-3663). Dim text with no handler until
+    // now, while `_openPathFromOutput`'s comment justified sending every file
+    // click to the browser on the grounds that "the browser is reachable from a
+    // preview". It was not reachable from anywhere. Now that a file link opens
+    // the FILE, this is the one click that restores the other half of that
+    // rationale: see what is around it.
+    _subEl.title = 'Open this folder in the file browser';
+    _subEl.classList.add('clickable');
+    _subEl.onclick = () => openExplore(_dir,
+      (typeof peekSession !== 'undefined' && peekSession) ? peekSession : null);
+  }
   document.getElementById('file-body').className = 'file-overlay-body';
   document.getElementById('file-body').textContent = 'Loading...';
   document.getElementById('file-view-tabs').style.display = 'none';
@@ -17668,6 +18030,8 @@ function openCreate() {
   document.getElementById('create-provider-claude').classList.add('selected');
   document.getElementById('create-provider-codex').classList.remove('selected');
   document.getElementById('create-provider-gemini').classList.remove('selected');
+  const _iso0 = document.getElementById('create-isolated');
+  if (_iso0) { _iso0.checked = false; _toggleIsolated(false); }
   const _ollamaBtn0 = document.getElementById('create-provider-ollama');
   if (_ollamaBtn0) _ollamaBtn0.classList.remove('selected');
   const _omField0 = document.getElementById('create-ollama-model-field');
@@ -17849,6 +18213,16 @@ function _toggleCreateBranch(on) {
     setTimeout(() => inp.focus({preventScroll: true}), 50);
   }
 }
+// Isolation is the one create-time choice that cannot be changed later without
+// relaunching: spawn injects no AMUX_SESSION/AMUX_URL and no --mcp-config for an
+// isolated lane (AMUX-3232), so a worker isolated after the fact has already
+// started with the harness attached. The panel spells out what it gives up,
+// because "isolated" reads like a mild sandbox and it is not.
+function _toggleIsolated(on) {
+  const el = document.getElementById('create-isolated-info');
+  if (el) el.style.display = on ? '' : 'none';
+}
+
 function _toggleWorktree(on) {
   document.getElementById('create-worktree-info').style.display = on ? '' : 'none';
   if (on) {
@@ -17931,6 +18305,11 @@ async function submitCreate() {
     if (_m) createBody.model = _m;
   }
   if (worktreeEnabled) createBody.worktree = true;
+  // ISOLATED (Ethan, 2026-08-27). Sent only when true: the server writes
+  // CC_ISOLATED=1 and absence already means "not isolated" to every reader, so
+  // an explicit false would be a second spelling of the default.
+  const _isoEl = document.getElementById('create-isolated');
+  if (_isoEl && _isoEl.checked) createBody.isolated = true;
   let r;
   try {
     r = await fetch(API + '/api/sessions', {
@@ -19084,6 +19463,295 @@ function _mergeArchived(data) {
   const have = new Set(data.map(i => i.id));
   return data.concat(boardArchived.filter(i => !have.has(i.id)));
 }
+// ARCHIVED AS A VISIBLE GROUP (AMUX-3715, requested by tubescience).
+//
+// `amux board archive` sets archived=1 and leaves `status` alone, so archived
+// work keeps its old status and scatters — they archived 81 cards in one
+// session and the group became invisible. The data was already reachable
+// (`is:archived` triggers _ensureArchived below), but only by knowing the query
+// syntax. What was missing is a discoverable, persistent affordance.
+//
+// A read-only collapsible SECTION, not a column: they archive deliberately and
+// in bulk via the CLI, never by dragging, so a drop target would be a footgun
+// for the actual usage and would add a mutation path nobody asked for. Their
+// words: "drag-to-archive would be a footgun for exactly my usage."
+//
+// COLLAPSED BY DEFAULT and the count comes from ?count=1, because the archived
+// set was MEASURED at 445KB raw / 87KB gzipped — +38% on the board poll. Paying
+// that on every load of a mobile-first dashboard to render a number is the
+// wrong trade; the rows load only when someone opens it.
+let boardArchivedOpen = false;
+try { boardArchivedOpen = localStorage.getItem('amuxArchivedOpen') === '1'; } catch (e) {}
+// 200: measured. `archived=1&limit=200&full=1` is 142KB gzipped, against 2.9MB
+// for the unbounded query the `is:archived` path uses.
+const _ARCHIVED_SLICE = 200;
+let _archivedCountN = null;
+let _archivedCountAt = 0;
+
+// The server scope the Archived section should fetch with, derived from the
+// board's OWN parsed query (AMUX-3716, found by tubescience co-verifying 3715).
+//
+// The section used to fetch a global head-200 of 3008 archived cards, so which
+// lane's cards you saw was an accident of archive ordering. tubescience's 81
+// all landed inside the slice (last index 145) purely because theirs were the
+// most recently archived — the moment another lane bulk-archives 200, theirs
+// fall off and the section stops answering the question it exists for.
+//
+// Uses `_bqParse`, the board's own parser, rather than a second regex over the
+// query string. A private parse here would drift from the one the rows are
+// filtered by, and then the section would fetch one population and display a
+// filter over a different one (ethos rule 1).
+//
+// Positive `session:`/`worker:` facets only. A NEGATED facet (-session:x) does
+// not narrow to anything the server can scope by — it excludes — so it stays a
+// client-side filter over the unscoped fetch, which is correct rather than a
+// limitation: narrowing the fetch on an exclusion would drop rows the board is
+// still showing.
+function _archivedScope() {
+  const parsed = _bqParse(boardSearchQuery || '');
+  const names = [];
+  (parsed.terms || []).forEach(function (t) {
+    if (t.neg) return;
+    if (t.key !== 'session' && t.key !== 'worker') return;
+    (t.vals || []).forEach(function (v) { if (v && names.indexOf(v) < 0) names.push(v); });
+  });
+  // One session -> scope the fetch. Several -> the server takes one value, so
+  // scoping to the first would silently drop the others; stay unscoped and let
+  // the client filter, with the cap notice saying so.
+  return names.length === 1 ? names[0] : null;
+}
+
+function _archivedQuery(extra) {
+  const sc = _archivedScope();
+  // `done_limit=0` HERE TOO, or the count and the list describe different
+  // populations (found while verifying tubescience's co-verification numbers).
+  //
+  // The count query already passed it. This one did not, and unscoped that is a
+  // real disagreement: the count returns 3008 (uncapped) while the list is drawn
+  // from 662 (the fleet-wide terminal cap), so the header would have said
+  // "Showing 200 of 3008" about 200 rows taken from a different set. That is
+  // precisely the failure ?count=1 was built to prevent, reintroduced one query
+  // string away from it.
+  //
+  // The scoped branch was already correct by accident: a scoped query is not
+  // capped by default (the ts-gke fix — "A SCOPED query must answer
+  // completely"), which is exactly why scoping surfaced 154 of tubescience's
+  // cards where the fleet view showed 81. Correct-by-accident in one branch is
+  // still wrong in the other.
+  return '/api/board?archived=1' + (sc ? '&session=' + encodeURIComponent(sc) : '')
+    + '&done_limit=0&limit=' + _ARCHIVED_SLICE + (extra || '');
+}
+
+let _archivedScopeAt = null;
+async function _ensureArchivedCount() {
+  // KEYED ON THE SCOPE, not just on time. Without this, typing session:x into
+  // the board would keep serving the previous scope's cached count for up to a
+  // minute — a header describing a population the rows below no longer are.
+  const sc = _archivedScope();
+  const fresh = _archivedCountN !== null
+    && sc === _archivedScopeAt
+    && (Date.now() - _archivedCountAt) < 60000;
+  if (fresh) return;
+  try {
+    // The SAME scope + limit the expand fetches with, so the header cannot
+    // promise a number the section then contradicts. `count` is computed
+    // server-side from the same filter+cap the list runs; `_ARCHIVED_SLICE` is
+    // NOT applied to it, so this is the TRUE size of the filtered population
+    // and the rows may be a slice of it — which the cap notice then states.
+    const r = await fetch(API + '/api/board?archived=1'
+      + (sc ? '&session=' + encodeURIComponent(sc) : '') + '&done_limit=0&count=1');
+    const d = await r.json();
+    if (typeof d.count === 'number') {
+      _archivedCountN = d.count;
+      _archivedCountAt = Date.now();
+      _archivedScopeAt = sc;
+      renderBoard();
+    }
+  } catch (e) { console.error('archived count:', e); }
+}
+
+// ITS OWN BOUNDED FETCH, not _ensureArchived.
+//
+// _ensureArchived exists for the `is:archived` QUERY and fetches
+// `archived=1&done_limit=0&full=1` — measured live at 8.9MB raw / 2.9MB
+// gzipped across 3008 archived cards fleet-wide. Wiring a one-tap section to
+// that would have put a 2.9MB pull one thumb away on a mobile-first dashboard.
+//
+// I nearly shipped exactly that. The +38% figure I used to justify the design
+// was measured on `archived=1&slim=1` (87KB gzip) — a DIFFERENT QUERY from the
+// one the code runs. Measuring the wrong thing and reasoning from the number is
+// the same failure as verifying a boundary in the wrong language; the fix is
+// the same too, which is to measure the call the code actually makes.
+//
+// 200 rows with prose is 142KB gzipped and is roughly the limit of what a human
+// reviews in one sitting, so the bound is a UX bound that happens to be a
+// payload bound. `full=1` because slim DROPS source_ref, and the trigger is the
+// one field tubescience said they would act on.
+let _archivedSliceAt = 0;
+let _archivedSliceScope = null;
+async function _loadArchivedSlice() {
+  if (_archivedLoading) return _archivedLoading;
+  const sc = _archivedScope();
+  // Same scope-keying as the count: a cached slice from a different scope is
+  // rows that do not belong to the filter the board is showing.
+  if (boardArchived.length && sc === _archivedSliceScope
+      && (Date.now() - _archivedSliceAt) < 60000) return;
+  _archivedLoading = (async () => {
+    try {
+      const r = await fetch(API + _archivedQuery('&full=1'));
+      const d = await r.json();
+      if (Array.isArray(d)) {
+        boardArchived = d.filter(i => i.archived);
+        _archivedSliceAt = Date.now();
+        _archivedSliceScope = sc;
+        renderBoard();
+      }
+    } catch (e) { console.error('archived slice:', e); }
+    finally { _archivedLoading = null; }
+  })();
+  return _archivedLoading;
+}
+
+function _toggleArchivedSection() {
+  boardArchivedOpen = !boardArchivedOpen;
+  try { localStorage.setItem('amuxArchivedOpen', boardArchivedOpen ? '1' : '0'); } catch (e) {}
+  if (boardArchivedOpen) _loadArchivedSlice();
+  renderBoard();
+}
+
+// Render the section. Grouped BY UNDERLYING STATUS, because tubescience's
+// second answer was explicit that a flat list is the visibility problem
+// relocated rather than solved: "79 flat is the visibility problem relocated".
+//
+// Each row carries status + title + the TRIGGER, and the trigger is the
+// load-bearing field — archiving de-arms it (archived is excluded from every
+// autonomy loop), so for a card parked on a condition this view is the only
+// path back to it when that condition lands. Their HK-04/HK-01/ADM-16 are in
+// exactly that state.
+function _renderBoardArchivedSection(container) {
+  const wrap = document.createElement('div');
+  wrap.className = 'board-archived-section';
+  const n = _archivedCountN === null ? '…' : _archivedCountN;
+  const caret = boardArchivedOpen ? '▾' : '▸';
+  let html = '<button class="board-archived-header" onclick="_toggleArchivedSection()" '
+    + 'aria-expanded="' + (boardArchivedOpen ? 'true' : 'false') + '">'
+    + caret + ' Archived (' + esc(String(n)) + ')</button>';
+  if (boardArchivedOpen) {
+    // ASKING FOR IT IS WHAT LOADS IT (AMUX-2271's rule, which I broke).
+    //
+    // The fetch used to live ONLY in the toggle handler, so the open state
+    // persisting in localStorage produced a section that renders expanded on the
+    // next page load and never fetches — permanently empty, no request, no
+    // error. Caught by reloading with the section already open, which no
+    // data-layer check reaches and no first visit reproduces.
+    //
+    // `_bqHideArchived` states the rule for the query path: "The ONE place that
+    // decides archived visibility is also the right place to make sure the data
+    // exists... Hooking the trigger anywhere else would be a second mechanism."
+    // This render is that place for the section, so the trigger belongs here and
+    // not only in the toggle. `_loadArchivedSlice` is idempotent and TTL-guarded.
+    // UNCONDITIONAL. `_loadArchivedSlice` already decides — it returns early
+    // when a fetch is in flight, and when the cached slice is BOTH the current
+    // scope and fresh. Guarding it here with `if empty` re-implemented half of
+    // that decision and got it wrong: with 200 unscoped rows cached, typing
+    // session:x left the array non-empty, so the scoped refetch never fired and
+    // the section filtered the STALE unscoped slice forever — 86 rows under a
+    // header that correctly said 154. Two mechanisms deciding one thing, and
+    // the outer one could not see scope at all.
+    _loadArchivedSlice();
+    // THE SAME CLIENT FILTERS THE ACTIVE COLUMNS USE. The server scope narrows
+    // the FETCH (session only); everything else in the board's query — owner,
+    // type, tag, negations, free text — is client-side, and the section must
+    // apply it too or it shows a different population than the columns beside
+    // it under the same query. `_bqFilter` is shared rather than re-derived.
+    let rows = (boardArchived || []).slice();
+    // THE OWNER TOGGLE IS NOT APPLIED HERE, and this file already records why.
+    //
+    // Rendered, the first version showed "Archived (3008)" above ONE row. The
+    // count comes from ?count=1 (unfiltered by owner, because owner filtering is
+    // client-side and the server cannot do it), while the rows were being run
+    // through the Human/Sessions toggle — which defaults to Human, and archived
+    // cards are almost all agent-owned. Header and body describing different
+    // populations, which is the defect this whole section was built to fix.
+    //
+    // renderBoard's own comment, twelve thousand lines up, is the same bug:
+    // "Stacking made the chip counts lie: 'Rotting 5' rendered 0 cards, because
+    // all 5 are agent-owned and the toggle defaults to Human. The count is
+    // computed over the same unfiltered set, so a chip that says 5 must show 5.
+    // The toggle is the browse default; the query is the filter."
+    //
+    // So the same rule: the QUERY filters this section (a user asked for it),
+    // the TOGGLE does not (it is a browse default for active work, and archive
+    // review is not about ownership). Only rendering it caught this — every
+    // data-layer check passed, because the mismatch is between a server count
+    // and a client filter and neither side is wrong alone.
+    // SAVE/RESTORE `_bqRankActive` around the shared filter. `_bqFilter` sets
+    // that global, and `_boardCardSort`'s own comment says it must reflect "the
+    // _bqFilter call that produced this render's `visible` set" — which is the
+    // columns' call, made earlier in renderBoard. Reusing the shared predicate
+    // is right; silently repointing the ranking flag it owns is not, and it
+    // would surface as columns losing relevance order on any later re-sort
+    // (a drag, the peek board) rather than here, where it would be found.
+    const _rankWas = _bqRankActive;
+    rows = _bqFilter(rows, boardSearchQuery);
+    _bqRankActive = _rankWas;
+    if (!rows.length) {
+      html += '<div class="board-archived-empty">'
+        + (_archivedCountN === 0 ? 'Nothing archived.' : 'Loading…') + '</div>';
+    } else {
+      const groups = {};
+      rows.forEach(function (i) {
+        const st = _statusCanon(i.status || 'todo');
+        (groups[st] = groups[st] || []).push(i);
+      });
+      // NO SILENT CAP. The header count is the TRUE total; this list is a
+      // bounded slice of it, and a section that showed 200 of 3008 without
+      // saying so would read as "this is everything archived" — which is the
+      // same false completeness the whole feature exists to fix.
+      // NO SILENT CAP, AND NAME THE FILTER (AMUX-3716's acceptance criterion,
+      // tubescience's words: a scoped view that silently truncates is the same
+      // false-completeness bug one scope down).
+      //
+      // The count is the true size of the SCOPED population; the rows are a
+      // slice of it, further narrowed client-side. Saying "200 of 3008" while
+      // scoped to one session would describe the fleet and mislead in the
+      // other direction, so the scope is named either way.
+      const _sc = _archivedScope();
+      const _scopeTxt = _sc ? ' in session:' + esc(_sc) : ' fleet-wide';
+      if (_archivedCountN !== null && _archivedCountN > rows.length) {
+        html += '<div class="board-archived-empty">Showing ' + rows.length + ' of '
+          + _archivedCountN + _scopeTxt + '.'
+          + (_sc ? '' : ' Add <code>session:&lt;lane&gt;</code> to the search box to scope this'
+                       + ' to one lane and see all of its archived cards.')
+          + '</div>';
+      } else if (_archivedCountN !== null) {
+        html += '<div class="board-archived-empty">All ' + rows.length + _scopeTxt
+          + '.</div>';
+      }
+      Object.keys(groups).sort().forEach(function (st) {
+        const g = groups[st];
+        html += '<div class="board-archived-group"><div class="board-archived-group-h">'
+          + esc(st) + ' (' + g.length + ')</div>';
+        g.forEach(function (i) {
+          const trig = String(i.source_ref || '').trim();
+          html += '<div class="board-archived-row" onclick="openBoardDetail(\'' + esc(i.id) + '\')">'
+            + '<span class="board-archived-id">' + esc(i.id) + '</span> '
+            + '<span class="board-archived-title">' + esc(i.title || '') + '</span>'
+            + (trig
+                ? '<div class="board-archived-trigger" title="archiving DE-ARMS this trigger — '
+                  + 'archived cards are excluded from every autonomy loop, so it will not fire">'
+                  + '⚑ ' + esc(trig) + '</div>'
+                : '')
+            + '</div>';
+        });
+        html += '</div>';
+      });
+    }
+  }
+  wrap.innerHTML = html;
+  container.appendChild(wrap);
+}
+
 async function _ensureArchived() {
   // One in-flight fetch at a time; refresh at most once a minute, since the
   // age-archive sweep only moves cards every few hours.
@@ -23125,6 +23793,19 @@ function _renderBoardCard(item) {
   h += '<div class="board-card-key">' + _hlSearch(esc(item.id), _bq) + '</div>';
   if (item.doing_rot) h += '<div class="board-card-rot" title="Rotting: ' + item.doing_rot_days + 'd in doing with no board update and no commit/PR evidence. Evidence it forward or demote it.">&#x26A0; ' + Math.round(item.doing_rot_days) + 'd no evidence</div>';
   if (item.no_executor) h += '<div class="board-card-noexec" title="In doing, but nobody is executing it: ' + esc(item.no_executor) + '. Shepherding is not ownership.">&#x1F6A8; no executor</div>';
+  // ISOLATED OWNER (AMUX-3728). The server computes owner_isolated and a
+  // written-out owner_reach for every card whose owning session is a raw agent,
+  // precisely so consumers do not each re-derive what isolation implies — and
+  // nothing rendered it, on any surface, since the day it shipped.
+  //
+  // It belongs HERE, beside `no executor`, because it is the same class of fact:
+  // the standard advice on half the cards on this board is "route it to its
+  // session", and for these cards that advice is unfollowable — the owner is not
+  // in the peer fleet list and peer sends to it are refused. The server's own
+  // sentence is used verbatim rather than paraphrased; that is what the field is
+  // for and re-wording it here would be the second spelling the comment warns
+  // against.
+  if (item.owner_isolated) h += '<div class="board-card-isolated" title="' + esc(item.owner_reach || 'The owning session is an isolated raw agent.') + '">&#x1F512; isolated owner</div>';
   h += '<div class="board-card-title">';
   if (boardViewMode === 'worker') { const _st = item.status || 'todo'; h += '<span class="board-status-dot" style="background:' + statusStyle(_st).dot + '"></span>'; }
   h += _hlSearch(esc(item.title), typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') + '</div>';
@@ -23668,6 +24349,13 @@ function renderBoard() {
     },
   });
   const cols = bucket.cols;
+
+  // ARCHIVED SECTION (AMUX-3715). Appended AFTER the columns rather than being
+  // one of them: it is read-only and must never be a drop target, and it must
+  // not participate in the column-reorder Sortable below (which is filtered to
+  // `.board-col`, so `.board-archived-section` is excluded by construction).
+  _ensureArchivedCount();
+  _renderBoardArchivedSection(container);
 
   // Column reorder Sortable — drag columns by their header (global only:
   // reordering rewrites boardStatuses, which no narrower scope may do)
@@ -26872,6 +27560,38 @@ function _sseLooksStale() {
 }
 function _forceSseReconnect(reason) {
   _dbgLog('SSE reconnect: ' + reason);
+  // BEACON THE GIVE-UP (AF-262). This is the single choke point where a client
+  // decides the realtime backbone has failed it, and until now that decision
+  // was invisible to the server: /api/events is excluded from the request log
+  // by design, so a fleet-wide SSE degradation showed up only as a rise in
+  // ordinary poll traffic — indistinguishable from more browser tabs being
+  // open, which is exactly the call that could not be made on 2026-08-27.
+  //
+  // The server half (a live-connection gauge) cannot see this on its own: from
+  // there a reconnect looks like one stream closing and another opening, which
+  // is also what a laptop lid does. Only the CLIENT knows it declared the
+  // stream stale. Joined at /api/debug/sse.
+  //
+  // Rides the existing /api/client-debug beacon rather than a new endpoint —
+  // same primitive the peek-poller lifecycle already uses.
+  try {
+    fetch(API + '/api/client-debug', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+      body: JSON.stringify({
+        kind: 'sse-stale-reconnect', reason: reason || '?',
+        // How long the stream had actually been silent. `stale_ms` past
+        // _SSE_STALE_MS is a zombie; well under it means something else forced
+        // the bounce (a resume, an `online` event) and is NOT backbone trouble.
+        // Without it every reconnect reads the same and the counter would
+        // conflate the two.
+        stale_ms: Math.round(Date.now() - (_lastDataTime || _pageLoadTime)),
+        had_data: _lastDataTime ? 1 : 0,
+        retries: _sseRetries,
+        ver: (typeof APP_VER !== 'undefined' ? APP_VER : '?'),
+        hidden: document.hidden ? 1 : 0
+      })
+    }).catch(() => {});
+  } catch (e) {}
   if (_sse) { try { _sse.close(); } catch(e) {} _sse = null; }
   _sseRetries = 0;
   _liveSSE = false;
@@ -28046,8 +28766,16 @@ async function loadUsage() {
       const col = used >= 90 ? 'var(--red)' : (used >= 70 ? '#f0a020' : 'var(--green)');
       return '<div style="margin-bottom:9px;">'
         + '<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:3px;">'
-        +   '<span style="font-size:0.8rem;color:var(--fg);">' + esc(label(l)) + '</span>'
-        +   '<span style="font-size:0.74rem;color:var(--dim);">' + rem + '% left · ' + esc(resetTxt(l.resets_at)) + '</span>'
+        // THE LABEL SHRINKS, THE NUMBER DOES NOT. Capping the menu width alone
+        // would clip these rows one layer in: both spans were nowrap by default
+        // in a space-between flex, so the row's intrinsic width was 445px on a
+        // 375px screen and something had to be cut. The reading order decides
+        // WHICH: "78% left · resets in <1h" is the answer, "5-hour session" is
+        // the question and is recoverable from position. So the label gets
+        // min-width:0 + ellipsis (a flex item will not shrink below its content
+        // without min-width:0) and the value gets flex-shrink:0.
+        +   '<span style="font-size:0.8rem;color:var(--fg);min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + esc(label(l)) + '</span>'
+        +   '<span style="font-size:0.74rem;color:var(--dim);flex-shrink:0;white-space:nowrap;">' + rem + '% left · ' + esc(resetTxt(l.resets_at)) + '</span>'
         + '</div>'
         + '<div style="height:6px;border-radius:4px;background:var(--border);overflow:hidden;">'
         +   '<div style="height:100%;width:' + used + '%;background:' + col + ';"></div>'
@@ -33242,14 +33970,45 @@ async function _bwLoadProfiles() {
     const cur = sel.value;
     // Rebuild: Auto (empty) + registered profiles + real Chrome profiles
     sel.innerHTML = '<option value="">Auto profile</option>';
-    (d.profiles || []).forEach(p => {
+    // SAVED PROFILES FIRST (AMUX-3670, Ethan: "i have saved profiles in amux
+    // browser… i want it to be simple").
+    //
+    // This listed every DIRECTORY under playwright-auth/profiles, flat and in
+    // one style. Measured 2026-08-24: 48 entries, of which 4 are registered in
+    // `profiles.json` — the ones actually saved via the Save button. The other
+    // 44 are scratch left by tests and probes (`rawtest-13181`,
+    // `resolver-test`, `godmode-verify`, `anonymous-1776924814739`…), and they
+    // rendered identically to the real ones. Picking your own saved login meant
+    // finding it among 92% noise.
+    //
+    // Split, never FILTERED: an unregistered dir may still hold a login
+    // somebody staged without pressing Save, and silently hiding it would lose
+    // real work (it is the user's data, not ours to judge). They move below a
+    // separator and keep their names.
+    const all = d.profiles || [];
+    const saved = all.filter(p => p.registered);
+    const scratch = all.filter(p => !p.registered);
+    const opt = (p, icon) => {
       const o = document.createElement('option');
       o.value = p.name;
       const doms = (p.domains || []).join(', ');
-      o.textContent = '🔓 ' + p.name + (doms ? ' — ' + doms : '');
+      // The LABEL is what the user typed when saving, so it is the best name to
+      // show; the directory name stays alongside because it is what the API and
+      // AMUX_PROFILE take.
+      const lbl = (p.label || '').trim();
+      o.textContent = icon + ' ' + (lbl ? lbl + ' (' + p.name + ')' : p.name)
+                    + (doms ? ' — ' + doms : '');
       if (doms) o.title = doms;
-      sel.appendChild(o);
-    });
+      return o;
+    };
+    saved.forEach(p => sel.appendChild(opt(p, '⭐')));
+    if (saved.length && scratch.length) {
+      const sep = document.createElement('option');
+      sep.disabled = true;
+      sep.textContent = '─── unsaved / scratch profiles (' + scratch.length + ') ───';
+      sel.appendChild(sep);
+    }
+    scratch.forEach(p => sel.appendChild(opt(p, '🔓')));
     (d.chrome_profiles || []).forEach(p => {
       const o = document.createElement('option');
       o.value = p; o.textContent = '🌐 ' + p;
@@ -33312,9 +34071,38 @@ async function _bwGo() {
     const r = await fetch('/api/browser/start', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(body) });
     const d = await r.json();
     if (d.error) { _bwStatus('Error: ' + d.error); return; }
-    _bwCurrentUrl = (d.data && d.data.url) || url;
+    // SAY WHERE IT LANDED, and say so when that is not where you asked.
+    //
+    // This read `(d.data && d.data.url) || url`. `/api/browser/start` has no
+    // `data` object, so the first term was ALWAYS undefined and the fallback
+    // recorded the url we REQUESTED as though it were the current page. Then
+    // "Navigated" printed unconditionally on the mere absence of d.error. One
+    // word for two states: "you are on the page you typed" and "Chrome started
+    // and went somewhere else entirely".
+    //
+    // Reported 2026-08-25: google.com typed, "Navigated" shown, and the only
+    // page target was a session-restored app.hubspot.com/login. The server now
+    // returns `launch_url` — where the page tab actually is — so the mismatch
+    // is a fact we can show instead of one the user has to notice.
+    //
+    // A DIFFERENCE IS NOT A FAILURE. launch_url is read immediately after
+    // launch, so a slow page can still be about:blank and a redirect may not
+    // have resolved; hosts also legitimately differ (google.com -> www.google.com).
+    // Compare the HOST and only when we have a real one, or this becomes a
+    // false alarm on every redirect.
+    const _landed = d.launch_url || (d.data && d.data.url) || '';
+    _bwCurrentUrl = _landed || url;
     _bwShowProfile(d.profile, d.auto_profile);
-    _bwStatus('Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : ''));
+    let _msg = 'Navigated' + (d.profile_fallback ? ' (no profile — Chrome busy)' : '');
+    if (_landed && !/^about:/.test(_landed)) {
+      const _host = u => { try { return new URL(u).host.replace(/^www\./, ''); } catch (e) { return ''; } };
+      const _want = _host(url), _got = _host(_landed);
+      if (_want && _got && _want !== _got) {
+        _msg = 'Started, but the page is ' + _got + ' — not ' + _want
+             + '. The profile may have restored a session; navigate again or pick a different profile.';
+      }
+    }
+    _bwStatus(_msg);
     // We navigated → we now EXPECT a live frame; a blank viewport from here is a
     // failure, not the initial state (drives _bwViewportFail).
     _bwWantFrame = true; _bwHasFrame = false; _bwShotFails = 0;

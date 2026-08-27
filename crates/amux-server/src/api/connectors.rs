@@ -1248,6 +1248,31 @@ async fn test_connection(Path(id): Path<String>) -> Response {
 /// delegation, impersonating the requesting Workspace user (see
 /// [`impersonation_subject`]). The raw SA key is NEVER returned or logged, and
 /// the minted token is NEVER logged. Optional `?scopes=` overrides the provider's
+/// Did Google REFUSE us, as opposed to something breaking on the way there?
+///
+/// `mint_token` returns two families of error and they want opposite statuses.
+/// When the token endpoint answers non-2xx it relays Google's own OAuth error
+/// code (`format!("{err}: {desc}")`), and those codes are a CLOSED SET defined
+/// by RFC 6749 section 5.2 — not a fuzzy phrase, which is what makes this a
+/// safe match rather than a guess. Everything else is a local or network fault:
+/// missing config, unreadable key file, bad PEM, sign failure, transport error,
+/// a body with no access_token.
+///
+/// A refusal is 403 + `needs_auth`: Google worked, our SA is not authorized, and
+/// the body already names who can grant it. A fault stays 502, because that IS
+/// amux failing and must not hide behind a refusal (AMUX-3738).
+pub(crate) fn delegation_refusal(err: &str) -> bool {
+    const OAUTH_REFUSALS: [&str; 5] = [
+        "unauthorized_client",
+        "invalid_client",
+        "invalid_grant",
+        "access_denied",
+        "invalid_scope",
+    ];
+    let code = err.split(':').next().unwrap_or("").trim();
+    OAUTH_REFUSALS.contains(&code)
+}
+
 /// declared scopes (space- or comma-delimited). On failure the endpoint surfaces
 /// Google's own error (e.g. `unauthorized_client`), which names the Admin-console
 /// fix — the same honest-error path `test_connection` uses.
@@ -1388,12 +1413,31 @@ async fn mint_connector_token(
             .into_response()
         }
         Err(e) => {
-            tracing::warn!("connector_token: {id} mint failed for {subject}: {e}");
+            // A REFUSAL IS NOT A GATEWAY FAULT (AMUX-3738). Google's token
+            // endpoint answering `unauthorized_client` means it worked
+            // correctly and said no: our service account is not authorized for
+            // these scopes, and a named human (a Workspace super-admin) must
+            // grant it. Nothing in amux is broken, and 502 sent a reader here
+            // instead of to the Admin console.
+            //
+            // The sibling path already knew this. `connector_test` returns
+            // `status: "needs_auth"` for the IDENTICAL failure while this one
+            // returned `status: "error"` at 502 — two verdicts about one fact,
+            // and the wrong one was the one that files autofix cards.
+            //
+            // A genuine fault (unreadable key file, bad PEM, network) keeps
+            // 502: those ARE amux failing and must not hide behind a refusal.
+            let refusal = delegation_refusal(&e);
+            if refusal {
+                tracing::warn!("connector_token: {id} delegation REFUSED for {subject}: {e}");
+            } else {
+                tracing::warn!("connector_token: {id} mint failed for {subject}: {e}");
+            }
             (
-                StatusCode::BAD_GATEWAY,
+                if refusal { StatusCode::FORBIDDEN } else { StatusCode::BAD_GATEWAY },
                 Json(json!({
                     "ok": false,
-                    "status": "error",
+                    "status": if refusal { "needs_auth" } else { "error" },
                     "detail": format!("service-account delegation failed: {e}. If this is 'unauthorized_client', a Workspace super-admin must authorize this connector's scopes for the SA in Admin console -> Security -> API controls -> Domain-wide delegation."),
                 })),
             )
@@ -1833,6 +1877,64 @@ pub fn callback_routes_with(ctx: Arc<ConnectorsCtx>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-3738: a delegation REFUSAL is 403 + needs_auth, a real fault stays
+    /// 502.
+    ///
+    /// The filed card was `POST /api/connectors/{id}/token -> HTTP 502` with a
+    /// body saying "unauthorized_client ... a Workspace super-admin must
+    /// authorize this connector's scopes". Google worked correctly and said no.
+    /// Nothing in amux was broken, and 502 sent a reader here instead of to the
+    /// Admin console.
+    ///
+    /// The sibling path already knew: `connector_test` returns
+    /// `status: "needs_auth"` for the IDENTICAL failure while the token path
+    /// said `status: "error"` at 502. Two verdicts about one fact, and the
+    /// wrong one was the one that files autofix cards.
+    ///
+    /// The refusal set is RFC 6749 section 5.2 — a closed set, which is what
+    /// makes this a safe match rather than a phrase guess.
+    #[test]
+    fn a_delegation_refusal_is_not_a_gateway_fault() {
+        // Exactly the shape mint_token relays: "{err}: {desc}".
+        for e in [
+            "unauthorized_client: Client is unauthorized to retrieve access tokens",
+            "invalid_client: The OAuth client was not found.",
+            "invalid_grant: Invalid grant: account not found",
+            "access_denied: ",
+            "invalid_scope: bad scope",
+        ] {
+            assert!(delegation_refusal(e), "Google refusing us is not amux failing: {e}");
+        }
+
+        // CONTROLS: every OTHER mint_token failure is a genuine fault and must
+        // KEEP 502. Without these the classifier could return true always, the
+        // assertions above would pass, and a real outage would hide behind a
+        // needs_auth label — which is the expensive direction here, because
+        // nobody investigates a permissions notice.
+        for e in [
+            "GOOGLE_SA_KEY_FILE / GOOGLE_SA_SUBJECT not set",
+            "read SA key file: No such file or directory (os error 2)",
+            "parse SA key JSON: expected value at line 1",
+            "SA private key is not valid RSA PEM: bad base64",
+            "sign JWT: InvalidKeyFormat",
+            "http client: builder error",
+            "token exchange request: connection refused",
+            "token exchange body: expected value",
+            "token exchange returned no access_token",
+        ] {
+            assert!(!delegation_refusal(e), "a real fault must keep 502: {e}");
+        }
+
+        // A refusal-looking word INSIDE a description must not flip a fault.
+        // The code is the FIRST field; matching anywhere would make
+        // "token exchange body: unauthorized_client" a refusal when the body
+        // failed to parse.
+        assert!(
+            !delegation_refusal("token exchange body: unauthorized_client somewhere"),
+            "only the leading OAuth code counts, not the description text"
+        );
+    }
+
     use super::*;
 
     #[test]

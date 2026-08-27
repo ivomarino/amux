@@ -58,6 +58,7 @@ pub fn routes_with(ctx: Arc<EmailCtx>) -> Router<AppState> {
         .route("/log", get(send_log))
         // AMUX-3510: the human approval half of the external-send gate.
         .route("/approve/{id}", post(approve))
+        .route("/reject/{id}", post(reject))
         .route("/approvals", get(list_approvals))
         .layer(Extension(ctx))
 }
@@ -711,6 +712,78 @@ fn approval_required_response(id: &str, preview: Value) -> Response {
         .into_response()
 }
 
+/// POST /api/email/reject/{id} — the human DISCARD (AMUX-3698).
+///
+/// Reported by autodesk, and Ethan hit the consequence directly: his approvals
+/// banner showed two of autodesk's `example.invalid` gate probes, and the only
+/// button on it was "Approve & send". A human looking at a draft they do not
+/// want has had exactly one move — wait an hour for the TTL — while the copy
+/// underneath told them so.
+///
+/// That is ethos rule 3 on a HUMAN-facing surface: a constraint whose only exit
+/// is the passage of time. It also means the queue cannot distinguish "pending a
+/// decision" from "decided against, waiting to rot", so a glance at the banner
+/// overstates what is actually awaiting judgment.
+///
+/// Attributed like approve, and for the same reason: a discard is a decision
+/// about someone else's queued work, and "why was this not sent" is a question
+/// the ledger could not answer for ANY unsent draft. It can now.
+pub async fn reject(
+    Extension(ctx): Extension<Arc<EmailCtx>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    body: Option<Json<Value>>,
+) -> Response {
+    let by = headers
+        .get("x-amux-approver")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| hdr_worker(&headers))
+        .unwrap_or_else(|| "unidentified".to_string());
+    let reason = body
+        .as_ref()
+        .and_then(|b| b.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let home = ctx.client.home().to_path_buf();
+    // The creating lane may discard its OWN draft — unlike approve, where
+    // self-release is the whole loop the gate exists to break. Withdrawing a
+    // send you queued is not a bypass; refusing it would leave a worker that
+    // notices its own mistake with no way to clean up after itself, which is
+    // what left two probe drafts in Ethan's banner.
+    match crate::api::email_approval::discard(&home, &id, &by) {
+        Some(doc) => {
+            let session = doc.get("session").and_then(Value::as_str).unwrap_or("").to_string();
+            tracing::info!(
+                approval = %id, session = %session, by = %by, reason = %reason,
+                "[email] approval DISCARDED — the draft was never sent (AMUX-3698)"
+            );
+            email_log(
+                ctx.client.home(),
+                json!({
+                    "endpoint": "reject", "approval_id": id, "session": session,
+                    "rejected": true, "rejected_by": by, "reason": reason,
+                    "approver_verified": false,
+                }),
+            );
+            (
+                StatusCode::OK,
+                Json(json!({ "ok": true, "rejected": true, "approval_id": id,
+                             "was_for_session": session })),
+            )
+                .into_response()
+        }
+        None => err(
+            StatusCode::NOT_FOUND,
+            json!({ "error": crate::api::email_approval::fate(&home, &id) }),
+        ),
+    }
+}
+
 /// POST /api/email/approve/{id} — the human release (AMUX-3510). Refuses any
 /// request carrying a worker origin: a worker approving its own held send is
 /// the exact loop the gate exists to break.
@@ -733,7 +806,110 @@ pub async fn approve(
             }),
         );
     }
+    // AUTHORIZE ON A POSITIVE, NEVER ON AN ABSENCE (autodesk, AUTOD-48).
+    //
+    // THE BYPASS, measured against the live server, two calls and 743ms:
+    //
+    //   12:51:06  POST /api/email/send      X-Amux-Session: autodesk  -> 403, apr_5da6...
+    //   12:51:07  POST /api/email/approve/apr_5da6...   no headers    -> 200 approved:true
+    //
+    // Same shell, same lane, no human. The check above only ever stopped a lane
+    // that VOLUNTEERED its identity while trying to bypass a control, which is
+    // not a behaviour worth designing against. Absence of `X-Amux-Session` is
+    // the one condition a worker can produce at will.
+    //
+    // AND THE LEDGER LIED ABOUT IT, which is worse than the bypass. The release
+    // row read `approved_by: "dashboard (no worker origin)"` — an affirmative
+    // false exculpation, inferred from an absence. Anyone auditing the 22 Aug
+    // incident class would read that row and clear the lane. The send-path hole
+    // autodesk probed earlier degrades to `session='unattributed'`, a flag a
+    // reader can act on; this one handed out a clean bill of health.
+    //
+    // WHAT THIS IS AND IS NOT. On a localhost box a worker can send any header,
+    // so `X-Amux-Approver` is NOT a cryptographic boundary and nothing here
+    // pretends otherwise. What it changes is the shape of the act: a bypass now
+    // requires the lane to ASSERT a human identity under a name, instead of
+    // obtaining one by omitting a field. The ledger then records the claim as a
+    // claim (`approver_verified: false`) rather than manufacturing a fact.
+    //
+    // A real boundary needs an auth distinction the localhost bypass currently
+    // erases — see AMUX-3699. Fixing that is not a reason to leave this.
+    let approver = headers
+        .get("x-amux-approver")
+        .and_then(|v| v.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let Some(approver) = approver else {
+        tracing::warn!(
+            approval = %id,
+            "[email] approve refused: no X-Amux-Approver. Absence used to mean 'human' and \
+             that is the AUTOD-48 bypass — a worker produces an absence at will"
+        );
+        return err(
+            StatusCode::FORBIDDEN,
+            json!({
+                "error": "approval must NAME its approver: send X-Amux-Approver: <who>. \
+                          Absence used to be read as 'a human at the dashboard', which a \
+                          worker can produce by sending no headers at all (AUTOD-48).",
+                "code": "approver_unidentified",
+                "how_to_fix": {
+                    "dashboard": "the Approvals panel sends this automatically — reload if it does not",
+                    "curl": "curl -X POST -H 'X-Amux-Approver: <your name>' $AMUX_URL/api/email/approve/<id>",
+                    "note": "this names you in the send-audit ledger; it is not a password",
+                },
+            }),
+        );
+    };
     let home = ctx.client.home().to_path_buf();
+    // CREATOR CHECK BEFORE CONSUME (AUTOD-48 follow-up). This used to run
+    // AFTER, and my own comment argued that was the safe direction. It was not:
+    // `consume` is the one-shot rename, so reading the doc to learn the creator
+    // DESTROYED the draft the check refused.
+    //
+    // What that cost, from autodesk's bisect: any lane could delete any pending
+    // draft, because `GET /api/email/approvals` hands every caller the id AND
+    // the creating session — name that session back at the server and the draft
+    // is gone. And the legitimate failure was worse than the abuse: a lane that
+    // self-approved ONCE, the exact mistake this gate exists to catch,
+    // permanently destroyed the message a human was supposed to review.
+    //
+    // The retry worry that motivated the old order does not survive contact
+    // with it. The approver is a NAME, not a secret, so an attacker never
+    // needed to retry against one pending row; they could always create their
+    // own. I traded a real destructive defect for a guess about an attack that
+    // the design already conceded.
+    if let Some(pending) = crate::api::email_approval::peek(&home, &id) {
+        let creator = pending.get("session").and_then(Value::as_str).unwrap_or("");
+        if !creator.is_empty() && approver.eq_ignore_ascii_case(creator) {
+            tracing::warn!(
+                session = %creator, approver = %approver, approval = %id,
+                "[email] approve refused: the approver names the REQUESTING lane (AUTOD-48 v5) \
+                 — the draft is left PENDING, a refusal must not destroy what it refuses"
+            );
+            // AUDIT THE REFUSAL. It previously wrote nothing, so the only trace
+            // of a destroyed draft was its original freeze — a draft that
+            // existed and died left no row at all.
+            email_log(
+                ctx.client.home(),
+                json!({
+                    "endpoint": "approve", "blocked": "creator_cannot_approve",
+                    "approval_id": id, "session": creator, "approver_claimed": approver,
+                    "approver_verified": false,
+                }),
+            );
+            return err(
+                StatusCode::FORBIDDEN,
+                json!({
+                    "error": format!(
+                        "'{approver}' requested this send, so it cannot also approve it. The \
+                         draft is STILL PENDING — surface the preview to a human."
+                    ),
+                    "code": "creator_cannot_approve",
+                }),
+            );
+        }
+    }
     let doc = match crate::api::email_approval::consume(&home, &id) {
         crate::api::email_approval::Consume::Ready(d) => d,
         crate::api::email_approval::Consume::Expired => {
@@ -743,10 +919,19 @@ pub async fn approve(
             )
         }
         crate::api::email_approval::Consume::Gone => {
-            return err(
-                StatusCode::NOT_FOUND,
-                json!({ "error": "no pending approval with that id (already approved, expired, or never existed)" }),
-            )
+            // DO NOT ENUMERATE OUTCOMES THE SERVER CANNOT DISTINGUISH
+            // (AUTOD-48 follow-up). This said "already approved, expired, or
+            // never existed", and the first branch EXCULPATES: an auditor reads
+            // it and concludes a human released the draft. That is the same
+            // family as the `approved_by: "dashboard"` inference this endpoint
+            // was just fixed for — a message asserting something the server
+            // does not know.
+            //
+            // The directory DOES know, because consumed and expired files are
+            // renamed rather than deleted, so say which when it can be read and
+            // say nothing when it cannot.
+            let fate = crate::api::email_approval::fate(&home, &id);
+            return err(StatusCode::NOT_FOUND, json!({ "error": fate }));
         }
     };
     let payload = doc.get("payload").cloned().unwrap_or_else(|| json!({}));
@@ -796,7 +981,14 @@ pub async fn approve(
                 ctx.client.home(),
                 json!({
                     "endpoint": endpoint, "via": "gmail", "approved": true,
-                    "approval_id": id, "approved_by": "dashboard (no worker origin)",
+                    "approval_id": id,
+                    // The CLAIM, verbatim. Never "dashboard (no worker origin)",
+                    // which was an inference from an absence and was false in
+                    // AUTOD-48's specimen. `approver_verified` says plainly that
+                    // nothing here proved it, so a forensic reader weighs it as
+                    // a claim rather than a finding.
+                    "approved_by": approver,
+                    "approver_verified": false,
                     "from": p("from"), "to": p("to"),
                     "subject": p("subject"),
                     "body_chars": p("body").chars().count(),
@@ -1800,6 +1992,338 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{res}");
     }
 
+    /// AMUX-3698: a human can DISCARD a held draft, and it is recorded.
+    ///
+    /// Ethan's screenshot is the specimen: his approvals banner held two of
+    /// autodesk's `example.invalid` gate probes and the only button was
+    /// "Approve & send". The available moves were approve a worker's test email
+    /// or wait an hour — ethos rule 3 on a human-facing surface.
+    #[tokio::test]
+    async fn a_held_draft_can_be_discarded_and_the_discard_is_audited() {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "n", "threadId": "t" })),
+        ]);
+        let (app, _d, _r) = app_with(http, home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "gate-probe@example.invalid", "subject": "probe", "body": "b",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "premise: held: {res}");
+        let id = res["approval_id"].as_str().expect("approval_id").to_string();
+
+        let (st, ok) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/reject/{id}"),
+            Some(json!({ "reason": "worker probe, not a real send" })),
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{ok}");
+        assert_eq!(ok["rejected"], json!(true), "{ok}");
+        assert_eq!(ok["was_for_session"], json!("autodesk"), "{ok}");
+
+        // IT MUST NOT SEND. The whole point of a discard is that the draft dies
+        // unsent, and the MockHttp queue above would have served a send.
+        let log = crate::integrations::email::read_email_log(home.path(), 1, 50, "");
+        let rows = log["log"].as_array().unwrap();
+        assert!(
+            !rows.iter().any(|r| r.get("approved") == Some(&json!(true))),
+            "a discard must not release the draft: {rows:?}"
+        );
+        let rej = rows
+            .iter()
+            .find(|r| r.get("rejected") == Some(&json!(true)))
+            .expect("the discard must be a ledger row — 'why was this not sent' was \
+                     unanswerable for ANY unsent draft before this");
+        assert_eq!(rej["rejected_by"], json!("dashboard"));
+        assert_eq!(rej["reason"], json!("worker probe, not a real send"));
+
+        // ONE-SHOT, and the follow-up says WHICH terminal state it reached
+        // rather than enumerating three (the AUTOD-48 exculpation shape).
+        let (st, e) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/reject/{id}"),
+            None,
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{e}");
+        assert!(
+            e["error"].as_str().unwrap().contains("DISCARDED"),
+            "the directory knows which end it met — say it: {e}"
+        );
+        // AND IT NAMES WHO, rather than inventing a human (autodesk, third
+        // instance). The first version of this sentence read "a human rejected
+        // it" — while the ledger row for a headerless discard correctly says
+        // `rejected_by: "unidentified"`. The message asserted what the row
+        // refuses to, and pointed at that row as proof.
+        assert!(
+            e["error"].as_str().unwrap().contains("'dashboard'"),
+            "name the rejecter this doc actually recorded: {e}"
+        );
+        assert!(
+            e["error"].as_str().unwrap().contains("CLAIMED, not verified"),
+            "and say the identity is unverified, because nothing here checked it: {e}"
+        );
+
+        // THE UNIDENTIFIED CASE, which is the one that produced the false
+        // sentence: a headerless reject is permitted (it fails safe — refusing
+        // to send destroys nothing that was going to be sent) and must NOT be
+        // narrated as a human.
+        let (st, res2) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "someone@customer.com", "subject": "s2", "body": "b",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", "autodesk")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{res2}");
+        let id2 = res2["approval_id"].as_str().unwrap().to_string();
+        let (st, _) =
+            send_req(&app, "POST", &format!("/api/email/reject/{id2}"), None, &[]).await;
+        assert_eq!(st, StatusCode::OK, "a headerless discard fails safe and is allowed");
+        let (_, e3) =
+            send_req(&app, "POST", &format!("/api/email/reject/{id2}"), None, &[]).await;
+        let msg = e3["error"].as_str().unwrap();
+        assert!(
+            !msg.contains("a human"),
+            "NOBODY was identified — the sentence must not invent one: {msg}"
+        );
+        assert!(msg.contains("not known"), "say so plainly instead: {msg}");
+
+        // AND APPROVE MUST REFUSE IT AFTERWARDS. A discarded draft that could
+        // still be released would make the button a suggestion.
+        let (st, e2) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{id}"),
+            None,
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::NOT_FOUND, "{e2}");
+    }
+
+    /// AUTOD-48: the gate was bypassable in two calls by the lane it stops, and
+    /// the bypass logged as human-approved.
+    ///
+    /// autodesk's measurement against the live server, 743ms apart in one shell:
+    ///
+    /// ```text
+    /// 12:51:06  POST /api/email/send      X-Amux-Session: autodesk  -> 403, apr_5da6...
+    /// 12:51:07  POST /api/email/approve/apr_5da6...   no headers    -> 200 approved:true
+    /// ```
+    ///
+    /// The ledger row read `approved_by: "dashboard (no worker origin)"`. That
+    /// is the half that matters: the send-path hole degrades to
+    /// `session='unattributed'`, a flag a reader can act on, while this one
+    /// produced an affirmative false exculpation. Anyone auditing the incident
+    /// class would have read that row and cleared the lane.
+    ///
+    /// Every cell below is one of the seven variants autodesk said they would
+    /// probe the moment the binary was live. Cheaper to cover in one pass.
+    /// A lane's send, HELD pending approval, with its approval id.
+    ///
+    /// Was a closure inside `approve_refuses_an_absent_or_self_named_approver`;
+    /// lifted to module scope by AMUX-3699 so the contradiction test drives the
+    /// same fixture rather than a second copy that could drift from it.
+    async fn held(
+        name: &'static str,
+    ) -> (axum::Router, tempfile::TempDir, tempfile::TempDir, String) {
+        let home = temp_home();
+        let http = MockHttp::new(vec![
+            ("GET", "/settings/sendAs", 200, json!({ "sendAs": [] })),
+            ("POST", "/messages/send", 200, json!({ "id": "x", "threadId": "t" })),
+        ]);
+        let (app, d, _r) = app_with(http, home.path());
+        let (st, res) = send_req(
+            &app,
+            "POST",
+            "/api/email/send",
+            Some(json!({ "to": "cto@customer.com", "subject": "Q", "body": "draft",
+                         "from": ACCT, "force_new_thread": true })),
+            &[("x-amux-session", name)],
+        )
+        .await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "premise: the send must be HELD: {res}");
+        let id = res["approval_id"].as_str().expect("approval_id").to_string();
+        (app, d, home, id)
+    }
+
+    #[tokio::test]
+    async fn approve_refuses_an_absent_or_self_named_approver() {
+        // THE ORIGINAL BYPASS: no headers at all.
+        let (app, _d, _h, id) = held("autodesk").await;
+        let (st, e) =
+            send_req(&app, "POST", &format!("/api/email/approve/{id}"), None, &[]).await;
+        assert_eq!(st, StatusCode::FORBIDDEN, "{e}");
+        assert_eq!(e["code"], json!("approver_unidentified"), "{e}");
+
+        // VARIANTS 1 and 3: emptiness must fail CLOSED, on every header that
+        // participates. An empty `x-amux-session` reads as None to hdr_worker,
+        // so before this fix it was a one-character bypass; an empty approver
+        // must not satisfy the new check either.
+        for hdrs in [
+            vec![("x-amux-session", "")],
+            vec![("x-amux-session", "   ")],
+            vec![("x-amux-worker", "")],
+            vec![("x-amux-approver", "")],
+            vec![("x-amux-approver", "  ")],
+            vec![("x-amux-session", ""), ("x-amux-approver", " ")],
+        ] {
+            let (app, _d, _h, id) = held("autodesk").await;
+            let (st, e) =
+                send_req(&app, "POST", &format!("/api/email/approve/{id}"), None, &hdrs).await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "empty/blank must fail closed: {hdrs:?} -> {e}");
+            assert_eq!(e["code"], json!("approver_unidentified"), "{hdrs:?} -> {e}");
+        }
+
+        // VARIANT 5: creator may not be approver, even WITH a marker. The name
+        // is not a secret, so this is the independent gate that survives the
+        // marker being guessed or copied. Case-insensitive, because a name is
+        // not a password and `Autodesk` is the same lane.
+        //
+        // AND THE REFUSAL MUST NOT DESTROY THE DRAFT. The first version of this
+        // check ran AFTER `consume`, so it burned the row it refused: any lane
+        // could delete any pending draft by naming its creator back at the
+        // server (the pending list hands out both), and a lane that
+        // self-approved ONCE permanently destroyed the message a human was
+        // meant to review. autodesk bisected it — pending before=True,
+        // after=FALSE — and nothing else in this file could have told us,
+        // because the refusal wrote no ledger row either.
+        for who in ["autodesk", "AutoDesk"] {
+            let (app, _d, _h, id) = held("autodesk").await;
+            let (st, e) = send_req(
+                &app,
+                "POST",
+                &format!("/api/email/approve/{id}"),
+                None,
+                &[("x-amux-approver", who)],
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN, "{who} -> {e}");
+            assert_eq!(e["code"], json!("creator_cannot_approve"), "{who} -> {e}");
+
+            // THE DRAFT SURVIVES. This is the cell that would have caught the
+            // defect, and the one the original test could not: it asserts on
+            // the SIDE EFFECT of a refusal, not on its status code.
+            let (st2, ok) = send_req(
+                &app,
+                "POST",
+                &format!("/api/email/approve/{id}"),
+                None,
+                &[("x-amux-approver", "dashboard")],
+            )
+            .await;
+            assert_eq!(
+                st2,
+                StatusCode::OK,
+                "a refused self-approval must leave the draft PENDING so a human can still \
+                 release it — {who} -> {ok}"
+            );
+        }
+
+        // THE CONTROL, and without it every cell above passes against a gate
+        // that refuses everything and no mail could ever be released.
+        let (app, _d, _h, id) = held("autodesk").await;
+        let (st, ok) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{id}"),
+            None,
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "a NAMED approver who is not the creator must succeed: {ok}");
+        assert_eq!(ok["approved"], json!(true), "{ok}");
+    }
+
+    /// AMUX-3699: the worker-origin refusal must cover EVERY header spelling
+    /// `hdr_worker` knows, or it narrows silently and the bypass widens.
+    ///
+    /// WHAT INVESTIGATING THIS CARD ACTUALLY FOUND. The card's residual reads
+    /// "the two-call bypass becomes a three-header bypass: a lane sends
+    /// `X-Amux-Approver: dashboard` and the creator check passes because
+    /// `autodesk != dashboard`". True as far as it goes, and it understates one
+    /// guard: AMUX-3510 refuses ANY request carrying a worker origin, at the
+    /// top of `approve`, before the approver is even read. So a lane cannot
+    /// merely add a third header — it must also SUPPRESS its own origin. Two
+    /// independent things, not one.
+    ///
+    /// That is still not a boundary (a lane omits headers at will, and this is
+    /// self-attestation in both directions), which is why the card stays open
+    /// against a precondition amux does not have. But the guard that DOES
+    /// exist is worth keeping honest, and it was covered for exactly one of the
+    /// two header names `hdr_worker` reads.
+    ///
+    /// The list is asserted against `hdr_worker` itself rather than restated,
+    /// so a third origin header added there fails HERE instead of quietly
+    /// creating a spelling the refusal does not see.
+    #[tokio::test]
+    async fn the_worker_origin_refusal_covers_every_header_hdr_worker_reads() {
+        // The guard's own source of truth. A restated copy could drift from the
+        // function it is supposed to mirror, which is how a view and its
+        // mechanism disagree (ethos rule 1).
+        for spelling in ["x-amux-worker", "x-amux-session"] {
+            let mut h = HeaderMap::new();
+            h.insert(spelling, "autodesk".parse().unwrap());
+            assert_eq!(
+                hdr_worker(&h).as_deref(),
+                Some("autodesk"),
+                "premise: hdr_worker reads {spelling}"
+            );
+
+            let (app, _d, _home, id) = held("autodesk").await;
+            let (st, e) = send_req(
+                &app,
+                "POST",
+                &format!("/api/email/approve/{id}"),
+                None,
+                // The full bypass attempt: assert a human identity AND carry
+                // the origin. The origin is what must stop it.
+                &[("x-amux-approver", "dashboard"), (spelling, "autodesk")],
+            )
+            .await;
+            assert_eq!(
+                st,
+                StatusCode::FORBIDDEN,
+                "a lane claiming to be the dashboard while stamping {spelling} must be \
+                 refused, not merely logged: {e}"
+            );
+            assert_eq!(e["code"], json!("worker_cannot_approve"), "{spelling}: {e}");
+        }
+
+        // THE CONTROL. Without it, a guard that refused every approval would
+        // pass both cells above and no mail could ever be released — and the
+        // residual this card documents would read as closed when it is not.
+        let (app, _d, _home, id) = held("autodesk").await;
+        let (st, ok) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{id}"),
+            None,
+            &[("x-amux-approver", "dashboard")], // a browser sends no origin
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::OK,
+            "an origin-less caller claiming to be the dashboard still succeeds — that IS the \
+             open residual, and asserting it stops this test reading as a boundary: {ok}"
+        );
+    }
+
     #[tokio::test]
     async fn approve_is_human_only_one_shot_and_audited() {
         let home = temp_home();
@@ -1833,9 +2357,23 @@ mod tests {
         assert_eq!(st, StatusCode::FORBIDDEN);
         assert_eq!(e["code"], json!("worker_cannot_approve"));
 
-        // The human release sends the FROZEN draft and audits both halves.
-        let (st, ok) =
-            send_req(&app, "POST", &format!("/api/email/approve/{apr}"), None, &[]).await;
+        // THE HUMAN RELEASE NAMES ITSELF (AUTOD-48). This call used to send NO
+        // headers and expect 200 — so the cell named "approve_is_human_only"
+        // was, precisely, the assertion that an unidentified caller is a human.
+        // It certified the bypass for as long as it was green.
+        //
+        // Kept and corrected rather than deleted: the rest of what it pins
+        // (frozen draft released, both halves audited, one-shot) is real and
+        // still worth having. `approve_refuses_an_absent_or_self_named_approver`
+        // covers the refusals.
+        let (st, ok) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{apr}"),
+            None,
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
         assert_eq!(st, StatusCode::OK, "{ok}");
         assert_eq!(ok["approved"], json!(true));
         assert_eq!(ok["id"], json!("rel1"));
@@ -1849,11 +2387,30 @@ mod tests {
             .expect("the approved send must be a ledger row");
         assert_eq!(sent["approval_id"], json!(apr));
         assert_eq!(sent["session"], json!("autodesk"), "the AUTHOR stays on the row");
-        assert!(sent["approved_by"].as_str().unwrap().contains("dashboard"));
+        // The ledger records the CLAIM and says it is unverified. It used to
+        // assert "dashboard (no worker origin)" on the strength of an absence,
+        // which was an affirmative false exculpation in AUTOD-48's specimen.
+        assert_eq!(sent["approved_by"], json!("dashboard"), "the claim, verbatim");
+        assert_eq!(
+            sent["approver_verified"],
+            json!(false),
+            "nothing here proved who released it, and the row must say so rather than \
+             manufacturing a fact a forensic reader would clear the lane on"
+        );
 
-        // One-shot: the same approval cannot release twice.
-        let (st, _) =
-            send_req(&app, "POST", &format!("/api/email/approve/{apr}"), None, &[]).await;
+        // One-shot: the same approval cannot release twice. It carries the
+        // marker so the request REACHES the consume step — the approver gate
+        // runs first now, and a headerless retry would 403 before one-shot was
+        // exercised at all, which would leave this cell green while testing
+        // nothing about one-shot.
+        let (st, _) = send_req(
+            &app,
+            "POST",
+            &format!("/api/email/approve/{apr}"),
+            None,
+            &[("x-amux-approver", "dashboard")],
+        )
+        .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
     }
 

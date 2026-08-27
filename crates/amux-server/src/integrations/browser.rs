@@ -307,13 +307,19 @@ pub struct RunningBrowser {
 }
 
 /// The one running browser's ownership snapshot: (profile, started_by,
-/// started_at, pid). What the start handler's takeover guard reads.
-pub fn running_snapshot() -> Option<(String, String, i64, u32)> {
+/// started_at, pid, cdp_port). What the start handler's takeover guard reads.
+///
+/// `cdp_port` joined the tuple for AMUX-3610. The takeover refusal has to be
+/// able to say "0 tabs open for 18.5 hours", and it cannot ask without the port.
+/// A caller told only "someone else holds this" must choose between blocking
+/// forever and destroying possibly-live state, which is a shared single-instance
+/// resource whose only escape hatch is destructive.
+pub fn running_snapshot() -> Option<(String, String, i64, u32, u16)> {
     RUNNING
         .lock()
         .expect("browser registry poisoned")
         .as_ref()
-        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid))
+        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port))
 }
 
 /// Why the last browser is gone (AMUX-3414: a silent Chrome exit left NOTHING
@@ -365,7 +371,7 @@ fn spawn_exit_monitor() {
             let adopted_dead = if dead.is_none() {
                 let snap = running_snapshot();
                 match snap {
-                    Some((profile, owner, _, pid)) => {
+                    Some((profile, owner, _, pid, _)) => {
                         let alive = tokio::process::Command::new("kill")
                             .args(["-0", &pid.to_string()])
                             .status()
@@ -374,7 +380,7 @@ fn spawn_exit_monitor() {
                             .unwrap_or(true); // cannot poll ≠ dead
                         // Only report dead if the registry STILL names this pid
                         // (a stop/start between poll and here changes the pid).
-                        if !alive && running_snapshot().map(|(_, _, _, p)| p) == Some(pid) {
+                        if !alive && running_snapshot().map(|(_, _, _, p, _)| p) == Some(pid) {
                             Some((profile, pid, owner, None, None))
                         } else {
                             None
@@ -531,17 +537,78 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
     true
 }
 
+/// Every LIVE Chrome holding this exact `--user-data-dir`, from the OS.
+///
+/// `browser-running.json` records ONE pid, so every reconcile built on it can
+/// clear at most one orphan — and since AMUX-3184 detached Chrome into its own
+/// process group (so it survives the builder's re-exec, which is the whole
+/// point), each start/restart cycle can strand another. They accumulate
+/// silently, and Chrome's user-data-dir is single-instance: the second and
+/// later ones show the user "Something went wrong when opening your profile.
+/// Some features may be unavailable."
+///
+/// Measured 2026-08-24 from Ethan's report: FIVE live Chromes on
+/// `playwright-auth/profile`, ports 58242, 63713, 53913, 53402 and 60005, plus
+/// a sixth on `profiles/netsuite`. The state file named one of them.
+///
+/// So ask the OS, which knows all of them, instead of a handle we remembered.
+/// Scoped hard: an EXACT match on the flag value, and only inside amux-owned
+/// dirs — the user's own Chrome must never be a candidate.
+fn live_chromes_on_dir(home: &Path, target_dir: &Path) -> Vec<u32> {
+    if !is_amux_owned(home, target_dir) {
+        return Vec::new();
+    }
+    let flag = format!("--user-data-dir={}", target_dir.display());
+    let out = match std::process::Command::new("ps").args(["-ax", "-o", "pid=,command="]).output() {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::warn!(?e, "browser: could not list processes to find profile co-tenants");
+            return Vec::new();
+        }
+    };
+    pids_on_dir(&String::from_utf8_lossy(&out.stdout), &flag)
+}
+
+/// Pure half of [`live_chromes_on_dir`], so the matching rule is testable
+/// without a live `ps` and without live Chromes to kill.
+fn pids_on_dir(ps_output: &str, flag: &str) -> Vec<u32> {
+    ps_output
+        .lines()
+        // EXACT ARG MATCH, NOT `contains`. `playwright-auth/profile` is a
+        // PREFIX of `playwright-auth/profiles/netsuite`, so a substring test on
+        // the flag makes the DEFAULT profile match every named one — measured
+        // before shipping, on the live machine: `contains` found 9 processes on
+        // the default dir INCLUDING the `netsuite` browser holding a staged
+        // login, while the exact rule finds 7 and leaves netsuite alone. A
+        // launch on `default` would have killed every other profile's browser,
+        // which is a far worse bug than the one being fixed.
+        //
+        // Tokenising on whitespace is safe HERE and only here: the
+        // `is_amux_owned` gate in the caller means the dir is under `~/.amux`,
+        // which has no spaces. The user's own Chrome dirs do ("Application
+        // Support") and are excluded by that same gate.
+        .filter(|l| l.split_whitespace().any(|tok| tok == flag))
+        // Helper processes carry `--type=renderer` and friends and die with
+        // their parent; killing them individually is noise at best.
+        .filter(|l| !l.split_whitespace().any(|t| t.starts_with("--type=")))
+        .filter_map(|l| l.split_whitespace().next()?.parse::<u32>().ok())
+        .collect()
+}
+
 /// Before launching, make sure no Chrome from a PRIOR server process still holds
 /// `target_dir`. The in-memory RUNNING registry does not survive the builder's
 /// re-exec, so a live orphan is invisible to `start()`, and a second Chrome on
 /// the same `--user-data-dir` delegates to that orphan and exits 0 before binding
-/// any debug port ("Chrome exited 0 before CDP came up", AMUX-3207). Two cases,
-/// both closed here so the launch never delegates:
+/// any debug port ("Chrome exited 0 before CDP came up", AMUX-3207). Three cases,
+/// all closed here so the launch never delegates:
 ///   - orphan with LIVE CDP: adopt it into RUNNING, so start()'s replace-check
 ///     stops it by pid (the reported incident: pid 54237, CDP 53470, still alive).
 ///   - orphan whose CDP has WEDGED: adopt cannot speak to it and clears the file,
 ///     but the process still owns the dir. Kill it by the pid the running-file
 ///     recorded, or the next launch delegates to a zombie forever.
+///   - CO-TENANTS THE STATE FILE NEVER NAMED (AMUX-3674): the file records one
+///     pid, and detached Chrome survives a re-exec, so earlier launches strand
+///     browsers nothing remembers. [`live_chromes_on_dir`] asks the OS instead.
 async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // Snapshot the persisted pid/dir BEFORE adopt, which clears the file on dead CDP.
     let persisted = std::fs::read_to_string(running_state_path(home))
@@ -577,6 +644,40 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
                 clear_running(home);
             }
         }
+    }
+
+    // THE ONES THE STATE FILE NEVER KNEW ABOUT (AMUX-3674).
+    //
+    // Everything above reconciles the ONE pid we persisted. Detached Chrome
+    // survives a server re-exec, so earlier launches strand co-tenants the file
+    // no longer names, and a launch onto a dir another Chrome already holds
+    // gets Chrome's profile-lock modal instead of a working browser.
+    //
+    // Runs LAST and unconditionally, including after `adopt_if_orphaned`
+    // returned early — the adopted one is a legitimate tenant and is excluded
+    // by pid, but its co-tenants are not.
+    let adopted = running_snapshot().map(|(_, _, _, pid, _)| pid).unwrap_or(0);
+    let strays: Vec<u32> =
+        live_chromes_on_dir(home, target_dir).into_iter().filter(|p| *p != adopted).collect();
+    for pid in &strays {
+        tracing::warn!(
+            pid, dir = %target_dir.display(),
+            "browser: killing a stray Chrome co-tenant on this profile — two Chromes on one \
+             user-data-dir is what shows the user 'Something went wrong when opening your \
+             profile' (AMUX-3674)"
+        );
+        let _ = tokio::process::Command::new("kill").args(["-KILL", &pid.to_string()]).status().await;
+    }
+    if !strays.is_empty() {
+        // Counted, not just logged: a silent cleanup cannot tell anyone the
+        // leak is still happening, and the leak is the actual defect. This is
+        // the number to watch — it should trend to zero once nothing strands.
+        tracing::warn!(
+            count = strays.len(), dir = %target_dir.display(),
+            "browser: profile had {} stray co-tenant(s) before launch — each one was a \
+             corrupted-profile modal waiting to happen",
+            strays.len()
+        );
     }
 }
 
@@ -649,6 +750,24 @@ pub struct StartedBrowser {
     pub cdp_http: String,
     pub user_data_dir: String,
     pub started_at: i64,
+    /// The URL of the page tab this launch actually produced.
+    ///
+    /// `start()` took a `url` and returned NOTHING about where the browser
+    /// ended up, so `/api/browser/start`'s response had no url of any kind.
+    /// The dashboard read it as `d.data && d.data.url`, which is undefined for
+    /// this endpoint, fell back to the url it had ASKED for, and printed
+    /// "Navigated" unconditionally. So the one word the user gets meant both
+    /// "you are on the page you typed" and "Chrome started and went somewhere
+    /// else entirely" — reported 2026-08-25 as "it says navigated but i dont
+    /// see anything", with google.com requested and a session-restored
+    /// app.hubspot.com/login on screen.
+    ///
+    /// HONEST ABOUT ITS OWN LIMITS: this is read immediately after launch, so a
+    /// slow page can still be `about:blank` here and a redirect may not have
+    /// resolved. It is evidence of WHERE THE TAB WENT, not a load-complete
+    /// signal — the caller must not treat a mismatch as failure, only as a fact
+    /// worth showing. `None` when CDP listed no page tab at all.
+    pub launch_url: Option<String>,
 }
 
 /// The tail of Chrome's launch stderr, formatted for an error message, or "" if
@@ -665,6 +784,165 @@ fn chrome_stderr_tail(path: &Path) -> String {
     let n = s.chars().count();
     let tail: String = s.chars().skip(n.saturating_sub(600)).collect();
     format!(" (chrome stderr: {tail})")
+}
+
+/// What one CDP readiness poll actually got (AMUX-3689).
+///
+/// Pure and separate from the wait loop so the distinction it exists to draw can
+/// be tested without spawning a Chrome. The distinction: **Chrome answering with
+/// a status we reject is not Chrome being silent**, and the loop reported both
+/// as "never answered within 30s" while the stderr quoted in the same message
+/// said `DevTools listening on ws://127.0.0.1:<the very port>`. An investigator
+/// reading "never answered" goes looking at Chrome's startup; an investigator
+/// reading "HTTP 403" goes looking at what amux asked for.
+fn describe_cdp_probe(
+    outcome: &Result<reqwest::Response, reqwest::Error>,
+    http: &str,
+) -> String {
+    match outcome {
+        Ok(r) => format!("HTTP {} from {http}/json/version", r.status()),
+        Err(e) if e.is_connect() => "connection refused (nothing listening)".into(),
+        Err(e) if e.is_timeout() => "no response within the 1s poll timeout".into(),
+        Err(e) => format!("{e}"),
+    }
+}
+
+/// Keep a FAILED launch's stderr where the retry cannot destroy it (AMUX-3689).
+///
+/// `start()` opens the stderr path with `File::create`, which truncates. So the
+/// diagnostic for a failure is deleted by the next attempt on the same profile,
+/// and a caller that fails always retries. `primer` hit the CDP timeout six
+/// times on 2026-08-24 and only the last one's file survived, leaving the 600
+/// char tail already pasted into the error as the entire record of the incident.
+/// That is the artifact you need MOST of when a failure repeats, destroyed by
+/// the fact that it repeated.
+///
+/// Copies rather than renames, because Chrome is still running and still holds
+/// the descriptor. Best-effort throughout: a browser launch must not fail
+/// because a diagnostic copy failed, so every error here returns "" and the
+/// caller's message is merely shorter.
+fn preserve_failed_stderr(path: &Path) -> String {
+    let Some(dir) = path.parent() else { return String::new() };
+    // A WALL CLOCK IS NOT A UNIQUENESS SOURCE, and this function learned it
+    // twice from its own test. Draft one stamped SECONDS: two retries inside one
+    // second minted the same name, the copy overwrote the previous failure, and
+    // the function silently did the exact thing it exists to prevent (the exit-0
+    // delegation path fails in 1.5 to 3s, so that is routine). Draft two moved to
+    // MILLISECONDS and the same assertion failed again, because two calls in a
+    // unit test land in one millisecond just as happily.
+    //
+    // Any finer clock is the same bet at a smaller scale. So the stamp is for
+    // humans and for sorting, and the SEQUENCE is what guarantees uniqueness:
+    // probe until the name is free. Zero-padded so lexicographic order still
+    // matches chronological order within a millisecond, which the prune below
+    // relies on.
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base = format!("amux-chrome-launch.failed-{stamp}");
+    let mut kept = dir.join(format!("{base}-000.stderr"));
+    let mut seq = 0u32;
+    // Bounded: 1000 failures inside one millisecond is not a state worth looping
+    // for, and overwriting the last name beats spinning in a launch path.
+    while kept.exists() && seq < 999 {
+        seq += 1;
+        kept = dir.join(format!("{base}-{seq:03}.stderr"));
+    }
+    if std::fs::copy(path, &kept).is_err() {
+        return String::new();
+    }
+    // Bounded, or a profile that fails all day fills the disk with its own
+    // evidence. Newest 5 by name, which sorts by the millisecond stamp above.
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        let mut old: Vec<_> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("amux-chrome-launch.failed-"))
+            })
+            .collect();
+        old.sort();
+        while old.len() > 5 {
+            let _ = std::fs::remove_file(old.remove(0));
+        }
+    }
+    format!(" Full stderr kept at {}.", kept.display())
+}
+
+/// Chrome's `kBadFlags` (chrome/browser/ui/startup/bad_flags_prompt.cc) that
+/// this launcher could ever pass. Any of them puts the yellow "You are using an
+/// unsupported command-line flag ... Stability and security will suffer."
+/// infobar across the top of every window UNLESS the launch also declares
+/// itself a test harness — see `chrome_launch_args`. Kept as data so the test
+/// pinning that invariant cannot drift from the flags actually passed.
+#[cfg(test)]
+const CHROME_BAD_FLAGS: [&str; 2] =
+    ["--ignore-certificate-errors", "--ignore-certificate-errors-spki-list"];
+
+/// Every flag Chrome is launched with, in order, as ONE list. Pure in its
+/// inputs so the invariants between flags can be tested without spawning a
+/// Chrome (`launch_args_tests`); `start()` feeds it straight to the Command.
+fn chrome_launch_args(
+    port: u16,
+    target: &LaunchTarget,
+    headless: bool,
+    spki: Option<&str>,
+    url: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        format!("--remote-debugging-port={port}"),
+        format!("--user-data-dir={}", target.user_data_dir.display()),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        // --test-type: the SPKI pin below is on Chrome's kBadFlags list, so every
+        // launch opened with the "unsupported command-line flag" infobar across
+        // the window (Ethan's screenshot, 2026-08-24, MR-38). Chrome skips ALL of
+        // its startup infobars for a launch that declares itself a test harness:
+        // chrome/browser/ui/startup/infobar_utils.cc returns before
+        // ShowBadFlagsPrompt when `kTestType || IsAutomationEnabled()`.
+        // --test-type is the right one of the two: --enable-automation also
+        // skips the bad-flags bar but adds its own "Chrome is being controlled by
+        // automated test software" bar, and this is a browser a human logs into.
+        // ChromeDriver passes `--test-type=webdriver` on every session for the
+        // same reason. It changes nothing about what the pin permits — the pin
+        // is still the only certificate exemption. Passed unconditionally rather
+        // than only alongside the pin, so a future bad flag added here inherits
+        // the suppression instead of re-introducing the banner.
+        "--test-type".to_string(),
+    ];
+    // AMUX-3508: same profile dirs, no window — the logins made headfully in
+    // the amux Browser UI ride along, which is the whole point of profiles
+    // being durable. `new` headless shares the profile format with headful
+    // Chrome (the old --headless did not persist everything).
+    if headless {
+        args.push("--headless=new".to_string());
+    }
+    // amux serves its own dashboard over a SELF-SIGNED cert, so without this the
+    // one site this browser most needs to reach — amux itself — lands on
+    // chrome-error://chromewebdata/ and every subsequent verb runs against the
+    // error page. Dogfooding: the browser primitive could not browse the product
+    // that ships it.
+    //
+    // Deliberately SPKI-PINNED to amux's own key rather than the blanket
+    // --ignore-certificate-errors. This profile (~/.amux/playwright-auth/profile)
+    // holds real logged-in sessions for third-party sites; globally disabling
+    // certificate validation there would expose those cookies to any MITM on the
+    // network. The pin excuses exactly one public key and leaves validation fully
+    // intact for everything else — including, importantly, still rejecting a
+    // DIFFERENT bad cert on localhost.
+    if let Some(spki) = spki {
+        args.push(format!("--ignore-certificate-errors-spki-list={spki}"));
+    }
+    if let Some(pd) = &target.profile_directory {
+        args.push(format!("--profile-directory={pd}"));
+    }
+    if !url.trim().is_empty() {
+        args.push(url.trim().to_string());
+    }
+    args
 }
 
 /// Launch Chrome on a profile. Cleans stale locks first (amux-owned dirs
@@ -727,39 +1005,8 @@ pub async fn start(
     // Chrome and the next server process adopts it, as designed.
     #[cfg(unix)]
     cmd.process_group(0);
-    cmd.arg(format!("--remote-debugging-port={port}"))
-        .arg(format!("--user-data-dir={}", target.user_data_dir.display()))
-        .arg("--no-first-run")
-        .arg("--no-default-browser-check");
-    // AMUX-3508: same profile dirs, no window — the logins made headfully in
-    // the amux Browser UI ride along, which is the whole point of profiles
-    // being durable. `new` headless shares the profile format with headful
-    // Chrome (the old --headless did not persist everything).
-    if headless {
-        cmd.arg("--headless=new");
-    }
-    // amux serves its own dashboard over a SELF-SIGNED cert, so without this the
-    // one site this browser most needs to reach — amux itself — lands on
-    // chrome-error://chromewebdata/ and every subsequent verb runs against the
-    // error page. Dogfooding: the browser primitive could not browse the product
-    // that ships it.
-    //
-    // Deliberately SPKI-PINNED to amux's own key rather than the blanket
-    // --ignore-certificate-errors. This profile (~/.amux/playwright-auth/profile)
-    // holds real logged-in sessions for third-party sites; globally disabling
-    // certificate validation there would expose those cookies to any MITM on the
-    // network. The pin excuses exactly one public key and leaves validation fully
-    // intact for everything else — including, importantly, still rejecting a
-    // DIFFERENT bad cert on localhost.
-    if let Some(spki) = amux_cert_spki_b64(home) {
-        cmd.arg(format!("--ignore-certificate-errors-spki-list={spki}"));
-    }
-    if let Some(pd) = &target.profile_directory {
-        cmd.arg(format!("--profile-directory={pd}"));
-    }
-    if !url.trim().is_empty() {
-        cmd.arg(url.trim());
-    }
+    let spki = amux_cert_spki_b64(home);
+    cmd.args(chrome_launch_args(port, &target, headless, spki.as_deref(), url));
     // Capture Chrome's stderr so a launch failure is DIAGNOSABLE. It used to go
     // to /dev/null, so "CDP never answered" could not distinguish a crash (a bad
     // flag, a locked profile, no display) from a slow start — the exact failure
@@ -788,6 +1035,27 @@ pub async fn start(
     //    debugging port, so give a live Chrome up to 30s before giving up.
     let http = format!("http://127.0.0.1:{port}");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    // ONE CLIENT, not one per poll. This loop runs ~120 times in a 30s wait and
+    // built a fresh `reqwest::Client` on every pass, each of which allocates a
+    // connection pool, a TLS config, and on macOS reads the system proxy
+    // settings through SystemConfiguration. Nothing here needs a new client.
+    let probe = reqwest::Client::new();
+    // WHAT THE LAST POLL ACTUALLY GOT (AMUX-3689). The loop discarded every
+    // outcome, so connection-refused, a timeout, a 403 and a 500 all produced
+    // the identical "CDP never answered within 30s".
+    //
+    // That is not merely vague, it can be FALSE, and the specimen proves it: on
+    // 2026-08-24 `primer` hit this six times, and the stderr embedded in the very
+    // same message reads `DevTools listening on ws://127.0.0.1:60005/...` for the
+    // port the message says never answered. CDP came up ~3s in and amux polled
+    // it for another 27s. "Never answered" and "answered with a status I did not
+    // accept" send an investigator to opposite places, and this could not say
+    // which had happened.
+    let mut attempts: u32 = 0;
+    // Deliberately uninitialised: every path that READS it assigns it first, in
+    // the same iteration. A placeholder here would be a value that can never be
+    // observed, i.e. a state the message could claim and never mean.
+    let mut last_probe: String;
     loop {
         if let Ok(Some(status)) = child.try_wait() {
             // A CLEAN exit (status 0) before CDP is the delegation signature: the
@@ -816,20 +1084,35 @@ pub async fn start(
                 chrome_stderr_tail(&stderr_path)
             );
         }
-        match reqwest::Client::new()
+        attempts += 1;
+        let outcome = probe
             .get(format!("{http}/json/version"))
             .timeout(std::time::Duration::from_secs(1))
             .send()
-            .await
-        {
+            .await;
+        match outcome {
             Ok(r) if r.status().is_success() => break,
-            _ if std::time::Instant::now() > deadline => {
-                anyhow::bail!(
-                    "Chrome (pid {pid:?}) is running but CDP on port {port} never answered within 30s{}",
-                    chrome_stderr_tail(&stderr_path)
-                );
+            other => {
+                last_probe = describe_cdp_probe(&other, &http);
+                if std::time::Instant::now() > deadline {
+                    // WARN so a log sweep sees the CLASS, not just this instance
+                    // (/api/logs/analyze groups the 502 but cannot read a
+                    // free-text error body for the discriminator).
+                    tracing::warn!(
+                        ?pid, port, attempts, last_probe = %last_probe,
+                        stderr = %stderr_path.display(),
+                        "browser: CDP wait timed out (AMUX-3689)"
+                    );
+                    let kept = preserve_failed_stderr(&stderr_path);
+                    anyhow::bail!(
+                        "Chrome (pid {pid:?}) is running but CDP on port {port} did not become \
+                         usable within 30s. Last of {attempts} polls: {last_probe}.{}{}",
+                        kept,
+                        chrome_stderr_tail(&stderr_path)
+                    );
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-            _ => tokio::time::sleep(std::time::Duration::from_millis(250)).await,
         }
     }
 
@@ -861,12 +1144,26 @@ pub async fn start(
     // matches on tab TYPE and not on the URL string.
     // The CDP call happens BEFORE the lock is taken: NATIVE_TARGETS is a
     // std::sync::Mutex, and holding one across an await deadlocks the runtime.
-    let launch_tab = cdp_list(port).await.ok().and_then(|tabs| {
+    // The same listing already resolves the page tab; its URL was being thrown
+    // away, which is why the response could not say where the browser landed.
+    let launch_page = cdp_list(port).await.ok().and_then(|tabs| {
         tabs.as_array()
             .and_then(|ts| ts.iter().find(|t| t.get("type").and_then(Value::as_str) == Some("page")))
-            .and_then(|t| t.get("id").and_then(Value::as_str))
-            .map(str::to_string)
+            .map(|t| {
+                (
+                    t.get("id").and_then(Value::as_str).unwrap_or("").to_string(),
+                    t.get("url").and_then(Value::as_str).unwrap_or("").to_string(),
+                )
+            })
     });
+    let launch_url = launch_page
+        .as_ref()
+        .map(|(_, u)| u.clone())
+        .filter(|u| !u.is_empty());
+    let launch_tab = launch_page
+        .as_ref()
+        .map(|(id, _)| id.clone())
+        .filter(|id| !id.is_empty());
     {
         let mut map = NATIVE_TARGETS.lock().expect("native targets poisoned");
         map.clear();
@@ -892,6 +1189,7 @@ pub async fn start(
         cdp_http: http,
         user_data_dir: target.user_data_dir.display().to_string(),
         started_at,
+        launch_url,
     };
     // `child.id()` is None only once the child has been reaped; a browser we
     // just spawned always has one. Refusing here beats persisting pid 0, which
@@ -1154,7 +1452,15 @@ impl CdpClient {
         };
         match tokio::time::timeout(timeout, fut).await {
             Ok(r) => r,
-            Err(_) => anyhow::bail!("CDP {method} timed out after {}s", timeout.as_secs()),
+            // TYPED, not just a message (AMUX-3672). The API boundary maps a
+            // timeout to 504 and a protocol error to 502, and it must decide
+            // that from a TYPE rather than by matching this string — the wording
+            // here would then be load-bearing for a status code, which is the
+            // fragile coupling ethos rule 7 keeps producing.
+            Err(_) => Err(anyhow::Error::new(CdpTimeout {
+                method: method.to_string(),
+                secs: timeout.as_secs(),
+            })),
         }
     }
 
@@ -1201,6 +1507,34 @@ pub enum DriverError {
     Cdp(anyhow::Error),
 }
 
+/// A CDP call that never answered (AMUX-3672).
+///
+/// Carried as a TYPE so the API boundary can answer 504 Gateway Timeout instead
+/// of 502 Bad Gateway. Both used to be `Cdp`, so both became 502 — and
+/// `/api/logs/analyze` groups by (status, method, target), which folded "the
+/// browser is WEDGED" and "the browser REJECTED our call" into one group. Two
+/// different faults, one row, and only the error body told them apart.
+///
+/// That is what made the 2026-08-24 15:57 report need its card body to diagnose:
+/// `Emulation.setDeviceMetricsOverride timed out after 10s` was a symptom of
+/// five Chromes contending one profile (AMUX-3674), and nothing in the log
+/// grouping could have said "this one is a hang".
+#[derive(Debug)]
+pub struct CdpTimeout {
+    pub method: String,
+    pub secs: u64,
+}
+
+impl std::fmt::Display for CdpTimeout {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Unchanged wording: it is what the existing card bodies and the
+        // AMUX-3207 notes quote, and a status code no longer depends on it.
+        write!(f, "CDP {} timed out after {}s", self.method, self.secs)
+    }
+}
+
+impl std::error::Error for CdpTimeout {}
+
 impl From<anyhow::Error> for DriverError {
     fn from(e: anyhow::Error) -> Self {
         DriverError::Cdp(e)
@@ -1222,6 +1556,37 @@ pub struct DriverPage {
 /// from [`RUNNING`] only — verbs NEVER attach to a browser this process did
 /// not launch (a human's Chrome is not ours to drive).
 pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<DriverPage, DriverError> {
+    resolve_page_avoiding(session, create_url, None).await
+}
+
+/// How many times a bound target was abandoned because its socket would not
+/// open (AMUX-3708). Read by `GET /api/browser/status`.
+pub static STALE_BINDING_RECOVERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// `resolve_page`, but refusing to hand back `avoid`.
+///
+/// AMUX-3708. The bound-tab branch below already falls through when the tab is
+/// GONE from `/json/list`, which covers a closed or crashed tab. It does not
+/// cover the state this card is about: a tab Chrome still LISTS whose renderer
+/// is wedged, so the target resolves fine and the WebSocket connect is reset
+/// without a closing handshake. Two 502s 40s apart on 2026-08-25 were exactly
+/// that pair — `Page.captureScreenshot timed out after 30s` at 11:12:41 leaving
+/// the tab wedged, then `Connection reset without closing handshake` in 24ms at
+/// 11:13:21 when the next request resolved to the same still-listed target.
+/// Recovery arrived at 11:13:25 only because Chrome had by then removed the
+/// target, so the existing fall-through could finally see it. Every request in
+/// that window 502s, and nothing shortens it.
+///
+/// `avoid` closes the window: the caller that just failed to open a socket
+/// knows which target is bad, which is knowledge `/json/list` does not have.
+/// The binding is dropped too, or the next call would resolve straight back to
+/// it.
+pub async fn resolve_page_avoiding(
+    session: &str,
+    create_url: Option<&str>,
+    avoid: Option<&str>,
+) -> Result<DriverPage, DriverError> {
     let port = {
         let guard = RUNNING.lock().expect("browser registry poisoned");
         match guard.as_ref() {
@@ -1250,27 +1615,34 @@ pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<Dri
             map.iter().filter(|(k, _)| k.as_str() != session).map(|(_, v)| v.clone()).collect(),
         )
     };
-    if let Some(tid) = bound {
-        if let Some(p) = tabs
-            .iter()
-            .find(|t| tab_id(t).as_deref() == Some(tid.as_str()))
-            .and_then(page_of)
-        {
-            return Ok(p);
-        }
-        // The bound tab died (closed/crashed): fall through and rebind.
+    let (choice, binding_was_stale) =
+        choose_target(tabs, bound.as_deref(), &claimed_by_others, avoid);
+    if binding_was_stale {
+        // The caller just failed to open a socket on this exact target, so the
+        // binding is stale however healthy `/json/list` still claims it is. Drop
+        // it here rather than at the call site: leaving it would make the very
+        // next request resolve straight back to the tab we are abandoning.
+        NATIVE_TARGETS.lock().expect("native targets poisoned").remove(session);
+        STALE_BINDING_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::warn!(
+            "[browser] session {session:?} unbound from wedged target {}: Chrome still lists it \
+             but its CDP socket would not open (AMUX-3708); rebinding",
+            bound.as_deref().unwrap_or("?")
+        );
     }
-    if let Some(p) = tabs
-        .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        .filter(|t| tab_id(t).is_some_and(|id| !claimed_by_others.contains(&id)))
-        .find_map(page_of)
-    {
-        NATIVE_TARGETS
-            .lock()
-            .expect("native targets poisoned")
-            .insert(session.to_string(), p.target_id.clone());
-        return Ok(p);
+    match choice {
+        TargetChoice::KeepBound(tid) | TargetChoice::Rebind(tid) => {
+            if let Some(p) = tabs.iter().find(|t| tab_id(t).as_deref() == Some(tid.as_str())).and_then(page_of)
+            {
+                NATIVE_TARGETS
+                    .lock()
+                    .expect("native targets poisoned")
+                    .insert(session.to_string(), p.target_id.clone());
+                return Ok(p);
+            }
+            // Listed but missing a webSocketDebuggerUrl: fall through and open one.
+        }
+        TargetChoice::NewTab => {}
     }
     // Every page tab is claimed by another session (or none exist): open a
     // fresh one rather than hijacking a peer's tab.
@@ -1283,6 +1655,67 @@ pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<Dri
         .expect("native targets poisoned")
         .insert(session.to_string(), p.target_id.clone());
     Ok(p)
+}
+
+/// What `resolve_page_avoiding` should do, given only what Chrome listed and
+/// what this process has bound.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum TargetChoice {
+    /// Reuse the session's existing binding.
+    KeepBound(String),
+    /// Bind the session to this listed tab.
+    Rebind(String),
+    /// Nothing usable is listed; open a fresh tab.
+    NewTab,
+}
+
+/// The target-selection rule, separated from its side effects.
+///
+/// PURE ON PURPOSE (AMUX-3708). Every existing test of this area launches a
+/// real Chrome and is `#[ignore]`d, so it never runs in CI — a live-only test
+/// for this fix would be a check that cannot fail because it never executes,
+/// which is the exact shape ethos rule 7 is about. Extracting the decision is
+/// what makes the fix testable at all; unbinding, counting and opening tabs
+/// stay in the caller.
+///
+/// Returns the choice and whether the session's binding was found STALE, i.e.
+/// it names the target the caller has just proven unreachable.
+pub(crate) fn choose_target(
+    tabs: &[Value],
+    bound: Option<&str>,
+    claimed_by_others: &std::collections::HashSet<String>,
+    avoid: Option<&str>,
+) -> (TargetChoice, bool) {
+    let id_of = |t: &Value| t.get("id").and_then(Value::as_str).map(str::to_string);
+    let listed = |tid: &str| {
+        tabs.iter().any(|t| {
+            id_of(t).as_deref() == Some(tid) && t.get("webSocketDebuggerUrl").is_some()
+        })
+    };
+    let stale = bound.is_some() && bound == avoid;
+    if let Some(tid) = bound {
+        // A bound tab that is GONE from /json/list was already handled before
+        // this card: it falls through and rebinds. The case this adds is a tab
+        // still LISTED whose socket will not open, which /json/list reports
+        // identically to a healthy one — only the failing caller knows.
+        if !stale && listed(tid) {
+            return (TargetChoice::KeepBound(tid.to_string()), false);
+        }
+    }
+    let pick = tabs
+        .iter()
+        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
+        .filter(|t| id_of(t).is_some_and(|id| !claimed_by_others.contains(&id)))
+        // Never rebind to the target the caller just told us is unreachable.
+        // Dropping the binding makes it "unclaimed", so without this the rebind
+        // picks straight back up the tab we are abandoning.
+        .filter(|t| avoid.is_none() || id_of(t).as_deref() != avoid)
+        .find(|t| t.get("webSocketDebuggerUrl").is_some())
+        .and_then(id_of);
+    match pick {
+        Some(tid) => (TargetChoice::Rebind(tid), stale),
+        None => (TargetChoice::NewTab, stale),
+    }
 }
 
 /// Session bindings for GET /api/browser/sessions: (name, target, alive?).
@@ -1471,7 +1904,23 @@ const STATE_JS: &str = r#"
   return { url: location.href, title: document.title,
            viewport: { w: window.innerWidth, h: window.innerHeight },
            text: ((document.body && document.body.innerText) || '').slice(0, __TEXT_CAP__),
-           elements: els };
+           elements: els,
+           // NO SILENT CAPS (AMUX-3721). `seen` holds every visible match and is
+           // what click-by-index addresses; `els` is only what we render. When
+           // those differ the caller MUST be told, because the failure is
+           // invisible otherwise: you get a full-looking list, the element you
+           // want is not in it, and the only available conclusion is "it is not
+           // on the page" — which is wrong, and which is exactly what happened.
+           elements_total: seen.length,
+           elements_shown: els.length,
+           elements_truncated: seen.length > els.length,
+           elements_note: seen.length > els.length
+             ? ('showing ' + els.length + ' of ' + seen.length + ' visible elements. '
+                + 'The rest ARE addressable: click-by-index resolves against the full list, '
+                + 'so indices ' + els.length + '..' + (seen.length - 1) + ' work even though '
+                + 'they are not listed here. To find one, eval over window.__amux_els, or '
+                + 'click by CSS selector instead of index.')
+             : null };
 })()
 "#;
 
@@ -1727,6 +2176,34 @@ pub async fn navigate_and_settle(c: &mut CdpClient, url: &str) -> anyhow::Result
 /// response carries `path`). Zero decoded bytes is an ERROR — a 0-byte file
 /// reading as success is the lie ethos rule 7 exists for.
 pub async fn screenshot_to_file(c: &mut CdpClient, home: &Path, session: &str) -> anyhow::Result<(PathBuf, usize)> {
+    // ACTIVATE BEFORE CAPTURING (AMUX-3712).
+    //
+    // `Page.captureScreenshot` waits for the renderer to produce a frame, and a
+    // tab that is not the active surface does not composite. A backgrounded or
+    // occluded tab therefore does not FAIL, it BLOCKS, until the 30s deadline
+    // below turns into a 502. That is this card's entire signature: 30,003ms and
+    // 30,006ms, the deadline to the millisecond, twice, against a browser whose
+    // active surface was an omnibox popup rather than the page being captured.
+    //
+    // BEST EFFORT AND NON-FATAL, with a deadline of its own. If the renderer is
+    // genuinely wedged, bringToFront cannot fix it and must not become a second
+    // way for the same fault to be reported; if the tab was merely
+    // backgrounded, this is the whole fix. Proceeding on failure means it can
+    // only help.
+    //
+    // The WARN is the discriminator, and it is the thing that did not exist:
+    // "capture timed out" alone cannot separate a backgrounded tab from a dead
+    // one, and those want opposite responses. A timeout AFTER a successful
+    // bringToFront is a wedged renderer.
+    if let Err(e) =
+        c.call("Page.bringToFront", json!({}), std::time::Duration::from_secs(5)).await
+    {
+        tracing::warn!(
+            "[browser] Page.bringToFront failed for session {session:?} before capture: {e} — \
+             capturing anyway. If the capture now times out, the renderer is wedged rather than \
+             merely backgrounded (AMUX-3712)"
+        );
+    }
     let r = c
         .call(
             "Page.captureScreenshot",
@@ -1876,6 +2353,223 @@ mod tests {
     // All tests run against TEMP dirs only — never the live Chrome profiles
     // (repo rule: tests must not touch real profile contents), and never
     // launch Chrome except the #[ignore]d gated tests at the bottom.
+
+    /// AMUX-3708: a tab Chrome still LISTS can be unreachable, and only the
+    /// caller that failed to open its socket knows.
+    ///
+    /// THE SPECIMEN is a pair of 502s 40 seconds apart on 2026-08-25, filed as
+    /// one card because they share (status, method, family, target):
+    ///   11:12:41  30,006ms  "CDP Page.captureScreenshot timed out after 30s"
+    ///   11:13:21      24ms  "WebSocket protocol error: Connection reset
+    ///                        without closing handshake"
+    /// The first wedged the renderer. The second is its aftermath: the next
+    /// request resolved to the SAME target, because `/json/list` still reported
+    /// it and the pre-existing fall-through only triggers when a tab is GONE.
+    /// Recovery came at 11:13:25 solely because Chrome had by then removed the
+    /// target. Every request in that window 502s and nothing shortens it.
+    ///
+    /// FOUR CELLS, and the last two are the ones that keep this honest. Without
+    /// the no-avoid cell, dropping every binding unconditionally would pass. Without
+    /// the peer cell, avoiding a target by hijacking a peer's tab would pass.
+    #[test]
+    fn a_listed_but_unreachable_target_is_abandoned_and_not_picked_up_again() {
+        let tab = |id: &str| {
+            json!({"id": id, "type": "page", "webSocketDebuggerUrl": format!("ws://127.0.0.1:9/devtools/page/{id}"), "url": "about:blank", "title": ""})
+        };
+        let none = std::collections::HashSet::new();
+
+        // 1. The bound target is the one that just refused a socket. It must be
+        //    abandoned, reported stale, and NOT handed back.
+        let tabs = vec![tab("WEDGED"), tab("SPARE")];
+        let (choice, stale) = choose_target(&tabs, Some("WEDGED"), &none, Some("WEDGED"));
+        assert!(stale, "the binding names the unreachable target, so it is stale");
+        assert_eq!(
+            choice,
+            TargetChoice::Rebind("SPARE".into()),
+            "must rebind away from the wedged tab, not hand it back"
+        );
+
+        // 2. ...and the rebind must not pick it up again. Dropping the binding
+        //    makes WEDGED unclaimed, so a rebind that ignores `avoid` selects it
+        //    right back: this is the cell that fails if the second filter is lost.
+        let only_wedged = vec![tab("WEDGED")];
+        let (choice, stale) = choose_target(&only_wedged, Some("WEDGED"), &none, Some("WEDGED"));
+        assert!(stale);
+        assert_eq!(
+            choice,
+            TargetChoice::NewTab,
+            "with no other tab, open a fresh one rather than re-selecting the wedged target"
+        );
+
+        // 3. NO avoid: behaviour is unchanged, and the binding is not stale. A
+        //    fix that unbound on every call would satisfy 1 and 2 and break every
+        //    ordinary request.
+        let (choice, stale) = choose_target(&tabs, Some("WEDGED"), &none, None);
+        assert!(!stale, "an ordinary resolve must never report a stale binding");
+        assert_eq!(
+            choice,
+            TargetChoice::KeepBound("WEDGED".into()),
+            "without a failed socket there is nothing to avoid: keep the binding"
+        );
+
+        // 4. Avoiding a target must not reach into a PEER's tab. AC-336 is the
+        //    card that says one lane never adopts another's; a recovery path that
+        //    forgets it would be a regression wearing a fix's clothes.
+        let claimed: std::collections::HashSet<String> = ["SPARE".to_string()].into_iter().collect();
+        let (choice, _) = choose_target(&tabs, Some("WEDGED"), &claimed, Some("WEDGED"));
+        assert_eq!(
+            choice,
+            TargetChoice::NewTab,
+            "SPARE belongs to another lane — open a new tab instead of hijacking it"
+        );
+    }
+
+    /// AMUX-3689: an ANSWERED poll and a SILENT one must not read the same.
+    ///
+    /// THE SPECIMEN, and it is why this is a test rather than a comment: on
+    /// 2026-08-24 `primer` got six `POST /api/browser/start` 502s at ~30.3s each
+    /// saying "CDP on port 60005 never answered within 30s", with
+    /// `DevTools listening on ws://127.0.0.1:60005/devtools/browser/e9edcb66-...`
+    /// in the stderr embedded in the same message. Chrome had answered on that
+    /// port about three seconds in. The message was not vague, it was wrong, and
+    /// it sends an investigator to Chrome's startup instead of to the poll.
+    ///
+    /// The connect case is a REAL error object, produced by dialling a port
+    /// nothing listens on, rather than a hand-built stand-in: `reqwest::Error`
+    /// has no public constructor, and a stand-in would be testing my model of
+    /// `is_connect()` rather than `is_connect()`.
+    #[tokio::test]
+    async fn an_answered_cdp_poll_never_reads_as_silence() {
+        let answered: Result<reqwest::Response, reqwest::Error> =
+            Ok(axum::http::Response::builder().status(403).body("").unwrap().into());
+        let d = describe_cdp_probe(&answered, "http://127.0.0.1:60005");
+        assert!(d.contains("403"), "the STATUS is the whole discriminator: {d}");
+        assert!(
+            !d.to_lowercase().contains("never answered")
+                && !d.to_lowercase().contains("refused"),
+            "a 403 is Chrome answering — calling it silence is the AMUX-3689 defect: {d}"
+        );
+
+        // Port 1 on loopback: privileged, unbound, refuses immediately.
+        let refused = reqwest::Client::new()
+            .get("http://127.0.0.1:1/json/version")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await;
+        assert!(refused.is_err(), "premise: nothing may be listening on 127.0.0.1:1");
+        let d = describe_cdp_probe(&refused, "http://127.0.0.1:1");
+        assert!(
+            d.contains("refused") || d.contains("connection"),
+            "a genuinely silent port must say so, or the two cells above collapse: {d}"
+        );
+    }
+
+    /// AMUX-3689: a retry must not destroy the previous failure's stderr.
+    ///
+    /// `start()` opens the stderr path with `File::create`, which truncates, and
+    /// a failing caller always retries. `primer` failed six times and five of the
+    /// six stderr files were overwritten before anyone looked, leaving a 600-char
+    /// tail as the whole record. The artifact you need most when a failure
+    /// REPEATS was being deleted by the fact that it repeated.
+    #[test]
+    fn a_failed_launch_keeps_its_stderr_and_the_pile_stays_bounded() {
+        let dir = std::env::temp_dir().join(format!("amux-stderr-keep-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let live = dir.join("amux-chrome-launch.stderr");
+
+        std::fs::write(&live, "first failure\nDevTools listening on ws://127.0.0.1:1/x\n").unwrap();
+        let note = preserve_failed_stderr(&live);
+        assert!(note.contains("failed-"), "the message must NAME the kept file: {note:?}");
+        let kept: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.starts_with("amux-chrome-launch.failed-"))
+            .collect();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let body = std::fs::read_to_string(dir.join(&kept[0])).unwrap();
+        assert!(body.contains("DevTools listening"), "the COPY must hold the evidence: {body:?}");
+
+        // Simulate the retry that used to erase it: truncate the live file and
+        // preserve again. The first failure's copy must survive.
+        std::fs::write(&live, "second failure\n").unwrap();
+        preserve_failed_stderr(&live);
+        assert!(
+            std::fs::read_to_string(dir.join(&kept[0])).unwrap().contains("DevTools listening"),
+            "the retry erased the first failure's evidence, which is the whole bug"
+        );
+
+        // BOUNDED: a profile that fails all day must not fill the disk with its
+        // own evidence. Written directly rather than by repeated calls so the
+        // prune is tested on a known set rather than on however many distinct
+        // millisecond stamps the loop happened to produce.
+        for i in 0..9 {
+            std::fs::write(dir.join(format!("amux-chrome-launch.failed-{:010}.stderr", i)), "x")
+                .unwrap();
+        }
+        std::fs::write(&live, "another\n").unwrap();
+        preserve_failed_stderr(&live);
+        let n = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| {
+                e.file_name().to_string_lossy().starts_with("amux-chrome-launch.failed-")
+            })
+            .count();
+        assert_eq!(n, 5, "the pile must be pruned to the newest 5, found {n}");
+
+        // A MISSING file must be silent, not a panic: a launch may fail before
+        // the stderr file is ever created, and a browser start must never fail
+        // because its diagnostic copy failed.
+        assert_eq!(preserve_failed_stderr(&dir.join("nope.stderr")), "");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// AMUX-3674, from Ethan's report and the live `ps` output that explained
+    /// it. Five Chromes were sharing one `--user-data-dir`, which is
+    /// single-instance in Chrome, so all but the lock holder showed
+    /// "Something went wrong when opening your profile."
+    ///
+    /// The dangerous half is the CONTROL, and it caught a bug in the first
+    /// draft of this function before it shipped: `playwright-auth/profile` is a
+    /// PREFIX of `playwright-auth/profiles/netsuite`, so a `contains` test on
+    /// the flag matched 9 processes on the live machine including the netsuite
+    /// browser holding a staged login. Cleaning the DEFAULT profile would have
+    /// killed every NAMED profile's browser.
+    #[test]
+    fn stray_cotenants_match_the_dir_exactly_and_never_a_longer_one() {
+        // Verbatim shape of `ps -ax -o pid=,command=` on this machine.
+        let ps = "\
+29637 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=58242 --user-data-dir=/h/.amux/playwright-auth/profile --no-first-run
+35866 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=63713 --user-data-dir=/h/.amux/playwright-auth/profile --no-first-run
+35459 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome --remote-debugging-port=59100 --user-data-dir=/h/.amux/playwright-auth/profiles/netsuite --no-first-run
+40001 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome Helper --type=renderer --user-data-dir=/h/.amux/playwright-auth/profile
+  871 /Library/PrivilegedHelperTools/ChromeRemoteDesktopHost.app/Contents/MacOS/remoting_agent_process_broker";
+
+        let default_dir = pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profile");
+        assert_eq!(
+            default_dir,
+            vec![29637, 35866],
+            "the default profile's co-tenants, and NOT profiles/netsuite: {default_dir:?}"
+        );
+        assert!(
+            !default_dir.contains(&35459),
+            "a longer path that merely STARTS with this one is a different profile — killing \
+             it would take out another session's staged login"
+        );
+        assert!(!default_dir.contains(&40001), "helper processes die with their parent");
+        assert!(!default_dir.contains(&871), "unrelated processes are not candidates");
+
+        // The named profile finds only its own, which is the same rule read
+        // from the other side.
+        assert_eq!(
+            pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profiles/netsuite"),
+            vec![35459]
+        );
+
+        // A dir nobody is on is empty, not everything.
+        assert!(pids_on_dir(ps, "--user-data-dir=/h/.amux/playwright-auth/profiles/nope").is_empty());
+    }
 
     /// EVERY live-Chrome test must hold this for its whole body.
     ///
@@ -2052,6 +2746,89 @@ mod tests {
         assert!(err.to_string().contains("boom"), "{err}");
     }
 
+    /// AMUX-3712: the capture activates the tab first, and a failure to activate
+    /// does not abort the capture.
+    ///
+    /// THE SPECIMEN: `GET /api/browser/screenshot` returned 502 with "CDP
+    /// Page.captureScreenshot timed out after 30s" at 11:12:41 and again at
+    /// 12:06:17 on 2026-08-25, at 30,006ms and 30,003ms. The deadline to the
+    /// millisecond, twice, is not a slow capture — it is a capture that never
+    /// returns. `Page.captureScreenshot` waits on a compositor frame, and the
+    /// browser in question had its active surface on an omnibox popup, so the
+    /// page being captured was not compositing at all.
+    ///
+    /// BOTH CELLS MATTER. The order cell is the fix. The tolerate-failure cell
+    /// is what stops the fix becoming a second way for a wedged renderer to
+    /// fail: bringToFront cannot revive a dead renderer, so if it errors the
+    /// capture must still be attempted rather than short-circuiting into a
+    /// different error message for the same fault.
+    #[tokio::test]
+    async fn a_capture_activates_the_tab_first_and_survives_a_failed_activation() {
+        use std::sync::{Arc, Mutex};
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        // 1x1 transparent PNG, so the capture path writes real bytes.
+        const PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+
+        // `fail_front` drives the second cell: the fake refuses bringToFront.
+        let serve = |fail_front: bool, seen: Arc<Mutex<Vec<String>>>| async move {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                use tokio_tungstenite::tungstenite::Message;
+                while let Some(Ok(msg)) = ws.next().await {
+                    if let Message::Text(t) = msg {
+                        let v: Value = serde_json::from_str(&t).unwrap();
+                        let id = v["id"].as_u64().unwrap();
+                        let method = v["method"].as_str().unwrap_or("").to_string();
+                        seen.lock().unwrap().push(method.clone());
+                        let resp = match method.as_str() {
+                            "Page.bringToFront" if fail_front => {
+                                json!({"id": id, "error": {"message": "not attached to an active page"}})
+                            }
+                            "Page.captureScreenshot" => json!({"id": id, "result": {"data": PNG_B64}}),
+                            _ => json!({"id": id, "result": {}}),
+                        };
+                        ws.send(Message::Text(resp.to_string())).await.unwrap();
+                    }
+                }
+            });
+            addr
+        };
+
+        let home = fake_home();
+
+        // CELL 1 — the order. bringToFront must precede the capture, or a
+        // backgrounded tab blocks for 30s instead of being made visible.
+        let addr = serve(false, seen.clone()).await;
+        let mut c = CdpClient::connect(&format!("ws://{addr}")).await.unwrap();
+        let (path, size) = screenshot_to_file(&mut c, home.path(), "cell1").await.expect("capture");
+        assert!(size > 0 && path.exists(), "the capture wrote real bytes");
+        let calls = seen.lock().unwrap().clone();
+        let front = calls.iter().position(|m| m == "Page.bringToFront");
+        let shot = calls.iter().position(|m| m == "Page.captureScreenshot");
+        assert!(front.is_some(), "the tab must be activated before capturing: {calls:?}");
+        assert!(front < shot, "activation must come FIRST, not after: {calls:?}");
+
+        // CELL 2 — a refused activation must not abort the capture. Without
+        // this, a wedged renderer would report "not attached to an active page"
+        // instead of the timeout that actually describes it, and the fix would
+        // have added a failure mode rather than removed one.
+        let seen2: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let addr2 = serve(true, seen2.clone()).await;
+        let mut c2 = CdpClient::connect(&format!("ws://{addr2}")).await.unwrap();
+        let (_, size2) = screenshot_to_file(&mut c2, home.path(), "cell2")
+            .await
+            .expect("a refused bringToFront must not fail the capture");
+        assert!(size2 > 0);
+        assert!(
+            seen2.lock().unwrap().iter().any(|m| m == "Page.captureScreenshot"),
+            "the capture must still be attempted after a failed activation: {:?}",
+            seen2.lock().unwrap()
+        );
+    }
+
     /// The server-machine invariant, hermetically: a CDP endpoint that is
     /// not loopback is refused BEFORE any connection attempt — automation
     /// can only ever reach the Chrome this server launched.
@@ -2123,6 +2900,29 @@ mod tests {
         let js = state_js();
         assert!(!js.contains("__EL_LIMIT__") && !js.contains("__TEXT_CAP__"));
         assert!(js.contains("window.__amux_els"));
+        // THE CAP MUST DISCLOSE ITSELF (AMUX-3721). The state surface renders
+        // STATE_EL_LIMIT elements out of however many are visible, and it used
+        // to say nothing about the difference — so a caller got a full-looking
+        // list of exactly 120, could not find the element it wanted, and had
+        // only one available conclusion: "it is not on the page". Measured live
+        // on the amux dashboard: 158 visible, 120 returned, and the two elements
+        // being looked for sat at indices 155 and 156 — addressable the whole
+        // time, since click-by-index resolves against `seen`, not `els`.
+        //
+        // SCOPE, honestly: this asserts the disclosure is EMITTED, not that its
+        // arithmetic is right — the arithmetic runs in a browser, and no
+        // assertion in this process can execute it. It is a
+        // deletion/regression guard. The arithmetic was verified against the
+        // live dashboard instead, which is the only place it can be.
+        for f in [
+            "elements_total",
+            "elements_shown",
+            "elements_truncated",
+            "elements_note",
+            "seen.length > els.length",
+        ] {
+            assert!(js.contains(f), "state JS must disclose its cap, missing {f}: {js}");
+        }
         // Selector JSON-encodes through format!: quotes must survive.
         let js = selector_click_js("a[href=\"x\"]");
         assert!(js.contains("querySelector(\"a[href=\\\"x\\\"]\")"), "{js}");
@@ -2300,6 +3100,70 @@ mod tests {
         }
         let report = stop(home.path()).await;
         assert!(report.stopped);
+    }
+}
+
+#[cfg(test)]
+mod launch_args_tests {
+    use super::*;
+
+    fn owned_target() -> LaunchTarget {
+        LaunchTarget {
+            user_data_dir: PathBuf::from("/tmp/amux-launch-args-test/profile"),
+            profile_directory: None,
+        }
+    }
+
+    fn is_bad(arg: &str) -> bool {
+        CHROME_BAD_FLAGS.iter().any(|b| arg == *b || arg.starts_with(&format!("{b}=")))
+    }
+
+    /// MR-38: a kBadFlags entry without --test-type is the "unsupported
+    /// command-line flag" infobar on every window. The CONTROL assertion comes
+    /// first: if the pin is not actually in the list, the invariant is vacuous
+    /// and this test pins nothing (ethos rule 7 — say what a positive looks
+    /// like before believing the negative).
+    #[test]
+    fn bad_flags_never_launch_without_test_type() {
+        let args = chrome_launch_args(1234, &owned_target(), false, Some("PIN="), "");
+        let bad: Vec<&String> = args.iter().filter(|a| is_bad(a)).collect();
+        assert_eq!(bad.len(), 1, "control: the SPKI pin must be in the list: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "--test-type"),
+            "a kBadFlags entry is passed without --test-type — Chrome will show the \
+             unsupported-flag infobar (chrome/browser/ui/startup/infobar_utils.cc): {args:?}"
+        );
+        // --enable-automation would suppress the same bar but add its own
+        // "controlled by automated test software" bar; it must not creep in.
+        assert!(!args.iter().any(|a| a == "--enable-automation"), "{args:?}");
+    }
+
+    /// An unreadable cert means NO pin — never a blanket bypass in its place.
+    #[test]
+    fn no_pin_means_no_bad_flag_at_all() {
+        let args = chrome_launch_args(1234, &owned_target(), false, None, "");
+        assert!(!args.iter().any(|a| is_bad(a)), "{args:?}");
+    }
+
+    /// Shape Chrome depends on: the URL is the LAST positional, headless is
+    /// `new`, a Chrome-dir profile gets --profile-directory, and the debug port
+    /// and user-data-dir are the exact values the caller resolved.
+    #[test]
+    fn shape_is_what_chrome_expects() {
+        let t = LaunchTarget {
+            user_data_dir: PathBuf::from("/Users/x/Library/Application Support/Google/Chrome"),
+            profile_directory: Some("Profile 11".into()),
+        };
+        let args = chrome_launch_args(4321, &t, true, Some("PIN="), "  https://example.com/  ");
+        assert_eq!(args[0], "--remote-debugging-port=4321");
+        assert_eq!(args[1], "--user-data-dir=/Users/x/Library/Application Support/Google/Chrome");
+        assert!(args.contains(&"--headless=new".to_string()), "{args:?}");
+        assert!(args.contains(&"--profile-directory=Profile 11".to_string()), "{args:?}");
+        assert_eq!(args.last().map(String::as_str), Some("https://example.com/"), "url is trimmed and last");
+        // An empty url adds no positional at all (Chrome would open a blank
+        // window for "" — and the last arg must then be a flag).
+        let none = chrome_launch_args(4321, &t, false, None, "   ");
+        assert!(none.last().unwrap().starts_with("--"), "{none:?}");
     }
 }
 

@@ -153,6 +153,37 @@ jobs:
       - name: runtime smoke -- board status-update refuses flag-shaped prose (MHC-377 data loss)
         run: bash scripts/test-cli-status-update-flags.sh
 
+      # AF-195. The guard refuses a commit whose staged bytes are not the bytes
+      # on disk, and must NOT refuse `git commit -a` or `git commit -- <path>`,
+      # which resolve through a temporary index built FROM the working tree.
+      # That second half is a claim about git's behaviour rather than about our
+      # code, so it needs a real repo and a real `git commit` — reading the hook
+      # cannot settle it, and getting it wrong makes the guard fire on every
+      # ordinary commit, which is how a guard becomes a thing people bypass.
+      - name: runtime smoke -- staged-guard refuses an index that is not the worktree (AF-195)
+        run: bash scripts/test-index-worktree-divergence.sh
+
+      # AMUX-3667. CI has no `.cargo/config.toml` (install.sh writes it and it
+      # is gitignored), so this SKIPS here and exits 0. That is deliberate and
+      # it is not theatre: the half CI can genuinely break is the CONTROL —
+      # this job sets CARGO_TARGET_DIR itself, serve-head.sh exports its own
+      # (AMUX-2961), and a future change that let `build.target-dir` win over
+      # the env would move both silently. The script asserts that precedence
+      # empirically, so when a config IS present the control runs; keeping the
+      # step wired means the day someone commits a config, or CI starts running
+      # install.sh, the assertion is already here rather than remembered.
+      - name: runtime smoke -- a bare cargo does not build into the checkout (AMUX-3667)
+        run: bash scripts/test-cargo-target-dir-pinned.sh
+
+      # AMUX-3682. Two runtime hooks ran uncommitted for four days each because
+      # install.sh copied the WORKTREE while its own comments claimed the
+      # committed copy was authoritative. CI is the right home for this: the
+      # dirty-worktree cell builds its own throwaway repo, so it needs no
+      # fixture from this checkout and cannot pass for the wrong reason on a
+      # clean CI tree.
+      - name: runtime smoke -- hooks install from HEAD, not the worktree (AMUX-3682)
+        run: bash scripts/test-hook-install-from-head.sh
+
   e2e:
     # PR Full Gate tier (plan §CI tiers): the golden scenarios in a real
     # browser against the real server + real extracted dashboard.

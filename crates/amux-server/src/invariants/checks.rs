@@ -54,7 +54,7 @@ const GATEWAY_OWNED: &[&str] =
 /// near-misses and not just the hits: an exclusion list that swallows a sibling
 /// hides exactly the work it was meant to make visible (ethos rule 1's
 /// over-filtering corollary).
-fn gateway_owned(path: &str) -> bool {
+pub(crate) fn gateway_owned(path: &str) -> bool {
     GATEWAY_OWNED.iter().any(|p| {
         if let Some(prefix) = p.strip_suffix('/') {
             path == prefix || path.starts_with(p)
@@ -590,6 +590,55 @@ pub fn timestamp_units_are_what_readers_assume(
         );
     }
     out
+}
+
+/// A request cannot arrive before the process that served it booted (AMUX-3647).
+///
+/// This is the assumption the latency detectors now rest on, and it was being
+/// ASSERTED rather than checked. `spans_own_restart` used to subtract a latency
+/// from `ts` and call the result an arrival, which is a moment before the
+/// request existed; the fix compares `ts < boot_at` instead, and that comparison
+/// is only correct because migrations run inside `Store::open`, `record_boot`
+/// stamps the boot straight after, and the listener binds several hundred lines
+/// later. Measured at the time: 0 of 97,019 rows violate it.
+///
+/// The whole point of the check is that the structural argument could stop being
+/// true without anybody noticing. Socket activation, an inherited listener, a
+/// `record_boot` moved after the bind: each would make `since_boot_s` go
+/// negative and each would look like nothing at all. A failing row here is not
+/// cosmetic, it means the exclusion branch this repo believes is unreachable has
+/// started firing.
+///
+/// UNKNOWN when no row carries a `boot_at`, because "the invariant holds" and
+/// "the column was never populated" are different facts and a pass would say the
+/// wrong one. That is the AMUX-3575 rule: a check that cannot run says so.
+pub fn request_arrival_follows_boot(
+    rows_with_boot: i64,
+    arrivals_before_boot: i64,
+    window_h: f64,
+) -> Vec<InvariantResult> {
+    const ID: &str = "reqlog.arrival_follows_boot";
+    if rows_with_boot == 0 {
+        return vec![InvariantResult::unknown(
+            ID,
+            format!("no request_log row in the last {window_h:.0}h carries a boot_at"),
+        )];
+    }
+    if arrivals_before_boot == 0 {
+        return vec![InvariantResult::pass(ID)];
+    }
+    vec![InvariantResult::fail(
+        ID,
+        format!("0 of {rows_with_boot} rows with ts < boot_at"),
+        format!(
+            "{arrivals_before_boot} request(s) in the last {window_h:.0}h are stamped BEFORE the \
+             boot of the process that served them. `ts` is the request START, so this cannot \
+             happen while the listener binds after record_boot — something moved. The latency \
+             detectors' restart exclusion (autofix::spans_own_restart) is now live rather than \
+             structurally false, and /api/logs/stats will report negative since_boot_s. Recheck: \
+             SELECT COUNT(*) FROM _amux_request_log WHERE boot_at IS NOT NULL AND ts < boot_at;"
+        ),
+    )]
 }
 
 pub fn config_env_reaches_process(env_file: &str, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<InvariantResult> {
@@ -1432,7 +1481,11 @@ pub fn host_memory_not_critical(
 /// the filename, so each panic is exactly one incident (the store's dedupe)
 /// and each HEALS when its file ages past the dwell window — stale files get
 /// an explicit entity-keyed pass, which is what resolves the incident row.
-pub fn no_fresh_kernel_panic(panics: &[(String, f64)], window_s: f64) -> Vec<InvariantResult> {
+pub fn no_fresh_kernel_panic(
+    panics: &[(String, f64)],
+    window_s: f64,
+    now: f64,
+) -> Vec<InvariantResult> {
     const ID: &str = "host.no_fresh_kernel_panic";
     if panics.is_empty() {
         return vec![InvariantResult::pass(ID)];
@@ -1456,6 +1509,18 @@ pub fn no_fresh_kernel_panic(panics: &[(String, f64)], window_s: f64) -> Vec<Inv
                 )
                 .entity(name.as_str())
                 .evidence(json!({"file": name, "age_h": age_s / 3600.0}))
+                // The dwell is the point, so SAY when it ends (AMUX-3645).
+                // Without this the auto-filed card reads "failing across N
+                // evaluations and has not self-healed", which is true and
+                // reads as an escalating fault; the honest reading is "held
+                // red on purpose until <date>, no action accelerates it".
+                // `now` is a PARAMETER, not a clock read in here. The ages in
+                // `panics` were measured against the caller's clock, and a
+                // second time source would disagree with them by however long
+                // the directory scan took. It also keeps this a pure function,
+                // so the cell below can assert an exact epoch rather than a
+                // tolerance around whatever the test machine's clock said.
+                .heals_at(now - age_s + window_s)
             } else {
                 InvariantResult::pass(ID).entity(name.as_str())
             }
@@ -1995,6 +2060,11 @@ pub struct LedgerRow {
     pub session: String,
     pub title: String,
     pub card_status: Option<String>,
+    /// Whether the card is ARCHIVED (AF-246). Carried separately from
+    /// `card_status` because an archived card still HAS a status, so the two
+    /// are independent axes and folding them loses the alarming one: `done` is
+    /// reachable, archived is not.
+    pub card_archived: bool,
 }
 
 /// `frustrations.md` is a fixed-field file precisely so it can be counted; this
@@ -2120,9 +2190,41 @@ pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) ->
     let closed = |s: &str| CLOSED_CARD_STATUSES.contains(&s);
     let mut stale_open: Vec<&LedgerRow> = Vec::new();
     let mut premature_fixed: Vec<&LedgerRow> = Vec::new();
+    let mut archived_open: Vec<&LedgerRow> = Vec::new();
     for r in rows {
         let Some(cs) = r.card_status.as_deref() else { continue };
-        if r.file_status == "open" && closed(cs) {
+        // ARCHIVED IS ITS OWN STATE, AND IT IS CHECKED FIRST (AF-246, found on
+        // the 2026-08-26 drain when AC-354 was validated as STILL LIVE and
+        // `amux board status AC-354 todo` answered
+        // `{"error":"task is archived; restore it first"}`).
+        //
+        // This check compared STATUS only, and status is the wrong axis. An
+        // archived card is invisible to auto-pickup, rot detection and the
+        // verify queue simultaneously — every one of them additionally requires
+        // `COALESCE(archived,0)=0` — while still carrying a status this check
+        // happily compares. Two ways that went wrong, and the second is why
+        // this is a precedence change rather than a new bucket:
+        //
+        //   archived + `done`  -> landed in `stale_open`, indistinguishable
+        //                         from an ordinary done-over-open row, so the
+        //                         prescribed remedy ("route it to its session
+        //                         to reopen") hits a refusal this check never
+        //                         predicted.
+        //   archived + `todo`  -> landed NOWHERE. The pair read as AGREEING and
+        //                         the entry looked healthy while nothing could
+        //                         ever pick the card up. A view that is silent
+        //                         about unreachable work is worse than no view,
+        //                         because it is trusted and it is read first.
+        //
+        // THE PREDICATE IS COPIED FROM THE MECHANISM, not re-derived, which is
+        // rule 1's own caution about this exact trap: `archived` here is the
+        // same `COALESCE(archived,0)=0` that board_drive.rs's pickup queries
+        // apply. `owner_type='agent'` is deliberately NOT included — that is
+        // auto-pickup's additional narrowing, and a human-owned card is still
+        // reachable by a human. Unreachable means unreachable BY ANYONE.
+        if r.file_status == "open" && r.card_archived {
+            archived_open.push(r);
+        } else if r.file_status == "open" && closed(cs) {
             stale_open.push(r);
         } else if r.file_status != "open" && !r.file_status.is_empty() && !closed(cs) {
             premature_fixed.push(r);
@@ -2136,7 +2238,7 @@ pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) ->
             })
             .collect::<Vec<_>>()
     };
-    if stale_open.is_empty() && premature_fixed.is_empty() {
+    if stale_open.is_empty() && premature_fixed.is_empty() && archived_open.is_empty() {
         return vec![InvariantResult::pass(ID)
             .evidence(json!({"entries": rows.len(), "source": source}))];
     }
@@ -2156,20 +2258,51 @@ pub fn frustration_ledger_agrees_with_board(rows: &[LedgerRow], source: &str) ->
              hit the friction, and a card reading `done` is not proof the friction is gone \
              (AC-227's card was `done` and only its documentation half had shipped). Route each \
              row to its SESSION for sign-off. Ledger read from: {}.",
-            stale_open.len() + premature_fixed.len(),
+            stale_open.len() + premature_fixed.len() + archived_open.len(),
             stale_open.len(),
             ex(&stale_open),
             premature_fixed.len(),
             ex(&premature_fixed),
             source,
-        ),
+        ) + &archived_sentence(&archived_open, &ex),
     )
     .evidence(json!({
         "entries": rows.len(),
         "source": source,
         "stale_open": ev(&stale_open),
         "premature_fixed": ev(&premature_fixed),
+        "archived_open": ev(&archived_open),
+        "archived_open_note": "the card is ARCHIVED, so it is invisible to auto-pickup, rot \
+                               detection and the verify queue at once. `amux board status <id> \
+                               todo` REFUSES with archived_task_immutable — restore it first.",
     }))]
+}
+
+/// The archived clause, appended only when there is one (AF-246).
+///
+/// Separate from the sentence above rather than interpolated into it, because a
+/// zero-count clause reading "0 sit behind an ARCHIVED card ()" is noise on
+/// every ordinary failure, and this check already fails routinely for the two
+/// status classes. It says the REMEDY differs, since that is the part the
+/// prescribed one gets wrong: routing an archived card to its session produces
+/// a refusal, not a reopen.
+fn archived_sentence(
+    archived_open: &[&LedgerRow],
+    ex: &impl Fn(&[&LedgerRow]) -> String,
+) -> String {
+    if archived_open.is_empty() {
+        return String::new();
+    }
+    format!(
+        " SEPARATELY, {} open entry/entries sit behind an ARCHIVED card ({}) — a different and \
+         worse fact than a closed one. Archived hides a card from auto-pickup, rot detection AND \
+         the verify queue at the same time, so the friction is live and no loop can reach it. \
+         Do NOT route these to a session to reopen: `amux board status <id> todo` answers \
+         `archived_task_immutable`. RESTORE the card first, then decide its status with its \
+         author.",
+        archived_open.len(),
+        ex(archived_open),
+    )
 }
 
 /// The `AF-191` in `AF-191-1` is not a card id; the prefix is everything before
@@ -2321,7 +2454,18 @@ mod negative_controls {
             session: "amux-cloud".into(),
             title: "t".into(),
             card_status: card_status.map(str::to_string),
+            card_archived: false,
         }
+    }
+
+    /// Same row, ARCHIVED (AF-246).
+    fn lrow_archived(
+        line: usize,
+        card: &str,
+        file_status: &str,
+        card_status: Option<&str>,
+    ) -> LedgerRow {
+        LedgerRow { card_archived: true, ..lrow(line, card, file_status, card_status) }
     }
 
     /// AF-191 rebuilt from the sweep's own artifact: an entry reading
@@ -2370,6 +2514,89 @@ mod negative_controls {
             Status::Pass,
             "an absent card is cards_are_reachable's finding, not a status disagreement"
         );
+    }
+
+    /// AF-246: an ARCHIVED card behind a live entry is its own state.
+    ///
+    /// Rebuilt from the incident's own artifact rather than a convenient case.
+    /// AC-354 was validated as STILL LIVE on the 2026-08-26 drain and
+    /// `amux board status AC-354 todo` answered `archived_task_immutable`.
+    ///
+    /// THE `todo` CELL IS THE LOAD-BEARING ONE and it is why this had to change
+    /// the existing check rather than sit beside it: an archived card whose
+    /// status reads `todo` matches NEITHER status class, so before this the
+    /// pair read as AGREEING — a green row over work no loop can reach. A
+    /// sibling invariant would have left that green exactly where a reader
+    /// looks first.
+    #[test]
+    fn an_archived_card_behind_a_live_entry_is_reported_as_its_own_state() {
+        // THE NASTY CELL: archived + `todo`. Agrees on status, unreachable in
+        // fact. This is the one that was silently green.
+        let todo_archived = vec![lrow_archived(100, "AC-354", "open", Some("todo"))];
+        let r = frustration_ledger_agrees_with_board(&todo_archived, "worktree");
+        assert_eq!(
+            r[0].status,
+            Status::Fail,
+            "archived+todo agrees on STATUS and is unreachable in fact; it must not read green"
+        );
+        assert!(
+            r[0].observed.contains("ARCHIVED"),
+            "the message must name the state, not fold it into a status disagreement: {}",
+            r[0].observed
+        );
+        assert!(
+            r[0].observed.contains("archived_task_immutable"),
+            "it must say the prescribed remedy REFUSES, or a reader routes it to a session and \
+             gets an error the check never predicted: {}",
+            r[0].observed
+        );
+        assert_eq!(r[0].evidence["archived_open"].as_array().map(Vec::len), Some(1));
+
+        // Archived + a CLOSED status used to land in `stale_open`, where it is
+        // indistinguishable from an ordinary done-over-open row. Archived wins.
+        let done_archived = vec![lrow_archived(101, "AC-355", "open", Some("done"))];
+        let r2 = frustration_ledger_agrees_with_board(&done_archived, "worktree");
+        assert_eq!(r2[0].status, Status::Fail);
+        assert_eq!(
+            r2[0].evidence["stale_open"].as_array().map(Vec::len),
+            Some(0),
+            "an archived card must NOT be filed as an ordinary stale_open row — the remedies differ"
+        );
+        assert_eq!(r2[0].evidence["archived_open"].as_array().map(Vec::len), Some(1));
+
+        // NEGATIVE CONTROL 1 — an archived card behind a CLOSED entry is fine.
+        // The work is done and the card is put away; flagging it would make this
+        // fire on every properly-retired entry, which is the "threshold below
+        // the baseline" failure (a check that fires constantly stops being read).
+        let done_over_archived = vec![lrow_archived(102, "AC-356", "fixed", Some("done"))];
+        assert_eq!(
+            frustration_ledger_agrees_with_board(&done_over_archived, "worktree")[0].status,
+            Status::Pass,
+            "retiring an entry and archiving its card is the NORMAL end state"
+        );
+
+        // NEGATIVE CONTROL 2 — the same rows UNARCHIVED must behave exactly as
+        // before, or this fix has quietly widened the check. Without this cell,
+        // a build that flagged every open entry would pass everything above.
+        let live_todo = vec![lrow(100, "AC-354", "open", Some("todo"))];
+        assert_eq!(
+            frustration_ledger_agrees_with_board(&live_todo, "worktree")[0].status,
+            Status::Pass,
+            "open entry over a live todo card is agreement; archived is what changed"
+        );
+        let live_done = vec![lrow(101, "AC-355", "open", Some("done"))];
+        let r3 = frustration_ledger_agrees_with_board(&live_done, "worktree");
+        assert_eq!(r3[0].status, Status::Fail);
+        assert_eq!(
+            r3[0].evidence["stale_open"].as_array().map(Vec::len),
+            Some(1),
+            "a LIVE done card behind an open entry is still an ordinary stale_open row"
+        );
+
+        // The archived clause must be ABSENT when there is nothing archived, or
+        // every ordinary failure carries a "0 sit behind an ARCHIVED card ()"
+        // clause and the signal is diluted on the rows that fire most often.
+        assert!(!r3[0].observed.contains("ARCHIVED"), "{}", r3[0].observed);
     }
 
     /// AF-191, in the shape amux's hand classification produced: an id whose
@@ -3593,20 +3820,42 @@ mod negative_controls {
             2.7 * 86400.0,
         )];
 
-        let fresh = no_fresh_kernel_panic(&specimen, 7.0 * 86400.0);
+        // A FIXED clock, so the heal epoch below is an exact equality rather
+        // than a tolerance around whatever the test machine's clock said.
+        const NOW: f64 = 1_787_500_000.0;
+
+        let fresh = no_fresh_kernel_panic(&specimen, 7.0 * 86400.0, NOW);
         assert_eq!(fresh[0].status, Status::Fail, "{:?}", fresh[0]);
         assert_eq!(fresh[0].entity_key, "panic-base+socd-2026-08-19-210001.panic");
         assert!(fresh[0].observed.contains("AMUX-3396"), "{:?}", fresh[0].observed);
 
+        // AMUX-3645: the dwell is DECLARED, so a consumer can tell "held red on
+        // purpose until Tuesday" from "a fault that is getting worse". The
+        // artifact is 2.7d old inside a 7d window, so it ages out 4.3d from now.
+        let declared = crate::invariants::heals_at_of(&fresh[0].evidence)
+            .expect("a dwell-window failure must declare when it heals");
+        assert!(
+            (declared - (NOW + 4.3 * 86400.0)).abs() < 1.0,
+            "heal epoch is now - age + window: got {declared}, want {}",
+            NOW + 4.3 * 86400.0
+        );
+        // It must survive ALONGSIDE the diagnostic evidence, not replace it —
+        // trading the causal slice for the label would be the worse bargain.
+        assert_eq!(fresh[0].evidence["file"], "panic-base+socd-2026-08-19-210001.panic");
+
         // Past the window the SAME entity gets an explicit pass — that is
         // what resolves the incident row; a bare pass would leave it open
         // forever (the store resolves on matching (invariant, entity)).
-        let aged = no_fresh_kernel_panic(&specimen, 2.0 * 86400.0);
+        let aged = no_fresh_kernel_panic(&specimen, 2.0 * 86400.0, NOW);
         assert_eq!(aged[0].status, Status::Pass);
         assert_eq!(aged[0].entity_key, "panic-base+socd-2026-08-19-210001.panic");
+        // A PASS declares nothing: `heals_at` is a property of a live dwell,
+        // and leaving it on the healed result would park a card for a
+        // condition that is already gone.
+        assert_eq!(crate::invariants::heals_at_of(&aged[0].evidence), None, "{:?}", aged[0]);
 
         // No artifacts at all: a bare pass so the check reads alive.
-        assert_eq!(no_fresh_kernel_panic(&[], 7.0 * 86400.0)[0].status, Status::Pass);
+        assert_eq!(no_fresh_kernel_panic(&[], 7.0 * 86400.0, NOW)[0].status, Status::Pass);
     }
 
     /// The pressure check carries the kernel's verdict: only critical fails,
@@ -3721,6 +3970,37 @@ mod negative_controls {
         assert_eq!(oldrow[0].status, Status::Pass, "a 3000-day-old row is old, not mis-united: {oldrow:?}");
     }
 
+    /// AMUX-3647: the assumption the latency exclusion rests on is CHECKED, and
+    /// its three states stay distinguishable.
+    ///
+    /// The point of this cell is the third one. A violation count of zero and a
+    /// column nobody writes produce the same number, and reporting both as a
+    /// pass is how a check goes green by ceasing to be able to fail. The whole
+    /// reason `ts < boot_at` is safe to compare on is a startup ORDER that a
+    /// future edit could change silently, so "I could not tell" has to be its
+    /// own answer.
+    #[test]
+    fn arrival_before_its_own_boot_is_a_failure_and_no_data_is_not_a_pass() {
+        let clean = request_arrival_follows_boot(97_019, 0, 24.0);
+        assert_eq!(clean[0].status, Status::Pass, "{clean:?}");
+
+        let broken = request_arrival_follows_boot(97_019, 3, 24.0);
+        assert_eq!(broken[0].status, Status::Fail, "{broken:?}");
+        assert!(
+            broken[0].observed.contains("spans_own_restart"),
+            "the failure must name the code whose assumption just broke, or a reader gets a \
+             count with no consequence attached: {broken:?}"
+        );
+
+        let blind = request_arrival_follows_boot(0, 0, 24.0);
+        assert_eq!(
+            blind[0].status,
+            Status::Unknown,
+            "zero violations out of zero observations is not evidence — it is the same number \
+             a check that stopped running produces: {blind:?}"
+        );
+    }
+
     /// AF-184 REVIEW (amux): the declaration must cover timestamps, not one
     /// SPELLING of them.
     ///
@@ -3774,5 +4054,257 @@ mod negative_controls {
         names.sort();
         names.dedup();
         assert_eq!(before, names.len(), "a column is declared twice");
+    }
+}
+
+/// A schedule whose TITLE claims a cost property its `kind` contradicts (AF-216).
+#[derive(Debug, Clone)]
+pub struct ScheduleKindRow {
+    pub id: String,
+    pub title: String,
+    pub kind: String,
+    pub session: String,
+    /// What the schedule runs. Carried because the TITLE cannot answer the
+    /// question that matters (AMUX-3680): a schedule burning a model turn on a
+    /// pure shell command is just as expensive whether or not it claims to be
+    /// cheap, and only the command can say which it is.
+    pub command: String,
+}
+
+/// Titles that assert the schedule costs no model tokens. Kept as a list rather
+/// than one string because the claim is what matters, not the spelling.
+const ZERO_COST_CLAIMS: &[&str] = &["zero-token", "zero token", "no-token", "tokenless"];
+
+/// Does this command run a program, with no prose for a model to interpret?
+///
+/// Deliberately conservative: it must START with something that is
+/// unambiguously an invocation. Anything a person would read as an instruction
+/// ("review the breaches and reply", "check X then post Y") does not match, and
+/// that is the direction to be wrong in — a missed expensive schedule costs a
+/// turn a day, while a false one costs a card that says "should this be shell?"
+/// about a command that is prose.
+///
+/// `&&`/`;`/`|` chains are fine and are the common shape here
+/// (`cd ~/dir && ./runner.sh x`): the first token still decides whether a shell
+/// could have run the whole line.
+fn is_pure_shell(command: &str) -> bool {
+    let c = command.trim();
+    if c.is_empty() {
+        return false;
+    }
+    // A blank line means the author wrote a prompt with structure, not a
+    // command line. Real commands here are one line, possibly chained.
+    if c.contains("\n\n") {
+        return false;
+    }
+    let first = c.split_whitespace().next().unwrap_or("");
+    first.starts_with("./")
+        || first.starts_with('/')
+        || first.starts_with("~/")
+        || first.starts_with("$(")
+        || matches!(
+            first,
+            "cd" | "bash" | "sh" | "zsh" | "python" | "python3" | "node" | "npm" | "npx"
+                | "curl" | "git" | "make" | "cargo" | "docker" | "psql" | "sqlite3" | "amux"
+                | "env" | "export" | "source" | "echo" | "rsync" | "aws" | "gh"
+        )
+}
+
+/// `kind: shell` runs the command directly. `kind: tmux` delivers it to a lane as
+/// a PROMPT and wakes a full model turn — measured 2026-08-24 at ~$6.20 per fire
+/// (2,602 schedule-caused turns against 214 declared fires/day).
+///
+/// So a schedule TITLED "zero-token" while running as `tmux` is not a naming
+/// nitpick: it is a row asserting a cost property the row itself contradicts, and
+/// it defeats exactly the audit someone would run to find this class. Both
+/// specimens found on 2026-08-24 already had pure-shell commands
+/// (`cd ~/Dev/... && ./tick_runner.sh opps`), so each was ONE FIELD from being
+/// true, and their titles are why nobody looked.
+///
+/// FAILS TODAY, on purpose: 2 enabled rows. An invariant that goes green on the
+/// day it ships has not been shown to discriminate — this one names its specimens
+/// and can be watched to zero.
+pub fn schedule_cost_titles_match_kind(rows: &[ScheduleKindRow]) -> Vec<InvariantResult> {
+    const ID: &str = "schedules.cost_title_matches_kind";
+    let claims_free = |t: &str| {
+        let low = t.to_lowercase();
+        ZERO_COST_CLAIMS.iter().any(|c| low.contains(c))
+    };
+    // THE TITLE IS THE WRONG OPERAND (AMUX-3680, found by gtm-ticker).
+    //
+    // This fired only on a CONTRADICTION — a title claiming zero-token on a row
+    // that is not `shell`. So a schedule whose title says nothing about cost was
+    // invisible, however expensive it was, and honesty was what evaded the
+    // check. Measured 2026-08-24: this check found TWO of gtm-ticker's
+    // schedules; SEVEN were spending a model turn per firing on the same
+    // runner. The five it missed had made no claim, so there was nothing to
+    // contradict. It reported clean on them the whole time.
+    //
+    // The costlier question needs no title at all: does this schedule spend a
+    // model turn to run something a shell could have run? A command with no
+    // prose for a model to interpret, on a kind that wakes a lane, is a wasted
+    // turn per fire whatever the title says.
+    //
+    // Kept HIGH-PRECISION on purpose. This mints cards, and a detector that
+    // guesses at "is this prose" would bury the board in judgement calls; the
+    // rule below only fires on a command that unambiguously starts as a shell
+    // invocation, so the false-positive it can produce is "this looks
+    // self-contained, should it be shell?" — cheap to answer and usually yes.
+    // A prompt like "review the SLA breaches and reply" does not match and is
+    // correctly left alone.
+    let liars: Vec<&ScheduleKindRow> = rows
+        .iter()
+        .filter(|r| r.kind != "shell" && (claims_free(&r.title) || is_pure_shell(&r.command)))
+        .collect();
+    if liars.is_empty() {
+        return vec![InvariantResult::pass(ID)];
+    }
+    liars
+        .iter()
+        .map(|r| {
+            let mut out = InvariantResult::new(ID, Status::Fail);
+            // Per-schedule entity_key: two mislabelled rows are two incidents,
+            // and one being corrected must not close the other's.
+            out.entity_key = r.id.clone();
+            out.expected = format!("schedule {} titled zero-cost runs as kind='shell'", r.id);
+            out.observed = format!("kind='{}' — every fire wakes a lane and costs a model turn", r.kind);
+            out.evidence = serde_json::json!({
+                "id": r.id,
+                "title": r.title,
+                "kind": r.kind,
+                "session": r.session,
+                "remedy": "PATCH /api/schedules/<id> {\"kind\":\"shell\"} if the command is \
+                           self-contained, or retitle it — a title asserting a cost property \
+                           the row contradicts is worse than no title",
+            });
+            out
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod schedule_kind_tests {
+    use super::*;
+
+    fn row(id: &str, title: &str, kind: &str) -> ScheduleKindRow {
+        // Existing cells predate the command operand and are about the TITLE
+        // rule, so they get prose: it does not match `is_pure_shell`, which
+        // keeps each of them asserting exactly what it asserted before.
+        row_cmd(id, title, kind, "review the breaches and reply")
+    }
+
+    fn row_cmd(id: &str, title: &str, kind: &str, command: &str) -> ScheduleKindRow {
+        ScheduleKindRow {
+            id: id.into(),
+            title: title.into(),
+            kind: kind.into(),
+            session: "gtm-ticker".into(),
+            command: command.into(),
+        }
+    }
+
+    /// AMUX-3680, found by gtm-ticker after acting on this check's own output.
+    ///
+    /// The check found TWO of their schedules. SEVEN were spending a model turn
+    /// per firing on the same runner. The five it missed made no cost claim in
+    /// their titles, so there was nothing to contradict, and it reported clean
+    /// on them the whole time — honesty was what evaded the check.
+    ///
+    /// The cell above, `an_ordinary_tmux_schedule_making_no_cost_claim_passes`,
+    /// encoded that blind spot as intended behaviour. It still passes, because
+    /// its command is prose; what changes is that a claimless title no longer
+    /// protects a schedule whose command a shell could have run.
+    #[test]
+    fn a_claimless_title_no_longer_hides_a_model_turn_spent_on_a_shell_command() {
+        // The real command, verbatim, from all seven of gtm-ticker's rows.
+        let runner = "cd ~/Dev/mixpeek/gtm/engine && ./tick_runner.sh rb2b-inbound";
+
+        // THE FIVE IT MISSED: no cost claim, pure shell command, kind=tmux.
+        let missed = row_cmd("SCHED-200", "rb2b inbound tick", "tmux", runner);
+        let out = schedule_cost_titles_match_kind(&[missed]);
+        assert_eq!(out[0].status, Status::Fail, "{:?}", out[0]);
+        assert_eq!(out[0].entity_key, "SCHED-200");
+
+        // Same row on `shell` is the fixed state and must pass — otherwise the
+        // check would keep firing after the remedy it prescribes.
+        let fixed = row_cmd("SCHED-200", "rb2b inbound tick", "shell", runner);
+        assert_eq!(schedule_cost_titles_match_kind(&[fixed])[0].status, Status::Pass);
+
+        // CONTROL, and the reason the rule is conservative: a real PROMPT on a
+        // model lane is not a wasted turn, and flagging it would bury the board
+        // in judgement calls about what counts as prose.
+        let prompt = row_cmd(
+            "SCHED-999",
+            "SLA sweep",
+            "tmux",
+            "review the SLA breaches since yesterday and reply to any over 4h",
+        );
+        assert_eq!(
+            schedule_cost_titles_match_kind(&[prompt])[0].status,
+            Status::Pass,
+            "a genuine prompt must not be flagged"
+        );
+
+        // The predicate itself, both directions, since it is what decides.
+        assert!(is_pure_shell(runner));
+        assert!(is_pure_shell("./scripts/x.sh"));
+        assert!(is_pure_shell("python3 -m foo"));
+        assert!(is_pure_shell("/usr/local/bin/thing --flag"));
+        assert!(!is_pure_shell("review the breaches and reply"));
+        assert!(!is_pure_shell(""));
+        assert!(!is_pure_shell("   "));
+        // A structured prompt that HAPPENS to open with a command-looking word
+        // is still a prompt: the blank line is the tell.
+        assert!(!is_pure_shell("curl the thing\n\nThen summarise what you saw."));
+    }
+
+    /// The real specimens, verbatim from the board on 2026-08-24.
+    #[test]
+    fn a_zero_token_title_running_as_tmux_is_named() {
+        let rows = vec![
+            row("SCHED-1", "Opps tick: booked meetings -> Lightfield (zero-token, GT-62)", "tmux"),
+            row("SCHED-2", "rb2b inbound tick: sink -> Lightfield, zero-token (playbook 05)", "tmux"),
+        ];
+        let out = schedule_cost_titles_match_kind(&rows);
+        assert_eq!(out.len(), 2, "two mislabelled rows are TWO incidents, not one");
+        assert!(out.iter().all(|r| r.status == Status::Fail));
+        // entity_key must be per-schedule, or correcting one closes the other's incident.
+        let keys: Vec<&str> = out.iter().map(|r| r.entity_key.as_str()).collect();
+        assert_eq!(keys, vec!["SCHED-1", "SCHED-2"]);
+        assert!(out[0].observed.contains("tmux"));
+    }
+
+    /// NEGATIVE CONTROL 1: the claim is TRUE. A check that failed here would be
+    /// telling every correctly-configured schedule it is wrong.
+    #[test]
+    fn a_zero_token_title_running_as_shell_passes() {
+        let rows = vec![row("SCHED-3", "Opps tick (zero-token, GT-62)", "shell")];
+        let out = schedule_cost_titles_match_kind(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass);
+    }
+
+    /// NEGATIVE CONTROL 2: `tmux` is the CORRECT kind for most schedules — the
+    /// defect is the contradiction, not the kind. Without this cell, a check that
+    /// simply flagged every `tmux` row would pass the first cell perfectly and
+    /// fail 50 innocent schedules in production.
+    #[test]
+    fn an_ordinary_tmux_schedule_making_no_cost_claim_passes() {
+        let rows = vec![
+            row("SCHED-4", "MVS reliability/uptime — closed-loop health", "tmux"),
+            row("SCHED-5", "TS P0-P2 driver", "tmux"),
+        ];
+        let out = schedule_cost_titles_match_kind(&rows);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].status, Status::Pass, "a tmux schedule that claims nothing is fine");
+    }
+
+    /// The claim is matched on MEANING, not one spelling, and case-insensitively.
+    #[test]
+    fn the_claim_is_matched_in_its_other_spellings() {
+        for t in ["Nightly sweep (Zero-Token)", "tokenless tick", "no-token relay"] {
+            let out = schedule_cost_titles_match_kind(&[row("S", t, "tmux")]);
+            assert_eq!(out[0].status, Status::Fail, "{t} asserts zero cost and runs as tmux");
+        }
     }
 }

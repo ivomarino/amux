@@ -53,7 +53,7 @@ CTX.verify_mode = ssl.CERT_NONE
 BASE = base_url().rstrip("/")
 
 
-def api(method, path, body=None):
+def api(method, path, body=None, want_headers=False):
     req = urllib.request.Request(
         BASE + path,
         data=json.dumps(body).encode() if body is not None else None,
@@ -61,7 +61,8 @@ def api(method, path, body=None):
         method=method,
     )
     with urllib.request.urlopen(req, timeout=15, context=CTX) as r:
-        return json.loads(r.read().decode())
+        payload = json.loads(r.read().decode())
+        return (payload, dict(r.headers)) if want_headers else payload
 
 
 def rearm_hook_is_live():
@@ -88,7 +89,28 @@ def open_unowned_reports():
     # filter skipped everything and the sweep reported "0 to do" while 76
     # unowned reports sat on the board. A no-op that prints success is
     # worse than a crash.
-    rows = api("GET", "/api/board?full=1")
+    rows, hdrs = api("GET", "/api/board?full=1", want_headers=True)
+
+    # THE PAYLOAD IS TRUNCATED AND THAT IS FINE — but only for one reason, and
+    # this asserts it rather than assuming it (2026-08-26). `?full=1` without
+    # `done_limit=0` collapses TERMINAL rows: measured here, 7851 terminal items
+    # came back as 100, `x-amux-truncated: 1`. The sweep excludes terminal rows
+    # anyway, so its answer is unaffected — by construction. "By construction"
+    # is exactly the reasoning that produced the AMUX-3496 false all-clear this
+    # function already carries a comment about, so: if the cap ever grows into a
+    # flat row cap, `x-amux-total` stops matching `x-amux-returned` and this
+    # refuses instead of reporting a clean sweep computed from a partial board.
+    # A zero here must mean "nothing to do", never "nothing was sent".
+    total = hdrs.get("x-amux-total")
+    returned = hdrs.get("x-amux-returned")
+    if total is not None and returned is not None and total != returned:
+        raise SystemExit(
+            f"REFUSING: the board list dropped rows beyond the terminal cap "
+            f"(x-amux-total={total}, x-amux-returned={returned}). The sweep "
+            f"classifies the WHOLE open set, so a short page here would be a "
+            f"false all-clear. Re-run with an explicit ?done_limit=0, or page it."
+        )
+
     if rows and not any("desc" in r for r in rows):
         # The instrument, not the board: refuse rather than report a clean
         # sweep computed from fields that are not there (ethos rule 7).
@@ -105,7 +127,13 @@ def open_unowned_reports():
             continue
         if r.get("archived"):
             continue
-        if "Filed automatically by amux" not in (r.get("desc") or ""):
+        # ANCHORED to the first line, not a substring match anywhere in desc
+        # (AMUX-3553 measured the difference: 319 loose vs 317 anchored, the
+        # two extras being cards that merely QUOTE the marker while writing
+        # about this mechanism). The filer always writes it as the fixed first
+        # line, so the anchor costs nothing and stops the sweep classifying a
+        # discussion of autofix as a filing by it.
+        if not (r.get("desc") or "").startswith("Filed automatically by amux"):
             continue
         out.append(r)
     return out

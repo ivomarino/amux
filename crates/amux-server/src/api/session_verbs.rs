@@ -1450,6 +1450,303 @@ fn claude_session_flag(name: &str, conv_id: &str, resumable: bool) -> String {
     }
 }
 
+/// The one marker that means "the conversation was compacted here".
+///
+/// A single compaction writes SEVERAL records: a `system` row with
+/// `subtype:"compact_boundary"` (carrying `compactMetadata`), and a separate
+/// row flagged `isCompactSummary`. The first draft of the census behind
+/// AMUX-3742 counted any of the three and reported exactly 2x the truth —
+/// median 17 where the answer was 8. Count boundaries, not their debris.
+const COMPACT_BOUNDARY_MARKER: &[u8] = b"\"subtype\":\"compact_boundary\"";
+
+/// The transcript file backing a lane's CURRENT conversation, if there is one.
+fn transcript_path_for(name: &str) -> Option<PathBuf> {
+    let conv = meta_str(&load_meta(name), "cc_conversation_id");
+    if conv.is_empty() || !cached_re!(r"^[0-9a-fA-F-]{36}$").is_match(&conv) {
+        return None;
+    }
+    let wd = work_dir_of(&parse_env(name));
+    let p = claude_home().join("projects").join(project_name(&wd)).join(format!("{conv}.jsonl"));
+    p.exists().then_some(p)
+}
+
+/// How many times this lane's conversation has been compacted — the meter for
+/// the degradation AMUX-3742 measured (amux lanes median 8, max 215; raw
+/// terminal sessions median 0).
+///
+/// `None` means the measurement could not RUN — no conversation id yet, or the
+/// transcript is missing. That is a different fact from zero and every payload
+/// reporting this must keep them apart: a pristine lane and an unmeasurable one
+/// look identical otherwise, which is the shape ethos rule 4 is about.
+///
+/// INCREMENTAL, because transcripts reach 648MB on this machine and rescanning
+/// one per request is not acceptable. The cache holds (bytes_scanned, count)
+/// per path and reads only what was appended since; a Claude transcript is
+/// append-only, so this is exact rather than approximate. The offset advances
+/// only to the last complete line, so a record caught mid-write is counted on
+/// the next pass instead of being split and missed. A file that SHRANK was
+/// rotated or replaced, so it is rescanned from zero.
+fn conversation_generations(name: &str) -> Option<u32> {
+    count_compact_boundaries(&transcript_path_for(name)?)
+}
+
+/// The incremental counter behind [`conversation_generations`], split out so
+/// the scanning is testable against a real file without a `$HOME` full of
+/// lanes — the census one is a smoke test at best, since it passes vacuously
+/// on a machine with no sessions (ethos rule 7).
+pub fn count_compact_boundaries(path: &Path) -> Option<u32> {
+    count_compact_boundaries_with_chunk(path, 64 * 1024 * 1024)
+}
+
+/// [`count_compact_boundaries`] with the per-iteration read size exposed.
+///
+/// The chunk size is a MEMORY bound, never a scan bound — but proving that
+/// needs a fixture bigger than the chunk, and a 64MB fixture is not worth
+/// writing. So the test drives this with a tiny chunk instead. Without this
+/// seam the EOF-scan test is vacuous: any fixture small enough to write fits
+/// in one 64MB read, so it passes against the single-read bug it exists to
+/// catch.
+pub fn count_compact_boundaries_with_chunk(path: &Path, chunk: u64) -> Option<u32> {
+    use std::io::{Read, Seek, SeekFrom};
+    static CACHE: std::sync::Mutex<Option<std::collections::HashMap<PathBuf, (u64, u32)>>> =
+        std::sync::Mutex::new(None);
+
+    let path = path.to_path_buf();
+    let len = std::fs::metadata(&path).ok()?.len();
+    let mut guard = CACHE.lock().ok()?;
+    let cache = guard.get_or_insert_with(std::collections::HashMap::new);
+    let (mut offset, mut count) = cache.get(&path).copied().unwrap_or((0, 0));
+    if offset > len {
+        // Rotated or replaced: the cached count describes a file that no
+        // longer exists. Start over rather than report a number for it.
+        offset = 0;
+        count = 0;
+    }
+    if len > offset {
+        // CHUNKED TO EOF, not one bounded read. The first draft did a single
+        // `take(CHUNK)` and stopped, which on a 324MB transcript scanned the
+        // first 64MB and returned that partial count as if it were the answer:
+        // this lane read 30 against a hand count of 75. It was caught only
+        // because the live endpoint disagreed with the census that motivated
+        // the feature — a truncated scan is indistinguishable from a healthy
+        // low number, which is the exact failure the whole feature exists to
+        // stop reporting (ethos rule 4).
+        //
+        // A marker cannot straddle a chunk boundary: the offset only ever
+        // advances to the last complete LINE, so the next chunk re-reads from
+        // there. The cap is a memory bound per iteration, never a scan bound.
+        let chunk = chunk.max(4096);
+        let mut f = std::fs::File::open(&path).ok()?;
+        f.seek(SeekFrom::Start(offset)).ok()?;
+        loop {
+            let remaining = len.saturating_sub(offset);
+            if remaining == 0 {
+                break;
+            }
+            let mut buf = Vec::with_capacity(remaining.min(chunk) as usize);
+            (&f).take(chunk).read_to_end(&mut buf).ok()?;
+            if buf.is_empty() {
+                break;
+            }
+            let scanned = match buf.iter().rposition(|b| *b == b'\n') {
+                Some(i) => i + 1,
+                // No complete line in this chunk. Leave the offset where it is
+                // so the record is counted once it terminates, and stop rather
+                // than spin: without this break a trailing fragment loops.
+                None => break,
+            };
+            count += buf[..scanned]
+                .windows(COMPACT_BOUNDARY_MARKER.len())
+                .filter(|w| *w == COMPACT_BOUNDARY_MARKER)
+                .count() as u32;
+            offset += scanned as u64;
+            if scanned < buf.len() {
+                // The chunk ended mid-line; re-read from the line boundary.
+                f.seek(SeekFrom::Start(offset)).ok()?;
+            }
+        }
+        cache.insert(path, (offset, count));
+    }
+    Some(count)
+}
+
+/// A lane is worth recycling somewhere around here. Deliberately a number in
+/// a payload rather than an automatic action: a conversation is the lane's
+/// accumulated work and deciding it is spent belongs to its owner (ethos
+/// rule 8). amux reports; the human presses the button.
+pub const GENERATIONS_WARN_AT: u32 = 20;
+
+/// The rename cascade's table-by-table migration, hoisted to a const so it can
+/// be EXECUTED by a test rather than paraphrased by one (ethos rule 7: a test
+/// that restates the list is green whichever columns the shipped path
+/// actually touches).
+pub const RENAME_MIGRATIONS: [(&str, &str); 6] = [
+    ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
+    // BEYOND PYTHON, and the reason AMUX-3749 exists: the cascade
+    // migrated a card's OWNER and left the two columns that address
+    // OTHER lanes pointing at the dead name. `amux-rust` was renamed
+    // to `amux` and cards still named `amux-rust` as reviewer, so
+    // the reviewer nudge addressed a session that no longer existed
+    // and the cards sat in `review` with nobody coming. Same column
+    // family, same failure, so shepherd goes with it.
+    (
+        "issues.reviewer",
+        "UPDATE issues SET reviewer=?1 WHERE reviewer=?2 AND deleted IS NULL",
+    ),
+    (
+        "issues.shepherd",
+        "UPDATE issues SET shepherd=?1 WHERE shepherd=?2 AND deleted IS NULL",
+    ),
+    ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
+    ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),
+    ("saved_messages", "UPDATE saved_messages SET session=?1 WHERE session=?2"),
+];
+
+/// Does this name resolve to a REGISTERED worker?
+///
+/// `reviewer` and `shepherd` are free-text columns — nothing validates them at
+/// write time — so a typo, a human's name, or a lane that has since been
+/// renamed all park a card on somebody no nudge can reach. This is the one
+/// predicate for "can amux address this name", so the board and the session
+/// verbs cannot disagree about it.
+/// Why `owner` cannot use `reviewer` for peer review, or `None` if it can.
+///
+/// ONE PREDICATE FOR TWO QUESTIONS THAT WERE ANSWERED SEPARATELY (AMUX-3771).
+/// The board asked only "is this a registered worker" before routing a review
+/// nudge. Messaging asks a second question — `cross_group_send_ok` — and only
+/// the send API ever asked it, so the board could hand a lane a reviewer it was
+/// not allowed to talk to.
+///
+/// The result was a system inconsistent in the direction that surprises: review
+/// crossed groups silently, conversation about it was refused. A card then sits
+/// in `review`, which reads healthy, while the two parties cannot correspond.
+///
+/// The escapes are the ones that already exist and are already documented in
+/// the refusal text: `CC_RECEIVE_ANY=1` on the reviewer if it is a fleet-wide
+/// routing target (which is exactly what a designated cross-lane reviewer IS),
+/// or `CC_SEND_ALLOW` on the owner. Refusing here does not decide which; it
+/// forces the decision to be written down somewhere instead of emerging from a
+/// worker description nothing enforces.
+pub fn reviewer_unreachable_reason(owner: &str, reviewer: &str) -> Option<String> {
+    if !session_is_registered(reviewer) {
+        return Some(format!(
+            "`{reviewer}` is not a registered worker — reassign to a lane, or move the card to \
+             needsyou if a human owes the review"
+        ));
+    }
+    // The SAME rule worker-to-worker messaging uses, so a reviewer you cannot
+    // message can never become a reviewer you are waiting on.
+    cross_group_send_ok(owner, reviewer).err().map(|why| {
+        format!(
+            "{owner} cannot reach it for the conversation the review requires. {why} \
+             A designated cross-lane reviewer should carry CC_RECEIVE_ANY=1."
+        )
+    })
+}
+
+pub fn session_is_registered(name: &str) -> bool {
+    let n = name.trim();
+    !n.is_empty() && valid_session_name(n) && env_path(n).exists()
+}
+
+/// The degraded predicate, in ONE place. The hourly watch and the debug view
+/// both call it, so a view cannot disagree with the mechanism it describes —
+/// the drift ethos rule 1 names, which has cost this repo five separate
+/// over/under-filtered views.
+pub fn is_degraded(generations: u32) -> bool {
+    generations >= GENERATIONS_WARN_AT
+}
+
+/// Every registered lane and how many compaction generations deep it is.
+///
+/// ONE enumeration, shared by the debug view and the hourly watch, so the two
+/// cannot disagree about which lanes count — a view that re-derives the
+/// mechanism's predicate drifts the moment either changes (ethos rule 1).
+pub(crate) fn generation_census() -> Vec<(String, Option<u32>)> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(sessions_dir()) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().and_then(|x| x.to_str()) != Some("env") {
+                continue;
+            }
+            if let Some(lane) = p.file_stem().and_then(|s| s.to_str()) {
+                let g = conversation_generations(lane);
+                out.push((lane.to_string(), g));
+            }
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
+}
+
+/// `GET /api/debug/context-health` — how degraded each lane's conversation is.
+///
+/// This endpoint IS the fix for AMUX-3742 as much as the recycle verb is. The
+/// report was "amux claude performs worse than raw claude, same model, same
+/// prompt", and nothing in amux could express the difference, so it stayed a
+/// feeling for months while the answer was sitting in every transcript. Model
+/// and effort were the same on both sides; compaction generations were not.
+pub async fn debug_context_health() -> Response {
+    let mut running: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(o) = tmux(&["list-sessions", "-F", "#{session_name}"]).await {
+        for line in String::from_utf8_lossy(&o.stdout).lines() {
+            if let Some(n) = line.trim().strip_prefix("amux-") {
+                running.insert(n.to_string());
+            }
+        }
+    }
+    let mut lanes: Vec<Value> = Vec::new();
+    let (mut measured, mut unmeasurable, mut over) = (0u32, 0u32, 0u32);
+    for (lane, gens) in generation_census() {
+        let mb =
+            transcript_path_for(&lane).and_then(|t| std::fs::metadata(t).ok()).map(|m| m.len() / (1024 * 1024));
+        match gens {
+            Some(g) => {
+                measured += 1;
+                if is_degraded(g) {
+                    over += 1;
+                }
+            }
+            None => unmeasurable += 1,
+        }
+        lanes.push(json!({
+            "session": lane,
+            "generations": gens,
+            // NOT inferable from `generations: null` alone — a lane that
+            // has never compacted and one nobody could measure must not
+            // read the same (ethos rule 4).
+            "measured": gens.is_some(),
+            "why_unmeasured": gens.is_none().then(|| {
+                if meta_str(&load_meta(&lane), "cc_conversation_id").is_empty() {
+                    "no conversation id yet (never started, or recycled and not restarted)"
+                } else {
+                    "conversation id recorded but its transcript is missing"
+                }
+            }),
+            "running": running.contains(&lane),
+            "transcript_mb": mb,
+        }));
+    }
+    lanes.sort_by_key(|l| std::cmp::Reverse(l.get("generations").and_then(Value::as_u64).unwrap_or(0)));
+    j200(json!({
+        "note": "compaction generations per lane: how many times this conversation has been \
+                 summarized away. A raw `claude` in a terminal sits at 0; an amux lane resumes \
+                 forever, so it answers from a summary of a summary. Measured 2026-08-26 across \
+                 every transcript active since 08-05: amux median 8 / max 215, raw median 0 / \
+                 max 32 — same models, same effort, same first-turn token baseline.",
+        "sessions": lanes.len(),
+        "measured": measured,
+        "unmeasurable": unmeasurable,
+        "over_warn_threshold": over,
+        "warn_at": GENERATIONS_WARN_AT,
+        "remedy": "amux fresh <session> — keeps the worker (env, cards, memory, groups) and \
+                   starts its conversation over. Never automatic: the conversation is the lane's \
+                   accumulated work, so discarding it is the owner's call (ethos rule 8).",
+        "lanes": lanes,
+    }))
+}
+
 /// The display name a transcript CURRENTLY carries — the last `customTitle` /
 /// `sessionName` record in the file, not the first (AMUX-2612).
 ///
@@ -2663,7 +2960,7 @@ fn get_default_model() -> String {
 // works — on the live shared DB these are no-ops against Python's schema.
 // ---------------------------------------------------------------------------
 
-fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub(crate) fn ensure_fleet_tables(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS session_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
@@ -3355,6 +3652,70 @@ pub(crate) async fn steer_enqueue_store(
     guard: &str,
     sender: &str,
 ) -> Result<String, &'static str> {
+    steer_enqueue_precond(store, name, text, guard, sender, None).await
+}
+
+/// Enqueue with a DELIVERY-TIME PRECONDITION (AMUX-3659).
+///
+/// `precond` is `(card_id, issues.rev)` — the card this message asserts
+/// something about, and the revision its text was computed against. At delivery
+/// the row is DROPPED if that card has moved on, because the message is about a
+/// state that no longer exists.
+///
+/// Board state is delivered at turn boundaries by design, and that decision is
+/// right. What it costs is that a nudge asserting a card's CURRENT state is
+/// computed at enqueue and read minutes later: measured over 24h, 649
+/// deliveries, mean lag 166s, max 3607s, and 209 (32%) over a minute. On MR-2
+/// that produced a nudge arriving 3m23s after its premise, two minutes after
+/// mvs-research had applied the exact remedy it prescribed — a correct trigger
+/// and a correct remedy adding up to what looked like a broken re-nag.
+///
+/// OPT-IN, and it has to be: a peer relay or a scheduler command asserts
+/// nothing about a card and must deliver unchanged. `guard` cannot carry this,
+/// being a producer label (`board-drive`, `commit-nudge`) rather than a
+/// condition.
+///
+/// The row is dropped, NOT recomputed. Recomputing would need the producer's
+/// logic at the consumer — the second spelling this repo keeps paying for — and
+/// is unnecessary: every producer here is a periodic trigger, so if the
+/// condition still holds it fires again on the next tick.
+#[must_use = "steer_enqueue REFUSES a permanently-blocked target and returns None. \
+Handle it, or write `let _ =` to say the refusal is deliberately unreported here (AF-188)."]
+pub(crate) async fn steer_enqueue_precond(
+    store: &crate::db::SharedStore,
+    name: &str,
+    text: &str,
+    guard: &str,
+    sender: &str,
+    precond: Option<(&str, i64)>,
+) -> Result<String, &'static str> {
+    // ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26: "isolated =
+    // zero amux harness, just raw LLM pass through"), gated at the CHOKEPOINT
+    // for the same reason AF-188 put the archived refusal here.
+    //
+    // The reported symptom was one nudge in one lane. The cause was that
+    // isolation's consumer list covered what a worker is TOLD ABOUT and
+    // DISCOVERABLE BY, and nothing about what gets TYPED INTO ITS PANE:
+    // measured that day, ZERO of the 15 runtime_jobs consulted
+    // `session_is_isolated`, and SEVEN automated producers reach this function
+    // — commit-nudge, board-drive, staged-guard, accountability, auto-compact,
+    // env-apply-prompt, typo. Fixing the two that were observed would have left
+    // five, which is how the original list went stale in the first place.
+    //
+    // THE DISCRIMINATOR IS `guard`, and it is opt-OUT by construction. Every
+    // automated producer names itself there; the owner's own send
+    // (`send_text_inner`) passes "". So a NEW automated caller is blocked by
+    // default and has to deliberately pass an empty guard to reach an isolated
+    // lane — the inverse of a list somebody must remember to extend (ethos
+    // rule 1).
+    //
+    // Owner peek/send stay working, which is the documented boundary. This
+    // REFUSES rather than silently dropping: a producer that thinks it
+    // delivered is how a board card gets claimed for a lane nobody is driving.
+    if !guard.is_empty() && session_is_isolated(name) {
+        return Err("target is an isolated (raw-agent) worker: amux automation is not \
+                    delivered into it. The owner's own send still works.");
+    }
     // REFUSE A PERMANENT BLOCK HERE, not in the handlers (AF-188).
     //
     // `steer_mutate` and `auto_deliver` each refused archived targets; this
@@ -3376,7 +3737,18 @@ pub(crate) async fn steer_enqueue_store(
     // without the attribute this would have been a refusal any future producer
     // could drop silently. CI denies warnings, so every one of the 18 call
     // sites now says out loud what it does with a refusal.
-    if let Some(reason) = permanently_blocked(name) {
+    let blocked = {
+        // Read scoped tight: the resolver needs a connection, and holding one
+        // across the enqueue write below would deadlock the single writer.
+        match store.read() {
+            Ok(conn) => permanently_blocked_resolved(&conn, name),
+            // Unreadable store: fall back to the file-only answer rather than
+            // refusing everything. A read failure is not evidence a target does
+            // not exist, and this path's whole job is to distinguish those.
+            Err(_) => permanently_blocked(name),
+        }
+    };
+    if let Some(reason) = blocked {
         // Stable token so a sweep can COUNT these without a human noticing
         // first — the same /api/logs/analyze WARN sweep that found the bug.
         tracing::warn!(
@@ -3402,6 +3774,7 @@ pub(crate) async fn steer_enqueue_store(
     let text_s = text.to_string();
     let guard_s = guard.to_string();
     let sender_s = sender.to_string();
+    let precond_w = precond.map(|(c, r)| (c.to_string(), r));
     let _ = store
         .write_async(move |conn| {
             ensure_fleet_tables(conn)?;
@@ -3448,14 +3821,18 @@ pub(crate) async fn steer_enqueue_store(
                     rusqlite::params![session, text_s],
                 )?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO steering_queue(id, session, text, queued_at, guard, sender) VALUES(?,?,?,?,?,?)",
+                    "INSERT OR REPLACE INTO steering_queue\
+                     (id, session, text, queued_at, guard, sender, precond_card, precond_rev) \
+                     VALUES(?,?,?,?,?,?,?,?)",
                     rusqlite::params![
                         id,
                         session,
                         text_s,
                         now_f64(),
                         if guard_s.is_empty() { None } else { Some(guard_s.clone()) },
-                        sender_s
+                        sender_s,
+                        precond_w.as_ref().map(|(c, _)| c.clone()),
+                        precond_w.as_ref().map(|(_, r)| *r),
                     ],
                 )?;
             }
@@ -3912,6 +4289,19 @@ pub(crate) fn send_failure_status(msg: &str) -> (StatusCode, Option<&'static str
     // falls through to 500 because the inner text is unclassified.
     if let Some(inner) = m.strip_prefix("auto-wake failed: ") {
         return send_failure_status(inner);
+    }
+    // --- 409: the target exists and is deliberately closed to this caller.
+    //     An isolated lane refuses amux automation and takes the owner's send
+    //     (AMUX-3764), so this is a policy refusal with an obvious next step,
+    //     not a fault. 500 would file it as a bug and send someone debugging.
+    if m.starts_with("target is an isolated (raw-agent) worker") {
+        return (
+            StatusCode::CONFLICT,
+            Some(
+                "this lane is isolated: amux automation is not delivered into it. Send as the \
+                 owner, or clear CC_ISOLATED on the lane if it should take automation.",
+            ),
+        );
     }
     // --- 404: the target does not exist.
     if m.starts_with("session '") && m.ends_with("not found") {
@@ -4432,7 +4822,13 @@ pub(crate) fn keystroke_lanes(state: &AppState) -> Vec<String> {
     names
 }
 
-async fn send_after_ready(state: AppState, name: String, text: String, timeout_s: u64) {
+async fn send_after_ready(
+    state: AppState,
+    name: String,
+    text: String,
+    timeout_s: u64,
+    origin: SendOrigin,
+) {
     // py:24889 _send_after_ready — wait for Claude's input prompt, then send.
     let deadline = std::time::Instant::now() + Duration::from_secs(timeout_s);
     while std::time::Instant::now() < deadline {
@@ -4441,7 +4837,7 @@ async fn send_after_ready(state: AppState, name: String, text: String, timeout_s
             let clean = strip_ansi(&out);
             if claude_ui_visible(&clean) && !at_resume_picker(&clean) {
                 sleep_ms(1200).await;
-                let _ = send_text_boxed(&state, &name, &text, false).await;
+                let _ = send_text_boxed(&state, &name, &text, false, origin).await;
                 return;
             }
         }
@@ -4489,8 +4885,73 @@ pub(crate) fn must_paste(generating: bool, chars: usize, picker_shaped: bool) ->
     generating || chars > 400 || picker_shaped
 }
 
-pub(crate) async fn send_text(state: &AppState, name: &str, text: &str, defer_if_busy: bool) -> (bool, String) {
-    send_text_inner(state, name, text, defer_if_busy, false, false, false).await
+/// WHO is putting this text into the pane.
+///
+/// Exists because the isolation gate was one layer too high (AMUX-3764). It sat
+/// on `steer_enqueue`, discriminating on a non-empty `guard`, which is correct
+/// and complete FOR THE QUEUE. But `steer_enqueue` is not where text reaches a
+/// pane — `send_text_inner` is — and three producers call that directly,
+/// walking straight past the gate: `deliver_hot_config` (amux typing a slash
+/// command into the lane), and the two channel notices in `channels.rs`.
+///
+/// Same opt-OUT shape as the guard, deliberately: `Automation` is what a caller
+/// gets by thinking about it, and `Owner` has to be chosen. A new call site
+/// cannot reach an isolated lane by forgetting something.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SendOrigin {
+    /// A person acted: the send API, the deploy button, apply-instructions.
+    Owner,
+    /// amux decided on its own. Refused into an isolated lane.
+    Automation,
+}
+
+/// Does the isolation gate refuse this send? `None` means it proceeds.
+///
+/// A PURE PREDICATE, AND THAT IS THE POINT (AMUX-3765). The check used to be
+/// inline at the top of `send_text_inner`, which meant testing the ALLOWED
+/// cases required calling `send_text` — and `send_text_inner`'s auto-wake path
+/// STARTS A REAL SESSION for a lane that is not running. My own control
+/// assertions in `an_isolated_lane_refuses_amux_automation_and_still_takes_the_
+/// owners_send` therefore spawned two live Claude Code processes on the
+/// production tmux socket (`amux-raw`, `amux-ordinary`, 16:14 on 2026-08-26),
+/// in /private/tmp, on a Claude Max seat, and one of them ran a turn replying
+/// to the literal string "owner text".
+///
+/// The refused cases were safe — they return before any side effect — so the
+/// test looked fine and the damage was entirely in the CONTROLS, which exist to
+/// prove the gate is not "refuse everything". A control that has to invoke the
+/// side-effecting path to prove a negative is the wrong shape; assert the
+/// decision, not the delivery.
+pub(crate) fn isolation_refusal(name: &str, origin: SendOrigin) -> Option<&'static str> {
+    (origin == SendOrigin::Automation && session_is_isolated(name)).then_some(
+        "target is an isolated (raw-agent) worker: amux automation is not delivered into it. \
+         The owner's own send still works.",
+    )
+}
+
+/// The `guard` a send carries when a live selector parks it on the queue.
+///
+/// Split out so the shipped path and its test share ONE definition. The park
+/// passed `""` unconditionally, which is the exact value the queue's isolation
+/// gate reads as "the owner", so an automated send that happened to find the
+/// lane at a picker was laundered into an owner send (AMUX-3764). An empty
+/// guard also drops the per-producer dedupe, which is a defect independent of
+/// isolation.
+pub(crate) fn park_guard(origin: SendOrigin) -> &'static str {
+    match origin {
+        SendOrigin::Automation => "deferred-automation",
+        SendOrigin::Owner => "",
+    }
+}
+
+pub(crate) async fn send_text(
+    state: &AppState,
+    name: &str,
+    text: &str,
+    defer_if_busy: bool,
+    origin: SendOrigin,
+) -> (bool, String) {
+    send_text_inner(state, name, text, SendMode::deferring(defer_if_busy, origin)).await
 }
 
 /// WHAT "sent" MEANS, as a pure function of the send's own verdict string.
@@ -4592,7 +5053,11 @@ pub(crate) async fn deliver_automated(
     // that are not running and leaves the row pending, so a queued command for a
     // stopped lane would wait forever while the run row claimed it was pending.
     if !is_running(name).await {
-        let (ok, msg) = send_text(state, name, text, false).await;
+        // AUTOMATION by construction: `auto_deliver`'s own doc two lines up
+        // says "this is an automated producer, and `guard` already names which
+        // one". This branch skipped the queue for a stopped lane, and with it
+        // the queue's isolation gate (AMUX-3764).
+        let (ok, msg) = send_text(state, name, text, false, SendOrigin::Automation).await;
         return classify(ok, msg);
     }
 
@@ -4603,7 +5068,7 @@ pub(crate) async fn deliver_automated(
         // `from_steering = true` makes the callee REFUSE rather than type into a
         // turn that started between the gate and the send. A lost race then
         // falls through to the queue below instead of being reported as failed.
-        let (ok, msg) = send_text_inner(state, name, text, false, true, false, false).await;
+        let (ok, msg) = send_text_inner(state, name, text, SendMode::drained(false, false)).await;
         if ok {
             return classify(ok, msg);
         }
@@ -4647,26 +5112,81 @@ fn send_text_boxed<'a>(
     name: &'a str,
     text: &'a str,
     defer_if_busy: bool,
+    origin: SendOrigin,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = (bool, String)> + Send + 'a>> {
-    Box::pin(send_text_inner(state, name, text, defer_if_busy, false, false, false))
+    Box::pin(send_text_inner(state, name, text, SendMode::deferring(defer_if_busy, origin)))
+}
+
+/// How a send should behave, and on whose authority.
+///
+/// Grouped when `origin` made this eight positional arguments, four of them
+/// bools (AMUX-3764). Four adjacent bare `false`s at a call site is how the
+/// wrong flag gets passed, and `allow_mid_turn` in particular decides whether
+/// amux types into a RUNNING turn — not a flag to hand to argument order.
+pub(crate) struct SendMode {
+    pub defer_if_busy: bool,
+    pub from_steering: bool,
+    /// OVERDUE delivery (AMUX-2642): the message has waited past
+    /// `AMUX_STEER_MAX_AGE_S` for a boundary that is not coming, so it goes into
+    /// the running turn and Claude Code folds it in at its own boundary. Only
+    /// the steering tick sets this, and only after the deadline.
+    pub allow_mid_turn: bool,
+    /// The caller already knows the session is idle (e.g. the Stop hook just
+    /// reported it). Skip the pane-based generating checks — the hook report
+    /// IS the authority (D1 exit: reported state outranks the scrape).
+    pub hook_confirmed_idle: bool,
+    pub origin: SendOrigin,
+}
+
+impl SendMode {
+    /// The ordinary send: no deferral, not from the queue, never mid-turn.
+    fn plain(origin: SendOrigin) -> Self {
+        Self {
+            defer_if_busy: false,
+            from_steering: false,
+            allow_mid_turn: false,
+            hook_confirmed_idle: false,
+            origin,
+        }
+    }
+    fn deferring(defer_if_busy: bool, origin: SendOrigin) -> Self {
+        Self { defer_if_busy, ..Self::plain(origin) }
+    }
+    /// A drain off the steering queue. Already gated at enqueue, so the origin
+    /// here is whatever was allowed to queue.
+    fn drained(allow_mid_turn: bool, hook_confirmed_idle: bool) -> Self {
+        Self {
+            defer_if_busy: false,
+            from_steering: true,
+            allow_mid_turn,
+            hook_confirmed_idle,
+            origin: SendOrigin::Owner,
+        }
+    }
 }
 
 async fn send_text_inner(
     state: &AppState,
     name: &str,
     text: &str,
-    defer_if_busy: bool,
-    from_steering: bool,
-    // OVERDUE delivery (AMUX-2642): the message has waited past
-    // `AMUX_STEER_MAX_AGE_S` for a boundary that is not coming, so it goes into
-    // the running turn and Claude Code folds it in at its own boundary. Only
-    // the steering tick sets this, and only after the deadline.
-    allow_mid_turn: bool,
-    // The caller already knows the session is idle (e.g. the Stop hook just
-    // reported it). Skip the pane-based generating checks — the hook report
-    // IS the authority (D1 exit: reported state outranks the scrape).
-    hook_confirmed_idle: bool,
+    mode: SendMode,
 ) -> (bool, String) {
+    let SendMode { defer_if_busy, from_steering, allow_mid_turn, hook_confirmed_idle, origin } =
+        mode;
+    // ZERO AMUX HARNESS INTO AN ISOLATED LANE, AT THE LAYER THAT ACTUALLY TYPES
+    // (AMUX-3764). The gate on `steer_enqueue` is correct and complete for the
+    // QUEUE, and three producers never touch the queue: `deliver_hot_config`
+    // types a slash command straight in, and the two channel notices in
+    // `channels.rs` call `send_text` directly. Gating those three by name would
+    // rebuild the consumer list bc6d3067 was written to delete, so the check
+    // goes where every path to a pane converges.
+    //
+    // It also closes a hole the queue gate could not see: the `defer_if_busy`
+    // park below re-enqueued with an EMPTY guard, so an automated send that
+    // happened to find the lane at a selector was laundered into an owner send.
+    if let Some(refusal) = isolation_refusal(name, origin) {
+        return (false, refusal.into());
+    }
     let cfg = parse_env(name);
     if !iterm2_id(&cfg).is_empty() {
         return (false, "iTerm2-backed sessions are not supported by the rust origin yet".into());
@@ -4739,7 +5259,7 @@ async fn send_text_inner(
         if boot_in_flight {
             let st2 = state.clone();
             let (n, t) = (name.to_string(), text.to_string());
-            tokio::spawn(async move { send_after_ready(st2, n, t, 30).await });
+            tokio::spawn(async move { send_after_ready(st2, n, t, 30, origin).await });
             return (true, "sent (waiting for in-flight boot)".into());
         }
         if !env_path(name).exists() {
@@ -4752,7 +5272,7 @@ async fn send_text_inner(
         }
         let st2 = state.clone();
         let (n, t) = (name.to_string(), text.to_string());
-        tokio::spawn(async move { send_after_ready(st2, n, t, 60).await });
+        tokio::spawn(async move { send_after_ready(st2, n, t, 60, origin).await });
         return (true, "sent (auto-woke)".into());
     }
     let mut text = text.to_string();
@@ -4950,7 +5470,15 @@ async fn send_text_inner(
     if defer_if_busy && waiting {
         // A live selector parks an automated send (py:25545; the
         // AskUserQuestion kill of 2026-07-15).
-        let _ = steer_enqueue(state, name, &text, "", "").await;
+        //
+        // THE GUARD IS NAMED, not erased (AMUX-3764). This passed `""`, which
+        // is precisely the value the queue's isolation gate reads as "the
+        // owner" — so an automated send that happened to find the lane at a
+        // selector was LAUNDERED into an owner send on its way to the queue.
+        // The gate above already refuses Automation into an isolated lane, so
+        // this is belt-and-braces there; it matters independently because an
+        // empty guard also drops the per-producer dedupe the guard provides.
+        let _ = steer_enqueue(state, name, &text, park_guard(origin), "").await;
         return (true, "queued (steering) — session at a selector, delivers when it resolves".into());
     }
     if waiting && from_steering {
@@ -6246,14 +6774,14 @@ async fn start_session(state: &AppState, name: &str, extra_flags: &str, skip_con
         let prompt = log_reload_prompt(name, &pending_reason);
         let st2 = state.clone();
         let n = name.to_string();
-        tokio::spawn(async move { send_after_ready(st2, n, prompt, 60).await });
+        tokio::spawn(async move { send_after_ready(st2, n, prompt, 60, SendOrigin::Automation).await });
     }
     // Standing instruction re-send (py:24833). Board digest briefing: gap.
     let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
     if !instr.is_empty() {
         let st2 = state.clone();
         let n = name.to_string();
-        tokio::spawn(async move { send_after_ready(st2, n, instr, 60).await });
+        tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
     }
     emit_event(
         state,
@@ -7851,6 +8379,7 @@ pub(crate) fn lane_block_reason_from(
     env_exists: bool,
     archived: bool,
     running: bool,
+    rate_limited: bool,
 ) -> Option<&'static str> {
     if !env_exists {
         return Some("no-env-file");
@@ -7860,6 +8389,21 @@ pub(crate) fn lane_block_reason_from(
     }
     if !running {
         return Some("not-running");
+    }
+    // HOLD A SEND FOR A RATE-LIMITED LANE (AMUX-2238, Ethan 2026-08-03:
+    // "commands sent to a rate-limited session must queue and deliver only
+    // after the limit is confirmed released").
+    //
+    // LAST of the four, and the order is the claim. A lane that is not running
+    // is not-running whether or not it is also rate-limited, and that is the
+    // more actionable sentence for a sender. This fires only for a lane that is
+    // UP and cannot take work.
+    //
+    // NOT DEAD-LETTERED: `steer_dead_letter_verdict` covers the two permanent
+    // reasons only, and a rate limit is by definition temporary. The row waits,
+    // which is the whole point of the card.
+    if rate_limited {
+        return Some("rate-limited");
     }
     None
 }
@@ -7891,7 +8435,19 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     let archived = lane_is_archived(name);
     // Don't pay a tmux query for a lane already known unreachable.
     let running = env_exists && !archived && is_running(name).await;
-    lane_block_reason_from(env_exists, archived, running)
+    // CONFIRMED RELEASE, NOT A CLOCK — which is what the card asks for and what
+    // makes this implementable at all.
+    //
+    // `rate_limited_since` is maintained by the rate-limit sweep and is
+    // PRESENCE-BASED in both directions: it is stamped when the limit menu or
+    // the credit banner is on screen, and CLEARED on the first tick where
+    // neither is. So a non-zero value means the lane is limited right now, and
+    // zero is a live observation that it is not. No reset timestamp is
+    // consulted, which is why this also covers credit caps — they have no reset
+    // clock at all, and the design was stuck on that until the sweep gained the
+    // presence-based clear.
+    let rate_limited = env_exists && !archived && meta_i64(&load_meta(name), "rate_limited_since") > 0;
+    lane_block_reason_from(env_exists, archived, running, rate_limited)
 }
 
 /// The sentence a sender gets. It states what will HAPPEN, not merely what is
@@ -7925,6 +8481,50 @@ pub(crate) fn permanently_blocked(name: &str) -> Option<&'static str> {
         return Some("archived");
     }
     None
+}
+
+/// The same policy, but able to answer EXISTENCE for a rust-managed worker
+/// (AMUX-3649, closing GitHub #134 — reported with a 42-verb inventory by an
+/// external contributor).
+///
+/// `permanently_blocked` answers two questions at once: DOES THIS TARGET EXIST
+/// (a resolution question) and MAY WE DELIVER TO IT (a policy question). It
+/// answers the first with `env_path(name).exists()`, which encodes
+/// `existence == has an env file` — true of the tmux fleet substrate and of
+/// nothing else. A rust-managed worker is a `_amux_workers` row that has no env
+/// file, so delivery refused with "no worker called '<name>' exists" about a
+/// worker that demonstrably does.
+///
+/// That check is mine (AF-188) and it is RIGHT for fleet lanes: a typo is the
+/// only block it can produce, and the refusal wording depends on it. So it stays
+/// exactly as it is, and the row lookup is a SECOND way to prove existence,
+/// consulted only when the first says no.
+///
+/// `archived` is deliberately NOT re-derived here. It is a policy about a target
+/// that exists, and for a fleet lane it lives in the env file this branch has
+/// already established is present.
+///
+/// Not a `Target` type yet, which is what the card proposed. That refactor
+/// touches 18 call sites for a split this makes at the one call site where the
+/// two questions are actually confused — delivery. The type is worth having when
+/// a second caller needs it; building it now would be a wider blast radius than
+/// the bug.
+pub(crate) fn permanently_blocked_resolved(
+    conn: &rusqlite::Connection,
+    name: &str,
+) -> Option<&'static str> {
+    match permanently_blocked(name) {
+        // The one case a `_amux_workers` row can overturn: the env file is
+        // absent, which for a rust-managed worker is normal rather than fatal.
+        Some("no-env-file") => match crate::db::queries::get_worker(conn, name) {
+            // Existence proven from the row, which is a stronger proof than a
+            // file on disk. `get_worker` excludes soft-deleted rows, so a
+            // deleted worker is still correctly a non-target.
+            Ok(Some(_)) => None,
+            _ => Some("no-env-file"),
+        },
+        other => other,
+    }
 }
 
 /// The sentence for a message that was REFUSED and never stored (AF-188).
@@ -7973,6 +8573,18 @@ pub(crate) fn block_reason_explain(reason: &str, name: &str) -> String {
             "NOT DELIVERABLE — '{name}' is not running. The message is stored, but the delivery loop \
              skips stopped lanes, so it waits for the lane to be STARTED, not for it to be free. \
              No deadline will force it through."
+        ),
+        // AMUX-2238. Says WHEN it goes, not merely that it is stuck: the
+        // release is observed (the banner leaving the lane's screen), so a
+        // sender knows waiting is the correct action here, unlike the three
+        // above where waiting helps only after someone does something.
+        "rate-limited" => format!(
+            "HELD — '{name}' is rate-limited. The message is queued and will deliver once the limit \
+             is CONFIRMED released, which amux observes directly: the rate-limit sweep clears the \
+             lane the first tick its limit menu and credit banner are both off screen. No clock is \
+             consulted, so this also covers credit caps, which have no reset time. Nothing is \
+             required of you; the deadline that normally forces a message into a running turn does \
+             not apply, because a rate-limited lane cannot act on it."
         ),
         other => format!("NOT DELIVERABLE — '{name}': {other}."),
     }
@@ -8055,27 +8667,142 @@ pub(crate) fn steer_decide(reported: Option<&str>, pane_idle: Option<bool>, age_
     SteerDelivery::Hold
 }
 
+/// One lane's stored self-report, with the SHARED trust verdict already applied.
+///
+/// `None` means the lane has never reported — a hookless lane (gemini, codex),
+/// or one whose hooks have not fired yet. It never means "idle".
+pub(crate) struct LaneReport {
+    pub state: String,
+    pub age_s: f64,
+    /// [`sessions_legacy::report_applies`] — the SAME predicate the status
+    /// badge uses. When false the report is evidence of nothing and the caller
+    /// must fall through to the pane.
+    pub applies: bool,
+}
+
+/// Read the report and judge it, in one place, for every mechanism that acts on
+/// one. Two callers had their own copy of the read and NEITHER judged it
+/// (AMUX-3756).
+pub(crate) fn lane_report(state: &AppState, name: &str) -> Option<LaneReport> {
+    let conn = state.store.read().ok()?;
+    let raw: String = conn
+        .query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .ok()?;
+    let v: Value = serde_json::from_str(&raw).ok()?;
+    let rep = v.get(name)?;
+    let st = rep["state"].as_str()?.to_string();
+    // ts is a FLOAT (time.time()); as_i64 reads every report as epoch-0.
+    let ts = rep["ts"].as_f64().unwrap_or(0.0);
+    let started: f64 = conn
+        .query_row(
+            "SELECT MAX(ts) FROM session_events WHERE type='session.started' AND session=?1",
+            rusqlite::params![name],
+            |r| r.get::<_, Option<f64>>(0),
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(0.0);
+    let now = crate::config::now_f64();
+    let applies = crate::api::sessions_legacy::report_applies(&st, ts, started, now);
+    if !applies {
+        warn_stuck_report_once(name, &st, ts, now - ts);
+    }
+    Some(LaneReport { state: st, age_s: (now - ts).max(0.0), applies })
+}
+
+/// WARN once per lane per stuck report, so a lane held out of the drive loop by
+/// a report nothing will ever refresh SELF-ANNOUNCES (the two-fixes rule).
+///
+/// Keyed on the report's `ts`, not on the lane, for two reasons: the gate runs
+/// every tick and an unkeyed WARN would be a per-tick spew, and a NEW stuck
+/// report on the same lane is a new occurrence that must be heard. Silence here
+/// means every lane's report is being honoured, which is a different fact from
+/// "the gate never ran" — the board-drive trace carries the count either way.
+fn warn_stuck_report_once(name: &str, st: &str, ts: f64, age: f64) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<HashMap<String, f64>>> = OnceLock::new();
+    let mut g = SEEN.get_or_init(Default::default).lock().unwrap_or_else(|p| p.into_inner());
+    if g.get(name).copied() == Some(ts) {
+        return;
+    }
+    g.insert(name.to_string(), ts);
+    tracing::warn!(
+        session = %name,
+        report_state = %st,
+        report_age_s = age,
+        "stuck_self_report: this lane's stored report is no longer authoritative, so the \
+         turn-boundary gate is falling through to the pane. A stuck `active` report used to \
+         hold a lane out of auto-pickup, nudges and steering FOREVER (AMUX-3756) — the lane \
+         only ever escaped when a human typed at it. GET /api/sessions/<name>/status-explain \
+         for the trust evidence."
+    );
+}
+
+/// One lane's recorded status decisions, newest first, with the timestamp of
+/// the OLDEST row of this kind anywhere.
+///
+/// The second value is what makes an empty list honest. `history: []` means
+/// "this lane has not changed status" when the job has been running, and "no
+/// one has been sampling" when it has not, and the two are indistinguishable
+/// from the array alone — the exact failure AMUX-3761 exists to close, which is
+/// why it is not left for the reader to infer (ethos rule 4).
+///
+/// Deliberately NOT scoped to this lane: a fleet-wide floor answers "how far
+/// back can this table see at all", where a per-lane floor would report a lane
+/// that first appeared an hour ago as if the record started then.
+pub(crate) fn status_decision_history(
+    conn: &rusqlite::Connection,
+    name: &str,
+    limit: usize,
+) -> (Vec<Value>, Option<f64>) {
+    let ev = crate::runtime_jobs::status_history::EVENT;
+    let mut out = Vec::new();
+    if let Ok(mut st) = conn.prepare(
+        "SELECT ts, data FROM session_events WHERE type=?1 AND session=?2 \
+         ORDER BY id DESC LIMIT ?3",
+    ) {
+        if let Ok(rows) = st.query_map(rusqlite::params![ev, name, limit as i64], |r| {
+            Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?))
+        }) {
+            let now = crate::config::now_f64();
+            for (ts, data) in rows.flatten() {
+                let mut v: Value = serde_json::from_str(&data).unwrap_or(json!({}));
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("ts".into(), json!(ts));
+                    o.insert("age_s".into(), json!((now - ts).max(0.0)));
+                }
+                out.push(v);
+            }
+        }
+    }
+    let since: Option<f64> = conn
+        .query_row(
+            "SELECT MIN(ts) FROM session_events WHERE type=?1",
+            rusqlite::params![ev],
+            |r| r.get::<_, Option<f64>>(0),
+        )
+        .ok()
+        .flatten();
+    (out, since)
+}
+
 pub(crate) async fn steer_lane_at_boundary(state: &AppState, name: &str) -> bool {
     // 1. Self-report (hooks). "active" = mid-turn, "waiting" = at a selector.
-    let reported: Option<String> = state
-        .store
-        .read()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
-        })
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v[name]["state"].as_str().map(str::to_string));
-    if let Some(st) = reported {
-        return st == "idle";
+    //    ONLY while it is still authoritative — a report this gate would honour
+    //    but the status badge refuses is the AMUX-3756 deadlock.
+    if let Some(r) = lane_report(state, name) {
+        if r.applies {
+            return r.state == "idle";
+        }
     }
-    // 2. Hookless lane: the pane. Empty capture means "cannot tell" — and for a
-    // herdr lane mid-turn the capture is empty BY DESIGN (herdr refuses a
-    // history read while working/blocked), so treating empty as idle would
-    // deliver into exactly the state we are trying to avoid.
+    // 2. Hookless lane, or a report that no longer applies: the pane. Empty
+    //    capture means "cannot tell" — and for a herdr lane mid-turn the
+    //    capture is empty BY DESIGN (herdr refuses a history read while
+    //    working/blocked), so treating empty as idle would deliver into exactly
+    //    the state we are trying to avoid.
     let raw = tmux_capture(name, 12).await;
     if raw.trim().is_empty() {
         return false;
@@ -8101,18 +8828,12 @@ pub(crate) fn pane_is_at_boundary(raw: &str) -> bool {
 /// The same two signals `steer_lane_at_boundary` reads, fed into
 /// [`steer_decide`] together with the message's age.
 pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64) -> SteerDelivery {
-    let reported: Option<String> = state
-        .store
-        .read()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row("SELECT value FROM prefs WHERE key='session_reports'", [], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
-        })
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .and_then(|v| v[name]["state"].as_str().map(str::to_string));
+    // Same shared read and the same trust verdict as the gate above — this used
+    // to be a second, unjudged copy of the report read (AMUX-3756). A report
+    // that no longer applies is dropped to `None`, which routes to the pane
+    // exactly as a hookless lane does.
+    let reported: Option<String> =
+        lane_report(state, name).filter(|r| r.applies).map(|r| r.state);
     let pane_idle = if reported.is_some() {
         None
     } else {
@@ -8127,21 +8848,64 @@ pub(crate) async fn steer_delivery_for(state: &AppState, name: &str, age_s: f64)
 /// a loop whose only evidence is "no rows left" cannot distinguish delivered
 /// from dropped).
 /// Pull the board card id out of an auto-pickup "work it now" prompt, if this
-/// text IS one. Keyed on the literal template minted by `board_drive.rs` (the
-/// sole producer of "[amux auto-pickup] Claimed board card <ID> from your
-/// queue"); any other steering text returns None, so a non-pickup message is
-/// never voided. KEEP IN STEP with that template: if its wording changes this
-/// returns None and the AMUX-3052 stale-pickup guard silently goes dark, so the
-/// two are commented as a pair and pinned by `pickup_card_id_parses_the_template`.
-fn pickup_card_id(text: &str) -> Option<String> {
-    const ANCHOR: &str = "Claimed board card ";
-    const TAIL: &str = " from your queue";
-    let start = text.find(ANCHOR)? + ANCHOR.len();
-    let rest = text.get(start..)?;
-    let end = rest.find(TAIL)?;
-    let id = rest.get(..end)?.trim();
-    (!id.is_empty()).then(|| id.to_string())
+/// text IS one. Anything else returns None, so a non-pickup message is never
+/// voided.
+///
+/// KEYED ON THE PRODUCER'S OWN CONST, not on a copy of its wording. It used to
+/// hold its own literal ("Claimed board card <ID> from your queue") with a
+/// comment on both sides saying to change them together; 03ed2b6c reworded the
+/// prompt and this stayed behind, and the AMUX-3052 guard was dark for 17 hours
+/// with every one of its tests green (they fed the retired wording too).
+///
+/// The TAIL is gone as well: it only existed to find where the id ended, and it
+/// was a second literal that could drift on its own. A card id has no spaces, so
+/// the first token after the anchor IS the id — provided it looks like one. The
+/// shape check is what lets the caller tell "not a pickup" from "a pickup whose
+/// id I could not read", which is the state that used to be silent.
+pub(crate) fn pickup_card_id(text: &str) -> Option<String> {
+    let start = text.find(crate::runtime_jobs::board_drive::PICKUP_ANCHOR)?
+        + crate::runtime_jobs::board_drive::PICKUP_ANCHOR.len();
+    let tok = text.get(start..)?.split_whitespace().next()?;
+    // A board id is `<PREFIX>-<n>`: uppercase/digit prefix, a hyphen, digits.
+    // Rejecting anything else is deliberate — a void is a DROPPED message, so a
+    // parse that is merely plausible must not authorise one.
+    let (prefix, num) = tok.split_once('-')?;
+    let shaped = !prefix.is_empty()
+        && prefix.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && !num.is_empty()
+        && num.chars().all(|c| c.is_ascii_digit());
+    shaped.then(|| tok.to_string())
 }
+
+/// Does this text CLAIM to be an auto-pickup? Separate from `pickup_card_id` on
+/// purpose: together they distinguish "not a pickup, deliver it" from "a pickup
+/// the guard could not read", and only the second is a defect worth a WARN.
+///
+/// This is the two-fixes half. The failure being fixed here was invisible
+/// precisely because a dark guard and a fleet with no stale pickups produce the
+/// same observation — zero voids. With this, the next drift announces itself in
+/// the log the first time a pickup is delivered.
+fn looks_like_pickup(text: &str) -> bool {
+    text.contains(crate::runtime_jobs::board_drive::PICKUP_ANCHOR)
+}
+
+/// The `guard` label every board-drive steering row carries, and the ONLY thing
+/// that routes a queued row into the AMUX-3052 stale-pickup check.
+///
+/// SAME DEFECT AS AF-268, ONE LAYER UP, caught before it fired. The string had
+/// five copies in this seam: two enqueue sites (`board_drive::deliver`,
+/// `deliver_about`), the reactive dispatch in `api/board.rs`, and two readers
+/// here. Rename any producer's copy and `pickup_stale_void` returns None on the
+/// first line, before the parser is ever consulted — so the parse-failure WARN
+/// that catches template drift cannot fire, because the row never reaches it.
+///
+/// That is the residual `amux` named on AF-268 and proposed covering with a
+/// last-evaluated timestamp. A shared const is the cheaper half of it: this
+/// drift becomes impossible rather than observable. The other half, "delivery
+/// stops routing through pickup_stale_void at all", is already covered by
+/// `a_stale_auto_pickup_is_voided_at_the_delivery_boundary`, which drives the
+/// real `steer_deliver_tick` and would fail if the call were removed.
+pub(crate) const BOARD_DRIVE_GUARD: &str = "board-drive";
 
 /// AMUX-3052 void decision, extracted from `steer_deliver_tick` so BOTH legs are
 /// unit-testable in isolation (a drop-guard that silently drops everything passes
@@ -8170,7 +8934,7 @@ fn pickup_stale_void(
     card_session: Option<&str>,
     recipient: &str,
 ) -> Option<String> {
-    if !guard.starts_with("board-drive") {
+    if !guard.starts_with(BOARD_DRIVE_GUARD) {
         return None; // not a board-drive delivery — never void a user/inter-session message
     }
     let card = pickup_card_id(text)?; // not a single-card pickup (e.g. a nudge) — deliver
@@ -8186,20 +8950,94 @@ fn pickup_stale_void(
 pub async fn steer_deliver_tick(state: &AppState) -> usize {
     // Only lanes that actually HAVE a queue: costs nothing on an empty fleet,
     // and keeps the pane captures below proportional to real work.
+    // (steer id, card, why) for rows whose premise expired — filled inside the
+    // read scope, acted on outside it (the delete is a write).
+    let expired: Vec<(String, String, String)>;
     let queued: Vec<(String, String, String, f64, String, String)> = {
         let Ok(conn) = state.store.read() else { return 0 };
         let Ok(mut stmt) = conn.prepare(
-            "SELECT id, session, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') \
+            "SELECT id, session, text, queued_at, COALESCE(guard,''), COALESCE(sender,''), \
+                    COALESCE(precond_card,''), COALESCE(precond_rev,-1) \
              FROM steering_queue ORDER BY queued_at ASC",
         ) else {
             return 0;
         };
-        let rows = stmt
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)))
+        type QueuedRow = (String, String, String, f64, String, String, String, i64);
+        let rows: Vec<QueuedRow> = stmt
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?, r.get(7)?))
+            })
             .map(|it| it.flatten().collect::<Vec<_>>())
             .unwrap_or_default();
-        rows
+        // DROP A ROW WHOSE PREMISE HAS EXPIRED (AMUX-3659).
+        //
+        // The text of a board nudge asserts a card's CURRENT state, and it was
+        // computed at enqueue. Measured over 24h: 649 deliveries, mean lag
+        // 166s, 32% over a minute, max an hour. If the card moved in between,
+        // the message is about a state that no longer exists — and a false
+        // premise on arrival is indistinguishable from a broken trigger, which
+        // is what cost mvs-research an investigation on MR-2.
+        //
+        // Only rows that OPTED IN carry a precondition; everything else is
+        // untouched by this and delivers exactly as before.
+        let mut stale: Vec<(String, String, String)> = Vec::new();
+        let rows: Vec<_> = rows
+            .into_iter()
+            .filter(|(id, _s, _t, _q, _g, _sd, card, rev)| {
+                if card.is_empty() || *rev < 0 {
+                    return true;
+                }
+                let cur: Option<i64> = conn
+                    .query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![card], |r| r.get(0))
+                    .ok();
+                match cur {
+                    // Card gone: the premise cannot hold, and nothing will
+                    // re-fire for a card that no longer exists.
+                    None => {
+                        stale.push((id.clone(), card.clone(), "card no longer exists".into()));
+                        false
+                    }
+                    Some(now_rev) if now_rev != *rev => {
+                        stale.push((
+                            id.clone(),
+                            card.clone(),
+                            format!("card moved rev {rev} -> {now_rev} since this was computed"),
+                        ));
+                        false
+                    }
+                    Some(_) => true,
+                }
+            })
+            .collect();
+        expired = stale;
+        rows.into_iter()
+            .map(|(a, b, c, d, e, f, _, _)| (a, b, c, d, e, f))
+            .collect::<Vec<_>>()
     };
+    // NEVER SILENT, and OUTSIDE the read guard — the delete is a write and the
+    // read connection must be dropped first. A nudge that was dropped and one
+    // that was never queued look identical from the outside, and that ambiguity
+    // is precisely why this defect took a cross-session investigation to pin
+    // down. Say which rows went and why, in the log the fleet already reads.
+    for (id, card, why) in &expired {
+        tracing::info!(
+            steer_id = %id, card = %card, reason = %why,
+            "steering: dropped a queued nudge whose premise expired before delivery \
+             (AMUX-3659) — the trigger will re-fire if the condition still holds"
+        );
+    }
+    if !expired.is_empty() {
+        let ids: Vec<String> = expired.iter().map(|(i, _, _)| i.clone()).collect();
+        let _ = state
+            .store
+            .write_async(move |c| {
+                for id in &ids {
+                    c.execute("DELETE FROM steering_queue WHERE id=?1", rusqlite::params![id])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+    }
     if queued.is_empty() {
         return 0;
     }
@@ -8243,7 +9081,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // The re-check reads the LIVE issues.status row — NOT session_events
         // (records the claim but not the close on this path) and NOT
         // issues.updated (stale at the claim second), per gtm-engine's forensics.
-        if guard.starts_with("board-drive") {
+        if guard.starts_with(BOARD_DRIVE_GUARD) {
             if let Some(card_id) = pickup_card_id(&text) {
                 // Ok(Some(status)) found · Ok(None) deleted · Err → read failed,
                 // so DO NOT void — delivering a valid pickup beats dropping one on
@@ -8349,6 +9187,24 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                     )
                     .await;
                 }
+            } else if looks_like_pickup(&text) {
+                // THE GUARD IS DARK FOR THIS ROW and would otherwise say nothing.
+                // A parser that returns None reads exactly like "this was a nudge,
+                // not a pickup" — which is how the 03ed2b6c drift survived 17
+                // hours and 97 deliveries with a green suite: no void ever fired,
+                // and zero voids is also what a healthy fleet looks like.
+                //
+                // Reached only when the text carries PICKUP_ANCHOR (so it IS a
+                // pickup) and the id after it did not parse. Delivering is still
+                // right — fail-open, same posture as the read-failure leg above —
+                // but it must not be silent.
+                tracing::warn!(
+                    session = %session, id = %id,
+                    preview = %chars_truncate(&text, 120),
+                    "auto-pickup prompt carries the anchor but NO parsable card id — \
+                     the AMUX-3052 stale guard cannot run on it (template drift: the id \
+                     must be the first token after board_drive::PICKUP_ANCHOR)"
+                );
             }
         }
         // Per-lane preconditions are evaluated once, not per row — via the SAME
@@ -8498,7 +9354,7 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         // from_steering=true is still passed: it makes the callee REFUSE rather
         // than re-queue if the lane starts generating between this check and the
         // send, so a lost race leaves the row where it is instead of duplicating.
-        let (ok, msg) = send_text_inner(state, &session, &text, false, true, mid_turn, false).await;
+        let (ok, msg) = send_text_inner(state, &session, &text, SendMode::drained(mid_turn, false)).await;
         if !ok {
             skip(&session, &id, &format!("send-refused: {msg}"));
             continue; // NEXT ROW for this lane, not the next lane
@@ -8762,15 +9618,47 @@ async fn warn_on_stalled_lanes(state: &AppState) {
         //
         // Both go in the line and both go in the key. They agree most of the
         // time; the times they disagree are exactly the ones worth seeing.
+        // A HOLD IS NOT A STALL (AMUX-2238). Once a rate-limited lane holds its
+        // queue by design, this path would report the designed behaviour as a
+        // fault: "STALLED — messages are not reaching this lane" is true and
+        // completely misleading, and it would fire every hour a limit lasts,
+        // plus notify the SENDER that something needs doing when nothing does.
+        //
+        // That is how a warning stops being read. So the hold stays VISIBLE and
+        // stops claiming a fault: INFO, its own wording, and no sender
+        // notification. Nothing is lost by not escalating — the lane already
+        // emits `session.rate_limited` and carries the status badge, so the
+        // condition is on the record where people look for it, which is the
+        // question ethos rule 4 actually asks.
+        //
+        // Deliberately NOT a duration threshold. "Warn if the limit lasts more
+        // than N hours" is a tuned parameter guarding a state amux can already
+        // observe directly, and picking N at all is the tell.
+        let held_by_limit = cond == "rate-limited";
         if stall_log_first_this_bucket(&stall_dedupe_key(&session, cond, &reason), bucket) {
-            tracing::warn!(
-                session = %session,
-                queued = count,
-                oldest_min = (age / 60.0) as i64,
-                last_skip = %reason,
-                blocked_now = %cond,
-                "steering queue STALLED — messages are not reaching this lane"
-            );
+            if held_by_limit {
+                tracing::info!(
+                    session = %session,
+                    queued = count,
+                    oldest_min = (age / 60.0) as i64,
+                    last_skip = %reason,
+                    "steering queue HELD — the lane is rate-limited; delivery resumes when the \
+                     sweep observes the limit released (AMUX-2238). This is the designed \
+                     behaviour, not a stall."
+                );
+            } else {
+                tracing::warn!(
+                    session = %session,
+                    queued = count,
+                    oldest_min = (age / 60.0) as i64,
+                    last_skip = %reason,
+                    blocked_now = %cond,
+                    "steering queue STALLED — messages are not reaching this lane"
+                );
+            }
+        }
+        if held_by_limit {
+            continue;
         }
 
         // ETHOS RULE 4, which is the whole of this card: "when this goes wrong,
@@ -8939,7 +9827,7 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
         // hook_confirmed_idle=true: the Stop hook just reported idle — trust
         // it over the pane scrape. The pane may still show "esc to interrupt"
         // from background agents, which is NOT generation.
-        let (ok, msg) = send_text_inner(state, session, &rtext, false, true, mid, true).await;
+        let (ok, msg) = send_text_inner(state, session, &rtext, SendMode::drained(mid, true)).await;
         if ok {
             id = rid;
             text = rtext;
@@ -9453,7 +10341,22 @@ async fn dispatch(
     // `send` from this list would hand every one of them the pointer instead.
     // The list shrinks when a verb's legacy spelling has no callers left, not
     // when it gains a modern route.
-    const NATIVE_ONLY_HERE: [&str; 2] = ["peek", "send"];
+    //
+    // `duplicate` joins them on the SAME rule, not as an exception to it: it is
+    // implemented here and has no modern home (there is no
+    // `POST /api/workers/{id}/duplicate`), so a store-managed worker asking to
+    // be duplicated was being handed a pointer to a route that does not
+    // implement the verb.
+    //
+    // ITS PRECONDITION IS NOW MET, which is the only reason this line may
+    // change. #137 (@tsukimiya) filed the ordering explicitly: exempting
+    // `duplicate` is precisely what makes an unregistered twin reachable, so
+    // the exemption had to wait for the registration. `register_twin` writes
+    // the `_amux_workers` row before either verb returns, and rolls the copied
+    // env file back if it cannot — so promoting no longer ships a route that
+    // mints sessions `/api/workers` cannot see. Reversing this order re-opens
+    // the defect; the doc records the same ordering.
+    const NATIVE_ONLY_HERE: [&str; 3] = ["peek", "send", "duplicate"];
     if !NATIVE_ONLY_HERE.contains(&action.as_str()) {
         let is_rust_worker = state
             .store
@@ -9475,7 +10378,17 @@ async fn dispatch(
     let qs = parse_qs(q.as_deref().unwrap_or(""));
     let body: Value = match parse_body(&body_bytes) {
         Ok(v) => v,
-        Err(e) => return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e})),
+        Err(e) => {
+            tracing::warn!(
+                session = %name,
+                method = %method.as_str(),
+                action = %action,
+                body_sample = %String::from_utf8_lossy(&body_bytes[..body_bytes.len().min(100)]),
+                parse_error = %e,
+                "malformed_request_body: JSON parsing failed"
+            );
+            return jresp(StatusCode::BAD_REQUEST, json!({"error": e}));
+        }
     };
     // Validate session exists (py:74882) — for every action, share included.
     // ONE exception: a RETRY of a partially-completed rename addresses the
@@ -9850,16 +10763,32 @@ async fn get_dispatch(
                 fs.capture_panes();
                 let running = fs.agent_running(&format!("amux-{nm}"));
                 let (status, explain) = fs.derive_status_explain(&nm, running);
-                Ok((running, status, explain))
+                // THE RETROSPECTIVE HALF (AMUX-3761). Everything above answers
+                // "why is this lane's badge what it is RIGHT NOW", and every
+                // question anyone actually asks about a badge is about a moment
+                // that has already passed — a screenshot arrives minutes late,
+                // by which time the lane has taken another turn and the live
+                // verdict is a different, correct, useless answer.
+                let (history, since) = status_decision_history(&conn, &nm, 20);
+                Ok((running, status, explain, history, since))
             })
             .await;
             match joined {
-                Ok(Ok((running, status, explain))) => j200(json!({
+                Ok(Ok((running, status, explain, history, since))) => j200(json!({
                     "session": name,
                     "running": running,
                     "status": status,
                     "explain": explain,
-                    "note": "decided_by names the rule that produced `status`; transition/pane/report carry the evidence and trust windows the rules weighed. Fresh snapshot, same derivation the session list uses.",
+                    "history": history,
+                    // AN EMPTY HISTORY HAS TWO MEANINGS and they are opposite:
+                    // this lane has been stable, or nothing has been sampling
+                    // it. `history_recorded_since` is null in the second case,
+                    // and the cadence says how coarse the sample is, because a
+                    // flip that completes inside one tick leaves no row and
+                    // that gap must not read as "it never changed".
+                    "history_recorded_since": since,
+                    "history_sample_secs": crate::runtime_jobs::status_history::tick_secs(),
+                    "note": "decided_by names the rule that produced `status`; transition/pane/report carry the evidence and trust windows the rules weighed. Fresh snapshot, same derivation the session list uses. `history` is a SAMPLE on change at `history_sample_secs`, not a log of every derivation.",
                 })),
                 Ok(Err(e)) => (
                     StatusCode::INTERNAL_SERVER_ERROR,
@@ -10773,11 +11702,11 @@ async fn post_dispatch(
                 let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
                 if !instr.is_empty() {
                     if is_running(name).await {
-                        let _ = send_text(state, name, &instr, false).await;
+                        let _ = send_text(state, name, &instr, false, SendOrigin::Owner).await;
                     } else {
                         let st2 = state.clone();
                         let n = name.to_string();
-                        tokio::spawn(async move { send_after_ready(st2, n, instr, 60).await });
+                        tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
                     }
                     applied = true;
                 }
@@ -10902,7 +11831,7 @@ async fn post_dispatch(
                  Do all steps now. If any step fails, fix it and continue."
                     .to_string()
             };
-            let _ = send_text(state, name, &msg, false).await;
+            let _ = send_text(state, name, &msg, false, SendOrigin::Owner).await;
             j200(json!({"ok": true, "message": "deploy instructions sent to session"}))
         }
         "start" => {
@@ -10911,8 +11840,15 @@ async fn post_dispatch(
             let cfg = parse_env(name);
             let wd0 = cfg.get_or("CC_DIR", "").trim().to_string();
             if !wd0.is_empty() && !expanduser(&wd0).is_dir() {
+                // Missing work directory is a CLIENT validation error (4xx), not a
+                // server error (5xx). AMUX-378: this was returning 500 which masked the
+                // actual refusal — a client misconfiguration — as a server fault. Return
+                // 400 (Bad Request) instead, matching the pattern for other precondition
+                // failures on this endpoint (cf. start_block_reason @ line 10918 which
+                // returns 409 Conflict). Log the refusal so a sweep can find it.
+                tracing::warn!(session = %name, dir = %wd0, "session_start_refused: work directory missing (client config error)");
                 return jresp(
-                    StatusCode::INTERNAL_SERVER_ERROR,
+                    StatusCode::BAD_REQUEST,
                     json!({"ok": false, "message": format!("work dir missing: {wd0}")}),
                 );
             }
@@ -10939,7 +11875,7 @@ async fn post_dispatch(
                         // the tightest one for the very path most likely to
                         // exceed it (AMUX-3055). The loop still exits the instant
                         // the composer appears, so this only widens the ceiling.
-                        send_after_ready(st2.clone(), n.clone(), prompt, 60).await;
+                        send_after_ready(st2.clone(), n.clone(), prompt, 60, SendOrigin::Owner).await;
                     }
                 } else {
                     // A background failure must still be SEEN (ethos rule 4).
@@ -10999,7 +11935,27 @@ async fn post_dispatch(
             if std::fs::copy(env_path(name), &new_file).is_err() {
                 return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
             }
-            j200(json!({"ok": true, "message": format!("duplicated as {new_name}")}))
+            let registered = match register_twin(state, name, &new_name) {
+                Ok(applied) => applied,
+                // FAIL WHOLE, NOT HALF. Leaving the copied env file behind after
+                // a failed insert would produce exactly the unregistered twin
+                // this code exists to prevent, and it would do so on the error
+                // path where nobody looks.
+                Err(e) => {
+                    let _ = std::fs::remove_file(&new_file);
+                    return jresp(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        json!({"error": format!("could not register '{new_name}' in the worker store; the duplicate was rolled back rather than left invisible: {e}")}),
+                    );
+                }
+            };
+            j200(json!({
+                "ok": true,
+                "message": format!("duplicated as {new_name}"),
+                // Say which shape happened, so a caller can tell a registered
+                // twin from a plain env-file copy without going to the store.
+                "registered": registered,
+            }))
         }
         "clone" => clone_post(state, name, body).await,
         "archive" => {
@@ -11220,6 +12176,31 @@ pub(crate) fn env_flag_on(v: Option<&str>) -> bool {
 /// function is the single source of truth every isolation decision consults:
 /// spawn-env suppression, `--mcp-config`, board auto-capture, the peer fleet
 /// list, the fleet roster, the peer-send guard, and the status/rate-limit sweep.
+///
+/// AND WHAT GETS TYPED INTO ITS PANE, which that list did not cover for two
+/// months (Ethan, 2026-08-26: "we have an isolated worker but it still has amux
+/// shit", naming gtm-research). Every consumer above is about what the worker is
+/// TOLD ABOUT or DISCOVERABLE BY. Measured that day: ZERO of the 15
+/// `runtime_jobs` consulted this function, and three of them steer text into
+/// sessions — so a lane marked "raw agent, no amux harness" was still receiving
+/// commit nudges and board auto-pickup claims. Now:
+///
+/// - `commit_nudge` skips isolated lanes.
+/// - `board_drive` filters them out of `lanes()` — at the SELECTION, not the
+///   send. Gating delivery would let auto-pickup CLAIM a card for a lane it then
+///   cannot reach, stranding it in `doing`, which is worse than the bug.
+///
+/// THE SCHEDULER IS DELIBERATELY NOT FILTERED, and that is a decision rather
+/// than an omission. A schedule is a standing instruction a HUMAN created
+/// against that session by name; isolation is about amux's own automation not
+/// typing at a raw agent, not about silently cancelling configuration somebody
+/// set up (ethos rule 8). Owner peek/send are untouched for the same reason —
+/// that is the documented boundary.
+///
+/// The lesson, since this list is what was wrong: audit an exemption against
+/// what still REACHES the thing, not against what the list already names.
+/// "Who receives this by default" is ethos rule 1's question, and it applies to
+/// exemptions as much as to features.
 pub(crate) fn session_is_isolated(name: &str) -> bool {
     env_flag_on(parse_env(name).get("CC_ISOLATED"))
 }
@@ -11478,7 +12459,14 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
             );
         }
     }
-    let (ok, msg) = send_text(state, name, &text, defer_busy).await;
+    // A PEER RELAY IS NOT THE OWNER (AMUX-3764). `origin` is the sender's
+    // server-verified session identity, empty only when a person sent it. The
+    // documented boundary for an isolated lane is "the owner's own send still
+    // works" — a peer lane addressing it through amux's messaging is amux
+    // mediation, which is what "raw LLM pass through" excludes.
+    let send_origin =
+        if origin.is_empty() { SendOrigin::Owner } else { SendOrigin::Automation };
+    let (ok, msg) = send_text(state, name, &text, defer_busy, send_origin).await;
     if ok {
         update_meta(
             name,
@@ -11577,6 +12565,73 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     jresp(code, resp)
 }
 
+/// Give a copied session its own `_amux_workers` row, when the source has one.
+///
+/// #137 (@tsukimiya) / AF-236. `duplicate` and `clone` both copy the env file
+/// and, before this, touched the `workers` table nowhere: across the whole of
+/// this module the only `queries::` call that saw it was the dispatch guard's
+/// own read. `list_workers` reads the store, so a copied env file with no row
+/// is a session that can RUN while being absent from `/api/workers` and from
+/// the dashboard. Copying the file and not the row is what makes the twin
+/// invisible rather than merely new.
+///
+/// The reporter filed it as a PRECONDITION rather than a bug, which was the
+/// right call: `dispatch()` answers 501 for every verb on a store-managed
+/// worker, so neither verb was reachable, and exempting one is exactly what
+/// would have made it reachable. That is why this landed BEFORE the promotion
+/// and not after.
+///
+/// ONE helper for both verbs, deliberately. `clone` is slated for retirement in
+/// favour of `duplicate` (docs/workers-verb-classification.md), but "will be
+/// deleted eventually" and "cannot mint an invisible session today" are
+/// different properties, and fixing only the survivor would leave the identical
+/// defect behind the same guard for whoever promotes the other one.
+///
+/// Returns whether a row was written: `false` is the correct, non-error answer
+/// for a plain env-file source. Minting a row for that twin would invent a
+/// worker the original never was — the mirror defect, harder to spot because an
+/// extra row reads as tidiness.
+fn register_twin(state: &AppState, source: &str, twin: &str) -> Result<bool, String> {
+    let src = source.to_string();
+    let twin_name = twin.to_string();
+    let out = state
+        .store
+        .write(move |conn| {
+            let Some(row) = crate::db::queries::get_worker(conn, &src)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let mut config = row.config();
+            config.display_name = twin_name.clone();
+            // Aliases are the SOURCE's former names (Invariant 17). Copying them
+            // would let `get_worker` resolve an old name of the source to the
+            // twin, silently re-pointing every caller still using it — the twin
+            // would answer peeks meant for the original.
+            config.name_aliases.clear();
+            let id = WorkerId::from_ulid(ulid::Ulid::new());
+            let new_row =
+                crate::db::queries::WorkerRow::new(&id, &config, &chrono::Utc::now().to_rfc3339());
+            crate::db::queries::insert_worker(conn, &new_row)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .map_err(|e| e.to_string());
+    match &out {
+        Ok(o) => Ok(o.applied),
+        Err(e) => {
+            // Named marker: the caller rolls the copy back, so without this the
+            // only trace of a store that refused the write would be a 500 among
+            // every other 500 on this route.
+            tracing::warn!(
+                marker = "twin_worker_row_failed",
+                source = %source,
+                twin = %twin,
+                error = %e,
+                "could not register a duplicated session in the worker store (AF-236 / #137)"
+            );
+            Err(e.clone())
+        }
+    }
+}
+
 async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
     let new_name = body_str(body, "new_name").trim().to_string();
     if new_name.is_empty() {
@@ -11591,6 +12646,22 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
     if std::fs::copy(env_path(name), &new_file).is_err() {
         return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
     }
+    // BEFORE start_session, not after (#137 / AF-236). `clone` is the worse
+    // half of the pair precisely because it then STARTS the copy: an
+    // unregistered twin here is not a dormant file, it is a running session
+    // that /api/workers cannot see. Registering first means the window in
+    // which it exists-and-is-invisible does not open at all, and a store that
+    // refuses the write costs a rolled-back file rather than a live ghost.
+    let cloned_registered = match register_twin(state, name, &new_name) {
+        Ok(applied) => applied,
+        Err(e) => {
+            let _ = std::fs::remove_file(&new_file);
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("could not register '{new_name}' in the worker store; the clone was rolled back rather than started invisible: {e}")}),
+            );
+        }
+    };
     let source_meta = load_meta(name);
     let session_id = {
         let sid = meta_str(&source_meta, "cc_conversation_id");
@@ -11655,7 +12726,7 @@ async fn clone_post(state: &AppState, name: &str, body: &Value) -> Response {
             send_key(&new_name, "Enter").await;
         }
     }
-    j200(json!({"ok": true, "message": format!("cloned as {new_name} (method: {method_used})"), "started": ok}))
+    j200(json!({"ok": true, "message": format!("cloned as {new_name} (method: {method_used})"), "started": ok, "registered": cloned_registered}))
 }
 
 fn find_latest_session_id(work_dir: &str) -> String {
@@ -12446,12 +13517,8 @@ async fn rename_session(state: &AppState, name: &str, raw_new: &str) -> Response
             let mut out = Vec::new();
             // Python's cascade (py:76375-76437). issues: active only —
             // historical/deleted keep the old name, matching Python.
-            let python_tables: [(&str, &str); 4] = [
-                ("issues", "UPDATE issues SET session=?1 WHERE session=?2 AND deleted IS NULL"),
-                ("schedules", "UPDATE schedules SET session=?1 WHERE session=?2"),
-                ("session_gates", "UPDATE session_gates SET session=?1 WHERE session=?2"),
-                ("saved_messages", "UPDATE saved_messages SET session=?1 WHERE session=?2"),
-            ];
+            let python_tables = RENAME_MIGRATIONS;
+
             for (table, sql) in python_tables {
                 match conn.execute(sql, rusqlite::params![new_s, old_s]) {
                     Ok(n) => out.push(format!("db.{table}: {n} row(s)")),
@@ -12832,7 +13899,7 @@ fn spawn_switch_confirm_watcher(name: &str) {
 /// choreography here would rediscover all of them.
 async fn deliver_hot_config(state: &AppState, name: &str, cmd: &str, ack: &str) -> HotOutcome {
     let before = tmux_capture(name, 40).await;
-    let (sent, msg) = send_text(state, name, cmd, true).await;
+    let (sent, msg) = send_text(state, name, cmd, true, SendOrigin::Automation).await;
     tracing::info!(session = name, cmd, sent, result = %msg, "hot config: delivered");
     if !sent {
         return HotOutcome::Failed(msg);
@@ -13480,18 +14547,95 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         return j200(json!({"ok": true, "message": format!("{msg} (restart session to apply)")}));
     }
 
-    // New conversation (py:76741).
+    // New conversation (py:76741), extended to RUNNING workers (AMUX-3742).
+    //
+    // Why this had to change: a lane's conversation is immortal. Every start
+    // resumes (all 8 `start_session` call sites pass skip_conv_id=false; the
+    // one `true` is the `--fork-session` duplicate path), so a lane
+    // accumulates compaction generations forever. Measured over every
+    // transcript active since 2026-08-05: amux lanes median 17 compactions,
+    // max 430; raw terminal sessions median 0. The median lane answers from a
+    // 17th-generation lossy summary while a raw terminal answers from primary
+    // sources — the whole "same model, same prompt, worse output" report.
+    //
+    // The remedy already existed and reached NOBODY (ethos rule 1): this
+    // handler refused while running, and `app.js` rendered the menu item only
+    // when `!s.running`. Every live lane is running, so the one control that
+    // fixes a degraded conversation was hidden and refused on all of them.
+    //
+    // `restart: true` does it live. NOT the default: recycling discards the
+    // lane's accumulated context, which is its work, so the caller says so
+    // explicitly (ethos rule 8). The 409 for the bare form now NAMES its own
+    // escape in the sanctioned tooling rather than in HTTP terms only —
+    // ethos rule 6, the constraint whose documented escape was unwalkable.
     if body.get("new_conversation").map(py_truthy).unwrap_or(false) {
-        if is_running(name).await {
+        let restart = body.get("restart").map(py_truthy).unwrap_or(false);
+        let running = is_running(name).await;
+        if running && !restart {
             return jresp(
                 StatusCode::CONFLICT,
-                json!({"error": "stop the session before starting a new conversation"}),
+                json!({
+                    "error": "worker is running: a fresh conversation needs it restarted",
+                    "running": true,
+                    "escape": format!("amux fresh {name}  (or re-send with {{\"new_conversation\":true,\"restart\":true}})"),
+                }),
             );
         }
+        let generations = conversation_generations(name);
+        // Clear BEFORE the stop. Safe in this order because stop_session
+        // writes only `cc_session_name`; it is `restart_for_swap` that
+        // re-stashes a conversation id via find_latest_session_id, which is
+        // exactly why this path does its own stop/start instead of reusing it.
         let mut meta = load_meta(name);
+        let previous = meta_str(&meta, "cc_conversation_id");
         meta.remove("cc_conversation_id");
         save_meta(name, &meta);
-        return j200(json!({"ok": true, "message": "conversation reset — next start will be a fresh conversation"}));
+        // Greppable, because the point of the fix is that the degradation was
+        // invisible: `conversation_recycled` carries how many generations deep
+        // the discarded conversation was, so a log sweep can see both that
+        // lanes are being recycled and how bad they get before anyone acts.
+        tracing::warn!(
+            session = %name,
+            generations = generations.map(|g| g as i64).unwrap_or(-1),
+            restarted = running,
+            previous_conv = %chars_truncate(&previous, 8),
+            "conversation_recycled: worker keeps its env/cards/memory, the conversation starts fresh"
+        );
+        emit_event(
+            state,
+            name,
+            "session.conversation_recycled",
+            Some(json!({"generations": generations, "restarted": running})),
+            None,
+            "api-config",
+        )
+        .await;
+        if !running {
+            return j200(json!({
+                "ok": true, "restarted": false, "generations": generations,
+                "message": "conversation reset — next start will be a fresh conversation",
+            }));
+        }
+        let st2 = state.clone();
+        let n = name.to_string();
+        tokio::spawn(async move {
+            let _ = stop_session(&n).await;
+            kill_tmux_session(&n).await;
+            // skip_conv_id=true AND the meta already cleared: belt and braces,
+            // because either one alone still leaves a path that could resume.
+            let (ok, msg) = start_session(&st2, &n, "", true).await;
+            if !ok {
+                tracing::warn!(session = %n, reason = %chars_truncate(&msg, 200),
+                    "conversation_recycle_failed: worker stopped but did not come back");
+            }
+        });
+        return jresp(
+            StatusCode::ACCEPTED,
+            json!({
+                "ok": true, "restarted": true, "generations": generations,
+                "message": "restarting on a fresh conversation",
+            }),
+        );
     }
 
     jresp(StatusCode::BAD_REQUEST, json!({"error": "nothing to update"}))
@@ -14226,8 +15370,8 @@ mod tests {
     /// (still `doing` at delivery after 578s) delivers.
     #[test]
     fn stale_pickup_voids_iff_card_left_doing_not_by_how_long_it_waited() {
-        let pick =
-            "[amux auto-pickup] Claimed board card GE-626 from your queue — work it now.";
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
+        let pick = &format!("{PICKUP_ANCHOR}GE-626 — work it now.");
         // DROP leg — card closed/moved in the claim->delivery gap.
         assert_eq!(
             pickup_stale_void("board-drive", pick, Some("done"), Some("gtm-engine"), "gtm-engine").as_deref(),
@@ -14278,6 +15422,164 @@ mod tests {
             pickup_stale_void("board-drive", "advance BDQ-1 or move it — a nudge, no card sentinel", Some("done"), Some("x"), "x"),
             None,
             "a board-drive NUDGE is not a single-card pickup and must deliver"
+        );
+    }
+
+    /// ZERO AMUX HARNESS INTO AN ISOLATED LANE (Ethan, 2026-08-26).
+    ///
+    /// Reported as one nudge in one lane (gtm-research). The cause was that
+    /// isolation's consumer list covered what a worker is TOLD ABOUT and
+    /// DISCOVERABLE BY and nothing about what is TYPED INTO ITS PANE — zero of
+    /// the 15 runtime_jobs consulted `session_is_isolated`, while seven
+    /// automated producers reach this chokepoint.
+    ///
+    /// THE OWNER'S SEND IS THE LOAD-BEARING CELL. A fix that refused everything
+    /// into an isolated lane would pass the first assertion perfectly and mute
+    /// the worker completely — and "the owner can still peek and send" is the
+    /// documented boundary of the whole feature. Asserting only the refusal
+    /// would ship that.
+    #[tokio::test]
+    async fn an_isolated_lane_refuses_amux_automation_and_still_takes_the_owners_send() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_DIR=/tmp\nCC_ISOLATED=\"1\"\n").unwrap();
+        std::fs::write(sessions.join("ordinary.env"), "CC_DIR=/tmp\n").unwrap();
+        assert!(
+            session_is_isolated("raw"),
+            "fixture must actually be isolated, or every assertion below is vacuous"
+        );
+        assert!(!session_is_isolated("ordinary"));
+
+        // AUTOMATION is refused. `guard` is what names the producer, and every
+        // automated one sets it.
+        for src in ["commit-nudge", "board-drive", "staged-guard", "auto-compact"] {
+            let r = steer_enqueue(&st, "raw", "harness text", src, "").await;
+            assert!(r.is_err(), "{src} must not be delivered into an isolated lane");
+        }
+
+        // THE OWNER'S OWN SEND still queues. `send_text_inner` passes an empty
+        // guard, which is the discriminator — and it makes the rule opt-OUT: a
+        // NEW automated caller is blocked by default rather than needing to be
+        // added to a list somebody must remember.
+        assert!(
+            steer_enqueue(&st, "raw", "owner text", "", "").await.is_ok(),
+            "the owner's send must still reach an isolated lane — that is the documented boundary"
+        );
+
+        // CONTROL: an ORDINARY lane still takes automation, or this fix is
+        // "turn the fleet off" and every assertion above would still pass.
+        assert!(
+            steer_enqueue(&st, "ordinary", "harness text", "commit-nudge", "").await.is_ok(),
+            "automation into a NON-isolated lane must be unaffected"
+        );
+
+        // AND THE OTHER LAYER (AMUX-3764). Every assertion above is about the
+        // QUEUE, and three producers never touch it: `deliver_hot_config` types
+        // a slash command straight into the pane, and both `channels.rs`
+        // notices call `send_text` directly. So the whole test above passed
+        // while amux automation still reached an isolated lane — the same
+        // shape as the consumer list bc6d3067 deleted, one layer down.
+        //
+        // ASSERT THE DECISION, NEVER THE DELIVERY (AMUX-3765). The first
+        // version of this block called `send_text` for all three cells. The
+        // REFUSED one is safe — it returns before any side effect — but the two
+        // CONTROLS proceed, and `send_text_inner`'s auto-wake path STARTS A REAL
+        // SESSION for a lane that is not running. They spawned two live Claude
+        // Code processes on the production tmux socket, in /private/tmp, on a
+        // Claude Max seat, and one of them ran a turn replying to the literal
+        // string "owner text".
+        //
+        // The controls are the whole reason this test discriminates, so the
+        // answer is not to drop them: it is to test the gate's VERDICT through
+        // the pure predicate the send path now calls.
+        assert!(
+            isolation_refusal("raw", SendOrigin::Automation).is_some(),
+            "automation must be refused at the SEND layer too"
+        );
+        assert!(
+            isolation_refusal("raw", SendOrigin::Automation).unwrap().contains("isolated"),
+            "and the refusal must name why"
+        );
+        assert!(
+            isolation_refusal("raw", SendOrigin::Owner).is_none(),
+            "the owner's send must not be refused by the isolation gate"
+        );
+        assert!(
+            isolation_refusal("ordinary", SendOrigin::Automation).is_none(),
+            "a non-isolated lane must be unaffected, or this gate is just 'turn the fleet off'"
+        );
+    }
+
+    /// The test above spawned real sessions, so this pins the property that
+    /// stops it recurring: NO test in this module may reach the auto-wake path.
+    ///
+    /// The tell is calling `send_text`/`send_text_inner` with a lane that is not
+    /// running — `send_text_inner` starts one. A grep is a weak check, and it is
+    /// the right weight here: the strong version needs a tmux seam this module
+    /// does not have, and a weak check that names the hazard beats the nothing
+    /// that was there when it happened (AMUX-3765).
+    #[test]
+    fn no_test_in_this_module_sends_into_a_lane_that_could_be_auto_woken() {
+        let src = include_str!("session_verbs.rs");
+        let tests = src.rfind("mod tests").map(|i| &src[i..]).unwrap_or("");
+        const NEEDLE: &str = "send_text(&st";
+        for (n, line) in tests.lines().enumerate() {
+            let l = line.trim();
+            // Skip the guard's OWN source: it necessarily contains the
+            // needle it searches for, which is the classic self-match.
+            if l.starts_with("//") || l.contains("NEEDLE") || !l.contains(NEEDLE) {
+                continue;
+            }
+            panic!(
+                "test-module line {n} calls send_text on a live store: {l}\n\
+                 `send_text_inner` AUTO-WAKES a lane that is not running, which starts a real \
+                 Claude Code process on the production tmux socket (AMUX-3765 did exactly this, \
+                 twice). Assert the decision through a pure predicate instead — \
+                 `isolation_refusal` is the one this module already exposes."
+            );
+        }
+    }
+
+    /// The `defer_if_busy` park used to erase the guard to `""` on its way to
+    /// the queue, which is exactly the value the queue gate reads as "the
+    /// owner" — so an automated send that happened to find the lane at a
+    /// selector was laundered into an owner send (AMUX-3764).
+    ///
+    /// Asserts on the SHIPPED `park_guard`, not a copy of it: reaching that
+    /// branch for real needs a live pane sitting on a picker, and a local
+    /// re-implementation would stay green against any change to the real one.
+    #[tokio::test]
+    async fn a_parked_automated_send_keeps_a_guard_and_the_owners_does_not() {
+        assert!(
+            !park_guard(SendOrigin::Automation).is_empty(),
+            "a parked automated send must stay guarded, or the queue reads it as the owner"
+        );
+        assert!(
+            park_guard(SendOrigin::Owner).is_empty(),
+            "and the owner's parked send must stay unguarded, or it stops reaching isolated lanes"
+        );
+
+        // The consequence, through the real gate: the guard this produces must
+        // actually be refused by an isolated lane's queue. Asserting the string
+        // is non-empty proves nothing on its own — `steer_enqueue` is what
+        // decides, and that is the coupling worth pinning.
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("raw.env"), "CC_DIR=/tmp\nCC_ISOLATED=\"1\"\n").unwrap();
+        assert!(session_is_isolated("raw"), "fixture must be isolated or this is vacuous");
+        assert!(
+            steer_enqueue(&st, "raw", "parked", park_guard(SendOrigin::Automation), "")
+                .await
+                .is_err(),
+            "the parked automated guard must be refused into an isolated lane"
+        );
+        assert!(
+            steer_enqueue(&st, "raw", "parked", park_guard(SendOrigin::Owner), "").await.is_ok(),
+            "the parked owner guard must still get through"
         );
     }
 
@@ -14381,6 +15683,108 @@ mod tests {
     /// `permanently_blocked`), and this change added the chokepoint without
     /// removing the copies. Collapsing them is what makes the threaded reason
     /// live.
+    /// AMUX-3649 / GitHub #134, reported with a 42-verb inventory by an external
+    /// contributor: `/api/workers` has no send, and the delivery path refuses a
+    /// rust-managed worker as non-existent.
+    ///
+    /// The cause was that `permanently_blocked` answers EXISTENCE with
+    /// `env_path(name).exists()` — `existence == has an env file`, true of the
+    /// tmux fleet substrate and of nothing else. A `_amux_workers` row has no
+    /// env file, so a worker that demonstrably exists got "no worker called
+    /// '<name>' exists".
+    ///
+    /// ASSERTS DELIVERY, NOT STATUS, which the card calls for and is the point:
+    /// a cell asserting 200 passes against a handler that drops the body. The
+    /// discriminator is that the message is actually QUEUED.
+    ///
+    /// The negative control is what stops this being indistinguishable from
+    /// deleting the guard — a MISTYPED name must still be refused, and with the
+    /// same wording, because that wording is the only thing a typo produces.
+    #[tokio::test]
+    async fn a_rust_managed_worker_accepts_delivery_and_a_typo_still_does_not() {
+        let (st, dir) = state();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).unwrap();
+
+        // A worker that exists ONLY as a row: no env file anywhere.
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                conn.execute_batch(
+                    "CREATE TABLE IF NOT EXISTS _amux_workers (\
+                       id TEXT PRIMARY KEY, display_name TEXT, name_aliases TEXT DEFAULT '[]',\
+                       cwd TEXT, provider TEXT, model TEXT, backend TEXT, environment TEXT,\
+                       permissions TEXT, group_id TEXT, state TEXT, version INTEGER DEFAULT 0,\
+                       created_at TEXT, updated_at TEXT);",
+                )?;
+                conn.execute(
+                    "INSERT INTO _amux_workers \
+                     (id, display_name, name_aliases, cwd, provider, backend, state, created_at, updated_at) \
+                     VALUES ('wrk_01ZZZTESTWORKER00000000000','rust-only','[]','/tmp','claude',\
+                             'herdr','{\"state\":\"stopped\"}','2026-08-24T00:00:00Z','2026-08-24T00:00:00Z')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+
+        // PREMISE, asserted so the treatment cannot pass for the wrong reason:
+        // this name has no env file, so the OLD check calls it non-existent.
+        assert_eq!(
+            permanently_blocked("rust-only"),
+            Some("no-env-file"),
+            "fixture premise: the env-file check must still say this does not exist"
+        );
+
+        // TREATMENT: the resolving check consults the row and finds it.
+        {
+            let conn = st.store.read().unwrap();
+            assert_eq!(
+                permanently_blocked_resolved(&conn, "rust-only"),
+                None,
+                "a worker that exists as a row must not be refused as non-existent"
+            );
+            // NEGATIVE CONTROL: a typo has no row and no env file, and must
+            // still be refused with the SAME reason — otherwise this is
+            // indistinguishable from deleting the guard.
+            assert_eq!(
+                permanently_blocked_resolved(&conn, "rust-onlyy"),
+                Some("no-env-file"),
+                "a mistyped name must still be refused"
+            );
+        }
+
+        // DELIVERY, not status: the message has to actually reach the queue.
+        let id = steer_enqueue_store(&st.store, "rust-only", "hello worker", "", "amux").await;
+        assert!(id.is_ok(), "enqueue to a rust-managed worker must be accepted: {id:?}");
+        let queued: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE session='rust-only' AND text='hello worker'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(queued, 1, "the message must be QUEUED, not merely accepted");
+
+        // And the typo must queue NOTHING.
+        let bad = steer_enqueue_store(&st.store, "rust-onlyy", "hello typo", "", "amux").await;
+        assert!(bad.is_err(), "a typo must still be refused");
+        let none: i64 = st
+            .store
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE session='rust-onlyy'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(none, 0, "nothing may be queued behind a permanent block");
+    }
+
     #[tokio::test]
     async fn a_permanently_blocked_target_is_refused_and_nothing_is_queued() {
         let (st, dir) = state();
@@ -14800,20 +16204,130 @@ mod tests {
         assert_eq!(msgs, 1, "the prompt is still recorded in cmd_history (Messages ledger)");
     }
 
-    // The stale-pickup guard (AMUX-3052) keys on the EXACT template board_drive.rs
-    // mints. This pins that the parser finds the id (anchor + tail both precede
-    // the "— work it now" separator, so the dash is irrelevant) and returns None
-    // for anything that is not a pickup — a non-pickup steering message must never
-    // be voided. If the template is reworded and this test is not, the guard goes
-    // dark; that is what this catches.
+    // The stale-pickup guard (AMUX-3052) reads the card id out of the prompt
+    // board_drive.rs mints. THE PREVIOUS VERSION OF THIS TEST WAS GREEN THROUGH
+    // THE WHOLE OUTAGE: it fed a hand-written copy of the RETIRED wording
+    // ("Claimed board card GV-648 from your queue"), so it pinned the parser to
+    // a string no producer had emitted since 03ed2b6c. A test that mints its own
+    // input cannot notice the producer moving.
+    //
+    // So the round-trip against the real `pickup_prompt` now lives in
+    // board_drive.rs, where the producer is in scope and a reword fails the test
+    // in the file being edited. What is left here is the half that belongs to
+    // the parser: everything it must REFUSE. A void drops a message, so a
+    // false positive is the expensive direction.
     #[test]
-    fn pickup_card_id_parses_the_template() {
-        let real = "[amux auto-pickup] Claimed board card GV-648 from your queue - work it now. \
-                    Anything quoted below is the CARD's stored text";
-        assert_eq!(pickup_card_id(real).as_deref(), Some("GV-648"));
+    fn pickup_card_id_refuses_everything_that_is_not_a_pickup() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
+
+        // Built from the const, never from a copy of the wording.
+        let real = format!("{PICKUP_ANCHOR}GV-648 — work it now. Card text below is historical");
+        assert_eq!(pickup_card_id(&real).as_deref(), Some("GV-648"));
+
         assert_eq!(pickup_card_id("hey, can you rebase and push?"), None);
         assert_eq!(pickup_card_id("[Ethan] decision on AMUX-1: APPROVED"), None);
-        assert_eq!(pickup_card_id("Claimed board card  from your queue"), None);
+        // The retired wording must NOT parse: it is not what ships, and quietly
+        // accepting both is how nobody notices which one is live.
+        assert_eq!(
+            pickup_card_id("[amux auto-pickup] Claimed board card GV-648 from your queue"),
+            None,
+            "the pre-03ed2b6c wording is dead; parsing it would hide the next drift"
+        );
+        // Anchor present, id missing or malformed -> None, which is what routes
+        // the WARN. Each of these would have been a plausible-looking void.
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}— work it now")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}the next card")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}lower-9 — work it now")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}AF- — work it now")), None);
+        assert_eq!(pickup_card_id(&format!("{PICKUP_ANCHOR}AF-x1 — work it now")), None);
+    }
+
+    // AMUX-3659, rebuilt from the MR-2 timeline to the second.
+    //
+    //   11:42:57  nudge QUEUED
+    //   11:45     mvs-research complies: needs:you cleared, card -> backlog
+    //   11:46:20  nudge DELIVERED, 3m23s after its premise was computed
+    //
+    // The trigger fired ONCE and was correct; the remedy was applied and worked.
+    // What arrived was a message asserting a state that had already changed, and
+    // a false premise on arrival is indistinguishable from a broken trigger —
+    // which is the conclusion it cost a cross-session investigation to overturn.
+    //
+    // Measured across 24h: 649 deliveries, mean lag 166s, 209 (32%) over a minute.
+    //
+    // The CONTROL is the half that matters. A message with NO precondition must
+    // be untouched, or this drops peer relays and scheduler commands — messages
+    // that assert nothing about a card and cannot go stale.
+    #[tokio::test]
+    async fn a_nudge_whose_card_moved_is_dropped_and_a_plain_message_is_not() {
+        let (st, _dir) = state();
+        let now = now_f64();
+        let _ = st
+            .store
+            .write_async(move |conn| {
+                ensure_fleet_tables(conn)?;
+                // rev 7 at compute time; the card has since moved to 9.
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, session, created, updated, rev) \
+                     VALUES ('MR-2','t','backlog','lane-a',0,0,9)",
+                    [],
+                )?;
+                // rev 3 and still 3 — the premise holds.
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, session, created, updated, rev) \
+                     VALUES ('MR-7','t','needsyou','lane-b',0,0,3)",
+                    [],
+                )?;
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard, precond_card, precond_rev) \
+                     VALUES('stale','lane-a','MR-2 has been waiting on a human answer',?1,'board-drive','MR-2',7)",
+                    rusqlite::params![now - 20.0],
+                )?;
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard, precond_card, precond_rev) \
+                     VALUES('fresh','lane-b','MR-7 has been waiting on a human answer',?1,'board-drive','MR-7',3)",
+                    rusqlite::params![now - 20.0],
+                )?;
+                // CONTROL: no precondition at all — a peer relay.
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
+                     VALUES('plain','lane-c','can you take a look at this?',?1,'')",
+                    rusqlite::params![now - 20.0],
+                )?;
+                // CONTROL: precondition naming a card that no longer exists.
+                conn.execute(
+                    "INSERT INTO steering_queue(id, session, text, queued_at, guard, precond_card, precond_rev) \
+                     VALUES('gone','lane-d','GONE-1 has been waiting',?1,'board-drive','GONE-1',1)",
+                    rusqlite::params![now - 20.0],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+
+        steer_deliver_tick(&st).await;
+
+        let conn = st.store.read().unwrap();
+        let present = |id: &str| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM steering_queue WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(present("stale"), 0, "a nudge whose card moved rev 7->9 must be dropped");
+        assert_eq!(present("gone"), 0, "a nudge about a card that no longer exists must be dropped");
+        // NOT dropped. `fresh` may or may not have been DELIVERED (that depends
+        // on the lane being at a boundary, which a test fleet has no way to be),
+        // so the assertion is the one this change is responsible for: it was not
+        // discarded as stale.
+        assert_eq!(present("fresh"), 1, "a nudge whose card has NOT moved must survive");
+        assert_eq!(
+            present("plain"),
+            1,
+            "a message with no precondition asserts nothing about a card and must be \
+             untouched — dropping these would silently eat peer relays"
+        );
     }
 
     // AMUX-3052: a queued auto-pickup for a card CLOSED after the atomic claim
@@ -14824,6 +16338,7 @@ mod tests {
     // been RED before the guard existed (the row would have stayed for delivery).
     #[tokio::test]
     async fn a_stale_auto_pickup_is_voided_at_the_delivery_boundary() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
         let (st, _dir) = state();
         let now = now_f64();
         let _ = st
@@ -14843,18 +16358,21 @@ mod tests {
                     [],
                 )?;
                 let stale =
-                    "[amux auto-pickup] Claimed board card GV-648 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}GV-648 — work it now.");
                 let live =
-                    "[amux auto-pickup] Claimed board card AMUX-9 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}AMUX-9 — work it now.");
+                // Guard from the const, never a literal: a fixture that types
+                // its own guard stays green through exactly the drift this
+                // test exists to catch (AF-268's lesson, applied to itself).
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
-                     VALUES('s1','lane-stale',?1,?2,'board-drive')",
-                    rusqlite::params![stale, now - 20.0],
+                     VALUES('s1','lane-stale',?1,?2,?3)",
+                    rusqlite::params![stale, now - 20.0, BOARD_DRIVE_GUARD],
                 )?;
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
-                     VALUES('s2','lane-live',?1,?2,'board-drive')",
-                    rusqlite::params![live, now - 20.0],
+                     VALUES('s2','lane-live',?1,?2,?3)",
+                    rusqlite::params![live, now - 20.0, BOARD_DRIVE_GUARD],
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -14945,6 +16463,7 @@ mod tests {
     /// carried the producer positionally would break here first.
     #[tokio::test]
     async fn a_row_leaving_the_queue_keeps_the_guard_it_was_enqueued_with() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
         let (st, _dir) = state();
         let now = now_f64();
         let _ = st
@@ -14958,7 +16477,7 @@ mod tests {
                     [],
                 )?;
                 let stale =
-                    "[amux auto-pickup] Claimed board card AMUX-8 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}AMUX-8 — work it now.");
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard, sender) \
                      VALUES('v1','lane-v',?1,?2,'board-drive','')",
@@ -14992,6 +16511,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_error_at_the_stale_check_signals_and_still_delivers() {
+        use crate::runtime_jobs::board_drive::PICKUP_ANCHOR;
         let (st, _dir) = state();
         let now = now_f64();
         let _ = st
@@ -14999,7 +16519,7 @@ mod tests {
             .write_async(move |conn| {
                 ensure_fleet_tables(conn)?;
                 let pick =
-                    "[amux auto-pickup] Claimed board card BET-6 from your queue - work it now.";
+                    &format!("{PICKUP_ANCHOR}BET-6 — work it now.");
                 conn.execute(
                     "INSERT INTO steering_queue(id, session, text, queued_at, guard) \
                      VALUES('r1','lane-x',?1,?2,'board-drive')",
@@ -15569,6 +17089,108 @@ mod tests {
             assert_eq!(st, StatusCode::NOT_IMPLEMENTED, "{path} -> {v}");
             assert_eq!(v["hint"], json!("/api/workers/hw"), "{path}");
         }
+    }
+
+    /// AF-236 / #137: `duplicate` must not mint a session the store cannot see.
+    ///
+    /// The twin gets an env file either way. The question is whether it also
+    /// gets a `_amux_workers` row, and the answer has to depend on the SOURCE:
+    /// a store-managed worker's twin must be registered or it is a running
+    /// session absent from /api/workers and from the dashboard, while a plain
+    /// env-file session's twin must NOT be, or the verb invents a worker the
+    /// original never was.
+    ///
+    /// Both cells in one test on purpose. Either alone passes against a build
+    /// that answers unconditionally, in whichever direction it picked.
+    #[tokio::test]
+    async fn duplicate_registers_the_twin_only_when_the_source_is_store_managed() {
+        use amux_core::provider::ProviderId;
+        use amux_core::session::BackendId;
+        use amux_core::worker::WorkerConfig;
+        use crate::db::queries::WorkerRow;
+        use crate::db::WriteOutcome;
+
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/managed.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        std::fs::write(home.path().join("sessions/plain.env"), "CC_DIR=\"/tmp\"\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (state, _dir) = state();
+
+        // `managed` is store-managed; `plain` deliberately is not.
+        let id = WorkerId::from_ulid(ulid::Ulid::new());
+        let config = WorkerConfig {
+            display_name: "managed".into(),
+            name_aliases: vec!["oldname".into()],
+            cwd: "/tmp".into(),
+            provider: ProviderId::new("claude"),
+            model: Some("sonnet".into()),
+            backend: BackendId::from("tmux"),
+            environment: Default::default(),
+            permissions: Vec::new(),
+            group: None,
+        };
+        let row = WorkerRow::new(&id, &config, &chrono::Utc::now().to_rfc3339());
+        state
+            .store
+            .write(move |conn| {
+                crate::db::queries::insert_worker(conn, &row)?;
+                Ok(WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed the managed worker");
+
+        let app: Router = routes().with_state(state.clone());
+
+        // CELL 1 — store-managed source: the twin is registered and addressable.
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/managed/duplicate",
+            Some(json!({"new_name": "managed-twin"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["registered"], json!(true), "{v}");
+        assert!(env_path("managed-twin").exists(), "the env file is still copied");
+
+        let conn = state.store.read().expect("read store");
+        let twin = crate::db::queries::get_worker(&conn, "managed-twin")
+            .expect("query")
+            .expect(
+                "the twin has no _amux_workers row — it is a session that can run and that \
+                 /api/workers cannot see, which is exactly #137",
+            );
+        assert_eq!(twin.display_name, "managed-twin");
+        assert_ne!(twin.id, id.as_str(), "the twin must be its own worker, not an alias of the source");
+        // Config is inherited...
+        assert_eq!(twin.model.as_deref(), Some("sonnet"), "config must carry over");
+        // ...but NOT the aliases. Copying them would make `get_worker("oldname")`
+        // resolve to whichever row sorts first, silently re-pointing callers that
+        // still use the source's former name at the twin.
+        assert!(twin.name_aliases.is_empty(), "aliases belong to the source: {:?}", twin.name_aliases);
+        assert_eq!(
+            crate::db::queries::get_worker(&conn, "oldname").unwrap().map(|r| r.id),
+            Some(id.as_str().to_string()),
+            "the source's old name must still resolve to the SOURCE"
+        );
+        drop(conn);
+
+        // CELL 2 — plain env-file source: copied, and deliberately unregistered.
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/plain/duplicate",
+            Some(json!({"new_name": "plain-twin"})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["registered"], json!(false), "{v}");
+        assert!(env_path("plain-twin").exists());
+        let conn = state.store.read().expect("read store");
+        assert!(
+            crate::db::queries::get_worker(&conn, "plain-twin").unwrap().is_none(),
+            "a plain env-file session's twin must not be invented as a worker"
+        );
     }
 
     #[tokio::test]
@@ -16148,12 +17770,22 @@ mod steer_boundary_tests {
     }
 
     async fn set_report(state: &AppState, name: &str, st: &str) {
+        set_report_aged(state, name, st, 0.0).await
+    }
+
+    /// A report `age_s` old. The `ts` is not decoration: the boundary gate now
+    /// judges a report's AGE (AMUX-3756), and this fixture used to omit `ts`
+    /// entirely — which the old gate could not notice, because it asked only
+    /// `state == "idle"`. A fixture that cannot express the field the mechanism
+    /// reads cannot test the mechanism.
+    async fn set_report_aged(state: &AppState, name: &str, st: &str, age_s: f64) {
         let (n, s) = (name.to_string(), st.to_string());
+        let ts = crate::config::now_f64() - age_s;
         state
             .store
             .write_async(move |conn| {
                 ensure_fleet_tables(conn)?;
-                let blob = serde_json::json!({ &n: { "state": s } }).to_string();
+                let blob = serde_json::json!({ &n: { "state": s, "ts": ts } }).to_string();
                 conn.execute(
                     "INSERT INTO prefs(key,value) VALUES('session_reports',?1) \
                      ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -16240,6 +17872,178 @@ mod steer_boundary_tests {
                 "reported state {reported:?} should give at_boundary={want}"
             );
         }
+
+        // AMUX-3756: AND ONLY WHILE THE REPORT IS STILL AUTHORITATIVE. A stuck
+        // `active` — the Stop hook never fired — used to hold the lane here
+        // forever, because this gate asked `state == "idle"` and nothing else.
+        // Measured live: 4 of 52 running lanes, up to 61.4 HOURS, every one
+        // with auto_pickup on and cards waiting. The lane's own dashboard badge
+        // read IDLE throughout, from the same row.
+        //
+        // A refused report falls through to the pane, and the pane for this
+        // fixture's non-existent tmux session captures empty, which
+        // `steer_lane_at_boundary` reads as "cannot tell" -> false. So both
+        // sides are false here and the assertion below would pass either way.
+        // The DISCRIMINATOR is `lane_report`'s verdict, which is what the gate
+        // consults, so assert on that: it is the value that used to be absent.
+        set_report_aged(&state, "probe", "active", 214_567.0).await;
+        let r = lane_report(&state, "probe").expect("the report row is present");
+        assert!(
+            !r.applies,
+            "a 59.5h-old `active` report must be refused, not honoured as mid-turn forever"
+        );
+        assert!(r.age_s > 200_000.0, "and its age must be legible to the caller");
+        set_report_aged(&state, "probe", "active", 30.0).await;
+        assert!(
+            lane_report(&state, "probe").expect("present").applies,
+            "a FRESH active report is still the authority — this gate must keep deferring to a real turn"
+        );
+    }
+
+    /// AMUX-3771, Ethan: "figure out why `@random` is peer reviewing code
+    /// outside of its group".
+    ///
+    /// Because the board asked one question and messaging asked another. The
+    /// reviewer gate checked only "is this a registered worker"; the messaging
+    /// rule (`cross_group_send_ok`) is enforced in exactly ONE place, the send
+    /// API, and the review nudge goes through `steer_enqueue` and never touches
+    /// it. So review crossed groups silently while conversation about it was
+    /// refused — a card sits in `review`, which reads healthy, and the two
+    /// parties cannot correspond.
+    ///
+    /// The cells are the three states that matter, and the middle one is the
+    /// whole point: REGISTERED IS NOT ENOUGH.
+    #[tokio::test]
+    async fn a_reviewer_must_be_reachable_not_merely_registered() {
+        let dir = tempfile::tempdir().unwrap();
+        let _g = crate::api::settings::test_env::set_home(dir.path());
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(sessions.join("owner.env"), "CC_DIR=/tmp\nCC_TAGS=\"alpha\"\n").unwrap();
+        std::fs::write(sessions.join("peer.env"), "CC_DIR=/tmp\nCC_TAGS=\"alpha\"\n").unwrap();
+        std::fs::write(sessions.join("far.env"), "CC_DIR=/tmp\nCC_TAGS=\"beta\"\n").unwrap();
+        std::fs::write(
+            sessions.join("open.env"),
+            "CC_DIR=/tmp\nCC_TAGS=\"beta\"\nCC_RECEIVE_ANY=\"1\"\n",
+        )
+        .unwrap();
+
+        // ABSENT: the case the old gate already caught.
+        let why = reviewer_unreachable_reason("owner", "ghost").expect("absent must refuse");
+        assert!(why.contains("not a registered worker"), "{why}");
+
+        // SAME GROUP: fine, and this control is what stops the fix being
+        // "refuse every reviewer".
+        assert!(
+            reviewer_unreachable_reason("owner", "peer").is_none(),
+            "a same-group reviewer must still be assignable"
+        );
+
+        // THE NEW CELL: registered, real, and in another group. The old gate
+        // passed this — it is ECOLO-14 and AMUX-3761 exactly — and the owner
+        // then could not message the reviewer it was waiting on.
+        let why = reviewer_unreachable_reason("owner", "far")
+            .expect("a cross-group reviewer must refuse even though it IS registered");
+        assert!(
+            !why.contains("not a registered worker"),
+            "the refusal must name the REACH problem, not mislead about existence: {why}"
+        );
+        assert!(
+            why.contains("CC_RECEIVE_ANY"),
+            "and it must name the sanctioned escape, or the gate is a dead end (ethos rule 6): \
+             {why}"
+        );
+
+        // THE ESCAPE WORKS. A designated fleet-wide reviewer carries
+        // CC_RECEIVE_ANY=1, which is precisely the "documented routing target"
+        // case the messaging guard already provides for. Without this cell the
+        // gate could be unconditional and every assertion above would pass.
+        assert!(
+            reviewer_unreachable_reason("owner", "open").is_none(),
+            "a cross-group reviewer that DECLARES itself open must be assignable — otherwise \
+             the fix bans cross-lane review instead of making it explicit"
+        );
+    }
+
+    /// AMUX-3761. The load-bearing property is NOT that the rows come back —
+    /// it is that an EMPTY list is distinguishable from an unsampled one.
+    ///
+    /// Ethan's question was "is this badge accurate", asked about a moment 31
+    /// minutes gone. If `history: []` reads the same for "this lane has been
+    /// stable all day" and "nothing has ever recorded this", the endpoint has
+    /// reproduced the exact failure it was built to close, one layer in.
+    #[tokio::test]
+    async fn status_history_tells_a_stable_lane_from_an_unsampled_one() {
+        let (state, _d) = tstate();
+        state
+            .store
+            .write_async(|c| {
+                ensure_fleet_tables(c)?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        // NOTHING RECORDED ANYWHERE. Empty list, and `since` is None — the
+        // whole point: the reader can tell nobody was watching.
+        {
+            let conn = state.store.read().unwrap();
+            let (h, since) = status_decision_history(&conn, "probe", 20);
+            assert!(h.is_empty());
+            assert!(since.is_none(), "with no rows at all, the record has no floor to report");
+        }
+
+        // Two decisions for `probe`, and one for a DIFFERENT lane. The other
+        // lane's row must not appear in probe's history, and it MUST set the
+        // fleet-wide floor — a per-lane floor would tell a reader the record
+        // began when this lane first changed, which is a different claim.
+        let ev = crate::runtime_jobs::status_history::EVENT;
+        state
+            .store
+            .write_async(move |c| {
+                for (ts, lane, st, by) in [
+                    (1000.0, "other", "idle", "report"),
+                    (2000.0, "probe", "active", "contradiction_subagents_working"),
+                    (3000.0, "probe", "idle", "report"),
+                ] {
+                    c.execute(
+                        "INSERT INTO session_events (ts, session, type, data, source) VALUES (?1,?2,?3,?4,'t')",
+                        rusqlite::params![
+                            ts,
+                            lane,
+                            ev,
+                            serde_json::json!({"status": st, "decided_by": by}).to_string()
+                        ],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .unwrap();
+
+        let conn = state.store.read().unwrap();
+        let (h, since) = status_decision_history(&conn, "probe", 20);
+        assert_eq!(h.len(), 2, "another lane's decisions are not this lane's history");
+        assert_eq!(h[0]["decided_by"], json!("report"), "newest first: {h:?}");
+        assert_eq!(
+            h[1]["decided_by"],
+            json!("contradiction_subagents_working"),
+            "and the rule that WAS deciding when the screenshot was taken is still there"
+        );
+        assert_eq!(h[0]["ts"], json!(3000.0), "each row carries when it was decided");
+        assert!(h[0]["age_s"].as_f64().unwrap() > 0.0, "and how long ago that was");
+        assert_eq!(
+            since,
+            Some(1000.0),
+            "the floor is fleet-wide (the `other` row), not this lane's first change"
+        );
+
+        // A lane that has NEVER changed, on a fleet that IS being sampled:
+        // empty list, but `since` is populated. This is the cell that separates
+        // "stable" from "unwatched", and it is the reason `since` exists.
+        let (h2, since2) = status_decision_history(&conn, "never-changed", 20);
+        assert!(h2.is_empty());
+        assert_eq!(since2, Some(1000.0), "the record exists, this lane simply never moved");
     }
 
     /// AMUX-3048: subagent start/stop events accumulate a live count in the same
@@ -17407,13 +19211,13 @@ mod steer_max_age_tests {
     fn the_three_stalled_lanes_are_distinguished_from_a_merely_busy_one() {
         // amux-agent — 15.2h queued, skip reason `no-env-file`.
         assert_eq!(
-            lane_block_reason_from(false, false, false),
+            lane_block_reason_from(false, false, false, false),
             Some("no-env-file"),
             "amux-agent: a lane with no env file is not a worker, and no deadline reaches it"
         );
         // amux-rust-execution — 4.3h queued, and mixpeek-orchestrator at 15.2h.
         assert_eq!(
-            lane_block_reason_from(true, false, false),
+            lane_block_reason_from(true, false, false, false),
             Some("not-running"),
             "amux-rust-execution / mixpeek-orchestrator: a stopped lane waits to be STARTED, \
              not to be free"
@@ -17422,7 +19226,7 @@ mod steer_max_age_tests {
         // exactly this state at the same moment, and they are the reason the
         // other three were invisible: all five reported the same "queued".
         assert_eq!(
-            lane_block_reason_from(true, false, true),
+            lane_block_reason_from(true, false, true, false),
             None,
             "a running, unarchived lane is deliverable — busy is not blocked, and conflating \
              the two is the whole defect"
@@ -17430,12 +19234,93 @@ mod steer_max_age_tests {
         // Archived is its own answer rather than being collapsed into
         // `not-running`: un-archiving is a human's call (ethos rule 8), so the
         // sender needs to be told which of the two they are looking at.
-        assert_eq!(lane_block_reason_from(true, true, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, false, false), Some("archived"));
         assert_eq!(
-            lane_block_reason_from(true, true, true),
+            lane_block_reason_from(true, true, true, false),
             Some("archived"),
             "an archived lane that still has a live pane is still refused — the send path \
              refuses archived, so the queue must not promise otherwise"
+        );
+    }
+
+    /// AMUX-2238: a send to a rate-limited lane HOLDS, and is never dropped.
+    ///
+    /// Ethan, 2026-08-03: "commands sent to a rate-limited session must queue
+    /// and deliver only after the limit is confirmed released — keyed on the
+    /// limit passing + a live confirmation, not just the clock."
+    ///
+    /// THE ORDER IS THE CLAIM, and it is the trap I flagged when triaging this.
+    /// A lane that is not running is `not-running` whether or not it is also
+    /// rate-limited: that is the more actionable sentence, and a held send must
+    /// never reach a lane before the lane is up. The two cells below pin that
+    /// precedence, so a later reorder cannot quietly invert it.
+    ///
+    /// The delivery-order half of the design question resolves BY CONSTRUCTION
+    /// rather than by ordering logic, which is why there is no queue-position
+    /// code here to test: the resume that clears a limit is a direct tmux key
+    /// (`send_keys_op(name, "Enter")` in the sweep), not a steering row. So the
+    /// resume cannot be queued behind a held send, and the queue does not drain
+    /// until the sweep observes the banner gone — which is downstream of the
+    /// lane actually working again.
+    #[test]
+    fn a_rate_limited_lane_holds_its_queue_and_never_dead_letters() {
+        assert_eq!(
+            lane_block_reason_from(true, false, true, true),
+            Some("rate-limited"),
+            "a running lane that cannot take work must block, or the send is delivered into a \
+             limit and lost"
+        );
+        assert_eq!(
+            lane_block_reason_from(true, false, true, false),
+            None,
+            "CONTROL: a running lane with no limit is deliverable — if this ever returns a \
+             block, every send in the fleet queues forever"
+        );
+
+        // PRECEDENCE. Both cells, because either direction of a reorder is a
+        // real bug and only asserting one of them would let the other through.
+        assert_eq!(
+            lane_block_reason_from(true, false, false, true),
+            Some("not-running"),
+            "a stopped lane is not-running first: telling a sender 'rate-limited' would send \
+             them to wait on a limit when the lane needs STARTING"
+        );
+        assert_eq!(
+            lane_block_reason_from(true, true, true, true),
+            Some("archived"),
+            "archived still outranks it — un-archiving is a human's call and no limit release \
+             will ever make an archived lane deliverable"
+        );
+
+        // NEVER DEAD-LETTERED, at any age. The dead-letter path exists for
+        // PERMANENTLY unroutable targets; a rate limit is temporary by
+        // definition, and discarding a held message because the limit lasted a
+        // long time is the failure this card exists to prevent.
+        assert!(
+            steer_dead_letter_verdict("rate-limited", 86_400.0 * 30.0).is_none(),
+            "a month-old hold is still a hold — dead-lettering it would silently drop the \
+             message the card asked to be QUEUED"
+        );
+
+        // The sentence must say WHEN it goes, not just that it is stuck. Every
+        // other block reason requires a human to act; this one does not, and a
+        // sender who cannot tell the difference will go and do something.
+        let msg = block_reason_explain("rate-limited", "busy-lane");
+        assert!(msg.contains("busy-lane"), "{msg}");
+        assert!(
+            msg.contains("CONFIRMED released"),
+            "the card's own words: confirmed, not a clock: {msg}"
+        );
+        assert!(
+            msg.contains("credit caps"),
+            "credit caps have no reset time and were the reason this design stalled — the \
+             sentence has to say they are covered: {msg}"
+        );
+        assert!(
+            !msg.contains("NOT DELIVERABLE"),
+            "it IS deliverable, later, with no action from the sender. Sharing the wording of \
+             the three reasons that need a human is how a temporary hold gets read as a \
+             dead end: {msg}"
         );
     }
 
@@ -17449,8 +19334,8 @@ mod steer_max_age_tests {
     /// and autofix cards that could never clear.
     #[test]
     fn archived_is_the_one_blocked_reason_that_must_not_be_queued() {
-        assert_eq!(lane_block_reason_from(true, true, false), Some("archived"));
-        assert_eq!(lane_block_reason_from(true, true, true), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, false, false), Some("archived"));
+        assert_eq!(lane_block_reason_from(true, true, true, false), Some("archived"));
         // The refusal has to publish what to do, or the sender hand-rolls
         // something worse to get past it (the AMUX-2325 shape).
         let msg = block_reason_explain("archived", "old-lane");

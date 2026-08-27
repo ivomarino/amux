@@ -21,8 +21,20 @@ git rev-list --count origin/main..HEAD   # unpushed commits here
 git rev-list --count HEAD..origin/main   # how far behind
 ```
 
-If BOTH are non-zero the checkout has diverged, cannot fast-forward, and nothing
-will carry your entry upstream — append to a clone that is current instead. The
+If BOTH are non-zero the checkout has diverged and cannot fast-forward. That is a
+REPORT, not a verdict, and the difference cost a review pass on 2026-08-27
+(AF-272): the two counts cannot tell a stranded clone from the canonical one.
+A checkout that MERGES A PR ON GITHUB goes "behind" by that merge commit
+immediately, so the canonical repo — the one whose 255 unpushed commits every
+lane is working in — reads as stranded by exactly this test, and the honest
+reading is the opposite one.
+
+Ask what put you behind. Commits that are peers' work landing on origin while
+yours sit unpushed means stranded, and the entry belongs in a current clone.
+Commits that are YOUR OWN merges of PRs you just reviewed mean the opposite:
+this is the checkout everything flows through. When the answer is not obvious,
+`git log --oneline HEAD..origin/main` names them, and a name settles it where a
+count cannot. The
 SessionStart freshness hook now says this out loud when it applies, because a
 rule that only asks you to remember is the kind ethos rule 6 warns about.
 
@@ -76,6 +88,55 @@ work item someone can pick up. If there is no card yet, file one.
 
 **Record the COST in what it actually cost** — minutes, a wrong conclusion shipped, a
 push blocked, a card closed that should not have been. "Annoying" is not a cost.
+
+## Retiring an entry — the three dispositions
+
+An entry leaves `frustrations.md` only when the session that ORIGINATED it says the
+friction is gone. Use `scripts/frustrations-archive.py`, which moves it to
+`frustrations-archive.md`, stamps who signed off, and carries the SYMPTOM and COST onto
+the card (AF-38's rule — the card is where someone hitting it again looks).
+
+There are **three** states, not two, and the third had no honest exit until AF-243:
+
+- **Right, and fixed** → archive with `VALIDATED: <who> | <evidence>`.
+- **Right, and still live** → do NOT touch the entry. **Reopen the CARD.** A card reading
+  `done` over a live friction is the disagreement `frustrations.ledger_agrees_with_board`
+  flags, and the honest correction is the card.
+- **Wrong** → archive with `--superseded`, which stamps `SUPERSEDED:` instead. Archiving a
+  wrong entry as validated files a FALSE MECHANISM as history, and reopening its card
+  says a friction is live that was never real. Both available moves lie about it, which
+  is ethos rule 3 — a constraint with no truthful path through. The text is still kept,
+  as a DEAD HYPOTHESIS, so nobody re-derives it.
+
+**A VALIDATION IS A CLAIM ABOUT THE ENTRY'S TEXT, NOT ABOUT THE SUBSYSTEM** (amux,
+2026-08-26). They validated `AMUX-2777`'s narrow claim — "cannot tell MY broken change
+from a PEER's", genuinely closed by lint-blame partitioning offenders — while that same
+entry's COST line describes the structural defect that is still open as `AF-182`. Both
+verdicts are correct. The two come apart exactly when a subsystem carries two entries at
+different depths, and the shallower one can be honestly retired while the deeper one
+stays live. So read an archived entry as *this sentence stopped being true*, never as
+*this area is done* — and when you retire the shallow one, say beside it that the deep
+one is open, or the next reader finds a "fixed" entry describing a live bug.
+
+The same edge exists on the CARD side, and it is worth stating because neither half
+would make you check the other. **A REVIEW is a claim about what was BUILT, not about
+the card's title** (amux, 2026-08-26). They signed off `AF-182` on a fix that did
+exactly what it claimed — the notice stopped saying a peer's error was yours — while
+the card's headline, "blocks your commit over a peer's uncommitted file", stayed true
+and recurred after the fix. The card held two units of work and no status was a true
+statement about it. Where an entry can be validated at the wrong DEPTH, a card can be
+reviewed at the wrong SCOPE; the remedy for both is to name which clause you tested.
+
+**Ask the author; do not infer from the card.** Card status is not evidence — this drain
+found entries whose card read `done` because the FEATURE had been deleted, because the
+lesson was encoded in a replacement, and because the card "closed on something else"
+(three independent confirmations of that last shape). None of those are readable from a
+status field.
+
+**Some entries have no validatable author, and that is not yours to resolve.** A session
+that was a subagent, a one-off `claude` invocation, or a lane on another machine cannot
+sign anything off. Do not retire those on your own judgement — that is deciding another
+party's work is finished (ethos rule 8). Surface them and let the owner decide.
 
 ## Then act on it
 

@@ -221,6 +221,31 @@ async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
 /// Authorship is by the Amux-Session TRAILER, not `%an` — every lane on this
 /// machine commits as the same person, so `%an` cannot discriminate (CLAUDE.md
 /// deploy section).
+/// Is the NEWEST commit touching `path` the owner's own? (AMUX-3677)
+///
+/// Answers "is the owner's work in local HEAD", which is the question neither
+/// `owner_committed_since` (defeated by a peer refreshing the owner's mtime
+/// record) nor `LandedOnOrigin` (unreachable on a lane ahead of origin) can
+/// answer on a checkout with unpushed commits.
+///
+/// Deliberately the NEWEST commit and not merely "any commit of theirs": if a
+/// peer has committed this path since, the owner's bytes may have been changed
+/// or reverted by that commit, and only the owner can judge it.
+async fn owner_owns_newest_commit(dir: &str, path: &str, owner: &str) -> Option<String> {
+    let out = git_out(
+        dir,
+        &["log", "-1", "--format=%h%x09%(trailers:key=Amux-Session,valueonly,separator=)", "--", path],
+    )
+    .await?;
+    let mut it = out.trim().split('\t');
+    let sha = it.next()?.trim();
+    let who = it.next().unwrap_or("").trim();
+    // An UNTRAILERED commit is not the owner's for this purpose. Reading a
+    // missing trailer as a match would hand out receipts on anyone's commit,
+    // which is the loud-to-quiet direction this guard must not take.
+    (!sha.is_empty() && !owner.is_empty() && who == owner).then(|| sha.to_string())
+}
+
 pub(crate) async fn owner_committed_since(
     dir: &str,
     path: &str,
@@ -326,6 +351,28 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
             ),
             false,
         ),
+        // AN OBSERVED CLAIM IS CIRCUMSTANTIAL, and says so (AMUX-3778).
+        //
+        // The record is a cwd mtime the Bash hook pair caught, not a recorded
+        // write. On a shared checkout that CANNOT distinguish your write from a
+        // peer's write in the same window: the hook walks the command's cwd and
+        // claims every file whose mtime moved, with no check that the command
+        // touched it. Live specimen (AMUX-3763): mixpeek-general was warned
+        // about radio-canada's brand-new file and both lanes lost a turn.
+        //
+        // Still flagged, still `true` for the at-risk count — the guard exists
+        // because absorption is real and under-warning is the expensive
+        // direction. What changes is that the sentence stops asserting a
+        // recorded write it does not have.
+        PathFate::AtRisk if provenance == "observed" => (
+            format!(
+                "  {pth}  — differs from HEAD and you have no commit for it. NOTE: your claim \
+                 here is OBSERVED (a file mtime moved during one of your Bash commands), not a \
+                 recorded edit. On a shared checkout a peer writing under your cwd looks \
+                 identical from here, so check whether this is actually yours before acting"
+            ),
+            true,
+        ),
         PathFate::AtRisk => (
             format!(
                 "  {pth}  — differs from HEAD and you have no commit for it; \
@@ -339,9 +386,46 @@ pub(crate) fn victim_path_line(pth: &str, fate: &PathFate, provenance: &str) -> 
 /// Decide between the three. Content-in-HEAD is checked with `git diff HEAD`,
 /// which answers "are these bytes committed by ANYONE" — the question the
 /// trailer-only check could not ask.
-pub(crate) async fn path_fate(dir: &str, path: &str, owner: &str, edit_age_secs: i64) -> PathFate {
+pub(crate) async fn path_fate(
+    dir: &str,
+    path: &str,
+    owner: &str,
+    edit_age_secs: i64,
+    provenance: &str,
+) -> PathFate {
     if let Some(sha) = owner_committed_since(dir, path, owner, edit_age_secs).await {
         return PathFate::SettledByOwner(sha);
+    }
+    // AN INFERRED RECORD IS NOT EVIDENCE THE OWNER WROTE ANYTHING (AMUX-3677).
+    //
+    // `owner_committed_since` asks whether the owner's commit is newer than the
+    // EDIT that triggered this notice. For an `inferred` record that operand is
+    // an mtime which moved during one of the owner's Bash commands — and a
+    // PEER'S WRITE PRODUCES EXACTLY THAT. So the committing peer refreshes the
+    // victim's record past the victim's own commit, and the check that should
+    // have said "settled" misses.
+    //
+    // The rescue below cannot fire either: `LandedOnOrigin` needs the bytes to
+    // match origin/main, and on a lane with unpushed commits — this repo, most
+    // of the time, 44 commits deep while the push was blocked — that arm is
+    // unreachable by construction. AMUX-3445 added it for the MIRROR lane, a
+    // graft-push checkout whose local HEAD never advances; the lane whose HEAD
+    // is AHEAD had no equivalent.
+    //
+    // Specimen, 2026-08-24 16:00: `browser.rs` reported "differs from HEAD and
+    // you have no commit for it; the WORK ITSELF is at risk" to amux, whose
+    // 02197674 was the newest commit on that path, twenty minutes old, with a
+    // clean worktree.
+    //
+    // So: if the owner's record is INFERRED and the newest commit touching the
+    // path is the OWNER'S OWN, their work is in HEAD and the current dirt
+    // belongs to the committer. `firsthand` is deliberately excluded — a real
+    // recorded edit newer than the owner's commit IS at risk, and that is the
+    // direction this must never get wrong.
+    if provenance == "inferred" {
+        if let Some(sha) = owner_owns_newest_commit(dir, path, owner).await {
+            return PathFate::SettledByOwner(sha);
+        }
     }
     // Empty `git diff HEAD -- path` means the working tree matches HEAD, i.e.
     // whatever was written is committed — by someone.
@@ -869,6 +953,17 @@ pub(crate) fn apply_observed(
         })
         .collect();
     for (p, ts) in mine_keep {
+        // PROVENANCE FOR MY OWN CLAIM (AMUX-3662), the mirror of
+        // `theirs_observed_only` below. Transcript rows are all loaded before
+        // this runs, so `mine_firsthand` at this point means "I have a RECORDED
+        // write here" — anything else is an mtime my Bash window caught, which
+        // on a shared checkout includes writes I did not make.
+        //
+        // Checked BEFORE the insert, or the insert three lines down would make
+        // every observed row look firsthand and mark nothing.
+        if !inputs.mine_firsthand.contains(&p) {
+            inputs.mine_observed_only.insert(p.clone());
+        }
         let slot = inputs.mine.entry(p.clone()).or_insert(0.0);
         if ts > *slot {
             *slot = ts;
@@ -1226,6 +1321,29 @@ pub(crate) struct GuardInputs {
     /// a co-edit signal knows what it claims, so a phantom co-editor is
     /// labeled as possibly your own write seen twice instead of asserted.
     pub theirs_observed_only: HashSet<String>,
+    /// abs realpath where the REQUESTING session's own claim is an OBSERVED
+    /// (mtime) row rather than a transcript record (AMUX-3662).
+    ///
+    /// The mirror of `theirs_observed_only`, and its absence was the bug. The
+    /// guard tracked provenance for the PEER's claim and not for the reader's,
+    /// so `mine_age_secs` rendered identically whether it came from a write
+    /// this session recorded or from an mtime that moved during one of its Bash
+    /// commands. On a shared checkout those are very different facts.
+    ///
+    /// Live specimen 2026-08-24: probing `api/board.rs` returned
+    /// `age_secs: 455, mine_age_secs: 455, owner: amux-frustrations` with no
+    /// signal of any kind. The PEER's claim was real (commit 8575cc6f touched
+    /// that file at 12:18:08); MY only contact was `sed -n '2270,2300p'`, a
+    /// read. The equal ages are the tell of one write seen twice, and the
+    /// response presented both claims in the same shape, so which one was
+    /// inferred was not recoverable from the output.
+    ///
+    /// That symmetry is worse than a missing warning, because it gets read in
+    /// whichever direction the reader already leans: the day before, the same
+    /// signature was read as "the peer is a phantom co-editor" and cost a
+    /// wipe-apology sweep to an innocent peer. On this specimen the phantom was
+    /// the reader's own.
+    pub mine_observed_only: HashSet<String>,
     /// abs realpath whose WINNING owner's latest record is a restore
     /// (MG-1484): an edit record without authored content. Drives the
     /// `provenance` field on foreign verdicts so the victim notice never
@@ -1252,6 +1370,12 @@ pub(crate) struct Verdict {
     pub foreign: Vec<Value>,
     pub shared: Vec<Value>,
     pub unclaimed: Vec<Value>,
+    /// A peer's work is being SPLIT by this commit (AF-190).
+    ///
+    /// One row per (staged file a peer co-edited, that peer's dirty files this
+    /// commit leaves behind). It is a hazard about the COMMIT, not about the
+    /// tree, and it is the one thing no other check here can see.
+    pub split_risk: Vec<Value>,
 }
 
 /// How the winning owner's claim to a path arose (MG-1484): `firsthand` (an
@@ -1261,6 +1385,25 @@ pub(crate) struct Verdict {
 fn provenance_of(inp: &GuardInputs, ap: &str) -> &'static str {
     if inp.theirs_restore.contains(ap) {
         "restore"
+    // OBSERVED BEFORE FIRSTHAND, and the order is the whole fix (AMUX-3778).
+    //
+    // `apply_observed` inserts observed rows INTO `theirs_firsthand` on
+    // purpose — AF-123, so a Bash-editing lane stops being penalised for a
+    // signal the harness makes unobtainable for it (ethos rule 3). Correct,
+    // and it made this function report every observed row as `firsthand`,
+    // because the firsthand check came first and the set had just been
+    // widened to include them.
+    //
+    // So the VICTIM NOTICE asserted a recorded write where the evidence was a
+    // cwd mtime — while the JSON verdict, three hundred lines up, already
+    // reported `their_provenance: "observed"` correctly off the same set. The
+    // machine-readable field was right and the sentence a human reads was
+    // wrong, which is the worse half to have wrong.
+    //
+    // This does NOT demote the record. Rank is unchanged and AF-123 holds; the
+    // claim is still made, it is just described honestly.
+    } else if inp.theirs_observed_only.contains(ap) {
+        "observed"
     } else if inp.theirs_firsthand.contains(ap) {
         "firsthand"
     } else {
@@ -1367,6 +1510,29 @@ pub(crate) fn classify(
                     // owner to stage per-hunk sends them into a needless
                     // git add -p over zero hunks of their own.
                     "mine_age_secs": inp.mine.get(ap).map(|ts| (now - ts).max(0.0) as i64),
+                    // SAY WHERE EACH CLAIM CAME FROM (AMUX-3662). `mine_age_secs`
+                    // used to render identically for a write this session
+                    // RECORDED and an mtime that merely moved during one of its
+                    // Bash commands, and only the peer's side ever carried a
+                    // provenance marker. Two claims, same shape, one of them
+                    // inferred and no way to tell which — so the equal-age
+                    // coincidence gets read in whichever direction the reader
+                    // already leans.
+                    //
+                    // Stated as a fact rather than a verdict: this does not
+                    // decide who wrote the file, it says how each side knows.
+                    "mine_provenance": if !inp.mine.contains_key(ap) {
+                        "none"
+                    } else if inp.mine_observed_only.contains(ap) {
+                        "observed"
+                    } else {
+                        "transcript"
+                    },
+                    "their_provenance": if inp.theirs_observed_only.contains(ap) {
+                        "observed"
+                    } else {
+                        "transcript"
+                    },
                     "has_unstaged_changes": is_dirty,
                 });
                 // AMUX-3497, rule-4 half: when the peer's claim is an OBSERVED
@@ -1500,7 +1666,80 @@ pub(crate) fn classify(
             ),
         }));
     }
+    split_risk(paths, inp, &mut v);
     v
+}
+
+/// A COMMIT that cannot compile, from a TREE that can (AF-190).
+///
+/// THE SPECIMEN: `53ae4b8b` was the tip of `origin/main` and did not build.
+/// Staging `api/board.rs` took ~16 lines of a peer's in-flight AMUX-3607 wiring
+/// out of the same FILE, including a call to `effective_gate_trail`, which was
+/// defined in `db/board_store.rs` and still uncommitted in their tree. The
+/// caller's `cargo check` passed and the pre-commit gate passed, both correctly:
+/// they check the TREE, which held the peer's definition. Nothing anywhere
+/// builds the COMMIT.
+///
+/// The pathspec rule does not reach this. `git commit -- <paths>` protects
+/// against sweeping whole unrelated FILES; the peer's work was in a file the
+/// committer was legitimately editing, so file-granular staging takes it whole.
+///
+/// WHY THIS IS ALMOST FREE: the guard already holds both halves. It knows which
+/// staged files a peer co-edited (that is `foreign`/`shared`) and it knows which
+/// paths are `dirty`. One cross-reference turns them into the hazard. What it
+/// costs is a set intersection over data already in memory.
+///
+/// IT STATES A FACT, IT DOES NOT POSE A QUESTION, and that is the load-bearing
+/// design choice rather than a stylistic one. The guard ALREADY printed the
+/// discriminating number for this specimen ("34 insertions / 9 deletions — if
+/// that is MORE than you wrote, their work is in it") and its author read past
+/// it, because 34 looked about right for the edit they had made. A number
+/// matching your expectation is exactly where a check gets skipped. Any remedy
+/// that asks the committer to do arithmetic fails the same way.
+///
+/// SILENT unless a peer who co-edited a STAGED file also has dirty work OUTSIDE
+/// the commit. A warning that fires on every commit is one nobody reads, which
+/// is how the insertion-count line came to be ignored in the first place.
+fn split_risk(paths: &[(String, String)], inp: &GuardInputs, v: &mut Verdict) {
+    let staged: HashSet<&String> = paths.iter().map(|(_, ap)| ap).collect();
+    // Which peers co-edited something in THIS commit, and which staged file
+    // implicated each. Ordered so the output is stable for a test and for a
+    // human diffing two runs.
+    let mut by_owner: BTreeMap<&str, Vec<&String>> = BTreeMap::new();
+    for (rel, ap) in paths {
+        if let Some((owner, _)) = inp.theirs.get(ap) {
+            by_owner.entry(owner.as_str()).or_default().push(rel);
+        }
+    }
+    for (owner, staged_rels) in by_owner {
+        // The same peer's other work, still dirty, and NOT in this commit.
+        let mut left: Vec<&String> = inp
+            .theirs
+            .iter()
+            .filter(|(p, (o, _))| o == owner && inp.dirty.contains(*p) && !staged.contains(p))
+            .map(|(p, _)| p)
+            .collect();
+        if left.is_empty() {
+            continue;
+        }
+        left.sort();
+        v.split_risk.push(json!({
+            "owner": owner,
+            "staged": staged_rels,
+            "left_dirty": left,
+            "why": format!(
+                "you are committing {} — which '{owner}' co-edited — while {} of THEIR files \
+                 are dirty and NOT in this commit. A symbol added on one side may be missing \
+                 from the other, so this commit can fail to build even though your tree \
+                 compiles: your tree has their uncommitted half and the commit does not. \
+                 Nothing else here checks that, because `cargo check` and the pre-commit gate \
+                 both build the TREE. Either include their files, or leave their lines out of \
+                 yours (`git add -p`), or confirm with them.",
+                staged_rels.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", "),
+                left.len()
+            ),
+        }));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1544,6 +1783,14 @@ impl Envelope {
             "foreign": self.verdict.foreign,
             "shared": self.verdict.shared,
             "unclaimed": self.verdict.unclaimed,
+            // AF-190. A NEW KEY, not folded into `foreign`, and the reason is
+            // the one stated a few lines up in `classify`: installed hooks block
+            // on `foreign` being non-empty, and this is a WARNING about a build,
+            // not a claim that the staged bytes are somebody else's. Putting it
+            // in `foreign` would start blocking commits that are perfectly
+            // legitimate. Older hooks ignore the key, which is the correct
+            // degradation for an advisory.
+            "split_risk": self.verdict.split_risk,
             "unaccounted": self.unaccounted,
             "cotenants": self.cotenants,
             "window_secs": self.window as i64,
@@ -1605,10 +1852,38 @@ fn warn_outdated_hook(session: &str, dir: &str) {
         target: "staged_guard",
         "[staged-guard] OUTDATED HOOK: {} in {} sent no guard_version — that hook swallows \
          server errors (`except Exception: return 0`) and printed nothing for the whole \
-         405 window. Reinstall: scripts/install-hooks.sh",
+         405 window. Reinstall: {}",
         if session.is_empty() { "(no session)" } else { session },
-        dir
+        dir,
+        outdated_hook_remedy(dir)
     );
+}
+
+/// The command that actually reinstalls the guard IN `dir` (AF-156).
+///
+/// This used to be the constant `scripts/install-hooks.sh`, which is only
+/// correct for a caller already inside the amux checkout. Measured 2026-08-27 by
+/// amux-frustrations: this checkout emits ZERO of these warnings. All 272 in one
+/// day came from lanes under /Users/ethan/Dev/mixpeek, where
+/// `scripts/install-hooks.sh` does not exist at any path — so 100% of recipients
+/// were handed an instruction that cannot resolve. A remedy that cannot be run
+/// is worse than none: it reads as actionable and costs the reader the attempt.
+/// Ethos rule 3 wants a truthful path forward in every legitimate state.
+///
+/// `install-hooks.sh <dir>` is the foreign-checkout mode, which by its own header
+/// installs the guard and NEVER writes the other repo's `pre-commit`. `dir` is
+/// already in the warn line, so the server had the data and was printing a
+/// constant beside it.
+///
+/// Honest in both states: a runnable absolute command when `AMUX_REPO` names the
+/// checkout, and a visibly-unfilled placeholder when it does not — never a
+/// plausible path that silently resolves to nothing.
+pub(crate) fn outdated_hook_remedy(dir: &str) -> String {
+    let base = std::env::var("AMUX_REPO")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "<your amux checkout>".to_string());
+    format!("{base}/scripts/install-hooks.sh {dir}")
 }
 
 /// The HTTP entry point — a REAL commit attempt, so owners get notified.
@@ -1945,6 +2220,8 @@ pub async fn staged_guard_inner(
     let inputs = GuardInputs {
         mine: mine.paths,
         mine_firsthand: mine_fh.paths.keys().cloned().collect(),
+        // Filled by apply_observed, same as theirs_observed_only below.
+        mine_observed_only: HashSet::new(),
         theirs,
         theirs_firsthand: theirs_fh,
         theirs_observed_only: HashSet::new(), // filled by apply_observed
@@ -2121,7 +2398,7 @@ pub async fn staged_guard_inner(
                 let mut lines: Vec<String> = Vec::new();
                 let mut n_at_risk = 0usize;
                 for (pth, age, prov) in paths.iter().take(10) {
-                    let fate = path_fate(&wd, pth, &owner, *age).await;
+                    let fate = path_fate(&wd, pth, &owner, *age, prov).await;
                     let (line, at_risk) = victim_path_line(pth, &fate, prov);
                     if at_risk {
                         n_at_risk += 1;
@@ -2534,12 +2811,12 @@ mod tests {
         // and "absorbed into <sha> under `bob`" ADDRESSED TO BOB reads as
         // someone having taken work that nobody took. edit_age=0 forces
         // owner_committed_since to miss, which is the live mechanism.
-        match path_fate(&d, "absorbed.txt", "bob", 0).await {
+        match path_fate(&d, "absorbed.txt", "bob", 0, "firsthand").await {
             PathFate::SettledByOwner(_) => {}
             other => panic!("your own commit is settled, never an absorption: {other:?}"),
         }
 
-        match path_fate(&d, "absorbed.txt", "alice", 3600).await {
+        match path_fate(&d, "absorbed.txt", "alice", 3600, "firsthand").await {
             PathFate::AbsorbedBy(_, who) => assert_eq!(who, "bob",
                 "must name WHO absorbed it, so the victim knows where the reasoning went"),
             other => panic!("expected AbsorbedBy, got {other:?} — this is the cry-wolf case"),
@@ -2547,13 +2824,13 @@ mod tests {
 
         // alice's work that is NOT in HEAD: genuinely at risk.
         std::fs::write(dir.path().join("atrisk.txt"), "uncommitted\n").unwrap();
-        assert_eq!(path_fate(&d, "atrisk.txt", "alice", 3600).await, PathFate::AtRisk);
+        assert_eq!(path_fate(&d, "atrisk.txt", "alice", 3600, "firsthand").await, PathFate::AtRisk);
 
         // and a file alice committed herself stays settled.
         std::fs::write(dir.path().join("mine.txt"), "alice\n").unwrap();
         git(&["add", "mine.txt"]);
         git(&["commit", "-q", "-m", "alice\n\nAmux-Session: alice"]);
-        assert!(matches!(path_fate(&d, "mine.txt", "alice", 3600).await,
+        assert!(matches!(path_fate(&d, "mine.txt", "alice", 3600, "firsthand").await,
                          PathFate::SettledByOwner(_)));
 
         // AMUX-3445, the graft-push shape: backend's work landed on ORIGIN via
@@ -2584,13 +2861,13 @@ mod tests {
         // exactly this state and asserted the receipt, which is the proof the
         // amendment was needed.)
         assert_eq!(
-            path_fate(&d, "grafted.txt", "backend", 3600).await,
+            path_fate(&d, "grafted.txt", "backend", 3600, "firsthand").await,
             PathFate::AtRisk,
             "stale staged blob under origin-identical worktree is the revert-in-waiting"
         );
         // Receipt only when BOTH trees match origin: stage the origin bytes.
         git(&["add", "grafted.txt"]);
-        match path_fate(&d, "grafted.txt", "backend", 3600).await {
+        match path_fate(&d, "grafted.txt", "backend", 3600, "firsthand").await {
             PathFate::LandedOnOrigin(sha) => {
                 assert!(!sha.is_empty(), "the receipt must carry origin's sha")
             }
@@ -2599,7 +2876,85 @@ mod tests {
         // Control: worktree differing from BOTH HEAD and origin is the real
         // at-risk case, and it must stay loud.
         std::fs::write(dir.path().join("grafted.txt"), "novel v3, uncommitted\n").unwrap();
-        assert_eq!(path_fate(&d, "grafted.txt", "backend", 0).await, PathFate::AtRisk);
+        assert_eq!(path_fate(&d, "grafted.txt", "backend", 0, "firsthand").await, PathFate::AtRisk);
+    }
+
+    /// AMUX-3677, rebuilt from the notice's own text and the repo state that
+    /// produced it.
+    ///
+    /// A peer commits a path; their write refreshes the victim's INFERRED
+    /// (Bash+mtime) record past the victim's own commit, so
+    /// `owner_committed_since` misses. The path is dirty, so `LandedOnOrigin`
+    /// is consulted — and on a lane with unpushed commits it can never match.
+    /// Result: "the WORK ITSELF is at risk" about work in local HEAD.
+    ///
+    /// The fixture deliberately has NO `origin/main` at all, which is the
+    /// strongest form of "ahead of origin" and makes the old rescue path
+    /// provably unavailable rather than merely unlikely.
+    #[tokio::test]
+    async fn an_inferred_record_over_the_owners_own_newest_commit_is_settled_not_at_risk() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_string_lossy().to_string();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git").args(args).current_dir(&d).output().unwrap()
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+
+        // alice commits the file — this is the work the notice claims is at risk.
+        std::fs::write(dir.path().join("shared.rs"), "alice's work\n").unwrap();
+        git(&["add", "shared.rs"]);
+        git(&["commit", "-q", "-m", "alice's change\n\nAmux-Session: alice"]);
+
+        // bob is mid-commit: the path is dirty against HEAD right now.
+        std::fs::write(dir.path().join("shared.rs"), "alice's work\nbob's line\n").unwrap();
+
+        // PREMISE, asserted so neither arm below is vacuously green: the path
+        // IS dirty, and alice's commit IS the newest on it.
+        assert!(
+            git_out(&d, &["diff", "HEAD", "--name-only", "--", "shared.rs"])
+                .await
+                .map(|o| !o.trim().is_empty())
+                .unwrap_or(false),
+            "fixture must be dirty, or AtRisk is never reached"
+        );
+        assert!(owner_owns_newest_commit(&d, "shared.rs", "alice").await.is_some());
+
+        // TREATMENT: alice's record is INFERRED — an mtime that moved when bob
+        // wrote. edit_age 0 makes `owner_committed_since` certainly miss, which
+        // is what the peer's refresh does in the real case.
+        match path_fate(&d, "shared.rs", "alice", 0, "inferred").await {
+            PathFate::SettledByOwner(sha) => assert!(!sha.is_empty()),
+            other => panic!("inferred record over alice's own newest commit must be settled: {other:?}"),
+        }
+
+        // CONTROL 1, AND THE ONE THAT MATTERS. A FIRSTHAND record is a real
+        // recorded edit of alice's that is NOT in her commit — genuinely at
+        // risk. Trading a false alarm for a missed one is the only way this
+        // change can do harm, so it is asserted rather than reasoned about.
+        assert!(
+            matches!(path_fate(&d, "shared.rs", "alice", 0, "firsthand").await, PathFate::AtRisk),
+            "a recorded edit newer than the owner's commit must STILL be at risk"
+        );
+
+        // CONTROL 2: if the newest commit is a PEER's, alice's bytes may have
+        // been changed by it and only she can judge — no receipt.
+        git(&["add", "shared.rs"]);
+        git(&["commit", "-q", "-m", "bob's change\n\nAmux-Session: bob"]);
+        std::fs::write(dir.path().join("shared.rs"), "alice's work\nbob's line\nmore\n").unwrap();
+        assert!(
+            owner_owns_newest_commit(&d, "shared.rs", "alice").await.is_none(),
+            "alice no longer owns the newest commit"
+        );
+
+        // CONTROL 3: an UNTRAILERED commit is nobody's. Reading a missing
+        // trailer as a match would hand out receipts on any commit at all.
+        std::fs::write(dir.path().join("other.rs"), "x\n").unwrap();
+        git(&["add", "other.rs"]);
+        git(&["commit", "-q", "-m", "no trailer here"]);
+        assert!(owner_owns_newest_commit(&d, "other.rs", "alice").await.is_none());
+        assert!(owner_owns_newest_commit(&d, "other.rs", "").await.is_none());
     }
 
     #[tokio::test]
@@ -2653,6 +3008,97 @@ mod tests {
         g.theirs.insert(format!("/repo/{path}"), (owner.into(), ts));
         g.theirs_firsthand.insert(format!("/repo/{path}"));
         g
+    }
+
+    /// AF-190, rebuilt from the incident's own artifact rather than a
+    /// convenient shape.
+    ///
+    /// `53ae4b8b` was the tip of origin/main and did not compile. Staging
+    /// `api/board.rs` took ~16 lines of `amux`'s in-flight AMUX-3607 wiring from
+    /// the same file, including a call to `effective_gate_trail` whose
+    /// definition lived in `db/board_store.rs` and was still uncommitted in
+    /// their tree. `cargo check` and the pre-commit gate both passed, correctly:
+    /// they build the TREE, which had the peer's definition, and nothing builds
+    /// the COMMIT.
+    ///
+    /// THE CONTROL IS HALF THE TEST. A warning that fires on every commit is one
+    /// nobody reads, and that is not hypothetical here: the guard already
+    /// printed a discriminating insertion count for this specimen and its author
+    /// read past it. So `split_risk` must be SILENT when the peer has nothing
+    /// dirty outside the commit, and silent when the dirty file is theirs but
+    /// already staged (including it is the fix, so warning about it would be
+    /// telling someone off for doing the right thing).
+    #[test]
+    fn a_commit_that_splits_a_peers_work_names_what_it_leaves_behind() {
+        let mut g = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        // The peer's other half: same lane, dirty, NOT staged.
+        g.theirs.insert(
+            "/repo/crates/amux-server/src/db/board_store.rs".into(),
+            ("amux".into(), 100.0),
+        );
+        g.dirty.insert("/repo/crates/amux-server/src/db/board_store.rs".into());
+        g.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+
+        let staged = [pair("crates/amux-server/src/api/board.rs")];
+        let v = classify(&staged, 200.0, 3600.0, &g);
+        assert_eq!(v.split_risk.len(), 1, "{:?}", v.split_risk);
+        let r = &v.split_risk[0];
+        assert_eq!(r["owner"], "amux");
+        assert!(
+            r["left_dirty"].as_array().unwrap()[0]
+                .as_str()
+                .unwrap()
+                .ends_with("db/board_store.rs"),
+            "it must NAME the file being left behind, not merely say one exists: {r}"
+        );
+        let why = r["why"].as_str().unwrap();
+        assert!(
+            why.contains("NOT in this commit"),
+            "the hazard is about the COMMIT, so say so: {why}"
+        );
+        assert!(
+            why.contains("fail to build"),
+            "state the consequence — this is the check that catches an unbuildable commit \
+             from a compiling tree: {why}"
+        );
+        assert!(
+            !why.contains('?'),
+            "STATE A FACT, never ask the committer a question. The guard already asked one \
+             for this exact specimen (\"if that is MORE than you wrote...\") and its author \
+             read past it, because the number matched what they expected: {why}"
+        );
+
+        // CONTROL 1: the peer has nothing dirty outside the commit.
+        let mut quiet = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        quiet.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        assert!(
+            classify(&staged, 200.0, 3600.0, &quiet).split_risk.is_empty(),
+            "a co-edited staged file alone is not a split — every commit on this checkout \
+             would warn, and a warning that always fires is one nobody reads"
+        );
+
+        // CONTROL 2: their other file is dirty AND staged. Including it is the
+        // remedy, so warning about it would punish the correct behaviour.
+        let both = [
+            pair("crates/amux-server/src/api/board.rs"),
+            pair("crates/amux-server/src/db/board_store.rs"),
+        ];
+        assert!(
+            classify(&both, 200.0, 3600.0, &g).split_risk.is_empty(),
+            "their two halves are BOTH in the commit, which is exactly the fix"
+        );
+
+        // CONTROL 3: a DIFFERENT peer's dirty file. The hazard is a symbol split
+        // across one lane's work; unrelated dirt from a third lane is noise, and
+        // attributing it here would make the message wrong as well as loud.
+        let mut other = peer_wrote("crates/amux-server/src/api/board.rs", "amux", 100.0);
+        other.mine_firsthand.insert("/repo/crates/amux-server/src/api/board.rs".into());
+        other.theirs.insert("/repo/unrelated.rs".into(), ("desktop".into(), 100.0));
+        other.dirty.insert("/repo/unrelated.rs".into());
+        assert!(
+            classify(&staged, 200.0, 3600.0, &other).split_risk.is_empty(),
+            "only the co-editor's OWN dirty files can split their own symbol"
+        );
     }
 
     /// AMUX-3497, rebuilt from the live specimen: a session whose Bash window
@@ -2730,6 +3176,87 @@ mod tests {
         let v = classify(&[pair("t.rs")], 2000.0, 3600.0, &g);
         assert_eq!(v.shared.len(), 1);
         assert!(v.shared[0].get("co_signal").is_none(), "{:?}", v.shared[0]);
+    }
+
+    /// AMUX-3662, rebuilt from the live specimen rather than a convenient shape.
+    ///
+    /// Probing `api/board.rs` returned `age_secs: 455, mine_age_secs: 455,
+    /// owner: amux-frustrations` and no signal of any kind. Their claim was
+    /// REAL (commit 8575cc6f touched that file at 12:18:08); my only contact
+    /// was `sed -n '2270,2300p'`, a read. So the phantom was MINE — and
+    /// `co_signal` correctly stayed silent, because it only fires when the
+    /// PEER's claim is observed.
+    ///
+    /// Both claims rendered in the same shape, which is worse than a missing
+    /// warning: the day before, the identical equal-age signature was read as
+    /// "the peer is the phantom" and cost a wipe-apology sweep to an innocent
+    /// peer. A symmetric instrument answering an asymmetric question gets read
+    /// whichever way the reader already leans.
+    #[test]
+    fn a_shared_row_says_whether_each_side_recorded_the_write_or_only_saw_the_mtime() {
+        // THE SPECIMEN. Peer wrote it for real (transcript); I only observed
+        // the mtime move during a command that merely READ the file. The skew
+        // is deliberately wider than RECENCY_SKEW_MARGIN_S so my echo is NOT
+        // dropped — that drop is a different rule with its own cells above, and
+        // this one is about what the reader is told when a claim survives.
+        let mut g = peer_wrote("board.rs", "amux-frustrations", 1000.0);
+        let mut my_echo = HashMap::new();
+        my_echo.insert("/repo/board.rs".to_string(), 1600.0);
+        apply_observed(&mut g, &my_echo, &[]);
+        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert_eq!(
+            v.shared[0]["mine_provenance"], "observed",
+            "my claim came from an mtime, and the row must say so: {:?}",
+            v.shared[0]
+        );
+        assert_eq!(
+            v.shared[0]["their_provenance"], "transcript",
+            "their claim IS a recorded write: {:?}",
+            v.shared[0]
+        );
+
+        // CONTROL 1: the exact inverse must read the exact opposite way.
+        let mut g = GuardInputs::default();
+        g.mine.insert("/repo/board.rs".into(), 1000.0);
+        g.mine_firsthand.insert("/repo/board.rs".into());
+        let mut peer_obs = HashMap::new();
+        peer_obs.insert("/repo/board.rs".to_string(), 1600.0);
+        apply_observed(&mut g, &HashMap::new(), &[("bob".to_string(), peer_obs)]);
+        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert_eq!(
+            v.shared[0]["mine_provenance"], "transcript",
+            "a write I RECORDED must never read as inferred: {:?}",
+            v.shared[0]
+        );
+        assert_eq!(v.shared[0]["their_provenance"], "observed", "{:?}", v.shared[0]);
+
+        // CONTROL 2, AND IT IS THE LOAD-BEARING ONE. I hold a transcript record
+        // AND my own Bash window also caught the mtime — the ordinary case when
+        // you edit a file and then run anything that touches the tree.
+        //
+        // Control 1 does not reach it: with no observed row of mine, the
+        // marking loop never runs for that path, so a mutation that marks
+        // EVERYTHING observed still leaves it empty and Control 1 passes. That
+        // mutation survived the first draft of this test, which is the whole
+        // reason this case exists — a field hardcoded to "observed" would tell
+        // every author their own recorded work is an inference, and nothing
+        // above would have gone red.
+        let mut g = peer_wrote("board.rs", "bob", 1500.0);
+        g.mine.insert("/repo/board.rs".into(), 1000.0);
+        g.mine_firsthand.insert("/repo/board.rs".into());
+        let mut my_own_echo = HashMap::new();
+        my_own_echo.insert("/repo/board.rs".to_string(), 1010.0);
+        apply_observed(&mut g, &my_own_echo, &[]);
+        let v = classify(&[pair("board.rs")], 2000.0, 3600.0, &g);
+        assert_eq!(v.shared.len(), 1, "{:?}", v.shared);
+        assert_eq!(
+            v.shared[0]["mine_provenance"], "transcript",
+            "a transcript record OUTRANKS my own mtime echo of the same write — \
+             seeing your own edit land is not a second, weaker claim: {:?}",
+            v.shared[0]
+        );
     }
 
     /// AF-179, rebuilt from the reported specimen's own numbers.
@@ -3276,6 +3803,66 @@ mod tests {
     /// MG-1484: the foreign verdict carries the owner's claim PROVENANCE so
     /// every consumer (victim notice, nudges, external tripwires) can say
     /// "you restored this" instead of "you edited this".
+    /// AMUX-3778: an OBSERVED claim must not be described as a recorded write.
+    ///
+    /// `apply_observed` inserts observed rows into `theirs_firsthand` on
+    /// purpose (AF-123 — a Bash-editing lane must not be penalised for a signal
+    /// the harness denies it). That widened the set the provenance lookup
+    /// checked FIRST, so every observed row reported as `firsthand`, and the
+    /// victim notice asserted a recorded write over a cwd mtime. The JSON
+    /// verdict already reported "observed" correctly off the same data, so the
+    /// machine field was right and the human sentence was wrong.
+    ///
+    /// The specimen is AMUX-3763: mixpeek-general warned about radio-canada's
+    /// brand-new file, both lanes interrupted.
+    #[test]
+    fn an_observed_claim_reads_as_circumstantial_and_a_firsthand_one_does_not() {
+        let mut inp = GuardInputs::default();
+        let p = "/repo/customers/radio-canada/pipeline/s04_faces.py".to_string();
+        // Exactly what apply_observed does: rank it WITH firsthand, and mark
+        // how it was learned.
+        inp.theirs_firsthand.insert(p.clone());
+        inp.theirs_observed_only.insert(p.clone());
+        assert_eq!(
+            provenance_of(&inp, &p),
+            "observed",
+            "an observed row is ranked with firsthand but is not firsthand EVIDENCE"
+        );
+
+        let (line, at_risk) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "observed");
+        assert!(at_risk, "it is still flagged — under-warning is the expensive direction");
+        assert!(
+            line.contains("OBSERVED"),
+            "the notice must say how the claim was learned: {line}"
+        );
+        assert!(
+            !line.contains("the WORK ITSELF is at risk"),
+            "and must not assert a recorded write it does not have: {line}"
+        );
+
+        // CONTROL 1: a genuine firsthand edit still warns at FULL strength.
+        // Without this the fix could have defanged the guard and every
+        // assertion above would still pass — the acceptance criterion that
+        // matters most on AMUX-3778.
+        let mut inp2 = GuardInputs::default();
+        inp2.theirs_firsthand.insert(p.clone());
+        assert_eq!(provenance_of(&inp2, &p), "firsthand");
+        let (line2, at_risk2) = victim_path_line("s04_faces.py", &PathFate::AtRisk, "firsthand");
+        assert!(at_risk2);
+        assert!(
+            line2.contains("the WORK ITSELF is at risk"),
+            "a recorded edit must keep the loud line: {line2}"
+        );
+
+        // CONTROL 2: restore still wins over both, or the new arm has silently
+        // reordered a case that was already correct.
+        let mut inp3 = GuardInputs::default();
+        inp3.theirs_restore.insert(p.clone());
+        inp3.theirs_firsthand.insert(p.clone());
+        inp3.theirs_observed_only.insert(p.clone());
+        assert_eq!(provenance_of(&inp3, &p), "restore");
+    }
+
     #[test]
     fn foreign_verdicts_carry_the_owners_claim_provenance() {
         let mut g = peer_wrote("f.md", "alice", 1000.0);
@@ -3445,6 +4032,42 @@ mod tests {
     /// not prove ownership, so the tie still BLOCKS. (The original fixture used a
     /// clearly-fresher committer, which AF-27 showed is a different case that must
     /// NOT block — see `a_clearly_fresher_self_edit_beats_a_stale_firsthand_peer`.)
+    /// AF-156: the OUTDATED HOOK remedy must be runnable BY ITS AUDIENCE.
+    ///
+    /// The old constant `scripts/install-hooks.sh` resolved for nobody who
+    /// received it — every one of 272 warnings in a day came from lanes under
+    /// /Users/ethan/Dev/mixpeek, where that path does not exist. The remedy must
+    /// therefore carry the TARGET DIR (install-hooks.sh's foreign-checkout mode,
+    /// which never writes the other repo's pre-commit).
+    ///
+    /// The second cell is the one that matters: with no AMUX_REPO the string
+    /// must be VISIBLY unfilled, not a plausible relative path that silently
+    /// resolves to nothing. A remedy that looks runnable and is not costs the
+    /// reader the attempt, which is worse than printing none.
+    #[test]
+    fn the_outdated_hook_remedy_names_the_target_dir_and_never_fakes_a_path() {
+        let d = "/Users/ethan/Dev/mixpeek/server/mvs";
+        // SAFETY: single-threaded unit test, restored below.
+        let prev = std::env::var("AMUX_REPO").ok();
+        std::env::set_var("AMUX_REPO", "/Users/ethan/Dev/amux");
+        let r = super::outdated_hook_remedy(d);
+        assert_eq!(r, format!("/Users/ethan/Dev/amux/scripts/install-hooks.sh {d}"));
+        assert!(r.contains(d), "the remedy must name the dir it is fixing: {r}");
+
+        std::env::remove_var("AMUX_REPO");
+        let bare = super::outdated_hook_remedy(d);
+        assert!(
+            bare.starts_with("<your amux checkout>"),
+            "with no AMUX_REPO the path must be visibly unfilled, not a plausible \
+             relative path that resolves nowhere: {bare}"
+        );
+        assert!(bare.contains(d), "and it must still name the target dir: {bare}");
+        match prev {
+            Some(v) => std::env::set_var("AMUX_REPO", v),
+            None => std::env::remove_var("AMUX_REPO"),
+        }
+    }
+
     #[test]
     fn inferred_self_claim_no_fresher_than_the_peer_still_blocks() {
         let mut inp = peer_wrote("test_x.py", "peer-lane", 1000.0);

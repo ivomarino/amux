@@ -36,6 +36,22 @@ CC_HOME="${CC_HOME:-$HOME/.amux}"
 CC_SESSIONS="$CC_HOME/sessions"
 CC_DEFAULTS="$CC_HOME/defaults.env"
 
+# MR-43: recover AMUX_SESSION from the tmux pane name when it is empty inside
+# a lane that IS running in its amux-launched pane (spawn always injects it —
+# session_verbs.rs — so this is loss in-process, not absence at launch).
+# Fixed ONCE here rather than at each of this script's 30+ AMUX_SESSION call
+# sites, so every X-Amux-Session/X-Amux-Worker header downstream benefits
+# without a separate edit per site. Scoped to amux- prefixed panes: a human's
+# own tmux session (or no tmux at all) leaves AMUX_SESSION exactly as unset as
+# before this.
+if [[ -z "${AMUX_SESSION:-}" ]]; then
+  _mr43_tname="$(tmux display-message -p '#S' 2>/dev/null || true)"
+  if [[ "$_mr43_tname" == amux-* ]]; then
+    export AMUX_SESSION="${_mr43_tname#amux-}"
+  fi
+  unset _mr43_tname
+fi
+
 # ── Colors (disabled when not a tty or TERM is dumb) ────────────────────────
 if [[ -t 1 ]] && [[ "${TERM:-dumb}" != "dumb" ]]; then
   BOLD=$'\033[1m' DIM=$'\033[2m' RESET=$'\033[0m'
@@ -1581,6 +1597,23 @@ if ign:
 '
   fi
   local body
+  # WARNING: the block below is inside single quotes (python3 -c '...'). An
+  # apostrophe anywhere in it — including in a comment — closes the quote early
+  # and bash then fails to parse this whole FILE. That is not a local bug: this
+  # script is the symlink target of ~/.local/bin/amux, so a save is a deploy and
+  # every session in the fleet loses every subcommand at once, with the CLI too
+  # broken to print the help that would name the HTTP fallback. It happened
+  # (AMUX-3464, 2026-08-26). Keep explanations out here in bash-comment land,
+  # where quoting does not apply. `.claude/check-and-commit.sh` runs `bash -n`
+  # on save now, and tests/cli_syntax_guard.rs is the backstop.
+  #
+  # `reason` and `desc_append` are BOTH sent for a force, on purpose. The server
+  # interpolates `reason` into the permanent audit line ("force by <who>: a->b
+  # reason=..."); desc_append is prose a later edit can bury. Sending only the
+  # latter is why all 41 force lines this board had ever written read `reason=`
+  # empty, while 9 of those cards carried a good "[FORCED] <why>" in the desc:
+  # --force had already refused to run without a reason, and it simply never
+  # reached the ledger.
   body=$(S="$status" A="$ack" T="$newtype" O="$override" R="$rev" G="$trigger" F="$force_reason" V="$reviewer" python3 -c '
 import json, os, sys, time
 b = {"status": os.environ["S"]}
@@ -1589,7 +1622,10 @@ if os.environ.get("T"): b["type"] = os.environ["T"]
 if os.environ.get("V"): b["reviewer"] = os.environ["V"]
 if os.environ.get("O"): b["override_doing"] = True
 if os.environ.get("R"): b["rev"] = int(os.environ["R"])
-if os.environ.get("F"): b["force"] = True; b["desc_append"] = "[FORCED] " + os.environ["F"]
+if os.environ.get("F"):
+    b["force"] = True
+    b["reason"] = os.environ["F"]
+    b["desc_append"] = "[FORCED] " + os.environ["F"]
 # Stamp last_verified_at alongside source_ref: a trigger with no verification
 # time is indistinguishable from one checked a month ago, and the staleness
 # view keys on exactly that field. Setting one without the other would make
@@ -1692,6 +1728,8 @@ Usage: amux board add <title>
 Optional:
   --desc <text> | --desc-stdin | --desc-file <path>    card body
   --type <type>                                        the GATE is derived from this
+  --depends-on <ISSUE-ID>                              link the new card to one it
+                                                       depends on (repeatable)
   --help                                               this text
 
 types: $(_board_valid_types)
@@ -1743,6 +1781,42 @@ if ok:
     # misread, then routed around a working command with a raw PATCH.
     label = (_argv[2] if len(_argv) > 2 else "") or d.get("status") or d.get("title") or "ok"
     print(d.get("id", "?"), "\u2192", label)
+    # DIVERTED is not IGNORED, and the difference is what the caller does next
+    # (AMUX-3791). Ignored means "set it somewhere else"; diverted means "it IS
+    # set, stop looking in the field you named". `board backlog --trigger` on an
+    # autofix-filed card writes the condition into the card BODY, because
+    # source_ref holds the dedupe signature that stops the detector re-filing.
+    # Without this line the command printed "<id> -> backlog", and verifying the
+    # way the flag implies \u2014 read back source_ref \u2014 returned the old value and
+    # read as a silent drop. That false negative cost a probe against a live
+    # card and nearly a bug report against code behaving correctly. stderr and
+    # exit 0: nothing went wrong, so it must not look like a failure or change
+    # the stdout shape any script is parsing.
+    for dv in (d.get("diverted_fields") or []):
+        if not isinstance(dv, dict):
+            continue
+        # QUOTE THE VALUE THE SERVER ECHOED BACK, not a generic noun. The whole
+        # point of this line is that a caller can confirm the write WITHOUT
+        # opening the card, and "the value was recorded" sends them to look
+        # anyway. The first draft reached for the status LABEL here, which
+        # `board backlog` never passes, so every real invocation printed the
+        # generic fallback.
+        #
+        # NO APOSTROPHE OR SINGLE QUOTE BELOW, INCLUDING IN COMMENTS. This
+        # function is a python3 -c block delimited by single quotes, so one
+        # apostrophe anywhere in it takes the fleet CLI down at load. The first
+        # draft of this hunk did exactly that; the save gate caught it and the
+        # CLI was broken fleet-wide until it was stashed.
+        val = dv.get("value") or ""
+        if len(val) > 73:
+            val = val[:72] + "..."
+        shown = "\"" + val + "\"" if val else "the value"
+        sys.stderr.write(
+            "note: %s was recorded in the card %s, not in `%s` \u2014 %s\n"
+            % (shown,
+               (dv.get("landed_in") or "?").upper(),
+               dv.get("field") or "?",
+               dv.get("why") or "no reason given"))
     # A 200 does not mean the server applied everything you sent. Reported by
     # mixpeek-frustrations: `board backlog --trigger` stored source_ref but
     # silently dropped last_verified_at, so the card parked with a good trigger
@@ -1963,6 +2037,36 @@ types: $(_board_valid_types)"
       echo "$result" | _board_outcome "$id" "" "type set to $new_type"
       return $?
       ;;
+    epic)
+      # AMUX-3707. The decompose nudge has told every lane since AMUX-3323 to
+      # "set each child's `epic` to <ID>" when promoting a capture shell — and
+      # there was no verb. `epic` is a real PATCH field (board.rs:2142, added by
+      # AMUX-2992) reachable only by hand-rolled curl, which drops the worker
+      # header and produces exactly the unattributed writes the ledger depends
+      # on not having. Same defect as `type`, `archive` and `reviewer` above
+      # (AMUX-2325), found the same way: by walking the sanctioned escape with
+      # only the sanctioned tooling and discovering it leaves the trail.
+      local id="${1:-}"; local parent="${2:-}"
+      _board_id_guard "epic" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board epic <ISSUE-ID> <EPIC-ID>
+       amux board epic <ISSUE-ID> none        (detach from its epic)
+Rolls a card up under an epic. The epic itself is a card retyped \`epic\`:
+  amux board type PARENT-1 epic && amux board epic CHILD-1 PARENT-1"
+      # An empty second argument would silently CLEAR the epic, so a typo
+      # (\`amux board epic AMUX-1\`) would detach rather than error. Clearing
+      # must be asked for by name.
+      [[ -n "$parent" ]] || die "amux board epic: name the epic, or 'none' to detach.
+Usage: amux board epic $id <EPIC-ID> | none"
+      case "$parent" in none|None|NONE|clear) parent="" ;; esac
+      local result
+      result=$(P="$parent" python3 -c 'import json,os;print(json.dumps({"epic":os.environ["P"]}))' \
+        | _curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      local _note="epic set to $parent"
+      [[ -n "$parent" ]] || _note="epic cleared"
+      echo "$result" | _board_outcome "$id" "" "$_note"
+      return $?
+      ;;
     archive|unarchive)
       # AMUX-2492. `archived` had no per-card setter anywhere — only the age-archive
       # sweep and a per-session bulk update could touch it, so an automated action had
@@ -2143,6 +2247,7 @@ print(json.dumps(b))' \
       # the mistake natural. `retitle` already had these flags; `add`, the verb
       # you reach first, had none and said so nowhere reachable.
       local title="" desc="" itype="" _src=""
+      local -a deps=()
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --stdin|-)     title=$(cat); _src=1; shift ;;
@@ -2156,20 +2261,38 @@ print(json.dumps(b))' \
           --type)        [[ -n "${2:-}" ]] || die "usage: amux board add --type <type>
 types: $(_board_valid_types)"
                          itype="$2"; shift 2 ;;
+          # AF-242. The server has ALWAYS accepted depends_on at create (it is
+          # in the POST handler's known_keys) and honours it — verified live.
+          # `add` could not say it, and `epic` was the CLI's only link verb, so
+          # a card that begets a card took two steps and the second had no verb
+          # at all. That is ethos rule 1: capability present, honoured, reaching
+          # nobody because the sanctioned tool cannot express it. Two lanes
+          # routed around it on 2026-08-26 alone — a reviewer's out-of-scope
+          # finding written into the host card's desc, and an AF-182 -> AMUX-3726
+          # split written into prose on both cards.
+          --depends-on)  [[ -n "${2:-}" ]] || die "usage: amux board add --depends-on <ISSUE-ID>"
+                         deps+=("$2"); shift 2 ;;
           --help|-h)     _board_add_usage; return 0 ;;
           --*)           _board_bad_flag add "$1" \
-                           "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --type <t> --help" ;;
+                           "--stdin --file <p> --desc <text> --desc-stdin --desc-file <p> --type <t> --depends-on <ID> --help" ;;
           *)             title="${title:+$title }$1"; _src=1; shift ;;
         esac
       done
       [[ -n "$title" ]] || die "$(_board_add_usage)"
       local body result
-      body=$(T="$title" S="${AMUX_SESSION:-}" D="$desc" TY="$itype" python3 -c 'import json,os
+      local _deps_joined=""
+      [[ ${#deps[@]} -gt 0 ]] && _deps_joined=$(printf '%s\n' "${deps[@]}")
+      body=$(T="$title" S="${AMUX_SESSION:-}" D="$desc" TY="$itype" DEP="$_deps_joined" python3 -c 'import json,os
 b = {"title": os.environ["T"].strip(), "status": "todo", "session": os.environ["S"]}
 d = os.environ.get("D", "")
 if d.strip(): b["desc"] = d
 t = os.environ.get("TY", "").strip()
 if t: b["type"] = t
+# ABSENT, not an empty list, when no --depends-on was given. An always-present
+# [] is a different statement to the server and would satisfy any assertion
+# that only checks the flag WORKS (AF-242).
+dep = [x.strip() for x in os.environ.get("DEP", "").split("\n") if x.strip()]
+if dep: b["depends_on"] = dep
 print(json.dumps(b))')
       result=$(_curl -sk -X POST \
         -H 'Content-Type: application/json' \
@@ -2598,6 +2721,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
 
   amux whoami                      Live worker identity vs inherited env (mismatch warns)
   amux board ls [--all]            List open issues (--all includes archived)
+  amux board show <ID>             Print one card in full (title, desc, gate, history)
   amux board add <title>           Create a new todo issue
     --type T                       set the type at create time (the GATE is derived from it)
     --desc/--desc-stdin/--desc-file  give the card a body in the same write
@@ -2611,6 +2735,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board ask <ID> [question]   Ask the owning worker to post a status update
   amux board status-update <ID> …  (for the owning worker) post status to the board
                                    (prose, --stdin or --file <path>; NOT the gate flags below)
+  amux board discard <ID>          Retire a card that is not a unit of work (ungated)
   amux board done <ID>             Move issue to done
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review
@@ -2618,6 +2743,10 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board backlog <ID>          Move issue to backlog
   amux board status <ID> <status>  Set any status
   amux board type <ID> <type>      Correct a card's type (the gate is DERIVED from it)
+  amux board epic <ID> <EPIC-ID>   Roll a card up under an epic ('none' detaches)
+  amux board reviewer <ID> <W>     Name the peer a card in review is handed to
+  amux board archive <ID>          Hide a card from every view AND every autonomy loop
+  amux board unarchive <ID>        Bring an archived card back (the un-do, AMUX-2492)
   amux board retitle <ID> <title>  Rewrite a title/desc so the card stands alone
                                    (--stdin/--file preferred; --desc-stdin for the body)
 
@@ -2948,6 +3077,9 @@ ${BOLD}Worker management:${RESET}
   amux exec <name> [flags]       Register + start in one step
   amux stop <name>               Stop a running worker
   amux rm <name>                 Remove a worker (stops if running)
+  amux fresh <name> [-y]         Restart the worker on a NEW conversation
+                                 ${DIM}keeps env, cards, memory, groups — drops the${RESET}
+                                 ${DIM}compaction backlog. See /api/debug/context-health${RESET}
   amux start-all                 Start all registered workers
   amux stop-all                  Stop all running workers
 
@@ -3269,6 +3401,80 @@ cmd_whoami() {
 #
 # DEFAULT is a PURE FILE READ (no HTTP probe): probing per-call across ~48 lanes
 # would flood the server to ask where the server is. `--verify` opts into a probe.
+# amux fresh <session> — recycle a worker's CONVERSATION, keep the worker.
+#
+# Why this exists (AMUX-3742). A lane resumes the same Claude conversation
+# forever, so it accumulates compaction generations. Measured 2026-08-26 over
+# every transcript active since 08-05: amux lanes median 8, max 215; a raw
+# terminal sits at 0. Same model, same effort, same first-turn token baseline —
+# the difference is that the lane answers from a summary of a summary while a
+# fresh terminal reads primary sources. That is the whole "raw claude performs
+# better than amux claude" report.
+#
+# The remedy lived in the server the whole time and reached nobody: the
+# dashboard rendered "New conversation" only on a STOPPED worker, and the API
+# answered 409 while running. Every live lane is running, so on all 50 of them
+# the one control that fixes this was hidden AND refused.
+#
+# The worker survives untouched: env, board cards, memory, groups, name, tags.
+# Only the conversation starts over. Deliberately never automatic — the
+# conversation is the lane's accumulated work and discarding it is the owner's
+# call (ethos rule 8).
+cmd_fresh() {
+  local yes=0 name=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -y|--yes) yes=1; shift ;;
+      *)        name="$1"; shift ;;
+    esac
+  done
+  [[ -n "$name" ]] || die "usage: amux fresh <session> [-y]"
+  name=$(resolve_session "$name") || return 1
+
+  local api="${AMUX_API:-$(cmd_url)}"
+  # State the cost before paying it. The generation count is what makes this a
+  # decision instead of a guess, so it is fetched even when -y skips the prompt.
+  local gens
+  gens=$(_curl -sk "$api/api/debug/context-health" 2>/dev/null | N="$name" python3 -c "
+import json,os,sys
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+for l in d.get('lanes',[]):
+    if l.get('session')==os.environ['N']:
+        print(l.get('generations') if l.get('measured') else 'unmeasured')
+        break
+")
+  echo "${BOLD}$name${RESET} — conversation has been compacted ${BOLD}${gens:-?}${RESET} time(s)."
+  echo "${DIM}The worker keeps its env, board cards, memory and groups. Only the conversation restarts.${RESET}"
+  if [[ "$yes" -ne 1 ]]; then
+    if [[ ! -t 0 ]]; then
+      die "not a terminal — re-run with -y to confirm discarding this conversation"
+    fi
+    printf "Discard it and restart on a fresh conversation? [y/N] "
+    local reply; read -r reply
+    [[ "$reply" == "y" || "$reply" == "Y" ]] || { echo "${DIM}unchanged${RESET}"; return 0; }
+  fi
+
+  local resp rc=0
+  resp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' \
+    -H "X-Amux-Session: ${AMUX_SESSION:-}" \
+    -d '{"new_conversation":true,"restart":true}' \
+    "$api/api/sessions/$name/config" 2>/dev/null) || rc=$?
+  [[ "$rc" -eq 0 ]] || die "cannot reach the amux server at $api (curl exit $rc) — NOTHING was changed"
+  # Read the BODY, never the exit code: a 409 is a perfectly successful curl.
+  echo "$resp" | python3 -c "
+import json,sys
+raw=sys.stdin.read()
+try: d=json.loads(raw)
+except Exception: sys.exit('unexpected response: '+raw[:200])
+if d.get('error'):
+    msg=d['error']
+    if d.get('escape'): msg += chr(10)+'  try: '+d['escape']
+    sys.exit(msg)
+print(d.get('message','ok') + (' (was %s generations deep)' % d['generations'] if d.get('generations') is not None else ''))
+"
+}
+
 cmd_url() {
   local literal="https://localhost:8824"   # last-resort floor; appended, never an else-branch
   local retired_floor="8822"                # only consulted when endpoint.json is unreadable
@@ -3373,6 +3579,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     alert)            shift; cmd_alert "$@" ;;
     iac)              shift; cmd_config "$@" ;;
     whoami)           cmd_whoami ;;
+    fresh)            shift; cmd_fresh "$@" ;;
     url)              shift; cmd_url "$@" ;;
     help|--help|-h)   cmd_help ;;
     version|--version|-v) echo "amux v${CC_VERSION}" ;;

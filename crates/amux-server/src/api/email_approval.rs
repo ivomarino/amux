@@ -144,6 +144,39 @@ pub enum Consume {
     Gone,
 }
 
+/// Read a pending approval WITHOUT consuming it (AUTOD-48 follow-up).
+///
+/// `consume` is a one-shot atomic rename, so any check that has to read the
+/// frozen doc first DESTROYS the draft it is checking. The creator-cannot-approve
+/// gate did exactly that: it consumed to learn the creator, then refused, and the
+/// human's draft was gone.
+///
+/// autodesk bisected it, one probe per fresh approval, checking the pending list
+/// before and after:
+///
+/// ```text
+/// no-headers    -> 403 approver_unidentified   pending before=True  after=True
+/// self-named    -> 403 creator_cannot_approve  pending before=True  after=FALSE
+/// worker-header -> 403 worker_cannot_approve   pending before=True  after=True
+/// ```
+///
+/// Only the creator check consumed. And because `GET /api/email/approvals`
+/// returns each pending id AND its creating session to any caller, ANY lane
+/// could destroy ANY pending draft by naming that creator back at the server.
+///
+/// The legitimate failure mode is worse than the abuse: a lane that self-approves
+/// ONCE — the precise mistake the gate exists to catch — permanently destroyed
+/// the message a human was supposed to review.
+///
+/// So: peek for the checks, consume only on the path that actually sends.
+pub fn peek(home: &Path, id: &str) -> Option<Value> {
+    if !valid_id(id) {
+        return None;
+    }
+    let raw = std::fs::read_to_string(approvals_dir(home).join(format!("{id}.json"))).ok()?;
+    serde_json::from_str::<Value>(&raw).ok()
+}
+
 /// One-shot consume: the rename is the atomicity — of two racing approvals,
 /// exactly one rename succeeds and the loser sees Gone. Consumed and expired
 /// files are KEPT (renamed, not deleted) so "what happened to apr_X" stays
@@ -165,6 +198,94 @@ pub fn consume(home: &Path, id: &str) -> Consume {
         return Consume::Gone; // raced: the other approver's rename won
     }
     Consume::Ready(doc)
+}
+
+/// What actually became of an approval id, read off the directory.
+///
+/// `consume` renames rather than deletes precisely so "what happened to apr_X"
+/// stays answerable, and nothing was reading it — the 404 enumerated three
+/// possibilities instead, one of which (`already approved`) asserts a human
+/// released the draft. An auditor reading that on a draft destroyed by a refused
+/// self-approval would have drawn exactly the wrong conclusion.
+///
+/// Says only what the filesystem shows. An id with no file of any kind gets the
+/// non-committal answer, because that genuinely is indistinguishable from one
+/// that never existed.
+pub fn fate(home: &Path, id: &str) -> String {
+    if !valid_id(id) {
+        return "not a valid approval id".into();
+    }
+    let dir = approvals_dir(home);
+    if dir.join(format!("{id}.approved.json")).exists() {
+        return "this approval was already RELEASED — it is not pending. \
+                GET /api/email/log shows who released it and when."
+            .into();
+    }
+    // NAME THE REJECTER, NEVER INFER ONE (autodesk, third instance of this
+    // defect in one day). This said "a human rejected it" — while the ledger row
+    // for a headerless discard correctly reads `rejected_by: "unidentified"`.
+    // So the MESSAGE asserted what the ROW refuses to assert, and pointed the
+    // reader at that row as proof. An operator reads the message, not the row.
+    //
+    // Same family as `approved_by: "dashboard (no worker origin)"` and the
+    // three-way 404, both fixed hours earlier. I wrote this one after fixing
+    // those, which is the part worth remembering: knowing the rule did not stop
+    // me applying its inverse in the next sentence I typed.
+    let rejected = dir.join(format!("{id}.rejected.json"));
+    if rejected.exists() {
+        let by = std::fs::read_to_string(&rejected)
+            .ok()
+            .and_then(|r| serde_json::from_str::<Value>(&r).ok())
+            .and_then(|d| d.get("rejected_by").and_then(Value::as_str).map(str::to_string))
+            .unwrap_or_default();
+        return match by.as_str() {
+            "" | "unidentified" => "this approval was DISCARDED and never sent. The caller did \
+                                    not identify itself, so who discarded it is not known — \
+                                    GET /api/email/log has the row."
+                .into(),
+            who => format!(
+                "this approval was DISCARDED by '{who}' and never sent (the identity is \
+                 CLAIMED, not verified). GET /api/email/log has the row."
+            ),
+        };
+    }
+    if dir.join(format!("{id}.expired.json")).exists() {
+        return "this approval EXPIRED unreleased (1h TTL) — the worker must request the send again"
+            .into();
+    }
+    "no approval with that id is pending, and the directory holds no record of one".into()
+}
+
+/// Discard a pending approval without sending it (AMUX-3698).
+///
+/// The same one-shot rename `consume` uses, to `.rejected.json`. Renamed rather
+/// than deleted, like every other terminal state here, so "what happened to
+/// apr_X" stays answerable from the directory alone — and so `fate()` can tell a
+/// later caller it was discarded rather than guessing.
+pub fn discard(home: &Path, id: &str, by: &str) -> Option<Value> {
+    if !valid_id(id) {
+        return None;
+    }
+    let dir = approvals_dir(home);
+    let live = dir.join(format!("{id}.json"));
+    let mut doc = serde_json::from_str::<Value>(&std::fs::read_to_string(&live).ok()?).ok()?;
+    // WHO, RECORDED IN THE DOC ITSELF (autodesk, third instance). `fate()` reads
+    // the directory and nothing else, so without this it could only GUESS who
+    // discarded a draft — and it guessed "a human", which is exactly the
+    // assertion this endpoint spent the morning learning not to make.
+    if let Some(o) = doc.as_object_mut() {
+        o.insert("rejected_by".into(), Value::String(by.to_string()));
+        o.insert("rejected_at".into(), json!(now_f64()));
+    }
+    let dest = dir.join(format!("{id}.rejected.json"));
+    // Write the enriched doc to the destination, then remove the live file. Not
+    // a rename, because the rename would carry the ORIGINAL bytes and lose the
+    // attribution just added. Ordering matters: the destination exists before
+    // the source goes, so a crash between them leaves a discarded record rather
+    // than a vanished draft.
+    std::fs::write(&dest, serde_json::to_string(&doc).ok()?).ok()?;
+    std::fs::remove_file(&live).ok()?;
+    Some(doc)
 }
 
 /// Pending approvals, oldest first, for the dashboard / a human's curl.

@@ -37,12 +37,12 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
-# (`grep -L 'GUARD_VERSION = 6' */.git/hooks/amux-staged-guard`), so a tracked
+# (`grep -L 'GUARD_VERSION = 8' */.git/hooks/amux-staged-guard`), so a tracked
 # file that changed without moving this number makes every stale installed copy
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 6
+GUARD_VERSION = 10
 
 
 def amux_base_url():
@@ -246,8 +246,203 @@ def _post_outcome(sess, top, resolution, basis, override=None,
         record_unenforced("outcome-send-failed: %r" % (e,), sess, [])
 
 
+# ---------------------------------------------------------------------------
+# AF-195: YOU ARE COMMITTING THE INDEX; YOUR TESTS DESCRIBED THE WORKING TREE.
+#
+# INCIDENT (2026-08-24, AF-182 instance five). amux-frustrations ran the full
+# suite: 37/37 green. Minutes later the same suite failed for another lane on
+# the commit they had just made, because the blob in `.git/index` for
+# `board.rs` was not the file on disk they had tested. A numeric floor that
+# their own commit message said was REMOVED was added back by the diff.
+#
+# Both results were true. The verification did not fail, it EXPIRED — and that
+# defeats "verify before you commit" as a habit, because the habit's premise is
+# that a green result describes the thing you are about to commit.
+#
+# THE FRAMING THAT MAKES IT CHEAP TO CATCH: nothing "moved". `git commit`
+# writes the INDEX and every test reads the WORKING TREE, and those are two
+# objects that nothing requires to agree. So the check is one command, it is
+# deterministic, it needs no server, and it answers in milliseconds:
+#
+#     (worktree != index)  INTERSECT  (index != HEAD)
+#
+# The intersection is load-bearing in both directions. Without the first term
+# you flag every ordinary commit; without the second you flag unrelated dirty
+# files that are not being committed at all — which is most of a shared
+# checkout, most of the time, and a guard that fires on every commit is one
+# everybody learns to bypass.
+#
+# WHY THE OTHER COMMIT FORMS DO NOT TRIP IT, verified rather than assumed (see
+# scripts/test-index-worktree-divergence.sh): `git commit -a` and
+# `git commit -- <paths>` both build a TEMPORARY index from the working tree
+# and point GIT_INDEX_FILE at it, so `git diff` inside the hook compares the
+# worktree against that temp index and finds nothing. The form this fires on is
+# plain `git commit` over a hand-staged index, which is exactly the form the
+# incident used.
+DIVERGENCE_LOG = os.path.join(
+    os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux"),
+    "staged-guard-divergence.jsonl")
+
+
+def _git_lines(args):
+    r = subprocess.run(["git"] + args, capture_output=True, text=True, timeout=10)
+    return [p for p in r.stdout.split("\0") if p.strip()]
+
+
+def index_worktree_divergence(sess, w):
+    """Refuse a commit whose staged content differs from the files on disk.
+
+    Returns 1 to block, 0 to allow. Fails OPEN on any error, like the rest of
+    this guard: a hook that cannot run must not brick every lane's commit.
+    """
+    try:
+        staged = set(_git_lines(["diff", "--cached", "--name-only", "-z"]))
+        if not staged:
+            return 0
+        dirty = set(_git_lines(["diff", "--name-only", "-z"]))
+        both = sorted(staged & dirty)
+        if not both:
+            return 0
+    except Exception as e:
+        # Distinguishable from "clean" in the log, per the file's own rule
+        # about the difference between a check that passed and one that never
+        # got as far as asking.
+        record_unenforced("divergence-check-unreadable: %r" % (e,), sess, [])
+        return 0
+
+    if os.environ.get("AMUX_PARTIAL_STAGE"):
+        # The honest escape, in the AF-26 shape the overrides below already
+        # use: a DECLARATION, not a suppression. `git add -p` is a real
+        # workflow and this claim is the true statement for it.
+        _record_divergence(sess, both, "declared-partial")
+        w("\namux staged-guard: partial stage DECLARED for %d path(s) — %s\n"
+          "  Proceeding. Recorded in %s\n" % (len(both), ", ".join(both), DIVERGENCE_LOG))
+        return 0
+
+    _record_divergence(sess, both, "blocked")
+    w("\n" + "=" * 72 + "\n"
+      "amux staged-guard: REFUSED — YOU ARE COMMITTING THE INDEX, NOT THESE FILES.\n"
+      + "=" * 72 + "\n"
+      "\nThese paths are staged AND differ from the copy on disk:\n\n")
+    for p in both:
+        w("    %s\n" % p)
+    w("\nSo the bytes about to be committed are not the bytes any test you ran\n"
+      "read. A green suite minutes ago described the working tree; `git commit`\n"
+      "writes the index. Nothing in git, cargo, or this guard's other checks\n"
+      "compares the two, which is how AF-182 instance five shipped a commit whose\n"
+      "message asserted the opposite of its own diff.\n"
+      "\nTHREE HONEST WAYS FORWARD. Pick by which one is TRUE for you:\n"
+      "\n  1. Commit what you tested:\n"
+      "         git add %s\n"
+      "     READ THE DIFF FIRST if the divergence surprised you. On a shared\n"
+      "     checkout the disk copy can contain a PEER's edit that landed after\n"
+      "     you staged, and re-adding would sweep it into your commit. The\n"
+      "     cross-session half of this guard runs next and will say so, but you\n"
+      "     want to know before you get there:  git diff -- %s\n"
+      "\n  2. Test what you are committing (stash the unstaged remainder first):\n"
+      "         git stash push --keep-index && <your test> && git stash pop\n"
+      "\n  3. You MEANT to commit a subset (`git add -p`), and you accept that the\n"
+      "     staged subset is not what you exercised:\n"
+      "         AMUX_PARTIAL_STAGE=1 git commit ...\n"
+      "\nNot `--no-verify`: that turns off the cross-session sweep protection too,\n"
+      "and this refusal is the cheap one to satisfy.\n"
+      % (" ".join(both), " ".join(both)))
+    return 1
+
+
+def _record_divergence(sess, paths, resolution):
+    """Local ledger, deliberately not server-backed — the whole value of this
+    check is that it answers with nothing running. Counted so instance six of
+    AF-182 is a query instead of a conversation between two lanes who happened
+    to be talking."""
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                              capture_output=True, text=True, timeout=5).stdout.strip()
+        with open(DIVERGENCE_LOG, "a") as fh:
+            fh.write(json.dumps({
+                "ts": time.time(), "session": sess, "resolution": resolution,
+                "paths": paths, "head_before": head,
+                "guard_version": GUARD_VERSION,
+            }) + "\n")
+    except Exception:
+        pass
+
+
+def _derive_session_from_tmux():
+    """Fallback identity for MR-43: $AMUX_SESSION can be empty inside a lane
+    that IS running in its amux-launched tmux pane (the var got lost somewhere
+    in the process env, not at spawn — spawn always injects it, session_verbs.rs).
+    Ask tmux directly and strip the `amux-` prefix the launcher always uses.
+
+    Scoped to amux- prefixed panes only, so a genuine human shell (no such
+    prefix, or no tmux at all) still resolves to "" and takes the existing
+    no-op path below — this only recovers a lane that lost its own identity,
+    it never invents one for a human.
+    """
+    try:
+        name = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception:
+        return ""
+    return name[len("amux-"):] if name.startswith("amux-") else ""
+
+
+def _render_split_risk(d, w):
+    """AF-190: this commit SPLITS a peer's work, so it can fail to build even
+    though the tree it came from compiles.
+
+    `cargo check` and the pre-commit gate both pass, correctly — they build the
+    TREE, which holds the peer's uncommitted half. Nothing builds the COMMIT, so
+    53ae4b8b was the tip of origin/main and did not compile.
+
+    A SEPARATE FUNCTION so this can be tested. The rest of the verdict rendering
+    lives inline in main() behind a live HTTP call, which is exactly the shape
+    that lets a print statement be wrong for months: a field the server emits and
+    no hook renders reaches nobody, and nothing about reading main() would say
+    so. test_amux_staged_guard.py drives this directly.
+
+    Advisory, never blocking. It is a warning about a BUILD, not an assertion
+    that the staged bytes are somebody else's, and blocking on it would stop
+    commits that are perfectly legitimate. Printed BEFORE the block section:
+    when both fire, this one names a consequence the committer can act on
+    without first reading a claim about ownership.
+    """
+    for _sr in d.get("split_risk") or []:
+        w("\namux staged-guard: SPLIT COMMIT WARNING — %s's work is being cut in half:\n"
+          % _sr.get("owner", "?"))
+        w("  in this commit:  %s\n" % ", ".join(_sr.get("staged") or []))
+        w("  left behind, dirty and NOT committed:\n")
+        for _p in _sr.get("left_dirty") or []:
+            w("    %s\n" % _p)
+        # The server's sentence, verbatim. It STATES the hazard rather than
+        # asking the committer to judge a number: the guard already printed a
+        # discriminating insertion count for the specimen behind this feature
+        # ("34 insertions / 9 deletions — if that is MORE than you wrote...")
+        # and its author read past it, because 34 matched what they expected.
+        # A number that agrees with you is exactly where a check gets skipped.
+        w("  %s\n" % _sr.get("why", ""))
+
+
 def main():
     sess = os.environ.get("AMUX_SESSION", "")
+    derived = False
+    if not sess:
+        sess = _derive_session_from_tmux()
+        derived = bool(sess)
+    if derived:
+        # Said HERE, once, before any check runs on `sess` — every message and
+        # server call below already uses whatever `sess` resolved to, so this
+        # is the one place a reader needs the note to make sense of the rest.
+        sys.stderr.write(
+            "amux staged-guard: $AMUX_SESSION was empty; using '%s' from the "
+            "tmux session name instead (MR-43).\n" % sess)
+    # AF-195 runs FIRST and outranks the overrides below, because it is a
+    # different claim. ALLOW_FOREIGN says "their work is in it and I mean to
+    # ship it"; neither it nor VERIFIED_SOLO says anything about whether the
+    # staged bytes are the bytes you tested, and letting them imply it would
+    # put the commonest override in the fleet on the path of the newest check.
+    if sess and index_worktree_divergence(sess, sys.stderr.write):
+        return 1
     # AMUX_VERIFIED_SOLO is the HONEST half of the same exit (AF-26). Both skip the
     # check; they differ in what the operator asserts, and that difference is the point —
     # ALLOW_FOREIGN says "their work is in it and I mean to ship it", VERIFIED_SOLO says
@@ -461,6 +656,30 @@ def main():
         # transcript co-edits; old servers never send it.
         if f.get("co_signal"):
             w("  Co-edit signal caveat: %s\n" % f.get("co_signal"))
+        # AMUX-3662: say how EACH side knows, not just the peer's side.
+        #
+        # `co_signal` above only fires when the PEER's claim is observed, so the
+        # inverse case — their claim is a recorded write and YOURS is an mtime
+        # your Bash window caught — printed no marker at all. Both ages rendered
+        # identically and the reader had no way to tell which claim was
+        # inferred. Measured 2026-08-24 on `api/board.rs`: equal ages, peer's
+        # claim real (commit 8575cc6f), mine a `sed` that only READ the file.
+        #
+        # Printed only when the two DISAGREE, because that is the case the
+        # reader cannot resolve; two transcript claims need no annotation and a
+        # line on every row is a line nobody reads. Absent on old servers, which
+        # is why it is a .get with a default rather than an index.
+        _mp, _tp = f.get("mine_provenance"), f.get("their_provenance")
+        if _mp and _tp and _mp != _tp:
+            if _mp == "observed":
+                w("  Provenance: THEIR claim is a recorded write; YOURS is an mtime your "
+                  "own Bash command saw move, which on a shared checkout includes writes "
+                  "you did not make. Before concluding they are a phantom co-editor, check "
+                  "whether the phantom is yours (AMUX-3662).\n")
+            else:
+                w("  Provenance: YOUR claim is a recorded write; THEIRS is an mtime their "
+                  "Bash command saw move — possibly your own write, seen from their "
+                  "window (AMUX-3662).\n")
     # THE BELT (AMUX-2443 / AF-19 residual / AC-297 — three sightings, one gap):
     # staged paths with NO edit record from ANY session in the window were
     # invisible to both classifications above, and a plain commit ships them
@@ -526,6 +745,7 @@ def main():
         w("  If these are yours via shell edits, proceed. If you do not recognize "
           "one, it is a peer's in-flight hunk riding your git add — stage "
           "per-hunk instead (git add -p %s).\n" % _ua.get("path", ""))
+    _render_split_risk(d, w)
     foreign = d.get("foreign") or []
     _m = _read_marker(sess, top)
     if not foreign:

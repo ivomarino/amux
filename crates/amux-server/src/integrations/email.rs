@@ -143,7 +143,29 @@ pub fn sig_html_to_text(sig_html: &str) -> String {
     if sig_html.is_empty() {
         return String::new();
     }
-    let br = regex::Regex::new(r"(?i)<\s*br\s*/?>").expect("static regex");
+    // `<br` PLUS ANY ATTRIBUTES (Ethan, 2026-08-24: "formatting wasn't
+    // retained"). This was `<\s*br\s*/?>`, which matches `<br>` and `<br/>` and
+    // NOT `<br style="...">` — and Gmail's signature editor puts an inline style
+    // on every single break. Unmatched, they fell through to the generic
+    // `<[^>]+>` stripper below and were DELETED, so every line break in a real
+    // signature silently vanished.
+    //
+    // What the recipient saw, from the primis reply of that evening, read back
+    // off the SENT message rather than reasoned about:
+    //
+    //   Ethan Steininger
+    //   Founder & CEO @ Mixpeek LinkedInSchedule time with me
+    //   915 Broadway, Suite 1200
+    //
+    // Two link labels concatenated into `LinkedInSchedule` because the break
+    // between them was dropped. `\b` after `br` so `<brother>` is still not a
+    // break.
+    //
+    // Only the text/plain alternative was affected. The HTML alternative
+    // carries the signature HTML verbatim and was correct throughout, which is
+    // exactly why this survived: whoever checked in Gmail saw the HTML part and
+    // it looked fine.
+    let br = regex::Regex::new(r"(?i)<\s*br\b[^>]*>").expect("static regex");
     let blocks = regex::Regex::new(r"(?i)</\s*(p|div|tr|table|h[1-6])\s*>").expect("static regex");
     let tags = regex::Regex::new(r"<[^>]+>").expect("static regex");
     let trail_ws = regex::Regex::new(r"[ \t]+\n").expect("static regex");
@@ -154,7 +176,25 @@ pub fn sig_html_to_text(sig_html: &str) -> String {
     t = html_unescape(&t);
     t = trail_ws.replace_all(&t, "\n").into_owned();
     t = many_nl.replace_all(&t, "\n\n").into_owned();
-    t.trim().to_string()
+    let out = t.trim().to_string();
+    // MAKE THE NEXT ONE SELF-ANNOUNCING. This bug shipped in the text/plain
+    // alternative of every email for as long as the signature had styled breaks,
+    // and nothing anywhere could have reported it: the HTML alternative was
+    // correct, so the send looked right to anyone who checked in Gmail.
+    //
+    // The condition cannot false-positive. A signature with no `<br` at all is
+    // legitimately one line and does not fire; one that HAS breaks and produced
+    // zero newlines has lost every one of them, which is never correct.
+    if !out.is_empty() && !out.contains('\n') && sig_html.to_ascii_lowercase().contains("<br") {
+        tracing::warn!(
+            html_len = sig_html.len(),
+            text_len = out.len(),
+            "email signature: HTML has <br> breaks but the plain-text rendering has NO line \
+             breaks — the text/plain alternative is collapsing the signature onto one line \
+             (this is how `LinkedInSchedule time with me` reached a customer on 2026-08-24)"
+        );
+    }
+    out
 }
 
 /// The handful of entities `html.unescape` sees in real signatures.
@@ -348,16 +388,33 @@ pub fn build_rfc822(spec: &MimeSpec) -> String {
 /// the plain body, signature appended to both alternatives. Returns
 /// `(plain_full, html_full, signature_included)`.
 pub fn compose_bodies(body: &str, sig_html: &str) -> (String, String, bool) {
-    // The HTML alternative must MIRROR the text/plain part, which Gmail renders
-    // only as a fallback (primis, 2026-08-13: a delivered reply came out cramped
-    // — paragraph spacing collapsed, bullet list flattened). The old
-    // `white-space:normal` COLLAPSED the sender's whitespace (indentation, blank
-    // lines) and `\n -> <br>` discarded structure. `white-space:pre-wrap` on the
-    // ESCAPED body — newlines KEPT, not turned into <br> — renders exactly the
-    // spacing the text/plain part has: blank-line paragraph breaks and indented
-    // list items survive. (Rich markdown -> <ul>/<strong> is a separate opt-in;
-    // this faithful-whitespace fix is the safe default and cannot misrender.)
-    let body_html = html_escape(body);
+    // BOTH `<br>` AND `white-space:pre-wrap`, and the combination is the fix
+    // (Ethan, 2026-08-25, with a rendered screenshot).
+    //
+    // `pre-wrap` ALONE was not enough, and the proof is inside one delivered
+    // message. The welcome email to siripuru.v@media.net went out with a correct
+    // MIME — 11 blank-line breaks in text/plain, `pre-wrap` plus raw newlines in
+    // the HTML, both verified by reading the SENT message back. It rendered as a
+    // wall of text, breaks lost mid-sentence ("adtech-platform-docs You work in
+    // adtech"). In the SAME message the signature rendered correctly, and the
+    // signature is built from real `<br>` elements.
+    //
+    // Same client, same message, two mechanisms: `<br>` survived and
+    // `white-space` did not. Mail clients sanitise CSS; they do not strip `<br>`.
+    // Structure that depends on a style property is structure the recipient may
+    // never see, and nothing in the send path can detect that — the bytes we
+    // sent were right, which is exactly why this survived a verification that
+    // read them back.
+    //
+    // NO RAW NEWLINE IS LEFT BEHIND, which is the trap the previous comment was
+    // written to avoid. Under `pre-wrap` a `<br>` followed by a literal newline
+    // renders as TWO breaks, so converting while also keeping the newline would
+    // double every paragraph gap. Converting REPLACES it, so:
+    //   - `pre-wrap` honoured  -> `<br>` breaks, nothing doubles
+    //   - `pre-wrap` stripped  -> `<br>` breaks anyway
+    // The div stays for the one thing `<br>` cannot carry, leading indentation,
+    // which degrades to collapsed rather than to lost lines.
+    let body_html = html_escape(body).replace('\n', "<br>");
     let mut html_full = format!("<div style=\"white-space:pre-wrap;\">{body_html}</div>");
     if !sig_html.is_empty() {
         html_full.push_str(&format!("<br><br>{sig_html}"));
@@ -1808,6 +1865,54 @@ mod tests {
         let sig = "<div><b>Ethan</b><br>Founder, Mixpeek</div><p>ethan&amp;co</p>";
         assert_eq!(sig_html_to_text(sig), "Ethan\nFounder, Mixpeek\nethan&co");
         assert_eq!(sig_html_to_text(""), "");
+
+        // THE REAL SIGNATURE, not a convenient one (Ethan, 2026-08-24:
+        // "formatting wasn't retained"). Lifted from the sent MIME of the
+        // primis reply — Gmail's editor puts an inline style on EVERY break,
+        // and the old `<\s*br\s*/?>` matched none of them, so they fell through
+        // to the tag stripper and were deleted.
+        //
+        // The bare-`<br>` fixture above passed the whole time. It is convenient
+        // precisely because it lacks the property that made the incident.
+        let real = concat!(
+            r#"Ethan Steininger<br>Founder &amp; CEO @ "#,
+            r#"<a href="https://mixpeek.com/" style="font-size:13px">Mixpeek</a> "#,
+            r#"<br style="color:rgb(213,218,222);font-size:13px">"#,
+            r#"<br style="color:rgb(213,218,222);font-size:13px">"#,
+            r#"<a href="https://www.linkedin.com/in/ethansteininger/" style="font-size:13px">LinkedIn</a>"#,
+            r#"<br style="color:rgb(213,218,222);font-size:13px">"#,
+            r#"<a href="https://calendly.com/mixpeek" style="font-size:13px">Schedule time with me</a>"#,
+        );
+        let txt = sig_html_to_text(real);
+        assert!(
+            !txt.contains("LinkedInSchedule"),
+            "the exact string a customer received: two link labels concatenated because the \
+             styled <br> between them was dropped: {txt:?}"
+        );
+        assert!(
+            txt.contains("Mixpeek") && txt.contains("LinkedIn") && txt.contains("Schedule time"),
+            "every label must survive — the fix must not trade a lost break for lost text: {txt:?}"
+        );
+        // Pinned as the exact rendering rather than a line count, because my
+        // first draft asserted 4 and the truth is 5: the doubled `<br><br>`
+        // between the title and the links becomes a real BLANK line, which is
+        // correct and which `lines()` counts. The code was right and the
+        // expectation was wrong, so the expectation moved.
+        assert_eq!(
+            txt,
+            "Ethan Steininger\nFounder & CEO @ Mixpeek\n\nLinkedIn\nSchedule time with me",
+            "the whole point is the shape, so assert the shape: {txt:?}"
+        );
+
+        // The boundary that keeps the widened pattern honest: `<br` must not
+        // swallow a tag that merely starts with those letters.
+        assert_eq!(
+            sig_html_to_text("a<brother>b"),
+            "ab",
+            "<brother> is stripped as an unknown tag, NOT treated as a line break"
+        );
+        // Self-closing and upper-case with attributes, both real in the wild.
+        assert_eq!(sig_html_to_text("a<BR CLASS='x'/>b"), "a\nb");
     }
 
     #[test]
@@ -1819,18 +1924,69 @@ mod tests {
         assert_eq!(parse_addresses(""), Vec::<String>::new());
     }
 
+    /// Structure must survive a client that strips CSS (Ethan, 2026-08-25).
+    ///
+    /// THE SPECIMEN: the welcome email to siripuru.v@media.net rendered as a
+    /// wall of text — "adtech-platform-docs You work in adtech", breaks lost
+    /// mid-sentence — while its MIME was correct: 11 blank-line breaks in
+    /// text/plain and `pre-wrap` with raw newlines in the HTML, both read back
+    /// off the SENT message.
+    ///
+    /// The signature in that same message rendered correctly, and it is built
+    /// from real `<br>`. One client, one message, two mechanisms, one survivor.
+    ///
+    /// This cell asserts on the MECHANISM rather than on the bytes, because
+    /// reading the bytes back is exactly the verification that passed while the
+    /// defect was live.
+    #[test]
+    fn html_breaks_survive_a_client_that_strips_white_space_css() {
+        let (_plain, html, _) = compose_bodies("para one\n\npara two\nnext line", "");
+
+        // A blank line is TWO breaks; a single newline is one.
+        assert!(html.contains("para one<br><br>para two<br>next line"), "{html}");
+
+        // NO RAW NEWLINE SURVIVES IN THE BODY. Under `pre-wrap` a `<br>`
+        // followed by a literal newline renders as TWO breaks, so keeping both
+        // would double every paragraph gap on any client that DOES honour the
+        // style — trading a wall of text for a sparse one.
+        let body_part = html.split("</div>").next().unwrap();
+        assert!(
+            !body_part.contains('\n'),
+            "a raw newline beside a <br> doubles the gap under pre-wrap: {body_part:?}"
+        );
+
+        // The div stays: it is the only thing carrying leading indentation,
+        // which <br> cannot express.
+        assert!(html.contains("white-space:pre-wrap"), "{html}");
+
+        // AND THE PLAIN PART IS UNTOUCHED. It is the alternative a text-only
+        // client renders, and it was never the broken half — changing it to
+        // chase an HTML bug would break the one part that worked.
+        let (plain, _, _) = compose_bodies("para one\n\npara two", "");
+        assert_eq!(plain, "para one\n\npara two");
+    }
+
     #[test]
     fn compose_bodies_escapes_and_appends_signature() {
         let (plain, html, inc) = compose_bodies("hi <b>\nline2", "<b>Sig</b>");
         assert_eq!(plain, "hi <b>\nline2\n\nSig");
-        // pre-wrap + KEEP the newline (not <br>): the HTML mirrors the plain
-        // part's spacing exactly (BACKE/primis 2026-08-13). A `<br>` here would
-        // DOUBLE the break under pre-wrap.
+        // pre-wrap AND `<br>`, with the newline REPLACED rather than kept
+        // (Ethan, 2026-08-25). This cell used to demand the opposite — "newline
+        // preserved, not <br>-ified" — and that was a reasonable reading of the
+        // 2026-08-13 evidence, which was about `white-space:normal` collapsing
+        // indentation. It was overturned by a rendered screenshot: a message
+        // whose MIME was verifiably correct still arrived as a wall of text,
+        // because the client sanitised the style. The signature in the same
+        // message, built from real `<br>`, rendered fine.
+        //
+        // The doubling worry the old comment names is real and is why the
+        // newline is REPLACED, not accompanied: `<br>` plus a literal newline
+        // renders as two breaks wherever pre-wrap IS honoured.
         assert_eq!(
             html,
-            "<div style=\"white-space:pre-wrap;\">hi &lt;b&gt;\nline2</div><br><br><b>Sig</b>"
+            "<div style=\"white-space:pre-wrap;\">hi &lt;b&gt;<br>line2</div><br><br><b>Sig</b>"
         );
-        assert!(html.contains("pre-wrap") && !html.contains("<br>line2"), "newline preserved, not <br>-ified: {html}");
+        assert!(html.contains("pre-wrap"), "the div still carries indentation: {html}");
         assert!(inc);
         let (plain2, html2, inc2) = compose_bodies("hi", "");
         assert_eq!(plain2, "hi");

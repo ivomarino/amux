@@ -610,6 +610,14 @@ pub(crate) mod test_env {
     pub struct HomeGuard {
         prev: Option<String>,
         prev_leaky: Vec<(&'static str, Option<String>)>,
+        /// The whole process env as it stood when the guard was taken, used to
+        /// restore the fixture's OWN keys. See the Drop impl: a static key list
+        /// cannot bound what a fixture home may export, and a blanket restore
+        /// over-reaches into keys other tests own.
+        snapshot: Vec<(String, String)>,
+        /// The fixture home, so Drop can ask its `server.env` which keys this
+        /// guard's window could have exported.
+        home: std::path::PathBuf,
         _g: MutexGuard<'static, ()>,
     }
 
@@ -620,12 +628,28 @@ pub(crate) mod test_env {
     /// against each other — two guards can never interleave — but nothing
     /// makes the ~79 `amux_home()` READ sites take it, so a guardless test
     /// reading a home concurrently with a guard's window sees the fixture
-    /// home. Accepted with ~43 users and zero observed bites; if one is ever
-    /// observed, the promotion path is routing test reads through the
-    /// injected-lookup seam `config::resolve_home(get)` already provides
-    /// (built for exactly this), not a bigger lock. Until then: prefer that
-    /// seam over this guard for NEW tests when the code under test can take
-    /// an injected lookup — every test that does shrinks the exposure.
+    /// home. Accepted with ~43 users; the promotion path is routing test reads
+    /// through the injected-lookup seam `config::resolve_home(get)` already
+    /// provides (built for exactly this), not a bigger lock. Until then: prefer
+    /// that seam over this guard for NEW tests when the code under test can
+    /// take an injected lookup — every test that does shrinks the exposure.
+    ///
+    /// THE "ZERO OBSERVED BITES" CLAUSE IS SPENT (AMUX-3719, 2026-08-25). One
+    /// was observed: `owner_alert_full_send_shape_channels_and_ledger` read a
+    /// pin that only exists in another test's fixture home, once in 4 full-suite
+    /// runs. That is the trigger this comment named, so the exit condition is
+    /// live rather than hypothetical.
+    ///
+    /// It does not match the exposure described above, which is what makes it
+    /// worth writing down instead of just fixing: BOTH tests involved hold a
+    /// guard, and two guards cannot interleave. Ruled out with the code, so
+    /// nobody re-runs them: `set_server_env_key` writes only the file and never
+    /// the process env; every unguarded `set_var("AMUX_HOME")` is in `tests/`,
+    /// which are separate binaries. The mechanism is still unknown and the flake
+    /// did not reproduce in three subsequent full runs. The failing assertion now
+    /// prints the fixture home, `AMUX_HOME`, and the resolved home, so the next
+    /// occurrence identifies its own cause instead of costing another
+    /// investigation that ends here.
     pub fn set_home(path: &std::path::Path) -> HomeGuard {
         let g = LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev_leaky: Vec<(&'static str, Option<String>)> = leaky_keys()
@@ -637,16 +661,55 @@ pub(crate) mod test_env {
                 (k, was)
             })
             .collect();
+        // FULL SNAPSHOT, taken AFTER the leaky strip so the strip is what the
+        // guard restores to. See the Drop impl for why a key list cannot do
+        // this job.
+        let snapshot: Vec<(String, String)> = std::env::vars().collect();
         let prev = std::env::var("AMUX_HOME").ok();
         std::env::set_var("AMUX_HOME", path);
         HomeGuard {
             prev,
             prev_leaky,
+            snapshot,
+            home: path.to_path_buf(),
             _g: g,
         }
     }
 
     impl Drop for HomeGuard {
+        /// Restore the process env EXACTLY, not just the keys we thought could leak.
+        ///
+        /// AMUX-3719, diagnosed 2026-08-26 after the flake reproduced on a
+        /// SECOND test in the module (`owner_alert_respects_channel_config`,
+        /// where the first was `owner_alert_full_send_shape_channels_and_ledger`
+        /// — which is itself the tell that the defect is the guard, not either
+        /// test).
+        ///
+        /// `leaky_keys()` derives its set from the MACHINE's `~/.amux/server.env`,
+        /// and that is the right derivation for the direction it was built for:
+        /// stopping the real machine's config from leaking INTO a fixture. It is
+        /// blind to the opposite direction. A test writes a key into its OWN temp
+        /// home (`set_server_env_key`), `ServerConfig::load` exports that file
+        /// into the PROCESS env (config.rs:225 — `std::env::set_var(k, v)`, and
+        /// its own comment notes it runs on a timer, not just at boot), and the
+        /// guard then cannot restore a key it was never told about. On this
+        /// machine `AMUX_OWNER_EMAIL` is absent from `~/.amux/server.env`
+        /// (verified: zero matching lines), so `pinned@example.com` survived its
+        /// test's guard and every later test that did not set the key in its own
+        /// fixture read it from the process env.
+        ///
+        /// The previous investigation ruled out the writer and stopped: "
+        /// `set_server_env_key` writes only the file and never the process env"
+        /// is TRUE, and irrelevant, because the export happens later in the
+        /// READER. Checking the writer and not the re-exporter is what left this
+        /// open for a day.
+        ///
+        /// A key list cannot fix this, and adding `AMUX_OWNER_EMAIL` to the floor
+        /// would fix exactly one test. Any fixture may write any key, so the set
+        /// is unbounded and unknowable in advance — the same "someone must
+        /// remember to add a row" shape `leaky_keys()` was written to escape.
+        /// Snapshot-and-restore is derived from behaviour instead of enumeration,
+        /// so a fixture that invents a new key tomorrow is covered today.
         fn drop(&mut self) {
             match &self.prev {
                 Some(v) => std::env::set_var("AMUX_HOME", v),
@@ -657,6 +720,69 @@ pub(crate) mod test_env {
                     Some(v) => std::env::set_var(k, v),
                     None => std::env::remove_var(k),
                 }
+            }
+            // Remove anything that appeared during the guard's window, then
+            // restore anything that was changed or deleted. Order matters only
+            // in that removals must not undo a restore, so restores go last.
+            // SCOPE THE RESTORE TO THE LEAK CHANNEL, not to "every key that
+            // changed". The first version of this fix restored the WHOLE env
+            // diff and immediately broke
+            // `the_budgeted_sample_is_spread_across_directories_not_taken_alphabetically`:
+            // that test sets AMUX_NUDGE_REVIVED_MAX_PATHS with a bare set_var,
+            // outside any guard, and runs twice under the cap. A concurrent
+            // guard whose snapshot predated the set_var deleted the key between
+            // the two runs, so the second used the default 40 and disagreed —
+            // which is the exact failure that test's own comment already
+            // describes as its first draft's bug. Trading one flake for a
+            // broader one is not a fix; the blanket restore could clobber any
+            // env var any test owns.
+            //
+            // The channel is exactly one file. config.rs:225 exports the
+            // resolved home's `server.env` into the process env, so the keys
+            // this guard's window could have exported ARE that file's keys.
+            // Reading them at drop (not at set_home) is deliberate: the fixture
+            // is usually written AFTER the guard is taken.
+            let mut scoped: Vec<String> = crate::config::parse_env_file(&self.home.join("server.env"))
+                .into_keys()
+                .collect();
+            // The marker config.rs writes alongside the export belongs to the
+            // same mechanism, so it leaks the same way.
+            scoped.push(crate::config::ENV_FROM_FILE_MARKER.to_string());
+
+            let mut leaked: Vec<String> = Vec::new();
+            for k in scoped {
+                if k == "AMUX_HOME" || self.prev_leaky.iter().any(|(lk, _)| *lk == k) {
+                    continue; // already handled above
+                }
+                let want = self.snapshot.iter().find(|(sk, _)| *sk == k).map(|(_, v)| v.clone());
+                let have = std::env::var(&k).ok();
+                if have == want {
+                    continue;
+                }
+                leaked.push(k.clone());
+                match want {
+                    Some(v) => std::env::set_var(&k, v),
+                    None => std::env::remove_var(&k),
+                }
+            }
+            // SAY THAT IT HAPPENED. Containing the leak silently would make the
+            // next leak path indistinguishable from no leak path at all, and
+            // this bug already cost two investigations that ended in "mechanism
+            // unknown". The restore above is now total, so a name appearing here
+            // is not a failure — it is the only evidence that a fixture home is
+            // exporting into the shared process env, which is the thing that was
+            // invisible. The first diagnostic for this flake was attached to ONE
+            // test's assertion and the flake then reproduced on a DIFFERENT test,
+            // printing nothing; an instrument on the mechanism does not care
+            // which test trips it.
+            if !leaked.is_empty() {
+                leaked.sort();
+                leaked.dedup();
+                tracing::warn!(
+                    marker = "fixture_home_env_leak",
+                    keys = %leaked.join(","),
+                    "a fixture home mutated the shared process env; HomeGuard restored it (AMUX-3719)"
+                );
             }
         }
     }
@@ -719,6 +845,62 @@ pub(crate) mod test_env {
             checked > 0,
             "server.env exists at {} but parsed 0 keys — the parser, not the coverage, is wrong",
             file.display()
+        );
+    }
+
+    /// AMUX-3719: THE OTHER DIRECTION — a fixture home must not leak OUT.
+    ///
+    /// The test above covers machine -> fixture. This covers fixture -> process,
+    /// which is the one that actually bit, twice, on two different tests in
+    /// `api::alerts`. A test writes a key into its own temp `server.env`,
+    /// `ServerConfig::load` exports the file into the PROCESS env, and the key
+    /// outlives the guard because `leaky_keys()` was derived from the machine's
+    /// file and has never heard of it.
+    ///
+    /// THE PROBE KEY IS DELIBERATELY UNIQUE TO THIS TEST. Using the real
+    /// specimen (`AMUX_OWNER_EMAIL`) would read a process-global key that
+    /// another test legitimately sets, so the assertion after the guard drops
+    /// would race the very tests this is about — a new flake aimed at an old
+    /// one, which is the trap the sibling test's comment names. A key nobody
+    /// else touches tests the identical property with no interference.
+    ///
+    /// Set-up mutates the process env only THROUGH the shipped export path
+    /// while the guard is held, so nothing global happens outside the lock.
+    #[test]
+    fn a_fixture_home_cannot_leak_a_key_past_its_guard() {
+        const PROBE: &str = "AMUX_TEST_LEAK_PROBE_3719";
+        assert!(
+            std::env::var(PROBE).is_err(),
+            "{PROBE} is meant to be unique to this test; something else set it"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let _guard = set_home(dir.path());
+            crate::api::settings::set_server_env_key(dir.path(), PROBE, "from-a-fixture").unwrap();
+            // The SHIPPED export path, not a paraphrase of it: this is the
+            // function that puts server.env into the process env, and pinning a
+            // hand-rolled set_var here would test something the product does not
+            // do (ethos rule 7 — the fixture must flow through the code where
+            // the defect is introduced).
+            let _ = crate::config::ServerConfig::load(
+                dir.path().to_path_buf(),
+                &std::collections::BTreeMap::new(),
+            );
+            assert_eq!(
+                std::env::var(PROBE).ok().as_deref(),
+                Some("from-a-fixture"),
+                "set-up failed: ServerConfig::load did not export the fixture key, so the \
+                 assertion below would pass without the leak ever existing"
+            );
+        }
+
+        assert!(
+            std::env::var(PROBE).is_err(),
+            "{PROBE} survived its HomeGuard. A fixture home exported it into the process env \
+             and the guard restored only leaky_keys(), which is derived from the MACHINE's \
+             server.env and cannot know about it. Every later test that does not set this key \
+             in its own fixture now reads it — that is AMUX-3719."
         );
     }
 }

@@ -140,9 +140,16 @@ pub struct DiskHealth {
 /// machine reached 741 MB free with a 50-session fleet and writes failing with
 /// ENOSPC (the incident CLAUDE.md's shared-target-dir rule exists for).
 ///
-/// So: critical below 10 GB (a single build cannot complete), warn below 50 GB
-/// (a few builds from trouble). At today's 170 GB free this reads `ok`, and it
-/// would have read `critical` throughout the 2026-08-10 incident. It can fail.
+/// Thresholds, RE-SET 2026-08-24 after they proved too low in a real incident:
+/// the volume fell from 144 GB to 13 GB overnight and spent the morning at
+/// 100% capacity, and 13 GB free read as merely `warn`. On a box running ~50
+/// lanes that is an emergency, not a caution.
+///
+/// critical below 25 GB, warn below 75 GB. Both sit well under the measured
+/// healthy baseline — `reclaim_scans` recorded 186-220 GB free across
+/// 2026-08-16..21, and 420 GB after the 08-24 cleanup — so this stays quiet
+/// normally rather than reporting that the disk exists (ethos rule 7), and
+/// still fires with runway rather than at the cliff.
 pub fn disk_health() -> DiskHealth {
     // statvfs is POSIX and present on both macOS and Linux, so unlike mem_health
     // this needs no cfg split at all.
@@ -163,8 +170,8 @@ pub fn disk_health() -> DiskHealth {
 /// shipped path calls exactly this.
 pub(crate) fn disk_state(free_gb: Option<f64>) -> &'static str {
     match free_gb {
-        Some(g) if g < 10.0 => "critical",
-        Some(g) if g < 50.0 => "warn",
+        Some(g) if g < 25.0 => "critical",
+        Some(g) if g < 75.0 => "warn",
         Some(_) => "ok",
         None => "unknown",
     }
@@ -377,9 +384,27 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
         ])
         .output();
     let which = std::process::Command::new("which").arg("tmux").output();
+    // AMUX-3700: how often a pane capture had to be KILLED on its deadline.
+    // A bounded capture is invisible by construction — the request succeeds and
+    // the lane's preview is merely absent — so a tmux that has started hanging
+    // reads exactly like a quiet fleet. Before the bound existed, the same
+    // condition showed up as GET /api/sessions at 12.1s and 93.3s, diagnosed
+    // from raw latency rows because nothing could name the cause.
+    let pane_timeouts = crate::api::sessions_legacy::PANE_CAPTURE_TIMEOUTS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let pane_last = crate::api::sessions_legacy::PANE_CAPTURE_LAST_TIMEOUT
+        .lock()
+        .ok()
+        .and_then(|l| l.clone())
+        .map(|(lane, ts)| serde_json::json!({"lane": lane, "ts": ts}));
     axum::Json(match out {
         Ok(o) => serde_json::json!({
             "spawn": "ok",
+            "pane_capture_timeouts": pane_timeouts,
+            "pane_capture_last_timeout": pane_last,
+            "pane_capture_note": "captures killed on AMUX_PANE_CAPTURE_TIMEOUT_S (default 3s). \
+                                  In-memory, so a restart resets it; a non-zero count means \
+                                  tmux is not answering and some lane previews are missing.",
             "exit": o.status.to_string(),
             "stdout_bytes": o.stdout.len(),
             "stdout_lines": String::from_utf8_lossy(&o.stdout).lines().count(),
@@ -558,13 +583,24 @@ mod disk_tests {
         assert_eq!(disk_state(Some(170.0)), "ok");
     }
 
+    /// Rebuilt from the 2026-08-24 incident, which is why the thresholds moved:
+    /// the volume fell 144 GB -> 13 GB overnight and sat at 100% capacity. The
+    /// OLD thresholds called 13 GB `warn`. On a box running ~50 lanes that is
+    /// an emergency, and the old numbers would have under-called it again.
+    #[test]
+    fn the_2026_08_24_overnight_fall_is_called_at_its_real_severity() {
+        assert_eq!(disk_state(Some(144.0)), "ok", "where the night started — genuinely fine");
+        assert_eq!(disk_state(Some(60.0)), "warn", "falling, with runway to act");
+        assert_eq!(disk_state(Some(13.0)), "critical", "where it actually ended up");
+    }
+
     /// Boundaries pinned so a later refactor cannot slide them silently.
     #[test]
     fn the_thresholds_discriminate_at_their_own_boundaries() {
-        assert_eq!(disk_state(Some(9.99)), "critical");
-        assert_eq!(disk_state(Some(10.0)), "warn", "one cargo target tree of headroom");
-        assert_eq!(disk_state(Some(49.99)), "warn");
-        assert_eq!(disk_state(Some(50.0)), "ok");
+        assert_eq!(disk_state(Some(24.99)), "critical");
+        assert_eq!(disk_state(Some(25.0)), "warn");
+        assert_eq!(disk_state(Some(74.99)), "warn");
+        assert_eq!(disk_state(Some(75.0)), "ok");
     }
 
     /// The statvfs read must actually work. A reader that compiles everywhere

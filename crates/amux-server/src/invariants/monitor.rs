@@ -6,7 +6,7 @@
 //! the only place that touches the world.
 
 use std::collections::BTreeSet;
-use super::{checks, store, Confidence, InvariantResult};
+use super::{checks, store, Confidence, InvariantResult, Status};
 use crate::api::AppState;
 use serde_json::json;
 
@@ -93,6 +93,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
 
     // -- 5b. do the `ts` columns hold what their readers assume? (AF-184)
     out.extend(timestamp_units_check(state));
+    out.extend(arrival_follows_boot_check(state));
 
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
     // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
@@ -177,6 +178,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // already done or verified. The ledger and the cards were two stores of one
     // fact with nothing between them.
     out.extend(frustration_ledger_check(state));
+    out.extend(schedule_kind_check(state));
 
     // -- 6e. is the invariant system's OWN evaluation log bounded? (AMUX-3489:
     // 8M rows / ~2GB from a flat 7-day retention on ~13 green rows/sec — the
@@ -301,6 +303,49 @@ fn alert_channel_check(state: &AppState) -> Vec<InvariantResult> {
 /// Reading the launcher's own function is the point — the check cannot disagree
 /// with what the launcher runs. Pure over the static registry + launch table, so
 /// its negative control drives it with plain rows and needs no live fleet.
+/// AF-216: read enabled schedules and hand (title, kind) to the pure check.
+///
+/// `deleted` and `enabled` are filtered HERE rather than in the check, because a
+/// disabled or deleted schedule costs nothing per fire — it does not fire. The
+/// claim under test is about what a LIVE schedule spends.
+fn schedule_kind_check(state: &AppState) -> Vec<InvariantResult> {
+    let Ok(conn) = state.store.read() else {
+        // Cannot read: Unknown, never Pass. A store we could not open is not a
+        // store with nothing wrong in it.
+        return vec![InvariantResult::new(
+            "schedules.cost_title_matches_kind",
+            Status::Unknown,
+        )];
+    };
+    let rows: Vec<checks::ScheduleKindRow> = conn
+        .prepare(
+            "SELECT id, COALESCE(title,''), COALESCE(kind,'tmux'), COALESCE(session,''), \
+                    COALESCE(command,'') \
+             FROM schedules WHERE enabled=1 AND COALESCE(deleted,0)=0",
+        )
+        .and_then(|mut st| {
+            st.query_map([], |r| {
+                Ok(checks::ScheduleKindRow {
+                    id: r.get::<_, String>(0)?,
+                    title: r.get::<_, String>(1)?,
+                    kind: r.get::<_, String>(2)?,
+                    session: r.get::<_, String>(3)?,
+                    command: r.get::<_, String>(4)?,
+                })
+            })
+            .map(|it| it.flatten().collect::<Vec<_>>())
+        })
+        .unwrap_or_default();
+    if rows.is_empty() {
+        // No enabled schedules at all is not evidence that none are mislabelled.
+        return vec![InvariantResult::new(
+            "schedules.cost_title_matches_kind",
+            Status::Unknown,
+        )];
+    }
+    checks::schedule_cost_titles_match_kind(&rows)
+}
+
 fn provider_launch_check() -> Vec<InvariantResult> {
     use crate::provider::PromptMode;
     let reg = crate::provider::default_registry();
@@ -501,6 +546,32 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     }
     let now = crate::runtime_jobs::registry::unix_now();
     checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now)
+}
+
+/// Gather what [`checks::request_arrival_follows_boot`] needs (AMUX-3647).
+///
+/// ONE query, both numbers, over the indexed `ts` range. Counting the rows that
+/// CARRY a boot_at in the same pass is what lets the check distinguish "the
+/// invariant holds" from "the column stopped being written", which are the two
+/// states a bare violation count cannot tell apart.
+fn arrival_follows_boot_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "reqlog.arrival_follows_boot";
+    const WINDOW_H: f64 = 24.0;
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    let cutoff = crate::runtime_jobs::registry::unix_now() - WINDOW_H * 3600.0;
+    match conn.query_row(
+        "SELECT COUNT(*), COALESCE(SUM(ts < boot_at), 0) FROM _amux_request_log \
+         WHERE ts >= ?1 AND boot_at IS NOT NULL",
+        [cutoff],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ) {
+        Ok((with_boot, before)) => {
+            checks::request_arrival_follows_boot(with_boot, before, WINDOW_H)
+        }
+        Err(e) => vec![InvariantResult::unknown(ID, format!("request log unreadable: {e}"))],
+    }
 }
 
 fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
@@ -781,7 +852,14 @@ fn kernel_panic_check() -> Vec<InvariantResult> {
             }
         }
     }
-    checks::no_fresh_kernel_panic(&files, window_s)
+    // Same `now` the ages above were measured against (AMUX-3645): the check
+    // derives its declared heal epoch as now - age + window, and a second
+    // clock read here would offset every one of them by the scan duration.
+    let now_epoch = now
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    checks::no_fresh_kernel_panic(&files, window_s, now_epoch)
 }
 
 /// AMUX-3489. The budget is env-tunable (AMUX_INVARIANT_RESULT_BUDGET) so a
@@ -909,13 +987,26 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
             // still carries its status, and filtering it out here would report a
             // live link as broken — the archived-filter trap ethos rule 1 logs
             // five instances of.
-            let st: Option<String> = conn
+            // `archived` comes back ALONGSIDE status, never as a filter
+            // (AF-246). The comment above is still right that filtering it out
+            // would report a live link as broken; the defect was that the flag
+            // was not SELECTED at all, so `LedgerRow` could not express
+            // "reachable" and the check compared the one axis it had. An
+            // instrument that cannot state the discriminator is the bug
+            // (ethos rule 4), and here it made an archived card behind a live
+            // entry read as agreeing.
+            let row: Option<(String, i64)> = conn
                 .query_row(
-                    "SELECT status FROM issues WHERE id=?1 AND deleted IS NULL",
+                    "SELECT status, COALESCE(archived,0) FROM issues \
+                     WHERE id=?1 AND deleted IS NULL",
                     [&card],
-                    |r| r.get::<_, String>(0),
+                    |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
                 )
                 .ok();
+            let (st, archived) = match row {
+                Some((s, a)) => (Some(s), a != 0),
+                None => (None, false),
+            };
             rows.push(checks::LedgerRow {
                 line,
                 card,
@@ -923,6 +1014,7 @@ fn frustration_ledger_check(state: &AppState) -> Vec<InvariantResult> {
                 session: session.clone(),
                 title: title.clone(),
                 card_status: st,
+                card_archived: archived,
             });
         }
     }
@@ -1489,6 +1581,124 @@ mod tests {
     /// returns one result per probed lane, on one without it returns a single
     /// `Unknown`. What it may never do is return NOTHING, which is what a
     /// silently-dropped binding looks like.
+    /// AF-246: the LOADER must actually read `archived`, not merely have a
+    /// field for it.
+    ///
+    /// This test exists because a mutation proved the check-level tests cannot
+    /// catch its absence. `checks::negative_controls::an_archived_card_behind_
+    /// a_live_entry_is_reported_as_its_own_state` builds `LedgerRow`s directly,
+    /// so gutting this loader to `(Some(s), false)` leaves it green — a real
+    /// property, correctly asserted, one layer above where the defect would be
+    /// introduced (AF-161's shape, found in my own work this time).
+    ///
+    /// So this one runs the SHIPPED path: a real store, a real archived issue,
+    /// a real frustrations.md in a temp home, through `frustration_ledger_check`.
+    #[test]
+    fn the_ledger_loader_reads_archived_from_the_store() {
+        let home = tempfile::tempdir().unwrap();
+        // The ledger is read from `repo_dir()`, NOT from AMUX_HOME. The first
+        // draft of this test wrote the fixture into the temp home and asserted
+        // on the result — it read the REAL repo's frustrations.md the whole
+        // time, whose cards are absent from this temp store, so every row was
+        // skipped and the check passed for a reason that had nothing to do with
+        // the property. It only surfaced because the assertion was written to
+        // fail loudly rather than to confirm.
+        //
+        // AMUX_REPO_DIR is written into the fixture's server.env as well as the
+        // process env, deliberately: HomeGuard restores exactly the fixture's
+        // OWN server.env keys on drop (AMUX-3719), and Drop runs during unwind,
+        // so a panic here cannot leak a temp repo dir into every later test.
+        let repo = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(repo.path().join(".git")).unwrap();
+        std::fs::write(
+            repo.path().join("frustrations.md"),
+            // The header's own template is indented on purpose; entries start at
+            // a column-0 `## ` after the `---`, which is what the parser keys on.
+            "# amux frustrations\n\n---\n\n\
+             ## an entry whose card is put away\n\
+             AREA: cli\nSEVERITY: slows\nSTATUS: open\nDATE: 2026-08-26\n\
+             SESSION: amux\nCARD: ZZ-1\nSYMPTOM: x\nCOST: minutes\nFIX: y\n",
+        )
+        .unwrap();
+        let _h = crate::api::settings::test_env::set_home(home.path());
+        crate::api::settings::set_server_env_key(
+            home.path(),
+            "AMUX_REPO_DIR",
+            &repo.path().to_string_lossy(),
+        )
+        .unwrap();
+        std::env::set_var("AMUX_REPO_DIR", repo.path());
+        // Set-up assertion: if the override did not take, every assertion below
+        // is about the real repo's ledger and means nothing.
+        assert_eq!(
+            crate::api::self_update::repo_dir().as_deref(),
+            Some(repo.path()),
+            "AMUX_REPO_DIR override did not take; the test would read the real ledger"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        store
+            .write(|conn| {
+                conn.execute(
+                    "INSERT INTO issues (id, title, status, archived, created, updated) \
+                     VALUES ('ZZ-1', 't', 'todo', 1, 0, 0)",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("seed an ARCHIVED card");
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+
+        let rs = frustration_ledger_check(&state);
+        let agree = rs
+            .iter()
+            .find(|r| r.invariant_id == "frustrations.ledger_agrees_with_board")
+            .expect("the agreement check must reach a verdict");
+
+        // `todo` over an open entry AGREES on status. The only thing that can
+        // make this fail is the archived flag having survived the query.
+        assert_eq!(
+            agree.status,
+            crate::invariants::Status::Fail,
+            "an archived card behind a live entry must fail; observed: {}",
+            agree.observed
+        );
+        assert_eq!(
+            agree.evidence["archived_open"].as_array().map(Vec::len),
+            Some(1),
+            "the loader dropped `archived` on the floor: {}",
+            agree.evidence
+        );
+
+        // CONTROL, in the same test: unarchive the same card and the same
+        // fixture must PASS. Without it, a build that failed every open entry
+        // would satisfy the assertions above.
+        state
+            .store
+            .write(|conn| {
+                conn.execute("UPDATE issues SET archived=0 WHERE id='ZZ-1'", [])?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("unarchive");
+        let rs2 = frustration_ledger_check(&state);
+        let agree2 = rs2
+            .iter()
+            .find(|r| r.invariant_id == "frustrations.ledger_agrees_with_board")
+            .expect("verdict");
+        assert_eq!(
+            agree2.status,
+            crate::invariants::Status::Pass,
+            "the SAME entry over a LIVE todo card is agreement: {}",
+            agree2.observed
+        );
+    }
+
     #[test]
     fn the_status_pane_check_is_actually_wired_into_the_monitor() {
         let dir = tempfile::tempdir().unwrap();

@@ -104,6 +104,147 @@ fn env_secs(name: &str, default: f64) -> f64 {
         .unwrap_or(default)
 }
 
+/// Is a stored self-report authoritative RIGHT NOW? The ONE trust rule, so the
+/// DISPLAY and the MECHANISMS that act on a report cannot disagree about the
+/// same row (AMUX-3756).
+///
+/// They did disagree, for months, and it deadlocked lanes permanently. The
+/// status derivation below applies this test and records `applied:false` for a
+/// report it refuses. `steer_lane_at_boundary` — the gate on auto-pickup, board
+/// nudges and steering delivery — read the SAME row and asked only
+/// `state == "idle"`, with no age, no life and no staleness. So a lane whose
+/// Stop hook never fired kept a stuck `active` report, the dashboard correctly
+/// showed IDLE (`decided_by: activity_fallback`), and the drive loop skipped it
+/// as `mid-turn` forever. Measured live 2026-08-26: 4 of 52 running lanes held
+/// this way — ai-video-editor 59.5h, creative-dna 61.4h, mixpeek-autopilot 6.4h,
+/// primer 1.0h — every one of them `auto_pickup: true` with eligible cards
+/// waiting.
+///
+/// The deadlock is SELF-PERPETUATING, which is what made it Ethan's "why do i
+/// need to push X to continue": only a turn writes a new report, and only a
+/// human starts a turn on a lane the drive loop refuses to touch. Pushing it by
+/// hand was the sole exit, and doing so cleared the evidence.
+///
+/// Pure and parameterised so both callers can be tested on the same cells.
+pub fn report_applies(state: &str, ts: f64, started: f64, now: f64) -> bool {
+    // A report from BEFORE the session's last (re)start describes a PREVIOUS
+    // LIFE. A restarted claude lane loses nothing: its hooks re-report on the
+    // first turn, and until then the pane and activity decide.
+    let from_this_life = started <= ts;
+    let age = now - ts;
+    // An `active` report is a claim about a turn in flight, and a turn in
+    // flight paints. Silence past the heartbeat means the claim outlived its
+    // evidence — a Stop hook that never fired, a crashed turn, an interrupt.
+    let stale_active = state == "active" && age > env_secs("AMUX_ACTIVE_HEARTBEAT_S", 120.0);
+    // `idle` survives silence (an idle lane has nothing to report until its
+    // next prompt); every other state has a much shorter trust window.
+    let trust_window = if state == "idle" {
+        env_secs("AMUX_HOOKS_LIVE_IDLE_S", 86400.0)
+    } else {
+        env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
+    };
+    from_this_life
+        && !stale_active
+        && age < trust_window
+        && matches!(state, "active" | "idle" | "waiting")
+}
+
+/// Pane captures abandoned on a deadline, and the lanes they were for.
+///
+/// AMUX-3700. Surfaced in `GET /api/debug/tmux` because a bounded capture is
+/// invisible by construction: the request succeeds, the lane's preview is
+/// simply absent, and the next poll usually works. Without a counter, a tmux
+/// that has started hanging looks exactly like a fleet that is quiet.
+pub static PANE_CAPTURE_TIMEOUTS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub static PANE_CAPTURE_LAST_TIMEOUT: std::sync::Mutex<Option<(String, f64)>> =
+    std::sync::Mutex::new(None);
+
+/// One `tmux capture-pane`, bounded.
+///
+/// THE DEFECT THIS REPLACES: this was `Command::output()`, which blocks until
+/// the child exits, with no deadline anywhere. `capture_panes` spawns twelve of
+/// those and then `join()`s them, so ONE tmux that does not return blocks the
+/// whole chunk, and every later chunk behind it — inside `build_array`, inside
+/// a request. That is `GET /api/sessions` at 12.1s (AMUX-3700) and at 93.3s
+/// (the 7-day worst), with 4,174 of 38,377 requests over a second.
+///
+/// It also explains the two things that made the outlier hard to read: the
+/// slow requests arrive in BURSTS (a busy tmux server affects consecutive
+/// polls), and they do not correlate with host load, because the server is
+/// blocked rather than working. The card's own evidence said "1-minute load 9.3
+/// on 28 cores (0.33x)" and that is exactly right and exactly not the cause.
+///
+/// A killed capture returns None, so the lane's pane is simply missing from
+/// this round. That is already a state the callers handle — `pane_of` returns
+/// Option and the status derivation treats an absent pane as "no contradicting
+/// evidence" — which is why bounding is safe here and would not be if the pane
+/// were load-bearing for a decision.
+fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
+    use std::process::{Command, Stdio};
+    // POLICY IN CONFIG, not a constant (ethos D4). A timeout hardcoded here is
+    // a ceiling nobody can move when the fleet grows.
+    let budget = std::time::Duration::from_secs_f64(env_secs("AMUX_PANE_CAPTURE_TIMEOUT_S", 3.0));
+    // `pt`, not `target`: tests/tmux_target_audit.rs requires every `-t` value
+    // to be a variable built by pane_target()/session_target(), and it enforces
+    // that by NAME. It caught this refactor — the caller does pass a real
+    // pane_target(), and renaming the parameter is what keeps the audit able to
+    // see that at the call site it inspects.
+    let mut cmd = Command::new("tmux");
+    cmd.args(["capture-pane", "-t", pt, "-p", "-e", "-S", "-30"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    run_bounded(cmd, budget, lane)
+}
+
+/// Run a child to completion or KILL it on the deadline, returning its stdout.
+///
+/// Split out from `capture_pane_bounded` so it is testable: that one hardcodes
+/// `tmux`, and a test cannot make the real tmux hang on demand. The mechanism
+/// being bounded is the part that can be wrong, so the mechanism is what the
+/// test drives — with `sh -c "sleep 30"`, which hangs for real rather than
+/// standing in for hanging.
+fn run_bounded(
+    mut cmd: std::process::Command,
+    budget: std::time::Duration,
+    lane: &str,
+) -> Option<String> {
+    use std::io::Read;
+    let mut child = cmd.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= budget {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(mut l) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
+                        *l = Some((lane.to_string(), crate::config::now_f64()));
+                    }
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        lane = %lane,
+                        budget_s = budget.as_secs_f64(),
+                        "tmux capture-pane exceeded its budget and was killed — this lane's \
+                         preview is absent this round (AMUX-3700). Before this bound, one hung \
+                         capture blocked GET /api/sessions for as long as tmux took."
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+    // Small payload (30 lines), so the pipe cannot fill and deadlock the child
+    // before it exits; reading after the wait is safe here for that reason.
+    let mut s = String::new();
+    child.stdout.take()?.read_to_string(&mut s).ok()?;
+    Some(s.trim().to_string())
+}
+
 /// Derive the waiting_reason from a pane capture: "permission_prompt",
 /// "user_input", "rate_limit", or "" (not waiting / unknown).
 ///
@@ -916,11 +1057,7 @@ impl FleetSignals {
                     let n = name.clone();
                     std::thread::spawn(move || {
                         let pt = pane_target(&format!("amux-{n}"));
-                        let out = std::process::Command::new("tmux")
-                            .args(["capture-pane", "-t", &pt, "-p", "-e", "-S", "-30"])
-                            .output()
-                            .ok()?;
-                        Some((n, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+                        capture_pane_bounded(&pt, &n).map(|raw| (n, raw))
                     })
                 })
                 .collect();
@@ -1083,7 +1220,8 @@ impl FleetSignals {
             // claude lane loses nothing: its hooks re-report on the first
             // turn, and until then the pane and activity decide — which is
             // exactly right for the boot window.
-            let from_this_life = self.started.get(name).copied().unwrap_or(0.0) <= ts;
+            let started = self.started.get(name).copied().unwrap_or(0.0);
+            let from_this_life = started <= ts;
             let age = self.now - ts;
             let stale_active = st == "active" && age > heartbeat;
             let trust_window = if st == "idle" {
@@ -1091,11 +1229,11 @@ impl FleetSignals {
             } else {
                 env_secs("AMUX_HOOKS_LIVE_S", 1800.0)
             };
-            let live = age < trust_window;
-            let applied = from_this_life
-                && !stale_active
-                && live
-                && matches!(st, "active" | "idle" | "waiting");
+            // THE VERDICT COMES FROM THE SHARED PREDICATE, never from the
+            // locals above — those exist only to publish the evidence. The
+            // steering/pickup gate calls the same function, so the display and
+            // the mechanism cannot drift (AMUX-3756, ethos rule 1).
+            let applied = report_applies(st, ts, started, self.now);
             ex.insert(
                 "report".into(),
                 json!({
@@ -1787,12 +1925,27 @@ pub(crate) fn worker_model_env(
     default_model: &str,
 ) -> (String, String, String) {
     let is_ollama = provider == "ollama";
-    let model = if is_ollama {
+    // THE CLAUDE DEFAULT MODEL BELONGS TO CLAUDE ONLY (Ethan, 2026-08-27,
+    // screenshot of gtm-researcher-gemini).
+    //
+    // AMUX-3182 fixed this for ollama BY NAME — `is_ollama` — and left the same
+    // defect for every other non-Claude provider. A gemini worker created with
+    // no model got CC_FLAGS="--model sonnet", and a Claude model name is not a
+    // thing the Gemini API can be asked for: every request died with
+    // `models/sonnet is not found for API version v1beta`. The worker was dead
+    // on arrival and the failure named a model the user never chose.
+    // Reproduced before fixing: POST {"provider":"gemini"} -> "--model sonnet".
+    //
+    // An UNSPECIFIED model now means "let the provider's own CLI decide", which
+    // is the only answer that is right for a provider amux does not have a
+    // model table for. Guessing a gemini model name here would be the same bug
+    // one name over — the enumeration is what failed, not the value in it.
+    let model = if is_ollama || !raw_model.is_empty() {
         raw_model.to_string()
-    } else if raw_model.is_empty() {
+    } else if provider == "claude" {
         default_model.to_string()
     } else {
-        raw_model.to_string()
+        String::new()
     };
     let cc_flags = if !explicit_flags.is_empty() {
         explicit_flags.to_string()
@@ -1909,6 +2062,20 @@ pub async fn create_session_legacy(
     }
     if !cc_flags.is_empty() {
         pairs.push(("CC_FLAGS", cc_flags.clone()));
+    }
+    // ISOLATED AT CREATE TIME (Ethan, 2026-08-27). `CC_ISOLATED` was settable
+    // only by hand-editing the env file after the fact, so the one decision
+    // that has to be true from the FIRST launch — spawn injects no
+    // AMUX_SESSION/AMUX_URL and no --mcp-config for an isolated lane
+    // (AMUX-3232) — could not be made at the moment the lane is created. A
+    // worker created normally and isolated afterwards has already started with
+    // the harness attached.
+    //
+    // Written only when true: absent means "not isolated", which is what every
+    // reader already assumes (`env_flag_on(cfg.get("CC_ISOLATED"))`), so an
+    // explicit CC_ISOLATED=0 would add a second spelling of the default.
+    if body.get("isolated").map(crate::api::py_truthy).unwrap_or(false) {
+        pairs.push(("CC_ISOLATED", "1".to_string()));
     }
     // ACCEPT tags AS AN ARRAY, which is what the dashboard and API send
     // (AMUX-3114). `s("tags")` only matched a STRING, so `{"tags":["gtm"]}` read
@@ -2683,6 +2850,70 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
 mod tests {
     use super::*;
 
+    /// AMUX-3700: a pane capture that will not return is KILLED, and one that
+    /// returns is not.
+    ///
+    /// THE DEFECT: `capture_panes` spawned twelve `tmux capture-pane` children
+    /// with `Command::output()` — no deadline anywhere — and then `join()`ed
+    /// them, inside `build_array`, inside a request. One tmux that does not
+    /// answer blocked the whole chunk and every chunk behind it. That is
+    /// `GET /api/sessions` at 12,080ms (this card) and 93,344ms (the 7-day
+    /// worst), with 4,174 of 38,377 requests over a second.
+    ///
+    /// It also explains why the outlier read as unattributable: the card's own
+    /// evidence said "1-minute load 9.3 on 28 cores (0.33x)", which is true and
+    /// is not the cause — a blocked server is not a busy one.
+    ///
+    /// `sh -c "sleep 30"` HANGS FOR REAL rather than standing in for hanging. A
+    /// fixture that merely returns slowly would pass against a version that
+    /// waits patiently, which is the bug.
+    #[test]
+    fn a_pane_capture_that_never_returns_is_killed_on_its_budget() {
+        use std::process::{Command, Stdio};
+        let budget = std::time::Duration::from_millis(300);
+
+        // 1. THE HANG. Must come back on the budget, not in 30s.
+        let mut hang = Command::new("sh");
+        hang.args(["-c", "sleep 30"]).stdout(Stdio::piped()).stderr(Stdio::null());
+        let before = PANE_CAPTURE_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed);
+        let t0 = std::time::Instant::now();
+        let got = run_bounded(hang, budget, "hung-lane");
+        let waited = t0.elapsed();
+        assert!(got.is_none(), "a killed capture yields no pane, not a partial one: {got:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(5),
+            "the whole point is the bound: waited {waited:?} for a 300ms budget"
+        );
+        assert!(
+            waited >= budget,
+            "and it must actually WAIT the budget, not return instantly — an\
+             always-None implementation would pass the cell above: {waited:?}"
+        );
+
+        // 2. THE COUNTER. A bounded capture is invisible otherwise: the request
+        //    succeeds and the preview is merely absent, so a hanging tmux reads
+        //    as a quiet fleet.
+        let after = PANE_CAPTURE_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(after, before + 1, "the kill must be counted");
+        let last = PANE_CAPTURE_LAST_TIMEOUT.lock().unwrap().clone();
+        assert_eq!(last.map(|(l, _)| l).as_deref(), Some("hung-lane"), "and must name the lane");
+
+        // 3. THE HAPPY PATH, which is what stops this becoming a capture that
+        //    always fails. Output must survive intact.
+        let mut ok = Command::new("sh");
+        ok.args(["-c", "printf 'pane line one'"]).stdout(Stdio::piped()).stderr(Stdio::null());
+        assert_eq!(
+            run_bounded(ok, std::time::Duration::from_secs(5), "ok-lane").as_deref(),
+            Some("pane line one"),
+            "a capture that returns must still return its bytes"
+        );
+        assert_eq!(
+            PANE_CAPTURE_TIMEOUTS.load(std::sync::atomic::Ordering::Relaxed),
+            after,
+            "a successful capture must NOT increment the timeout counter"
+        );
+    }
+
     /// Worker creation CREATES a missing working directory instead of refusing
     /// (Ethan, 2026-08-22). The four cells are separated because the single
     /// message this replaces was false about two of them.
@@ -2791,6 +3022,40 @@ mod tests {
     /// never as `--model` in CC_FLAGS, and the CLAUDE default model must never
     /// be applied to a local-model worker. Each assertion carries a positive
     /// control on the SAME inputs so a vacuous pass is impossible (ethos rule 7).
+    /// Ethan, 2026-08-27: a gemini worker was launched with `--model sonnet` and
+    /// every request died with `models/sonnet is not found for API version
+    /// v1beta`. AMUX-3182 fixed this for ollama BY NAME and left it for every
+    /// other non-Claude provider.
+    ///
+    /// The last two cells are the controls and they are what stop the obvious
+    /// wrong fix: "never default a model" would break Claude, and an explicit
+    /// model must still win for any provider. Without them a version that just
+    /// deleted the default would look correct.
+    #[test]
+    fn the_claude_default_model_never_reaches_another_providers_worker() {
+        for p in ["gemini", "codex", "grok", "whatever-ships-next"] {
+            let (flags, ccm, resolved) = worker_model_env(p, "", "", "sonnet");
+            assert_eq!(
+                flags, "",
+                "{p} with no model must get NO --model flag, not the Claude default: {flags:?}"
+            );
+            assert_eq!(ccm, "", "{p} must not get CC_MODEL either: {ccm:?}");
+            assert_eq!(resolved, "", "and nothing to display as its model: {resolved:?}");
+        }
+
+        // CONTROL 1: an EXPLICIT model still wins, for any provider. The fix
+        // must not make non-Claude workers unconfigurable.
+        let (flags, _, resolved) = worker_model_env("gemini", "gemini-2.5-flash", "", "sonnet");
+        assert_eq!(flags, "--model gemini-2.5-flash");
+        assert_eq!(resolved, "gemini-2.5-flash");
+
+        // CONTROL 2: claude with no model STILL inherits the default. This is
+        // the cell that fails if someone "fixes" this by deleting the default.
+        let (flags, _, resolved) = worker_model_env("claude", "", "", "sonnet");
+        assert_eq!(flags, "--model sonnet", "claude must still get its default");
+        assert_eq!(resolved, "sonnet");
+    }
+
     #[test]
     fn worker_model_env_wires_ollama_to_cc_model_not_flags() {
         // Ollama + a chosen model -> CC_MODEL, and NO --model in CC_FLAGS.
@@ -3500,6 +3765,80 @@ Claude usage limit reached. Your limit will reset at 3pm.
         let (status, ex) = s.derive_status_explain("x", false);
         assert_eq!(status, "");
         assert_eq!(ex["decided_by"], json!("not_running"));
+    }
+
+    /// AMUX-3756. The status badge and the turn-boundary gate must reach the
+    /// same verdict about the same stored report.
+    ///
+    /// The bug was not that either side was wrong in isolation. `derive_status`
+    /// judged the report and published `applied:false`; the gate on auto-pickup
+    /// / nudges / steering read the same row and asked only `state == "idle"`.
+    /// A stuck `active` report therefore showed IDLE on the dashboard and
+    /// `mid-turn` to the drive loop — permanently, because the only thing that
+    /// writes a new report is a turn and the only thing that starts a turn on a
+    /// lane the loop refuses to touch is a human typing at it.
+    ///
+    /// The cells below are the four lanes MEASURED in that state on 2026-08-26,
+    /// with their real ages. Each carries the drive loop's old answer beside the
+    /// new one, so the row that used to deadlock is named rather than implied.
+    #[test]
+    fn the_boundary_gate_and_the_badge_judge_a_report_the_same_way() {
+        let now = 1_787_766_000.0;
+        let born = now - 400_000.0; // every lane started well before its report
+        // (state, age_s, applies?, lane it was measured on)
+        let cells: &[(&str, f64, bool, &str)] = &[
+            ("active", 214_567.0, false, "ai-video-editor (59.5h, prompt-hook)"),
+            ("active", 221_356.0, false, "creative-dna (61.4h, tool-hook)"),
+            ("active", 22_952.0, false, "mixpeek-autopilot (6.4h, prompt-hook)"),
+            ("active", 3_390.0, false, "primer (56m, tool-hook)"),
+            ("active", 9.0, true, "tubescience — genuinely mid-turn, must stay held"),
+            // THE CELLS THAT ISOLATE `stale_active` FROM THE TRUST WINDOW.
+            // Every measured lane above is also past the 1800s active window,
+            // so without these three the whole `stale_active` leg could be
+            // deleted and this test would stay green — verified by mutation,
+            // which is the only reason they exist. An `active` report is
+            // refreshed by the tool hook on every tool call, so silence past
+            // the 120s heartbeat means the turn died; without this leg the
+            // deadlock window is 30 minutes rather than 2.
+            ("active", 119.0, true, "inside the heartbeat — a real turn between tool calls"),
+            ("active", 121.0, false, "one second past it: the turn stopped reporting"),
+            ("active", 600.0, false, "10m silent but inside the 1800s window — stale_active only"),
+            ("idle", 50.0, true, "gtm-research — fresh stop-hook idle"),
+            ("idle", 40_000.0, true, "idle survives silence inside its 24h window"),
+            ("idle", 90_000.0, false, "past the 24h idle window"),
+            ("waiting", 60.0, true, "a fresh selector report"),
+            ("compacting", 5.0, false, "a state no rule knows is not evidence"),
+        ];
+        for (st, age, want, why) in cells {
+            let ts = now - age;
+            assert_eq!(
+                report_applies(st, ts, born, now),
+                *want,
+                "report_applies({st}, age={age}s): {why}"
+            );
+            // THE ANTI-DRIFT HALF: the badge's own `applied` field, produced by
+            // the shipped derivation over the same row, must agree. A second
+            // copy of this rule inside derive_status_explain would pass every
+            // assertion above and still deadlock the fleet.
+            let mut s = signals();
+            s.now = now;
+            s.running.insert("amux-x".into());
+            s.reports = json!({"x": {"state": st, "ts": ts, "source": "t"}});
+            let (_, ex) = s.derive_status_explain("x", true);
+            assert_eq!(
+                ex["report"]["applied"],
+                json!(*want),
+                "the badge disagrees with the gate about {st}/{age}s: {ex}"
+            );
+        }
+
+        // A report from a PREVIOUS LIFE is refused whatever its age says. The
+        // gate had no life check at all, so a pre-restart `active` held a lane
+        // that had since been restarted and was sitting at a fresh prompt.
+        assert!(
+            !report_applies("active", now - 5.0, now - 1.0, now),
+            "a report predating the last session.started describes a dead process"
+        );
     }
 
     /// AMUX-3433, the property the card exists for: a lane generating with a

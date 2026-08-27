@@ -205,4 +205,131 @@ else
   FAIL=$((FAIL+1)); echo "FAIL: (dl2) unreadable rev did not refuse"; sed 's/^/      /' "$dl/out2.txt" | head -8
 fi
 
+
+# ---------------------------------------------------------------------------
+# (s) THE STRANDED CELLS (AF-229). Everything above runs with the board at a dead
+#     port, which is CI's condition — and it means the CARD-resolution half has
+#     never been exercised by any test at all. So these cells stand up a fixture
+#     board on localhost and point the audit at it. That keeps the new check
+#     runnable in CI, where the REAL board is unreachable and always will be.
+#
+#     What is being pinned: "not on this board" was one output for two states, and
+#     they need opposite handling. An unresolved id whose author is a live lane is
+#     drainable — ask them. An unresolved id in a prefix namespace this board has
+#     never held, by an author absent from the fleet, can never be signed off,
+#     because the deletion protocol requires the originating session.
+#
+#     The discriminator is the PREFIX, not author liveness, and that distinction is
+#     load-bearing rather than fussy: amux-rust is not live either, yet AR-114
+#     answers HTTP 200 on this board. Judging on liveness alone called six drainable
+#     AR-* entries permanently stranded on the first run of this feature. Cell (s3)
+#     is that specimen, rebuilt.
+# ---------------------------------------------------------------------------
+fixture_board() { # $1 = dir, $2 = "sessions_ok" | "sessions_500"
+  cat > "$1/fixture_server.py" <<PYEOF
+import json, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+MODE = sys.argv[1]
+BOARD = [{"id": "KNOWN-1", "title": "a known card", "status": "done"},
+         {"id": "KNOWN-2", "title": "another known card", "status": "done"}]
+SESSIONS = [{"name": "live-lane"}, {"name": "other-live"}]
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_GET(self):
+        if self.path.startswith("/api/sessions"):
+            if MODE == "sessions_500":
+                self.send_response(500); self.end_headers(); return
+            # An EMPTY list is a different failure from a dead endpoint and a far
+            # more dangerous one: the server answers, so nothing looks broken, and
+            # every author is trivially "not in the fleet". Cell (s7).
+            body = json.dumps([] if MODE == "sessions_empty" else SESSIONS).encode()
+        elif self.path.startswith("/api/board"):
+            body = json.dumps(BOARD).encode()
+        else:
+            self.send_response(404); self.end_headers(); return
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+srv = HTTPServer(("127.0.0.1", 0), H)
+print(srv.server_port, flush=True)
+srv.serve_forever()
+PYEOF
+  python3 "$1/fixture_server.py" "$2" > "$1/port.txt" 2>/dev/null &
+  echo $! > "$1/pid.txt"
+  for _ in $(seq 1 50); do
+    [ -s "$1/port.txt" ] && break
+    perl -e 'select(undef,undef,undef,0.1)' 2>/dev/null || true
+  done
+  cat "$1/port.txt"
+}
+
+# Same shape as run_on, but against the fixture board instead of a dead port.
+run_on_board() { # $1 = case dir, $2 = sessions mode
+  local d="$TMP/$1"; mkdir -p "$d/scripts"
+  cp "$AUDIT" "$d/scripts/frustrations_audit.py"
+  cat > "$d/frustrations.md"
+  local port; port=$(fixture_board "$d" "$2")
+  if [ -z "$port" ]; then echo "NOPORT"; return; fi
+  ( cd "$d" && AMUX_URL="http://127.0.0.1:$port" AMUX_API="http://127.0.0.1:$port" \
+      python3 scripts/frustrations_audit.py >"$d/out.txt" 2>&1; echo $? )
+  kill "$(cat "$d/pid.txt")" 2>/dev/null || true
+}
+
+entry_with() { # $1 = card field, $2 = session field
+  printf '## an entry\nAREA: cli\nSEVERITY: slows\nSTATUS: open\nDATE: 2026-08-25\nSESSION: %s\nCARD: %s\nSYMPTOM: s\nCOST: 1 minute\nFIX: f\n\n' "$2" "$1"
+}
+
+# (s1) IT FIRES: unknown prefix + author not in the fleet.
+rc=$( { header; entry_with "ZZZ-1" "ghost-lane"; } | run_on_board stranded_fires sessions_ok )
+check_says "(s1) unknown prefix + absent author reports STRANDED" "STRANDED" stranded_fires
+check_says "(s1) names the author who cannot be asked" "ghost-lane" stranded_fires
+
+# (s2) MUST NOT FIRE: same unresolved id, but the author IS live here.
+rc=$( { header; entry_with "ZZZ-1" "live-lane"; } | run_on_board author_live sessions_ok )
+check_lacks "(s2) an unresolved id whose author is live is NOT stranded" "STRANDED" author_live
+check_says  "(s2) routes it to the live author instead" "IS live here" author_live
+
+# (s3) MUST NOT FIRE — THE AR-* SPECIMEN. Author absent from the fleet, but the
+#      prefix IS one this board holds, so the card is reachable and the entry drains
+#      whenever that lane runs. Liveness alone would call this stranded.
+rc=$( { header; entry_with "KNOWN-99" "ghost-lane"; } | run_on_board prefix_known sessions_ok )
+check_lacks "(s3) a KNOWN prefix with a missing id is NOT stranded" "STRANDED" prefix_known
+
+# (s4) MUST NOT FIRE: sessions unreachable means the question was never asked, and
+#      absence of a STRANDED block must not read as "none stranded" (ethos rule 7 —
+#      a passing check and an absent check look identical).
+rc=$( { header; entry_with "ZZZ-1" "ghost-lane"; } | run_on_board no_sessions sessions_500 )
+check_lacks "(s4) unreachable sessions claims nothing" "STRANDED" no_sessions
+check_says  "(s4) says the question was not asked" "sessions unreachable" no_sessions
+
+# (s6) THE ROLL-UP, pinned separately from the per-entry line. Deleting the
+#      `stranded.append` leaves every advisory line intact and silently removes the
+#      summary — and cells (s1)-(s5) all stayed green under exactly that mutation.
+#      The COUNT is the product here ("three entries sharing an AREA is an argument"),
+#      so it needs its own assertion rather than riding on the prose above it.
+rc=$( { header; entry_with "ZZZ-1" "ghost-lane"; entry_with "ZZZ-2" "ghost-lane"; } | run_on_board rollup sessions_ok )
+check_says "(s6) the summary reports how many entries are stranded" "STRANDED  2 entr" rollup
+check_says "(s6) and groups them by the session that must sign them off" "ghost-lane" rollup
+
+# (s7) THE EMPTY-SESSION-LIST CONTROL. fetch_sessions returns None on failure so
+#      callers can say "unknown" — but a server that answers with `[]` takes the
+#      SUCCESS path, and then every author is absent from the fleet and every entry
+#      is branded permanently unactionable. A confident wrong answer in the alarming
+#      direction, from a probe that looks healthy. `return names or None` is what
+#      prevents it; changing it to `return names or set()` passed every other cell.
+rc=$( { header; entry_with "ZZZ-1" "ghost-lane"; } | run_on_board sessions_empty sessions_empty )
+check_lacks "(s7) an EMPTY session list claims nothing rather than stranding everything" "STRANDED" sessions_empty
+check_says  "(s7) and says the question was not answered" "sessions unreachable" sessions_empty
+
+# (s5) THE MULTI-ID REGRESSION. Real CARD fields read "AR-114, AR-115, AR-116" and
+#      "AF-69 (investigation) + AMUX-3221 (the FIX)". board.get() on the whole string
+#      matched none of them, so every multi-id entry had ALWAYS reported unresolved —
+#      invisible while the branch said something mild, and instantly wrong once it
+#      said something specific. Both ids here resolve; nothing may be reported.
+rc=$( { header; entry_with "KNOWN-1, KNOWN-2" "live-lane"; } | run_on_board multi_id sessions_ok )
+check_lacks "(s5) a multi-id CARD that fully resolves reports nothing" "not on this board" multi_id
+check_lacks "(s5) and is not counted as partially missing" "ids resolve" multi_id
+
+
 echo "test-frustrations-audit: $PASS passed, $FAIL failed"

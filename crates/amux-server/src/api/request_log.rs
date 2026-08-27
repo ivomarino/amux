@@ -86,6 +86,7 @@ pub struct LogRow {
     pub latency_ms: f64,
     pub client_ip: String,
     pub user_agent: String,
+
     pub amux_session: String,
     pub worker: Option<String>,
     pub req_bytes: Option<i64>,
@@ -93,6 +94,44 @@ pub struct LogRow {
     pub answered_by: String,
     pub error_body: Option<String>,
     pub req_meta: Option<String>,
+}
+
+/// Resolve the CALLER of a request, in the same order every handler uses.
+///
+/// Mirrors `session_verbs::hdr_worker`: `x-amux-worker` first, `x-amux-session`
+/// as the fallback. Extracted so the middleware and its test share ONE
+/// definition rather than the test restating the order — the two drifting is
+/// exactly how the log came to disagree with the handlers in the first place.
+pub(crate) fn caller_from_headers(h: &axum::http::HeaderMap) -> String {
+    for k in ["x-amux-worker", "x-amux-session"] {
+        if let Some(v) = h.get(k).and_then(|v| v.to_str().ok()) {
+            let v = v.trim();
+            if !v.is_empty() {
+                return v.to_string();
+            }
+        }
+    }
+    String::new()
+}
+
+/// The host's 1-minute load average, or `None` if the OS would not say
+/// (AMUX-3646).
+///
+/// `getloadavg(3)` rather than the `sysctl vm.loadavg` subprocess `metrics.rs`
+/// shells out for. This runs on every log-batch flush, and forking a process per
+/// flush to measure how oversubscribed the machine is would be the detector
+/// paying its cost in the same resource as the fault (ethos rule 7's spin-catcher
+/// lesson). Present on macOS and glibc alike, so no cfg branch.
+///
+/// `None`, never 0.0, when the call fails. A consumer reading absence as "idle"
+/// would report an oversubscribed host as a quiet one, which inverts the exact
+/// signal this exists to carry.
+pub(crate) fn host_load1() -> Option<f64> {
+    let mut avg = [0f64; 3];
+    // SAFETY: getloadavg writes at most `nelem` doubles into the caller's array;
+    // 3 is the documented maximum and the array is 3 long.
+    let n = unsafe { libc::getloadavg(avg.as_mut_ptr(), 3) };
+    (n >= 1).then(|| (avg[0] * 100.0).round() / 100.0)
 }
 
 /// Cheap-to-clone handle the middleware sends rows through.
@@ -135,6 +174,9 @@ impl RequestLogger {
                 // AF-175: the boot of the process writing this batch. Constant
                 // within a process, so read once here.
                 let boot = crate::runtime_jobs::heartbeat::boot_at();
+                // AMUX-3646: what the HOST was doing. Once per batch, beside
+                // `boot` and for the same reason.
+                let load1 = host_load1();
                 let res = store
                     .write_async(move |conn| {
                         {
@@ -142,8 +184,8 @@ impl RequestLogger {
                                 "INSERT INTO _amux_request_log \
                                  (ts, method, path, family, status, latency_ms, client_ip, \
                                   user_agent, amux_session, worker, req_bytes, resp_bytes, \
-                                  answered_by, error_body, req_meta, boot_at) \
-                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+                                  answered_by, error_body, req_meta, boot_at, load1) \
+                                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
                             )?;
                             for r in &batch {
                                 stmt.execute(rusqlite::params![
@@ -168,6 +210,12 @@ impl RequestLogger {
                                     // process, and re-reading it per row would
                                     // imply it could.
                                     boot,
+                                    // AMUX-3646: the host's 1-minute load at
+                                    // flush. Same value for every row in the
+                                    // batch, and that is not an approximation
+                                    // worth apologising for: a batch forms in
+                                    // milliseconds and load1 averages a minute.
+                                    load1,
 ])?;
                             }
                         }
@@ -288,9 +336,34 @@ pub async fn middleware(State(logger): State<RequestLogger>, req: Request, next:
                 .unwrap_or("")
                 .to_string()
         };
+        // CALLER IDENTITY: same resolution order the handlers use (AF-217).
+        //
+        // This read `x-amux-session` alone, while every handler resolves a
+        // caller through `session_verbs::hdr_worker`, which tries
+        // `x-amux-worker` FIRST and falls back to `x-amux-session`. So a client
+        // that sends only `x-amux-worker` — which `amux send` does, because that
+        // is the header carrying the server-stamped origin — was fully
+        // identified to the handler and ANONYMOUS in the log.
+        //
+        // Measured by the 2026-08-25 log sweep: of 29 cross-group send refusals
+        // in 24h, 27 had an empty `amux_session`, and the sender was recoverable
+        // only by regexing it out of `error_body` prose. That is the endpoint
+        // whose ENTIRE JOB is deciding based on who is sending, logging the
+        // decision without the subject — and it made step 4 of the sweep
+        // (401/403 bursts by client) undecidable: every row is 127.0.0.1 with a
+        // blank session, so one lane looping and twelve lanes trying once are
+        // the same picture. The sweep's first reading of it was in fact wrong.
+        //
+        // THIS IS NOT THE FALLBACK THE SWEEP CONTRACT FORBIDS, and the next
+        // reader will think it is. That rule is about the `worker` COLUMN, which
+        // is PATH-derived (`/api/sessions/{name}/*`) and therefore names the
+        // TARGET of a request — using it as an author manufactures a mutation by
+        // whoever was being written ABOUT. `x-amux-worker` is a caller-supplied
+        // header naming the SENDER. Opposite direction, opposite failure.
+        let caller = caller_from_headers(req.headers());
         (
             truncate_chars(&hdr("user-agent"), USER_AGENT_CHARS),
-            hdr("x-amux-session"),
+            caller,
             truncate_chars(&hdr("content-type"), CONTENT_TYPE_CHARS),
         )
     };
@@ -609,9 +682,18 @@ pub fn routes() -> Router<AppState> {
 ///
 /// Additive params (not sent by the SPA today, needed by the daily sweep —
 /// docs/rust-migration/log-sweep.md): `worker` (the per-worker subset),
-/// `since` (unix ts), `family`, `min_status`, `answered_by`. Additive
-/// response field: `total_matched` — the pre-LIMIT count, so volume
-/// questions are answerable without paging (the page-vs-corpus trap).
+/// `since` + `until` (unix ts, a HALF-OPEN window `since < ts <= until`),
+/// `family`, `min_status`, `answered_by`. Additive response field:
+/// `total_matched` — the pre-LIMIT count, so volume questions are
+/// answerable without paging (the page-vs-corpus trap).
+///
+/// `until` exists because this list used to stop at `since` (AF-230), and a
+/// lower bound alone is not a window: with `ORDER BY ts DESC LIMIT <=2000`
+/// every call returns the same newest rows, so paging backward was
+/// impossible and a caller asking for 24h got an unannounced slice of it.
+/// `total_matched` is the pre-LIMIT count and stays the right answer for
+/// "how many" — `until` is for when you need the ROWS across a window
+/// wider than 2000 of them.
 async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
     let limit: i64 = q
         .get("limit")
@@ -667,6 +749,25 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         clauses.push("ts > ?".into());
         params.push(ts.into());
     }
+    // UPPER bound, so the window is PAGEABLE (AF-230). `since` alone plus
+    // `ORDER BY ts DESC LIMIT <=2000` means every call returns the same newest
+    // N rows and there is no way to walk backward — so a caller asking about a
+    // 24h window silently gets whatever slice 2000 rows happens to cover. On
+    // 2026-08-26 that was 2,000 of 123,645 rows: 0.48 HOURS of the 24 the daily
+    // sweep's step 5 believed it was judging, taken from one end.
+    //
+    // That step decides whether any worker is doing mutating work with no board
+    // trace — an accusation the contract itself calls "the expensive kind" — and
+    // it was reaching that verdict from 1.6% of its window. The endpoint's own
+    // doc comment lists the params added FOR this sweep and this is the one that
+    // was missing, which is why the contract carries a workaround telling the
+    // reader to state the blind spot, or to go read the store directly. Routing
+    // a caller off the sanctioned instrument onto raw SQL is the ethos rule 6
+    // shape; giving the instrument the bound removes the need.
+    if let Some(ts) = q.get("until").and_then(|v| v.parse::<f64>().ok()) {
+        clauses.push("ts <= ?".into());
+        params.push(ts.into());
+    }
     if let Some(ms) = q.get("min_status").and_then(|v| v.parse::<i64>().ok()) {
         clauses.push("status >= ?".into());
         params.push(ms.into());
@@ -706,10 +807,39 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         Ok(v) => v,
         Err(e) => return internal(e),
     };
+    // SAY THAT THIS IS A SLICE (AF-230, the second half). `until` lets a
+    // caller page the window; these fields are what tell them they NEED to.
+    // The 2026-08-26 sweep read 2,000 of 123,645 rows and reported on "the
+    // 24h window" — `total_matched` was right there and disagreed, but
+    // nothing in the body said "you are holding 0.48 hours", so the mismatch
+    // had to be noticed rather than read. `analyze` and `stats` already
+    // publish `scan_truncated`/`actual_window_h` for exactly this reason;
+    // this is the same admission on the endpoint that lacked it, so the next
+    // capped read announces itself in the payload the caller already opens
+    // instead of being inferred by whoever happens to compare two numbers.
+    let truncated = events.len() as i64 == limit && total > events.len() as i64;
+    let span_h = match (events.first(), events.last()) {
+        (Some(a), Some(b)) => {
+            let (hi, lo) = (a["ts"].as_f64().unwrap_or(0.0), b["ts"].as_f64().unwrap_or(0.0));
+            ((hi - lo) / 3600.0 * 100.0).round() / 100.0
+        }
+        _ => 0.0,
+    };
     Json(json!({
         "events": events,
         "count": events.len(),
         "total_matched": total,
+        // True = you are holding the newest `limit` rows, NOT the window you
+        // asked for. Page backward with `until=<oldest ts you got>`.
+        "truncated": truncated,
+        // The span the returned rows ACTUALLY cover, so a window claim can be
+        // checked against the page rather than assumed from `since`.
+        "page_span_h": span_h,
+        "note": if truncated {
+            "TRUNCATED: these are the newest rows, not the whole window. \
+             Page backward with `until=<the oldest ts in this page>`, or read \
+             `total_matched` for volume. Do not describe this page as the window."
+        } else { "" },
     }))
     .into_response()
 }
@@ -932,8 +1062,10 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/calendar.ics", methods: &["GET"] },
     RouteEntry { path: "/api/debug/tmux", methods: &["GET"] },
     RouteEntry { path: "/api/debug/scan", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/sse", methods: &["GET"] },
     RouteEntry { path: "/api/debug/downtime", methods: &["GET"] },
     RouteEntry { path: "/api/debug/logs", methods: &["GET"] },
+    RouteEntry { path: "/api/debug/context-health", methods: &["GET"] },
     RouteEntry { path: "/api/debug/boundary", methods: &["GET"] },
     RouteEntry { path: "/api/debug/legacy-port", methods: &["GET"] },
     RouteEntry { path: "/api/debug/routes", methods: &["GET"] },
@@ -1007,6 +1139,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/email/search", methods: &["GET"] },
     RouteEntry { path: "/api/email/log", methods: &["GET"] },
     RouteEntry { path: "/api/email/approve/{id}", methods: &["POST"] },
+    RouteEntry { path: "/api/email/reject/{id}", methods: &["POST"] },
     RouteEntry { path: "/api/email/approvals", methods: &["GET"] },
     RouteEntry { path: "/api/cal-events", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/cal-events/{id}", methods: &["PATCH", "DELETE"] },
@@ -1214,6 +1347,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/config/apply", methods: &["PUT"] },
     RouteEntry { path: "/api/board/themes", methods: &["GET"] },
     RouteEntry { path: "/api/board/commit-mentions", methods: &["GET"] },
+    RouteEntry { path: "/api/board/deleted-substrate", methods: &["GET"] },
     RouteEntry { path: "/api/logs/raw", methods: &["GET"] },
     RouteEntry { path: "/api/logs/analyze", methods: &["GET"] },
     RouteEntry { path: "/api/logs/stats", methods: &["GET"] },
@@ -1457,6 +1591,43 @@ struct ErrGroup {
     /// log readable and it is also what fused those two, so the discriminator
     /// has to be kept alongside the group rather than recovered from it.
     param_literals: std::collections::HashMap<String, u64>,
+    /// AF-232. For gate 409s: how often each (session, the exact gate_checked
+    /// the caller sent) was refused. A 409 here is the gate WORKING, which is
+    /// true of one refusal and wrong of the 340th — and the group renders both
+    /// identically, so a caller wedged in a permanent retry loop looks exactly
+    /// like a fleet touching gates normally.
+    ///
+    /// Same observation as `param_literals` one status code over: one value
+    /// carrying most of a multi-hit group means a caller is hammering
+    /// something that never resolves. Kept alongside the group for the same
+    /// reason — grouping is what makes the log readable and it is also what
+    /// fuses "25 lanes hit a gate twice" with "one lane hit it 349 times".
+    rejected_acks: std::collections::HashMap<RejectedAck, u64>,
+}
+
+/// The identity of one refused gate acknowledgement: who asked, what
+/// transition, what they sent, what was required. All four come out of the
+/// 409 body the server already writes (AMUX-3132 raised the error_body cap to
+/// 2000 chars precisely so `you_sent` and `missing` survive truncation).
+type RejectedAck = (String, String, String, String);
+
+/// Pull (session, attempted_status, you_sent, gate) out of a gate-refusal
+/// body. `None` for any 409 that is not a gate refusal — board 409s also
+/// carry claim conflicts and browser-already-running, and counting those as
+/// stuck acks would manufacture the very false confidence this exists to
+/// remove.
+fn rejected_ack_of(session: &str, error_body: Option<&str>) -> Option<RejectedAck> {
+    let b: Value = serde_json::from_str(error_body?).ok()?;
+    // `gate` is the required criteria; its presence is what marks this body a
+    // gate refusal rather than some other 409.
+    let gate = b.get("gate").filter(|g| !g.is_null())?;
+    let sent = b.get("you_sent").cloned().unwrap_or(Value::Null);
+    Some((
+        session.to_string(),
+        b.get("attempted_status").and_then(Value::as_str).unwrap_or("").to_string(),
+        serde_json::to_string(&sent).ok()?,
+        serde_json::to_string(gate).ok()?,
+    ))
 }
 
 /// GET /api/logs/analyze?since_h=24 — the diagnosis endpoint. Groups every
@@ -1536,8 +1707,16 @@ async fn analyze(
                 status,
                 family,
                 param_literals: std::collections::HashMap::new(),
+                rejected_acks: std::collections::HashMap::new(),
             });
             g.count += 1;
+            if g.status == 409 && g.rejected_acks.len() < 200 {
+                if let Some(k) =
+                    rejected_ack_of(amux_session.as_deref().unwrap_or(""), error_body.as_deref())
+                {
+                    *g.rejected_acks.entry(k).or_insert(0) += 1;
+                }
+            }
             // min/max, never positional: the scan is newest-first now
             // (AF-131), and `last_ts = ts` under DESC would report the
             // group's OLDEST hit as its most recent.
@@ -1591,6 +1770,55 @@ async fn analyze(
                 "clients": g.clients.iter().take(5).collect::<Vec<_>>(),
                 "sample": g.sample,
             });
+            // AF-232: a stuck caller, stated. One (session, gate_checked)
+            // pair carrying most of a multi-hit 409 group is a caller
+            // retrying an acknowledgement the gate has already refused —
+            // invisible in the group line, which shows only a count and a
+            // client tally and so renders "one lane refused 349 times"
+            // exactly like "25 lanes hit a gate twice". The floor mirrors
+            // `dominant_param_literal` above: 5, because 2-of-2 proves
+            // nothing.
+            //
+            // The verdict does NOT guess the cause beyond what the body
+            // settles, and here the body settles a real fork. `you_sent`
+            // present and disjoint from `gate` is a caller sending the WRONG
+            // criteria (it has them hardcoded, or read the type default
+            // instead of the card's resolved gate). `you_sent` null is a
+            // caller not acknowledging at all. Those are different bugs with
+            // different fixes, and naming the wrong one sends the reader to
+            // rewrite working code.
+            if g.status == 409 && !g.rejected_acks.is_empty() {
+                let mut acks: Vec<(&RejectedAck, &u64)> = g.rejected_acks.iter().collect();
+                acks.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+                if let Some(((sess, attempted, sent, gate), n)) = acks.first().copied() {
+                    v["top_rejected_ack"] = json!({
+                        "session": sess, "attempted_status": attempted,
+                        "you_sent": sent, "gate_required": gate, "count": n,
+                    });
+                    v["distinct_rejected_acks"] = json!(g.rejected_acks.len());
+                    if *n >= 5 && *n * 2 > g.count {
+                        let who = if sess.is_empty() { "(unattributed)" } else { sess.as_str() };
+                        let reading = if sent == "null" {
+                            "the caller is not acknowledging the gate at all"
+                        } else if sent == gate {
+                            "the caller sent exactly the required gate — if this is still \
+                             refused, the SERVER side is what to check"
+                        } else {
+                            "the caller is sending the WRONG criteria (hardcoded, or the \
+                             type default rather than the card's resolved gate — \
+                             GET /api/board/contract?card=<id> is the resolved one)"
+                        };
+                        verdicts.push(format!(
+                            "409 {} {}: {} of {} are ONE caller ({}) retrying the SAME refused \
+                             acknowledgement for `{}` — {}. A single gate 409 is the gate \
+                             working; this many identical ones is a caller wedged in a loop, \
+                             and the two look the same in the group line. it sent {} where the \
+                             gate requires {}.",
+                            g.method, target, n, g.count, who, attempted, reading, sent, gate,
+                        ));
+                    }
+                }
+            }
             if g.status == 404 || g.status == 405 {
                 let routed = routed_methods_at(&g.sample_path);
                 v["routed_methods"] = json!(routed);
@@ -1741,6 +1969,40 @@ async fn stats(
     let proc_boot = crate::runtime_jobs::heartbeat::boot_at();
     let mut spanned = 0u64;
     let mut spanned_by_family: std::collections::BTreeMap<String, u64> = Default::default();
+
+    // SAMPLE THE WINDOW; DO NOT TRUNCATE IT (AF-261).
+    //
+    // The cap used to keep the NEWEST `cap` rows, which is right when a window
+    // fits and silently destroys the comparison when it does not. On 2026-08-27
+    // a single day exceeded the cap for the first time (214,320 rows, +74% in
+    // a day), so `since_h=24` and `since_h=192` returned the SAME 200,000 rows:
+    // identical `actual_window_h` of 21.52, and every family's p95 ratio exactly
+    // 1.00x. The trailing norm, which is the entire point of the second call,
+    // had become a comparison of a window with itself — and "1.00x everywhere"
+    // is the most reassuring output a non-functioning check can produce
+    // (AF-253's class, at the level of a whole sweep step).
+    //
+    // Raising the cap only defers that to the next volume step. Percentiles are
+    // exactly the statistic a uniform sample estimates well, so when the window
+    // is bigger than the cap we take every Nth row ACROSS THE WHOLE WINDOW
+    // instead of all of the newest ones. `id` is an INTEGER PRIMARY KEY (a rowid
+    // alias) and both id and ts are monotonic with insertion, so `id % stride`
+    // is uniform in time without needing a random() sort the planner would have
+    // to materialise.
+    //
+    // The point of the change is that `actual_window_h` becomes the window that
+    // was ASKED for rather than the slice that fitted, which is what makes the
+    // norm a norm again.
+    let window_rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _amux_request_log WHERE ts >= ?1", [cutoff], |r| r.get(0))
+        .unwrap_or(0);
+    let stride: i64 = if window_rows > ANALYZE_SCAN_CAP {
+        (window_rows + ANALYZE_SCAN_CAP - 1) / ANALYZE_SCAN_CAP
+    } else {
+        1
+    };
+    let sampled = stride > 1;
+
     let res = (|| -> rusqlite::Result<()> {
         let mut stmt = conn.prepare(
             // AF-131: ORDER BY ts DESC is load-bearing. With no ORDER BY,
@@ -1751,11 +2013,14 @@ async fn stats(
             // 42k requests was 1.07x against an honest window. Newest-first
             // makes the slice the trailing window everyone assumes AND makes
             // actual_window_h truthful by construction.
+            // `?3 = 1` makes the modulus a no-op, so the unsampled path is the
+            // same statement and the same plan it has always been.
             "SELECT family, status, latency_ms, answered_by, worker, amux_session, client_ip, ts, \
              boot_at \
-             FROM _amux_request_log WHERE ts >= ?1 ORDER BY ts DESC LIMIT ?2",
+             FROM _amux_request_log WHERE ts >= ?1 AND (id % ?3) = 0 \
+             ORDER BY ts DESC LIMIT ?2",
         )?;
-        let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP])?;
+        let mut rows = stmt.query(rusqlite::params![cutoff, ANALYZE_SCAN_CAP, stride])?;
         while let Some(r) = rows.next()? {
             scanned += 1;
             let family: String = r.get(0)?;
@@ -1875,7 +2140,8 @@ async fn stats(
             let threshold = 5.0 * p50;
             let r = (|| -> rusqlite::Result<()> {
                 let mut stmt = conn.prepare_cached(
-                    "SELECT ts, method, path, status, latency_ms, worker, boot_at \
+                    "SELECT ts, method, path, status, latency_ms, worker, boot_at, \
+                            amux_session, client_ip \
                      FROM _amux_request_log \
                      WHERE family = ?1 AND ts >= ?2 AND latency_ms > ?3 \
                      ORDER BY latency_ms DESC LIMIT ?4",
@@ -1890,6 +2156,8 @@ async fn stats(
                     let latency_ms: f64 = r.get(4)?;
                     let worker: Option<String> = r.get(5)?;
                     let row_boot: Option<f64> = r.get(6)?;
+                    let amux_session: Option<String> = r.get(7)?;
+                    let client_ip: Option<String> = r.get(8)?;
                     // The same exclusion as the first pass (AF-186). Applied
                     // here TOO rather than relying on the pass above, because
                     // this is a separate re-read: on 2026-08-24 the outlier
@@ -1910,6 +2178,31 @@ async fn stats(
                             "status": status, "latency_ms": round2(latency_ms),
                             "family": family, "family_p50_ms": round2(p50),
                             "ratio": round2(latency_ms / p50), "worker": worker,
+                            // WHO MADE THE CALL (AF-260). The row already carries
+                            // `amux_session` and `client_ip` — this list shipped
+                            // neither, so the one question you ask of a latency
+                            // outlier could not be answered from it. Only `worker`
+                            // was here, and the sweep contract says in as many
+                            // words: "Attribute on `amux_session` ONLY. Never fall
+                            // back to `worker`" — because `worker` is PATH-derived,
+                            // so it is null for every /api/board row and names the
+                            // SUBJECT rather than the caller for /api/sessions/{n}.
+                            //
+                            // Measured on the 2026-08-27 sweep: all 20 outliers
+                            // reported worker=null, including five /api/board GETs
+                            // at 24-32s inside one 90-second window. The cluster is
+                            // real and it is still unattributed.
+                            "amux_session": amux_session, "client_ip": client_ip,
+                            // AMUX-3647: how far into its own process's life this
+                            // request ARRIVED. A row a few seconds in was competing
+                            // with a cold cache, migrations and ~15 background
+                            // loops, and until 2026-08-24 rows like that were
+                            // deleted from this list by latency arithmetic that
+                            // claimed to be a restart filter. Reported rather than
+                            // hidden, so the reader makes that call with the number
+                            // in front of them. NULL means the row predates
+                            // migration 0030.
+                            "since_boot_s": row_boot.map(|b| round2(ts - b)),
                         }),
                     ));
                 }
@@ -1940,7 +2233,24 @@ async fn stats(
         "percentile_method": "nearest-rank: value at 1-based rank ceil(q*n) of the window's \
                               sorted per-family latencies (always an observed latency, \
                               never interpolated)",
-        "scan_truncated": scanned >= ANALYZE_SCAN_CAP,
+        // TRUNCATED and SAMPLED are different facts and must not be conflated
+        // (AF-261). `scan_truncated` keeps its meaning — the answer covers LESS
+        // than you asked for — and is now FALSE while sampling, because a
+        // sampled read covers the whole window. That is the point of the
+        // change: `actual_window_h` becomes the window that was asked for, so
+        // the trailing norm is a norm again.
+        "scan_truncated": stride == 1 && scanned >= ANALYZE_SCAN_CAP,
+        // Every family `count` below is the number of rows USED. When sampling,
+        // that is 1 in `sample_stride` of the real traffic — stated here rather
+        // than left to be inferred, because a sampled count read as a volume is
+        // exactly the wrong-by-a-constant-factor error this endpoint exists to
+        // prevent. `window_rows` is the true pre-sample count for the window.
+        "sampled": sampled,
+        "sample_stride": stride,
+        "window_rows": window_rows,
+        "sampling_note": if sampled {
+            "counts below are SAMPLED (1 in `sample_stride`); multiply by              `sample_stride` for volume, or read `window_rows` for the window total.              Percentiles are unbiased under uniform sampling; a family whose sampled              count is small is not a reliable percentile — the contract's n<20 rule              applies to the SAMPLED count."
+        } else { "" },
         "families": fam_rows.into_iter().map(|(_, v, _)| v).collect::<Vec<_>>(),
         "totals": {
             "count": total_count,
@@ -2828,6 +3138,301 @@ mod tests {
         Router::new().nest("/api/logs", routes()).with_state(state(store))
     }
 
+    /// AF-261 — a window bigger than the cap must be SAMPLED, not truncated.
+    ///
+    /// The trailing-norm call exists so step 2 of the daily sweep can ask "is
+    /// today's p95 out of line". On 2026-08-27 a single day exceeded the cap for
+    /// the first time, so `since_h=24` and `since_h=192` returned the SAME
+    /// newest 200,000 rows: identical `actual_window_h`, and every family's ratio
+    /// exactly 1.00x. The comparator was gone, and "1.00x everywhere" is the most
+    /// reassuring output a dead check can produce.
+    ///
+    /// THE ASSERTION IS ABOUT THE WINDOW, NOT THE ROW COUNT. A test that only
+    /// checked "we got <= cap rows back" passes against the truncating version
+    /// too — that version returns exactly cap rows and is the bug. What
+    /// discriminates is whether the OLDEST row reached is the one the caller
+    /// asked for.
+    #[tokio::test]
+    async fn a_window_larger_than_the_cap_is_sampled_across_it_not_truncated_to_its_newest_end() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // 60k rows spread evenly over 60 hours, with a cap of 20k for the test.
+        // Truncating keeps the newest 20k => the oldest row reached is ~20h ago.
+        // Sampling every 3rd row reaches the full 60h.
+        // ABOVE the 200k cap on purpose. The first draft of this test seeded
+        // 60k, which is UNDER it — stride stayed 1, the sampling branch never
+        // ran, and it passed against code that could not sample at all. A test
+        // for a cap that never reaches the cap is the purest form of the thing
+        // this endpoint exists to catch.
+        //
+        // At 260k over 60h a truncating read covers 200/260 of the span, so it
+        // reaches ~46h and fails the assertion below; a sampled read reaches all
+        // 60. That gap is what makes the assertion discriminate.
+        const N: i64 = 260_000;
+        const SPAN_H: f64 = 60.0;
+        store
+            .write(move |conn| {
+                let mut stmt = conn.prepare(
+                    "INSERT INTO _amux_request_log \
+                     (ts, method, path, family, status, latency_ms, client_ip, \
+                      amux_session, worker, answered_by, error_body) \
+                     VALUES (?1,'GET','/api/board','/api/board',200,?2,'127.0.0.1','lane',NULL,'native',NULL)",
+                )?;
+                for i in 0..N {
+                    let frac = i as f64 / N as f64;
+                    let ts = now - SPAN_H * 3600.0 * (1.0 - frac);
+                    // Latency rises with age so a truncated read has a visibly
+                    // different distribution from a sampled one.
+                    stmt.execute(rusqlite::params![ts, 1.0 + (1.0 - frac) * 100.0])?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .unwrap();
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=72").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+
+        // The window is the whole point: it must reach back across the seeded
+        // span, not stop at whatever the newest cap-worth covered.
+        let aw = v["actual_window_h"].as_f64().expect("actual_window_h");
+        assert!(
+            aw > SPAN_H * 0.9,
+            "the read must cover the window ASKED for, not its newest slice: \
+             actual_window_h {aw} against a {SPAN_H}h span. This is the assertion a \
+             truncating implementation fails: {v}"
+        );
+        // `window_rows` is the TRUE pre-sample count, so a sampled `count` can
+        // never be mistaken for the volume.
+        assert_eq!(v["window_rows"], N, "window_rows is the pre-sample truth: {v}");
+        // TRUNCATED and SAMPLED are different facts.
+        assert_eq!(
+            v["scan_truncated"], false,
+            "a sampled read covers the window, so it is not truncated: {v}"
+        );
+        if v["sampled"] == true {
+            assert!(v["sample_stride"].as_i64().unwrap_or(0) > 1, "{v}");
+            assert!(
+                v["sampling_note"].as_str().unwrap_or("").contains("SAMPLED"),
+                "a sampled answer must say so in the payload a caller already reads: {v}"
+            );
+        }
+    }
+
+    /// AF-260 — a latency outlier you cannot attribute is half an instrument.
+    ///
+    /// The list shipped `worker` and nothing else. `worker` is PATH-derived, so it
+    /// is NULL for every `/api/board` row and names the SUBJECT rather than the
+    /// caller for `/api/sessions/{name}/*`. The sweep contract says it outright —
+    /// "Attribute on `amux_session` ONLY. Never fall back to `worker`" — and this
+    /// endpoint offered only the field the contract forbids.
+    ///
+    /// Measured on the 2026-08-27 sweep: all 20 outliers reported worker=null,
+    /// among them five /api/board GETs at 24-32s inside one 90-second window. The
+    /// cluster is real, and it could not be pinned on a caller.
+    ///
+    /// The control matters as much as the assertion: a row with NO session must
+    /// still say so honestly rather than borrow the worker, because 90% of
+    /// /api/sessions traffic is unattributed dashboard polling and a fallback
+    /// would label all of it with whatever the path happened to contain.
+    #[tokio::test]
+    async fn slow_outliers_name_the_caller_not_just_the_path_derived_worker() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // A fast baseline so p50 is small and the slow rows clear 5x.
+        for i in 0..40u32 {
+            seed(&store, now - 300.0 - f64::from(i), "GET", "/api/board", 200, 1.0, "", "native", None).await;
+        }
+        // Slow, WITH a session. `/api/board` is deliberately a family whose
+        // `worker` is always null, which is the case that had no attribution at all.
+        seed(&store, now - 60.0, "GET", "/api/board", 200, 9000.0, "mvs-infra", "native", None).await;
+        // Slow, with NO session: the honest-absence control.
+        seed(&store, now - 50.0, "GET", "/api/board", 200, 9500.0, "", "native", None).await;
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let outs = v["slow_outliers"].as_array().expect("slow_outliers");
+        assert!(!outs.is_empty(), "the seeded slow rows must appear: {v}");
+
+        let attributed = outs
+            .iter()
+            .find(|o| o["latency_ms"].as_f64().unwrap_or(0.0) > 8500.0
+                && o["latency_ms"].as_f64().unwrap_or(0.0) < 9200.0)
+            .expect("the 9000ms row");
+        assert_eq!(
+            attributed["amux_session"], "mvs-infra",
+            "an outlier must name the CALLER; `worker` is path-derived and null here: {attributed}"
+        );
+
+        let anon = outs
+            .iter()
+            .find(|o| o["latency_ms"].as_f64().unwrap_or(0.0) > 9200.0)
+            .expect("the 9500ms row");
+        assert!(
+            anon["amux_session"].is_null() || anon["amux_session"] == "",
+            "an unattributed row must say so, never borrow the path-derived worker: {anon}"
+        );
+    }
+
+    /// AF-253 — the CLASS guard, not another instance.
+    ///
+    /// @tsukimiya named the shape from outside the fleet: outputs that read the same
+    /// whether things are healthy or broken. Measured across the board the same day:
+    /// 16 cards, 8 lanes, every one diagnosed and fixed alone — and the FIX is already
+    /// an idiom here that six independent authors reinvented (`scan_truncated`,
+    /// `actual_window_h`, `truncated`, `page_span_h`, `ran`, `ignored_fields`).
+    ///
+    /// Their point was that nobody was treating it as a class. This is the narrow,
+    /// buildable part of doing so: the three endpoints the DAILY SWEEP publishes
+    /// conclusions from must each say whether their measurement was COMPLETE. A wrong
+    /// zero here does not mislead one reader, it becomes a published verdict about the
+    /// fleet — which is exactly what happened on 2026-08-22, when a truncated norm
+    /// turned a 1.07x p95 into a 6.46x "finding" that every guard in the contract would
+    /// have passed through.
+    ///
+    /// SCOPED ON PURPOSE. A general "every instrument declares its completeness" check
+    /// needs a definition of "instrument" that decays into a hand-kept list — the thing
+    /// that goes stale silently here. This list does not: it is the sweep's own entry
+    /// points, maintained because the sweep breaks loudly without them. Adding a fourth
+    /// sweep endpoint without a completeness field fails this test.
+    #[tokio::test]
+    async fn every_sweep_endpoint_says_whether_its_measurement_was_complete() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        for i in 0..3u32 {
+            seed(&store, now - f64::from(i) * 60.0, "GET", "/api/board", 500, 1.0, "lane", "native",
+                 Some("{\"error\":\"x\"}")).await;
+        }
+        let api = logs_api(store.clone());
+        // (path, the field that answers "was this the whole window?")
+        let sweep_endpoints = [
+            ("/api/logs?limit=2000", "truncated"),
+            ("/api/logs/analyze?since_h=24", "scan_truncated"),
+            ("/api/logs/stats?since_h=24", "scan_truncated"),
+        ];
+        for (uri, completeness) in sweep_endpoints {
+            let (st, body) =
+                hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+            assert_eq!(st, StatusCode::OK, "{uri}");
+            let v: Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                !v[completeness].is_null(),
+                "{uri} must publish `{completeness}` — a caller cannot otherwise tell a \
+                 complete answer from a slice, and this endpoint's numbers become a \
+                 published verdict about the fleet: {v}"
+            );
+            // The SPAN too, where the answer is a window: "complete" is meaningless if
+            // the reader cannot see what was actually covered. `/api/logs` reports the
+            // page it returned; the two analysis endpoints report the window they read.
+            let span = if uri.starts_with("/api/logs?") { "page_span_h" } else { "actual_window_h" };
+            assert!(
+                v[span].as_f64().is_some(),
+                "{uri} must publish `{span}` — `{completeness}: false` still leaves \
+                 'over what?' unanswered: {v}"
+            );
+        }
+    }
+
+    /// AF-230, from the 2026-08-26 sweep's own numbers: step 5 asked for a
+    /// 24h window, got 2,000 of 123,645 rows, and that page spanned 0.48
+    /// HOURS. `since` was the only time bound, so with `ORDER BY ts DESC
+    /// LIMIT <=2000` every call returned the same newest rows and paging
+    /// backward was impossible — the step judged "is anyone working
+    /// off-ledger" from 1.6% of its window and could not have known.
+    ///
+    /// The fixture flows through the SHIPPED handler (`logs_api` -> the same
+    /// `routes()` the server mounts), not a re-implementation of the filter:
+    /// the defect is in `get_logs`'s clause list, so a test that rebuilt the
+    /// WHERE clause itself would pin the wrong layer and pass either way.
+    ///
+    /// Both assertions are load-bearing in opposite directions. `until` must
+    /// EXCLUDE the newest rows — the whole point, and the half that fails on
+    /// the pre-fix code, since an ignored param returns everything. And the
+    /// disjoint pages must reassemble the window exactly: `until` that
+    /// overlapped or dropped a row at the seam would still shrink the page
+    /// and look like it worked.
+    #[tokio::test]
+    async fn until_makes_the_window_pageable_backward() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // Six rows, one per hour, newest first at now-1h.
+        for i in 1..=6u32 {
+            seed(&store, now - (i as f64) * 3600.0, "GET", "/api/board", 200, 1.0, "lane", "native", None).await;
+        }
+        let api = logs_api(store.clone());
+        let get = |uri: String| {
+            let api = api.clone();
+            async move {
+                let (st, body) = hit(&api, HttpRequest::builder().uri(uri).body(Body::empty()).unwrap()).await;
+                assert_eq!(st, StatusCode::OK);
+                serde_json::from_slice::<Value>(&body).unwrap()
+            }
+        };
+
+        // Control: the window unbounded above holds all six. Without this, a
+        // seeding failure would make every `until` assertion below pass by
+        // returning nothing (ethos rule 7: confirm the fixture is real).
+        let all = get(format!("/api/logs?since={}&limit=2000", now - 7.0 * 3600.0)).await;
+        assert_eq!(all["total_matched"], 6, "control: all six rows are in the window: {all}");
+
+        // `until` excludes the newest rows. THIS is the assertion that fails
+        // on the pre-fix code, where an unknown param is silently dropped and
+        // the answer is 6.
+        let old = get(format!(
+            "/api/logs?since={}&until={}&limit=2000",
+            now - 7.0 * 3600.0,
+            now - 3.5 * 3600.0
+        ))
+        .await;
+        assert_eq!(old["total_matched"], 3, "until must exclude rows newer than it: {old}");
+        for e in old["events"].as_array().unwrap() {
+            let ts = e["ts"].as_f64().unwrap();
+            assert!(ts <= now - 3.5 * 3600.0, "row newer than `until` leaked through: {e}");
+        }
+
+        // The truncation disclosure: a page that IS the whole window must not
+        // claim otherwise, and one that is a slice must say so in the body.
+        assert_eq!(all["truncated"], false, "6 of 6 rows is not a truncated page: {all}");
+        assert_eq!(all["note"], "", "an untruncated page carries no warning: {all}");
+        let capped = get(format!("/api/logs?since={}&limit=2", now - 7.0 * 3600.0)).await;
+        assert_eq!(capped["truncated"], true, "2 of 6 rows IS truncated: {capped}");
+        assert_eq!(capped["total_matched"], 6, "total_matched stays the pre-LIMIT count");
+        assert!(
+            capped["note"].as_str().unwrap().contains("TRUNCATED"),
+            "a capped page must say so in the body, not leave it to be inferred: {capped}"
+        );
+        // page_span_h describes the ROWS RETURNED, which is the number the
+        // sweep needed and did not have: 2 rows an hour apart span 1h even
+        // though `since` asked for 7.
+        assert_eq!(capped["page_span_h"], 1.0, "span is of the page, not of `since`: {capped}");
+
+        // The seam: two disjoint pages must reassemble the window exactly —
+        // no row counted twice, none lost between them.
+        let newer = get(format!("/api/logs?since={}&limit=2000", now - 3.5 * 3600.0)).await;
+        assert_eq!(newer["total_matched"], 3, "the other half of the split: {newer}");
+        let mut seen: Vec<String> = old["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(newer["events"].as_array().unwrap())
+            .map(|e| e["ts"].to_string())
+            .collect();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), 6, "the two pages must partition the window, not overlap it");
+    }
+
     /// AF-131, rebuilt from the sweep's own numbers: three /api/logs/stats
     /// calls (96h/192h/336h) each scanned exactly the 200k cap over the SAME
     /// rows, yet actual_window_h reported min(requested, data_span) — and the
@@ -2837,7 +3442,7 @@ mod tests {
     /// slice must be the NEWEST rows, and the window claim must shrink to
     /// what was actually read.
     #[tokio::test]
-    async fn truncated_scans_keep_the_newest_rows_and_say_the_real_window() {
+    async fn over_cap_stats_samples_the_window_while_analyze_truncates_and_both_report_it() {
         let (store, _dir) = store();
         let now = unix_now();
         // 50k "old-era" rows around 90-80h ago, then 210k "new-era" rows in
@@ -2874,24 +3479,51 @@ mod tests {
         .await;
         assert_eq!(st, StatusCode::OK);
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["scan_truncated"], true, "{v}");
-        let fams: Vec<&str> = v["families"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|f| f["family"].as_str().unwrap())
-            .collect();
+        // STATS NOW SAMPLES THE WINDOW RATHER THAN TRUNCATING IT (AF-261), so the
+        // three assertions here changed and the reasons matter.
+        //
+        // AF-131's bug was that the capped slice kept the OLDEST rows, making an
+        // "8-day norm" really days 8-5 while actual_window_h claimed the full
+        // span — two lies at once, and a 6.46x p95 "regression" that was 1.07x
+        // against an honest window. Its fix was to keep the NEWEST rows instead.
+        //
+        // Sampling subsumes that fix rather than undoing it: covering the whole
+        // window proportionally makes an oldest-first slice impossible AND makes
+        // actual_window_h truthful by covering what it claims. The old assertion
+        // ("old-era must be ABSENT") was a statement about the mechanism, not
+        // about the property, and under the better mechanism it is wrong.
+        //
+        // PROPORTIONALITY IS THE STRONGER ASSERTION and it replaces it: the
+        // sampled mix must match the seeded mix. That catches an oldest-first
+        // slice (old-era over-represented) AND a newest-only truncation
+        // (old-era absent), where the old cell caught only the first.
+        assert_eq!(v["scan_truncated"], false, "a sampled read covers the window: {v}");
+        assert_eq!(v["sampled"], true, "260k rows over a 200k cap must sample: {v}");
+        assert_eq!(v["window_rows"], 260_000, "the true pre-sample count: {v}");
+        let fam_n = |name: &str| -> f64 {
+            v["families"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|f| f["family"] == name)
+                .map(|f| f["count"].as_f64().unwrap_or(0.0))
+                .unwrap_or(0.0)
+        };
+        let (new_n, old_n) = (fam_n("new-era"), fam_n("old-era"));
+        assert!(new_n > 0.0 && old_n > 0.0, "both eras must survive sampling: {v}");
+        // Seeded 210k new : 50k old = 4.2. A uniform sample preserves the ratio.
+        let ratio = new_n / old_n;
         assert!(
-            !fams.contains(&"old-era"),
-            "a truncated trailing window must keep the NEWEST rows — old-era rows \
-             surviving means the cap ate the recent traffic: {fams:?}"
+            (ratio - 4.2).abs() < 0.3,
+            "the sample must be UNIFORM across the window — seeded 210k:50k = 4.2, \
+             got {new_n}:{old_n} = {ratio}. A skew here means the read is biased \
+             toward one end of the window, which is AF-131's bug in either direction: {v}"
         );
-        assert!(fams.contains(&"new-era"), "{fams:?}");
         let aw = v["actual_window_h"].as_f64().unwrap();
         assert!(
-            aw < 70.0,
-            "actual_window_h must report the span actually READ (the newest ~200k of \
-             the last 70h), never min(requested, data_span): got {aw} vs since_h=96"
+            aw > 85.0,
+            "actual_window_h must now report the window COVERED — sampling reaches \
+             the full ~90h of seeded data, where truncation reached ~46h: got {aw}"
         );
 
         // ANALYZE: same slice rule, same honest window, and the group's
@@ -2925,6 +3557,87 @@ mod tests {
         );
         let aw = v["actual_window_h"].as_f64().unwrap();
         assert!(aw < 70.0, "analyze window claim must shrink too: {aw}");
+    }
+
+    /// AF-232, built from the 2026-08-26 incident's own artifact rather than
+    /// a convenient one: mvs-infra sent the `code` type's four verified
+    /// criteria against `investigation` cards every 30 minutes for 23.5h —
+    /// 340 identical refusals, zero successes, and the group line rendered it
+    /// as ordinary gate traffic (`409 PATCH /api/board/{id} n=494
+    /// clients=25`).
+    ///
+    /// The control is the load-bearing half. A 409 group where the acks
+    /// DIFFER is a fleet touching gates normally and must stay silent —
+    /// without that, a verdict that fired on every 409 group would look
+    /// exactly as green on the incident and be useless.
+    #[tokio::test]
+    async fn analyze_names_a_caller_stuck_retrying_one_refused_gate_ack() {
+        let (store, _dir) = store();
+        let now = unix_now();
+        // The real body, keys and all (serde emits them alphabetically, which
+        // is what pushed you_sent/missing past the old 500-char cap — AMUX-3132).
+        let stuck = "{\"attempted_status\":\"verified\",\"blocked\":true,\
+            \"error\":\"gate_checked does not match the gate\",\
+            \"gate\":[\"Outcome confirmed to still hold\"],\
+            \"item\":\"MI-4975\",\"item_type\":\"investigation\",\
+            \"missing\":[\"Outcome confirmed to still hold\"],\"ok\":false,\
+            \"you_sent\":[\"CI/CD green\",\"Deployed to prod\",\
+            \"Confirmed working in prod\",\"Zero regressions\"]}";
+        for i in 0..8 {
+            seed(&store, now - 100.0 - f64::from(i), "PATCH", "/api/board/MI-4975", 409, 1.0,
+                 "mvs-infra", "native", Some(stuck)).await;
+        }
+        // Two other lanes hitting the same gate normally — present so the
+        // dominant pair is a MAJORITY of a mixed group, not the whole of a
+        // pure one. A verdict that only fires on a homogeneous group would
+        // miss the real incident, which was 349 of 494.
+        for (i, who) in ["tubescience", "backend"].iter().enumerate() {
+            seed(&store, now - 50.0 - i as f64, "PATCH", "/api/board/MI-4975", 409, 1.0, who,
+                 "native", Some("{\"attempted_status\":\"done\",\"gate\":[\"Outcome recorded\"],\
+                 \"you_sent\":null}")).await;
+        }
+        // CONTROL: a 409 group where every ack differs. Must NOT produce a
+        // verdict. It has to live in a DIFFERENT family, and that is worth
+        // saying: `/api/board/TG-1` and `/api/board/MI-4975` both normalize
+        // to `/api/board/{id}`, so a board-card control lands in the SAME
+        // group and merely dilutes the majority. That merge is not a quirk of
+        // this test — it is precisely why the production incident hid, since
+        // every card's 409s in the fleet collapse into one line.
+        for (i, who) in ["a", "b", "c", "d", "e", "f"].iter().enumerate() {
+            let body = format!("{{\"attempted_status\":\"done\",\"gate\":[\"g\"],\
+                                \"you_sent\":[\"{who}\"]}}");
+            seed(&store, now - 30.0 - i as f64, "PATCH", "/api/schedules/SCHED-1", 409, 1.0, who,
+                 "native", Some(&body)).await;
+        }
+
+        let api = logs_api(store.clone());
+        let (st, body) = hit(&api,
+            HttpRequest::builder().uri("/api/logs/analyze?since_h=24").body(Body::empty()).unwrap()).await;
+        assert_eq!(st, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let verdicts: Vec<&str> =
+            v["verdicts"].as_array().unwrap().iter().map(|s| s.as_str().unwrap()).collect();
+
+        let stuck_v = verdicts.iter().find(|s| s.contains("mvs-infra"))
+            .unwrap_or_else(|| panic!("no stuck-caller verdict: {verdicts:?}"));
+        // WHO, HOW MANY, and OUT OF WHAT — the three facts the group line hid.
+        assert!(stuck_v.contains("8 of 10"), "{stuck_v}");
+        assert!(stuck_v.contains("verified"), "the refused transition: {stuck_v}");
+        // The fork the body settles: wrong criteria, not a missing ack.
+        assert!(stuck_v.contains("WRONG criteria"), "{stuck_v}");
+        assert!(stuck_v.contains("contract?card="), "must name the resolved-gate lookup: {stuck_v}");
+
+        // The control group must be silent — a diverse 409 group is health.
+        assert!(!verdicts.iter().any(|s| s.contains("/api/schedules")),
+                "a 409 group with differing acks is normal gate traffic: {verdicts:?}");
+
+        // The structured field is present on the group either way, so a reader
+        // below the verdict floor can still see the distribution.
+        let grp = v["groups"].as_array().unwrap().iter()
+            .find(|g| g["target"] == "/api/board/{id}" && g["status"] == 409)
+            .expect("the 409 board group");
+        assert_eq!(grp["top_rejected_ack"]["session"], "mvs-infra", "{grp}");
+        assert_eq!(grp["top_rejected_ack"]["count"], 8, "{grp}");
     }
 
     #[tokio::test]
@@ -3018,20 +3731,28 @@ mod tests {
         assert!(cell3.contains("GET-only"), "{cell3}");
     }
 
-    /// A row whose CLOCK spans a restart is not a slow request (AF-186).
+    /// A slow request near a restart is REPORTED with its age, not deleted
+    /// (AMUX-3647, superseding this cell's AF-186 shape).
     ///
-    /// autofix stopped counting these in AF-175. /api/logs/stats — the endpoint
-    /// a human opens — still did, and on 2026-08-24 the daily sweep's
-    /// slow_outliers was six of them at 33-58s, completing 5s apart with
-    /// latencies falling by exactly 5s, against a family p50 of 0.3ms. One
-    /// dashboard poll draining across a restart, rendered as six slow requests.
+    /// AF-186 was right that `/api/logs/stats` was rendering an outage as six
+    /// slow requests, and wrong about the mechanism, and this test encoded the
+    /// wrong one: its specimen was `ts = boot + 20` with a 120s latency,
+    /// described as "arrived 100s before the boot". `ts` is the request START,
+    /// so that row arrived 20 seconds AFTER its boot. The old predicate excluded
+    /// it through latency arithmetic and this cell certified the arithmetic.
     ///
-    /// THE CONTROL IS THE SECOND HALF and it is the one that matters: a
-    /// genuinely slow request that ARRIVED AFTER the boot must still appear.
-    /// Large is not exempt; only crossing the boundary is. Without that cell a
-    /// filter excluding everything passes.
+    /// Measured before rewriting it: 0 of 97,019 live rows carrying a `boot_at`
+    /// have `ts < boot_at`, and all 4 rows the arithmetic excluded in 24h were
+    /// ordinary slow requests arriving 2 to 15 seconds after a boot. Two were
+    /// the `GET /api/sessions-git` cache stampede (AMUX-3684), so this filter
+    /// was deleting a live defect's evidence from the list a human reads.
+    ///
+    /// THE CLAIM NOW: near-a-restart is CONTEXT, not a reason to drop a row.
+    /// Both slow rows appear, each carrying `since_boot_s`, and the reader
+    /// decides. The exclusion still exists for a row that genuinely predates
+    /// its own process, and still publishes its count including zero.
     #[tokio::test]
-    async fn stats_does_not_report_a_restart_spanning_row_as_a_slow_one() {
+    async fn stats_reports_a_slow_row_near_a_restart_and_says_how_near() {
         let (store, _dir) = store();
         let now = unix_now();
         let boot = now - 300.0;
@@ -3039,9 +3760,11 @@ mod tests {
         for i in 0..8 {
             seed_boot(&store, now - 200.0 + i as f64, "/api/board", 5.0, Some(boot)).await;
         }
-        // THE SPECIMEN: completed after boot, ARRIVED 100s before it.
+        // AF-186's own specimen, read correctly: ARRIVED 20s after its process
+        // booted and ran 120s. Startup contention is a plausible cause and this
+        // endpoint is not the place that decides.
         seed_boot(&store, boot + 20.0, "/api/board", 120_000.0, Some(boot)).await;
-        // THE CONTROL: equally slow, but it arrived well AFTER the boot.
+        // The far-from-boot twin: equally slow, 120s into its process's life.
         seed_boot(&store, now - 10.0, "/api/board", 120_000.0, Some(now - 130.0)).await;
 
         let api = logs_api(store.clone());
@@ -3056,43 +3779,68 @@ mod tests {
         let outliers = v["slow_outliers"].as_array().unwrap();
         assert_eq!(
             outliers.len(),
-            1,
-            "the spanning row must be gone and the genuinely slow one must remain: {outliers:?}"
+            2,
+            "BOTH slow rows must be reported: the one near a boot was excluded until \
+             AMUX-3647, in the under-reporting direction nobody notices: {outliers:?}"
         );
-        // IDENTIFY the survivor, do not bit-compare it. `assert_eq!` on a
-        // serde_json f64 is an equality of BITS, and this one crosses a JSON
-        // encode/decode boundary: the endpoint emits `now - 10.0` through ryu
-        // and the test parses the text back. That round trip came back one ULP
-        // high on a GitHub runner on 2026-08-24 (1787580761.0102837 vs
-        // ...835 — 2.4e-7 apart at this magnitude, which is exactly 1 ULP) and
-        // failed the run. It reproduces on no local run in 150.
-        //
-        // The bit-equality was never the claim. The claim is WHICH ROW
-        // SURVIVED, and the candidates are 183 seconds apart at the closest
-        // (the baselines sit at now-200..now-193, the spanning specimen at
-        // now-280). A millisecond window is five orders of magnitude tighter
-        // than it needs to be to discriminate, and it stops the test asserting
-        // a property of serde_json's float parser instead of a property of
-        // this endpoint.
-        let got = outliers[0]["ts"].as_f64().expect("outlier ts is a number");
+        // IDENTIFY rows by an approximate ts, never a bit-compare. `assert_eq!`
+        // on a serde_json f64 is an equality of BITS, and this crosses a JSON
+        // encode/decode boundary: a round trip came back one ULP high on a
+        // GitHub runner on 2026-08-24 (1787580761.0102837 vs ...835) and failed
+        // the run, reproducing on no local run in 150. The candidates here are
+        // seconds apart, so a millisecond window discriminates fine and stops
+        // this asserting a property of serde_json's float parser.
+        let at = |want: f64| {
+            outliers
+                .iter()
+                .find(|o| (o["ts"].as_f64().unwrap() - want).abs() < 1e-3)
+                .unwrap_or_else(|| panic!("no outlier at ts {want}: {outliers:?}"))
+        };
+
+        // THE REPLACEMENT INSTRUMENT. The exclusion used to make this judgment
+        // silently and got it wrong; the number makes it the reader's.
+        let near = at(boot + 20.0);
         assert!(
-            (got - (now - 10.0)).abs() < 1e-3,
-            "the survivor is the one after boot: got {got}, want {}, off by {}s ({:?})",
-            now - 10.0,
-            got - (now - 10.0),
-            outliers[0]
+            (near["since_boot_s"].as_f64().expect("since_boot_s must be a number") - 20.0).abs()
+                < 1e-3,
+            "the near-boot row must say HOW near, or hiding it and showing it are equally \
+             uninformative: {near}"
+        );
+        let far = at(now - 10.0);
+        assert!(
+            (far["since_boot_s"].as_f64().unwrap() - 120.0).abs() < 1e-3,
+            "and the far row must say so too, or the field only appears when it is alarming \
+             and its absence becomes the signal: {far}"
         );
 
-        // THE EXCLUSION IS PUBLISHED, NOT SILENT. A detector that quietly drops
-        // rows is one nobody can audit (AF-178), and a zero here is what tells a
-        // reader the exclusion RAN.
-        assert_eq!(v["totals"]["restart_spanning_excluded"], json!(1), "{v}");
+        // THE EXCLUSION STILL EXISTS AND STILL PUBLISHES. A row stamped before
+        // its own process booted is the one thing that spans a restart. It
+        // cannot happen today (0 of 97,019), which is exactly why it is seeded
+        // here: an unreachable branch nobody exercises is one that rots.
+        seed_boot(&store, boot - 5.0, "/api/board", 120_000.0, Some(boot)).await;
+        let (_, body2) = hit(
+            &api,
+            HttpRequest::builder().uri("/api/logs/stats?since_h=24").body(Body::empty()).unwrap(),
+        )
+        .await;
+        let v2: Value = serde_json::from_slice(&body2).unwrap();
+        assert_eq!(v2["totals"]["restart_spanning_excluded"], json!(1), "{v2}");
+        assert_eq!(
+            v2["slow_outliers"].as_array().unwrap().len(),
+            2,
+            "and the pre-boot row must not reach the list: {v2}"
+        );
+
+        // AF-178: the count is published even when it is ZERO, so "the filter
+        // ran and dropped nothing" is not the same silence as "no filter ran".
+        // This is the assertion that keeps the now-structurally-false predicate
+        // from becoming an invisible no-op.
+        assert_eq!(v["totals"]["restart_spanning_excluded"], json!(0), "{v}");
         let board = v["families"].as_array().unwrap().iter()
             .find(|f| f["family"] == "/api/board").unwrap();
-        assert_eq!(board["restart_spanning_excluded"], json!(1), "{board}");
-        // And it is out of the latency statistics too, not merely the list.
-        assert_eq!(board["count"], 9, "8 fast + the control, not the spanning row: {board}");
-        assert_eq!(board["max_ms"], 120_000.0, "the CONTROL is still the max — it is real: {board}");
+        assert_eq!(board["restart_spanning_excluded"], json!(0), "{board}");
+        assert_eq!(board["count"], 10, "8 fast + both slow rows: {board}");
+        assert_eq!(board["max_ms"], 120_000.0, "{board}");
     }
 
     /// Insert with an explicit `boot_at`, which `seed` does not carry.
@@ -3249,5 +3997,58 @@ mod category_tests {
         assert_eq!(category_of("/api/usage"), "http");
         assert_eq!(category_of("/health"), "http");
         assert_eq!(category_of(""), "http");
+    }
+}
+
+#[cfg(test)]
+mod caller_attribution_tests {
+    use super::caller_from_headers;
+    use axum::http::HeaderMap;
+
+    fn h(pairs: &[(&str, &str)]) -> HeaderMap {
+        let mut m = HeaderMap::new();
+        for (k, v) in pairs {
+            let name = axum::http::HeaderName::from_bytes(k.as_bytes()).unwrap();
+            m.insert(name, v.parse().unwrap());
+        }
+        m
+    }
+
+    /// The specimen: `amux send` stamps the origin on `x-amux-worker` and sends
+    /// no `x-amux-session`. This is the row that logged as anonymous — 27 of 29
+    /// cross-group refusals on 2026-08-25.
+    #[test]
+    fn a_worker_header_alone_identifies_the_caller() {
+        assert_eq!(caller_from_headers(&h(&[("x-amux-worker", "backend")])), "backend");
+    }
+
+    /// CONTROL: the old behaviour must still work. A client sending only
+    /// `x-amux-session` is the common case and must not regress.
+    #[test]
+    fn a_session_header_alone_still_identifies_the_caller() {
+        assert_eq!(caller_from_headers(&h(&[("x-amux-session", "amux")])), "amux");
+    }
+
+    /// Order matters and matches `hdr_worker`: worker wins when both are present.
+    #[test]
+    fn the_worker_header_wins_when_both_are_sent() {
+        let m = h(&[("x-amux-worker", "sender"), ("x-amux-session", "other")]);
+        assert_eq!(caller_from_headers(&m), "sender");
+    }
+
+    /// CONTROL: an EMPTY worker header must fall through, not shadow the session
+    /// one with "". Without this, a client sending `x-amux-worker: ""` would log
+    /// as anonymous while identifying itself perfectly well on the other header.
+    #[test]
+    fn an_empty_worker_header_falls_through_rather_than_shadowing() {
+        let m = h(&[("x-amux-worker", "   "), ("x-amux-session", "amux")]);
+        assert_eq!(caller_from_headers(&m), "amux");
+    }
+
+    /// CONTROL: no headers at all is still anonymous. A resolver that invented a
+    /// caller would be worse than the bug.
+    #[test]
+    fn no_identity_headers_stays_anonymous() {
+        assert_eq!(caller_from_headers(&HeaderMap::new()), "");
     }
 }

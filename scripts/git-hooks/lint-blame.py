@@ -92,5 +92,39 @@ def main():
     print("\n  The commit is refused either way: a red workspace is red for every lane, "
           "and CI denies warnings on the next push of main.")
 
+    # NAME THE NARROW ESCAPE, but only when the failure is provably not yours
+    # (AF-182, third instance 2026-08-26). Refusing without an exit is what sent
+    # three commits through `--no-verify`, which ALSO drops the security scan,
+    # the staged-guard, the append-only guard and the JS checks. The gate that
+    # was doing real work is the one that gets disabled, because it is bundled
+    # with the one that was wrong.
+    #
+    # This still does not change the verdict — the hook exits 1 regardless, and
+    # a human or agent has to make the call. It replaces a dead end with a
+    # precise alternative to the nuclear one. Deliberately silent when `mine` is
+    # non-empty: printing an escape beside your OWN denial would be handing you
+    # a false green.
+    if not mine and (theirs or onhead):
+        print("\n  If you are certain none of the offenders are yours, skip THIS gate only:")
+        print("      AMUX_SKIP_RUST_GATE=1 git commit ...")
+        print("  Every other gate still runs, and the skip prints itself in the commit output.")
+        print("  Prefer that to --no-verify, which disables the security scan and the "
+              "staged-guard as well.")
+        # EXIT 10 = "attributed successfully, and NONE of the offenders are
+        # staged" (AMUX-3726). The hook uses this to decide whether it is worth
+        # building the INDEX to answer the question the tree cannot.
+        #
+        # A DISTINCT code, and only this one, because of the rule this aid is
+        # already bound by: it must never be able to turn a refusal into a pass.
+        # Every other outcome — 0, a crash, a missing interpreter, an unparseable
+        # clippy dump — is NOT 10, and the hook treats not-10 as "refuse, exactly
+        # as before". So a BROKEN aid degrades to today's behaviour and can only
+        # cost a wait; it can never grant an allow.
+        return 10
 
-main()
+
+# The exit code carries the verdict; `main` returns 10 only when it positively
+# established that no offender is staged. `or 0` keeps every other path at 0, so
+# the hook's existing `|| true` semantics are unchanged for them.
+import sys as _sys
+_sys.exit(main() or 0)

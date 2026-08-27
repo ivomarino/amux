@@ -272,6 +272,56 @@ pub enum ScheduleExpr {
     Cron(Box<cron::Schedule>),
 }
 
+/// How many times a day this expression fires (AMUX-3546).
+///
+/// `every 15m` is eleven characters and reads like a small choice. It is 96
+/// turns a day, and five of them were enabled on this machine — part of ~1,650
+/// turns/day from 34 rows, each one a full model turn against the owner's own
+/// subscription. Nothing said so at the moment of the decision, which is the
+/// only moment the information is free.
+///
+/// STATED, NEVER REFUSED. A ten-minute poll is a legitimate thing to want; the
+/// cost simply has to be visible when it is chosen (the AMUX-2785 argument, one
+/// subsystem over).
+///
+/// `None` only when the count cannot be established, never 0 — a schedule that
+/// fires an unknown number of times is not a schedule that fires never, and
+/// collapsing them would put the noisiest cell behind the quietest label.
+pub fn fires_per_day(expr: &ScheduleExpr) -> Option<f64> {
+    const DAY: f64 = 86_400.0;
+    match expr {
+        ScheduleExpr::Interval { every } => {
+            let secs = every.num_seconds() as f64;
+            (secs > 0.0).then(|| DAY / secs)
+        }
+        ScheduleExpr::Daily { .. } => Some(1.0),
+        // Mon-Fri: 5 fires per 7 days, expressed per-day so every arm of this
+        // match is in the same unit and the caller never has to ask.
+        ScheduleExpr::Weekday { .. } => Some(5.0 / 7.0),
+        ScheduleExpr::Weekly { .. } => Some(1.0 / 7.0),
+        // 365.2425 / 12: the mean Gregorian month. A flat 30 would report a
+        // monthly schedule as firing 1.4% more often than it does, which is
+        // invisible and wrong rather than approximate and honest.
+        ScheduleExpr::Monthly { .. } => Some(12.0 / 365.2425),
+        // COUNTED, not derived from the field pattern. A cron expression's
+        // firing rate is not readable from its shape without reimplementing
+        // cron, and the `cron` crate already owns that: walk the next 24 hours
+        // and count. Bounded, because `* * * * *` yields 1440 and a malformed
+        // schedule could in principle yield more.
+        ScheduleExpr::Cron(sched) => {
+            let now = chrono::Local::now();
+            let until = now + ChronoDuration::days(1);
+            let n = sched.after(&now).take(MAX_CRON_FIRES).take_while(|t| *t < until).count();
+            (n < MAX_CRON_FIRES).then_some(n as f64)
+        }
+    }
+}
+
+/// One per minute for a day, plus headroom. Reaching it means the count is not
+/// trustworthy, and `fires_per_day` returns None rather than a floor wearing the
+/// authority of a measurement.
+const MAX_CRON_FIRES: usize = 2000;
+
 static RE_IN: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^in\s+(\d+)\s*(m|min|minutes?|h|hr|hours?)$").unwrap());
 static RE_EVERY_N: LazyLock<Regex> =
@@ -1321,11 +1371,73 @@ pub fn delivered_text(command: &str, source: &str) -> String {
     format!("{why}\n\n{command}")
 }
 
+/// Does the background reserve gate a fire from this `source`?
+///
+/// Extracted so the rule is testable without a live usage probe — `deliver`
+/// asks the network, this asks the string, and the string is the whole
+/// decision (Ethan, 2026-08-26: "if i manually send a scheduler to run now it
+/// should override this").
+///
+/// `manual:` WITH THE PREFIX. `run_now` builds `format!("manual:{by}")` so the
+/// row carries who tapped it, and `delivered_text` already reads it that way.
+/// An `== "manual"` check matches nothing and leaves run-now gated exactly as
+/// before — a silent no-op that reads as a fix, which is why this has a test
+/// over the REAL source strings rather than invented ones.
+pub fn reserve_applies_to(source: &str) -> bool {
+    !source.starts_with("manual:")
+}
+
 #[async_trait::async_trait]
 impl Deliverer for LiveDeliverer {
     async fn deliver(&self, sched: &DurableSchedule, source: &str) -> RunOutcome {
         if sched.str_field("kind") == "shell" {
+            // NOT GATED BY THE RESERVE, and the exemption is the point: a shell
+            // schedule wakes no model turn, so it consumes none of the plan
+            // window the reserve protects. Gating it would stop work that costs
+            // the human nothing — the same distinction AF-216's kind_note and
+            // AMUX-3546's cadence note both draw.
             return self.run_shell(sched).await;
+        }
+        // THE BACKGROUND RESERVE (AMUX-3545). Ethan's call: 30%, so a tmux
+        // schedule stops firing once the plan window is 70% used.
+        //
+        // PAUSE, NOT THROTTLE. A throttle spreads the same total spend over more
+        // time and still arrives at zero; the customer's complaint was never
+        // that background work was fast, it was that it left nothing. The
+        // schedule keeps its next_run and fires normally once the window rolls.
+        //
+        // Refused, not Err: nothing is broken, and a failure count would make a
+        // working reserve look like an outage.
+        // A MANUAL RUN-NOW IS NOT BACKGROUND WORK (Ethan, 2026-08-26: "if i
+        // manually send a scheduler to run now it should override this").
+        //
+        // The reserve protects the human's plan window FROM AUTOMATION — its own
+        // note says so: "Background work stops here so a prompt you type still
+        // has room; direct sends are never gated." Pressing Run now IS the human
+        // spending their own reserve, deliberately, on a thing they chose. amux
+        // refusing that is amux deciding something that is the human's to decide
+        // (ethos rule 8), and it does it at exactly the moment they most want
+        // control — the window is nearly full and they are picking what the last
+        // of it goes on.
+        //
+        // The discriminator already existed and was already threaded here.
+        // `source` is the same field AMUX-0032 added because a manual run and a
+        // cron fire were byte-identical rows and a session read three Run-now
+        // taps as the scheduler re-firing. It was recorded for the audit trail
+        // and never read for a decision. This is the decision it was for.
+        //
+        // Scheduled (cron) fires stay gated: nobody typed those.
+        //
+        // `manual:` with the PREFIX, not an equality check: `run_now` builds
+        // `format!("manual:{by}")` so the row carries WHO tapped it, and
+        // `delivered_text` two hundred lines up already reads it that way
+        // (`source.strip_prefix("manual:")`). An `== "manual"` here would have
+        // matched nothing and left the reserve gating run-now exactly as before
+        // — a silent no-op that reads as a fix.
+        if reserve_applies_to(source) && crate::api::usage::background_should_pause_now().await {
+            return RunOutcome::Refused {
+                reason: crate::api::usage::reserve_pause_note("schedule"),
+            };
         }
         let command = sched.str_field("command").trim().to_string();
         if command.is_empty() {
@@ -1751,6 +1863,82 @@ pub async fn run_scheduler(
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-3546: a cadence has a number, and it is the number nobody saw.
+    ///
+    /// From the live board when the card was filed: 165 schedules enabled, ~1,650
+    /// turns/day from 34 rows. `every 15m` is eleven characters and is 96 turns a
+    /// day; five were enabled.
+    /// AMUX-3741: a manual Run-now overrides the background reserve.
+    ///
+    /// The reserve protects the human's plan window FROM AUTOMATION — its own
+    /// note says "direct sends are never gated". Pressing Run now IS the human
+    /// spending their own reserve on a thing they chose, and refusing it is amux
+    /// deciding what is the human's to decide, at exactly the moment they most
+    /// want control: the window is nearly full and they are picking what the
+    /// last of it goes on.
+    ///
+    /// THE SOURCE STRINGS HERE ARE THE REAL ONES, not invented. `run_now` builds
+    /// `format!("manual:{by}")` and the cron path passes "cron-rs". My first cut
+    /// compared `source != "manual"`, which matches NEITHER and would have left
+    /// run-now gated exactly as before — a silent no-op that reads as a fix.
+    /// That is the whole reason this test exists rather than a comment.
+    #[test]
+    fn a_manual_run_now_is_exempt_from_the_reserve_but_cron_is_not() {
+        // The exact string run_now builds.
+        assert!(!reserve_applies_to("manual:esteininger"));
+        assert!(!reserve_applies_to("manual:amux"));
+        // The exact strings the cron path passes. These MUST stay gated —
+        // nobody typed them, and exempting them would delete the reserve.
+        assert!(reserve_applies_to("cron-rs"));
+        assert!(reserve_applies_to("cron"));
+        assert!(reserve_applies_to(""));
+        // A bare "manual" is NOT the shape run_now produces. Pinned so a future
+        // caller that emits it is caught here rather than silently gated.
+        assert!(reserve_applies_to("manual"));
+    }
+
+    #[test]
+    fn fires_per_day_counts_every_expression_shape() {
+        let f = |e: &str| {
+            super::fires_per_day(&ScheduleExpr::parse(e).expect(e)).expect("countable")
+        };
+        // The card's own census, expression by expression.
+        assert_eq!(f("every 15m"), 96.0, "the eleven characters that motivated this card");
+        assert_eq!(f("every 10m"), 144.0);
+        assert_eq!(f("every 30m"), 48.0);
+        assert_eq!(f("every 1h"), 24.0);
+        assert_eq!(f("every 6h"), 4.0);
+        assert_eq!(f("daily at 9am"), 1.0);
+
+        // Sub-daily shapes are per-DAY too, so every arm shares one unit and a
+        // caller never has to ask which it got.
+        assert!((f("every weekday at 9am") - 5.0 / 7.0).abs() < 1e-9, "Mon-Fri is 5/7 per day");
+        assert!((f("weekly on Monday at 9am") - 1.0 / 7.0).abs() < 1e-9);
+        // Mean Gregorian month, not a flat 30: that would over-report a monthly
+        // schedule by 1.4%, which is invisible and wrong rather than approximate
+        // and honest.
+        assert!((f("monthly on 1 at 9am") - 12.0 / 365.2425).abs() < 1e-9);
+
+        // CRON IS COUNTED, not pattern-matched. Reimplementing cron to read a
+        // rate off the field shapes is how the count and the firing disagree.
+        assert_eq!(f("0 9 * * *"), 1.0, "daily cron");
+        assert_eq!(f("*/15 * * * *"), 96.0, "quarter-hourly cron matches `every 15m`");
+        assert_eq!(f("0 * * * *"), 24.0, "hourly cron");
+
+        // THE CONTROL, and it is the one that matters: this must not return a
+        // plausible number for something it cannot count. A floor wearing the
+        // authority of a measurement is worse than no number, because the
+        // caller acts on it.
+        assert!(
+            super::fires_per_day(&ScheduleExpr::Interval {
+                every: ChronoDuration::seconds(0)
+            })
+            .is_none(),
+            "a zero interval fires unboundedly — reporting 0/day would put the noisiest \
+             possible schedule behind the quietest label"
+        );
+    }
+
     use super::*;
     use crate::db::Store;
     use std::sync::Arc;
@@ -2453,6 +2641,9 @@ mod tests {
         // byte-identical to the 9am cron fire.
         assert_eq!(delivered_text("do the thing", "cron-rs"), "do the thing");
         assert_eq!(delivered_text("do the thing", "cron"), "do the thing");
+
+
+
         let manual = delivered_text("do the thing", "manual:ethan");
         assert!(manual.contains("Run-now, triggered by ethan"), "{manual}");
         assert!(manual.ends_with("do the thing"), "{manual}");

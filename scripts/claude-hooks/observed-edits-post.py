@@ -16,11 +16,58 @@
 import json
 import os
 import ssl
+import subprocess
 import sys
 import time
 import urllib.request
 
 PRUNE = {".git", "node_modules", "target", ".venv", "__pycache__", ".next", "dist"}
+
+
+def _derive_session_from_tmux():
+    """Fallback identity for MR-43: $AMUX_SESSION can be empty inside a lane
+    that IS running in its amux-launched pane (spawn always injects it —
+    session_verbs.rs — so this is loss in-process, not absence at launch).
+    Scoped to amux- prefixed panes, so a human's own tmux session (or no tmux
+    at all) still resolves to "" and takes the existing no-op path. Mirrors
+    the PRE half's helper of the same name — kept duplicated rather than
+    imported since every hook here is a standalone TRACKED SOURCE file.
+
+    The tmux CALL FAILING is a different case from tmux CLEANLY SAYING "not an
+    amux- pane", and conflating them was a real gap (amux-frustrations auditing
+    MR-43, 2026-08-25): both returned "" identically, so a real lane whose tmux
+    call merely errored or timed out vanished exactly like a human shell — the
+    original MR-43 symptom (edit record missing, guard names a peer as sole
+    editor) reproduced under a new cause, and silently, since the old return ""
+    left no trace to count. That case logs a WARN before falling through to the
+    same "" — a human shell (tmux succeeds, name isn't amux-*) still logs
+    nothing, so this does not add a row for every ordinary command.
+    """
+    try:
+        name = subprocess.run(["tmux", "display-message", "-p", "#S"],
+                              capture_output=True, text=True, timeout=3).stdout.strip()
+    except Exception as e:
+        _warn_derive_failed(e)
+        return ""
+    return name[len("amux-"):] if name.startswith("amux-") else ""
+
+
+def _warn_derive_failed(exc):
+    """Countable trace for the one case that must not be silent: the tmux call
+    itself failed, which could be masking a real lane rather than confirming a
+    human shell. Best-effort — a logging failure must never break the hook."""
+    try:
+        home = os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux")
+        # The directory usually exists by the time this runs (the PRE half
+        # creates it on every successful derivation) — but the failure this
+        # exists to catch can happen on the FIRST call in a fresh/broken
+        # environment, exactly when it would not yet.
+        os.makedirs(os.path.join(home, "hooks", "state"), exist_ok=True)
+        log_line(home, "UNKNOWN",
+                 f"tmux derivation failed ({type(exc).__name__}: {exc}) - "
+                 "cannot tell a human shell from a real lane")
+    except Exception:
+        pass
 MAX_PATHS = 80
 FIND_BUDGET_S = 1.5
 
@@ -110,6 +157,8 @@ def log_line(home, session, text):
 
 def main():
     session = (os.environ.get("AMUX_SESSION") or "").strip()
+    if not session:
+        session = _derive_session_from_tmux()
     if not session:
         return
     home = os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux")

@@ -21,11 +21,65 @@
 
 use super::AppState;
 use axum::extract::State;
+use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use futures::stream::Stream;
 use futures::StreamExt;
 use std::convert::Infallible;
 use std::time::Duration;
+
+/// LIVE SSE CONNECTIONS, and the cumulative count of opens (AF-262).
+///
+/// The SSE backbone had NO health signal of any kind, and `/api/events` is
+/// deliberately excluded from the request log (it is one long-lived request, so
+/// logging it would say nothing about the traffic it carries). So the one
+/// component whose documented failure mode is "every client falls back to
+/// POLLING" was the one component with nothing to look at.
+///
+/// That cost a real wrong conclusion on 2026-08-27. A day's `/api/sessions`
+/// volume rose 63% with 90% of it unattributed — exactly the shape a fleet-wide
+/// SSE degradation produces per `.claude/rules/sse-realtime.md` — and there was
+/// no way to tell that from "more browser tabs are open". The latency half of
+/// that finding turned out to be wrong for an unrelated reason; the blindness
+/// was real either way and survives the correction.
+///
+/// VOLATILE BY CONSTRUCTION and that is honest here: the builder swaps this
+/// binary whenever anyone commits, and every SSE connection dies with it. A
+/// gauge that resets on deploy is exactly right for "how many clients are
+/// attached to THIS process" — which is the question. `opened_total` is
+/// per-process for the same reason, so a high open count against a low live
+/// count is reconnect churn within one process's life, which is the signal.
+static SSE_LIVE: AtomicI64 = AtomicI64::new(0);
+static SSE_OPENED: AtomicU64 = AtomicU64::new(0);
+
+/// Decrements when the RESPONSE STREAM is dropped, which is what axum does on
+/// client disconnect.
+///
+/// Deliberately NOT held by the producer task. The producer parks on
+/// `rx.recv()` for the broadcast channel and only discovers a dead client when
+/// it next tries to SEND — so on a quiet fleet, which is precisely when you are
+/// asking whether clients are still attached, it would keep counting clients
+/// that had already gone. The stream is dropped promptly; the producer is not.
+struct ConnGuard;
+
+impl ConnGuard {
+    fn open() -> Self {
+        SSE_LIVE.fetch_add(1, Ordering::Relaxed);
+        SSE_OPENED.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        SSE_LIVE.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `(live, opened_total)` for the debug surface.
+pub fn conn_stats() -> (i64, u64) {
+    (SSE_LIVE.load(Ordering::Relaxed), SSE_OPENED.load(Ordering::Relaxed))
+}
 
 pub async fn events(
     State(state): State<AppState>,
@@ -196,16 +250,66 @@ where
         serde_json::json!({"type": "hello", "rev": current_rev}).to_string(),
     );
     tokio::spawn(producer(tx));
+    // The guard rides in the STREAM STATE so it drops exactly when axum drops
+    // the response body — i.e. on client disconnect (AF-262).
+    let guard = ConnGuard::open();
     futures::stream::once(async move { Ok(hello) }).chain(futures::stream::unfold(
-        rx,
-        |mut rx| async move {
-            rx.recv().await.map(|ev| (Ok(ev), rx))
+        (rx, guard),
+        |(mut rx, guard)| async move {
+            rx.recv().await.map(|ev| (Ok(ev), (rx, guard)))
         },
     ))
 }
 
 #[cfg(test)]
 mod ping_tests {
+    use super::*;
+
+    /// AF-262 — the gauge must go DOWN, and it must go down when the STREAM is
+    /// dropped rather than when the producer notices.
+    ///
+    /// A counter that only increments is worse than none: it reports a growing
+    /// fleet forever and reads as health. The decrement is the whole instrument,
+    /// so it is what this pins.
+    ///
+    /// The placement matters as much as the arithmetic. The obvious home for the
+    /// guard is the producer task, and it is WRONG: the producer parks on
+    /// `rx.recv()` for the broadcast channel and only discovers a dead client
+    /// when it next tries to SEND. On a quiet fleet — precisely when you are
+    /// asking whether anyone is still attached — it would keep counting clients
+    /// that had already gone, and the gauge would be highest exactly when the
+    /// truth was lowest.
+    #[test]
+    fn the_connection_gauge_decrements_when_the_stream_drops_not_when_the_producer_notices() {
+        let (live0, opened0) = conn_stats();
+
+        let g1 = ConnGuard::open();
+        let (live1, opened1) = conn_stats();
+        assert_eq!(live1, live0 + 1, "open must increment live");
+        assert_eq!(opened1, opened0 + 1, "open must increment the cumulative total");
+
+        let g2 = ConnGuard::open();
+        assert_eq!(conn_stats().0, live0 + 2, "two streams, two live");
+
+        drop(g2);
+        assert_eq!(
+            conn_stats().0,
+            live0 + 1,
+            "dropping one stream must decrement live — a gauge that only counts up \
+             reports a growing fleet forever and reads as health"
+        );
+
+        drop(g1);
+        assert_eq!(conn_stats().0, live0, "live returns to baseline when all streams drop");
+        assert_eq!(
+            conn_stats().1,
+            opened0 + 2,
+            "opened_total is CUMULATIVE and must NOT decrement — opened >> live within \
+             one process is the reconnect-churn signal, and it disappears if this \
+             counter tracks live"
+        );
+    }
+
     /// AMUX-3503 — this exact JSON is the ENTIRE replacement for the 1MB
     /// legacy pushes, and app.js parses it as `msg.keys` (an array). A shape
     /// drift here silently stops every SSE-driven refetch fleet-wide, so the

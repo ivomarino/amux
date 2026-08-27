@@ -141,6 +141,52 @@ def fetch_board():
     return ids
 
 
+def fetch_sessions():
+    """Live session names on THIS server, or None if that cannot be established.
+
+    Exists to split one advisory into two (AF-229). `not on this board` was printed
+    identically for AC-227 (amux-cloud, a live lane here — ask them and the entry
+    drains) and AEAB-18 (amux-errors-and-bugs, absent from all 120 sessions, working
+    out of a `~/Developer/amux` that does not exist on this machine). The deletion
+    protocol keys removal to the ORIGINATING SESSION's sign-off, so those two states
+    need opposite handling and the ledger could not tell them apart.
+
+    Returns None rather than an empty set when the fetch fails: an empty set would
+    make EVERY entry look stranded, which is the loud-wrong-probe failure — a
+    confident answer produced by a broken instrument. Callers must treat None as
+    "unknown" and claim neither state.
+    """
+    base = os.environ.get("AMUX_URL", "") or "https://localhost:8824"
+    if base.rstrip("/").endswith(":8822"):
+        base = "https://localhost:8824"
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        req = urllib.request.Request(base + "/api/sessions")
+        data = json.load(urllib.request.urlopen(req, context=ctx, timeout=30))
+    except Exception:
+        return None
+    names = {s["name"] for s in data if isinstance(s, dict) and s.get("name")}
+    return names or None
+
+
+def citing_session(raw):
+    """The session NAME out of a SESSION: field, or "" if there isn't one.
+
+    The field is prose in practice and always has been: `amux-rust (lifecycle-fix
+    subagent)`, `amux (hit it, twice), amux-frustrations (verified the mechanism)`,
+    `(agent, AMUX-2629)`, `(Claude Code in iTerm - not a fleet lane, hence no session
+    stamp)`. Taking the leading bare token handles the first two and correctly yields
+    "" for the last two, which are genuinely not lane names.
+
+    Deliberately NOT a model call (ethos rule 2): this is string manipulation, and a
+    helper-model call here would be the 12-15k-token label mistake again.
+    """
+    m = re.match(r"\s*([A-Za-z][A-Za-z0-9_-]*)", raw or "")
+    return m.group(1) if m else ""
+
+
 def overlap(a, b):
     """Loose word overlap. Deliberately crude and deliberately only ADVISORY: card titles
     get rewritten as understanding improves, so a low score is 'a human should look',
@@ -302,6 +348,13 @@ def main():
             dupes[e["CARD"]].append(e["title"])
     shared_ids = {k: v for k, v in dupes.items() if len(v) > 1}
 
+    # AF-229. Fetched even though only the unresolved-id branch reads it, because
+    # `sessions is None` is a THIRD state that branch has to report honestly, and
+    # deciding that per-entry would re-ask a dead endpoint once per entry.
+    sessions = fetch_sessions()
+    stranded = []
+    board_prefixes = set()
+
     try:
         board = fetch_board()
     except Exception as ex:
@@ -332,18 +385,59 @@ def main():
         # disagreed, and only the script knows whether `problems` is empty.
         return 1 if (problems or not structure_ok) else 2
 
+    # Every id namespace this board actually holds — the discriminator for "foreign
+    # instance" vs "id I mistyped or someone deleted" (AF-229). Derived from the board
+    # rather than hardcoded, so a new lane's prefix is known the moment it files a card.
+    board_prefixes = {i.rsplit("-", 1)[0] for i in board if "-" in i}
+
     for e in entries:
         c = e.get("CARD")
         if not c or c.lower() == "none":
             continue
-        card = board.get(c)
-        if not card:
+        # CARD fields are not always a bare id. Real ones in this file:
+        #   "AR-114, AR-115, AR-116, AR-118, AR-119, AR-120"
+        #   "AF-69 (investigation, signed off) + AMUX-3221 (the FIX, open)"
+        # `board.get(c)` on the whole string missed every one of them, so multi-id
+        # entries have ALWAYS reported as unresolved. That was invisible while the
+        # branch printed a mild "other instance, or deleted"; the moment AF-229 made
+        # the branch say something specific, it said something specific and WRONG
+        # (six live AR-* cards, all HTTP 200, announced as unreachable). Extract the
+        # ids and judge on those.
+        ids = re.findall(r"\b([A-Z][A-Z0-9]{1,9}-\d+)\b", c)
+        if not ids:
+            advisories.append("%-10s CARD names no parseable id :: %s" % (c[:10], e["title"][:46]))
+            continue
+        found = [i for i in ids if i in board]
+        if found and len(found) < len(ids):
+            advisories.append("%-10s %d of %d ids resolve (%s missing) :: %s"
+                              % (ids[0], len(found), len(ids),
+                                 ", ".join(i for i in ids if i not in board), e["title"][:40]))
+        if not found:
             # Cross-instance ids are expected (AC-* live on amux-cloud's board). Flag as
             # advisory rather than error, but SAY it, so "not on this board" is a known
             # state rather than a silent hole in the protocol.
-            advisories.append("%-10s not on this board (other instance, or deleted) :: %s"
-                              % (c, e["title"][:46]))
+            #
+            # AF-229: it stays advisory, but it must not be ONE OUTPUT FOR TWO STATES.
+            # The discriminator is the PREFIX NAMESPACE, not whether the author happens
+            # to be running. amux-rust is not live either, yet AR-114 answers HTTP 200 —
+            # same board, a lane that simply is not up, and its entries are drainable
+            # whenever it is. AEAB-* resolve nowhere: 0 of 9,296 cards carry that prefix
+            # while DESKT-*, also a non-fleet lane, carries 25. Judging on liveness alone
+            # would have called six drainable AR-* entries permanently stranded.
+            who = citing_session(e.get("SESSION", ""))
+            prefixes = {i.rsplit("-", 1)[0] for i in ids}
+            foreign = prefixes - board_prefixes
+            if foreign == prefixes and sessions is not None and who and who not in sessions:
+                where = ("STRANDED: prefix %s exists nowhere on this board and author %s "
+                         "is not in this fleet" % ("/".join(sorted(foreign)), who))
+                stranded.append((ids[0], who, e["title"]))
+            elif sessions is not None and who and who in sessions:
+                where = "id missing; author %s IS live here — ask them" % who
+            else:
+                where = "not on this board (other instance, or deleted)"
+            advisories.append("%-10s %s :: %s" % (ids[0], where, e["title"][:46]))
             continue
+        card = board[found[0]]
         ov = overlap(e["title"], card.get("title", ""))
         if ov <= 0.3:
             advisories.append("%-10s TITLE MISMATCH (%.2f)\n              entry: %s\n              card:  %s"
@@ -360,6 +454,27 @@ def main():
                   % len(shared_ids))
             for k, v in sorted(shared_ids.items()):
                 print("              %s x%d" % (k, len(v)))
+        if stranded:
+            # ROLLED UP, not left as N scattered CHECK lines (AF-229). The argument
+            # this file makes is a COUNT — "three entries sharing an AREA" — so the
+            # thing a reader needs is how much of the open set is permanently
+            # undrainable, which no per-entry line delivers. By session, because the
+            # remedy is per-session (reach that lane, or retire its entries), not
+            # per-entry.
+            by_who = defaultdict(list)
+            for cid, who, _t in stranded:
+                by_who[who].append(cid)
+            print("  STRANDED  %d entr(ies) cite a card no one in this fleet can reach."
+                  % len(stranded))
+            for who, ids in sorted(by_who.items()):
+                print("              %-24s %d :: %s" % (who, len(ids), ", ".join(sorted(set(ids)))))
+            print("              These cannot leave the file by the sanctioned path: deletion")
+            print("              needs the ORIGINATING session's sign-off and it is not here.")
+        elif sessions is None:
+            # Absence of a STRANDED block must not read as "none stranded" when the
+            # question was never asked (ethos rule 7 — a passing check and an absent
+            # check look identical).
+            print("  NOTE      sessions unreachable — no entry was classified as stranded")
         if not problems and not advisories:
             print("  clean — every CARD: resolves and plausibly matches its entry")
     return 1 if (problems or not structure_ok) else 0

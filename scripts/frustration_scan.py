@@ -47,6 +47,7 @@ fleet talking to itself. `cmd_history.ts` is in MILLISECONDS.
 """
 import json
 import os
+import difflib
 import re
 import sqlite3
 import sys
@@ -76,11 +77,30 @@ MARKERS = [
     (r"\bnothing happen|\bno response\b|\bsilent\b", 2, "no-response"),
 ]
 # Short imperatives that mean "you did not do it", as opposed to new work.
-REPROMPT = re.compile(
-    r"^(just do it|do it|continue|go|now|\?+|well\?*|and\?*|status\??|"
+#
+# TWO CLASSES, and conflating them made a CONTINUATION read as a chase.
+# `and\?*` matched `^and\b`, so "and send the email with the ns" and "and
+# suggest a call this week" both scored as re-prompts — both were Ethan
+# finishing one thought in a second message, 8 and 9 seconds after the first,
+# which is the opposite of "you did not do it". Measured 2026-08-25: 2 of the
+# 3 new candidates that sweep produced, and the reprompt kind's whole meaning
+# is "a lane went quiet or a delivery did not land".
+#
+# `and` and `well` are prods ONLY when they are the entire message ("and?",
+# "well?"). Followed by content they introduce more work. The others carry
+# their meaning with a tail — "did you push it", "status of the sweep" — so
+# they keep the prefix form.
+REPROMPT_BARE = re.compile(r"^(and|well|now|go)\?*$", re.I)
+REPROMPT_PREFIX = re.compile(
+    r"^(just do it|do it|continue|\?+|status\??|"
     r"any update|did you|are you)\b",
     re.I,
 )
+
+
+def is_reprompt(norm):
+    """A chase, not a continuation. See REPROMPT_BARE above for why the split."""
+    return bool(REPROMPT_BARE.match(norm) or REPROMPT_PREFIX.match(norm))
 CONTROL = re.compile(
     r"(?:continue|go ahead|go on|proceed|keep going|yes|yep|ok(?:ay)?|sure|"
     r"do it|just do it|next|more|status|thanks?|ty|nice|good|perfect|done)"
@@ -104,6 +124,76 @@ def normalize(t):
     t = TIME_PREFIX.sub("", t or "")
     t = ATTACH.sub("", t)
     return WS.sub(" ", t.lower()).strip()
+
+
+# ---- PASTED CONTENT IS NOT ETHAN'S WORDS (AF-255) --------------------------
+#
+# `normalize` strips the timestamp and the attachment path and nothing else, so
+# everything Ethan PASTES — a forwarded email, a meeting transcript, a canary's
+# output — was scored as though he had written it. Measured on the 2026-08-26
+# run: 4 of 9 candidates were this artifact, including the second-highest
+# scorer, a customer meeting transcript whose "you didn't" / "no response" /
+# "i said" markers were spoken by MEETING PARTICIPANTS. The sweep's own
+# instruction says "do not infer a mood and file it"; the scanner was inferring
+# one from a third party's words and attributing it to Ethan.
+PASTE_HEADER = re.compile(
+    r"^\s*(meeting title|meeting participants|meeting date|attendees|from|to|subject|sent)\s*:",
+    re.I | re.M,
+)
+SIG_DELIM = re.compile(r"^\s*--\s*$", re.M)
+FENCE = re.compile(r"```.*?```", re.S)
+QUOTED_LINE = re.compile(r"^\s*>.*$", re.M)
+
+
+def own_words(t):
+    """What is left after removing what Ethan quoted rather than wrote.
+
+    Conservative on purpose: it removes only regions with an unambiguous paste
+    marker. A forwarded body with no marker at all still survives here — that
+    case is handled at the PAIR level by `ask_similarity`, which is the right
+    layer for it because a quote is only detectable as a quote when it appears
+    twice.
+    """
+    t = FENCE.sub(" ", t or "")
+    t = QUOTED_LINE.sub(" ", t)
+    # A paste header or a signature delimiter starts a block that runs to the
+    # end. Truncate at the EARLIEST of them.
+    cut = len(t)
+    for rx in (PASTE_HEADER, SIG_DELIM):
+        m = rx.search(t)
+        if m:
+            cut = min(cut, m.start())
+    return WS.sub(" ", t[:cut]).strip()
+
+
+def ask_similarity(a, b):
+    """Similarity of the two ASKS, not of what they both quote.
+
+    Two messages that forward the SAME email share hundreds of words, so plain
+    jaccard reports ~1.0 while the actual requests differ completely. Removing
+    the longest shared run and comparing the remainders separates the two cases
+    without needing to recognise any quote format:
+
+      genuinely repeated ask  -> the shared run IS the whole message, both
+                                 remainders are empty, and the original
+                                 similarity stands.
+      different asks, one quote -> the shared run is the quote, the remainders
+                                 are Ethan's two different requests, and their
+                                 similarity is the honest answer.
+
+    Returns (similarity, shared_word_count).
+    """
+    aw, bw = a.split(), b.split()
+    sm = difflib.SequenceMatcher(a=aw, b=bw, autojunk=False)
+    m = sm.find_longest_match(0, len(aw), 0, len(bw))
+    if m.size < 20:
+        return similarity(a, b), m.size
+    rem_a = " ".join(aw[: m.a] + aw[m.a + m.size :]).strip()
+    rem_b = " ".join(bw[: m.b] + bw[m.b + m.size :]).strip()
+    # Nothing meaningful left on one side = the shared run WAS the message.
+    if len(rem_a.split()) < 4 or len(rem_b.split()) < 4:
+        return similarity(a, b), m.size
+    return similarity(rem_a, rem_b), m.size
 
 
 def shingles(s, n=4):
@@ -138,7 +228,30 @@ def main():
     msgs = []
     for mid, ts, sess, text in rows:
         norm = normalize(text)
-        if len(norm) < 8:  # "ok", "yes" — not a request, cannot be a repeat
+        # SHORT = NOT A REQUEST, which is a statement about the REPEAT branch and
+        # was being applied to both (AF-224). Its own comment says "cannot be a
+        # repeat", and `continue` dropped the row from `msgs` entirely, so it
+        # never reached the re-prompt branch either.
+        #
+        # That silently disabled the re-prompt signal for the terse prods it
+        # exists to catch. Measured 2026-08-25, normalized lengths: "go" 2,
+        # "and" 3, "now" 3, "and?" 4, "well?" 5, "status?" 7 — every one under
+        # the gate, and every one a chase. "continue" survives on exactly 8
+        # characters, which is why the branch looked like it worked.
+        #
+        # So the REPROMPT table listed `and`, `well`, `now`, `go` and `status?`
+        # as prods while the gate above guaranteed none of them could arrive.
+        # The only form those tokens could ever match was the PREFIX one — "and
+        # <more work>" — i.e. a continuation, which is the opposite of a chase.
+        # They generated false positives exclusively (2 of 3 new candidates in
+        # that sweep) and could never generate a true one.
+        #
+        # Marked control rather than dropped: control rows are excluded from the
+        # repeat branch (what the gate wanted) and kept for the re-prompt branch,
+        # where the timing carries the meaning.
+        if len(norm) < 8:
+            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
+                         "norm": norm, "own": own_words(text), "control": True})
             continue
         # CONTROL WORDS ARE NOT REQUESTS. "continue" appeared six times in the
         # first run as a near-duplicate of itself across three days, which is
@@ -148,10 +261,10 @@ def main():
         # timing is what carries the meaning.
         if CONTROL.fullmatch(norm):
             msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
-                         "norm": norm, "control": True})
+                         "norm": norm, "own": own_words(text), "control": True})
             continue
         msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
-                     "norm": norm, "control": False})
+                     "norm": norm, "own": own_words(text), "control": False})
 
     findings = defaultdict(lambda: {"score": 0, "why": [], "msgs": []})
 
@@ -159,7 +272,7 @@ def main():
     real = [m for m in msgs if not m["control"]]
     for i, a in enumerate(real):
         for b in real[i + 1 :]:
-            sim = similarity(a["norm"], b["norm"])
+            sim, shared = ask_similarity(a["norm"], b["norm"])
             if sim >= 0.55:
                 gap_s = (b["ts"] - a["ts"]) / 1000
                 # UNDER A MINUTE IS NOT A HUMAN REPEATING THEMSELVES. Two
@@ -168,6 +281,24 @@ def main():
                 # frustration would send someone to read Ethan's tone when the
                 # bug is in send_dedup. Found on the first run: ids 30451/30452,
                 # identical, same second, consecutive ids.
+                # SAME SESSION OR IT IS NOT A REPEAT, AND THIS GUARD BELONGS
+                # TO BOTH BRANCHES. It used to live inside the sub-60s branch
+                # below, while the comment there claimed a cross-session pair
+                # "is skipped outright rather than falling through to the repeat
+                # branch below". It was not: only pairs that were ALSO under a
+                # minute and ALSO near-identical were skipped, and everything
+                # else fell through exactly as the comment said it would not.
+                #
+                # Live specimen, 2026-08-24 sweep: id 31240 to `random` and id
+                # 31973 to `tubescience`, both "whats the status?", 31.4h apart.
+                # Reported as `random` repeating itself with jaccard 1.00 — the
+                # top-scoring candidate of the run. Two different lanes each
+                # being asked for status is ordinary operation, and the finding
+                # cost a sweep slot and produced a verdict of "undecidable".
+                #
+                # Ethos rule 6: the promise was in the comment and not in the code.
+                if a["session"] != b["session"]:
+                    continue
                 if gap_s < 60 and sim > 0.98:
                     # SAME SESSION OR IT IS NOT A DELIVERY DEFECT. Measured
                     # 2026-08-23: ids 31157/31158 are the SAME text 12s apart to
@@ -179,8 +310,6 @@ def main():
                     # also NOT a `repeat` (he did not ask twice, he addressed two
                     # workers), so it is skipped outright rather than falling
                     # through to the repeat branch below.
-                    if a["session"] != b["session"]:
-                        continue
                     key = f"double-delivery:{a['id']}"
                     f = findings[key]
                     f["score"] = max(f["score"], 8)
@@ -208,7 +337,7 @@ def main():
         for i in range(1, len(group)):
             prev, cur = group[i - 1], group[i]
             gap_s = (cur["ts"] - prev["ts"]) / 1000
-            if gap_s <= 600 and REPROMPT.match(cur["norm"]) and len(cur["norm"]) < 60:
+            if gap_s <= 600 and is_reprompt(cur["norm"]) and len(cur["norm"]) < 60:
                 key = f"reprompt:{cur['id']}"
                 f = findings[key]
                 f["score"] = max(f["score"], 5)
@@ -218,8 +347,12 @@ def main():
     # 3. MARKERS — additive, never sufficient alone unless strong.
     for m in msgs:
         hits, sc = [], 0
+        # AF-255: markers score what ETHAN wrote, never what he pasted. The
+        # 2026-08-26 run scored a customer meeting transcript at 13 on
+        # "still/again/i-said/already/you-didnt/no-response" — every one of
+        # them spoken by a meeting participant.
         for pat, w, name in MARKERS:
-            if re.search(pat, m["norm"]):
+            if re.search(pat, m["own"]):
                 hits.append(name)
                 sc += w
         if not hits:

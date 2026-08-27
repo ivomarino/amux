@@ -56,6 +56,57 @@ test.describe('board card lineage tab', () => {
     const card = (await created.json()).id as string;
     expect(card, 'created card must have an id').toBeTruthy();
 
+    // CAPTURE THE PANEL'S OWN RESPONSE, rather than re-asking the endpoint
+    // afterwards (AMUX-3648).
+    //
+    // The assertions below are "the renderer rendered everything it was given".
+    // Re-fetching to build the expectation asks a DIFFERENT question — "does the
+    // DOM match what the endpoint says NOW" — and on a card created two seconds
+    // earlier those diverge, because the card is still settling. It failed
+    // exactly that way on 2026-08-24: the panel rendered 3 gaps and the later
+    // fetch reported 2, because `_amux_state_events` is a delta-sync journal
+    // whose row for the creation had not landed when the panel loaded, so the
+    // "no journal rows" gap was true then and false by the time the test asked.
+    //
+    // The listener must be armed BEFORE the navigation or the response is
+    // already past. Nothing here weakens the check: the payload compared is the
+    // exact bytes the renderer received, which is strictly closer to the claim
+    // than a second sample of a moving target.
+    //
+    // COLLECT ALL OF THEM AND TAKE THE LAST, rather than resolving on the first.
+    // `_bdRenderLineage` re-fetches on every open of the tab and renders
+    // whatever lands, guarded only by `_bdLineageFor !== id` — which drops a
+    // response for a DIFFERENT card and lets every same-card response through.
+    // So the DOM holds the last one to resolve, and first-match would be the
+    // wrong ordinal exactly when there is more than one, which is the case this
+    // race is made of.
+    //
+    // WHAT THIS SPEC CANNOT PROVE ABOUT ITS OWN FIX, measured 2026-08-24.
+    //
+    // Mutating the comparison back to a second `request.get` leaves this spec
+    // GREEN, 5 runs out of 5. A probe capturing both samples and diffing them
+    // reported DIVERGED=false every time, panel and later fetch each reading 2
+    // gaps and 3 empty sources. The window the 3-vs-2 failure came through does
+    // not open on this box today.
+    //
+    // So do not read a green run as evidence that this comparison is the right
+    // one, and do not read a surviving mutation as evidence the fix was
+    // pointless. The argument is structural rather than empirical: there is now
+    // exactly ONE sample of a moving target and it is the one the renderer
+    // consumed, so no timing can revive the class. Pre-fix code that is only
+    // SOMETIMES wrong cannot be made to go red on demand, which is the whole
+    // reason the window was closed by construction instead of narrowed.
+    //
+    // Also measured: exactly ONE /api/why response arrives per run, so the
+    // last-not-first ordinal below is currently unexercised. It stays because
+    // `_bdRenderLineage` re-fetches on every tab open and a second opener makes
+    // it load-bearing, not because anything here tests it.
+    const whyBodies: Promise<unknown>[] = [];
+    page.on('response', r => {
+      if (r.url().includes(`/api/why/task/${encodeURIComponent(card)}`) && r.status() === 200) {
+        whyBodies.push(r.json().catch(() => null));
+      }
+    });
     await page.goto(`/#issue=${encodeURIComponent(card)}:lineage`);
 
     // The deep link is half the feature: a tab reachable only by tapping cannot
@@ -74,12 +125,21 @@ test.describe('board card lineage tab', () => {
     // a plausible trail and never reaches the caveats has been misled by layout.
     await expect(panel.locator('.bd-lin-vlabel')).toHaveCount(1);
 
-    // Whatever the endpoint reports must survive into the DOM. Compare against
-    // the API rather than a fixture, so this fails if the renderer starts
-    // dropping things the endpoint still sends.
-    const why = await (await request.get(`/api/why/task/${encodeURIComponent(card)}`, { headers: auth })).json();
+    // Whatever the endpoint reported must survive into the DOM. Compared
+    // against the live payload captured above rather than a fixture, so this
+    // fails if the renderer starts dropping things the endpoint still sends.
+    // Resolved as LATE as possible, after the panel has stopped loading, so the
+    // array holds every response the render could have come from.
+    type WhyPayload = { gaps?: string[]; sources?: { rows: number }[] };
+    const bodies = (await Promise.all(whyBodies)).filter(Boolean) as WhyPayload[];
+    expect(
+      bodies.length,
+      'the panel must have fetched /api/why at least once, or there is nothing to compare against',
+    ).toBeGreaterThan(0);
+    const why = bodies[bodies.length - 1];
+
     const gaps: string[] = why.gaps ?? [];
-    const zero = (why.sources ?? []).filter((s: { rows: number }) => !s.rows);
+    const zero = (why.sources ?? []).filter(s => !s.rows);
 
     // THE SPEC MUST NOT PASS VACUOUSLY. `toHaveCount(0)` against an empty
     // payload is zero compared with zero — it holds just as well against a

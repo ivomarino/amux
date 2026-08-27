@@ -1227,13 +1227,35 @@ mod tests {
         // Email is a channel now (AMUX-3203), but the temp home has no connected
         // Gmail account and AMUX_OWNER_EMAIL is unset, so it reports why rather
         // than sending — push + sms are unchanged.
+        // THE FAILURE MESSAGE MUST NAME THE HOME IT ACTUALLY READ (AMUX-3719).
+        //
+        // Observed failing once in 4 full-suite runs on 2026-08-25 with
+        // `email: "email via ethan@example.com -> pinned@example.com
+        // [AMUX_OWNER_EMAIL]"` — a value that can only come from ANOTHER test's
+        // fixture home (a_pinned_owner_email_is_used_and_reported_as_pinned
+        // writes that pin into its own tempdir). Not reproducible: passes alone,
+        // passes as a module, passed three consecutive full runs afterwards.
+        //
+        // The mechanism could not be determined from the failure output, because
+        // the assertion printed the rendered channels and nothing about WHICH
+        // home produced them — so the one datum that separates "the guard leaked"
+        // from "this test resolved a different home" was absent from the only
+        // artifact the flake leaves behind. That missing datum is the bug worth
+        // fixing here (ethos rule 4); the cause is still open on AMUX-3719.
         assert_eq!(
             v["channels"],
             json!({
                 "push": "sent",
                 "sms": "imessage",
                 "email": "no AMUX_OWNER_EMAIL and no connected Gmail account",
-            })
+            }),
+            "fixture home = {:?}\nAMUX_HOME  = {:?}\nresolved   = {:?}\n\
+             If `resolved` is not `fixture home`, this is the AMUX-3719 cross-test \
+             home leak and NOT a defect in the alert path — report the three paths \
+             above on that card rather than re-deriving them.",
+            dir.path(),
+            std::env::var("AMUX_HOME").ok(),
+            crate::config::amux_home(),
         );
         assert_eq!(v["message"], json!("prod is down\n(deploy failed)"));
         assert_eq!(v["origin"], json!("sender-a"));

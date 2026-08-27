@@ -52,6 +52,157 @@ use serde_json::{json, Value};
 use super::AppState;
 use crate::provider::claude::{probe_usage_raw, UsageProbe};
 
+// ---------------------------------------------------------------------------
+// BACKGROUND RESERVE (AMUX-3545) — a share of the plan window background work
+// may not consume.
+// ---------------------------------------------------------------------------
+
+/// The share of the plan window reserved for the human, as a percent.
+///
+/// Ethan's call, 2026-08-25: **30**. Background work pauses once the session
+/// window is 70% used, so roughly a third of every window is still there when he
+/// sits down.
+///
+/// The measurement behind the question: in the 5-hour window that day, 2,270
+/// turns and 82.1% background — 1,059 peer-message turns, 552 schedule, 50
+/// pickup, against 505 of his own. A person on a $20 plan typing 2-3 prompts was
+/// competing with all of that inside the window their plan meters.
+///
+/// A PREF, NOT A CONSTANT. D4 is this repo's record of what a compiled-in
+/// context policy costs: it becomes the ceiling silently. `0` disables the
+/// reserve entirely, which is the honest off switch.
+pub fn background_reserve_pct() -> i64 {
+    std::env::var("AMUX_BACKGROUND_RESERVE_PCT")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|n| (0..=95).contains(n))
+        .unwrap_or(30)
+}
+
+/// Should background work pause right now?
+///
+/// PURE, so the decision is testable without a plan window — and so the one
+/// property that matters can be pinned: **it fails OPEN.**
+///
+/// `window_pct == None` means the reading is missing or stale, and the answer is
+/// then "do not pause". Pausing on an unknown would stop every schedule and
+/// every pickup across the fleet the moment the usage probe rate-limits or the
+/// OAuth token expires — turning a credit guard into a fleet outage triggered by
+/// a third party. Under-protecting for one window is recoverable; the inverse is
+/// not, and it would be blamed on anything but the probe.
+pub fn background_should_pause(window_pct: Option<i64>, reserve_pct: i64) -> bool {
+    if reserve_pct <= 0 {
+        return false;
+    }
+    match window_pct {
+        Some(p) => p >= 100 - reserve_pct,
+        None => false,
+    }
+}
+
+/// Last observed session-window utilisation, and when it was observed.
+///
+/// Written by `get_usage` as a side effect of serving a request, so on a box
+/// with an open dashboard this stays fresh for free. `window_pct_fresh` is the
+/// only reader and it enforces the age bound, because a percentage from an hour
+/// ago is not a reading of the current window.
+static WINDOW_PCT: std::sync::Mutex<Option<(Instant, i64)>> = std::sync::Mutex::new(None);
+
+/// Record a fresh session-window reading. Idempotent, cheap, never fails.
+pub fn note_window_pct(pct: i64) {
+    if let Ok(mut g) = WINDOW_PCT.lock() {
+        *g = Some((Instant::now(), pct));
+    }
+}
+
+/// The reading, if it is younger than `max_age`. `None` is a real answer and
+/// the caller must treat it as "unknown", never as zero.
+pub fn window_pct_fresh(max_age: Duration) -> Option<i64> {
+    let g = WINDOW_PCT.lock().ok()?;
+    let (at, pct) = (*g)?;
+    (at.elapsed() < max_age).then_some(pct)
+}
+
+/// How stale a window reading may be and still bound a decision.
+///
+/// A 5-hour window moves slowly, but a percentage from an hour ago is not a
+/// reading of the CURRENT one. Deliberately longer than the probe TTL so a
+/// dashboard that is merely idle does not tip the fleet into fail-open.
+const RESERVE_MAX_AGE: Duration = Duration::from_secs(600);
+
+/// Minimum gap between reserve-driven probes, so the background consumers
+/// cannot amplify a rate limit by asking harder when the answer is missing —
+/// the failure the usage cache's own comment already records for the HTTP path.
+const RESERVE_PROBE_EVERY: Duration = Duration::from_secs(120);
+
+static LAST_RESERVE_PROBE: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+
+/// Should background work pause right now, probing at most once per
+/// [`RESERVE_PROBE_EVERY`] if no fresh reading is on hand (AMUX-3545).
+///
+/// THE CONSUMER REFRESHES WHAT IT CONSUMES. `get_usage` notes a reading as a
+/// side effect of serving the dashboard, which keeps this free on a box someone
+/// is looking at; a headless box has nobody polling, and a reserve that silently
+/// never engages there would be the ethos-1 failure — capability that exists and
+/// reaches nobody. So the schedulers top it up themselves, rate-limited.
+///
+/// Fails OPEN at every step: no reading, a failed probe, a probe we declined to
+/// make because one was recent — all of them mean "do not pause".
+pub async fn background_should_pause_now() -> bool {
+    let reserve = background_reserve_pct();
+    if reserve <= 0 {
+        return false;
+    }
+    if let Some(p) = window_pct_fresh(RESERVE_MAX_AGE) {
+        return background_should_pause(Some(p), reserve);
+    }
+    // No fresh reading. Probe, but only if we have not just tried.
+    {
+        let mut g = match LAST_RESERVE_PROBE.lock() {
+            Ok(g) => g,
+            Err(_) => return false,
+        };
+        if let Some(at) = *g {
+            if at.elapsed() < RESERVE_PROBE_EVERY {
+                return false;
+            }
+        }
+        *g = Some(Instant::now());
+    }
+    let probe = crate::provider::claude::probe_usage_raw().await;
+    if let UsageProbe::Ok(body) = probe {
+        if let Some(pct) = session_pct_of(&shape_probe(UsageProbe::Ok(body))) {
+            note_window_pct(pct);
+            return background_should_pause(Some(pct), reserve);
+        }
+    }
+    false
+}
+
+/// The sentence a paused consumer prints, so a skipped fire is never silent.
+pub fn reserve_pause_note(kind: &str) -> String {
+    let reserve = background_reserve_pct();
+    let pct = window_pct_fresh(RESERVE_MAX_AGE).unwrap_or(-1);
+    format!(
+        "{kind} PAUSED: the plan window is {pct}% used and {reserve}% is reserved for the human \
+         (AMUX_BACKGROUND_RESERVE_PCT). Background work stops here so a prompt you type still \
+          has room; direct sends are never gated. Set the pref to 0 to disable the reserve."
+    )
+}
+
+/// Pull the `session` window's percent out of a shaped usage body.
+///
+/// The `limits` array is the shape `/api/usage` already returns; `kind` is the
+/// discriminator and `session` is the 5-hour window the plan meters.
+pub fn session_pct_of(body: &Value) -> Option<i64> {
+    body.get("limits")?
+        .as_array()?
+        .iter()
+        .find(|l| l.get("kind").and_then(Value::as_str) == Some("session"))
+        .and_then(|l| l.get("percent"))
+        .and_then(Value::as_i64)
+}
+
 /// Default cache TTL. Python used 30s; this defaults to 60 because the probe
 /// is a NETWORK call made on a settings render, and the endpoint is
 /// rate-limited per account — on a host running a fleet of Claude Code
@@ -396,6 +547,11 @@ fn trigger_label(t: &str) -> &'static str {
         "user" => "you typed it",
         "schedule" => "a schedule fired",
         "session" => "a peer lane messaged",
+        // AMUX-3547. Its own cell because "did amux hand me this, or did I ask
+        // for it?" is the question this whole view exists to answer, and until
+        // board_drive::record_prompt shipped, pickup turns had no row and were
+        // credited to whatever prompt preceded them — including the human's.
+        "pickup" => "amux handed this lane a board card",
         "system" => "an amux nudge",
         "direct" | "steering" => "a steering message",
         "" => "no prompt matched — the turn predates this lane's history",
@@ -452,6 +608,43 @@ fn stmt_top(conn: &rusqlite::Connection, cutoff: i64) -> anyhow::Result<Vec<Valu
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-3545: the reserve decision, and the property that matters most is
+    /// that it FAILS OPEN.
+    ///
+    /// Ethan's call, 2026-08-25: 30%, so background pauses at 70% window use.
+    /// The measurement behind the question, from the 5h window that day: 2,270
+    /// turns, 82.1% background — 1,059 peer-message, 552 schedule, 50 pickup,
+    /// against 505 of his own.
+    #[test]
+    fn the_reserve_pauses_at_the_threshold_and_fails_open_on_an_unknown() {
+        // Ethan's 30: pause at 70 and above, run below it.
+        assert!(!super::background_should_pause(Some(69), 30));
+        assert!(super::background_should_pause(Some(70), 30), "the boundary is inclusive");
+        assert!(super::background_should_pause(Some(99), 30));
+
+        // THE CELL THAT MATTERS. An unknown reading must NOT pause. The usage
+        // probe is a network call to a third party; if a rate limit or an
+        // expired token made `None` mean "pause", every schedule and every
+        // pickup across the fleet would stop, and the outage would be blamed on
+        // anything but the probe. Under-protecting for one window is
+        // recoverable; that is not.
+        assert!(
+            !super::background_should_pause(None, 30),
+            "an unknown window must never pause background work"
+        );
+
+        // 0 is the honest off switch, and it must beat even a maxed window —
+        // otherwise "disabled" would still gate at 100%.
+        assert!(!super::background_should_pause(Some(100), 0));
+        assert!(!super::background_should_pause(None, 0));
+
+        // A larger reserve bites earlier; a smaller one later. Pinned so the
+        // arithmetic cannot invert without a red test — the direction is the
+        // whole meaning of the number.
+        assert!(super::background_should_pause(Some(51), 50), "50% reserve pauses at 50");
+        assert!(!super::background_should_pause(Some(51), 20), "20% reserve does not");
+    }
+
     use super::*;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
@@ -484,6 +677,11 @@ mod tests {
             // Three prompts into one lane: a human, a schedule, a peer.
                 for (t, origin, at) in [
                     ("user", "", now - 300),
+                    // AMUX-3547: a pickup lands right after the human's prompt.
+                    // Before board_drive::record_prompt existed this row was
+                    // never written, so the turn below was matched to the
+                    // HUMAN's row and counted as foreground.
+                    ("pickup", "board-drive", now - 250),
                     ("schedule", "poll the inbox", now - 200),
                     ("session", "peer-lane", now - 100),
                 ] {
@@ -495,6 +693,7 @@ mod tests {
                 // A turn after each prompt, plus one far outside the window.
                 for (at, cost) in [
                     (now - 290, 1.0),
+                    (now - 240, 7.0), // the pickup's turn
                     (now - 190, 5.0),
                     (now - 90, 20.0),
                     (now - 86_400 * 30, 999.0),
@@ -542,15 +741,51 @@ mod tests {
         assert_eq!(by.get("schedule"), Some(&5.0), "the schedule's turn: {v}");
         assert_eq!(by.get("session"), Some(&20.0), "the peer's turn: {v}");
 
+        // AMUX-3547. A PICKUP IS ITS OWN BUCKET AND IT IS BACKGROUND.
+        //
+        // Measured on the live fleet before the fix: 247 auto-pickup deliveries
+        // in `steering_history` over 24h and TWO in `cmd_history`. Pickup went
+        // through `steer_enqueue`, which writes the steering tables; only the
+        // send path wrote `cmd_history`. So a pickup's turns were matched to
+        // whatever prompt preceded them — here the human's — and counted as
+        // FOREGROUND.
+        //
+        // The bias ran toward under-reporting background, which is the one
+        // direction that matters: AMUX-3542 is a customer whose plan window was
+        // eaten by background work, and the instrument built to prove it was
+        // crediting some of that work to their own typing.
+        assert_eq!(by.get("pickup"), Some(&7.0), "the pickup's turn is its own bucket: {v}");
+        let pickup_row = v["by_source"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["source"] == "pickup")
+            .expect("pickup row");
+        assert_eq!(
+            pickup_row["is_background"],
+            json!(true),
+            "amux handing a lane a card is not the human typing: {pickup_row}"
+        );
+        assert!(
+            pickup_row["label"].as_str().unwrap().contains("amux handed"),
+            "the label is read by someone wondering where their credits went: {pickup_row}"
+        );
+        assert_eq!(
+            by.get("user"),
+            Some(&1.0),
+            "AND THE HUMAN'S BUCKET MUST NOT HAVE ABSORBED IT — 8.0 here is the pre-fix \
+             behaviour, and it is the whole defect: {v}"
+        );
+
         // 2. Background share is the headline the complaint was about.
-        assert_eq!(v["total_cost_usd"], json!(26.0));
-        assert_eq!(v["background_cost_usd"], json!(25.0));
-        assert_eq!(v["background_pct"], json!(96.2));
+        assert_eq!(v["total_cost_usd"], json!(33.0));
+        assert_eq!(v["background_cost_usd"], json!(32.0));
+        assert_eq!(v["background_pct"], json!(97.0));
 
         // 3. THE CONTROL. The 30-day-old row must be OUTSIDE a 1-hour window.
         //    If this is 0 the join matched everything and every number above is
         //    the whole table wearing a window's label.
-        assert_eq!(v["rows_considered"], json!(3));
+        assert_eq!(v["rows_considered"], json!(4));
         assert!(
             v["rows_excluded_by_window"].as_i64().unwrap() >= 1,
             "the window excluded nothing — an unbounded match returns a confident wrong \

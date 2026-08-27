@@ -1967,6 +1967,17 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         Creates a git worktree with its own working directory and branch. The worker works on an isolated copy &mdash; changes are merged back when done.
       </div>
     </div>
+    <div class="field-group">
+      <label class="field-label" style="display:flex;align-items:center;gap:6px;cursor:pointer;">
+        <input type="checkbox" id="create-isolated" onchange="_toggleIsolated(this.checked)" style="width:auto;margin:0;">
+        Isolated <span class="field-optional">(no amux harness &mdash; runs alone)</span>
+      </label>
+      <div id="create-isolated-info" style="display:none;margin-top:6px;font-size:0.78rem;color:var(--dim);background:rgba(240,136,62,0.08);border-radius:6px;padding:8px 10px;line-height:1.5;">
+        No auto-pickup, no board nudges, no MCP tools, and peers cannot discover or message it.
+        You can still peek and send to it yourself. Set at creation because an isolated worker must
+        start that way &mdash; a worker isolated later has already launched with the harness attached.
+      </div>
+    </div>
     <div class="edit-actions">
       <button class="btn" onclick="closeCreate()">Cancel</button>
       <button class="btn primary" onclick="submitCreate()">Create</button>

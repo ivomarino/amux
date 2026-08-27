@@ -58,6 +58,94 @@ fn is_invocation(line: &str, at: usize) -> bool {
     }
 }
 
+/// Does this ONE line carry a curl that could hang? Split out of the scan so
+/// the rule can be exercised on synthetic lines.
+///
+/// It has to be, because `amux` is a SYMLINK into the working tree and a SAVE
+/// there is a fleet-wide deploy (AF-237). Mutating the real CLI to check that
+/// this guard still discriminates would mean shipping a deliberately-broken CLI
+/// to 52 lanes for as long as the test takes to run. So the file scan below
+/// stays a thin loop, and the judgment lives here where a test can feed it
+/// whatever it likes.
+fn line_offends(raw: &str) -> bool {
+    let trimmed = raw.trim_start();
+    // Comments are prose ABOUT curl. There is a lot of it in this file and it
+    // is history, not traffic — guarding it would make the guard noise.
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    // Lines that PRINT a recipe (`echo "  curl -sk ..."`) are documentation
+    // handed to a human, not a call this CLI makes.
+    if trimmed.starts_with("echo ") || trimmed.starts_with("printf ") || trimmed.starts_with("die ")
+    {
+        return false;
+    }
+    for (at, _) in raw.match_indices("curl ") {
+        if !is_invocation(raw, at) {
+            continue;
+        }
+        // PROSE AFTER A SHELL OPERATOR IS STILL PROSE (AMUX-3761's by-catch).
+        // The exemption above is anchored on line-START, but the idiom in this
+        // CLI is `<check> || die "... (curl exit $rc) ..."`, where `die` follows
+        // `||` and the word `curl` sits inside its MESSAGE. `is_invocation`
+        // already knows a curl token can follow a shell operator; the prose test
+        // did not get the same treatment, so it fired on an error string while
+        // the real call two lines above went correctly through `_curl`.
+        //
+        // This mattered more than a red test: the natural way to make a false
+        // positive go away is to reword the message, and this guard's whole
+        // reason for existing is that AEAB-36's connect failures were
+        // unreadable. A check that pressures people into vaguer error text is
+        // working against its own purpose.
+        //
+        // Scoped to text BEFORE the token on purpose. `curl ... || die "x"` has
+        // `die` on the line and is a REAL invocation, so looking at the whole
+        // line here would exempt exactly the thing the guard is for.
+        if raw[..at].contains("die ")
+            || raw[..at].contains("echo ")
+            || raw[..at].contains("printf ")
+        {
+            continue;
+        }
+        // `command curl` is the sanctioned escape from the wrapper (the wrapper
+        // itself, and the breadcrumb flush, which must not breadcrumb its own
+        // failure). It pays the flag explicitly.
+        if raw.contains("--connect-timeout") {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+/// The guard's own controls. A widened exemption is the moment to ask whether
+/// the check can still fail, and this one was widened to stop it firing on an
+/// error message.
+#[test]
+fn the_guard_still_catches_a_real_hang_and_leaves_prose_alone() {
+    // MUST FIRE.
+    for line in [
+        r#"  resp=$(curl -sk "$api/api/board")"#,
+        r#"  if curl -sk "$api/health" >/dev/null; then"#,
+        // The direction the new exemption must NOT swallow: a real call whose
+        // failure handler happens to mention curl.
+        r#"  curl -sk "$api/x" || die "cannot reach the server (curl exit $rc)""#,
+    ] {
+        assert!(line_offends(line), "a curl that can hang must be caught: {line}");
+    }
+    // MUST NOT FIRE.
+    for line in [
+        r#"  resp=$(_curl -sk "$api/api/board")"#,
+        r#"  command curl --connect-timeout 3 -sk "$api/health""#,
+        r#"# curl -sk $AMUX_URL/api/board is the raw form"#,
+        r#"  echo "  curl -sk $AMUX_URL/api/board""#,
+        // The AMUX-3761 specimen, verbatim in shape.
+        r#"  [[ "$rc" -eq 0 ]] || die "cannot reach the amux server at $api (curl exit $rc) — NOTHING was changed""#,
+    ] {
+        assert!(!line_offends(line), "prose and wrapped calls must be left alone: {line}");
+    }
+}
+
 #[test]
 fn every_curl_in_the_bash_cli_cannot_hang_on_connect() {
     let path = repo_root().join("amux");
@@ -67,35 +155,11 @@ fn every_curl_in_the_bash_cli_cannot_hang_on_connect() {
     let mut wrapper_calls = 0usize;
 
     for (i, raw) in src.lines().enumerate() {
-        let lineno = i + 1;
-        let trimmed = raw.trim_start();
-        // Comments are prose ABOUT curl. There is a lot of it in this file and
-        // it is history, not traffic — guarding it would make the guard noise.
-        if trimmed.starts_with('#') {
-            continue;
-        }
-        // Lines that PRINT a recipe (`echo "  curl -sk ..."`) are documentation
-        // handed to a human, not a call this CLI makes.
-        if trimmed.starts_with("echo ")
-            || trimmed.starts_with("printf ")
-            || trimmed.starts_with("die ")
-        {
-            continue;
-        }
         if raw.contains("_curl ") {
             wrapper_calls += 1;
         }
-        for (at, _) in raw.match_indices("curl ") {
-            if !is_invocation(raw, at) {
-                continue;
-            }
-            // `command curl` is the sanctioned escape from the wrapper (the
-            // wrapper itself, and the breadcrumb flush, which must not
-            // breadcrumb its own failure). It pays the flag explicitly.
-            if raw.contains("--connect-timeout") {
-                continue;
-            }
-            offenders.push((lineno, raw.trim().to_string()));
+        if line_offends(raw) {
+            offenders.push((i + 1, raw.trim().to_string()));
         }
     }
 

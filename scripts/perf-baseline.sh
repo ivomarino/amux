@@ -111,13 +111,33 @@ avg() { echo "$1" | sed 's/.*_avg_ms": \([0-9]*\).*/\1/'; }
 [ "$(avg "$M2")" -lt 50 ] || { echo "FAIL: health >= 50ms"; fail=1; }
 [ "$(avg "$M3")" -lt 200 ] || { echo "FAIL: board >= 200ms"; fail=1; }
 [ "$RSS_MB" -lt "$RSS_MAX_MB" ] || { echo "FAIL: RSS ${RSS_MB}MB >= ${RSS_MAX_MB}MB (ceiling: PERF_RSS_MAX_MB, provenance above)"; fail=1; }
-# The LEAK detector (AMUX-3488): dirty is live heap, so unlike RSS it does
-# not inherit allocator weather — measured 30-45MB today on both a fresh
-# boot and after the battery. 250 is deliberately generous until the first
-# CI (Linux) reading lands; tighten it then. Skipped, loudly, when the
-# platform gave no reading — an absent number is not a passing one.
+# The LEAK detector (AMUX-3488): dirty is live heap, so on macOS it does not
+# inherit allocator weather — measured 30-45MB there against an RSS of 220+.
+# 250 was "deliberately generous until the first CI (Linux) reading lands;
+# tighten it then".
+#
+# THE READINGS LANDED AND SAID SOMETHING ELSE (AMUX-3790). Linux reads
+# Private_Dirty from smaps_rollup, which counts EVERY private dirty page —
+# heap, stack, .data/.bss, COW — not just malloc arenas. Across the five
+# nightly runs that produced a number: dirty 254/268/224/239/227 against rss
+# 257/270/226/241/229. Dirty is rss minus 2-3MB every time, ratio 0.987-0.993.
+# So on Linux this gate is NOT independent of RSS, it is RSS, and it inherits
+# the ±28% shared-runner noise that RSS's own ceiling is set at 350 to escape.
+# It passed three nights and failed the next two on the same code shape.
+#
+# The default stays 250 because on macOS the premise holds and 250 is still
+# generous there. CI pins PERF_DIRTY_MAX_MB=350 to match its RSS ceiling.
+# Skipped, loudly, when the platform gave no reading — an absent number is not
+# a passing one.
 DIRTY_MAX_MB="${PERF_DIRTY_MAX_MB:-250}"
 if [ -n "$DIRTY_MB" ]; then
+  # SAY IT WHEN THE TWO METRICS HAVE COLLAPSED INTO ONE. A reader who sees
+  # dirty and RSS both reported assumes two independent witnesses; when they
+  # agree to within a few percent there is only one, and a leak verdict drawn
+  # from "both agree" is drawn from a single measurement counted twice.
+  if [ "${RSS_MB:-0}" -gt 0 ] && [ $(( DIRTY_MB * 100 / RSS_MB )) -ge 95 ]; then
+    echo "NOTE: dirty ${DIRTY_MB}MB is $(( DIRTY_MB * 100 / RSS_MB ))% of RSS ${RSS_MB}MB — on this platform the dirty gate is NOT independent of the RSS gate (AMUX-3790); treat them as ONE measurement, not two agreeing ones"
+  fi
   [ "$DIRTY_MB" -lt "$DIRTY_MAX_MB" ] || { echo "FAIL: dirty (live) heap ${DIRTY_MB}MB >= ${DIRTY_MAX_MB}MB — unlike RSS this is NOT allocator weather; suspect a real leak or a new resident cache"; fail=1; }
 else
   echo "NOTE: dirty heap unmeasurable on this platform — the leak gate did not run"

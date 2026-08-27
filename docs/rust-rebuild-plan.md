@@ -5138,12 +5138,47 @@ week at the end. Phases 6-7 are the integration long tail (parallelizable, saves
 ### Semantic invariant IDs
 
 Every invariant has a stable semantic ID (`INV-xxx`) in addition to its number.
-The semantic ID is:
+
+> **STATUS, corrected 2026-08-24 (AMUX-3598). This section used to describe the
+> tagging and both CI directions in the present tense, as if they existed. They
+> did not, and there was not ONE tag anywhere outside this file.**
+>
+> That is ethos rule 6 at its most expensive: an enforcement mechanism that is
+> claimed and not implemented is worse than an absent one, because it gets
+> trusted. A reader of this section reasonably concluded that the 53 invariants
+> below were covered by tests. Nothing was.
+>
+> What is true today:
+>
+> - **Direction 2 IS enforced**, by `crates/amux-server/tests/inv_tags.rs`: an
+>   `INV-xxx` tag anywhere in `crates/`, `scripts/` or `e2e/` that does not name
+>   an invariant in the table below fails the build. It is green today because
+>   there are no tags, so the test also asserts it actually walked the tree
+>   (>200 files) — with an empty tag set, "clean" and "did not look" are
+>   otherwise the same green.
+> - **Direction 1 is NOT enforced**, deliberately. "Every invariant has a tagged
+>   test" against zero tags is an empty set compared with an empty set: it would
+>   pass, and it would certify a codebase with no coverage at all. The test
+>   PRINTS the coverage count instead (`0 of 53` as of this note — 53, not 54: a shell `grep -o 'INV-[A-Z0-9-]*'`
+>   counts the bare `INV-xxx` placeholder in this section's prose as a 54th id,
+>   and the test's parser correctly does not) rather than
+>   asserting on it.
+> - **Nothing is tagged, and that is a finding rather than a gap to fill
+>   quickly.** This is a REDESIGN document. Most invariants here describe a
+>   system that does not exist: invariant 7 specifies `Done != Verified` as a
+>   `Verification { verifier, criteria, evidence, result }` record, while today's
+>   board has a status string with gates. Tagging a current test with invariant
+>   7's ID would claim a test proves an invariant of an unbuilt design, which
+>   manufactures exactly the false coverage this correction is about.
+>
+> So the tagging below becomes real as the redesign lands, invariant by
+> invariant, and direction 1 becomes enforceable (as a ratchet on the count) once
+> the number is non-zero. Do not tag an invariant whose design is not built.
+
+When an invariant IS implemented, its semantic ID is:
 - Tagged in code: `// INV-BOARD-SOT` in the implementation
 - Tagged in tests: `#[test] fn inv_board_sot_...`
-- CI-enforced bidirectionally:
-  1. No invariant in this document without at least one test tagged with its ID
-  2. No `INV-xxx` tag in code/tests without a matching invariant in this document
+- Checked by `tests/inv_tags.rs` (direction 2 today; direction 1 when non-zero)
 
 | Number | Semantic ID | Short name |
 |--------|-------------|------------|

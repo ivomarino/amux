@@ -1,5 +1,95 @@
 [
   {
+    "hash": "0ae647b1",
+    "short": "0ae647b",
+    "title": "Real-time backbone health is now visible in the dashboard",
+    "date": "2026-08-27",
+    "type": "feat",
+    "tags": ["dashboard", "observability"],
+    "description": "The SSE realtime backbone now publishes a joined health signal — server-side connection count meets the client-side reconnect beacon count. The dashboard can now show whether your fleet is truly live-connected or silently polling. A near-zero stale reconnect count shortly after a deploy is expected (ramp-up); the live connections metric is the discriminator. Check GET /api/debug/sse for the full breakdown."
+  },
+  {
+    "hash": "7f197c13",
+    "short": "7f197c1",
+    "title": "Every fleet gh call now uses your GitHub App token automatically",
+    "date": "2026-08-27",
+    "type": "feat",
+    "tags": ["github", "fleet"],
+    "description": "A token shim now sits in front of every `gh` CLI call made by an agent in the fleet. When a GitHub App is configured in amux, its installation token is injected automatically — no per-session credential setup, no agent-by-agent authentication. Teams using GitHub Apps for CI, PR creation, or repository access get fleet-wide coverage without touching each worker's environment."
+  },
+  {
+    "hash": "b1f5a478",
+    "short": "b1f5a47",
+    "title": "Board pickup scoring now weights by task age — older tasks surface first",
+    "date": "2026-08-26",
+    "type": "feat",
+    "tags": ["board", "fleet"],
+    "description": "The board drive previously picked up todo items in pos-LIFO order, which meant tasks added early could be buried under newer ones indefinitely. Age-weighted pickup scoring now blends position with how long a card has been waiting. Tasks that have sat in todo for hours or days score higher and get claimed sooner, keeping the backlog moving rather than stacking."
+  },
+  {
+    "hash": "bfd8d78c",
+    "short": "bfd8d78",
+    "title": "Duplicate / clone any live session",
+    "date": "2026-08-26",
+    "type": "feat",
+    "tags": ["sessions", "fleet"],
+    "description": "Any running session can now be duplicated with one API call (POST /api/sessions/<name>/clone) or via the dashboard 'Duplicate' button. The twin is registered alongside the original, inherits its project config and board association, and is immediately ready to receive messages. Use it to run parallel prompt experiments, split a long task across two agents, or A/B test two implementation approaches simultaneously without re-queuing from scratch."
+  },
+  {
+    "hash": "f4092ab9",
+    "short": "f4092ab",
+    "title": "Archived cards collapse into a drawer on the board",
+    "date": "2026-08-26",
+    "type": "feat",
+    "tags": ["board", "ux"],
+    "description": "The board's Archived section now folds behind a collapsible 'Archived (N)' header by default. On boards with dozens of completed cards, this keeps the active columns scannable without discarding history. Click the header to expand it when you need to review or restore an archived card."
+  },
+  {
+    "hash": "05df543e",
+    "short": "05df543",
+    "title": "Discard a held email draft and dismiss the approvals banner",
+    "date": "2026-08-26",
+    "type": "feat",
+    "tags": ["email", "ux"],
+    "description": "The email composition flow now includes a Discard button for held drafts and a way to collapse the approvals banner once you've decided not to send. Previously, a draft that was no longer relevant stayed in the approval queue with no way to remove it short of sending it or leaving it indefinitely. The banner now auto-collapses after a discard."
+  },
+  {
+    "hash": "03f3d8d3",
+    "short": "03f3d8d",
+    "title": "amux reserves 30% of the plan window for the human operator",
+    "date": "2026-08-26",
+    "type": "feat",
+    "tags": ["usage", "reliability"],
+    "description": "Under heavy overnight fleet load, the agent pool could consume the full API plan window, leaving no budget for the human operator's own interactive sessions the next morning. amux now reserves 30% of the plan window for human use and constrains agent activity to the remaining 70%. If the fleet reaches the ceiling it queues new work rather than continuing to consume — the reservation is enforced, not advisory."
+  },
+  {
+    "hash": "5e647edd",
+    "short": "5e647ed",
+    "title": "Send to a specific worker by its ID",
+    "date": "2026-08-25",
+    "type": "feat",
+    "tags": ["workers", "api"],
+    "description": "The worker-send route is now canonical: POST /api/sessions/<worker-name>/send is a stable, documented endpoint that external systems can address directly. Previously the send path had to be discovered from the session listing on each call. This change makes it practical to wire GitHub Actions, webhooks, and other external triggers to a named worker by ID, since the URL is now stable across restarts and server updates."
+  },
+  {
+    "hash": "9b27e1c1",
+    "short": "9b27e1c",
+    "title": "Schedules show estimated turns per day at creation and on edit",
+    "date": "2026-08-25",
+    "type": "feat",
+    "tags": ["schedules", "ux"],
+    "description": "When you create or edit a recurring schedule, amux now calculates and displays the estimated agent turns per day that schedule will consume based on its cadence. A schedule running every hour shows 24 turns/day; one running every weekday at 9am shows 5. This lets you forecast token spend before committing to a schedule, rather than discovering cost only after the first week of runs."
+  },
+  {
+    "hash": "84d0bd03",
+    "short": "84d0bd0",
+    "title": "Messages hold during rate limits instead of being dropped",
+    "date": "2026-08-25",
+    "type": "feat",
+    "tags": ["reliability", "steering"],
+    "description": "When a message is sent to a session that is currently rate-limited — either by API quota or by Claude Code's own rate limit — amux now holds the message in a delivery queue and delivers it as soon as the limit is released. Previously the message was silently dropped, with no indication to the sender that it had not been received. This affects agent-to-agent pipelines and external API callers who cannot predict whether a target worker is rate-limited at send time."
+  },
+  {
     "hash": "1ad1e7744d9bebaefd6dd0e568bea886cfb8081b",
     "short": "1ad1e77",
     "title": "Board tasks now record when they closed",

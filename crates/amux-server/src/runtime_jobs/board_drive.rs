@@ -87,12 +87,28 @@ use amux_core::board::TaskStatus;
 /// cooldowns above, not by the tick, so the tick can be honest about latency.
 pub const BOARD_DRIVE_TICK_SECS: u64 = 60;
 
+/// Local alias for the steering guard these deliveries carry. The string
+/// lives once, in session_verbs, because that is where it is READ.
+use crate::api::session_verbs::BOARD_DRIVE_GUARD as GUARD;
+
 /// py:12961 `_ADVANCE_COOLDOWN` — never push the same lane twice inside this.
 const ADVANCE_COOLDOWN_S: f64 = 15.0 * 60.0;
 /// py:12855 `_DECOMPOSE_NUDGE_COOLDOWN`.
 const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
 /// py:14514 freshness gate — never auto-run a card nobody has touched in 7 days.
-const PICKUP_FRESHNESS_S: i64 = 7 * 86400;
+/// Default; overridable via `AMUX_PICKUP_FRESHNESS_S` (AMUX-3779). With pickup
+/// scoring on, age SURFACES old cards before they reach this edge, so the gate
+/// is a backstop for a genuinely-overwhelmed lane, not the thing that hides a
+/// starved card — and when it does exclude a todo, `select_pickup` now says so
+/// in the trace instead of the card silently vanishing from auto-pickup.
+const PICKUP_FRESHNESS_S_DEFAULT: i64 = 7 * 86400;
+fn pickup_freshness_s() -> i64 {
+    std::env::var("AMUX_PICKUP_FRESHNESS_S")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(PICKUP_FRESHNESS_S_DEFAULT)
+}
 /// Per-card re-claim cooldown (py:14515 / AMUX-1857), now a knob and much
 /// SHORTER (AMUX-2987). It exempts a card from re-pickup for this long after it
 /// was last claimed — so a card that was dispatched, returned to `todo`, and is
@@ -326,6 +342,22 @@ pub trait Fleet: Send + Sync {
     fn auto_continue_enabled(&self, lane: &str) -> bool;
     /// Hand text to the lane. Durable queue + the existing delivery loop.
     async fn deliver(&self, lane: &str, text: &str);
+
+    /// Deliver a message whose text ASSERTS SOMETHING ABOUT A CARD (AMUX-3659).
+    ///
+    /// Same delivery, plus the card and the `issues.rev` the text was computed
+    /// against, so the delivery loop can drop the row if the card moved on
+    /// before the turn boundary arrived. Measured: 32% of steering is read more
+    /// than a minute after its premise was computed, and on MR-2 that turned a
+    /// correct trigger plus a correctly-applied remedy into what looked like a
+    /// broken re-nag.
+    ///
+    /// DEFAULTED to plain `deliver` so a Fleet that does not care — every test
+    /// fake — is unaffected, and so adding this could not silently change the
+    /// behaviour of any existing caller.
+    async fn deliver_about(&self, lane: &str, text: &str, _card: &str, _rev: i64) {
+        self.deliver(lane, text).await;
+    }
 }
 
 /// The live fleet: session envs on disk, `session_verbs`' liveness and boundary
@@ -336,7 +368,28 @@ pub struct LiveFleet {
 
 impl Fleet for LiveFleet {
     fn lanes(&self) -> Vec<String> {
+        // ISOLATED LANES ARE NOT DRIVEN (Ethan, 2026-08-26: "we have an isolated
+        // worker but it still has amux shit", naming gtm-research, which had
+        // CC_ISOLATED=1 and was being auto-picked-up and nudged).
+        //
+        // FILTERED HERE, at the ONLY consumer of `lanes()`, rather than at
+        // `deliver`. Gating the send would let auto-pickup CLAIM a card for an
+        // isolated lane and then silently not deliver it — the card sits in
+        // `doing` with nobody working it, which is worse than the bug. Removing
+        // the lane from consideration means the card is never claimed at all.
+        //
+        // `session_is_isolated`'s doc calls itself "the single source of truth
+        // every isolation decision consults" and lists seven consumers, all
+        // about what the worker is TOLD ABOUT or DISCOVERABLE BY. None covered
+        // what gets typed INTO its pane: measured 2026-08-26, ZERO of the 15
+        // runtime_jobs consulted it, and three of them steer. The designation
+        // promised "the amux harness stripped" and delivered env suppression.
+        //
+        // The owner's peek/send are untouched — that is the documented boundary.
         crate::api::session_verbs::all_lane_names()
+            .into_iter()
+            .filter(|l| !crate::api::session_verbs::session_is_isolated(l))
+            .collect()
     }
     fn auto_pickup_enabled(&self, lane: &str) -> bool {
         crate::api::session_verbs::standing_orders_on(lane, "CC_AUTO_PICKUP")
@@ -360,7 +413,61 @@ impl Fleet for LiveFleet {
         crate::api::session_verbs::steer_lane_at_boundary(&self.state, lane).await
     }
     async fn deliver(&self, lane: &str, text: &str) {
-        let _ = crate::api::session_verbs::steer_enqueue(&self.state, lane, text, "board-drive", "").await;
+        let _ = crate::api::session_verbs::steer_enqueue(&self.state, lane, text, GUARD, "").await;
+        self.record_prompt(lane, text).await;
+    }
+    async fn deliver_about(&self, lane: &str, text: &str, card: &str, rev: i64) {
+        let _ = crate::api::session_verbs::steer_enqueue_precond(
+            &self.state.store, lane, text, GUARD, "", Some((card, rev)),
+        )
+        .await;
+        self.record_prompt(lane, text).await;
+    }
+
+}
+
+impl LiveFleet {
+    /// A PICKUP IS A PROMPT, AND NOTHING RECORDED IT (AMUX-3547 -> AMUX-3544).
+    ///
+    /// `/api/usage/attribution` answers "where did the plan window go" by
+    /// matching every `token_ledger` turn to the most recent preceding
+    /// `cmd_history` row for that session. `steer_enqueue` writes
+    /// `steering_queue` and `steering_history`; only the SEND path writes
+    /// `cmd_history`. Auto-pickup goes through the former, so it wrote no row
+    /// at all.
+    ///
+    /// Measured over 24h before this fix: **247 auto-pickup deliveries in
+    /// `steering_history`, 2 in `cmd_history`.** So ~245 pickups' turns were
+    /// attributed to whatever prompt happened to precede them — and when that
+    /// was the human's, they landed under `user` / "you typed it", whose
+    /// `is_background` is FALSE.
+    ///
+    /// The bias therefore runs toward UNDER-reporting background, which is the
+    /// one direction that matters here: AMUX-3542 is a customer whose plan
+    /// window was eaten by background work, and the instrument built to prove
+    /// it was crediting some of that work to the customer's own typing.
+    ///
+    /// `pickup` as its own type rather than reusing `system` or `direct`: those
+    /// already mean other things in this table, and the question a reader asks
+    /// of this row ("did amux hand me this, or did I ask for it?") deserves its
+    /// own answer instead of being inferred from text.
+    async fn record_prompt(&self, lane: &str, text: &str) {
+        let (lane, text) = (lane.to_string(), text.to_string());
+        let ts = crate::runtime_jobs::registry::unix_now();
+        let _ = self
+            .state
+            .store
+            .write_async(move |conn| {
+                // Best-effort: a missing attribution row must never stop a
+                // delivery. The pickup is the product; this is its receipt.
+                let _ = conn.execute(
+                    "INSERT INTO cmd_history (text, type, session, ts, origin) \
+                     VALUES (?1, 'pickup', ?2, ?3, 'board-drive')",
+                    rusqlite::params![text, lane, (ts * 1000.0) as i64],
+                );
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
     }
 }
 
@@ -645,6 +752,47 @@ pub fn reviewer_acts_next(status: &str) -> bool {
 // DB reads
 // ---------------------------------------------------------------------------
 
+
+/// Has the REVIEWER written to this card since it entered `review`? (AF-214)
+///
+/// The reviewer nudge fires on `status == review AND reviewer == you`, and its
+/// own instruction — "if not, say what fails on the card" — is a DESC write that
+/// does NOT change status. So a reviewer who rejects work exactly as told leaves
+/// the card in the state that re-fires the nudge, and gets asked to review their
+/// own rejection until the 24h budget runs out. amux hit that twice on AF-203 in
+/// one afternoon.
+///
+/// The real fix is a status for it (`changes-requested`): `review` claims the
+/// card awaits a REVIEWER when it awaits the AUTHOR, and `doing` reads as the
+/// reviewer working it when the reviewer is finished. Neither cell exists, so the
+/// board misdescribes the card whichever move the reviewer makes. That is a
+/// vocabulary change and it is tracked on AF-214; this stops the wasted turns
+/// without pretending to fix the lying status.
+///
+/// PARSED FROM THE LOG, and NOT from "the last line's author", which is what the
+/// shape invites and would be wrong: the log carries `authz:` rows and
+/// `commit <sha> — <subject>` rows that are not actor actions, so the newest line
+/// is routinely neither party. Instead: find where the card last entered
+/// `review`, then look for a line by the reviewer strictly after it.
+fn reviewer_acted_since_review(log: &str, reviewer: &str) -> bool {
+    let rev = reviewer.trim();
+    if rev.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = log.lines().collect();
+    // Last transition INTO review. Anything before it belongs to an older round
+    // — a card can be reviewed, sent back, reworked and re-reviewed.
+    let entered = lines
+        .iter()
+        .rposition(|l| l.contains("-> review"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let needle = format!("` {rev}:");
+    lines[entered.min(lines.len())..]
+        .iter()
+        .any(|l| l.contains(&needle))
+}
+
 fn card_event_count(conn: &Connection, etype: &str, card: &str, since: f64) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM session_events WHERE type=?1 AND ts > ?2 AND data LIKE ?3",
@@ -763,7 +911,7 @@ const DISPATCHABLE_WHERE: &str = "i.session=?1 AND i.status='todo' \
 /// happen inside the loop and surface as `all-candidates-refused` — an honest
 /// difference, since those are judgments about a card, not queue membership.
 fn eligible_todo_count(conn: &Connection, session: &str, now: f64) -> i64 {
-    let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
+    let fresh_cut = (now as i64) - pickup_freshness_s();
     let reclaim_cut = now - reclaim_cooldown_s();
     conn.query_row(
         &format!("SELECT COUNT(*) FROM issues i WHERE {DISPATCHABLE_WHERE}"),
@@ -1252,6 +1400,98 @@ pub enum Pickup {
     None { reason: &'static str, detail: String },
 }
 
+/// Age-weighted pickup scoring (AMUX-3779). Default ON; `AMUX_PICKUP_SCORING=0`
+/// reverts to the legacy `ORDER BY pos ASC, created ASC` selection (board-drag
+/// order, which — because a new card is inserted at `pos = min-1024`, i.e. the
+/// TOP of its column, `board_store::create_issue` — is newest-first / LIFO by
+/// default and starves old cards until the freshness gate silently drops them).
+/// The knob reverts without a rebuild if the new ordering ever misbehaves fleet-wide.
+fn pickup_scoring_enabled() -> bool {
+    std::env::var("AMUX_PICKUP_SCORING").map(|v| v != "0").unwrap_or(true)
+}
+
+/// Severity/importance weight by card type — a shipping/blocking card outranks a
+/// journal of the same age, so a bug does not need a human to drag it above a
+/// doc. Unknown types default code-like, matching this file's `COALESCE(type,
+/// 'code')`. Dormant types (tripwire/watch/epic) are filtered out of pickup
+/// upstream, so their weight is never reached.
+fn type_weight(item_type: &str) -> i64 {
+    match item_type.to_ascii_lowercase().as_str() {
+        "blocker" | "escalation" => 30,
+        "bug" => 24,
+        "code" | "ops" => 12,
+        "investigation" => 6,
+        "research" | "chore" | "doc" => 0,
+        _ => 6,
+    }
+}
+
+/// Explicit human severity carried on tags (`p0`, `sev1`, `urgent`, ...). The
+/// deliberate "this one matters" signal, distinct from where a card happens to
+/// sit in the column.
+fn tag_severity(tags: &[String]) -> i64 {
+    let mut boost = 0;
+    for t in tags {
+        match t.to_ascii_lowercase().as_str() {
+            "p0" | "sev0" | "sev1" | "critical" | "urgent" => boost = boost.max(40),
+            "p1" | "sev2" | "high" => boost = boost.max(20),
+            _ => {}
+        }
+    }
+    boost
+}
+
+/// How many non-terminal cards depend on this one: this card is on their
+/// critical path, so working it unblocks the most downstream work. This is
+/// amux-core `orchestrator::score`'s `dependents` signal — computed there for the
+/// provider-fleet planner but never consulted on the path that actually drives
+/// the human fleet, until now.
+fn count_dependents(conn: &Connection, id: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues WHERE deleted IS NULL AND COALESCE(archived,0)=0 \
+         AND status NOT IN ('done','verified','discarded') \
+         AND depends_on LIKE '%\"' || ?1 || '\"%'",
+        rusqlite::params![id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// The pickup priority score. Higher = sooner. Mirrors amux-core
+/// `orchestrator::score` (an hour of waiting outranks a drag point, so
+/// starvation self-corrects without a separate aging pass), extended with type
+/// and tag severity. `drag` is the card's rank by board position (topmost =
+/// highest, 0 for the bottom) kept a MINOR term: it fine-tunes among
+/// similar-priority cards and lets a deliberate drag nudge one up, without
+/// re-installing the pos-LIFO default that buries old work. `pinned` is the hard
+/// human override — a pinned card leads regardless of everything else.
+fn pickup_score(row: &bs::IssueRow, now: f64, dependents: i64, drag: i64) -> i64 {
+    let age_hours = (((now as i64) - row.created).max(0)) / 3600;
+    let pin = if row.pinned != 0 { 10_000 } else { 0 };
+    pin + age_hours
+        + type_weight(&row.item_type)
+        + tag_severity(&row.tags)
+        + dependents * 5
+        + drag
+}
+
+/// Count todos that would be dispatchable but for the freshness gate — the
+/// cards the 7d window is silently withholding. Surfaced in the pickup trace so
+/// an aged-out queue is legible instead of reading as an empty one (AMUX-3779).
+fn stale_gate_excluded_todos(conn: &Connection, session: &str, fresh_cut: i64) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues i WHERE i.session=?1 AND i.status='todo' \
+         AND i.owner_type='agent' AND i.deleted IS NULL AND COALESCE(i.archived,0)=0 \
+         AND COALESCE(i.type,'') NOT IN ('tripwire','watch','epic') \
+         AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=i.id \
+                         AND lower(t.tag) LIKE 'needs:you%') \
+         AND i.updated < ?2",
+        rusqlite::params![session, fresh_cut],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
 /// Select the next board task for `session`, or say why not. Pure over the
 /// connection: no sends, no writes — so a test can assert the DECISION without
 /// a fleet, and the caller owns the ordering of claim-then-deliver.
@@ -1270,11 +1510,32 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     // needs:you re-nag keeps chasing the human either way. Same LIKE form as
     // the candidate query below, so the two loops can never disagree about
     // which cards are human-blocked (the py split this fixes).
+    // AND NEITHER DOES A CAPTURE SHELL amux MINTED ITSELF (AMUX-3757). A card
+    // whose desc is still literally `**Prompt:** <what the human typed>` is an
+    // UNANSWERED PROMPT, not work in progress — nothing about it is done or
+    // not-done, which is why the decompose nudge exists to make the lane
+    // dispose of it.
+    //
+    // Counting it against WIP-1 made the act of TYPING AT A LANE disable that
+    // lane's auto-pickup. Ethan, 2026-08-26: "why do i need to push
+    // @tubescience to continue despite it having so many tasks in its
+    // backlog". tubescience was holding TUBES-2225, titled "Why are you
+    // stopping" — his own complaint about the lane stopping, captured as a
+    // `doing` card, which is what guaranteed it would keep stopping. The
+    // frustrated re-prompt is the single most likely prompt to arrive at a
+    // stalled lane, so the loop closes on exactly the lanes already in trouble.
+    //
+    // Same `substr(desc,1,11)` form as the fold query in board.rs, so the two
+    // can never disagree about what a capture shell is. RESHAPING the desc —
+    // the sanctioned exit the decompose nudge asks for — makes the card stop
+    // matching and start counting again, which is correct: at that point it IS
+    // a unit of work.
     let cap = wip_cap();
     let holding: Vec<String> = conn
         .prepare(
             "SELECT id FROM issues WHERE session=?1 AND status='doing' AND deleted IS NULL \
              AND COALESCE(archived,0)=0 AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
+             AND NOT (creator='amux' AND substr(COALESCE(\"desc\",''), 1, 11) = '**Prompt:**') \
              AND NOT EXISTS (SELECT 1 FROM issue_tags t WHERE t.issue_id=issues.id \
                              AND lower(t.tag) LIKE 'needs:you%') \
              ORDER BY id",
@@ -1333,28 +1594,90 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
     // from one loop and dispatchable by the other. Unifying on the LIKE form
     // only ever WIDENS the exemption, so the first run after the change emits
     // nothing; the opposite direction would have discharged a backlog.
-    let fresh_cut = (now as i64) - PICKUP_FRESHNESS_S;
+    let fresh_cut = (now as i64) - pickup_freshness_s();
     let reclaim_cut = now - reclaim_cooldown_s();
-    let ids: Vec<String> = conn
-        .prepare(
-            &format!(
+    // Candidate ordering. Legacy (AMUX_PICKUP_SCORING=0): board-drag order
+    // `pos ASC, created ASC` — newest-first by default, because a new card lands
+    // at the top of its column, which starves old work. Default now: fetch
+    // eligible OLDEST-first (so a deep queue never truncates the oldest before it
+    // can score), then order by `pickup_score` — age surfaces starved cards, type
+    // and tag severity lift P0s, dependents lift critical-path work, and drag
+    // position / pin stay as human overrides.
+    let ids: Vec<String> = if pickup_scoring_enabled() {
+        let raw: Vec<String> = conn
+            .prepare(&format!(
                 "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
-                 ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
-            ),
-        )
+                 ORDER BY i.created ASC LIMIT 256"
+            ))
+            .and_then(|mut st| {
+                st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
+                    r.get::<_, String>(0)
+                })
+                .map(|rows| rows.flatten().collect())
+            })
+            .unwrap_or_default();
+        let rows: Vec<bs::IssueRow> = raw
+            .iter()
+            .filter_map(|id| bs::get_issue(conn, id).ok().flatten())
+            .collect();
+        // Drag rank: topmost board position (min `pos`) scores highest; ties by
+        // id so the rank is deterministic.
+        let n = rows.len() as i64;
+        let mut by_pos: Vec<(&str, f64)> =
+            rows.iter().map(|r| (r.id.as_str(), r.pos)).collect();
+        by_pos.sort_by(|a, b| {
+            a.1.partial_cmp(&b.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.0.cmp(b.0))
+        });
+        let drag: std::collections::HashMap<&str, i64> = by_pos
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| (*id, n - i as i64))
+            .collect();
+        let mut scored: Vec<(i64, i64, String)> = rows
+            .iter()
+            .map(|r| {
+                let deps = count_dependents(conn, &r.id);
+                let s = pickup_score(r, now, deps, *drag.get(r.id.as_str()).unwrap_or(&0));
+                (s, r.created, r.id.clone())
+            })
+            .collect();
+        // score DESC, then oldest-first, then id — a deterministic total order.
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)).then(a.2.cmp(&b.2)));
+        scored.into_iter().map(|(_, _, id)| id).collect()
+    } else {
+        conn.prepare(&format!(
+            "SELECT i.id FROM issues i WHERE {DISPATCHABLE_WHERE} \
+             ORDER BY COALESCE(i.pos, 0) ASC, i.created ASC LIMIT 16"
+        ))
         .and_then(|mut st| {
             st.query_map(rusqlite::params![session, fresh_cut, reclaim_cut], |r| {
                 r.get::<_, String>(0)
             })
             .map(|rows| rows.flatten().collect())
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+    };
     if ids.is_empty() {
+        // Name the aged-out cards rather than reporting an empty queue: the
+        // freshness gate silently withholds stale todos, and "nothing
+        // dispatchable" read identically to "no cards" before this (AMUX-3779).
+        let aged = stale_gate_excluded_todos(conn, session, fresh_cut);
+        let days = pickup_freshness_s() / 86400;
+        let aged_note = if aged > 0 {
+            format!(
+                "; {aged} todo card(s) aged past the {days}d freshness window — \
+                 touch or re-file to re-enable"
+            )
+        } else {
+            String::new()
+        };
         return Pickup::None {
             reason: "no-eligible-card",
             detail: format!(
                 "queue holds nothing dispatchable (needs:you, archived, dormant, \
-                 stale >7d and cards claimed in the last {}h are all exempt)",
+                 stale >{days}d and cards claimed in the last {}h are all exempt){aged_note}",
                 (reclaim_cooldown_s() / 3600.0).round() as i64
             ),
         };
@@ -1607,12 +1930,15 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
     // types (tripwire/watch) and no card parked on a live source_ref trigger.
+    // OLDEST-first (AMUX-3779): the idle-drain nudge now lists the same
+    // oldest-first order the todo scorer works in, so "what gets attention next"
+    // reads one way across todo and backlog instead of newest-here/oldest-there.
     conn.prepare(
         "SELECT id, title, created FROM issues \
          WHERE session=?1 AND status='backlog' AND deleted IS NULL \
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
          AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')='' \
-         ORDER BY created DESC LIMIT 8",
+         ORDER BY created ASC LIMIT 8",
     )
     .and_then(|mut st| {
         st.query_map(rusqlite::params![session], |r| {
@@ -1924,6 +2250,22 @@ fn continue_nudge_text(
     )
 }
 
+/// The opening literal of every auto-pickup prompt, and the seam the AMUX-3052
+/// stale-pickup guard reads the card id out of (`session_verbs::pickup_card_id`
+/// takes the first token after it).
+///
+/// IT IS A SHARED CONST BECAUSE A COMMENT WAS NOT ENOUGH. The old template said
+/// "Claimed board card <ID> from your queue" and the parser held its own copy of
+/// that wording, with a comment on BOTH sides saying to change them together.
+/// 03ed2b6c shortened the prompt for token cost — a correct change, made with
+/// that very comment three lines above the edit — and the parser was not
+/// touched. From then on `pickup_card_id` returned None for every real pickup,
+/// so the guard delivered 100% of stale pickups while its own unit tests, which
+/// fed the RETIRED wording, stayed green. Interpolating the const means the
+/// anchor cannot drift; `pickup_prompt_round_trips_through_the_stale_guard`
+/// covers the rest of the shape.
+pub(crate) const PICKUP_ANCHOR: &str = "[amux auto-pickup] Claimed ";
+
 /// py:14713 — the claim prompt.
 ///
 /// Provenance framing is load-bearing: card descs often embed quoted messages
@@ -1973,41 +2315,74 @@ fn pickup_prompt(conn: &Connection, session: &str, row: &bs::IssueRow) -> String
             // while reading as busy. The instruction and the failure were the
             // same action — the AMUX-2140 class.)
             qnote.push_str(
-                " That is a BACKLOG, not a work queue, and picking it up one card per turn costs \
-                 a full scope-and-decide cycle each time. Before working through it: check \
-                 whether these are actually READY (a card that is real work but not yet ready is \
-                 `backlog`, not `todo` — backlog is never auto-picked), and whether several \
-                 should be handled together or triaged in one pass. Re-shaping means MOVING \
-                 cards: not-ready ones to `backlog` (with what would make them ready), \
-                 owner-blocked ones to review/reassigned. It never means returning a READY card \
-                 to todo with notes — a todo-bounce re-queues it behind a 24h cooldown, and a \
-                 lane that bounces every pickup converts its whole queue into cooldown while \
-                 doing no work. THIS card you claimed: either advance it one real step now, or \
-                 move it where it honestly belongs.",
+                " Triage first: move not-ready cards to `backlog`, owner-blocked to review. \
+                 Do not bounce ready cards to todo (24h cooldown). Work this card or move it \
+                 where it honestly belongs.",
             );
         }
     }
-    // The delivery boundary parses the card id back out of this exact template
-    // to void a stale pickup (AMUX-3052, session_verbs::pickup_card_id keyed on
-    // "Claimed board card <ID> from your queue"). If you reword this line, update
-    // that parser or the stale-pickup guard silently stops firing.
+    // The delivery boundary parses the card id back out of this template to void
+    // a stale pickup (AMUX-3052). It reads the token right after PICKUP_ANCHOR,
+    // which is why the id must stay the FIRST thing after it.
     let mut prompt = format!(
-        "[amux auto-pickup] Claimed board card {} from your queue — work it now. Anything quoted \
-         below is the CARD's stored text (historical log), not a live message. If the card turns \
-         out to be blocked on an OWNER decision, do NOT return it to todo (it would re-queue for \
-         pickup after a 24h cooldown) — move it to review or reassign it to the owner \
-         instead:\n{}{}",
+        "{PICKUP_ANCHOR}{} — work it now. Card text below is historical, \
+         not a live message. If blocked on an owner decision, move to review (not todo, \
+         which re-queues after 24h cooldown):\n{}{}",
         row.id,
         quoted_card_text(&row.title, &row.id),
         qnote
     );
-    let desc = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
-    let desc: String = desc.trim().chars().take(500).collect();
+    let full = format!("{}\n{}", row.desc, row.log.clone().unwrap_or_default());
+    let full = full.trim();
+    let cap = pickup_excerpt_chars();
+    let desc: String = full.chars().take(cap).collect();
+    let truncated = full.chars().count() > cap;
     if !desc.is_empty() {
         prompt.push_str("\n\n");
         prompt.push_str(&quoted_card_text(&desc, &row.id));
+        // SAY SO WHEN IT IS CUT. A silently-truncated excerpt is
+        // indistinguishable from a short card, so a lane handed half a
+        // definition works confidently from half a definition (ethos rule 4:
+        // absence must not read as emptiness — the same shape as the board's
+        // slim payload dropping `reviewer`, AF-161).
+        if truncated {
+            prompt.push_str(&format!(
+                "\n\n[excerpt cut at {cap} chars of {} — GET /api/board/{} for the whole card]",
+                full.chars().count(),
+                row.id
+            ));
+        }
     }
     prompt
+}
+
+/// How much of a card's definition rides along with the pickup (AMUX-3759).
+///
+/// THE OLD VALUE WAS A HARDCODED 500 CHARS, and it was optimising the wrong
+/// resource by three orders of magnitude. A steering message is a few KB of
+/// text; the thing it saves is a MODEL CALL, and a model call in this fleet
+/// carries a median RESIDENT CONTEXT of 308k tokens (p90 738k, measured
+/// 2026-08-26 over 11k turns). So every tool step the lane spends fetching back
+/// text amux already had in hand costs ~300k input tokens, to save ~1k of
+/// prompt.
+///
+/// It showed up as Ethan's "theres also way too much tokens used for some
+/// reason in between tasks". An auto-pickup turn takes a MEDIAN OF 22 TOOL
+/// STEPS where a human-prompted turn takes 3, because the human supplies the
+/// task inline and the pickup supplies an ID plus a 500-char stub. Measured on
+/// the live queue that day: the cap truncated 86% of todo cards (median
+/// definition 1,933 chars, p90 6,658) and discarded 108,820 characters of card
+/// definition the lane then had to go and read back.
+///
+/// Config, not a constant, because this is D4 in the ethos ledger — a
+/// context-scarcity policy baked into code silently becomes the ceiling as
+/// windows grow. 4000 leaves ~20% of today's cards truncated, and those say so.
+fn pickup_excerpt_chars() -> usize {
+    std::env::var("AMUX_PICKUP_EXCERPT_CHARS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(4000)
 }
 
 // ---------------------------------------------------------------------------
@@ -2038,6 +2413,30 @@ pub fn select_advance(
     session: &str,
     tags: &[String],
     now: f64,
+) -> Advance {
+    select_advance_with(conn, session, tags, now, &|owner, reviewer| {
+        crate::api::session_verbs::reviewer_unreachable_reason(owner, reviewer)
+    })
+}
+
+/// [`select_advance`] over an INJECTED "is this name a registered worker"
+/// lookup.
+///
+/// The reviewer-unreachable gate (AMUX-3751) needs to know whether a nudge can
+/// actually be delivered, and the only source for that is the real
+/// `~/.amux/sessions` tree. Reading it from inside this otherwise-pure board
+/// function made three routing tests depend on which lanes happen to exist on
+/// the machine running them — they passed here and would fail in CI, which is
+/// the worst version of that dependency because the failure appears in someone
+/// else's push. `set_home` would serialise them against every other
+/// home-mutating test; an injected lookup costs nothing and is what
+/// `config::resolve_home`'s doc asks new tests to prefer.
+pub fn select_advance_with(
+    conn: &Connection,
+    session: &str,
+    tags: &[String],
+    now: f64,
+    reviewer_unreachable: &dyn Fn(&str, &str) -> Option<String>,
 ) -> Advance {
     let budget = advance_card_budget();
 
@@ -2281,22 +2680,53 @@ pub fn select_advance(
                 detail: format!("{card_id} is a capture shell ({why}); already asked for a split"),
             };
         }
+        // SHORT, AND EVERY COMMAND IN IT EXISTS (AMUX-3707, Ethan: "when its a
+        // question and doesnt produce work we get these, i feel like its
+        // wasteful of tokens").
+        //
+        // This block used to be ~250 words that re-argued AMUX-3323's history on
+        // every firing. Measured 2026-08-25: 540 of these ever, 296 in the last
+        // 7 days (~42/day fleet-wide), and 70.6% of the cards ended `discarded`.
+        // The text was the SMALL half of the cost — each nudge wakes an idle lane
+        // for a whole turn, so the prose is ~330 tokens and the turn it provokes
+        // is tens of thousands. Cutting the prose is worth doing; the reason it
+        // is worth MORE than its own token count is that a lane which can act in
+        // one command does not spend a turn working out how.
+        //
+        // Which is the second half, and the sharper one: the old text told the
+        // lane to "discard it" and to "set each child's `epic`", and named a
+        // command for NEITHER. `discard` does dispatch — AMUX-2140 added it as an
+        // alias precisely so this nudge would be walkable — but it is absent from
+        // `amux board` help, so a lane that did not already know it exists cannot
+        // find it. `epic` did not exist at all until this commit added the verb,
+        // while the nudge had been telling every lane to "set each child's epic"
+        // since AMUX-3323. Both roads out of a capture shell therefore ended at a
+        // hand-rolled curl, which drops the worker header: the nudge was
+        // manufacturing the unattributed writes the ledger depends on not having
+        // (ethos rule 6, same shape as AMUX-2325).
+        //
+        // Every command below was WALKED before it shipped, and
+        // tests/nudge_commands_exist.rs now walks them on every build — because
+        // "I checked once" is what AMUX-2140 already thought.
+        // NOT "holding your WIP slot" ANY MORE, and the correction is this
+        // commit's whole point (AMUX-3757 changed the mechanism an hour before
+        // this text was read back to its own author). A capture shell is now
+        // EXEMPT from the WIP cap, so the old wording asserted a blockage that
+        // no longer exists — a nudge whose urgency is fictional, which is the
+        // view-disagrees-with-mechanism shape the same commit went and fixed
+        // one layer down. `the_decompose_nudge_does_not_claim_a_blockage_the_
+        // wip_query_exempts` pins the two together so the next change to either
+        // one fails rather than drifting.
+        //
+        // The honest reason is the second clause, and it was always the real
+        // one: a card nothing can honestly call done or not-done cannot pass a
+        // gate, so it sits on the board reading like work forever.
         let text = format!(
-            "[amux] {card_id} is a captured prompt, not a unit of work ({why}). It cannot move \
-             through the gates as it stands, so it is holding your WIP slot and nothing is \
-             driving it.\n\n\
-             If it is genuinely NOT work (a status question, a slash command, an empty \
-             journal), discard it and nothing is lost.\n\n\
-             But if it decomposes into REAL work that is not yet finished, do NOT discard it. \
-             PROMOTE it to an epic that owns the pieces: retype it `epic`, rewrite the desc with \
-             the scope, the child cards, and acceptance criteria (that structure clears this \
-             capture brand), add one card per unit of work (`amux board add \"...\"`), and set \
-             each child's `epic` to {card_id}. Discarding an umbrella whose children are still \
-             open abandons the top-level request and orphans them, and the board then reads that \
-             request as thrown away (AMUX-3323).\n\n\
-             Only discard with a pointer when the pointed-to work is ALREADY done, or already \
-             tracked on another card, and this card adds nothing. Then drive each child through \
-             its gates to done."
+            "[amux] {card_id} is a capture shell ({why}). Not blocking pickup, but not actionable either.\n\n\
+             Not work? `amux board discard {card_id} --outcome-stdin`\n\
+             One task? `amux board retitle {card_id} \"<title>\" --desc-stdin`\n\
+             Several? `amux board type {card_id} epic`, `amux board add \"<unit>\"`, \
+             `amux board epic <NEW-ID> {card_id}`"
         );
         return Advance::Nudge {
             target: session.to_string(),
@@ -2413,7 +2843,19 @@ pub fn select_advance(
                 card: card_id,
                 status,
                 text,
-                kind: "renag",
+                // `renag-held`, NOT `renag` (AMUX-3777). Both arms re-nag and
+                // both write `needsyou.renag`, so at the TYPE level they are
+                // indistinguishable — and that type is the one the AMUX-3768
+                // audit confirmed empirically in both directions. The
+                // confirmation was therefore about the type, not about this
+                // branch: this arm could be dead today and the shared counter
+                // would still read 100.
+                //
+                // The distinction is real, not bookkeeping. The other arm scans
+                // the lane's WHOLE QUEUE for the oldest stale ask; this one
+                // fires about the card the lane is CURRENTLY HOLDING. They can
+                // rot independently.
+                kind: "renag-held",
             },
             None => Advance::None {
                 reason: "needsyou-renag-deduped",
@@ -2428,6 +2870,54 @@ pub fn select_advance(
     let rev = row.reviewer.clone().unwrap_or_default().trim().to_string();
     let mut ball_with_author = String::new();
     if reviewer_acts_next(&status) && !rev.is_empty() && rev != session {
+        // A REVIEWER WHO IS NOT A WORKER IS A CARD PARKED FOREVER.
+        //
+        // `reviewer` is free text and nothing validates it when it is written,
+        // so a typo, a human's name, or a lane that has since been RENAMED all
+        // address the nudge to somebody who cannot receive it. Measured
+        // 2026-08-26: 7 open cards sat in `review` naming a reviewer that
+        // resolves to no registered worker — including `amux-rust`, renamed to
+        // `amux` long ago, because the rename cascade migrated
+        // `issues.session` and left `issues.reviewer` on the dead name (fixed
+        // in the same commit).
+        //
+        // NAMED and WARNed rather than silently skipped, because a nudge that
+        // goes nowhere is indistinguishable from a reviewer who is merely slow,
+        // and the card looks healthy in `review` either way (ethos rule 4).
+        // REACHABLE, NOT MERELY REGISTERED (AMUX-3771, Ethan: "figure out why
+        // `@random` is peer reviewing code outside of its group").
+        //
+        // This gate used to ask only "is `rev` a registered worker", which is
+        // one predicate short. A registered CROSS-GROUP reviewer passed it, got
+        // nudged, and the owner then could not talk to them: worker-to-worker
+        // messaging is intra-group unless configured, and `cross_group_send_ok`
+        // is enforced in exactly ONE place — the send API. The review nudge goes
+        // through `steer_enqueue` and never touches it.
+        //
+        // So review crossed groups silently while conversation about it did
+        // not. Measured 2026-08-26: ECOLO-14 (ecology/customers -> random/
+        // personal) and AMUX-3761 (amux/amux -> random/personal, set by me).
+        // `random`'s CC_DESC advertises "Peer review for other lanes" — which is
+        // what every lane reads when picking a reviewer — while its config
+        // grants no such reach. The roster promised a role the mechanism did not
+        // implement (ethos rule 1).
+        //
+        // Refusing here does NOT decide whether random should be the fleet
+        // reviewer. It makes the answer explicit: grant the reach with
+        // CC_RECEIVE_ANY / CC_SEND_ALLOW, which the guard already provides for
+        // exactly this case, or stop assigning across groups.
+        if let Some(why) = reviewer_unreachable(session, &rev) {
+            tracing::warn!(
+                card = %card_id, reviewer = %rev, owner = %session, reason = %why,
+                "reviewer_unreachable: card parked in review naming a reviewer this lane \
+                 cannot reach — the nudge goes nowhere or the conversation about it does, \
+                 and the card looks healthy in `review` either way"
+            );
+            return Advance::None {
+                reason: "reviewer-unreachable",
+                detail: format!("{card_id} names reviewer `{rev}`: {why}"),
+            };
+        }
         match reviewer_has_responded(conn, &card_id, &rev) {
             // BALL IS WITH THE AUTHOR — SO TELL THE AUTHOR (py:13761, AMUX-2498).
             // Python said exactly this in a log line and then nudged nobody, so
@@ -2450,6 +2940,19 @@ pub fn select_advance(
                     return Advance::None {
                         reason: "budget-spent",
                         detail: format!("reviewer {rev} nudged {spent}x in 24h on {card_id}"),
+                    };
+                }
+                // AF-214: they have already reviewed it. Asking again is asking
+                // them to review their own rejection, and the instruction this
+                // nudge gives ("say what fails on the card") is what put the card
+                // in this state — so the nudge re-fires on compliance.
+                if reviewer_acted_since_review(row.log.as_deref().unwrap_or(""), &rev) {
+                    return Advance::None {
+                        reason: "reviewer-already-acted",
+                        detail: format!(
+                            "{rev} has written to {card_id} since it entered review — \
+                             the card awaits its AUTHOR, not a reviewer"
+                        ),
                     };
                 }
                 // Name the ACTUAL transition. A card at `done` told to "ack
@@ -2559,100 +3062,49 @@ struct AdvanceMsg<'a> {
     has_evidence: bool,
 }
 
-/// py:13878 — the nudge body.
-///
-/// Option 5 exists because a prompt offering exactly `done` or `todo` about a
-/// standing-role or mis-shaped card forces a false statement either way, and the
-/// less-wrong pick recycles the card into the rot queue forever. Option 3b names
-/// the command for parking on an external condition, because an exit the reader
-/// has to go and discover is one they may reasonably conclude does not exist.
+/// The advance nudge body. Compressed to reduce token waste (AMUX-3767):
+/// the old template was ~1,500 chars per nudge, 443 nudges/day = ~693K chars/day
+/// of automated prompts the model has to process.
 fn advance_text(m: AdvanceMsg<'_>) -> String {
     let reviewer_owns_gate = !m.reviewer.is_empty() && reviewer_acts_next(m.status);
-    // py:13845 RE-TYPE, the honest exit the menu never offered (AMUX-2478). Four
-    // finished cards sat terminal-at-done re-firing this nudge because, typed
-    // `code`, they faced gates (CI green / deployed / confirmed-in-prod) with
-    // NOTHING TO BIND TO, and correctly refused all three exits offered: false
-    // verified, fabricated trigger, false discard. When a gate does not fit, the
-    // fix is the TYPE, not the truth.
     let eff_type = if m.item_type.trim().is_empty() {
         DEFAULT_ITEM_TYPE
     } else {
         m.item_type.trim()
     };
-    let retype = if eff_type.eq_ignore_ascii_case("code") {
-        let lead = if m.has_evidence { "" } else { "THIS CARD LOOKS MIS-TYPED. " };
-        let no_ev = if m.has_evidence {
-            ""
-        } else {
-            " — and its description carries no commit, PR or merge reference, which is what a \
-             code card would have by now"
-        };
+    let retype = if eff_type.eq_ignore_ascii_case("code") && !m.has_evidence {
         format!(
-            "  1b. {lead}If the work on this card is NOT CODE — a doc or file move, an \
-             investigation whose result was negative, a research finding, a chore — then the \
-             gate above does not fit it, and the reason is the card's TYPE, not the work. It is \
-             typed `code`, so it inherits code's gates{no_ev}. Retyping is the HONEST exit and \
-             it already exists:\n       amux board type {} <investigation|research|doc|chore|ops>\n\
-             \x20    Those types gate on 'Outcome recorded in the item' for done and 'Outcome \
-             confirmed to still hold' for verified — satisfiable truthfully for work that ships \
-             no code. Fix the type, not the truth; never ack a merge or a deploy that did not \
-             happen.\n",
+            " Looks mis-typed: no commit/PR ref. If not code, retype: \
+             `amux board type {} <investigation|research|doc|chore|ops>`.",
             m.card
         )
     } else {
         String::new()
     };
-    // py:13884, AC-316 defect 1: telling the HOLDER of a review card to "satisfy
-    // the done gate and move it" offers an exit only the named reviewer can
-    // take, while the closing line forbids the force that is the sole way to
-    // obey. Same predicate as the reviewer edge, not re-derived.
     let option_one = if reviewer_owns_gate {
         format!(
-            "  1. Address the reviewer's feedback on the card, then ask {} to re-ack — \
-             '{}'->'{}' is {}'s sign-off, not yours; do NOT force it. If their feedback is \
-             already addressed, say so on the card and ping them.\n",
-            m.reviewer, m.status, m.gate_next, m.reviewer
+            "1) Address {}'s feedback, then ping them to re-ack (do NOT force).",
+            m.reviewer
         )
     } else {
         format!(
-            "  1. Advance it. The gate for '{}' is:\n{}\n     Satisfy those honestly and move \
-             it, then continue to the next card.\n",
+            "1) Advance to '{}'. Gate:\n{}\n   Satisfy honestly and move it.",
             m.gate_next, m.gate_txt
         )
     };
     let ball = if m.ball_with_author.is_empty() {
         String::new()
     } else {
-        format!("\n{}.\n", m.ball_with_author)
+        format!(" {}", m.ball_with_author)
     };
     format!(
-        "[amux] You went idle holding {} in '{}': {}\n\n{}Keep driving it. Do exactly one of:\n\
-         {}{}\
-         \x20 2. If it is genuinely finished, close it out to {} with the evidence.\n\
-         \x20 3. If it is BLOCKED, say what on — and if the blocker is another card, go work \
-         that dependency instead of waiting.\n\
-         \x20 3b. If it is blocked on something EXTERNAL that no one here controls (a provider \
-         outage, a deploy that cannot run, a third-party queue): record the condition and the \
-         resume trigger on the card, then `amux board backlog {} --trigger \"<the external \
-         condition>\"`. The --trigger records it as the card's source_ref and stamps \
-         last_verified_at, so a trigger nobody re-checks becomes detectable instead of the card \
-         sleeping forever — parking without it buys silence with no expiry. Do NOT leave it in \
-         'doing' (this nudge re-fires) or move it to 'todo' (the untracked-work guard fires \
-         instead). If it is a standing watcher rather than a one-off wait, retype it `watch` so \
-         it also stays out of auto-pickup and shows under is:armed.\n\
-         \x20 4. If it is blocked on a HUMAN decision, record that on the card and pick up the \
-         next unblocked one.\n\
-         \x20 5. If NEITHER done nor todo would be a TRUE statement about this card — a standing \
-         role, a journal, a mis-shape — it cannot rot because it cannot finish: DISCARD it with \
-         a note pointing at the closable units (or retype it tripwire/watch if it is a real \
-         dormant watch).\n\n\
-         You have {} more card(s) queued. Do not stall on a full queue: the aim is every card \
-         driven to {}, working dependencies first. Never --force a gate you cannot satisfy — an \
-         honest blocker beats a false 'done'.\n\n\
-         And whatever you choose, FIRST make this card's DESCRIPTION reflect its CURRENT state \
-         (what is done, what is next, and a link to the artifact), so a reader knows the state \
-         from the card alone without reading any logs (Ethan: push every update to the board \
-         issue).",
+        "[amux] Idle with {} in '{}': {}{}\n\n\
+         {}{}\n\
+         2) Finished? Close to {} with evidence.\n\
+         3) Blocked? Work the blocker. External block: `amux board backlog {} --trigger \"<condition>\"`.\n\
+         4) Needs human? Record it, pick up next card.\n\
+         5) Mis-shaped (not done-able)? Discard or retype to watch.\n\n\
+         {} more queued. Update the card desc with current state before moving on.",
         m.card,
         m.status,
         quoted_card_text(&m.title.chars().take(110).collect::<String>(), m.card),
@@ -2662,7 +3114,6 @@ fn advance_text(m: AdvanceMsg<'_>) -> String {
         m.term,
         m.card,
         m.queued,
-        m.term,
     )
 }
 
@@ -2721,12 +3172,9 @@ fn needsyou_renag_text(
         ""
     };
     Some(format!(
-        "[amux] {card} has been waiting on a human answer for at least {days} days: {}\n\n\
-         {arch}Not asking you to advance it — you cannot. Asking whether the ASK is still right: \
-         is the question you recorded still the question? If it is, re-state it on the card and \
-         that counts as re-confirming it — you will not be asked again for {} days. If it has \
-         been overtaken by events, clear the needs:you tag and move the card to whatever is now \
-         true.",
+        "[amux] {card} needs:you for {days}d: {}\n\n\
+         {arch}Still the right question? Re-state it on the card (silences this for {}d). \
+         Overtaken? Clear needs:you and move the card.",
         quoted_card_text(&title.chars().take(90).collect::<String>(), card),
         needsyou_renag_days() as i64
     ))
@@ -2766,6 +3214,48 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
         report.lanes.push(trace);
     }
     report.finished_at = now_f64();
+    // THE FLEET NUMBER, IN THE LOGS, EVERY TICK (AMUX-3758). A lane going idle
+    // on a full board produces a different local reason per lane — wip-cap,
+    // needsyou-renag-deduped, dep-other-lane — and each reads like a small bug.
+    // Only the aggregate says what is actually happening, and until now it
+    // existed nowhere: measured 2026-08-26, 4.9% of 1039 open cards were in the
+    // one status this loop can dispatch. `assigned=0` on a fleet with 1000 open
+    // cards was the reader's whole signal, and it does not distinguish "the
+    // loop is broken" from "there are 51 workable cards for 52 lanes".
+    //
+    // INFO always (a clean pass must be distinguishable from a census that
+    // measured nothing), WARN only when a LARGE board has almost nothing
+    // workable — the state where the fleet looks busy and is not.
+    if let Ok(conn) = state.store.read() {
+        let shape = fleet_queue_shape(&conn);
+        let (open, pct) = (
+            shape["open_total"].as_i64().unwrap_or(0),
+            shape["dispatchable_pct"].as_f64().unwrap_or(0.0),
+        );
+        tracing::info!(
+            job = "board-drive",
+            open_total = open,
+            dispatchable_todo = shape["dispatchable_todo"].as_i64().unwrap_or(0),
+            dispatchable_pct = pct,
+            needsyou_median_age_d = shape["needsyou_median_age_d"].as_f64(),
+            assigned = report.assigned,
+            "board queue shape"
+        );
+        if open >= 200 && pct < 10.0 {
+            tracing::warn!(
+                job = "board-drive",
+                open_total = open,
+                dispatchable_pct = pct,
+                needsyou = shape["by_status"]["needsyou"].as_i64(),
+                backlog = shape["by_status"]["backlog"].as_i64(),
+                needsyou_median_age_d = shape["needsyou_median_age_d"].as_f64(),
+                "queue_starved: the board is large and almost none of it is dispatchable — \
+                 lanes will idle with full queues and it is not this loop's fault. \
+                 `backlog` needs a trigger, `needsyou` needs a human; neither is amux's to \
+                 clear on its own. GET /api/debug/board-drive -> queue_shape"
+            );
+        }
+    }
     publish(&report);
     report
 }
@@ -2798,8 +3288,23 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     // anything not positively known to be idle is left alone. A nudge that waits
     // one more tick costs nothing; a nudge delivered mid-turn is an interruption.
     if !fleet.at_boundary(lane).await {
-        return LaneTrace::skip(lane, "mid-turn", "lane is not at a turn boundary")
-            .with_counts(eligible, open);
+        // NAME THE EVIDENCE, not just the verdict. `mid-turn` read identically
+        // for a lane genuinely generating and for one held by a self-report
+        // nothing would ever refresh — and the second kind sat here for up to
+        // 61 hours (AMUX-3756). The gate now falls through to the pane for a
+        // stale report, so this detail is what makes the remaining cases
+        // legible: a fresh report age is a real turn, a huge one is the class
+        // that used to deadlock.
+        let detail = match crate::api::session_verbs::lane_report(state, lane) {
+            Some(r) => format!(
+                "lane is not at a turn boundary (self-report `{}` {:.0}s old, {})",
+                r.state,
+                r.age_s,
+                if r.applies { "authoritative" } else { "REFUSED as stale — pane decided" }
+            ),
+            None => "lane is not at a turn boundary (no self-report; the pane decided)".into(),
+        };
+        return LaneTrace::skip(lane, "mid-turn", detail).with_counts(eligible, open);
     }
 
     let now = now_f64();
@@ -2816,7 +3321,24 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
     drop(conn);
 
     if let Advance::Nudge { target, card, status, text, kind } = advance {
-        fleet.deliver(&target, &text).await;
+        // A NUDGE IS ABOUT A CARD, so it carries that card's revision and the
+        // delivery loop drops it if the card moves first (AMUX-3659). Read
+        // here, at compute time, because that is the state the text describes.
+        // A card whose rev cannot be read delivers unconditionally — the same
+        // behaviour as before, since refusing to nudge because a read failed
+        // would be a worse trade than an occasionally-stale nudge.
+        let rev: Option<i64> = state
+            .store
+            .read()
+            .ok()
+            .and_then(|c| {
+                c.query_row("SELECT rev FROM issues WHERE id=?1", rusqlite::params![&card], |r| r.get(0))
+                    .ok()
+            });
+        match rev {
+            Some(r) => fleet.deliver_about(&target, &text, &card, r).await,
+            None => fleet.deliver(&target, &text).await,
+        }
         // THE COOLDOWN IS PER LANE, AND A REVIEW ROUTE INVOLVES TWO OF THEM.
         // `advance.nudged` is recorded under the REVIEWER (python:13817 — it
         // once stamped the card owner's cooldown while the message went to the
@@ -2843,7 +3365,12 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             )
             .await;
         }
-        let etype = if kind == "renag" { "needsyou.renag" } else { "advance.nudged" };
+        // BOTH renag arms write the same event TYPE — the type is the fault
+        // class and it should stay one thing. The arm is carried in `kind`
+        // inside the data, which is where a per-branch counter can read it
+        // without splitting the class (AMUX-3777).
+        let etype =
+            if kind.starts_with("renag") { "needsyou.renag" } else { "advance.nudged" };
         let idem = if kind == "decompose-asked" {
             Some(format!("decompose:{card}"))
         } else {
@@ -3278,6 +3805,20 @@ pub async fn claim_card_from(
     // card in the same atomic step, rather than leaving it `doing` with a stale
     // owner.
     let session_s = session.to_string();
+    // THE GUARD'S VERDICT HAS TO ESCAPE THE CLOSURE (AMUX-3776). `reassigned`
+    // is computed inside the write, where it can be read in the same
+    // transaction as the swap — which is correct and is why it lives there —
+    // and it was then used only for a tracing::warn and a card-log line. So a
+    // genuine cross-owner claim left NO row in `session_events`, while the
+    // ordinary path emits `task.claimed`.
+    //
+    // Two costs. A sweep of the ledger cannot find the violation at all. And
+    // the (reached, taken) instrument AMUX-3768 proposes can only see branches
+    // that RECORD, so this one would report dead-by-absence forever while being
+    // perfectly reachable — the same false negative random hit on
+    // raw-tmux-fallback and corrected.
+    let cross_owner = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let cross_owner_w = cross_owner.clone();
     let reply = state
         .store
         .write_async(move |conn| {
@@ -3329,6 +3870,9 @@ pub async fn claim_card_from(
                     "claim REASSIGNED a card across owners; every caller is supposed to prevent this; \
                      if you see this, a dispatch path let a lane claim another lane's card"
                 );
+                if let Ok(mut g) = cross_owner_w.lock() {
+                    *g = Some(prior_owner.clone());
+                }
                 format!("Auto-picked up from queue by {session_s} (reassigned from {prior_owner})")
             } else if from == "backlog" {
                 // A backlog card is never queue-dispatched; this line only ever
@@ -3355,6 +3899,23 @@ pub async fn claim_card_from(
              (raced to a terminal/doing state, or store unreadable); prompt NOT dispatched"
         );
         return false;
+    }
+    // THE VIOLATION GETS ITS OWN TYPE, and it is emitted BEFORE `task.claimed`
+    // so the ledger reads in causal order: the guard fired, then the claim
+    // landed. A distinct type rather than a field on `task.claimed`, because
+    // this is a different FACT — every caller is supposed to make it
+    // impossible, so one row is a bug report, not a variation on a claim
+    // (AMUX-3776).
+    if let Some(prior) = cross_owner.lock().ok().and_then(|g| g.clone()) {
+        crate::api::session_verbs::emit_event(
+            state,
+            session,
+            "claim.cross_owner",
+            Some(json!({"issue": card, "claimer": session, "prior_owner": prior, "from": from})),
+            None,
+            "board-drive",
+        )
+        .await;
     }
     crate::api::session_verbs::emit_event(
         state,
@@ -3430,6 +3991,8 @@ pub async fn debug_board_drive(
         .iter()
         .filter_map(|v| v["session"].as_str().map(str::to_string))
         .collect();
+    let capture_shells = state.store.read().ok().map(|c| capture_shell_cost(&c));
+    let queue_shape = state.store.read().ok().map(|c| fleet_queue_shape(&c));
     let body = json!({
         "note": "per-lane trace of the board -> worker drive loop; `reason` says why a lane \
                  was passed over. A skip that leaves no trace is indistinguishable from a loop \
@@ -3445,8 +4008,160 @@ pub async fn debug_board_drive(
         "lanes_with_eligible_cards": waiting.len(),
         "backlog": waiting,
         "distinct_lanes_waiting": seen.len(),
+        "capture_shells": capture_shells,
+        "queue_shape": queue_shape,
     });
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
+}
+
+/// The SHAPE of the fleet's open work, beside the loop that consumes it
+/// (AMUX-3758).
+///
+/// Ethan, 2026-08-26: "we need to rethink how we do amux because this isn't
+/// working." Chasing that per-lane finds a different local cause every time —
+/// wip-cap here, needsyou-renag-deduped there, dep-other-lane somewhere else —
+/// and each one reads like a small bug. The fleet number is the argument the
+/// per-lane traces cannot make: measured that day, of 1039 open cards, 48.2%
+/// were `backlog` (parked awaiting a trigger), 37.2% were `needsyou` (blocked
+/// on a human, median 7.2 days old, max 19.7), and **4.9% were `todo`** — the
+/// only status `DISPATCHABLE_WHERE` selects. 51 workable cards across 52 lanes.
+///
+/// So a lane going idle on a full board is mostly not a defect in this loop.
+/// The board is 95% invisible to it BY DESIGN, and the queue that actually
+/// feeds it is nearly empty. Nothing in amux said so, because every view is
+/// per-lane and the answer only exists in aggregate.
+///
+/// Deliberately a MEASUREMENT and not an action: promoting backlog or resolving
+/// needsyou on the fleet's behalf would be an agent deciding a human's work is
+/// unblocked (ethos rule 8). This reports; a human decides.
+///
+/// `dispatchable_pct` is the headline. It reads ZERO in two very different
+/// worlds — a fleet with nothing to do, and a fleet whose whole board is parked
+/// — so `open_total` rides along in the same payload to tell them apart.
+fn fleet_queue_shape(conn: &Connection) -> Value {
+    const OPEN: &str = "('todo','doing','backlog','needsyou','review','armed')";
+    let mut by_status = serde_json::Map::new();
+    let mut total = 0i64;
+    if let Ok(mut st) = conn.prepare(&format!(
+        "SELECT status, COUNT(*) FROM issues WHERE status IN {OPEN} \
+         AND deleted IS NULL AND COALESCE(archived,0)=0 GROUP BY status"
+    )) {
+        if let Ok(rows) = st.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for (s, n) in rows.flatten() {
+                total += n;
+                by_status.insert(s, json!(n));
+            }
+        }
+    }
+    let todo = by_status.get("todo").and_then(Value::as_i64).unwrap_or(0);
+    // Median age of the human-blocked pile, in days. The COUNT alone reads the
+    // same for 387 questions asked this morning and 387 asked a fortnight ago,
+    // and only the second is a bottleneck.
+    let needsyou_median_age_d: Option<f64> = conn
+        .query_row(
+            "SELECT (strftime('%s','now') - COALESCE(updated, created)) / 86400.0 \
+             FROM issues WHERE status='needsyou' AND deleted IS NULL \
+               AND COALESCE(archived,0)=0 \
+             ORDER BY COALESCE(updated, created) DESC \
+             LIMIT 1 OFFSET (SELECT COUNT(*)/2 FROM issues WHERE status='needsyou' \
+                             AND deleted IS NULL AND COALESCE(archived,0)=0)",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    json!({
+        "open_total": total,
+        "by_status": by_status,
+        "dispatchable_todo": todo,
+        "dispatchable_pct": if total > 0 { (todo as f64 * 1000.0 / total as f64).round() / 10.0 } else { 0.0 },
+        "needsyou_median_age_d": needsyou_median_age_d,
+        "note": "`dispatchable_todo` is the ONLY slice DISPATCHABLE_WHERE selects. A lane idling \
+                 on a full board is usually this: its queue is real and its workable queue is \
+                 empty. `backlog` needs a trigger, `needsyou` needs a human — neither is a defect \
+                 in the drive loop, and neither is amux's to clear on its own.",
+    })
+}
+
+/// What the capture-shell nudge is costing, in one call.
+///
+/// AMUX-3707. Ethan flagged these as wasteful ("when its a question and doesnt
+/// produce work we get these"), and answering *how* wasteful took hand-written
+/// SQL joining `session_events` to `issues` — which is the tell that the number
+/// nobody can reach is the number nobody watches. The nudge is emitted once per
+/// card ever (idem `decompose:<id>`), so the row count IS the count of lanes
+/// woken to dispose of a card amux itself minted.
+///
+/// The ratio is the signal, not the total: a `discarded` outcome means the woken
+/// turn produced a one-line retirement, while `promoted_to_epic` and `reshaped`
+/// mean the nudge bought real judgment. If `discarded_pct` climbs, amux is
+/// spending more turns on foregone conclusions and the capture predicate wants
+/// tightening; if it falls, the nudge is earning its keep. Neither direction is
+/// visible from the nudge count alone, which is all anything reported before.
+fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
+    let q = |sql: &str| -> i64 { conn.query_row(sql, [], |r| r.get(0)).unwrap_or(-1) };
+    let nudges = q("SELECT COUNT(*) FROM session_events WHERE idem LIKE 'decompose:%'");
+    let nudges_7d = q(
+        "SELECT COUNT(*) FROM session_events WHERE idem LIKE 'decompose:%' \
+         AND ts > strftime('%s','now') - 7*86400",
+    );
+    let by = |pred: &str| -> i64 {
+        q(&format!(
+            "SELECT COUNT(*) FROM session_events e JOIN issues i \
+             ON i.id = replace(e.idem,'decompose:','') \
+             WHERE e.idem LIKE 'decompose:%' AND {pred}"
+        ))
+    };
+    let discarded = by("i.status='discarded'");
+    let epic = by("i.type='epic'");
+    let resolved = by("i.status IN ('discarded','done','verified')");
+    // `Option`, so a missing DENOMINATOR is null rather than 0.0. That
+    // separates "nothing to divide by" from "a small share" at the type level,
+    // where a string like "<1%" separates them only for a caller that parses it
+    // (mixpeek-frustrations' point, and it is the shape to copy if the nudge's
+    // coverage field ever becomes machine-readable).
+    //
+    // AND NEVER 0.0 FOR A NONZERO COUNT. One-decimal rounding is not integer
+    // truncation and does not collapse at 5-of-501 (that is 1.0), which is what
+    // made this safer than the nudge's coverage field — but it is not immune,
+    // only later. The floor is `nudges > 2000*n`, STRICTLY: 1-of-2000 is exactly
+    // 0.05, ten times that is 0.5, and Rust's f64::round goes half-AWAY-from-
+    // zero, so it renders 0.1. The first ratio that renders zero is 1-of-2001.
+    // `nudges` is 545 today growing ~42/day, which puts that crossing about 35
+    // days out. A DATED bug, not an absent one.
+    //
+    // Below the floor the unrounded value is emitted, because "0.0% discarded"
+    // beside `outcome_discarded: 1` is the ZERO THAT MEANS NONE again: not an
+    // imprecise number, a different claim. A genuine zero still renders 0.0 —
+    // the guard is about nonzero counts, not about hiding zeros, and a cell
+    // pins that.
+    //
+    // The boundary above is pinned in a TEST rather than trusted here, because
+    // I first worked it out in Python and got it wrong by one: Python's round()
+    // is banker's rounding and disagrees with Rust at exactly the half-step.
+    let pct = |n: i64| -> Option<f64> {
+        (nudges > 0 && n >= 0).then(|| {
+            let exact = n as f64 * 100.0 / nudges as f64;
+            let rounded = (exact * 10.0).round() / 10.0;
+            if rounded == 0.0 && n > 0 {
+                exact
+            } else {
+                rounded
+            }
+        })
+    };
+    json!({
+        "note": "one nudge per card ever (idem decompose:<id>), so `nudges` is the count of \
+                 lanes woken to dispose of a card amux minted. Watch discarded_pct: it is the \
+                 share of those turns that reached a foregone conclusion.",
+        "nudges": nudges,
+        "nudges_7d": nudges_7d,
+        "outcome_discarded": discarded,
+        "outcome_promoted_to_epic": epic,
+        "outcome_resolved": resolved,
+        "discarded_pct": pct(discarded),
+        "promoted_to_epic_pct": pct(epic),
+        "still_open": (nudges >= 0 && resolved >= 0).then(|| nudges - resolved),
+    })
 }
 
 pub fn routes() -> axum::Router<AppState> {
@@ -3458,9 +4173,96 @@ pub fn routes() -> axum::Router<AppState> {
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
+mod reviewer_renag_tests {
+    use super::reviewer_acted_since_review;
+
+    /// The AF-203 specimen, verbatim in shape: amux is named reviewer, reviews
+    /// and rejects, and the log then carries rows that are NOT actor actions.
+    const REAL: &str = "\
+`14:37` commit ab6f5f30 — fix(messages): clamp /api/history (AF-213)
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars
+`14:40` authz: card=silent worker:amux-frustrations=silent group=silent
+`14:45` commit a8786e4a — docs(frustrations): a rejected review has no status";
+
+    #[test]
+    fn a_reviewer_who_has_written_since_review_is_not_nudged_again() {
+        assert!(
+            reviewer_acted_since_review(REAL, "amux"),
+            "amux wrote at 14:33, after the 14:20 move into review — they have reviewed it"
+        );
+    }
+
+    /// CONTROL, and the one that matters: a guard that suppressed every nudge
+    /// would pass the cell above perfectly.
+    #[test]
+    fn a_reviewer_who_has_not_touched_the_card_is_still_nudged() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:45` commit a8786e4a — docs(frustrations): a rejected review has no status";
+        assert!(
+            !reviewer_acted_since_review(log, "amux"),
+            "nobody has reviewed it — this is exactly the card the nudge exists for"
+        );
+    }
+
+    /// The non-actor rows must not be read as the reviewer acting. `authz:` and
+    /// `commit <sha> —` lines are the newest lines on a real card most of the
+    /// time, which is why "is the last line the reviewer's" is the wrong test.
+    #[test]
+    fn authz_and_commit_rows_are_not_reviewer_activity() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:40` authz: card=silent worker:amux=silent group=silent
+`14:45` commit a8786e4a — amux fixed something";
+        assert!(
+            !reviewer_acted_since_review(log, "amux"),
+            "an authz row naming the reviewer, and a commit subject containing their name, \
+             are not the reviewer writing to the card"
+        );
+    }
+
+    /// A SECOND ROUND re-arms the nudge. The reviewer's note from the previous
+    /// round is older than the latest move into review, so it must not suppress
+    /// the nudge for work that has since been redone and resubmitted.
+    #[test]
+    fn a_resubmitted_card_nudges_the_reviewer_again() {
+        let log = "\
+`10:00` author: doing -> review
+`10:05` amux: desc +900 chars
+`11:00` author: review -> doing
+`12:00` author: doing -> review";
+        assert!(
+            !reviewer_acted_since_review(log, "amux"),
+            "amux reviewed the FIRST submission; the card was reworked and resubmitted at \
+             12:00 and needs a fresh look"
+        );
+    }
+
+    #[test]
+    fn an_unnamed_reviewer_never_suppresses() {
+        assert!(!reviewer_acted_since_review(REAL, ""));
+        assert!(!reviewer_acted_since_review(REAL, "   "));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use rusqlite::Connection;
+
+    /// Every test below routes through the injected-lookup seam with a
+    /// PERMISSIVE registry, shadowing the real `select_advance`.
+    ///
+    /// A board fixture's `peer` / `reviewer` lanes exist on no machine, so the
+    /// reviewer-unreachable gate (AMUX-3751) turned "this test host has no lane
+    /// called peer" into a routing failure — three routing tests, red on any
+    /// host, including CI. Tests that mean to exercise the GATE pass their own
+    /// lookup to `select_advance_with`; `the_gate_refuses_a_reviewer_no_nudge_
+    /// can_reach` below is the one that does, so this shadow cannot hide it.
+    fn select_advance(conn: &Connection, session: &str, tags: &[String], now: f64) -> Advance {
+        select_advance_with(conn, session, tags, now, &|_, _| None)
+    }
 
     /// The drain cadence must SCALE to the backlog (Ethan 2026-08-13: big idle
     /// backlogs drained too slowly at a flat 2h). Pure math, no env.
@@ -3907,6 +4709,96 @@ mod tests {
         }
     }
 
+    // ---- pickup scoring (AMUX-3779) --------------------------------------
+
+    /// Full-control insert for scoring tests: pick the type, creation time,
+    /// board position and pin. Desc/title are the same non-junk shape the
+    /// passing pickup tests use, so the refusal guards let the card through.
+    #[allow(clippy::too_many_arguments)]
+    fn add_full(
+        conn: &Connection,
+        id: &str,
+        session: &str,
+        status: &str,
+        item_type: &str,
+        created: i64,
+        pos: f64,
+        pinned: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,pos,pinned) \
+             VALUES (?1, 'Work item ' || ?1, 'SCOPE: real work\n- [ ] do it', ?2,?3,?4,?4,'agent',?5,?6,?7)",
+            rusqlite::params![id, status, session, created, item_type, pos, pinned],
+        )
+        .expect("insert full");
+    }
+
+    /// A non-terminal card in some OTHER lane that depends on `target` — counts
+    /// toward `target`'s critical path without competing as a pickup candidate.
+    fn add_dependent(conn: &Connection, id: &str, target: &str) {
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,depends_on) \
+             VALUES (?1,?1,'x','todo','other', 0, 0,'agent','code', ?2)",
+            rusqlite::params![id, format!("[\"{target}\"]")],
+        )
+        .expect("insert dependent");
+    }
+
+    #[test]
+    fn scoring_picks_the_oldest_todo_not_the_newest() {
+        // Default (scoring on). Legacy pos-order would pick the newest card,
+        // which sits at the top of the column; scoring surfaces the starved one.
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 3 * 86400, -1024.0, 0);
+        add_full(&conn, "NEW", "lane", "todo", "code", now as i64, -99999.0, 0); // topmost pos
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("OLD"), "the 3-day-old card must be worked before the fresh one");
+    }
+
+    #[test]
+    fn a_pinned_todo_leads_regardless_of_age() {
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 5 * 86400, -1024.0, 0);
+        add_full(&conn, "PIN", "lane", "todo", "code", now as i64, -50.0, 1); // pinned, fresh
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("PIN"), "a pinned card is the hard human override");
+    }
+
+    #[test]
+    fn a_p0_tag_lifts_a_fresh_bug_over_an_older_chore() {
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "CHORE", "lane", "todo", "chore", now as i64 - 2 * 86400, -1024.0, 0);
+        add_full(&conn, "BUG", "lane", "todo", "bug", now as i64, -50.0, 0);
+        tag(&conn, "BUG", "p0", now);
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("BUG"), "a fresh p0 bug must outrank a 2-day-old chore");
+    }
+
+    #[test]
+    fn dependents_lift_a_card_on_the_critical_path() {
+        let conn = board_db();
+        let now = 1_000_000.0;
+        add_full(&conn, "PLAIN", "lane", "todo", "code", now as i64, -99999.0, 0); // topmost
+        add_full(&conn, "DEP", "lane", "todo", "code", now as i64, -50.0, 0);
+        add_dependent(&conn, "D1", "DEP");
+        add_dependent(&conn, "D2", "DEP");
+        let p = select_pickup(&conn, "lane", now);
+        assert_eq!(claimed(&p), Some("DEP"), "the card two others depend on must lead");
+    }
+
+    #[test]
+    fn type_and_tag_weights_are_ordered() {
+        assert!(type_weight("blocker") > type_weight("code"));
+        assert!(type_weight("bug") > type_weight("doc"));
+        assert_eq!(type_weight("chore"), 0);
+        assert_eq!(type_weight("unknown-legacy"), 6, "unknown defaults code-like");
+        assert!(tag_severity(&["p0".into()]) > tag_severity(&["p1".into()]));
+        assert_eq!(tag_severity(&["nope".into()]), 0);
+    }
+
     #[test]
     fn an_eligible_todo_is_selected_and_the_prompt_names_the_card() {
         let conn = board_db();
@@ -4168,6 +5060,86 @@ mod tests {
             "a whitespace-only source_ref is not a live trigger: {ids:?}"
         );
         assert_eq!(held, 1, "exactly the one live-trigger card is counted as held");
+    }
+
+    /// AMUX-3777: the HELD-CARD re-nag arm, which had NO coverage at all.
+    ///
+    /// Two arms emit `needsyou.renag`: one scans the lane's whole queue for the
+    /// oldest stale ask, the other fires about the card the lane is CURRENTLY
+    /// HOLDING. Both wrote `kind: "renag"`, so the ledger could not tell them
+    /// apart — and the AMUX-3768 audit's empirical confirmation of this event
+    /// type (0 during its dead window, 100 rows after the fix) was therefore a
+    /// statement about the TYPE, not about either branch.
+    ///
+    /// Then the suite turned out to be no better than the ledger. Verified by
+    /// mutation before writing this: replacing this arm's whole match with
+    /// `None::<String>` — so it can never nudge — left all 78 board_drive tests
+    /// GREEN. The branch could have been deleted outright and nothing would have
+    /// said so.
+    ///
+    /// So this pins both halves: that the arm fires, and that it is now
+    /// distinguishable from its sibling in the event data.
+    #[test]
+    fn the_held_card_renag_arm_fires_and_is_distinguishable_from_the_queue_scan_arm() {
+        let conn = board_db();
+        let now = now_f64();
+        let stale = now - (needsyou_renag_days() + 2.0) * 86400.0;
+        // The lane HOLDS this card (doing), it is tagged needs:you, and the ask
+        // is older than the window. That is arm 2's precondition.
+        add_card(&conn, "H-1", "lane", "doing", "held and unanswered", "SCOPE: x");
+        tag(&conn, "H-1", "needs:you", stale);
+
+        // ARM 2 IS HEAVILY SHADOWED, which is why it had no coverage: the
+        // queue-scan arm runs FIRST and its query selects ANY stale needs:you
+        // card for the session — tag OR status, including cards in doing/review,
+        // which is arm 2's entire population. It takes the OLDEST and returns.
+        //
+        // So arm 2 is reachable only through a narrow gap: the oldest pick is
+        // inside its own dedupe window (so arm 1 falls through without
+        // returning) while the HELD card is a different, un-nagged one. That is
+        // this fixture. Discovered by writing the naive version first and
+        // watching it hit arm 1 — variant 3 of random's taxonomy (an arm made
+        // unreachable by an earlier one), found in the branch AMUX-3768 flagged
+        // as uncountable.
+        add_card(&conn, "A-0", "lane", "needsyou", "older, already nagged", "SCOPE: x");
+        tag(&conn, "A-0", "needs:you", stale - 86400.0);
+        conn.execute(
+            "INSERT INTO session_events (ts,session,type,data,source) \
+             VALUES (?1,'lane','needsyou.renag','{\"issue\": \"A-0\"}','board-drive')",
+            // 30 MINUTES, NOT 10. A `needsyou.renag` row is read by TWO
+            // clocks: the per-card dedupe (3 days) and the PER-LANE advance
+            // cooldown (15 min, which counts this type). At 10 minutes the
+            // fixture tripped the cooldown and `select_advance` returned early,
+            // so the test failed for a reason that had nothing to do with the
+            // arm under test. 30 minutes is outside the cooldown and well
+            // inside the dedupe window, which is the state being modelled.
+            rusqlite::params![now - 1800.0],
+        )
+        .expect("dedupe the older pick");
+
+        let Advance::Nudge { kind, card, .. } = select_advance(&conn, "lane", &[], now) else {
+            panic!("a held needs:you card past the window must re-nag");
+        };
+        assert_eq!(card, "H-1", "the deduped older card must not be the one nudged about");
+        assert_eq!(
+            kind, "renag-held",
+            "the held-card arm must be distinguishable in the ledger from the queue scan — \
+             sharing `renag` is what made its fire count uncountable"
+        );
+
+        // CONTROL: inside the window it must NOT nudge, or the assertion above
+        // is just "any held needs:you card nudges" and the staleness gate is
+        // untested.
+        let conn2 = board_db();
+        add_card(&conn2, "H-2", "lane", "doing", "held, asked recently", "SCOPE: x");
+        tag(&conn2, "H-2", "needs:you", now - 3600.0);
+        assert!(
+            matches!(
+                select_advance(&conn2, "lane", &[], now),
+                Advance::None { reason: "needsyou", .. }
+            ),
+            "a fresh ask is the human's to answer, not a lane to nag"
+        );
     }
 
     /// A card parked by the DOCUMENTED transition — core's `Doing -> NeedsYou`,
@@ -4464,6 +5436,46 @@ mod tests {
             log.contains("by amux-frustrations") && log.contains("reassigned from amux"),
             "a cross-owner claim must record the reassignment in the card log: {log:?}"
         );
+
+        // AND IT MUST REACH THE LEDGER (AMUX-3776). The card log and a
+        // tracing::warn were the only records, so a sweep of `session_events`
+        // could not find this violation at all — while the ordinary path emits
+        // `task.claimed` right beside it. The asymmetry is the bug: the branch
+        // that is supposed to be impossible was the one leaving no row.
+        //
+        // It also blocks the (reached, taken) instrument AMUX-3768 proposes,
+        // which can only see branches that RECORD: this one would report
+        // dead-by-absence forever while being perfectly reachable.
+        let rows = |t: &str| -> Vec<String> {
+            store
+                .read()
+                .unwrap()
+                .prepare("SELECT COALESCE(data,'') FROM session_events WHERE type=?1")
+                .and_then(|mut st| {
+                    st.query_map([t], |r| r.get::<_, String>(0)).map(|r| r.flatten().collect())
+                })
+                .unwrap_or_default()
+        };
+        let cross = rows("claim.cross_owner");
+        assert_eq!(cross.len(), 1, "exactly the ONE cross-owner claim files a row: {cross:?}");
+        assert!(
+            cross[0].contains("AF-99") && cross[0].contains("amux"),
+            "the row must name the card and the prior owner, or it cannot be investigated: {}",
+            cross[0]
+        );
+        // CONTROL: the same-owner claim above must NOT have filed one, or this
+        // type says nothing and the ledger is noisier for no gain.
+        assert!(
+            !cross[0].contains("AF-78"),
+            "a same-owner claim is not a violation: {}",
+            cross[0]
+        );
+        assert_eq!(
+            rows("task.claimed").len(),
+            2,
+            "both claims still emit task.claimed — the new type is ADDITIONAL, not a \
+             replacement, or every existing consumer of the claim ledger silently loses a row"
+        );
     }
 
     #[test]
@@ -4491,6 +5503,259 @@ mod tests {
         conn.execute("UPDATE issues SET archived=1 WHERE id='D-1'", []).expect("archive");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
         assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// AMUX-3757, Ethan 2026-08-26: "why do i need to push @tubescience to
+    /// continue despite it having so many tasks in its backlog".
+    ///
+    /// Because typing at a lane disabled its auto-pickup. Every prompt is
+    /// auto-captured as a `doing` card whose desc is still literally
+    /// `**Prompt:** <what he typed>`, and that card counted against WIP-1. The
+    /// specimen is TUBES-2225, titled "Why are you stopping" — the complaint
+    /// about the lane stopping was the thing holding the slot that kept it
+    /// stopped. Measured that day: 14 of 52 running lanes idle at the cap with
+    /// 281 cards stranded behind them.
+    ///
+    /// The second cell is the one that makes this a gate rather than a hole. A
+    /// RESHAPED card — desc rewritten into a real definition, which is the exit
+    /// the decompose nudge asks for — must go back to holding WIP, because at
+    /// that point it IS work in progress. Without it, `NOT (creator='amux')`
+    /// alone would exempt every amux-minted card forever and this test would
+    /// look identical.
+    #[test]
+    fn a_capture_shell_does_not_hold_the_wip_slot_but_a_reshaped_card_does() {
+        let conn = board_db();
+        add_card(&conn, "C-1", "lane", "doing", "Why are you stopping", "**Prompt:** why are you stopping? you should continue");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='C-1'", []).expect("mint");
+        add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
+        assert_eq!(
+            claimed(&select_pickup(&conn, "lane", now_f64())),
+            Some("T-1"),
+            "an unanswered prompt is not work in progress; the lane must still be dealt"
+        );
+
+        // Reshaped: same card, same creator, a real definition.
+        conn.execute(
+            "UPDATE issues SET \"desc\"='SCOPE: fix the stall\n- [ ] repro' WHERE id='C-1'",
+            [],
+        )
+        .expect("reshape");
+        conn.execute("UPDATE issues SET status='todo' WHERE id='T-1'", []).expect("reset");
+        match select_pickup(&conn, "lane", now_f64()) {
+            Pickup::None { reason, detail } => {
+                assert_eq!(reason, "wip-cap");
+                assert!(detail.contains("C-1"), "the reshaped card holds the slot: {detail}");
+            }
+            other => panic!(
+                "a reshaped capture is real work and must hold WIP, got {:?}",
+                claimed(&other)
+            ),
+        }
+    }
+
+    /// AMUX-3758. The number that answers "we need to rethink how we do amux
+    /// because this isn't working" is a FLEET number, and every existing view
+    /// is per-lane.
+    ///
+    /// The median is hand-rolled SQL (`ORDER BY ... DESC LIMIT 1 OFFSET n/2`),
+    /// which is exactly the kind of expression that returns a plausible number
+    /// while being wrong — so the fixture uses ages whose median is not the
+    /// mean and not an endpoint. 2/10/30 has mean 14 and median 10; an
+    /// off-by-one in the OFFSET lands on 2 or 30, and averaging lands on 14.
+    #[test]
+    fn the_queue_shape_reports_the_dispatchable_slice_and_the_age_of_the_human_backlog() {
+        let conn = board_db();
+        let now = now_f64();
+        add_card(&conn, "T-1", "lane", "todo", "workable", "SCOPE: x");
+        for (n, days) in [("N-1", 2.0), ("N-2", 10.0), ("N-3", 30.0)] {
+            add_card(&conn, n, "lane", "needsyou", "asked a human", "SCOPE: x");
+            conn.execute(
+                "UPDATE issues SET updated=?1 WHERE id=?2",
+                rusqlite::params![(now - days * 86400.0) as i64, n],
+            )
+            .expect("age");
+        }
+        for n in ["B-1", "B-2", "B-3", "B-4", "B-5", "B-6"] {
+            add_card(&conn, n, "lane", "backlog", "parked", "SCOPE: x");
+        }
+        // An ARCHIVED card is cleared, and must not inflate the denominator —
+        // otherwise dispatchable_pct falls as the board is TIDIED, which reads
+        // as the fleet getting worse.
+        add_card(&conn, "Z-1", "lane", "backlog", "cleared", "SCOPE: x");
+        conn.execute("UPDATE issues SET archived=1 WHERE id='Z-1'", []).expect("archive");
+
+        let s = fleet_queue_shape(&conn);
+        assert_eq!(s["open_total"], json!(10), "1 todo + 3 needsyou + 6 backlog: {s}");
+        assert_eq!(s["dispatchable_todo"], json!(1));
+        assert_eq!(s["dispatchable_pct"], json!(10.0), "1 of 10, to one decimal: {s}");
+        assert_eq!(s["by_status"]["backlog"], json!(6));
+        assert_eq!(s["by_status"]["needsyou"], json!(3));
+        let med = s["needsyou_median_age_d"].as_f64().expect("a median");
+        assert!(
+            (med - 10.0).abs() < 0.5,
+            "the MIDDLE of 2/10/30 days, not the mean (14) and not an endpoint: got {med}"
+        );
+
+        // A fleet with a genuinely empty board reads zero for the same headline,
+        // so `open_total` is what tells the two apart (ethos rule 4).
+        let empty = board_db();
+        let e = fleet_queue_shape(&empty);
+        assert_eq!(e["dispatchable_pct"], json!(0.0));
+        assert_eq!(e["open_total"], json!(0), "zero%% with zero open is 'nothing to do': {e}");
+        assert!(e["needsyou_median_age_d"].is_null(), "no pile, no age: {e}");
+    }
+
+    /// AMUX-3759, Ethan: "theres also way too much tokens used for some reason
+    /// in between tasks".
+    ///
+    /// The pickup handed the lane a card ID and 500 characters, so the lane
+    /// spent MODEL CALLS fetching back text amux already had. Measured
+    /// 2026-08-26: an auto-pickup turn takes a median of 22 tool steps where a
+    /// human-prompted turn takes 3, at a median resident context of 308k tokens
+    /// per call — so a saved fetch is worth ~300k input tokens against ~1k of
+    /// extra prompt. On the live queue the cap truncated 86% of todo cards and
+    /// discarded 108,820 characters of definition.
+    ///
+    /// Two cells, and the second is the one that matters: a cut excerpt must
+    /// SAY it was cut. Silent truncation is indistinguishable from a short
+    /// card, so the lane works confidently from half a definition — the AF-161
+    /// shape, absence reading as emptiness.
+    #[test]
+    fn the_pickup_excerpt_carries_the_card_and_admits_when_it_does_not() {
+        let conn = board_db();
+        let short = "SCOPE: rotate the key\n- [ ] do it";
+        add_card(&conn, "P-1", "lane", "todo", "short card", short);
+        let row = bs::get_issue(&conn, "P-1").unwrap().unwrap();
+        let p = pickup_prompt(&conn, "lane", &row);
+        assert!(p.contains("rotate the key"), "the whole definition must ride along: {p}");
+        assert!(
+            !p.contains("excerpt cut at"),
+            "a card that fits is not truncated and must not claim to be: {p}"
+        );
+
+        // A card longer than the cap. 6,000 chars is between this fleet's p75
+        // (3,652) and its max (10,299), so it is a real card, not a synthetic
+        // extreme — and it is over the 4000 default while being under what a
+        // "just raise it a lot" cap would catch.
+        let long = format!("SCOPE: big one\n{}", "x".repeat(6000));
+        add_card(&conn, "P-2", "lane", "todo", "long card", &long);
+        let row = bs::get_issue(&conn, "P-2").unwrap().unwrap();
+        let p = pickup_prompt(&conn, "lane", &row);
+        assert!(
+            p.contains("excerpt cut at"),
+            "a truncated excerpt must announce itself: {}",
+            &p[..p.len().min(400)]
+        );
+        assert!(
+            p.contains("GET /api/board/P-2"),
+            "and name the read that returns the rest, or the admission is useless"
+        );
+        // The old 500-char cap is the regression this guards: the excerpt must
+        // carry MUCH more than a stub, or the lane is back to fetching.
+        let quoted = p.matches('x').count();
+        assert!(
+            quoted > 3000,
+            "the excerpt must carry the card, not a 500-char stub (got {quoted} body chars)"
+        );
+    }
+
+    /// THE PICKUP PROMPT MUST STAY READABLE BY THE STALE-PICKUP GUARD, and this
+    /// is deliberately in board_drive.rs rather than beside the parser: it fails
+    /// in the file someone is editing when they reword the template.
+    ///
+    /// Its predecessor lived next to `pickup_card_id` and fed a HAND-WRITTEN
+    /// copy of the template, which is why it was green for the entire outage.
+    /// 03ed2b6c (2026-08-26 17:36) shortened "Claimed board card <ID> from your
+    /// queue" to "Claimed <ID> —", the parser kept the old literal, and from
+    /// that commit `pickup_card_id` returned None for every real pickup: the
+    /// AMUX-3052 guard voided nothing for 17 hours across 97 deliveries. Three
+    /// were provably stale on arrival (AF-267/amux-frustrations 44s, TUBES-2242
+    /// 33s, NISSA-89 18s after their cards closed) and each cost a lane a turn
+    /// being told to redo finished work.
+    ///
+    /// A test that mints its own input can only ever pin ITSELF. This one runs
+    /// the real producer into the real parser.
+    #[test]
+    fn pickup_prompt_round_trips_through_the_stale_guard() {
+        let conn = board_db();
+        add_card(&conn, "RT-42", "lane", "doing", "round trip", "SCOPE: whatever\n- [ ] x");
+        let row = bs::get_issue(&conn, "RT-42").unwrap().unwrap();
+        let prompt = pickup_prompt(&conn, "lane", &row);
+
+        assert_eq!(
+            crate::api::session_verbs::pickup_card_id(&prompt).as_deref(),
+            Some("RT-42"),
+            "the stale-pickup guard cannot read the id out of the prompt this file mints, \
+             so it will void nothing and every stale pickup ships: {}",
+            &prompt[..prompt.len().min(200)]
+        );
+
+        // The id must be the FIRST token after the anchor — the property the
+        // parser actually depends on, and the one a reword breaks silently.
+        let after = prompt
+            .split_once(PICKUP_ANCHOR)
+            .expect("the prompt must open with PICKUP_ANCHOR")
+            .1;
+        assert!(
+            after.starts_with("RT-42"),
+            "the card id must be the first token after the anchor: {}",
+            &after[..after.len().min(80)]
+        );
+    }
+
+    /// The nudge and the WIP query must agree about whether a capture shell
+    /// BLOCKS anything.
+    ///
+    /// They stopped agreeing the moment AMUX-3757 exempted capture shells from
+    /// the cap: the nudge still opened "is a capture shell holding your WIP
+    /// slot", which is now false. Caught within the hour, by the nudge being
+    /// delivered to the lane that had just written the exemption — which is
+    /// luck, not a check.
+    ///
+    /// A nudge asserting a blockage that does not exist is worse than a silent
+    /// one. Its entire persuasive force is "this is blocking you", so a lane
+    /// acts on fictional urgency, and the honest reason to dispose of a capture
+    /// shell (no status is a true statement about it, so it sits on the board
+    /// reading like work forever) goes unsaid.
+    ///
+    /// Both halves are derived from the SAME card here, so changing either one
+    /// alone fails.
+    #[test]
+    fn the_decompose_nudge_does_not_claim_a_blockage_the_wip_query_exempts() {
+        let conn = board_db();
+        add_card(&conn, "C-9", "lane", "doing", "Why are you stopping", "**Prompt:** why are you stopping?");
+        conn.execute("UPDATE issues SET creator='amux' WHERE id='C-9'", []).expect("mint");
+        add_card(&conn, "T-9", "lane", "todo", "real work", "SCOPE: x\n- [ ] y");
+
+        // The MECHANISM: it does not hold the slot.
+        let blocks_pickup = matches!(
+            select_pickup(&conn, "lane", now_f64()),
+            Pickup::None { reason: "wip-cap", .. }
+        );
+        assert!(!blocks_pickup, "AMUX-3757: a capture shell must not hold the WIP slot");
+
+        // The VIEW: so it must not say it does.
+        let Advance::Nudge { text, kind, .. } = select_advance(&conn, "lane", &[], now_f64()) else {
+            panic!("a capture shell in doing must still draw a decompose nudge");
+        };
+        assert_eq!(kind, "decompose-asked");
+        assert!(
+            !text.to_lowercase().contains("wip slot"),
+            "the nudge claims a blockage the pickup query exempts: {text}"
+        );
+        // And it must still give the lane somewhere to GO, or removing the
+        // false claim just leaves an unmotivated chore.
+        //
+        // The exits, not the prose. My first version asserted the literal
+        // phrase "done or not-done" and went red on 03ed2b6c's compression,
+        // which says the same thing in different words. That is the coupling my
+        // own notes warn about — a text assertion measures wording, not
+        // behaviour — and the sibling test one screen down had already learned
+        // it: "a wording rewrite must be free; an exit losing its command must
+        // not be" (AMUX-3707).
+        for cmd in ["amux board discard", "amux board retitle", "amux board type"] {
+            assert!(text.contains(cmd), "the ask must still reach its exit `{cmd}`: {text}");
+        }
     }
 
     /// Backend, 2026-08-11 afternoon: 16 claims in one hour, every card
@@ -4810,6 +6075,46 @@ mod tests {
         );
     }
 
+    /// AMUX-3751's gate, which shipped with no test of its own and whose only
+    /// effect on the suite was turning three unrelated routing tests red.
+    ///
+    /// A card parked in `review` naming a reviewer that resolves to no worker
+    /// reads HEALTHY — the status says someone is looking at it — while the
+    /// nudge is addressed to a session that does not exist, so nobody is
+    /// coming. Seven open cards sat that way on 2026-08-26, two of them naming
+    /// `amux-rust`, a lane renamed to `amux` long before, because the rename
+    /// cascade migrated `issues.session` and left `issues.reviewer` behind.
+    ///
+    /// Both cells, over the SAME card: the only thing that changes is whether
+    /// the reviewer is reachable. A gate tested only on its refusal could be
+    /// `|_| false` and look identical here.
+    #[test]
+    fn the_gate_refuses_a_reviewer_no_nudge_can_reach() {
+        let conn = board_db();
+        add_card(&conn, "R-9", "lane", "review", "needs a peer", "SCOPE: x");
+        conn.execute("UPDATE issues SET reviewer='amux-rust' WHERE id='R-9'", []).expect("rev");
+
+        match select_advance_with(&conn, "lane", &[], now_f64(), &|_, r| {
+            Some(format!("`{r}` is not a registered worker"))
+        }) {
+            Advance::None { reason, detail } => {
+                assert_eq!(reason, "reviewer-unreachable");
+                assert!(detail.contains("amux-rust"), "must name the dead reviewer: {detail}");
+            }
+            Advance::Nudge { kind, target, .. } => panic!("an unreachable reviewer must not be nudged (kind={kind}, target={target})"),
+        }
+
+        match select_advance_with(&conn, "lane", &[], now_f64(), &|_, n| {
+            (n != "amux-rust").then(|| "not reachable".to_string())
+        }) {
+            Advance::Nudge { target, kind, .. } => {
+                assert_eq!(target, "amux-rust", "a REACHABLE reviewer is still routed");
+                assert_eq!(kind, "review-routed");
+            }
+            Advance::None { reason, detail } => panic!("the gate must only refuse the unreachable case, got {reason}: {detail}"),
+        }
+    }
+
     /// A card in review with a named reviewer is the REVIEWER's work: pushing
     /// the author asks for a self-ack the transition refuses.
     #[test]
@@ -5113,7 +6418,17 @@ mod tests {
         let Advance::Nudge { text, .. } = select_advance(&conn, "lane", &[], now_f64()) else {
             panic!("expected a nudge");
         };
-        assert!(text.contains("close it out to done"), "must aim at done: {text}");
+        // ASSERT THE TERM AND ITS ABSENCE, not the sentence around it. The
+        // property is which status the nudge AIMS AT; the phrasing carrying it
+        // is free to change, and did (03ed2b6c compressed "close it out to
+        // done" to "Close to done with evidence"). Pinning the sentence made a
+        // wording pass look like an AMUX-2312 regression.
+        assert!(text.contains("done"), "must aim at done: {text}");
+        assert!(
+            !text.contains("verified"),
+            "and must NOT name verified for a lane that has not opted in — that is the whole \
+             point of AMUX-2312: {text}"
+        );
         // Opt the lane in by tag and the aim becomes verified.
         conn.execute(
             "INSERT INTO status_scope (status,scope_type,scope_value) VALUES ('verified','tag','infra')",
@@ -5126,7 +6441,7 @@ mod tests {
         else {
             panic!("expected a nudge");
         };
-        assert!(text.contains("close it out to verified"), "must aim at verified: {text}");
+        assert!(text.contains("verified"), "must aim at verified once opted in: {text}");
     }
 
     #[test]
@@ -5136,13 +6451,30 @@ mod tests {
         match select_advance(&conn, "lane", &[], now_f64()) {
             Advance::Nudge { kind, text, .. } => {
                 assert_eq!(kind, "decompose-asked");
-                // The nudge now distinguishes not-work (discard) from
+                // The nudge distinguishes not-work (discard) from
                 // real-unfinished-work (promote to epic) — AMUX-3323, e8e648f.
                 assert!(text.contains("not a unit of work"), "{text}");
-                assert!(
-                    text.contains("PROMOTE it to an epic") && text.contains("discard it"),
-                    "the decompose ask must offer both the epic-promotion and the discard exits: {text}"
-                );
+                // Assert the EXITS, by the command that reaches each one, not by
+                // the sentence that describes it. This cell used to pin the
+                // literal prose ("PROMOTE it to an epic", "discard it"), which
+                // measures wording and not behaviour: it was green for months
+                // while the epic exit it was guarding named no command at all,
+                // because `amux board epic` did not exist (AMUX-3707). A wording
+                // rewrite must be free; an exit losing its command must not be.
+                for cmd in ["amux board discard", "amux board type", "amux board epic"] {
+                    assert!(
+                        text.contains(cmd),
+                        "the decompose ask must reach its exit with `{cmd}`: {text}"
+                    );
+                }
+                assert_cli_verbs_exist(&text);
+                // And it must stay SHORT. The old text was ~250 words re-argued
+                // on every one of ~42 daily firings; the cost Ethan flagged is
+                // the woken turn, but a lane that can act in one command does not
+                // spend a turn working out how. 120 is slack over the current ~85,
+                // not a target to grow into.
+                let words = text.split_whitespace().count();
+                assert!(words <= 120, "the decompose ask has grown back to {words} words: {text}");
             }
             Advance::None { reason, detail } => panic!("expected a split ask, got {reason}: {detail}"),
         }
@@ -5442,6 +6774,108 @@ mod tests {
                  (AF-66). Known verbs: {verbs:?}"
             );
         }
+    }
+
+    /// The capture-shell meter must move with the OUTCOMES, not just count
+    /// nudges (AMUX-3707). A total alone cannot say whether a woken turn reached
+    /// a foregone conclusion or did real judgment, and that ratio is the whole
+    /// reason the number exists.
+    #[test]
+    fn the_capture_shell_meter_reports_the_outcome_split_not_just_a_total() {
+        let conn = board_db();
+        conn.execute("DELETE FROM session_events", []).expect("clear");
+        // Three nudged capture cards: one discarded (foregone), one promoted to
+        // an epic (real judgment), one still open.
+        add_card(&conn, "C-1", "lane", "discarded", "q", "**Prompt:** what is x");
+        add_card(&conn, "C-2", "lane", "doing", "real", "**Prompt:** do a thing");
+        add_card(&conn, "C-3", "lane", "doing", "open", "**Prompt:** another");
+        conn.execute("UPDATE issues SET type='epic' WHERE id='C-2'", []).expect("retype");
+        for id in ["C-1", "C-2", "C-3"] {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,idem,source) \
+                 VALUES (?1,'lane','decompose-asked','{}',?2,'test')",
+                rusqlite::params![now_f64(), format!("decompose:{id}")],
+            )
+            .expect("event");
+        }
+        let m = capture_shell_cost(&conn);
+        assert_eq!(m["nudges"], 3, "{m}");
+        assert_eq!(m["outcome_discarded"], 1, "{m}");
+        assert_eq!(m["outcome_promoted_to_epic"], 1, "{m}");
+        assert_eq!(m["still_open"], 2, "one discarded, two not resolved: {m}");
+        // The ratio is the signal. 1 of 3 discarded = 33.3%.
+        assert_eq!(m["discarded_pct"], 33.3, "{m}");
+
+        // ...and it must MOVE when the outcomes move, or it is a constant with a
+        // plausible value — the shape that gets believed and never rechecked.
+        conn.execute("UPDATE issues SET status='discarded' WHERE id='C-3'", []).expect("upd");
+        let m2 = capture_shell_cost(&conn);
+        assert_eq!(m2["outcome_discarded"], 2, "{m2}");
+        assert_eq!(m2["discarded_pct"], 66.7, "{m2}");
+        assert_eq!(m2["still_open"], 1, "{m2}");
+
+        // NEVER 0.0 FOR A NONZERO COUNT (mixpeek-frustrations, replaying my own
+        // claim against this code). One-decimal rounding survives 5-of-501 where
+        // integer division does not, but it still collapses past a 2000:1 ratio
+        // — and `nudges` grows ~42/day from 545, so that is weeks away, not
+        // never. A rendered 0.0 beside a nonzero count is the same
+        // zero-that-means-none as the nudge's "0% coverage".
+        for _ in 0..5000 {
+            conn.execute(
+                "INSERT INTO session_events (ts,session,type,data,idem,source) \
+                 VALUES (?1,'lane','decompose-asked','{}',?2,'test')",
+                rusqlite::params![now_f64(), format!("decompose:pad{}", rand_pad())],
+            )
+            .expect("pad");
+        }
+        let m3 = capture_shell_cost(&conn);
+        // THE PREMISE, asserted: the ratio must actually be past the floor, or
+        // the guard below never fires and the cell passes against anything. The
+        // first draft padded to 2100 and 2-of-2103 rounds to 0.1, not 0.0 — so
+        // it was vacuous, and only a mutation run showed it. The floor is
+        // n*100/nudges < 0.05, i.e. nudges > 2000*n.
+        let nud = m3["nudges"].as_i64().unwrap();
+        let disc = m3["outcome_discarded"].as_i64().unwrap();
+        assert!(
+            disc > 0 && nud > 2000 * disc,
+            "premise: {disc} discarded of {nud} must be past the rounding floor: {m3}"
+        );
+        let d = m3["discarded_pct"].as_f64().expect("still a number");
+        assert!(
+            d > 0.0,
+            "2 discarded out of >2000 must not render as 0.0 — that reads as 'none': {m3}"
+        );
+
+        // THE BOUNDARY, PINNED IN RUST — because I got it wrong in prose by
+        // checking it in Python (mixpeek-frustrations caught it). Python's
+        // round() is BANKER'S rounding and Rust's f64::round is half-AWAY-from-
+        // zero, so the same expression disagrees at exactly the half-step: 1 of
+        // 2000 is 0.05, times ten is 0.5, and Python gives 0 where Rust gives 1.
+        // A boundary example verified in the wrong language is its own instance
+        // of this thread's whole subject.
+        //
+        // So the floor is `nudges > 2000*n`, STRICTLY, and these cells say so in
+        // the language that ships. They also pin the rounding mode: if
+        // f64::round ever changed, or someone rewrote this with a helper that
+        // rounds half-to-even, the first line goes red.
+        let render = |n: i64, nudges: i64| -> f64 {
+            let exact = n as f64 * 100.0 / nudges as f64;
+            let rounded = (exact * 10.0).round() / 10.0;
+            if rounded == 0.0 && n > 0 { exact } else { rounded }
+        };
+        assert_eq!(render(1, 2000), 0.1, "1-of-2000 is exactly 0.5 and rounds AWAY from zero");
+        assert!(render(1, 2001) > 0.0, "the first ratio past the floor must not be 0.0");
+        assert!(render(1, 2001) < 0.05, "...and it is the exact value, not a rounded one");
+        assert_eq!(render(0, 2001), 0.0, "a genuine ZERO still renders zero — the guard is \
+                                          about nonzero counts, not about hiding zeros");
+    }
+
+    /// Distinct ids for the padding rows above. A counter, not randomness:
+    /// `idem` is UNIQUE, and the test must not depend on a clock or an RNG.
+    fn rand_pad() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        N.fetch_add(1, Ordering::Relaxed)
     }
 
     /// The check above can only be trusted if it FIRES. A prompt naming a verb

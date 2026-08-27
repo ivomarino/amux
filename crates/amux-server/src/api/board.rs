@@ -240,7 +240,7 @@ async fn get_contract(
             "where": "_amux_state_events rows carry the FULL pre-mutation card snapshot in                       their payload, so a description overwritten by a PATCH is recoverable                       without any backup",
             "how": "find the row for the mutation (by card id and timestamp) and read the                     snapshot out of its payload",
             "prevention": "PATCH refuses two acts and the refusal body names which via `rule`: SIZE — a replace dropping a strict majority of a desc of 500+ chars, any writer; and AUTHORSHIP — a replace by a DIFFERENT session in which NONE of the card owner's lines survive, at any magnitude and in either direction. Length is not the test: a 54-char desc replaced by 17 chars and a 264-char desc replaced by 392 both destroyed everything and both passed the old size floors (AF-191). Both escape via desc_shrink_ack. To ADD rather than replace — almost always what a reviewer means — send PATCH /api/board/<id> {\"desc_append\": \"your note\"}. `desc_append` is a FIELD in the PATCH body, not a sub-path: POST /api/board/<id>/desc-append is NOT routed and a lane guessed it twice on 2026-08-24 (AF-187)",
-            "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head and \"slim\": 1). An ABSENT field is not an empty                                  one, and .get(\"desc\") returns None either way — read                                  desc_len, or GET the single card",
+            "why_this_happens": "GET /api/board OMITS `desc` (slim rows carry desc_len/                                 desc_head, and a `slim` key holding the ARRAY of dropped                                  field names — not the flag `1` this line claimed until                                  2026-08-27). An ABSENT field is not an empty one, and                                  .get(\"desc\") returns None either way — read desc_len,                                  read `slim` to see everything else that was dropped, or                                  GET the single card",
         },
         "list": {
             "endpoint": "GET /api/board",
@@ -258,14 +258,26 @@ async fn get_contract(
                 "limit": "page size, applied AFTER done_limit",
                 "offset": "page offset",
                 "slim": "1 = trimmed item bodies (desc_head/desc_len/log_n/folded_n instead of \
-                        prose) — the DEFAULT shape since AMUX-3496. Slim rows carry \
-                        \"slim\": 1 so a consumer can tell a dropped field from an empty one \
-                        (AF-161: a census read absence as emptiness and was 100% wrong)",
+                        prose) — the DEFAULT shape since AMUX-3496. Each slim row carries a \
+                        `slim` key whose VALUE IS THE ARRAY of field names that row dropped \
+                        (see slim_omits), so a consumer can tell a dropped field from an empty \
+                        one (AF-161: a census read absence as emptiness and was 100% wrong). \
+                        This said \"slim\": 1 until 2026-08-27, describing a flag where the code \
+                        ships the answer — a reader who trusted it would never think to look \
+                        there for WHICH fields went missing, which is the AF-161 failure with \
+                        the remedy already built",
                 "full": "1 = full prose bodies (desc + log). The default list is slim; a \
                          reader that needs desc/log must ask (slim=0 also honored)",
                 "quota": "1 = per-status terminal quotas (verified floor 300; done/discarded \
                           share done_limit) instead of the lumped cap — the dashboard poll's \
                           shape (AMUX-3503)",
+                "count": "1 = return {count, filter} instead of the rows. Counts what THIS \
+                          filter would return, from the same filter+cap the list runs, so a \
+                          header cannot disagree with what expanding it shows. Pass the SAME \
+                          params you will fetch with — terminal statuses are capped unless \
+                          you add done_limit=0 or all=1. Added for the dashboard's collapsed \
+                          Archived (N) header, where shipping the set to render a number cost \
+                          a measured +38% on the board poll (AMUX-3715)",
             },
             // NOT a filter — descriptive metadata about what `slim` DROPS, so it
             // lives outside `filters`. It sat inside `filters` from 64a9cb7d until
@@ -275,7 +287,20 @@ async fn get_contract(
             // gone green and been WRONG — it would document a query param that does
             // not exist and that axum silently drops, which is the exact defect that
             // test was written to catch. Keep `filters` strictly name -> description.
-            "slim_omits": ["desc", "log", "source_ref", "last_verified_at", "due_time", "gate"],
+            // SERIALIZED FROM THE CONST, not restated. This was a hardcoded
+            // literal of the same six fields while `SLIM_OMITS` (the list the
+            // slim writer actually removes) sat 800 lines below it — two
+            // definitions of one fact, in one file, neither referencing the
+            // other, and already textually divergent: the literal was in a
+            // different ORDER, so a diff of the two would not have looked like
+            // a duplicate.
+            //
+            // I introduced the second one myself, in d3cc2179, in the commit
+            // that closed AF-161's class. The contract's copy landed hours
+            // earlier at 64a9cb7d and I never grepped for it. That is the whole
+            // failure mode AF-161 names — one fact, two spellings, drift is a
+            // matter of time — reintroduced by the fix for it.
+            "slim_omits": SLIM_OMITS,
             "not_a_filter": {
                 "q / query / search": "REFUSED with 400 — /api/board does not search, it would \
                                        return the entire board. Use /api/search?q=",
@@ -984,8 +1009,51 @@ fn actor_from_headers(headers: &HeaderMap) -> (Actor, String) {
 /// [`IssueRow::snapshot`] — the SAME serialization the event journal records
 /// as each mutation's payload (RR-0111a), so API body, journal payload, and
 /// replay verification can never drift apart.
+/// Designate a card whose owning lane is ISOLATED (AMUX-3713, Ethan: "the card
+/// should have a designation that it is").
+///
+/// An isolated worker is a raw agent with the harness stripped: hidden from the
+/// peer fleet list and refused as a peer send target. Its CARDS were exempt from
+/// all of that — `desktop` owns 25 and not one said so — so a peer reading the
+/// board saw an ordinary card with an ordinary session name and no indication
+/// that the owning lane is undiscoverable and cannot be messaged. Same shape as
+/// AMUX-2796: work routed to a lane that cannot receive it.
+///
+/// IN A HELPER BOTH PATHS CALL, because the first version lived in `list_body`
+/// and the single-card GET does not go through it — `get_item` calls
+/// `detail_body` directly. The test drove `list_body(row, slim=false)` and
+/// passed while the live detail endpoint returned nothing, which is ethos rule
+/// 7's wrong-layer failure exactly: a real property asserted in a place the
+/// shipped request does not flow through. Verifying against the running server
+/// is what caught it.
+///
+/// Resolved through `session_is_isolated`, the same predicate the fleet filter
+/// and the send guard consult, so a card cannot claim a reachability the send
+/// path disagrees with.
+fn designate_owner_reach(obj: &mut serde_json::Map<String, Value>, row: &IssueRow) {
+    if !row.session.as_deref().is_some_and(crate::api::session_verbs::session_is_isolated) {
+        // Absent rather than `false`: this is a rare property and a key on every
+        // one of 1700+ cards saying "normal" is payload for nothing.
+        return;
+    }
+    obj.insert("owner_isolated".into(), json!(true));
+    // The MEANING, not just the flag. A bare boolean makes every consumer
+    // re-derive what isolation implies, and they will not agree.
+    obj.insert(
+        "owner_reach".into(),
+        json!("isolated (raw agent): not in the peer fleet list and refused as a peer send target. Reachable only by the owner from the dashboard — do not route this card to a peer expecting them to message the owner."),
+    );
+}
+
 fn detail_body(row: &IssueRow) -> Value {
-    row.snapshot()
+    let mut v = row.snapshot();
+    // HERE, not in `list_body`: this is the function `get_item` calls for the
+    // single-card GET, and `list_body`'s non-slim branch calls it too — so one
+    // insertion covers both shipped paths (AMUX-3713).
+    if let Some(obj) = v.as_object_mut() {
+        designate_owner_reach(obj, row);
+    }
+    v
 }
 
 /// List body, Python-parity (AMUX-2586 fix #4). The plain list serves the
@@ -1004,6 +1072,12 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
     // row.desc/row.log by reference.
     let mut v = if slim { row.snapshot_slim() } else { detail_body(row) };
     let obj = v.as_object_mut().expect("snapshot is an object");
+    // Only the SLIM branch needs this here: the non-slim branch got it inside
+    // `detail_body` above, which is also the function the single-card GET calls.
+    if slim {
+        designate_owner_reach(obj, row);
+    }
+    // (see designate_owner_reach for why this exists)
     if slim {
         obj.insert("desc_len".into(), json!(row.desc.chars().count()));
         let log_n = row
@@ -1107,7 +1181,7 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
         // fixed the caller for `desc`). `slim: 1` below is the general remedy:
         // a consumer can refuse a slim row instead of reading absence as
         // emptiness, and `GET /api/board?describe` names exactly what is gone.
-        for k in ["source_ref", "last_verified_at", "due_time", "gate"] {
+        for k in SLIM_OMITS {
             obj.remove(k);
         }
         // SAY THAT THIS ROW IS SLIM. Ten bytes against ~4.5MB, and it is the
@@ -1117,7 +1191,26 @@ pub fn list_body(row: &IssueRow, slim: bool, stale: bool) -> Value {
         // "loud, not silently empty" — true in the idiom it assumes
         // (`row["desc"]`) and false in the one every consumer actually
         // writes (`row.get("desc")`), which returns None and says nothing.
-        obj.insert("slim".into(), json!(1));
+        // `slim` NAMES WHAT IS GONE (AF-200). It used to serialize as `1`, which
+        // says something was omitted and not what — so a consumer still had to
+        // know the drop list by heart, which is the thing this marker exists to
+        // make unnecessary. Two of the six drops shipped a companion (desc ->
+        // desc_head/desc_len, log -> log_n) and four shipped no signal at all,
+        // including `gate`, which governs transitions, and `last_verified_at`,
+        // which is what a `verified` audit reads.
+        //
+        // Cost of the bare boolean, measured on 2026-08-24: reading `desc` off
+        // this payload returned None for a card carrying 1809 characters, and
+        // the conclusion drawn was that `amux board add --desc-file` was
+        // silently dropping bodies. Three probe cards were filed bisecting a CLI
+        // defect that does not exist, one step away from "fixing" a flag that
+        // works. That is AF-161's own predicted next occurrence — its entry ends
+        // by asking for a payload self-describing about what it omits "rather
+        // than restoring one column and waiting for the next report".
+        //
+        // An array is truthy exactly where `1` was, and nothing tests the value:
+        // the SPA detects slim via `items[0].desc !== undefined` (app.js:22577).
+        obj.insert("slim".into(), json!(SLIM_OMITS));
     }
     if stale {
         obj.insert("stale".into(), json!(true));
@@ -1184,6 +1277,21 @@ pub struct ListParams {
     // renders from the fetch path and the full-push is retired.
     #[serde(default)]
     pub quota: Option<String>,
+    // `?count=1` (AMUX-3715) — how many rows this filter selects, WITHOUT
+    // shipping them.
+    //
+    // For the dashboard's collapsed "Archived (N)" header. Measured before
+    // adding it: the archived set is 445KB raw / 87KB gzipped, a 38% increase
+    // on the board poll, for a section that is collapsed by default — too much
+    // to pay on every load of a mobile-first dashboard just to render a number.
+    //
+    // It runs the SAME filter+cap path the list runs and counts what that
+    // returns, so the header cannot disagree with what expanding it shows
+    // (ethos rule 1: a view must share the predicate of the mechanism it
+    // describes). A count computed by its own SELECT would drift the moment
+    // either changed.
+    #[serde(default)]
+    pub count: Option<String>,
     #[serde(default)]
     pub limit: Option<usize>,
     #[serde(default)]
@@ -1227,7 +1335,7 @@ pub struct ListParams {
 /// announces the terminal cap. (`q`/`query`/`search` are here because they are
 /// consumed above — refused with a 400 — so they are recognised, not ignored.)
 const RECOGNISED_BOARD_PARAMS: &[&str] = &[
-    "status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "limit", "offset", "q", "query",
+    "status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "count", "limit", "offset", "q", "query",
     "search",
 ];
 /// Cache-buster keys clients legitimately append; never a filter typo, so they
@@ -1405,7 +1513,7 @@ pub async fn list_board(
                 "use_instead": format!("/api/search?q={term}"),
                 "why": "This param was silently ignored until 2026-08-11, so the full board came \
                         back looking like ranked results. Refusing loudly beats answering wrongly.",
-                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "limit", "offset"],
+                "board_filters": ["status", "session", "archived", "done_limit", "all", "slim", "full", "quota", "count", "limit", "offset"],
             })),
         )
             .into_response();
@@ -1537,6 +1645,33 @@ pub async fn list_board(
     };
     let total = kept.len();
     let now = now_secs();
+
+    // COUNT-ONLY (AMUX-3715). Placed HERE, after the same filter+cap that
+    // produces `kept`, so the number is literally the length of what the list
+    // would have shipped — not a second SELECT that could drift from it.
+    //
+    // Returns an OBJECT while the list returns a bare array, which is
+    // deliberate: a consumer that forgets `count=1` is in its URL gets a shape
+    // error rather than a plausible-looking one-element array, and a client
+    // reading `.length` on `{"count": 662}` gets undefined rather than 1.
+    if qp_truthy(p.count.as_deref()) {
+        return Json(json!({
+            "count": total,
+            "filter": {
+                "status": p.status.clone(),
+                "session": p.session.clone(),
+                "archived": p.archived.clone(),
+                "done_limit": p.done_limit,
+                "quota": p.quota.clone(),
+            },
+            "note": "count of what THIS filter would return, computed from the same \
+                     filter+cap the list runs. Terminal statuses are capped unless you pass \
+                     done_limit=0 or all=1, so a count taken with different params will \
+                     differ from one taken with these — pass the SAME params you will \
+                     fetch with.",
+        }))
+        .into_response();
+    }
 
     // TWO-FIXES (AMUX-3154): the terminal cap already reports itself in
     // x-amux-truncated / x-amux-terminal-total, but a `curl | json.load` consumer
@@ -2162,10 +2297,24 @@ enum PatchOut {
     /// Any pre-write refusal (400/409) with its exact body.
     Refused(StatusCode, Value),
     /// Invariant 37: nothing changed; `rev` unmoved.
-    Noop { body: Value, ignored: Vec<String> },
+    ///
+    /// `all_ignored` = the body carried keys and EVERY one was unwritable, so the
+    /// request could not have done anything. That is a caller error and answers
+    /// 422; an ordinary no-op (a writable field set to its current value) is a
+    /// successful request that changed nothing and stays 200. See the response
+    /// arm for why the distinction has to be this narrow.
+    Noop { body: Value, ignored: Vec<String>, all_ignored: bool },
     Applied {
         body: Value,
         ignored: Vec<String>,
+        /// Fields whose value was APPLIED, but not to the field the caller
+        /// named (AMUX-3791). Distinct from `ignored` on purpose: ignored
+        /// means "this did not happen", diverted means "this happened
+        /// somewhere else". Reporting a diversion as ignored would be a lie in
+        /// the more damaging direction — a caller told their trigger was
+        /// dropped goes and sets it again, or files a bug against working
+        /// code, which is exactly what this card was.
+        diverted: Vec<Value>,
         /// (session, from_status, to_status) when a status change happened,
         /// for reactive pickup: if the transition freed the lane (done/verified/
         /// discarded), fire an immediate pickup instead of waiting 60s.
@@ -2450,6 +2599,23 @@ pub async fn clear_done(State(state): State<AppState>, headers: HeaderMap) -> Re
 /// escape is one field (`desc_shrink_ack`) that the refusal prints, and
 /// `desc_append` is there to add instead. A peer silently destroying a
 /// one-sentence card is the worse trade.
+/// Every field the slim list payload omits, in ONE definition shared by the
+/// writer and its test (AF-200).
+///
+/// The test used to restate this as its own literal beside the code, which is a
+/// paraphrase rather than the shipped list — the shape ethos rule 7 warns about,
+/// and how `reviewer` could be dropped for weeks with a green test next to it
+/// (AF-161). A seventh omission now cannot be added without this array, and the
+/// array is what callers are told.
+pub(crate) const SLIM_OMITS: [&str; 6] = [
+    "desc",
+    "due_time",
+    "gate",
+    "last_verified_at",
+    "log",
+    "source_ref",
+];
+
 pub(crate) fn desc_replace_destroys_peer_prose(
     owner: &str,
     writer: &str,
@@ -2507,6 +2673,51 @@ pub async fn patch_item(
             }),
         );
     }
+    // A REASON IS REQUIRED FOR FORCE, for the same reason attribution is
+    // (AMUX-3464, 2026-08-26). The check above fixed WHO and stopped there,
+    // and the half it left undone was 100% broken in production: of the 41
+    // force audit lines this board has ever written, 41 read `reason=` with
+    // nothing after the `=`. Not "mostly empty" — never once populated. The
+    // format string advertises the judgment and the field behind it was
+    // decoration, which is ethos rule 6 exactly: a bypass that claims to be
+    // audited and records only that something happened.
+    //
+    // It was not operators withholding it, either. `amux board --force` has
+    // always REFUSED to run without a reason, then sent it as `desc_append`
+    // instead of `reason` — 9 of those 41 cards carry a good "[FORCED] <why>"
+    // in their desc while their ledger line says nothing. So the sanctioned
+    // path collected the answer and dropped it, and the server accepted the
+    // blank without a murmur. Fixing only one end leaves the class alive:
+    // the CLI now sends `reason`, and this makes a blank one impossible to
+    // write from ANY caller, including the raw PATCHes that produced 25 of
+    // the 41 (the AMUX-2325 shape — a hand-rolled curl off the audited path).
+    //
+    // Fires on `force` ITSELF, not on `eff_gate && force`, for the reason the
+    // block above records: the specimens include gateless todo->discarded
+    // moves, so a gate-conditioned check cannot fail on them.
+    if map.get("force").and_then(Value::as_bool).unwrap_or(false)
+        && body_str(&map, "reason").is_none_or(|r| r.trim().is_empty())
+    {
+        // Named marker, because the refusal alone is not self-announcing: a
+        // 400 here groups with every other board-PATCH 400 in
+        // /api/logs/analyze, so "who is still forcing blind" would be
+        // invisible in the one place people already look. `id` names the card
+        // and `actor` names the lane, which is what routes the fix.
+        tracing::warn!(
+            marker = "force_without_reason",
+            card = %id,
+            actor = %actor_name,
+            "force refused: no reason supplied — caller is off the audited path (AMUX-3464)"
+        );
+        return err(
+            StatusCode::BAD_REQUEST,
+            json!({
+                "error": "force requires a reason",
+                "why": "force bypasses the checks, so the card's log line IS the audit. `reason=` with nothing after it names an actor and records no judgment, which is indistinguishable from no audit at all — every force ever written to this board before AMUX-3464 was that shape.",
+                "how": "amux board <status> <ID> --force \"<why you are bypassing the gate>\" — the CLI sends both the ledger `reason` and a [FORCED] note on the card. Raw PATCH: add \"reason\": \"<why>\". Or satisfy the gate honestly — if it does not fit the work, the TYPE is wrong; fix the type, not the truth.",
+            }),
+        );
+    }
     let force_actor = actor_name.clone();
     // Python `_hdr_worker`: "" when the header is absent — the cross-lane
     // archive guard only fires for a NAMED caller (AMUX-2492).
@@ -2560,6 +2771,17 @@ pub async fn patch_item(
                 })
                 .cloned()
                 .collect();
+            // Filled by the source_ref arm below when a trigger is rerouted to
+            // the card body. Empty on every other write.
+            let mut diverted: Vec<Value> = Vec::new();
+            // EVERY key unwritable = the request was unusable (AEAB/#134 review,
+            // reported by tsukimiya). Narrow on purpose: a MIXED body such as
+            // {"status":"done","item_type":"code"} where the card is already
+            // `done` is also a no-op with something ignored, and it must NOT
+            // 422 — the caller's `status` key was legitimate and the response
+            // already names the typo. Only "nothing you sent was writable"
+            // is unambiguously the caller's mistake.
+            let all_ignored = !map.is_empty() && ignored.len() == map.len();
 
             // ---- stage non-status field changes onto a working copy ------
             // (staged BEFORE the gate check so a PATCH changing type and
@@ -2816,7 +3038,79 @@ pub async fn patch_item(
             set_opt("epic", &mut next.epic, &mut changed); // AMUX-2992: assign/clear a card's epic
             set_opt("due", &mut next.due, &mut changed);
             set_opt("due_time", &mut next.due_time, &mut changed);
-            set_opt("source_ref", &mut next.source_ref, &mut changed);
+            // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
+            //
+            // `source_ref` has two owners. autofix stores its fault signature
+            // there (`autofix:<sig>`), and `open_card_for_fault` reads it to
+            // suppress a duplicate filing. `amux board backlog --trigger` also
+            // writes it — the external condition a parked card waits on — and
+            // that write is a plain overwrite.
+            //
+            // So parking an autofix card exactly as the board's own idle nudge
+            // prescribes DESTROYS the dedupe key, and the next tick files a
+            // duplicate of the card you just parked. Measured 2026-08-24 on
+            // AMUX-3651: parked with a trigger, AMUX-3685 filed minutes later
+            // for the same fault. The sanctioned instruction caused it, which
+            // is why a rule telling people to be careful would not help.
+            //
+            // NARROW ON PURPOSE: a trigger replacing another TRIGGER is normal
+            // and still allowed. Only an `autofix:` prefix is protected,
+            // because it is the only value with a second reader.
+            //
+            // The parked semantics survive untouched: board_drive tests that
+            // source_ref is NON-EMPTY (board_drive.rs:1677, :2422) and never
+            // reads the value, so the signature parks the card just as well as
+            // the trigger text did. What the trigger loses is a place to put
+            // its prose, and the card body is where a human reads it anyway —
+            // so it goes there rather than being dropped.
+            {
+                let incoming = body_str(&map, "source_ref");
+                let protected = next
+                    .source_ref
+                    .as_deref()
+                    .is_some_and(|cur| cur.starts_with("autofix:"));
+                match (incoming, protected) {
+                    (Some(t), true) if !t.starts_with("autofix:") => {
+                        tracing::warn!(
+                            card = %next.id, trigger = %t, kept = %next.source_ref.clone().unwrap_or_default(),
+                            "board: refused to overwrite an autofix signature with a trigger \
+                             (AMUX-3686) — the card stays parked and the dedupe key survives; \
+                             the condition is recorded in the card body"
+                        );
+                        // Not silent, and not lost: the reader of this card sees
+                        // the condition, which is the only consumer that ever
+                        // needed the TEXT.
+                        let note = format!(
+                            "\n\nPARKED ON: {t}\n(recorded here rather than in source_ref, which \
+                             holds this card's autofix dedupe signature — AMUX-3686)"
+                        );
+                        next.desc.push_str(&note);
+                        if !changed.iter().any(|c| c == "desc") {
+                            changed.push("desc".into());
+                        }
+                        // AND TELL THE CALLER, not only the card (AMUX-3791).
+                        // The WARN above reaches a log nobody is tailing and
+                        // the note reaches a reader who opens the card; the
+                        // operator who ran the command saw "→ backlog" and
+                        // nothing else. This is the ONE write where the field
+                        // you named is deliberately not the field that
+                        // changed, so verifying the obvious way — read back
+                        // source_ref — returns the old value and reads as a
+                        // silent drop. That false negative cost a probe
+                        // against a live card and very nearly a bug report
+                        // against code doing exactly the right thing.
+                        diverted.push(json!({
+                            "field": "source_ref",
+                            "landed_in": "desc",
+                            "value": t,
+                            "why": "this card's autofix dedupe signature occupies source_ref \
+                                    and overwriting it would let the detector file duplicates \
+                                    (AMUX-3686)",
+                        }));
+                    }
+                    _ => set_opt("source_ref", &mut next.source_ref, &mut changed),
+                }
+            }
             if let Some(ot) = body_str(&map, "owner_type") {
                 let ot = if ot == "agent" { "agent" } else { "human" }.to_string();
                 if ot != next.owner_type {
@@ -3768,6 +4062,7 @@ pub async fn patch_item(
                     PatchOut::Noop {
                         body: detail_body(&row),
                         ignored,
+                        all_ignored,
                     },
                     no_write(),
                 );
@@ -3830,7 +4125,44 @@ pub async fn patch_item(
                         ),
                         "owner_type" => format!("owner_type -> {}", next.owner_type),
                         "archived" => {
-                            if next.archived == 1 { "ARCHIVED".into() } else { "restored".into() }
+                            // ARCHIVING A TRIGGER-BEARING CARD DE-ARMS IT, SILENTLY
+                            // (AMUX-3715, reported by tubescience). `archived`
+                            // hides a card from every board view AND every
+                            // autonomy loop — advance, pickup, rot — so a
+                            // `--trigger` recorded in `source_ref` will never
+                            // fire again. The card looks parked-on-a-condition
+                            // and is actually parked forever.
+                            //
+                            // Measured when they reported it: 202 archived cards
+                            // fleet-wide carry a non-empty source_ref, across at
+                            // least six lanes (tubescience 77, mvs-infra 22,
+                            // amux 9). Not one of them will fire.
+                            //
+                            // This is ethos rule 1's exemption lesson again, on
+                            // a different field: when you exempt something from
+                            // a loop, name what still reaches it — and if the
+                            // answer is nothing, the exemption did not make it
+                            // cheap, it made it invisible. Same shape as the
+                            // armed watches that were findable only by
+                            // scrolling past them.
+                            //
+                            // RECORDED, NOT REFUSED. tubescience archives
+                            // trigger-bearing cards deliberately and keeps the
+                            // conditions in committed docs, so refusing would
+                            // break a working flow to protect them from a
+                            // choice they are making on purpose (ethos rule 8).
+                            // The log line is what a future lane needs, since it
+                            // outlives the response nobody kept.
+                            if next.archived == 1 {
+                                match next.source_ref.as_deref().map(str::trim) {
+                                    Some(t) if !t.is_empty() => format!(
+                                        "ARCHIVED — and this card carried a live trigger, which                                          archiving DE-ARMS: archived cards are excluded from                                          every autonomy loop, so it will not fire. Trigger was:                                          {t}"
+                                    ),
+                                    _ => "ARCHIVED".into(),
+                                }
+                            } else {
+                                "restored".into()
+                            }
                         }
                         "pinned" => {
                             if next.pinned == 1 { "pinned".into() } else { "unpinned".into() }
@@ -3996,6 +4328,7 @@ pub async fn patch_item(
                 PatchOut::Applied {
                     body: detail_body(&next),
                     ignored,
+                    diverted,
                     status_transition: st,
                     progress_notify,
                 },
@@ -4016,7 +4349,7 @@ pub async fn patch_item(
         None => internal("patch produced no outcome"),
         Some(PatchOut::NotFound) => not_found(&id),
         Some(PatchOut::Refused(status, body)) => err(status, body),
-        Some(PatchOut::Noop { mut body, ignored }) => {
+        Some(PatchOut::Noop { mut body, ignored, all_ignored }) => {
             body["applied"] = json!(false);
             if !ignored.is_empty() {
                 body["ignored_fields"] = json!(ignored);
@@ -4025,11 +4358,42 @@ pub async fn patch_item(
                      the rest of this response reflects the card as stored"
                 );
             }
-            (StatusCode::OK, Json(body)).into_response()
+            // 422 WHEN NOTHING YOU SENT WAS WRITABLE.
+            //
+            // Reported by tsukimiya reviewing #134: "a PATCH of item_type returns
+            // 200 with a bumped rev and silently does nothing — which cost you six
+            // mistyped cards in one night". The rev-bump and the silence are
+            // already fixed (`applied:false`, rev unmoved, the key named in
+            // `ignored_fields`), and the body has been honest for a while. The
+            // STATUS CODE was not: a caller checking `r.ok` or `resp.status`
+            // still read success, which is AC-227's trap exactly — `d.get('ok',
+            // True)` defaulting True is how a refused write got reported as done.
+            //
+            // Scoped to all_ignored rather than to every no-op, because those are
+            // different facts. A writable field set to its current value is a
+            // SUCCESSFUL request that changed nothing, and 422 would be a lie in
+            // the other direction — plus it would break every caller that PATCHes
+            // idempotently. Only "no key you sent can be written" is the caller's
+            // mistake, and only that answers 422.
+            let code = if all_ignored { StatusCode::UNPROCESSABLE_ENTITY } else { StatusCode::OK };
+            (code, Json(body)).into_response()
         }
-        Some(PatchOut::Applied { mut body, ignored, status_transition, progress_notify }) => {
+        Some(PatchOut::Applied {
+            mut body,
+            ignored,
+            diverted,
+            status_transition,
+            progress_notify,
+        }) => {
             body["applied"] = json!(true);
             body["global_rev"] = json!(reply.rev.0);
+            // SEPARATE KEY FROM `ignored_fields`, because they are opposite
+            // facts and a caller acts differently on each: ignored means set it
+            // somewhere else, diverted means it is already set, stop looking in
+            // the field you named (AMUX-3791).
+            if !diverted.is_empty() {
+                body["diverted_fields"] = json!(diverted);
+            }
             if !ignored.is_empty() {
                 body["ignored_fields"] = json!(ignored);
                 body["ignored_note"] = json!(
@@ -4056,7 +4420,14 @@ pub async fn patch_item(
                     );
                 } else {
                     let prompt = format!(
-                        "[amux board note on {id}: {}] {caller_for_notify} appended a progress \
+                        // "[board note on ...]", NOT "[amux board note on ...]".
+                        // There is no `note` verb; the old header read as a
+                        // command a lane could run, in the one position — the
+                        // first bracket of a delivered message — where an agent
+                        // is most likely to treat text as an instruction.
+                        // AMUX-3707's sweep of every `amux board <verb>` the
+                        // server emits is what surfaced it.
+                        "[board note on {id}: {}] {caller_for_notify} appended a progress \
                          note to YOUR card:\n{note}\n(Full note is on the card {id}. This notice \
                          is delivery of a peer's note, not a status request.)",
                         title.chars().take(60).collect::<String>()
@@ -4128,7 +4499,11 @@ async fn reactive_pickup(state: &AppState, session: &str) {
         // claim+dispatch could re-open and re-run a card closed in the gap.
         if crate::runtime_jobs::board_drive::claim_card(state, session, &card).await {
             let _ = crate::api::session_verbs::steer_enqueue(
-                state, session, &prompt, "board-drive:reactive", "",
+                state,
+                session,
+                &prompt,
+                &format!("{}:reactive", crate::api::session_verbs::BOARD_DRIVE_GUARD),
+                "",
             )
             .await;
             tracing::info!(
@@ -4444,20 +4819,55 @@ async fn status_request(
     // direct send: the decision recorded in ethos.md ("Board state changes are
     // delivered at turn boundaries") is that a running agent cannot consume an
     // event faster than its next turn anyway.
-    let _ = crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
-        .await;
+    // READ THE RESULT, DO NOT ASSERT IT (AMUX-3713). This was `let _ =`
+    // followed by a hardcoded `"delivered": true`, which is the two halves of
+    // one contradiction: `steer_enqueue` is `#[must_use]` and its own attribute
+    // text says `let _ =` means "the refusal is deliberately unreported here",
+    // and the very next line then reported delivery unconditionally.
+    //
+    // The enqueue REFUSES a permanently-blocked target (no-env-file, archived),
+    // so for exactly the lanes a status request cannot reach, the caller was
+    // told it had been delivered — and the card log got the same false line
+    // written into it, which is worse, because that one outlives the response.
+    let queued =
+        crate::api::session_verbs::steer_enqueue(&state, &session, &prompt, "status-request", &requester)
+            .await;
 
-    let line = if question.is_empty() {
-        format!("status requested by {requester} (routed to {session})")
-    } else {
-        format!("status requested by {requester} — \"{question}\" (routed to {session})")
+    let line = match &queued {
+        Ok(_) if question.is_empty() => {
+            format!("status requested by {requester} (routed to {session})")
+        }
+        Ok(_) => format!("status requested by {requester} — \"{question}\" (routed to {session})"),
+        // The card log records WHAT HAPPENED, not what was attempted. A reader
+        // scanning history for "why did nobody answer" gets the reason here
+        // instead of a routing line that never routed.
+        Err(reason) => format!(
+            "status request by {requester} NOT delivered to {session}: {reason} — the lane \
+             cannot receive, so nobody was asked"
+        ),
     };
     if let Err(e) = append_card_log(&state, &id, &line).await {
         return internal(e);
     }
-    Json(json!({"ok": true, "delivered": true, "session": session,
-                "message": format!("asked {session} to post a status update to {id}")}))
-    .into_response()
+    match queued {
+        Ok(_) => Json(json!({"ok": true, "delivered": true, "session": session,
+                    "message": format!("asked {session} to post a status update to {id}")}))
+        .into_response(),
+        Err(reason) => (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "ok": false,
+                "delivered": false,
+                "session": session,
+                "blocked_reason": reason,
+                "error": format!(
+                    "{session} cannot receive a status request ({reason}), so none was sent. \
+                     The card log records the refusal."
+                ),
+            })),
+        )
+            .into_response(),
+    }
 }
 
 async fn status_update(
@@ -4622,6 +5032,89 @@ mod param_tests {
         assert!(ignored_board_params("").is_empty());
         // Mixed: only the typo is named, alongside a real filter + cache-buster.
         assert_eq!(ignored_board_params("session=x&includearchived=1&_=9"), vec!["includearchived"]);
+    }
+}
+
+#[cfg(test)]
+mod isolation_designation_tests {
+    use super::*;
+
+    /// AMUX-3713: a card whose owning lane is ISOLATED says so, and an ordinary
+    /// one does not.
+    ///
+    /// Ethan asked for this after the verification: isolated mode works — the
+    /// peer fleet list hides those workers and a peer send is refused 403 — but
+    /// their CARDS were exempt from all of it. `desktop` owns 25 board cards and
+    /// not one carried any indication that the owning lane is undiscoverable and
+    /// cannot be messaged, so a peer reading the board would route work to a
+    /// session it has no way to reach.
+    ///
+    /// BOTH DIRECTIONS. Without the negative cell, stamping every card
+    /// `owner_isolated: true` would pass the first and make the designation
+    /// meaningless — a flag that is always on is not a flag.
+    ///
+    /// The lanes are addressed through `session_is_isolated`, the SAME predicate
+    /// the fleet filter and the send guard consult, so the card cannot claim a
+    /// reachability the send path disagrees with (ethos rule 1).
+    #[test]
+    fn a_card_owned_by_an_isolated_lane_is_designated_and_an_ordinary_one_is_not() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let _home = crate::api::settings::test_env::set_home(dir.path());
+        std::fs::create_dir_all(dir.path().join("sessions")).expect("sessions");
+        std::fs::write(dir.path().join("sessions/raw.env"), "CC_ISOLATED=\"1\"\n").expect("w");
+        std::fs::write(dir.path().join("sessions/normal.env"), "CC_TAGS=\"amux\"\n").expect("w");
+
+        // PREMISE, asserted rather than assumed: if the env home did not take,
+        // both lanes read as non-isolated and the negative cell below passes
+        // for the wrong reason.
+        assert!(
+            crate::api::session_verbs::session_is_isolated("raw"),
+            "premise: the fixture's CC_ISOLATED must be visible to the predicate"
+        );
+        assert!(!crate::api::session_verbs::session_is_isolated("normal"));
+
+        let card = |sess: &str| {
+            let mut r = IssueRow { id: "T-1".into(), ..Default::default() };
+            r.session = Some(sess.to_string());
+            r
+        };
+
+        // DRIVE WHAT THE HTTP HANDLERS DRIVE. The first version of this test
+        // called `list_body(row, slim=false)` for the detail case and passed,
+        // while the live GET /api/board/<id> returned nothing — `get_item`
+        // calls `detail_body` directly and never goes through `list_body`. A
+        // real property, asserted one layer above where the request flows
+        // (ethos rule 7). Caught by curling the running server, not by the
+        // suite. `bodies` now names the actual entry point of each path.
+        type Body = fn(&IssueRow) -> Value;
+        let bodies: [(&str, Body); 3] = [
+            ("detail_body (GET /api/board/{id})", |r| detail_body(r)),
+            ("list_body non-slim", |r| list_body(r, false, false)),
+            ("list_body slim", |r| list_body(r, true, false)),
+        ];
+        for (slim, f) in bodies {
+            let iso = f(&card("raw"));
+            assert_eq!(
+                iso["owner_isolated"],
+                json!(true),
+                "slim={slim}: an isolated lane's card must be designated: {iso}"
+            );
+            let reach = iso["owner_reach"].as_str().unwrap_or_default();
+            assert!(
+                reach.contains("refused as a peer send target"),
+                "slim={slim}: the designation must say what it MEANS, not just that it is \
+                 true — a bare boolean makes every consumer re-derive the implication: {iso}"
+            );
+
+            // THE NEGATIVE. Absent, not `false`: a key on every ordinary card is
+            // payload for nothing, and the list ships 1700+ of them.
+            let ord = f(&card("normal"));
+            assert!(
+                ord.get("owner_isolated").is_none(),
+                "slim={slim}: an ordinary lane's card must carry no designation at all: {ord}"
+            );
+            assert!(ord.get("owner_reach").is_none(), "slim={slim}: {ord}");
+        }
     }
 }
 
@@ -5002,12 +5495,21 @@ mod slim_tests {
 
         // The self-description, which is the general remedy rather than the
         // one-column one.
-        assert_eq!(slim["slim"], 1, "a slim row must say so");
+        // A slim row must say WHAT is gone, not merely that something is
+        // (AF-200). Compared against the shipped const rather than a literal
+        // restated here, so the two cannot drift.
+        assert_eq!(
+            slim["slim"],
+            json!(SLIM_OMITS),
+            "a slim row must ENUMERATE its omissions — `1` tells a consumer something \
+             was dropped and leaves it guessing which, which is how a 1809-char desc \
+             read as empty"
+        );
 
         // Still slim: the expensive drops stay dropped, or this test would be
         // pinning the absence of the optimisation instead of the presence of
         // the fix.
-        for gone in ["desc", "log", "gate", "source_ref", "last_verified_at", "due_time"] {
+        for gone in SLIM_OMITS {
             assert!(
                 slim.get(gone).is_none(),
                 "{gone} must stay out of the slim list — it is the payload diet's whole point"
@@ -5017,6 +5519,35 @@ mod slim_tests {
         // And the FULL body is unchanged by any of this: it carries everything,
         // and it must not sprout a `slim` marker.
         let full = list_body(&named, false, false);
+
+        // THE NON-CIRCULAR ASSERTION, and the only one here that can catch a
+        // WRONG const. Everything above iterates SLIM_OMITS, so the code and the
+        // test read the same list and agree with each other by construction —
+        // shrink the const and both stop checking the dropped field together.
+        // That is AF-161's defect exactly: a real property, asserted at a layer
+        // the bug does not pass through.
+        //
+        // So derive the omissions from the two payloads and require the const to
+        // MATCH REALITY. A field dropped without being declared, or declared
+        // without being dropped, fails here and nowhere else.
+        let full_keys: std::collections::BTreeSet<&str> =
+            full.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let slim_keys: std::collections::BTreeSet<&str> =
+            slim.as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        let actually_omitted: Vec<&str> =
+            full_keys.difference(&slim_keys).copied().collect();
+        let declared: Vec<&str> = {
+            let mut d: Vec<&str> = SLIM_OMITS.to_vec();
+            d.sort_unstable();
+            d
+        };
+        assert_eq!(
+            actually_omitted, declared,
+            "SLIM_OMITS must name exactly the fields the slim body drops. Left is what \
+             the payloads actually differ by, right is what the const claims — a field \
+             in one and not the other is a consumer being told the wrong thing about \
+             what it may trust."
+        );
         assert_eq!(full["reviewer"], "amux-frustrations");
         assert!(full.get("desc").is_some());
         assert!(full.get("slim").is_none(), "a full row must not claim to be slim");

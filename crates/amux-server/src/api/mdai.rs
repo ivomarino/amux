@@ -179,6 +179,18 @@ pub enum MdaiError {
     Model(String),
     /// A required request field was missing or empty.
     BadRequest(String),
+    /// The model did not answer inside MODEL_TIMEOUT_S (AMUX-3765).
+    ///
+    /// SPLIT OUT OF `Model` BECAUSE THE STATUS DIFFERS, and the difference is
+    /// what a reader does next. `Model` means the upstream answered with
+    /// something unusable — investigate the model or the parse, and 502 is
+    /// right. A TIMEOUT means it never answered — investigate the budget or the
+    /// load, and 504 is right by definition.
+    ///
+    /// `lookup.rs` already made this call for the identical error shape
+    /// (`GATEWAY_TIMEOUT` at its own model timeout). Two paths in one server
+    /// disagreeing about the same fact is the thing to remove.
+    ModelTimeout(String),
 }
 
 impl std::fmt::Display for MdaiError {
@@ -190,8 +202,40 @@ impl std::fmt::Display for MdaiError {
             MdaiError::Escape(p) => write!(f, "path escapes the files root: {p}"),
             MdaiError::Io(m) => write!(f, "io error: {m}"),
             MdaiError::Model(m) => write!(f, "model error: {m}"),
+            MdaiError::ModelTimeout(m) => write!(f, "model timeout: {m}"),
             MdaiError::BadRequest(m) => write!(f, "{m}"),
         }
+    }
+}
+
+/// The marker the timeout path writes, and the ONE place both halves agree on
+/// it (AMUX-3765).
+///
+/// `complete()` returns a bare String, so the caller cannot tell a timeout from
+/// any other model failure without reading the text. That is a weak seam and it
+/// is named rather than hidden: if the timeout wording changes, this const is
+/// what has to change with it, and `a_model_timeout_is_a_504_and_other_model_
+/// errors_are_502` fails if the two drift.
+pub(crate) const MODEL_TIMEOUT_MARKER: &str = "did not answer within";
+
+/// The timeout message itself, so the PRODUCER and the classifier's test share
+/// one definition instead of two copies of a format string.
+///
+/// The first version of that test rebuilt this string inline and called it a
+/// seam check. It was not: mutating the producer's wording left the test green,
+/// because the test was asserting against its own copy. A paraphrase cannot
+/// detect drift in the thing it paraphrases — the failure this whole session
+/// kept finding elsewhere, reproduced here by me.
+pub(crate) fn model_timeout_msg(cli: &str) -> String {
+    format!("{cli} {MODEL_TIMEOUT_MARKER} {MODEL_TIMEOUT_S}s")
+}
+
+/// Route a model failure to the variant whose STATUS is right for it.
+pub(crate) fn classify_model_err(m: String) -> MdaiError {
+    if m.contains(MODEL_TIMEOUT_MARKER) {
+        MdaiError::ModelTimeout(m)
+    } else {
+        MdaiError::Model(m)
     }
 }
 
@@ -206,6 +250,13 @@ impl MdaiError {
             MdaiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             // The upstream (the model) failed, not this request: 502.
             MdaiError::Model(_) => StatusCode::BAD_GATEWAY,
+            // It did not fail, it did not ANSWER. 504 by definition, and the
+            // distinction is load-bearing: measured 2026-08-26, three sibling
+            // calls finished at 105-125s against a 150s budget and the fourth
+            // timed out. A 502 sent a reader hunting a model bug; the real
+            // subject is a budget ~20% above typical runtime, which will fail
+            // regularly under any load.
+            MdaiError::ModelTimeout(_) => StatusCode::GATEWAY_TIMEOUT,
             MdaiError::Io(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -227,6 +278,11 @@ impl IntoResponse for MdaiError {
                 tracing::warn!(cycle = %chain.join(" -> "), "mdai: dependency cycle")
             }
             MdaiError::Model(m) => tracing::warn!(error = %m, "mdai: model call failed"),
+            MdaiError::ModelTimeout(m) => tracing::warn!(
+                error = %m,
+                "mdai: model did not answer inside its budget — this is a TIMEOUT (504), not a \
+                 model fault (502); look at MODEL_TIMEOUT_S and host load before the model"
+            ),
             MdaiError::Io(m) => tracing::warn!(error = %m, "mdai: io error"),
             _ => {}
         }
@@ -409,7 +465,7 @@ impl ModelClient for CliModel {
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
-                        return Err(format!("{cli} did not answer within {MODEL_TIMEOUT_S}s"));
+                        return Err(model_timeout_msg(&cli));
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -845,7 +901,7 @@ fn run_node(ctx: &mut RunCtx, abs_path: &Path) -> Result<String, MdaiError> {
             let out = ctx
                 .model
                 .complete(&model_name, &prompt)
-                .map_err(MdaiError::Model)?;
+                .map_err(classify_model_err)?;
             let dur = t0.elapsed().as_millis() as i64;
             tracing::info!(
                 path = %rel, model = %model_name,
@@ -1254,6 +1310,45 @@ pub fn connect_edge(source: &str, target: &str, prompt: &str) -> Result<Value, M
 
 #[cfg(test)]
 mod tests {
+    /// AMUX-3765: a model TIMEOUT is a 504, a model FAULT is a 502, and the two
+    /// send a reader to different places.
+    ///
+    /// The filed card was `POST /api/files/mdai/run -> HTTP 502` with the body
+    /// "claude did not answer within 150s". 502 says the upstream answered with
+    /// something unusable, so it points at the model or the parse. The evidence
+    /// said otherwise: three sibling calls the same minute finished at 105-125s
+    /// against a 150s budget and the fourth ran out of clock. The subject is the
+    /// BUDGET, and 504 is the code that says so.
+    ///
+    /// `lookup.rs` already returns GATEWAY_TIMEOUT for the identical shape. Two
+    /// paths in one server disagreeing about the same fact is what this removes.
+    #[test]
+    fn a_model_timeout_is_a_504_and_other_model_errors_are_502() {
+        let t = classify_model_err(format!("claude {MODEL_TIMEOUT_MARKER} 150s"));
+        assert!(matches!(t, MdaiError::ModelTimeout(_)), "the timeout shape must classify as one");
+        assert_eq!(t.status(), StatusCode::GATEWAY_TIMEOUT);
+        assert!(t.to_string().contains("model timeout"), "and read as one: {t}");
+
+        // CONTROL: a genuine model fault keeps 502. Without this the classifier
+        // could route everything to 504 and the assertion above would pass,
+        // which would hide real model faults behind a timeout label.
+        let e = classify_model_err("claude exited 1: bad JSON".to_string());
+        assert!(matches!(e, MdaiError::Model(_)));
+        assert_eq!(e.status(), StatusCode::BAD_GATEWAY);
+
+        // THE SEAM IS A STRING MATCH, so pin that the PRODUCER still writes what
+        // the classifier reads — by calling the producer, not by rebuilding its
+        // format string. The first version of this did rebuild it, and mutating
+        // the producer's wording left the test green: a paraphrase cannot detect
+        // drift in the thing it paraphrases.
+        let produced = model_timeout_msg("claude");
+        assert!(
+            produced.contains(MODEL_TIMEOUT_MARKER),
+            "the timeout message and its classifier have drifted: {produced}"
+        );
+        assert!(matches!(classify_model_err(produced), MdaiError::ModelTimeout(_)));
+    }
+
     use super::*;
     use std::sync::Mutex;
 
