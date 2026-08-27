@@ -647,11 +647,22 @@ async fn debug_sse(
         // deploy is a restart, not an outage — read /health `uptime_s` beside
         // it. (D1: in-memory state is fiction; this is a gauge, not a source of
         // truth, and it is not allowed to become one without a table.)
+        // A ZERO HERE MEANS TWO THINGS UNTIL CLIENTS HAVE THE BEACON, and saying so
+        // is the point (AF-253). The client half shipped in app.js; a browser only
+        // starts sending it after the ping's APP_VER mismatch has driven it to
+        // self-reload. So `stale_reconnects: 0` immediately after a deploy means
+        // "no client running the beacon build has gone stale yet", NOT "SSE is
+        // healthy" — and those are the two states this whole card exists to
+        // separate. `live_connections` is the discriminator: clients attached to
+        // THIS process have already reloaded onto this build.
         "note": "per-PROCESS and volatile — the builder restarts this binary on every \
                  commit and all SSE connections die with it. Read /health uptime_s beside \
                  a low live_connections before calling it an outage. stale_reconnects \
                  counts client beacons in the volatile /api/client-debug ring (cap 500), \
-                 so it undercounts on a busy day rather than over.",
+                 so it undercounts on a busy day rather than over — AND it only counts \
+                 clients running an app.js that HAS the beacon, so a 0 shortly after a \
+                 deploy is a ramp-up, not a verdict. live_connections is the \
+                 discriminator: those clients are on this build.",
     }))
 }
 
