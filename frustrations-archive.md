@@ -1396,3 +1396,43 @@ NARROWED 2026-08-25 (amux-frustrations, the author): part (a) is SHIPPED by amux
   dirty left behind — they may have committed their half seconds after you staged — and the
   warning is correctly silent while the commit is still unbuildable. Measured cost when it
   happened: 40.6s to build the commit, against four unbuildable commits landed on 2026-08-08.
+CORRECTED 2026-08-27 (amux-frustrations, the author — this entry's own probe was defective):
+  The NARROWED note above asserts "`git worktree add` appears once in the whole repo and it is
+  inside a test fixture". THAT IS FALSE, and it was false when I wrote it. The auto-builder has
+  built the COMMIT since 7253465c (2026-08-09), fifteen days BEFORE this entry was filed:
+  `scripts/rust-auto-build.sh:284` does `git -C "$REPO" worktree add --detach "$WORK" "$(... rev-parse HEAD)"`,
+  a detached worktree at the committed sha with no working-tree files, so a peer's uncommitted
+  definition cannot make a broken commit look sound. `e2e/serve-head.sh:142,149` does it too.
+  WHY THE PROBE COULD NOT SEE THEM: I grepped the literal adjacent pair `git worktree add`. Both
+  real callers write `git -C "$REPO" worktree add`, so the option sits BETWEEN my two tokens and
+  the pattern cannot match. It found two hits — a comment and a test fixture — and I read that as
+  a negative. Reproduced 2026-08-27: literal `git worktree add` -> 2 hits, neither a real caller;
+  `worktree add` -> 5, including both. The probe was blind to exactly the thing it searched for,
+  and the blindness is not incidental: a tool that builds a detached snapshot MUST operate on a
+  repo it is not cd'd into, so `-C <repo>` is precisely the form this class of caller takes.
+  This is ethos rule 4's "before believing a negative, say what a positive would look like and
+  confirm the probe could produce it", failed in an entry that is itself about a gate answering
+  the wrong question.
+WHAT IS ACTUALLY LEFT, measured rather than argued (amux's AMUX-3797, evidence corrected here):
+  The builder triggers on the LAST Rust-touching commit — `rust-auto-build.sh:46`,
+  `git log -1 --format=%H -- crates/ Cargo.toml Cargo.lock`. When two Rust commits land between
+  polls, the earlier one is stepped over and never built. Over the builder's whole life
+  (7253465c..main): 992 Rust-touching commits, 126 of them (12.7%) were never a `building`
+  target. That is this entry's COST clause exactly — "a bisect through that range still
+  breaks" — and it survives the headline being closed.
+  MEASURE BY ANCESTRY, NOT BY DATE. My first pass used `git log --since=2026-08-09` and got
+  1028/161; the range form gives 992/126. `--since` prunes traversal by author date, so it
+  admits commits that reached main through a merge of a branch based before the window and is
+  not the same set as "descendants of the builder's first commit". The two implementations
+  reconcile EXACTLY once both use ancestry: amux measured 7253465c..origin/main as 125 of 839
+  never built, I measure origin/main..HEAD as 1 of 153, and 125 + 1 = 126 of 992. Independent
+  scripts agreeing to the commit is worth more than either number.
+  THE UNPUSHED STACK IS CLEAN: 1 of 153 Rust-touching commits. An earlier "83 of 235" figure
+  counted docs and markdown commits, which `:46` correctly excludes from being build targets;
+  it was withdrawn.
+  NOT the mechanism: SKIP-under-contention. 287 distinct shas were skipped at least once and
+  only 7 of them were never subsequently built, because a SKIP is usually the dedupe declining a
+  DUPLICATE trigger for the sha already building. The line quoted as proof (07:45:48 SKIP
+  962c15d79) is preceded four seconds earlier by `07:45:44 building 962c15d79` — that sha was
+  built. Reading a SKIP without checking for a `building` line naming the same sha counts the
+  dedupe working as a commit lost.

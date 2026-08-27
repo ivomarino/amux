@@ -458,6 +458,14 @@ code as broken or missing:
   added row — the pickaxe reports commits where the COUNT of the string changed, and
   adding a row inside an existing const does not change how many times the const's name
   appears. Structurally invisible to `-S`, obvious to `-G`
+- a literal ADJACENT-TOKEN pattern, `git worktree add`, against callers that write
+  `git -C "$REPO" worktree add --detach` — the option sits between the two tokens, so the
+  pattern cannot match. It returned a comment and a test fixture, which read as a clean
+  negative, and the entry built on it (AF-190) claimed "nothing builds the COMMIT" while
+  the auto-builder had been building exactly that for fifteen days. The blindness is not
+  incidental: a tool that builds a detached snapshot MUST operate on a repo it is not
+  cd'd into, so `-C <repo>` is the form this whole CLASS of caller takes, and the probe
+  excluded the class it was searching for
 
 The three that generalise past "be careful": **name the target before you search for
 it** (which of the 28 selects? which of the two branches?), **bound a positional window
@@ -471,6 +479,16 @@ of this string, or only the lines around it?* If only the lines, `-S` cannot ans
 `-G` is the tool. Every other instance above needed a second instrument to disagree in
 front of you, and "I happened to notice two instruments disagreeing" is not a habit — it
 is luck. A precondition you can state in advance is.
+
+The ADJACENT-TOKEN case is the second one answerable in advance, and it is worth stating
+separately because it fails on the most ordinary thing you can type: *a multi-word
+pattern asserts the words are adjacent in the source, and a command's words usually are
+not.* `git -C <dir> worktree add`, `docker --context x compose up`, `curl -sk -X POST`
+all put an option between the tokens someone would grep for. Before believing a negative
+from a multi-word probe, ask which words could have something between them, and search
+on the token pair that cannot be split. The sharper version of the precondition: the
+form a probe excludes is often the form the thing you are looking for MUST take, because
+the option you left out is what makes the caller the kind of caller you want.
 
 **The fixture must live in the same DOMAIN as the defect, not merely exhibit its shape.**
 The mutation-strength rule above says to mutate the arithmetic rather than the wording;
