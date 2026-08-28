@@ -260,6 +260,13 @@ fi
 
 # ── 5. Service ──────────────────────────────────────────────────────────────
 if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
+  # envsubst ships in gettext-base (Debian/Ubuntu) / gettext (Fedora), not
+  # always present on a minimal install — checked explicitly (review
+  # @esteininger, PR #166) alongside the other tool checks above (cargo,
+  # tmux, herdr) instead of letting it fail inside the `|| die` below with
+  # a message that names the template, not the missing package.
+  command -v envsubst >/dev/null 2>&1 || die "envsubst required (apt install gettext-base / dnf install gettext)"
+
   # Create systemd user services from templates.
   SYSTEMD_DIR="$HOME/.config/systemd/user"
   mkdir -p "$SYSTEMD_DIR"
@@ -295,6 +302,16 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
   echo ""
   say "See docs/systemd-setup.md for full documentation"
+  echo ""
+  # Deliberate, not incidental (review @esteininger, PR #166): this path
+  # never starts the server — it prints the enable/start commands above and
+  # exits — so there is nothing running yet to wait on. The macOS path
+  # below this one DOES start the service and polls /health before
+  # declaring success; saying so here keeps the two honest with each other
+  # instead of leaving Linux users to notice the asymmetry on their own.
+  say "Unlike the macOS path, this installer does not start the service or"
+  say "verify /health on Linux — run the two 'systemctl --user' commands"
+  say "above, then check https://localhost:$PORT/health yourself."
   exit 0
 fi
 
