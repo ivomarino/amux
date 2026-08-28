@@ -697,11 +697,63 @@ fn is_pure_read_command(cmd: &str) -> bool {
                 _ => return false,
             }
         }
+        if verb == "sed" {
+            if sed_is_pure_read(seg) {
+                continue;
+            }
+            return false;
+        }
         if !READ_ONLY_VERBS.contains(&verb) {
             return false;
         }
     }
     saw
+}
+
+/// `sed -n '1,50p' <file>` is a READ, and it is the read this fleet is TOLD to
+/// use: bypass-permissions sessions are instructed to "read files with cat,
+/// head, or sed -n". `sed` is absent from `READ_ONLY_VERBS` on purpose, since
+/// `sed -i` authors — so the most-instructed read idiom fell through to the
+/// mtime gate and could mint an inferred edit claim on a file the session only
+/// read, which is AMUX-2841's mechanism ("a Bash command that merely NAMED a
+/// path"). Measured 2026-08-28 before the fix: `sed -n '1,50p' foo.rs`
+/// classified as a potential write, exactly like `sed -i`.
+///
+/// Read-only requires `-n` PRESENT and every write route ABSENT. `-n` is
+/// REQUIRED rather than assumed, so a bare `sed 's/a/b/' f` keeps today's
+/// conservative treatment; anything unrecognized still falls through to
+/// authored, so no real write loses its attribution — the direction this must
+/// never get wrong.
+fn sed_is_pure_read(seg: &str) -> bool {
+    let mut saw_n = false;
+    for tok in seg.split_whitespace().skip(1) {
+        if tok == "--in-place" || tok.starts_with("--in-place=") {
+            return false;
+        }
+        if tok.starts_with("--") {
+            continue;
+        }
+        if let Some(flags) = tok.strip_prefix('-') {
+            // A SHORT-FLAG CLUSTER carries both letters: `-ni` is in-place AND
+            // quiet, so finding `n` must never license an `i` sitting beside
+            // it. `-i.bak` lands here too, since the suffix rides in the same
+            // token.
+            if flags.contains('i') {
+                return false;
+            }
+            if flags.contains('n') {
+                saw_n = true;
+            }
+        }
+    }
+    // `s/a/b/w out` and `/re/w out` write a file with no shell redirection at
+    // all, so `has_output_redirection` cannot see them. Matched loosely on
+    // purpose: a path containing `/w` costs an unnecessary authored record,
+    // which is the over-warning direction this file already prefers.
+    if seg.contains("/w") || seg.contains("/W") {
+        return false;
+    }
+    saw_n
 }
 
 /// MG-1484: is this command a RESTORE and nothing else? True when every
@@ -4526,4 +4578,53 @@ mod staged_seen_tests {
         assert_eq!(staged_seen("", "/repo/one", now, 300.0), None);
         assert_eq!(staged_seen("lane-e", "", now, 300.0), None);
     }
+
+
+    /// AMUX-2841: the read idiom the fleet is INSTRUCTED to use must not mint an
+    /// inferred edit claim.
+    ///
+    /// `sed` is deliberately absent from READ_ONLY_VERBS because `sed -i`
+    /// authors, so every `sed` fell through to the mtime gate. Meanwhile
+    /// bypass-permissions sessions are told to "read files with cat, head, or
+    /// sed -n", which is the same shape as the `head -40 digests/x.md` case
+    /// that put the read-only exemption here in the first place: a lane reading
+    /// a file while a peer writes it takes an inferred claim on it.
+    ///
+    /// The write routes are asserted individually because each is a separate
+    /// way to author, and `-ni` and `s/a/b/w out` are the two a whitelist of
+    /// `-n` alone would wave through. The reads at the end are the control: if
+    /// they ever go false this test is broken rather than the code.
+    #[test]
+    fn sed_n_reads_but_every_sed_write_route_still_authors() {
+        for w in [
+            "sed -i 's/a/b/' foo.rs",
+            "sed -ni 's/a/b/p' foo.rs",
+            "sed -i.bak 's/a/b/' foo.rs",
+            "sed --in-place 's/a/b/' foo.rs",
+            "sed --in-place=.bak 's/a/b/' foo.rs",
+            "sed -n 's/a/b/w out.txt' foo.rs",
+            "sed -n '/re/w out.txt' foo.rs",
+            "sed 's/a/b/' foo.rs",
+            "sed -n '1,5p' foo.rs > out.txt",
+            "cd /repo && sed -i 's/a/b/' foo.rs",
+        ] {
+            assert!(
+                !super::is_pure_read_command(w),
+                "sed write route classified as a pure read, so a real author would lose its \
+                 attribution: {w}"
+            );
+        }
+        for r in [
+            "sed -n '1,50p' foo.rs",
+            "cd /repo && sed -n '1,50p' foo.rs",
+            "sed -n -e '1,50p' foo.rs",
+            "head -40 foo.rs",
+        ] {
+            assert!(
+                super::is_pure_read_command(r),
+                "a pure read still mints an inferred edit claim on a file it only read: {r}"
+            );
+        }
+    }
+
 }
