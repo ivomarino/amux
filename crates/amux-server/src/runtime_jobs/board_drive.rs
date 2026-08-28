@@ -2176,6 +2176,44 @@ mod continue_nudge_ask_tests {
             "with a reviewer named, the ask becomes chasing THEM, not naming one: {t2}"
         );
     }
+
+    /// AMUX-3819: `done` is a resting place, and the drive must not say
+    /// otherwise.
+    ///
+    /// The closing sentence read "keep going until everything is verified,
+    /// archived, or genuinely blocked", which is STRICTER THAN THE RULE IT
+    /// ENFORCES — the owner's wording is "you MAY move an issue to `verified`
+    /// only after ALL of these hold". Permission with a bar, not an obligation.
+    /// Enforcing the stricter reading converts an opt-in ladder into a standing
+    /// debt: amux-frustrations reported 143 done cards of which ~112 name no
+    /// reviewer and therefore cannot advance at all, and asked what routes them
+    /// to a peer. Nothing should. Nobody decided those 112 warranted a peer's
+    /// time; this sentence decided it for them.
+    #[test]
+    fn the_drive_does_not_demand_verification_of_every_done_card() {
+        let done: Vec<(String, String, String)> =
+            (0..3).map(|i| (format!("D-{i}"), "shipped".into(), String::new())).collect();
+        let t = continue_nudge_text(0, 3, &[], &done);
+
+        assert!(t.contains("done, verified, archived"), "`done` must be a listed terminal: {t}");
+        assert!(
+            t.contains("legitimate resting place") && t.contains("not a backlog"),
+            "and the done section must say so, or the closing line is the only signal: {t}"
+        );
+        // THE CONTROL, and the reason this is not just deleting the ask: the
+        // step a lane CAN take is still named, and still framed as a judgement
+        // about which cards warrant a peer rather than as coverage of all of
+        // them. A version that dropped the reviewer mechanics entirely would
+        // pass both assertions above and remove the only path to `verified`.
+        assert!(t.contains("amux board reviewer"), "the mechanics stay available: {t}");
+        assert!(
+            t.contains("worth a peer's time"),
+            "framed as judgement, not as a quota to clear: {t}"
+        );
+        // And the count is still REPORTED. Hiding the number would be the
+        // opposite failure to demanding it be zero.
+        assert!(t.contains("3 of the 3") || t.contains("name no reviewer"), "{t}");
+    }
 }
 
 fn last_continue_nudge_counts(conn: &Connection, lane: &str) -> Option<(i64, i64)> {
@@ -2259,25 +2297,54 @@ fn continue_nudge_text(
         // also produces the exact input the gate requires (12af7ab refuses a
         // `verified` transition with no reviewer), so the nudge starts feeding
         // the gate instead of demanding an output the recipient cannot make.
+        // `done` IS A RESTING PLACE (AMUX-3819). The owner's own rule reads
+        // "You MAY move an issue to `verified` only after ALL of these hold" —
+        // a permission with a bar on it, not an obligation. This nudge used to
+        // tell every lane to name a reviewer for every done card, which turns
+        // an opt-in ladder into a standing debt: amux-frustrations reported 143
+        // done cards of which ~112 name no reviewer, and asked, correctly, what
+        // routes them. Nothing should. Nobody decided those 112 warranted a
+        // peer's time; the nudge decided it for them.
+        //
+        // So the ask is now about JUDGEMENT rather than coverage: which of
+        // these is worth a peer, and the mechanics for that one. A count of
+        // unreviewed cards is still reported, because the number is real and
+        // hiding it would be the opposite failure.
         let unreviewed = done.iter().filter(|(_, _, rv)| rv.is_empty()).count();
         let ask = if unreviewed > 0 {
             format!(
-                "{done_count} done card(s). {unreviewed} of the {} listed name NO reviewer,                  and a card cannot reach `verified` without one — the gate asks for a                  DIFFERENT worker who checked it themselves, which you cannot supply on                  your own. The step that IS yours: name the peer,                  `amux board reviewer <id> <peer-session>`. Archive instead if the work was                  superseded.",
+                "{done_count} done card(s); {unreviewed} of the {} listed name no reviewer. \
+                 `done` is a legitimate resting place and most cards belong there — \
+                 `verified` is for work whose correctness is worth a peer's time, and it \
+                 needs a DIFFERENT worker who checked it themselves, which you cannot \
+                 supply on your own. If any of these IS worth that, name the peer: \
+                 `amux board reviewer <id> <peer-session>`. Archive the ones that were \
+                 superseded. Leaving the rest in `done` is not a backlog.",
                 done.len()
             )
         } else {
             format!(
-                "{done_count} done card(s), each with a reviewer named — ask them to verify                  (`amux board ask <id>`), or verify the ones where YOU are the named                  reviewer. Archive instead if the work was superseded."
+                "{done_count} done card(s), each with a reviewer named — ask them to verify \
+                 (`amux board ask <id>`), or verify the ones where YOU are the named \
+                 reviewer. Archive instead if the work was superseded."
             )
         };
         sections.push(format!("{ask}\n{}", lines.join("\n")));
     }
 
     format!(
+        // `done` IS IN THE LIST NOW (AMUX-3819). This sentence made `verified`
+        // the only non-archive terminal state, which is stricter than the rule
+        // it is enforcing: the owner's own wording is "you MAY move an issue to
+        // `verified` only after ALL of these hold". Permission with a bar, not
+        // an obligation — and a drive that says "keep going until everything is
+        // verified" converts an opt-in ladder into a standing debt for every
+        // lane, which is what produced a 143-card pile with ~112 unreviewable
+        // by construction.
         "[amux auto-continue] Your todo queue is empty but you still have \
          outstanding work:\n\n{}\n\n\
-         Keep going until everything is verified, archived, or genuinely blocked \
-         on someone else. Don't stop between cards.",
+         Keep going until everything is done, verified, archived, or genuinely \
+         blocked on someone else. Don't stop between cards.",
         sections.join("\n\n")
     )
 }
