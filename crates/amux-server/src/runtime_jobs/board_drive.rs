@@ -815,6 +815,45 @@ fn reviewer_acted_since_review(log: &str, reviewer: &str) -> bool {
         .any(|l| l.contains(&needle))
 }
 
+/// Did the REVIEWER themselves move this card out of `review`? (AMUX-3820)
+///
+/// The other end of [`reviewer_acted_since_review`], and of the
+/// `reviewer_unreachable` WARN. Both of those watch a card sitting IN `review`.
+/// A reviewer who rejects work and then moves the card to `doing` — which is the
+/// honest state, and exactly what AF-214 argued for — leaves that predicate BY
+/// CONSTRUCTION, and nothing re-nudges them when the author is done.
+///
+/// THE SPECIMEN IS THIS FUNCTION'S AUTHOR. On AF-203 I wrote "ping me and I will
+/// ack it the same turn", moved it review -> doing, and acked four days later
+/// only because the author came and asked. Nothing in amux told me, and the card
+/// read `doing` and looked healthy the whole time.
+///
+/// NARROW ON PURPOSE. The REVIEWER moving the card out is a promise to return;
+/// the AUTHOR moving it out is ordinary work, and firing on that would nag every
+/// in-progress card that ever named a reviewer. The needle carries the trailing
+/// colon for the same reason `reviewer_acted_since_review` does — without it
+/// `amux` matches every `amux-frustrations` line and the promise is attributed
+/// to the wrong party.
+fn reviewer_left_review(log: &str, reviewer: &str) -> bool {
+    let rev = reviewer.trim();
+    if rev.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = log.lines().collect();
+    // Scope to the CURRENT round, like the AF-214 needle: a card can be
+    // reviewed, sent back, reworked and re-reviewed, and only the latest exit is
+    // an outstanding promise.
+    let entered = lines
+        .iter()
+        .rposition(|l| l.contains("-> review"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let needle = format!("` {rev}:");
+    lines[entered.min(lines.len())..]
+        .iter()
+        .any(|l| l.contains(&needle) && l.contains("review ->"))
+}
+
 fn card_event_count(conn: &Connection, etype: &str, card: &str, since: f64) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM session_events WHERE type=?1 AND ts > ?2 AND data LIKE ?3",
@@ -2967,6 +3006,58 @@ pub fn select_advance_with(
     // is the REVIEWER's work now — pushing the author asks for a self-ack the
     // transition refuses.
     let rev = row.reviewer.clone().unwrap_or_default().trim().to_string();
+
+    // THE REVIEWER'S PROMISE (AMUX-3820). The complement of the edge below, and
+    // the half neither it nor the `reviewer_unreachable` WARN can see: both
+    // watch a card sitting IN `review`, and a reviewer who moves the card out
+    // to unblock the author leaves that predicate by construction.
+    //
+    // That move is CORRECT and this must not undo it — leaving a rejected card
+    // in `review` re-nudges the reviewer to review their own rejection, which
+    // is AF-214's whole subject. The defect is that the honest move drops the
+    // promise on the floor: the card reads `doing`, looks healthy, and nothing
+    // tells the reviewer when the author is done. AF-203 sat that way for four
+    // days and was acked only because its author went and asked.
+    //
+    // Ordered ABOVE the reviewer edge but mutually exclusive with it by
+    // `reviewer_acts_next`, so neither can shadow the other.
+    if !reviewer_acts_next(&status)
+        && !rev.is_empty()
+        && rev != session
+        && reviewer_left_review(row.log.as_deref().unwrap_or(""), &rev)
+    {
+        // Same reachability gate as the edge below: a nudge to a name that is
+        // not a worker goes nowhere, and the card looks healthy either way.
+        if let Some(why) = reviewer_unreachable(session, &rev) {
+            return Advance::None {
+                reason: "reviewer-unreachable",
+                detail: format!("{card_id} names reviewer `{rev}`: {why}"),
+            };
+        }
+        let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
+        if spent >= budget {
+            return Advance::None {
+                reason: "budget-spent",
+                detail: format!("reviewer {rev} nudged {spent}x in 24h on {card_id}"),
+            };
+        }
+        return Advance::Nudge {
+            text: format!(
+                "You reviewed `{card_id}` ({}) and moved it out of `review` yourself, which \
+                 means you owe it a second look — that move is what took it off every list \
+                 that would have reminded you. It now reads `{status}` and its author has \
+                 had it since. Read what landed and either ack it or say what still fails. \
+                 If you are no longer the right reviewer, say so on the card and clear the \
+                 field rather than leaving a promise nobody is tracking.",
+                row.title
+            ),
+            target: rev,
+            card: card_id,
+            status,
+            kind: "review-promised",
+        };
+    }
+
     let mut ball_with_author = String::new();
     if reviewer_acts_next(&status) && !rev.is_empty() && rev != session {
         // A REVIEWER WHO IS NOT A WORKER IS A CARD PARKED FOREVER.
@@ -4278,7 +4369,7 @@ pub fn routes() -> axum::Router<AppState> {
 
 #[cfg(test)]
 mod reviewer_renag_tests {
-    use super::reviewer_acted_since_review;
+    use super::{reviewer_acted_since_review, reviewer_left_review};
 
     /// The AF-203 specimen, verbatim in shape: amux is named reviewer, reviews
     /// and rejects, and the log then carries rows that are NOT actor actions.
@@ -4307,6 +4398,74 @@ mod reviewer_renag_tests {
         assert!(
             !reviewer_acted_since_review(log, "amux"),
             "nobody has reviewed it — this is exactly the card the nudge exists for"
+        );
+    }
+
+    /// AMUX-3820: the reviewer moving the card OUT of review is a promise, and
+    /// the promise must be detectable.
+    ///
+    /// The specimen is AF-203. amux reviewed, rejected, and moved it to `doing`
+    /// with an explicit note that `doing` was the true state — correct, and it
+    /// took the card off every list that would have re-nudged amux. It sat four
+    /// days and was acked only because its author asked.
+    #[test]
+    fn a_reviewer_who_moved_the_card_out_of_review_still_owes_it_a_look() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars
+`14:52` amux: review -> doing";
+        assert!(
+            reviewer_left_review(log, "amux"),
+            "amux moved it out themselves — that is a promise to come back"
+        );
+    }
+
+    /// THE CONTROL THAT MATTERS. An AUTHOR moving their own card out of review
+    /// is ordinary work. Firing on that turns this into a nag on every
+    /// in-progress card that ever named a reviewer, which is strictly worse
+    /// than the silence it replaces.
+    #[test]
+    fn an_author_moving_their_own_card_out_of_review_is_not_a_reviewer_promise() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:52` amux-frustrations: review -> doing";
+        assert!(
+            !reviewer_left_review(log, "amux"),
+            "the author withdrew it; the reviewer promised nothing"
+        );
+        // And the prefix trap, which is why the needle carries a trailing colon:
+        // `amux` is a prefix of `amux-frustrations`, so a bare name match would
+        // read the author's own move as the reviewer's promise.
+        assert!(
+            !reviewer_left_review(log, "amux"),
+            "`amux` must not match `amux-frustrations:`"
+        );
+    }
+
+    /// A card still sitting IN review is the OTHER edge's business. Firing here
+    /// too would double-nudge the reviewer for one card.
+    #[test]
+    fn a_card_still_in_review_is_not_a_promise_to_return() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars";
+        assert!(!reviewer_left_review(log, "amux"), "nobody has left review yet");
+        // ...and the existing edge DOES see it, so the two are complementary
+        // rather than leaving a gap between them.
+        assert!(reviewer_acted_since_review(log, "amux"));
+    }
+
+    /// A SECOND ROUND clears the old promise: the reviewer's exit from the
+    /// PREVIOUS round is not an outstanding debt once the card re-enters review.
+    #[test]
+    fn a_re_review_supersedes_the_previous_rounds_promise() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:52` amux: review -> doing
+`15:10` amux-frustrations: doing -> review";
+        assert!(
+            !reviewer_left_review(log, "amux"),
+            "the card is back in review; the old exit belongs to a closed round"
         );
     }
 
