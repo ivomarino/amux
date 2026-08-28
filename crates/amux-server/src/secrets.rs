@@ -7,9 +7,13 @@
 //! 4. Expose via environment variables and API
 //!
 //! Usage:
-//! ```
-//! let secrets = SecretStore::load().await?;
-//! let openai_key = secrets.get("external_services.openai.api_key");
+//! ```ignore
+//! // Illustrative — `new` takes real filesystem paths and `load` reads +
+//! // decrypts from disk, so this is not run as a doctest. See lib.rs's own
+//! // boot sequence for the actual call site.
+//! let secrets = SecretStore::new(age_key_path, secrets_file);
+//! secrets.load().await?;
+//! let openai_key = secrets.get("external_services.openai.api_key").await;
 //! ```
 
 pub mod persist;
