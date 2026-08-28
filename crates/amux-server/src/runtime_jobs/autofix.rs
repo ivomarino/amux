@@ -594,6 +594,26 @@ fn unix_now() -> f64 {
 // Detector 1 — 5xx.
 // ---------------------------------------------------------------------------
 
+/// Is this 5xx a connection-pool starvation rather than a defect in the handler
+/// that happened to answer it? (AMUX-3840)
+///
+/// r2d2 returns exactly this text when `Pool::get` exceeds its timeout. It says
+/// nothing about the endpoint: the victim is whoever asked while the pool was
+/// empty, and the cause is whoever was HOLDING connections — usually somebody
+/// else entirely (AR-135 measured the `/api/sessions` single-flight builder
+/// starving four unrelated routes, three of which never touch a subprocess).
+///
+/// Grouping these by target is therefore guaranteed to be wrong in the same way
+/// per-endpoint latency cards were before the outlier rollup (AMUX-2814): one
+/// card per innocent route, each naming an endpoint that is not the fault.
+/// Measured 2026-08-28: a two-minute burst at load average 46 filed FOUR cards
+/// — `/api/board`, `/api/board/session-gates`, `/api/board/statuses` and
+/// `/api/sessions` — 22 occurrences of one saturation.
+fn is_pool_exhaustion(body: &str) -> bool {
+    let b = body.to_ascii_lowercase();
+    b.contains("timed out waiting for connection")
+}
+
 /// Group every 5xx in the window by the SAME key `/api/logs/analyze` groups
 /// by: `(status, method, family, normalize_target(path))`. Reused rather than
 /// re-derived — `normalize_target` is the route-table-aware collapse, and a
@@ -652,7 +672,14 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             continue;
         }
         let target = rl::normalize_target(&path);
-        let key = (status, method.clone(), family.clone(), target.clone());
+        // ONE GROUP FOR THE STARVATION, not one per victim (AMUX-3840). The
+        // target still rides in `sample_path` and the evidence, so nothing is
+        // lost — it just stops being the thing that splits the card.
+        let key = if is_pool_exhaustion(&body) {
+            (status, "*".to_string(), "POOL".to_string(), "POOL".to_string())
+        } else {
+            (status, method.clone(), family.clone(), target.clone())
+        };
         let g = groups.entry(key).or_insert_with(|| Group {
             count: 0,
             first_ts: ts,
@@ -662,7 +689,9 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             sample_path: path.clone(),
             sample_body: String::new(),
             max_latency: 0.0,
+            targets: Default::default(),
         });
+        g.targets.insert(target.clone());
         g.count += 1;
         g.last_ts = ts;
         g.max_latency = g.max_latency.max(latency);
@@ -705,12 +734,25 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
         // while a genuinely new 5xx mints a new one and files regardless. The
         // re-arm skip below then keeps `5xx|` for the same reason it keeps
         // `latency|outlier|`: an occurrence, once judged, is judged forever.
-        let signature = format!(
-            "5xx|{status}|{method}|{family}|{target}|{}",
-            g.last_ts as i64
-        );
+        let is_pool = family == "POOL";
+        // The pool ident carries no target, so every burst collapses onto one
+        // fault identity and an open card suppresses the next route's report
+        // instead of minting a sibling.
+        let signature = if is_pool {
+            format!("5xx|{status}|POOL|{}", g.last_ts as i64)
+        } else {
+            format!("5xx|{status}|{method}|{family}|{target}|{}", g.last_ts as i64)
+        };
         // COMPUTED title: the signature in English, plus the count. No model.
-        let title = format!("{method} {target} → HTTP {status} ({}x)", g.count);
+        let title = if is_pool {
+            format!(
+                "Connection pool starved: {} request(s) across {} route(s) timed out waiting",
+                g.count,
+                g.targets.len()
+            )
+        } else {
+            format!("{method} {target} → HTTP {status} ({}x)", g.count)
+        };
         let recheck = format!(
             "curl -sk \"$AMUX_URL/api/logs/analyze?since_h={}\" | python3 -c \"import json,sys; \
              [print(json.dumps(x,indent=2)) for x in json.load(sys.stdin)['groups'] \
@@ -718,13 +760,28 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             window_h() as i64
         );
         let evidence = vec![
-            ("verdict".into(), format!(
-                "{method} {target} answered HTTP {status} {} time(s) from {} distinct client(s). \
-                 A 5xx is amux failing, not amux declining — if this is really a refusal, the fix \
-                 is the STATUS CODE, not the caller.",
-                g.count,
-                g.clients.len()
-            )),
+            ("verdict".into(), if is_pool {
+                format!(
+                    "{} request(s) across {} route(s) failed waiting for a database connection, \
+                     from {} distinct client(s). THE ROUTES ARE VICTIMS, NOT THE FAULT — the \
+                     cause is whatever was HOLDING connections, which is usually somewhere else \
+                     (AR-135: one endpoint's rebuild starved four unrelated routes). Look at what \
+                     the host was doing in this window before looking at any handler named below. \
+                     Routes hit: {}.",
+                    g.count,
+                    g.targets.len(),
+                    g.clients.len(),
+                    g.targets.iter().take(12).cloned().collect::<Vec<_>>().join(", ")
+                )
+            } else {
+                format!(
+                    "{method} {target} answered HTTP {status} {} time(s) from {} distinct \
+                     client(s). A 5xx is amux failing, not amux declining — if this is really a \
+                     refusal, the fix is the STATUS CODE, not the caller.",
+                    g.count,
+                    g.clients.len()
+                )
+            }),
             ("sample_request".into(), format!("{method} {}", g.sample_path)),
             ("error_body".into(), truncate(&g.sample_body, 800)),
             ("first_seen".into(), rl::local_when(g.first_ts)),
@@ -778,6 +835,11 @@ struct Group {
     sample_path: String,
     sample_body: String,
     max_latency: f64,
+    /// Every route that was a VICTIM of this group. Only populated for the
+    /// pool-exhaustion rollup, where the split-by-target was the defect
+    /// (AMUX-3840): the card has to name who was hit without being one card
+    /// per victim.
+    targets: std::collections::BTreeSet<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -6612,6 +6674,66 @@ mod tests {
             })
             .unwrap();
         rows.flatten().collect()
+    }
+
+    /// AMUX-3840. A pool starvation is ONE fault with many victims, and filing
+    /// it per victim is the AMUX-2814 shape: a card per innocent route, each
+    /// naming an endpoint that is not the fault. Measured 2026-08-28: a
+    /// two-minute burst at load 46 filed FOUR cards for 22 occurrences.
+    #[tokio::test]
+    async fn a_starved_pool_files_one_card_naming_its_victims_not_one_card_each() {
+        let (st, _d) = state();
+        let now = unix_now();
+        let pool = "{\"error\":\"timed out waiting for connection\"}";
+        for (i, path) in ["/api/board", "/api/board/statuses", "/api/calendar.ics", "/api/board"]
+            .iter()
+            .enumerate()
+        {
+            log_row(&st, Row { ts: now - 100.0 + i as f64, method: "GET", path, family: "/api",
+                               status: 500, body: pool, worker: "", ua: "curl/8", ms: 30_150.0 });
+        }
+        let (f, _) = detect_5xx(&st.store.read().unwrap(), now);
+        assert_eq!(f.len(), 1, "one starvation must be one card, got {:?}",
+                   f.iter().map(|x| &x.title).collect::<Vec<_>>());
+        let card = &f[0];
+        assert!(card.title.contains("Connection pool starved"), "{}", card.title);
+        assert!(card.signature.starts_with("5xx|500|POOL|"), "{}", card.signature);
+        let verdict = &card.evidence.iter().find(|(k, _)| k == "verdict").unwrap().1;
+        // THE VICTIMS ARE STILL NAMED. Collapsing must not cost the reader the
+        // list of what was hit — that was the useful half of the four cards.
+        for p in ["/api/board", "/api/board/statuses", "/api/calendar.ics"] {
+            assert!(verdict.contains(p), "verdict must name {p}: {verdict}");
+        }
+        // AND IT MUST SAY THEY ARE VICTIMS, or one card now points at three
+        // innocent handlers instead of three cards pointing at one each.
+        assert!(verdict.contains("VICTIMS, NOT THE FAULT"), "{verdict}");
+    }
+
+    /// THE CONTROL for the test above: ordinary 5xxs stay split per route,
+    /// because those genuinely are separate faults. Without this, the collapse
+    /// could silence real per-endpoint defects.
+    #[tokio::test]
+    async fn two_unrelated_500s_are_still_two_cards() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(&st, Row { ts: now - 50.0, method: "GET", path: "/api/alpha", family: "/api",
+                           status: 500, body: "index out of bounds", worker: "", ua: "curl/8", ms: 5.0 });
+        log_row(&st, Row { ts: now - 40.0, method: "GET", path: "/api/beta", family: "/api",
+                           status: 500, body: "unwrap on None", worker: "", ua: "curl/8", ms: 5.0 });
+        let (f, _) = detect_5xx(&st.store.read().unwrap(), now);
+        assert_eq!(f.len(), 2, "two unrelated 500s stay two cards: {:?}",
+                   f.iter().map(|x| &x.title).collect::<Vec<_>>());
+    }
+
+    /// The predicate alone. Matching too widely would fold unrelated 500s into
+    /// the pool card and hide real defects.
+    #[test]
+    fn only_a_real_pool_timeout_counts_as_starvation() {
+        assert!(is_pool_exhaustion("timed out waiting for connection"));
+        assert!(is_pool_exhaustion("{\"error\":\"Timed out waiting for connection\"}"));
+        assert!(!is_pool_exhaustion("connection refused"));
+        assert!(!is_pool_exhaustion("timed out waiting for the model"));
+        assert!(!is_pool_exhaustion(""));
     }
 
     /// THE grouping property: 14 identical failures are ONE incident. A filer
