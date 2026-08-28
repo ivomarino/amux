@@ -720,6 +720,32 @@ instead of open ones, because it changes what the tool CONCLUDES rather than how
 phrases it, so only an assertion reading the logic can catch it. Mutate the arithmetic or
 the predicate; a text mutation measures coupling, not correctness.
 
+**A GREEN RESULT AND A RESULT THAT NEVER RAN ARE THE SAME SILENCE, and only one of
+them is visible to "print what the probe matched"** (2026-08-28, amux + amux-frustrations,
+the fifth instance in a day of four). Four of that day's failures were PROBES that could
+not see their target: a `find('REVIEW')` that matched `REVIEWER` 1,867 characters early, a
+`grep -q ... | head` whose exit status was masked by head's, a scan over a board list
+payload that is slim and carries no `log` field at all, and a multi-word grep asserting
+adjacency the source never had. The remedy for all four is the same: anchor on the form you
+mean, and PRINT WHAT THE PROBE MATCHED before believing what it did not find.
+
+The fifth was different and the remedy above does not reach it. A mutation was applied to a
+`format!` string but removed the arguments with the text, so the crate did not compile, the
+test never ran, and the output was empty — one step from reading as "the control does not
+fire". There was nothing matched to print. The discriminator is the EXIT STATUS, which
+separates "ran and passed", "ran and failed" and "never ran"; the printed body collapses the
+first and third into the same blankness.
+
+So the pair, and both halves are needed:
+- For a search: print what it matched, not only what it concluded.
+- For a harness: read the exit status, not the output. `cargo test` returning non-zero with
+  no test lines is a compile failure wearing a green suit.
+
+The general form is the one rule 4 already states and this sharpens: an output that can read
+empty must publish whether the measurement RAN. A mutation harness is an instrument like any
+other, and "I mutated it and nothing changed" is a claim about a run that has to have
+happened.
+
 **And confirm the mutation LANDED before reading the suite's colour.** The same review
 produced the inverse failure minutes later: an attempt to zero the open count used a
 regex that matched NOTHING, the harness printed `count expr found: False`, and the
