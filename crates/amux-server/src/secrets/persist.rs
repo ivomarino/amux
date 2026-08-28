@@ -24,14 +24,21 @@ use tracing::{error, info, warn};
 /// # Arguments
 /// * `secrets` - Secrets as nested JSON
 /// * `secrets_file` - Path to encrypted output file
-/// * `_age_key_path` - Path to age private key (used by SOPS config)
+/// * `age_key_path` - Path to the age identity (private key) file. The
+///   recipient (public key) we encrypt TO is derived from this file via
+///   `age-keygen -y`, not hardcoded — see the doc comment on this module
+///   and PR #163's review (@esteininger) for why that distinction matters:
+///   a hardcoded recipient means every install encrypts to the SAME key
+///   regardless of whose `age_key_path` they actually configured.
 ///
 /// # Errors
-/// Returns error if encryption fails or file write fails
+/// Returns error if the identity file is missing/unreadable, `age-keygen`
+/// can't derive a public key from it, encryption fails, or the file write
+/// fails.
 pub async fn encrypt_and_persist(
     secrets: &Value,
     secrets_file: &Path,
-    _age_key_path: &Path,
+    age_key_path: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // 1. Serialize to YAML
     let yaml_str = serde_yaml::to_string(secrets)?;
@@ -44,12 +51,58 @@ pub async fn encrypt_and_persist(
     tokio::fs::write(&temp_path, &yaml_str).await?;
 
     // 4. Encrypt with age (X25519 encryption)
-    // Public key from .sops.yaml creation_rule
-    let public_key = "age1l6c7nzuyp3esvtgxs26txkd285mq84rsyjlxmtgwdaz8tfg3yahsmnkfqj";
+    //
+    // The recipient is derived from age_key_path's OWN identity, not a
+    // hardcoded literal — `age-keygen -y <identity-file>` prints the public
+    // key that corresponds to a private key file, which is exactly the
+    // recipient whoever holds that identity file should be encrypting to.
+    // A fixed literal here would mean every install encrypts to one
+    // specific key regardless of whose age_key_path is actually configured
+    // — silently correct only for whoever generated that one literal key.
+    if !age_key_path.exists() {
+        return Err(format!(
+            "age identity file not found at {} — run: age-keygen -o {}",
+            age_key_path.display(),
+            age_key_path.display()
+        )
+        .into());
+    }
 
-    let encrypt_output = tokio::process::Command::new("/usr/bin/age")
+    let keygen_output = tokio::process::Command::new("age-keygen")
+        .arg("-y")
+        .arg(age_key_path)
+        .output()
+        .await
+        .map_err(|e| {
+            error!("Failed to run age-keygen: {}", e);
+            e
+        })?;
+
+    if !keygen_output.status.success() {
+        let stderr = String::from_utf8_lossy(&keygen_output.stderr);
+        return Err(format!(
+            "age-keygen could not derive a public key from {}: {}",
+            age_key_path.display(),
+            stderr
+        )
+        .into());
+    }
+
+    let public_key = String::from_utf8(keygen_output.stdout)?.trim().to_string();
+    if public_key.is_empty() {
+        return Err(format!(
+            "age-keygen returned an empty public key for {}",
+            age_key_path.display()
+        )
+        .into());
+    }
+
+    // Resolved via PATH, not a hardcoded /usr/bin/age — Homebrew puts it at
+    // /opt/homebrew/bin/age, most Linux packages elsewhere; a fixed
+    // absolute path is a class of "works on my box" (same review).
+    let encrypt_output = tokio::process::Command::new("age")
         .arg("-r")
-        .arg(public_key)
+        .arg(&public_key)
         .arg(&temp_path)
         .output()
         .await
@@ -111,8 +164,10 @@ pub async fn load_and_decrypt(
         return Ok(Value::Object(Default::default()));
     }
 
-    // Decrypt using age
-    let decrypt_output = tokio::process::Command::new("/usr/bin/age")
+    // Decrypt using age — resolved via PATH (same reasoning as
+    // encrypt_and_persist above: a hardcoded /usr/bin/age doesn't exist on
+    // every install, e.g. Homebrew's /opt/homebrew/bin/age).
+    let decrypt_output = tokio::process::Command::new("age")
         .arg("-d")
         .arg("-i")
         .arg(age_key_path)
