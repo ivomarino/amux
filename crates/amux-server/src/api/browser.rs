@@ -323,6 +323,40 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
     }
 }
 
+#[cfg(test)]
+mod takeover_wording_tests {
+    use super::*;
+
+    /// The refusal must not claim something the code cannot do (Ethan, 2026-08-28).
+    ///
+    /// It used to say a start "would DESTROY its state (staged logins
+    /// included)". A completed staged login lives on disk under
+    /// `playwright-auth/profiles/<name>/` and survives both a stop (SIGTERM, so
+    /// storage flushes) and a takeover — the only `remove_dir_all` on a profile
+    /// is the explicit `delete_profile` verb. Ethan hit that sentence on a
+    /// browser held 18.1h with ZERO tabs, which is how a guard teaches people to
+    /// stop reading guards.
+    #[test]
+    fn the_refusal_names_what_a_takeover_actually_destroys() {
+        let v = takeover_refusal(
+            "default", "tubescience", 1_000, 42, Some(0), &[], 1_000 + 65_160,
+            Some("amux"), StartOrigin::NotLooked,
+        );
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(
+            !err.contains("staged logins"),
+            "the headline must not claim on-disk logins are lost: {err}"
+        );
+        assert!(err.contains("OPEN TABS"), "it must name what IS lost: {err}");
+        // CONTROLS: the refusal still refuses, and still carries the evidence
+        // that makes it judgeable. A fix that softened it into an approval, or
+        // dropped the idle facts, would pass the assertions above.
+        assert!(err.contains("already running"), "it must still refuse: {err}");
+        assert!(err.contains("ZERO tabs"), "and still carry the evidence: {err}");
+        assert!(err.contains("takeover"), "and still name the deliberate escape: {err}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn takeover_refusal(
     profile: &str,
@@ -346,8 +380,10 @@ fn takeover_refusal(
     // pointed the wrong way on the specimen: "4 tab(s)" was two omnibox popups,
     // an iframe, and one live Google sign-in, and "0.0h" read as brand new. Both
     // numbers argued for takeover while the thing at risk was the single most
-    // costly thing to destroy — which the sentence above warns about in the
-    // abstract ("staged logins included") and could not point at.
+    // costly thing to destroy — which the headline could only gesture at in the
+    // abstract and could not point to. (That headline no longer claims staged
+    // logins are lost; they are on disk and survive. See the note at the
+    // refusal itself.)
     let page_list = pages
         .iter()
         .map(|(t, h)| {
@@ -417,11 +453,30 @@ fn takeover_refusal(
         // takeover escape stays here — and "(unattributed)" alone names nobody,
         // supports no decision, and reads identically whether the holder is a
         // script on this box or a person signed in from another host.
+        //
+        // NAMES WHAT IS ACTUALLY AT RISK (Ethan, 2026-08-28). This used to say
+        // "would DESTROY its state (staged logins included)", which is wrong on
+        // its most alarming term and fired regardless of the evidence below it.
+        // A COMPLETED staged login lives on disk in
+        // `playwright-auth/profiles/<name>/` — 24M for `atlas` — and survives
+        // both a stop and a takeover: `stop_as` sends SIGTERM specifically so
+        // storage flushes, SIGKILL is a last resort, and the ONLY
+        // `remove_dir_all` on a profile is the explicit `delete_profile` verb.
+        // Nothing on the start path touches it.
+        //
+        // What a takeover does destroy is open tabs and an auth flow that has
+        // not persisted a cookie yet, which is exactly what the `idle` sentence
+        // already says correctly. The headline overstating it is how a guard
+        // trains people to ignore guards: Ethan hit this on a browser held 18.1h
+        // with ZERO tabs and was told staged logins were at stake.
+        //
+        // The refusal itself is UNCHANGED and still fires. Only the claim is
+        // now one the code can support.
         "error": format!(
-            "a browser is already running under {} — starting yours would DESTROY its \
-             state (staged logins included). It is {idle}. Pass {{\"takeover\": true}} to replace \
-             it deliberately, or drive the running one via session-scoped verbs; `your_options` \
-             below spells out the non-destructive moves.",
+            "a browser is already running under {} — starting yours would replace it, losing \
+             its OPEN TABS and any auth flow mid-completion. It is {idle}. Pass \
+             {{\"takeover\": true}} to replace it deliberately, or drive the running one via \
+             session-scoped verbs; `your_options` below spells out the non-destructive moves.",
             if named {
                 format!("session '{owner}'")
             } else {
