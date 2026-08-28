@@ -2107,6 +2107,62 @@ fn backlog_triage_text(
 
 /// Outstanding non-terminal cards for a session: (blocked_count, done_count,
 /// blocked_cards [(id, title)], done_cards [(id, title)]).
+/// A card's `(status, depends_on)`, or `None` when the id does not resolve.
+/// Named rather than inlined so the walk's signature says what it reads.
+type CardLink = Option<(String, Vec<String>)>;
+
+/// How far up a `depends_on` chain to look before giving up. Generous: the
+/// deepest live chain is 3 hops (MG-1356 -> MG-1355 -> MG-1354 -> MG-1369).
+const DEPENDS_ON_MAX_DEPTH: usize = 12;
+
+/// Does this blocked card's `depends_on` chain root in a card that is waiting on
+/// the human? Returns that card's id.
+///
+/// AMUX-3775, reported by mixpeek-general after the SAME seven cards were
+/// surfaced four times in one session. The nudge asks a lane to "re-assess each
+/// blocker", the lane does, nothing has moved because the root is waiting on
+/// Ethan, and the nudge fires again identically. Complying buys nothing, which
+/// selects against complying, and then a card that genuinely DID unblock goes
+/// unnoticed. The relationship was already in the data; nothing walked it.
+///
+/// Pure, over a lookup, so the walk has cells without a database. `lookup`
+/// returns `(status, depends_on)` or `None` for an id that does not resolve.
+///
+/// A DANGLING OR CYCLIC CHAIN IS NOT HUMAN-BLOCKED. Both return `None`, which
+/// leaves the card in the ordinary nudge — the honest default, since a chain
+/// this cannot follow is a chain it has learned nothing about. Treating an
+/// unresolvable id as "waiting on Ethan" would silence a card nobody is waiting
+/// on, which is the failure this fix exists to avoid in the other direction.
+fn human_blocked_root(
+    start: &str,
+    lookup: &dyn Fn(&str) -> CardLink,
+    max_depth: usize,
+) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut frontier = vec![start.to_string()];
+    for _ in 0..max_depth {
+        let mut next = Vec::new();
+        for id in frontier {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some((status, deps)) = lookup(&id) else { continue };
+            // The START card is `blocked`, not `needsyou`; only an ANCESTOR
+            // counts. Checking the start would make any card a lane retyped to
+            // needsyou silence itself.
+            if id != start && status == "needsyou" {
+                return Some(id);
+            }
+            next.extend(deps);
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
 #[allow(clippy::type_complexity)]
 /// `done` cards carry their REVIEWER (AMUX-3561): whether a card can be moved
 /// toward `verified` by the lane that owns it depends entirely on whether a peer
@@ -2114,7 +2170,7 @@ fn backlog_triage_text(
 fn outstanding_work(
     conn: &Connection,
     session: &str,
-) -> (i64, i64, Vec<(String, String)>, Vec<(String, String, String)>) {
+) -> (i64, i64, Vec<(String, String)>, Vec<(String, String, String)>, Vec<(String, String, String)>) {
     let query = |status: &str| -> (i64, Vec<(String, String)>) {
         let count: i64 = conn
             .query_row(
@@ -2139,7 +2195,44 @@ fn outstanding_work(
             .unwrap_or_default();
         (count, cards)
     };
-    let (bc, blocked) = query("blocked");
+    // BLOCKED IS PARTITIONED, not counted (AMUX-3775). Every blocked card is
+    // fetched rather than the first 8, because the split has to be exact: "7
+    // blocked" over one listed line is worse than either honest number. Blocked
+    // counts are small (the reporting lane's own worst case was 7).
+    let all_blocked: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT id, title FROM issues WHERE session=?1 AND status='blocked' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
+             ORDER BY updated DESC",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    let lookup = |id: &str| -> CardLink {
+        conn.query_row(
+            "SELECT status, COALESCE(depends_on,'') FROM issues WHERE id=?1 AND deleted IS NULL",
+            rusqlite::params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+        .map(|(status, deps)| {
+            (status, serde_json::from_str::<Vec<String>>(&deps).unwrap_or_default())
+        })
+    };
+    let mut blocked: Vec<(String, String)> = Vec::new();
+    let mut human_blocked: Vec<(String, String, String)> = Vec::new();
+    for (id, title) in all_blocked {
+        match human_blocked_root(&id, &lookup, DEPENDS_ON_MAX_DEPTH) {
+            Some(root) => human_blocked.push((id, title, root)),
+            None => blocked.push((id, title)),
+        }
+    }
+    let bc = blocked.len() as i64;
+    blocked.truncate(8);
     let (dc, done_plain) = query("done");
     let done: Vec<(String, String, String)> = done_plain
         .into_iter()
@@ -2154,7 +2247,7 @@ fn outstanding_work(
             (id, title, rv.trim().to_string())
         })
         .collect();
-    (bc, dc, blocked, done)
+    (bc, dc, blocked, done, human_blocked)
 }
 
 /// The `{blocked, done}` the LAST continue-nudge reported for this lane, or
@@ -2186,7 +2279,7 @@ mod continue_nudge_ask_tests {
             ("D-1".to_string(), "shipped a thing".to_string(), String::new()),
             ("D-2".to_string(), "shipped another".to_string(), String::new()),
         ];
-        let t = continue_nudge_text(1, 2, &blocked, &done);
+        let t = continue_nudge_text(1, 2, &blocked, &done, &[]);
 
         assert!(
             t.contains("amux board reviewer"),
@@ -2208,7 +2301,7 @@ mod continue_nudge_ask_tests {
             "shipped".to_string(),
             "amux-frustrations".to_string(),
         )];
-        let t2 = continue_nudge_text(1, 1, &blocked, &reviewed);
+        let t2 = continue_nudge_text(1, 1, &blocked, &reviewed, &[]);
         assert!(t2.contains("reviewer: amux-frustrations"), "name the peer: {t2}");
         assert!(
             t2.contains("amux board ask") && !t2.contains("amux board reviewer"),
@@ -2232,7 +2325,7 @@ mod continue_nudge_ask_tests {
     fn the_drive_does_not_demand_verification_of_every_done_card() {
         let done: Vec<(String, String, String)> =
             (0..3).map(|i| (format!("D-{i}"), "shipped".into(), String::new())).collect();
-        let t = continue_nudge_text(0, 3, &[], &done);
+        let t = continue_nudge_text(0, 3, &[], &done, &[]);
 
         assert!(t.contains("done, verified, archived"), "`done` must be a listed terminal: {t}");
         assert!(
@@ -2276,6 +2369,7 @@ fn continue_nudge_text(
     done_count: i64,
     blocked: &[(String, String)],
     done: &[(String, String, String)],
+    human_blocked: &[(String, String, String)],
 ) -> String {
     let mut sections = Vec::new();
 
@@ -2296,6 +2390,37 @@ fn continue_nudge_text(
              work it. If genuinely still blocked, leave it but ensure the blocker \
              is named in the desc.\n{}",
             lines.join("\n")
+        ));
+    }
+
+    // REPORTED, NOT ASKED (AMUX-3775). These are excluded from the re-assess ask
+    // because their chain roots in a card waiting on the human, so re-assessing
+    // them cannot change anything and asking again every cycle is what taught
+    // the reporting lane to ignore the nudge. They are still NAMED, with the
+    // root, because silently dropping them would replace a nudge that cannot be
+    // satisfied with a count that cannot be trusted (ethos rule 1).
+    if !human_blocked.is_empty() {
+        let mut roots: Vec<&str> = human_blocked.iter().map(|(_, _, r)| r.as_str()).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        sections.push(format!(
+            "{} blocked card(s) NOT listed above: their depends_on chain roots in {} \
+             ({}), which is waiting on the human. Nothing for you to do — do not \
+             re-assess these, and do not retype them to `needsyou`, which would put \
+             one decision in the owner's queue {} times and destroy the depends_on \
+             link this exclusion reads.\n{}",
+            human_blocked.len(),
+            if roots.len() == 1 { "a card" } else { "cards" },
+            roots.join(", "),
+            human_blocked.len(),
+            human_blocked
+                .iter()
+                .map(|(id, title, root)| {
+                    let t: String = title.chars().take(55).collect();
+                    format!("  {id} {t}   (-> {root})")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
 
@@ -3880,7 +4005,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 let Ok(conn) = state.store.read() else {
                     break 'cont None;
                 };
-                let (bc, dc, blocked, done) = outstanding_work(&conn, lane);
+                let (bc, dc, blocked, done, human_blocked) = outstanding_work(&conn, lane);
                 // `done` IS CONTEXT, NOT A TRIGGER (AMUX-2903, second pass).
                 //
                 // I shipped change-detection first and the very next nudge
@@ -3900,8 +4025,21 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 // blocker is work the lane can actually do. The done count still
                 // rides along in the message as context.
                 if bc == 0 {
+                    // SAY WHAT WAS EXCLUDED (AMUX-3775, ethos rule 1). A skip
+                    // line reading "0 blocked" over a lane holding seven blocked
+                    // cards is the reason this was hard to see: the count and
+                    // the board disagreed and only the board was visible.
+                    let hb = if human_blocked.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} blocked card(s) excluded: their depends_on chain roots in a \
+                             card waiting on the human, so the lane cannot act on them)",
+                            human_blocked.len()
+                        )
+                    };
                     break 'cont Some(format!(
-                        "auto-continue enabled, {dc} done but 0 blocked — done is context, not a trigger"
+                        "auto-continue enabled, {dc} done but 0 actionable blocked — done is context, not a trigger{hb}"
                     ));
                 }
                 let recent: bool = conn
@@ -3946,7 +4084,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     ));
                 }
                 drop(conn);
-                let text = continue_nudge_text(bc, dc, &blocked, &done);
+                let text = continue_nudge_text(bc, dc, &blocked, &done, &human_blocked);
                 crate::api::session_verbs::emit_event(
                     state,
                     lane,
@@ -4650,7 +4788,7 @@ mod tests {
         for i in 0..229 {
             ins(&format!("D-{i}"), "done");
         }
-        let (bc, dc, _, _) = outstanding_work(&conn, "me");
+        let (bc, dc, _, _, _) = outstanding_work(&conn, "me");
         assert_eq!((bc, dc), (0, 229));
         // The trigger is `bc > 0`. With no blocked cards there is nothing to
         // nudge about, no matter how large `done` grows.
@@ -4659,9 +4797,110 @@ mod tests {
         // Add one blocked card and it arms — because re-assessing a blocker is
         // work this lane can actually do.
         ins("B-1", "blocked");
-        let (bc2, dc2, blocked, _) = outstanding_work(&conn, "me");
+        let (bc2, dc2, blocked, _, _) = outstanding_work(&conn, "me");
         assert_eq!((bc2, dc2), (1, 229));
         assert_eq!(blocked.len(), 1, "the blocked card is named in the nudge");
+    }
+
+    /// AMUX-3775. The walk itself, over a lookup, so every branch has a cell.
+    #[test]
+    fn the_depends_on_walk_finds_a_human_root_and_refuses_to_guess() {
+        let table: &[(&str, &str, &[&str])] = &[
+            // The reporting lane's real chain: MG-1356 -> 1355 -> 1354 -> 1369.
+            ("MG-1356", "blocked", &["MG-1355"]),
+            ("MG-1355", "blocked", &["MG-1354"]),
+            ("MG-1354", "blocked", &["MG-1369"]),
+            ("MG-1369", "needsyou", &[]),
+            // A chain that roots in ordinary work is NOT human-blocked.
+            ("W-1", "blocked", &["W-2"]),
+            ("W-2", "todo", &[]),
+            // A chain that points at nothing resolvable.
+            ("D-1", "blocked", &["GONE-9"]),
+            // A cycle.
+            ("C-1", "blocked", &["C-2"]),
+            ("C-2", "blocked", &["C-1"]),
+            // A lane that retyped ITSELF to needsyou must not silence itself.
+            ("S-1", "needsyou", &[]),
+        ];
+        let lookup = |id: &str| -> CardLink {
+            table.iter().find(|(i, _, _)| *i == id).map(|(_, s, d)| {
+                (s.to_string(), d.iter().map(|x| x.to_string()).collect())
+            })
+        };
+        assert_eq!(
+            human_blocked_root("MG-1356", &lookup, DEPENDS_ON_MAX_DEPTH),
+            Some("MG-1369".into()),
+            "a three-hop chain to a needsyou card is blocked on the human"
+        );
+        assert_eq!(human_blocked_root("MG-1354", &lookup, DEPENDS_ON_MAX_DEPTH), Some("MG-1369".into()));
+        // THE CONTROLS. Each of these would silence a card nobody is waiting on,
+        // which is the same defect as the nudge that never stops, pointed the
+        // other way.
+        assert_eq!(human_blocked_root("W-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "root is todo");
+        assert_eq!(human_blocked_root("D-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "dangling id");
+        assert_eq!(human_blocked_root("C-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "a cycle terminates");
+        assert_eq!(
+            human_blocked_root("S-1", &lookup, DEPENDS_ON_MAX_DEPTH),
+            None,
+            "the START card's own status must not count, or a card retyped to needsyou silences itself"
+        );
+        // The cap holds: one hop is not enough to reach MG-1369 from MG-1356.
+        assert_eq!(human_blocked_root("MG-1356", &lookup, 1), None, "depth is bounded");
+    }
+
+    /// AMUX-3775, through `outstanding_work` — the shipped path, on the shape
+    /// mixpeek-general reported: several blocked cards chaining to one card
+    /// waiting on Ethan, plus one genuinely actionable.
+    #[test]
+    fn blocked_on_a_human_root_is_excluded_from_the_count_and_still_named() {
+        let conn = board_db();
+        let ins = |id: &str, status: &str, dep: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,depends_on) \
+                 VALUES (?1,?2,?3,'me','agent',0,'code',100,?4)",
+                rusqlite::params![
+                    id,
+                    format!("card {id}"),
+                    status,
+                    dep.map(|d| format!("[\"{d}\"]"))
+                ],
+            )
+            .expect("insert");
+        };
+        ins("MG-1369", "needsyou", None);
+        ins("MG-1354", "blocked", Some("MG-1369"));
+        ins("MG-1355", "blocked", Some("MG-1354"));
+        ins("MG-1356", "blocked", Some("MG-1355"));
+        // No depends_on: its trigger is a fleet state, so the lane CAN re-assess it.
+        ins("MG-1426", "blocked", None);
+
+        let (bc, _dc, blocked, _done, human_blocked) = outstanding_work(&conn, "me");
+        assert_eq!(bc, 1, "only the actionable one arms the nudge, not all four");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, "MG-1426");
+        assert_eq!(human_blocked.len(), 3, "the three chaining to MG-1369 are set aside");
+        assert!(human_blocked.iter().all(|(_, _, root)| root == "MG-1369"));
+
+        // NAMED, NOT DROPPED (ethos rule 1). A version that just filtered them
+        // out would pass every assertion above and leave the lane with a count
+        // that silently disagrees with its own board.
+        let text = continue_nudge_text(bc, 0, &blocked, &[], &human_blocked);
+        assert!(text.contains("MG-1426"), "the actionable one is still asked about: {text}");
+        assert!(text.contains("MG-1369"), "and the human root is named: {text}");
+        assert!(text.contains("MG-1356"), "and the excluded cards are listed: {text}");
+        assert!(
+            text.contains("Nothing for you to do"),
+            "the excluded ones carry no ask: {text}"
+        );
+        // The specific wrong fix, named in the message so nobody reaches for it.
+        assert!(text.contains("do not retype them to `needsyou`"), "{text}");
+
+        // AND WITH NOTHING ACTIONABLE, bc IS ZERO — which is what makes the
+        // nudge stop, since the caller's trigger is `bc > 0`.
+        conn.execute("UPDATE issues SET status='todo' WHERE id='MG-1426'", []).expect("update");
+        let (bc2, _, _, _, hb2) = outstanding_work(&conn, "me");
+        assert_eq!(bc2, 0, "a lane whose every blocker is human-rooted is not nudged");
+        assert_eq!(hb2.len(), 3, "and they are still visible to the caller, not lost");
     }
 
     /// AMUX-2903. The continue-nudge's cooldown is a RATE limit, not an exit,
