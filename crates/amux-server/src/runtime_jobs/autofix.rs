@@ -1894,6 +1894,11 @@ pub fn detect_silent(
     conn: &Connection,
     now: f64,
     blocked: &BTreeMap<String, Option<String>>,
+    // `resets`: per-lane `rate_limited_until` (0 = the banner named no reset
+    // time). Separate from `blocked` because `lane_block_reason` returns a
+    // `&'static str` on purpose — one shared predicate, no per-lane text — so
+    // the WHEN rides alongside the WHETHER instead of inside it.
+    resets: &BTreeMap<String, i64>,
 ) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
@@ -2041,6 +2046,39 @@ pub fn detect_silent(
                     continue;
                 }
                 let _ = stale_s;
+                // A RATE LIMIT IS TEMPORARY, AND CLAUDE'S BANNER SAYS WHEN
+                // (AMUX-3815). This card used to tell the board "this queue will
+                // not drain on its own" about `tubescience`, whose own pane read
+                // "continuing automatically at 8:30pm" — 35 minutes away. The
+                // claim was not merely unhelpful, it contradicted
+                // `lane_block_reason_from`'s own comment ("a rate limit is by
+                // definition temporary. The row waits, which is the whole point
+                // of the card").
+                //
+                // SUPPRESSED, not silent: it goes to the ledger with the reset
+                // time in it, so `/api/debug/autofix` can show a decision was
+                // made rather than a detector that never looked (ethos rule 4).
+                // A reset time of 0 means the banner named none (a credit cap
+                // has no clock), and that case still files.
+                let reset = resets.get(&session).copied().unwrap_or(0);
+                let reset_pending = block.as_deref() == Some("rate-limited")
+                    && reset > 0
+                    && (reset as f64) > now;
+                if reset_pending {
+                    suppressed.push(sup(
+                        DetectorKind::SilentSubsystem,
+                        &format!("silent|steering|{session}"),
+                        &format!(
+                            "{n} message(s) queued {:.0} min for {session}, but the lane is \
+                             rate-limited and its banner says it resumes at {} — the queue \
+                             drains then, unattended. Filed only if it is still queued after \
+                             that.",
+                            age / 60.0,
+                            rl::local_when(reset as f64)
+                        ),
+                    ));
+                    continue;
+                }
                 // ROUTE TO THE SENDER, NEVER THE STALLED LANE (AMUX-2796).
                 //
                 // This used to set `owner: Some(session)` — the lane whose queue
@@ -2089,6 +2127,50 @@ pub fn detect_silent(
                     },
                     evidence: vec![
                         ("verdict".into(), match &block {
+                            // A rate limit is the one block reason that lifts by
+                            // itself, so it gets its own sentence rather than the
+                            // blanket "will not drain" (AMUX-3815). The two cases
+                            // are genuinely different work: a reset time that has
+                            // PASSED with the queue still full is a real stall in
+                            // the drain loop, and no known reset time means amux
+                            // could not read one, which is the thing to fix.
+                            Some(r) if r.as_str() == "rate-limited" => format!(
+                                "{n} message(s) queued for {session}; the oldest has waited \
+                                 {:.0} min (deadline {deadline_min:.0} min). The lane is \
+                                 rate-limited. {} Every one of these was reported to its sender \
+                                 as accepted.",
+                                age / 60.0,
+                                // Compared against `now` HERE, not inherited
+                                // from the suppression above. Reaching this
+                                // branch normally means the reset is past, but
+                                // a sentence that is only true because of a
+                                // `continue` thirty lines up is one refactor
+                                // from asserting "has PASSED" about a future
+                                // time — which is exactly what the mutation run
+                                // printed when the suppression was disabled.
+                                if reset > 0 && (reset as f64) <= now {
+                                    format!(
+                                        "Its banner said it would resume at {}, and that time \
+                                         has PASSED with the queue still full — so this is not \
+                                         the limit waiting itself out; look at the drain loop.",
+                                        rl::local_when(reset as f64)
+                                    )
+                                } else if reset > 0 {
+                                    format!(
+                                        "Its banner says it resumes at {}, which is still \
+                                         ahead — the queue is expected to drain then.",
+                                        rl::local_when(reset as f64)
+                                    )
+                                } else {
+                                    "amux could not read a reset time from its banner \
+                                     (`rate_limited_until` is 0), so it cannot say whether this \
+                                     drains on its own. A credit cap genuinely has no reset \
+                                     clock; a session limit does, and a missing one there means \
+                                     the banner wording changed and \
+                                     `parse_rate_limit_reset` needs it."
+                                        .to_string()
+                                }
+                            ),
                             Some(r) => format!(
                                 "{n} message(s) queued for {session}; the oldest has waited \
                                  {:.0} min (deadline {deadline_min:.0} min). The lane is NOT \
@@ -4308,6 +4390,14 @@ pub async fn autofix_tick_with_ci(
         }
         m
     };
+    // WHEN each blocked lane's limit lifts, read from the same meta the
+    // rate-limit sweep stamps (AMUX-3815). Only meaningful for `rate-limited`;
+    // 0 everywhere else, and 0 for a rate-limited lane whose banner named no
+    // time — which the detector reports rather than treating as "now".
+    let steer_resets: BTreeMap<String, i64> = steer_blocked
+        .keys()
+        .map(|s| (s.clone(), crate::api::session_verbs::lane_rate_limit_reset(s)))
+        .collect();
 
     // DISK DETECTION RUNS OFF THE RUNTIME, AND OUTSIDE THE STORE LOCK (AF-97 —
     // the deeper exit AMUX-35 named and did not take).
@@ -4377,7 +4467,9 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::Http5xx => detect_5xx(&conn, now),
                 DetectorKind::Latency => detect_latency(&conn, now),
                 DetectorKind::DeadRoute => detect_dead_routes(&conn, now),
-                DetectorKind::SilentSubsystem => detect_silent(&conn, now, &steer_blocked),
+                DetectorKind::SilentSubsystem => {
+                    detect_silent(&conn, now, &steer_blocked, &steer_resets)
+                }
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
                 // Computed above, off-runtime and outside this lock (AF-97).
@@ -6286,7 +6378,7 @@ mod tests {
         let mut blocked = BTreeMap::new();
         blocked.insert("busy-lane".to_string(), None);
         blocked.insert("dead-lane".to_string(), Some("no-env-file".to_string()));
-        let (f, sup) = detect_silent(&conn, now, &blocked);
+        let (f, sup) = detect_silent(&conn, now, &blocked, &BTreeMap::new());
 
         // THE PREMISE, asserted rather than assumed: the query must have RUN.
         // If it did not prepare, the detector records a suppression saying so,
@@ -6317,7 +6409,7 @@ mod tests {
         // CELL 3 — reachable but far past the LARGER deadline: still reported,
         // as the different thing it is. A lane that has not reached a turn
         // boundary in 7h is worth a card; calling it a stuck queue is not.
-        let (f2, _) = detect_silent(&conn, now + 7.0 * 3600.0, &blocked);
+        let (f2, _) = detect_silent(&conn, now + 7.0 * 3600.0, &blocked, &BTreeMap::new());
         let late = f2
             .iter()
             .find(|x| x.signature == "silent|steering|busy-lane")
@@ -6348,6 +6440,100 @@ mod tests {
         assert!(
             ev["senders"].contains("cannot receive anything right now"),
             "...and there the blurb IS true: {ev:?}"
+        );
+    }
+
+    /// AMUX-3815: a rate limit lifts by itself, and Claude's banner says when.
+    ///
+    /// THE SPECIMEN IS `tubescience`. This detector filed "steering queue
+    /// cannot drain (rate-limited), oldest 91 min" with the verdict "This queue
+    /// will not drain on its own", while the lane's own pane read "Usage limit
+    /// reached · continuing automatically at 8:30pm" — 35 minutes out. amux had
+    /// matched that exact sentence to SET `credit_limited` and thrown the time
+    /// in it away: `rate_limited_until` was read in two places and written in
+    /// none, so it was a permanent 0.
+    ///
+    /// FOUR CELLS, and the last two are the controls. Suppressing every
+    /// rate-limited lane would pass cell 1 and delete the detector's purpose,
+    /// because a reset that has already passed and a limit with no clock at all
+    /// (a credit cap) are exactly the cases worth a card.
+    #[tokio::test]
+    async fn a_rate_limit_with_a_known_future_reset_is_not_a_stuck_queue() {
+        let (st, _d) = state();
+        let now = unix_now();
+        st.store
+            .write_async(move |conn| {
+                crate::api::session_verbs::ensure_fleet_tables(conn)?;
+                for lane in ["resets-soon", "reset-passed", "no-clock"] {
+                    conn.execute(
+                        "INSERT INTO steering_queue (id,session,text,queued_at,guard,sender) \
+                         VALUES (?1,?2,'hi',?3,'','')",
+                        rusqlite::params![format!("s-{lane}"), lane, now - 92.0 * 60.0],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .expect("seed");
+        let conn = st.store.read().unwrap();
+
+        let rl = || Some("rate-limited".to_string());
+        let blocked: BTreeMap<String, Option<String>> = [
+            ("resets-soon".to_string(), rl()),
+            ("reset-passed".to_string(), rl()),
+            ("no-clock".to_string(), rl()),
+        ]
+        .into();
+        let resets: BTreeMap<String, i64> = [
+            ("resets-soon".to_string(), now as i64 + 35 * 60),
+            ("reset-passed".to_string(), now as i64 - 20 * 60),
+            // 0 is the credit-cap case: no reset clock exists to read.
+            ("no-clock".to_string(), 0),
+        ]
+        .into();
+        let (f, sup) = detect_silent(&conn, now, &blocked, &resets);
+        assert!(
+            !sup.iter().any(|x| x.signature.contains("<query failed>")),
+            "the steering query did not prepare, so this test measures nothing: {sup:?}"
+        );
+
+        // CELL 1 — reset still ahead: no card.
+        assert!(
+            !f.iter().any(|x| x.signature == "silent|steering|resets-soon"),
+            "a limit that lifts in 35 min drains its own queue: {f:?}"
+        );
+        // CELL 2 — and the decision is VISIBLE, not silent. A detector that
+        // just skipped would be indistinguishable from one that never looked.
+        let s = sup
+            .iter()
+            .find(|x| x.signature == "silent|steering|resets-soon")
+            .expect("suppressing without recording it is the ethos-4 failure");
+        assert!(s.reason.contains("resumes at"), "say WHEN, not just that it will: {}", s.reason);
+
+        // CELL 3 (CONTROL) — the reset has PASSED and the queue is still full.
+        // That is a worse fact than the original card, not a lesser one.
+        let hit = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|reset-passed")
+            .expect("a limit whose reset came and went is a real stall");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        assert!(ev["verdict"].contains("has PASSED"), "{ev:?}");
+        assert!(
+            ev["verdict"].contains("drain loop"),
+            "and must send the reader somewhere: {ev:?}"
+        );
+
+        // CELL 4 (CONTROL) — no reset time known. Still files, and says amux
+        // could not read one rather than asserting the queue is doomed.
+        let hit = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|no-clock")
+            .expect("an unreadable reset time must not silence the card");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        assert!(ev["verdict"].contains("could not read a reset time"), "{ev:?}");
+        assert!(
+            !ev["verdict"].contains("will not drain on its own"),
+            "amux cannot support that claim about a temporary limit: {ev:?}"
         );
     }
 

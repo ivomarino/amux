@@ -1033,6 +1033,129 @@ pub(crate) fn is_rate_limited_credit_banner(footer: &str) -> bool {
         || clean.contains("usage limit reached \u{00b7} continuing automatically at")
 }
 
+/// WHEN the limit in [`is_rate_limited_credit_banner`]'s banner lifts, as an
+/// epoch — or `None` when the banner does not say (AMUX-3815).
+///
+/// The banner Claude renders carries the answer in the same sentence the
+/// detector above already matches:
+///
+/// ```text
+/// You've hit your session limit · resets 8:30pm (America/New_York)
+/// ⚠ Usage limit reached · continuing automatically at 8:30pm · esc to cancel
+/// ```
+///
+/// amux read the first half of that line and threw the second half away. The
+/// cost is a wrong CLAIM, not just a missing field: `rate_limited_until` was
+/// only ever read, never written, so it was a permanent zero, and the steering
+/// detector told the board "this queue will not drain on its own" about a lane
+/// that was going to resume by itself in 35 minutes. `lane_block_reason_from`
+/// says the opposite in a comment three files away ("a rate limit is by
+/// definition temporary. The row waits, which is the whole point of the card").
+///
+/// `None` is a real answer and must stay distinguishable from "resets at the
+/// epoch": a credit cap has no reset clock at all, and a caller that reads a
+/// missing time as zero re-creates exactly the bug above.
+///
+/// Local time, because the server and its lanes share a machine and a clock. A
+/// parsed time already past is tomorrow's — Claude writes "resets 2am" at
+/// 11pm — with a two-minute grace so a reset landing exactly now does not jump
+/// a day.
+pub(crate) fn parse_rate_limit_reset(footer: &str) -> Option<i64> {
+    parse_rate_limit_reset_at(footer, chrono::Local::now())
+}
+
+/// `8:30pm` / `2am` / `12am` at the head of `s`, as (hour24, minute).
+///
+/// 12-HOUR ONLY, deliberately. A bare `20:30` is ambiguous against `8:30` once
+/// the meridiem is optional, and Claude does not emit 24-hour times here.
+/// Refusing to read one is honest; guessing would put a silent 12-hour error
+/// into a field the steering detector suppresses cards on.
+fn parse_clock12(s: &str) -> Option<(u32, u32)> {
+    let mut chars = s.chars().peekable();
+    let mut hour = String::new();
+    while chars.peek().is_some_and(char::is_ascii_digit) {
+        hour.push(chars.next()?);
+    }
+    if hour.is_empty() || hour.len() > 2 {
+        return None;
+    }
+    let mut minute = 0u32;
+    if chars.peek() == Some(&':') {
+        chars.next();
+        let m: String = chars.by_ref().take(2).collect();
+        if m.len() != 2 || !m.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        minute = m.parse().ok()?;
+    }
+    while chars.peek() == Some(&' ') {
+        chars.next();
+    }
+    let mer: String = chars.take(2).collect();
+    let mut h: u32 = hour.parse().ok()?;
+    if !(1..=12).contains(&h) || minute > 59 {
+        return None;
+    }
+    match mer.as_str() {
+        "am" => {
+            if h == 12 {
+                h = 0
+            }
+        }
+        "pm" => {
+            if h != 12 {
+                h += 12
+            }
+        }
+        _ => return None,
+    }
+    Some((h, minute))
+}
+
+/// [`parse_rate_limit_reset`] against a caller-supplied "now", so the rollover
+/// and the already-past cases are testable without waiting for a clock.
+pub(crate) fn parse_rate_limit_reset_at(
+    footer: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<i64> {
+    use chrono::TimeZone;
+    let clean = strip_ansi(footer).to_lowercase().replace('\u{2019}', "'");
+    // Both phrasings. "resets" is the wording of the session-limit line,
+    // "continuing automatically at" of the footer warning; a pane often shows
+    // both and they agree. Most specific FIRST, and each candidate is parsed
+    // rather than merely located: "resets at 8pm" matches the bare "resets "
+    // too, leaving "at 8pm", which must lose to the marker that leaves "8pm".
+    let (h24, minute) = ["continuing automatically at ", "resets at ", "resets "]
+        .iter()
+        .filter_map(|m| clean.find(m).map(|i| &clean[i + m.len()..]))
+        .find_map(parse_clock12)?;
+    let (h, minute) = (h24, minute);
+
+    let today = now.date_naive();
+    let at = |d: chrono::NaiveDate| -> Option<i64> {
+        let naive = d.and_hms_opt(h, minute, 0)?;
+        match chrono::Local.from_local_datetime(&naive) {
+            chrono::offset::LocalResult::Single(t) => Some(t.timestamp()),
+            // A DST spring-forward can make a wall-clock time not exist and a
+            // fall-back can make it exist twice. Take the earliest candidate
+            // rather than dropping the reading: an hour of error beats
+            // reporting "no reset time known" and re-filing the card.
+            chrono::offset::LocalResult::Ambiguous(a, _) => Some(a.timestamp()),
+            chrono::offset::LocalResult::None => Some(
+                chrono::Local
+                    .from_local_datetime(&d.and_hms_opt(h.min(22) + 1, minute, 0)?)
+                    .earliest()?
+                    .timestamp(),
+            ),
+        }
+    };
+    let ts = at(today)?;
+    if ts < now.timestamp() - 120 {
+        return at(today.succ_opt()?);
+    }
+    Some(ts)
+}
+
 /// The policy for what amux does with a rate-limit menu (ethos D2).
 ///
 /// `wait` (default) presses 1. `off` leaves the menu for a human and reports it.
@@ -8489,6 +8612,25 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     lane_block_reason_from(env_exists, archived, running, rate_limited)
 }
 
+/// When this lane's rate limit lifts, or 0 if unknown (AMUX-3815).
+///
+/// The companion to [`lane_block_reason`]'s `rate-limited`, kept separate
+/// because that predicate returns a `&'static str` by design — one shared
+/// answer, no per-lane text. This is the WHEN, and it is deliberately NOT part
+/// of the block decision: the sweep's presence-based `rate_limited_since` is
+/// what says the lane is limited RIGHT NOW, and gating delivery on a clock
+/// instead would resurrect the bug the presence-based clear fixed.
+///
+/// 0 means "no reset time known", never "resets at the epoch". A credit cap has
+/// no clock at all, so a caller that reads 0 as a past time would treat every
+/// capped lane as overdue.
+pub(crate) fn lane_rate_limit_reset(name: &str) -> i64 {
+    if !env_path(name).exists() {
+        return 0;
+    }
+    meta_i64(&load_meta(name), "rate_limited_until")
+}
+
 /// The sentence a sender gets. It states what will HAPPEN, not merely what is
 /// wrong: "queued" on its own is the string that manufactured the false belief,
 /// and replacing it with a bare reason code would leave the sender to guess
@@ -9793,6 +9935,14 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
         // reason at all. This one is computed on the spot from the same
         // predicate the deliverer uses.
         let blocked = lane_block_reason(&session).await;
+        // WHEN a `rate-limited` block lifts (AMUX-3815). Published beside the
+        // reason because this endpoint is what the stall card tells the reader
+        // to check, and the autofix detector now SUPPRESSES a card on a known
+        // future reset — a suppression whose input is invisible here would be
+        // indistinguishable from a detector that never ran. Null, never 0, when
+        // no time is known: a credit cap has no reset clock, and 0 would read
+        // as a reset in 1970.
+        let reset = lane_rate_limit_reset(&session);
         lanes.push(json!({
             "session": session,
             "queued": count,
@@ -9801,6 +9951,12 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
             "overdue": now - oldest >= steer_max_age_s(),
             "deliverable": blocked.is_none(),
             "blocked_reason": blocked,
+            "rate_limit_resets_at": if reset > 0 { json!(reset) } else { Value::Null },
+            "rate_limit_resets_local": if reset > 0 {
+                json!(crate::api::request_log::local_when(reset as f64))
+            } else {
+                Value::Null
+            },
             "senders": senders.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>(),
             "last_skip_id": last_id,
             "last_skip_reason": reason,
@@ -10213,11 +10369,27 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             // Presence-based, and both signals are footer/menu-scoped, so scrollback
             // ABOUT limits never flags and a lane clears as soon as its banner goes.
             if meta_i64(&load_meta(name), "rate_limited_since") > 0 {
-                update_meta(name, &[("rate_limited_since", json!(0))]);
+                // Clear the reset time with the flag it qualifies. A stale
+                // `rate_limited_until` beside a cleared `since` is a lane that
+                // reads as "limited until 8:30pm" while it is already working.
+                update_meta(
+                    name,
+                    &[("rate_limited_since", json!(0)), ("rate_limited_until", json!(0))],
+                );
             }
             continue;
         }
         found += 1;
+        // WHEN it lifts, from the banner the check above already matched
+        // (AMUX-3815). Re-read every tick, not only on first detection: Claude
+        // rewrites the line when the window moves, and a reset time that cannot
+        // be refreshed is worse than none once it goes stale. `None` stays 0 —
+        // a credit cap has no reset clock, and callers must be able to tell
+        // "no reset time" from "resets at the epoch".
+        let reset = parse_rate_limit_reset(&footer).unwrap_or(0);
+        if meta_i64(&load_meta(name), "rate_limited_until") != reset {
+            update_meta(name, &[("rate_limited_until", json!(reset))]);
+        }
         if meta_i64(&load_meta(name), "rate_limited_since") == 0 {
             update_meta(
                 name,
@@ -19291,6 +19463,67 @@ mod steer_max_age_tests {
         assert!(!is_rate_limited_credit_banner(
             "clean.contains(\"usage limit reached\") // continuing automatically"
         ));
+    }
+
+    /// AMUX-3815: the banner that says a lane IS limited also says WHEN it
+    /// lifts, and amux read the first half and dropped the second.
+    ///
+    /// The live specimen is `tubescience` at 19:55 on 2026-08-27, whose queue
+    /// got a "will not drain on its own" card while its pane said it would
+    /// resume at 8:30pm. Both phrasings are asserted because a pane shows both.
+    #[test]
+    fn the_rate_limit_banner_yields_the_time_it_says_it_resets() {
+        use chrono::TimeZone;
+        let noon = chrono::Local.with_ymd_and_hms(2026, 8, 27, 12, 0, 0).unwrap();
+        let at = |h, m| chrono::Local.with_ymd_and_hms(2026, 8, 27, h, m, 0).unwrap().timestamp();
+
+        // The live specimen, both lines of it.
+        let live = "\u{2b9d}  You've hit your session limit \u{b7} resets 8:30pm (America/New_York)\n\
+                    \u{26a0} Usage limit reached \u{b7} continuing automatically at 8:30pm \u{b7} esc to cancel";
+        assert_eq!(parse_rate_limit_reset_at(live, noon), Some(at(20, 30)));
+        // Each phrasing alone, and the bare-hour form.
+        assert_eq!(
+            parse_rate_limit_reset_at("resets 8:30pm (America/New_York)", noon),
+            Some(at(20, 30))
+        );
+        assert_eq!(
+            parse_rate_limit_reset_at("continuing automatically at 2pm \u{b7} esc", noon),
+            Some(at(14, 0))
+        );
+        // "resets at 8pm" must not be read by the bare "resets " marker, which
+        // would leave "at 8pm" and parse to nothing. Most specific wins.
+        assert_eq!(parse_rate_limit_reset_at("resets at 8pm", noon), Some(at(20, 0)));
+        // Midnight and noon are the two the 12-hour conversion gets wrong if
+        // written the obvious way.
+        assert_eq!(parse_rate_limit_reset_at("resets 12am", noon), Some(at(0, 0) + 86_400));
+        assert_eq!(parse_rate_limit_reset_at("resets 12pm", noon), Some(at(12, 0)));
+
+        // A time already past today is TOMORROW's — Claude writes "resets 2am"
+        // at 11pm, and reading that as 21 hours ago would mark the lane overdue
+        // the instant it was detected.
+        let eleven_pm = chrono::Local.with_ymd_and_hms(2026, 8, 27, 23, 0, 0).unwrap();
+        assert_eq!(
+            parse_rate_limit_reset_at("continuing automatically at 2am", eleven_pm),
+            Some(at(2, 0) + 86_400)
+        );
+
+        // THE CONTROLS. `None` must stay distinguishable from a time, because
+        // the steering detector suppresses a card on a known future reset and
+        // a `None` read as 0 would suppress every credit-capped lane forever.
+        assert_eq!(parse_rate_limit_reset_at("Usage limit reached", noon), None, "no time at all");
+        assert_eq!(
+            parse_rate_limit_reset_at("/usage-credits to finish what you're working on", noon),
+            None,
+            "the credit-cap banner has no reset clock"
+        );
+        assert_eq!(
+            parse_rate_limit_reset_at("resets 20:30", noon),
+            None,
+            "24-hour is ambiguous against 8:30 once the meridiem is optional; refuse it"
+        );
+        assert_eq!(parse_rate_limit_reset_at("resets 13pm", noon), None, "not a 12-hour hour");
+        assert_eq!(parse_rate_limit_reset_at("resets 8:99pm", noon), None, "not a minute");
+        assert_eq!(parse_rate_limit_reset_at("resets soon", noon), None, "no digits");
     }
 
 
