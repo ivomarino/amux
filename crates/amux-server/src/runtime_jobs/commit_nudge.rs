@@ -38,9 +38,19 @@ use std::collections::{BTreeMap, BTreeSet};
 ///
 /// Deliberately NOT constructible from a working tree: it exists only to carry
 /// an answer the guard already gave.
+///
+/// Sentinel for a foreign path whose OWNER did not resolve — a running cotenant
+/// with no transcript. Distinct from an absent entry (which means nobody's edit
+/// record claims the path) because the two lead to different actions: one says
+/// there is a peer to go and find, the other says there is not (AMUX-3816).
+pub(crate) const UNRESOLVED_OWNER: &str = "\u{0}unresolved";
+
 #[derive(Debug, Default, Clone)]
 pub struct Ownership {
     /// A peer edited it and this session did NOT. Never commit these.
+    ///
+    /// The owner may be [`UNRESOLVED_OWNER`]: the path IS a peer's, and the
+    /// guard could not put a name to them.
     pub foreign: Vec<(String, String)>, // (path, owner)
     /// Both edited it. Contested, not forbidden.
     pub shared: Vec<(String, String)>, // (path, other owner)
@@ -315,7 +325,24 @@ pub fn build(
         let mut other: Vec<String> = Vec::new();
         for p in paths {
             if let Some(o) = foreign_owner.get(*p) {
-                other.push(format!("  {p}  [{o}'s]\n"));
+                // THREE STATES, THREE STRINGS (AMUX-3816). A foreign path whose
+                // owner did not resolve is neither `[<name>'s]` nor
+                // `[no edit record of yours]`: the first invents a name, the
+                // second says nobody owns it. mixpeek-frustrations hit exactly
+                // this — they needed a peer's name to warn them before a
+                // destructive commit, and `['s]` could not tell them whether
+                // there was anyone to warn.
+                //
+                // The row states the ACTION (hands off, and you will not get
+                // the name here). It deliberately does NOT name a cause: the
+                // row has not measured one, and `degraded` already carries the
+                // real reason when the guard knows it. Formatting something the
+                // row does not know is the defect this fixes.
+                if *o == UNRESOLVED_OWNER {
+                    other.push(format!("  {p}  [a peer's, name unresolved]\n"));
+                } else {
+                    other.push(format!("  {p}  [{o}'s]\n"));
+                }
             } else if unknown_owner.contains(*p) {
                 other.push(format!("  {p}  [no edit record of yours]\n"));
             } else {
@@ -1122,6 +1149,25 @@ async fn dirty_paths(dir: &str) -> Vec<String> {
         .collect()
 }
 
+/// The owner named in one guard entry, or [`UNRESOLVED_OWNER`] (AMUX-3816).
+///
+/// A free function rather than a closure inside the parse so it has a test that
+/// does not need an HTTP call to the guard (ethos rule 7). The bug it fixes was
+/// exactly one `unwrap_or` away and shipped to every row of a nudge:
+/// `unwrap_or` fires only on a MISSING key, so the guard's `owner: ""` for an
+/// unresolvable cotenant sailed through into a possessive template.
+fn owner_name(entry: &Value) -> String {
+    entry
+        .get("owner")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        // `?` was the old fallback and is the same defect one step later:
+        // `[?'s]` renders as a name, and looks deliberate while being none.
+        .filter(|s| !s.is_empty() && *s != "?")
+        .unwrap_or(UNRESOLVED_OWNER)
+        .to_string()
+}
+
 /// Ownership for `paths`, from the staged-guard ITSELF — called as a function,
 /// not reimplemented.
 ///
@@ -1157,7 +1203,15 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
                     .filter_map(|f| {
                         Some((
                             f.get("path")?.as_str()?.to_string(),
-                            f.get("owner").and_then(Value::as_str).unwrap_or("?").to_string(),
+                            // EMPTY IS UNRESOLVED, NOT A NAME (AMUX-3816). The
+                            // guard reports `owner: ""` for a peer it could not
+                            // resolve — a running cotenant with no transcript —
+                            // and `unwrap_or` fires only on a MISSING key, so
+                            // `Some("")` sailed through and the possessive
+                            // template rendered a whole list as `['s]`. `"?"`
+                            // was the same defect one step later and worse,
+                            // because `[?'s]` looks deliberate.
+                            owner_name(f),
                         ))
                     })
                     .collect()
@@ -2725,6 +2779,23 @@ mod tests {
         assert!(msg.contains("new.rs"), "the commit-worthy path must be listed: {msg}");
     }
 
+    /// AMUX-3816, the PARSE half. The render is only half the fix; if an empty
+    /// owner still reaches `foreign` as a name, every consumer has to re-handle
+    /// it. Tested on the shipped function rather than a paraphrase of it.
+    #[test]
+    fn an_owner_the_guard_could_not_resolve_never_becomes_a_name() {
+        assert_eq!(owner_name(&json!({"owner": ""})), UNRESOLVED_OWNER, "empty string");
+        assert_eq!(owner_name(&json!({"owner": "   "})), UNRESOLVED_OWNER, "whitespace");
+        assert_eq!(owner_name(&json!({"owner": "?"})), UNRESOLVED_OWNER, "the old fallback");
+        assert_eq!(owner_name(&json!({})), UNRESOLVED_OWNER, "absent key");
+        assert_eq!(owner_name(&json!({"owner": null})), UNRESOLVED_OWNER, "explicit null");
+        // THE CONTROL: a real name must survive untouched, trimmed. A
+        // normaliser that swallowed every owner would pass all five assertions
+        // above and delete the field's entire purpose.
+        assert_eq!(owner_name(&json!({"owner": "ts-onboard"})), "ts-onboard");
+        assert_eq!(owner_name(&json!({"owner": " peer-lane "})), "peer-lane");
+    }
+
     /// MG-1484 (mixpeek-general's 3-vs-20): the STALE header said "of your
     /// dirty file(s)" over a set with no ownership filter, so a regen bot's
     /// churn on a shared checkout was addressed to whoever the nudge reached —
@@ -2754,6 +2825,35 @@ mod tests {
         );
         assert!(msg.contains("[no edit record of yours]"), "{msg}");
         assert!(msg.contains("[peer-lane's]"), "the known owner must be named: {msg}");
+
+        // AMUX-3816 — THE THIRD STATE. A foreign path whose owner did not
+        // resolve rendered as a bare possessive with an empty name: `['s]`,
+        // on every row of a whole nudge. The guard reports `owner: ""` for a
+        // running cotenant with no transcript, and `unwrap_or` fires only on a
+        // MISSING key, so `Some("")` reached the possessive template.
+        //
+        // Reported by mixpeek-frustrations with the case that makes it matter:
+        // they needed a peer's name to warn them before a destructive commit,
+        // and `['s]` could not tell them whether there was anyone to warn.
+        let own_unresolved = Ownership {
+            foreign: vec![("sdk/model_b.py".into(), UNRESOLVED_OWNER.into())],
+            ..Default::default()
+        };
+        let msg = build("/repo", &dirty, &own_unresolved, &fresh, "test-provenance").unwrap();
+        assert!(
+            msg.contains("[a peer's, name unresolved]"),
+            "an unresolved owner is a peer WITHOUT a name, not a nameless possessive: {msg}"
+        );
+        // THE CONTROLS, one per way this can go wrong. The first is the bug
+        // itself; the second is the render that would replace it with a
+        // different lie (nobody owns this); the third is the `?` spelling,
+        // which is worse than the empty one because it looks deliberate.
+        assert!(!msg.contains("['s]"), "the empty possessive must be gone: {msg}");
+        assert!(
+            !msg.contains("[no edit record of yours]"),
+            "an unresolved OWNER is not an ABSENT owner — that is a different action: {msg}"
+        );
+        assert!(!msg.contains("[?'s]"), "{msg}");
         // The all-bot firing (the 20-shape with zero of yours): the header
         // must say NONE carries the recipient's record.
         let own_none = Ownership {
