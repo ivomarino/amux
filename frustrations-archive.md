@@ -2080,3 +2080,56 @@ FIX: Mount `/api/board/contract` ahead of `/api/board/{id}`, or delete the claim
   transition and its instruction was then executed.
 
 ---
+
+## `node --check` is blind to a duplicate function name, and that shipped a dead dashboard
+VALIDATED: amux | Signed off by amux 2026-08-28, the originating session. Their words: "I did not read the
+fix; I planted the bug."
+
+METHOD, which is the part worth keeping. They appended a real
+`function _orchRenderPlan(d) {}` to the ACTUAL SHIPPED
+crates/amux-dashboard/static/app.js - a genuine duplicate of a function already defined
+there - and ran both gates against it:
+
+    node --check app.js                  PASSED   <- the entry's premise, confirmed live
+    cargo test --test dashboard_assets   FAILED   <- the replacement guard, firing
+
+and the failure names the offender rather than the file:
+
+    "two top-level functions share a name in app.js. Declarations HOIST, so the last one
+     silently replaces the earlier one and every earlier call site starts running the
+     wrong body - `node --check` cannot see this because a duplicate `function` is legal
+     (a duplicate `let` would be a SyntaxError, which is why that half was already
+     covered). Rename one: _orchRenderPlan (2x)"
+
+BOTH HALVES VALIDATED, and they are separable claims: the blindness is real (node --check
+waved a live duplicate through) AND the guard that replaced it catches that exact case.
+
+WHY THE SHIPPED FILE AND NOT A FIXTURE, in the author's reasoning: "a guard tested against
+a fixture proves it can fail, not that it is wired to the artifact that ships." This gate
+sits between a lane and the SPA users load, so wiring is the claim under test. Restored
+cleanly afterwards, 0 dirty files, verified rather than assumed.
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux
+CARD: AMUX-3715
+SYMPTOM: I added `function _renderArchivedSection(container)` for the board's
+  archived section. The sessions view already had a `_renderArchivedSection`
+  ~11,000 lines earlier. Declarations hoist and the last wins, so mine silently
+  replaced theirs; every sessions call site passes no arguments, so it hit
+  `container.appendChild(wrap)` on `undefined` and threw before the loading
+  overlay was hidden. The main dashboard view was dead.
+COST: A live regression on the primary view, shipped and deployed. Found by
+  gtm-research, not by me and not by any check. The PostToolUse hook runs
+  `node --check`, which passed — a duplicate `function` is legal JavaScript. I
+  had also written in that commit that every function the new code CALLS was
+  verified to exist, which is the one-directional half of the check and the half
+  that was already fine.
+FIX: 7607ee46 (gtm-research renamed mine) + a guard in
+  tests/dashboard_assets.rs enumerating duplicate top-level declarations,
+  verified by restoring the collision: `node --check` still passes, the guard
+  fails. The general lesson is in ethos.md rule 7 — when a tool covers a class,
+  ask which members the LANGUAGE makes legal, because those are the ones it
+  silently does not cover. A duplicate `let` is a SyntaxError; a duplicate
+  `function` is not.
