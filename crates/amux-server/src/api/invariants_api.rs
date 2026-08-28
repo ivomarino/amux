@@ -131,11 +131,37 @@ async fn debug(State(state): State<AppState>) -> Response {
     // it reached 8M rows / ~2GB with no surface anywhere — rule 4, the tag
     // in a store the reader never opens).
     let (log_rows, log_oldest) = store::result_log_stats(&state.store).unwrap_or((0, 0.0));
+    // WHERE THE HEALTH ENDPOINT'S SECONDS GO (AMUX-3836). This endpoint is 16ms
+    // because it replays stored rows; `/api/health/invariants` re-evaluates and
+    // costs 6.5-9.4s, which is why it files as a latency outlier on any load
+    // spike. Published as the last run's breakdown, with `at` so a stale one is
+    // readable as stale, and as an explicit `null` with a reason when no run has
+    // happened in this process yet — never as an empty list, which would read as
+    // "measured, and it costs nothing".
+    let timing = monitor::last_section_timing().map(|t| {
+        let mut secs: Vec<_> = t
+            .sections
+            .iter()
+            .map(|(label, ms, n)| json!({"section": label, "ms": (ms * 10.0).round() / 10.0, "checks": n}))
+            .collect();
+        secs.sort_by(|a, b| {
+            b["ms"].as_f64().unwrap_or(0.0).partial_cmp(&a["ms"].as_f64().unwrap_or(0.0)).unwrap()
+        });
+        json!({
+            "total_ms": (t.total_ms * 10.0).round() / 10.0,
+            "measured_age_s": (crate::config::now_f64() - t.at).max(0.0).round(),
+            "by_section_slowest_first": secs,
+        })
+    });
     Json(json!({
         "live_incidents": incidents,
         "latest_per_invariant": latest,
         "stale_checks": stale,
         "result_log": { "rows": log_rows, "oldest_age_s": log_oldest },
+        "evaluate_all_timing": timing,
+        "evaluate_all_timing_absent_because": if timing.is_none() {
+            "evaluate_all has not run in this process yet — this is not a zero"
+        } else { "" },
         "notes": {
             "dedupe": "one incident per (invariant_id, entity); occurrences counts repeats",
             "stale_checks": "no evaluation in >300s — the check itself may be dead, which \
@@ -143,6 +169,9 @@ async fn debug(State(state): State<AppState>) -> Response {
             "unknown": "a probe that could not reach a verdict. NOT a pass.",
             "result_log": "the evaluation log itself; store.result_log_bounded fails past \
                            the row budget (AMUX_INVARIANT_RESULT_BUDGET, default 500k)",
+            "evaluate_all_timing": "the LAST run's cost per section, slowest first. It is what \
+                                    /api/health/invariants pays on every call, and null means no \
+                                    run has happened in this process, not that it is free.",
         }
     }))
     .into_response()

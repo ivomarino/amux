@@ -24,8 +24,94 @@ pub const TICK_SECS: u64 = 30;
 /// Returns the results rather than only persisting them so the HTTP handler can
 /// serve a FRESH evaluation on demand — a health endpoint that can only replay
 /// the last poll cannot answer "is it broken right now".
+/// Where `evaluate_all`'s wall time goes, per section, from its last run.
+///
+/// AMUX-3836. `/api/health/invariants` was filed as a latency outlier at 26.4s
+/// and the card's stock verdict said to look at the individual request. It was
+/// wrong in the direction that wastes the most time: measured three times at a
+/// QUIETER host load than the sample, the endpoint costs 6.5-9.4s every time.
+/// The 26s was that baseline under a load spike, so the endpoint sits one spike
+/// from the 10s threshold permanently, and `/api/board` answering in 0.3s in
+/// the same breath rules out "the server is slow".
+///
+/// What no instrument could say is WHICH of the 17 sections spends it, which is
+/// the only question worth asking next. `/api/debug/invariants` is 16ms because
+/// it replays stored results, so it could not answer either. This records it.
+static SECTION_MS: std::sync::OnceLock<std::sync::Mutex<Option<SectionTiming>>> =
+    std::sync::OnceLock::new();
+
+/// One `evaluate_all` run's cost, broken down.
+#[derive(Debug, Clone, Default)]
+pub struct SectionTiming {
+    /// Unix seconds when the run finished, so a stale breakdown is visible as
+    /// stale rather than being read as current.
+    pub at: f64,
+    pub total_ms: f64,
+    /// `(section label, ms, results added)`, in evaluation order.
+    pub sections: Vec<(&'static str, f64, usize)>,
+}
+
+/// Accumulates section costs during a run. Not a general timer: it exists so
+/// each `mark` can attribute the elapsed time to the checks that appeared in
+/// `out` since the previous mark, which makes the label and the count agree by
+/// construction instead of by a comment.
+struct SectionTimer {
+    started: std::time::Instant,
+    last: std::time::Instant,
+    prev_len: usize,
+    sections: Vec<(&'static str, f64, usize)>,
+}
+
+impl SectionTimer {
+    fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self { started: now, last: now, prev_len: 0, sections: Vec::new() }
+    }
+
+    fn mark(&mut self, out: &[InvariantResult], label: &'static str) {
+        let now = std::time::Instant::now();
+        self.sections.push((
+            label,
+            now.duration_since(self.last).as_secs_f64() * 1000.0,
+            out.len().saturating_sub(self.prev_len),
+        ));
+        self.last = now;
+        self.prev_len = out.len();
+    }
+
+    /// Split from `finish` so the accounting is testable without writing the
+    /// process-global slot, which a test cannot assert on without racing every
+    /// other test that evaluates.
+    fn into_timing(self) -> SectionTiming {
+        SectionTiming {
+            at: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs_f64(),
+            total_ms: self.started.elapsed().as_secs_f64() * 1000.0,
+            sections: self.sections,
+        }
+    }
+
+    fn finish(self) {
+        let t = self.into_timing();
+        if let Ok(mut g) = SECTION_MS.get_or_init(Default::default).lock() {
+            *g = Some(t);
+        }
+    }
+}
+
+/// The last run's breakdown, or `None` if `evaluate_all` has not run in this
+/// process yet. `None` is deliberately distinct from an empty section list: a
+/// breakdown that has never been measured must not be served as one that
+/// measured nothing (ethos rule 4).
+pub fn last_section_timing() -> Option<SectionTiming> {
+    SECTION_MS.get_or_init(Default::default).lock().ok().and_then(|g| g.clone())
+}
+
 pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let mut out = Vec::new();
+    let mut tm = SectionTimer::new();
 
     // -- 1. route contract: do shipped clients call routes that exist?
     let mounted: Vec<(&str, &[&str])> = crate::api::request_log::ROUTE_TABLE
@@ -35,6 +121,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     let callers = extract_caller_paths();
     out.extend(checks::route_callers_have_routes(&mounted, &callers));
 
+    tm.mark(&out, "1. route contract");
     // -- 1b. no two lanes share a Claude conversation (AMUX-1730 / AMUX-2819).
     //
     // Reads the session meta files, which are the same store the resume path
@@ -62,6 +149,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         out.extend(checks::conversations_are_not_shared(&pairs));
     }
 
+    tm.mark(&out, "1b. no two lanes share a Claude conversation");
     // -- 2. config provenance: did server.env reach the process?
     //
     // Reads the FILE and compares against the live process env. Deliberately
@@ -82,19 +170,24 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         )),
     }
 
+    tm.mark(&out, "2. config provenance");
     // -- 3. queue liveness: is anything queued in front of an IDLE target?
     out.extend(steering_queue_check(state).await);
 
+    tm.mark(&out, "3. queue liveness");
     // -- 4. status truth: does the card agree with the pane?
     out.extend(status_pane_check(state));
 
+    tm.mark(&out, "4. status truth");
     // -- 5. is the report control plane up? (2026-08-13 fleet-wide outage)
     out.extend(self_reports_check(state));
 
+    tm.mark(&out, "5. is the report control plane up?");
     // -- 5b. do the `ts` columns hold what their readers assume? (AF-184)
     out.extend(timestamp_units_check(state));
     out.extend(arrival_follows_boot_check(state));
 
+    tm.mark(&out, "5b. do the `ts` columns hold what their readers assu");
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
     // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
     // time — these scripts deploy on COMMIT (install), not on binary rebuild, so
@@ -154,24 +247,28 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
         ));
     }
 
+    tm.mark(&out, "6. shared-checkout git guard");
     // -- 6b. and is anything WIRED to that script? The sha check above would
     // have passed green through the entire AMUX-2936 regression, because the
     // file it compares was correct the whole time and settings.json simply
     // pointed elsewhere. This is the leg that fails on the actual incident.
     out.extend(report_hooks_check());
 
+    tm.mark(&out, "6b. and is anything WIRED to that script? The sha ch");
     // -- 6c. are session reports ATTRIBUTED? (AF-67). The largest signal in the
     // request log had no automated consumer: autofix reads only status>=500 and
     // a report is a 200, so 7,708 unattributed reports/day were visible to
     // nobody until a human-named trigger happened to say "unattributed-http".
     out.extend(reports_attributed_check(state));
 
+    tm.mark(&out, "6c. are session reports ATTRIBUTED?");
     // -- 6d. are auto-filed cards DISPATCHABLE? (AF-137: 215 session=NULL
     // reports invisible to auto-pickup's session-keyed predicate, both
     // halves reporting success for 11 days).
     out.extend(autofix_dispatchable_check(state));
     out.extend(card_type_vocabulary_check(state));
 
+    tm.mark(&out, "6d. are auto-filed cards DISPATCHABLE?");
     // -- 6f. does the frustrations LEDGER agree with the board? (AF-191).
     // `grep '^STATUS: open' frustrations.md` is that file's own documented
     // primary grep and it reported 78 while 52 of those entries had a card
@@ -180,16 +277,19 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(frustration_ledger_check(state));
     out.extend(schedule_kind_check(state));
 
+    tm.mark(&out, "6f. does the frustrations LEDGER agree with the boar");
     // -- 6e. is the invariant system's OWN evaluation log bounded? (AMUX-3489:
     // 8M rows / ~2GB from a flat 7-day retention on ~13 green rows/sec — the
     // watcher was the one thing no watcher covered).
     out.extend(result_log_bounded_check(state));
 
+    tm.mark(&out, "6e. is the invariant system's OWN evaluation log bou");
     // -- 7. capture pipeline: does a DELIVERED user prompt reach the board?
     // (AMUX-3148). The mint's own comment names "the cmd_history.card_id NULL
     // rate" as its detector but nothing read it; this closes that loop.
     out.extend(capture_pipeline_check(state));
 
+    tm.mark(&out, "7. capture pipeline");
     // -- 8. provider launch agrees with its adapter (RR-0043 / AMUX-3153): does
     // the server launch each provider with the same binary its adapter — and its
     // capability report — describes? The launcher and the adapter are two
@@ -199,6 +299,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // self-announces instead of a lying capability report.
     out.extend(provider_launch_check());
 
+    tm.mark(&out, "8. provider launch agrees with its adapter");
     // -- 10. host memory + kernel-panic tripwire (AMUX-3397): the 08-19
     // memory-exhaustion panic killed all 45 lanes and left no trace in any
     // amux instrument. The pressure check publishes the kernel's own verdict;
@@ -207,6 +308,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(host_memory_check());
     out.extend(kernel_panic_check());
 
+    tm.mark(&out, "10. host memory + kernel-panic tripwire");
     // -- 9. fire-alarm reachability: can the owner-alert channel reach a human?
     // (AMUX-3203). Both channels read healthy-enabled while neither had a
     // destination (0 push subs, empty phone), so five serious pages (a prod-down
@@ -215,6 +317,8 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // disconnected alarm a CONTINUOUS health failure instead.
     out.extend(alert_channel_check(state));
 
+    tm.mark(&out, "9. fire-alarm reachability");
+    tm.finish();
     out
 }
 
@@ -2109,6 +2213,64 @@ mod extractor_wiring_tests {
             "the CLI scan is not reaching the census — found {} cli callers out of {} total",
             cli.len(),
             all.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod section_timing_tests {
+    use super::{InvariantResult, SectionTimer};
+
+    /// A mark attributes elapsed time to the checks that appeared SINCE the
+    /// previous mark, not to everything accumulated so far. Getting that
+    /// backwards is the whole failure mode of this instrument: every section
+    /// would report the running total and the last one would look like the
+    /// culprit no matter which is actually slow.
+    #[test]
+    fn each_section_owns_only_the_checks_it_added() {
+        let mut out: Vec<InvariantResult> = Vec::new();
+        let mut tm = SectionTimer::new();
+        out.push(InvariantResult::pass("a"));
+        out.push(InvariantResult::pass("b"));
+        tm.mark(&out, "first");
+        out.push(InvariantResult::pass("c"));
+        tm.mark(&out, "second");
+        // A SECTION THAT ADDS NOTHING still gets a row. Dropping it would hide
+        // a section that is slow AND produces no result, which is the worst
+        // combination and the easiest to lose.
+        tm.mark(&out, "third-adds-none");
+        let t = tm.into_timing();
+        let counts: Vec<(&str, usize)> = t.sections.iter().map(|(l, _, n)| (*l, *n)).collect();
+        assert_eq!(counts, vec![("first", 2), ("second", 1), ("third-adds-none", 0)]);
+        // The parts cannot exceed the whole. A cheap arithmetic control: if
+        // `mark` ever measured from `started` instead of `last`, the sum would
+        // run away from the total.
+        let sum: f64 = t.sections.iter().map(|(_, ms, _)| ms).sum();
+        assert!(
+            sum <= t.total_ms + 1.0,
+            "sections sum to {sum}ms but the run took {}ms — marks are not consecutive",
+            t.total_ms
+        );
+    }
+
+    /// EVERY top-level section of `evaluate_all` is marked. A section added
+    /// later with no mark would silently fold its cost into its neighbour, and
+    /// the breakdown would still look complete.
+    #[test]
+    fn every_section_of_evaluate_all_is_marked() {
+        let src = include_str!("monitor.rs");
+        let body = src
+            .split_once("pub async fn evaluate_all(")
+            .expect("evaluate_all exists")
+            .1;
+        let body = body.split_once("\n}\n").expect("its closing brace").0;
+        let sections = body.lines().filter(|l| l.starts_with("    // -- ")).count();
+        let marks = body.lines().filter(|l| l.trim_start().starts_with("tm.mark(&out,")).count();
+        assert!(sections > 0, "the section-comment convention changed; this check is now blind");
+        assert_eq!(
+            marks, sections,
+            "{sections} sections but {marks} marks — an unmarked section's cost is charged to \
+             whichever section happens to precede it"
         );
     }
 }
