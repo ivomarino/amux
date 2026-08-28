@@ -569,6 +569,38 @@ pub(crate) fn internal(e: impl std::fmt::Display) -> axum::response::Response {
         .into_response()
 }
 
+/// Should this request declare itself legitimately slow (AMUX-3818)?
+///
+/// PER-REQUEST, NOT PER-ROUTE — the rule `x-amux-slow-ok` (AMUX-3513) was built
+/// on, and the reason to use it here rather than exempt a path. An endpoint that
+/// calls a model is only slow BECAUSE of the model on the calls where the model
+/// was slow; the same handler answering in 200ms with a cached or trivial reply
+/// must stay measured, and so must one where amux itself burned five seconds
+/// around a fast model call.
+///
+/// So: declare only when the external call actually DOMINATED. Both conditions
+/// are load-bearing. The share test is what keeps amux's own time measured — a
+/// 6s model inside an 11s request leaves 5s that is amux's fault and must still
+/// file. The floor stops a 3ms request declaring anything, which would put a
+/// permanent exemption on the route by another name.
+pub(crate) fn dominated_by_external(total_ms: u128, external_ms: u128) -> bool {
+    total_ms >= 1_000 && external_ms * 10 >= total_ms * 7
+}
+
+/// Stamp a response as REQUESTED latency, naming what consumed the time.
+///
+/// The reason string is truncated to 40 chars by the request log, and it is the
+/// only thing a human sees when asking why a slow request was not filed — so it
+/// carries the measured external time rather than a bare label. An exclusion
+/// that cannot say what it excluded on is the ethos-4 shape this whole
+/// mechanism exists to avoid.
+pub(crate) fn slow_ok(mut r: axum::response::Response, why: &str) -> axum::response::Response {
+    if let Ok(hv) = axum::http::HeaderValue::from_str(why) {
+        r.headers_mut().insert("x-amux-slow-ok", hv);
+    }
+    r
+}
+
 /// Python truthiness for a JSON value ({} , "" , [] , 0 falsy) — identity's
 /// `oauthAccount` check and scope's `if items:` gate share it.
 pub(crate) fn py_truthy(v: &serde_json::Value) -> bool {
@@ -864,5 +896,47 @@ mod truthy_reachability {
                  and AMUX-2928's fix is a behaviour change after all"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod slow_ok_tests {
+    use super::*;
+
+    /// AMUX-3818: an endpoint whose work IS a model call must declare the wait
+    /// as the MODEL's, and only when the model actually took it.
+    ///
+    /// `/api/orchestrate/plan` measured p50 7.1s against a flat 10s latency
+    /// threshold, so ordinary variance on an LLM round-trip files a defect
+    /// against amux. The route is not exempted, because the same handler can be
+    /// slow for reasons that ARE amux's fault.
+    #[test]
+    fn only_a_request_the_external_call_dominated_declares_itself_slow() {
+        // The filed specimen: 10.9s total, essentially all of it the model.
+        assert!(dominated_by_external(10_930, 10_800));
+        assert!(dominated_by_external(7_109, 6_900), "the p50 shape too");
+
+        // THE CONTROL THAT MATTERS. A fast model inside a slow request leaves
+        // time that is amux's own, and it must STILL be measured — otherwise
+        // this is a route exemption wearing a per-request header.
+        assert!(!dominated_by_external(11_000, 200), "5s+ of amux time must still file");
+        assert!(!dominated_by_external(10_000, 6_000), "60% is not dominated");
+
+        // And a fast request declares nothing: a 3ms call stamping the header
+        // would put a permanent exemption on the route by another name.
+        assert!(!dominated_by_external(3, 3));
+        assert!(!dominated_by_external(999, 999), "under the floor");
+        assert!(dominated_by_external(1_000, 1_000), "at the floor, fully external");
+    }
+
+    /// The reason string is the only thing a human sees when asking why a slow
+    /// request was not filed, so it must carry the measurement rather than a
+    /// bare label (ethos rule 4).
+    #[test]
+    fn the_slow_ok_reason_carries_what_it_was_measured_on() {
+        let r = slow_ok(axum::response::Response::new(axum::body::Body::empty()), "helper-model claude:haiku 6900ms");
+        let v = r.headers().get("x-amux-slow-ok").and_then(|v| v.to_str().ok()).unwrap_or("");
+        assert!(v.contains("6900ms"), "the excluded-on measurement must be in it: {v}");
+        assert!(v.contains("helper-model"), "and what consumed the time: {v}");
     }
 }

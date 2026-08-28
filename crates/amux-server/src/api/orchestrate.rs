@@ -167,6 +167,7 @@ fn extract_json_array(s: &str) -> Option<Value> {
 }
 
 pub async fn plan(State(state): State<AppState>, Json(body): Json<Value>) -> Response {
+    let started = std::time::Instant::now();
     let transcript = body
         .get("transcript")
         .and_then(Value::as_str)
@@ -184,12 +185,19 @@ pub async fn plan(State(state): State<AppState>, Json(body): Json<Value>) -> Res
             .into_response();
     }
     let prompt = build_prompt(&roster, &transcript);
+    // TIME THE MODEL SEPARATELY FROM THE REQUEST (AMUX-3818). This endpoint's
+    // work IS an LLM round-trip: measured p50 7.1s against a flat 10s latency
+    // threshold, so ordinary variance files a defect. The answer is not to
+    // exempt the route — amux's own time around the call must stay measured —
+    // but to know which of the two was slow, and say so on the way out.
+    let model_started = std::time::Instant::now();
     let (via, answer) = match crate::api::lookup::helper_answer(&prompt).await {
         Ok(x) => x,
         Err((code, msg)) => {
             return (code, Json(json!({ "error": msg, "transcript": transcript }))).into_response()
         }
     };
+    let model_ms = model_started.elapsed().as_millis();
     let Some(arr) = extract_json_array(&answer) else {
         // A router that cannot be parsed is a routing FAILURE, said plainly, with
         // the raw reply so the miss is diagnosable — never a silent empty plan
@@ -211,10 +219,15 @@ pub async fn plan(State(state): State<AppState>, Json(body): Json<Value>) -> Res
     let open_cards = live_card_ids(&state);
     let mut v = Validation::default();
     let out_plan = validate_plan(&arr, &names, open_cards.as_ref(), &mut v);
-    Json(json!({
+    let body = Json(json!({
         "plan": out_plan,
         "transcript": transcript,
         "via": via,
+        // Published, not just used for the header: the caller can see which
+        // part of its wait was the model, and so can anyone reading the
+        // response later without the request log to hand.
+        "model_ms": model_ms,
+        "took_ms": started.elapsed().as_millis() as u64,
         "dropped_unknown_workers": v.unknown_workers,
         // Each dropped class is its own list because each is a different
         // situation for the reader: the model invented a name, named a card
@@ -232,7 +245,16 @@ pub async fn plan(State(state): State<AppState>, Json(body): Json<Value>) -> Res
         "cards_checked": open_cards.is_some(),
         "verbs_available": VOICE_VERBS,
     }))
-    .into_response()
+    .into_response();
+    // Declare the wait as the MODEL's only when the model actually dominated
+    // it. A plan that took 11s around a 200ms model call is amux being slow and
+    // must still file — which is what makes this a per-request declaration
+    // rather than a route exemption.
+    let total_ms = started.elapsed().as_millis();
+    if crate::api::dominated_by_external(total_ms, model_ms) {
+        return crate::api::slow_ok(body, &format!("helper-model {via} {model_ms}ms"));
+    }
+    body
 }
 
 /// Open, non-archived board card ids, or `None` when the board could not be
