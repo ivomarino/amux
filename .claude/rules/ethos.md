@@ -52,6 +52,13 @@ you DEFINE must not already (`tests/dashboard_assets.rs` checks this for the
 dashboard). A check pinning the wrong layer is exactly as green as one pinning
 the right layer. When a totalizing word appears in your description (whole, all,
 every, blanket, total), test at the widest scope the mechanism touches.
+The way to know is to break it: `scripts/mutate.sh run <file> <old> <new> --
+<command>` applies one exact string, runs your command, and reverts in a trap
+even if the command is killed. Use it rather than `cp file bak`, which is a
+whole-file write and on this shared checkout has reverted a peer's in-flight
+work twice (AMUX-3670, AF-284). Naming it here because it existed for four days
+and reached neither of the two lanes that mutate most, which is rule 1 applied
+to a rule.
 
 **8. Are you deciding something that is the human's to decide?**
 Whose data is this? Would they recognise the change as theirs? Report and
