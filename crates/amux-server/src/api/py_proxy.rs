@@ -76,11 +76,10 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/orchestrate", "voice fleet-orchestrator: transcript -> helper-model routing plan (api/orchestrate.rs, AMUX-3074)"),
     ("/api/skin", "resolved skin (terms/colours/tabs) for a worker"),
     ("/api/config", "declarative instance config: export + idempotent apply"),
-    // AMUX-2888. Native and HONEST rather than native and complete: status
-    // answers 200 with `ported:false`, start/stop answer 501. Claimed here
-    // because the family IS ours — the relay client is the unported half, not
-    // the routing.
-    ("/api/tunnel", "tunnel client controls: status is native, start/stop 501 until the relay is ported (AMUX-2888)"),
+    // AMUX-2888. Complete: the relay client is ported, so start/stop drive a
+    // real tunnel rather than answering the honest 501 they carried while the
+    // client was missing.
+    ("/api/tunnel", "tunnel client controls: status/start/stop, driving the ported relay in runtime_jobs::tunnel (AMUX-2888)"),
     // ---- Mounted in mod.rs but never declared here, so
     // `every_mounted_api_family_is_claimed_by_the_registry` was RED on main and
     // CI could not go green for anyone. Native like everything else:
@@ -136,7 +135,7 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/api/tmux-sessions", "tmux sessions amux does not already own, for Connect (api/worker_create.rs)"),
     ("/api/iterm2", "open iTerm2 panes, for Connect-a-pane (api/worker_create.rs)"),
     ("/api/saved-messages", "peek composer's reusable snippets, per worker (api/saved_messages.rs, AMUX-2871)"),
-    ("/api/proxies", "Proxies tab CRUD; start/stop answer an honest 501 — the tunnel client is AMUX-2888 (api/proxies.rs, AMUX-2887)"),
+    ("/api/proxies", "Proxies tab CRUD; start/stop drive the tunnel relay (api/proxies.rs, AMUX-2887 + AMUX-2888)"),
     ("/api/pull", "self-update button; routes brew/pip installs and REFUSES a pull that would rewrite a shared checkout (api/self_update.rs, AMUX-2891)"),
     ("/api/observability", "Cost tab rollup over token_ledger; does NOT index on request — the periodic job owns that (api/observability.rs, AMUX-2893)"),
     ("/api/habits", "Habits tab state — one JSON array in ~/.amux/habits.json (api/habits.rs, AMUX-2871)"),

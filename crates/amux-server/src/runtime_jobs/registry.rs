@@ -99,6 +99,7 @@ pub mod ids {
     pub const COMMIT_NUDGE: &str = "commit-nudge";
     pub const COMMIT_MENTION_NOTES: &str = "commit-mention-notes";
     pub const SELF_ADOPT: &str = "self-adoption";
+    pub const TUNNEL: &str = "tunnel-relay";
     // The PeriodicTask ids below are NOT referenced by any spawn site — they
     // register themselves through `spawn_periodic_every` under the name their
     // own module passes. They are listed here only so CATALOG rows and tests
@@ -131,6 +132,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::COMMIT_NUDGE,
     ids::COMMIT_MENTION_NOTES,
     ids::SELF_ADOPT,
+    ids::TUNNEL,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
     ids::GHOST_RESCUE,
@@ -370,6 +372,45 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl { var: "AMUX_RS_BOOTSTRAP_SECS", effect: "pass seconds (default 2)", off: None }],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::TUNNEL,
+        name: "Tunnel relay",
+        purpose: "Long-polls the amux cloud gateway and serves each public request from a local port, so a localhost app is reachable without an inbound port. Registered only while a tunnel is running — absent here means no tunnel is up, which is also the default.",
+        env: &[
+            EnvControl {
+                var: "AMUX_TUNNEL_TOKEN",
+                effect: "the amux-cloud token the gateway authenticates; without it no tunnel can start at all",
+                off: Some(OFF_WHEN_UNSET),
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_PORT",
+                effect: "the local port to auto-target at boot. UNSET means no auto-start: defaulting to amux's own port would publish an unauthenticated control plane",
+                off: Some(OFF_WHEN_UNSET),
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_GATEWAY",
+                effect: "gateway base URL (default https://cloud.amux.io); point at your own for the self-hosted OSS gateway",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_RATE_PER_MIN",
+                effect: "public request cap per sliding minute, shed as 429 before the local app is touched (default 180)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_MAX_CONCURRENT",
+                effect: "simultaneous local fetches; excess waits 8s then gets a 503 (default 8)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_ALLOW_SELF",
+                effect: "1 = permit tunnelling amux's OWN port. Refused by default: this port has no request auth and /api/sessions/<n>/send is ungated",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/tunnel/status"),
     },
     Doc {
         id: ids::SELF_ADOPT,

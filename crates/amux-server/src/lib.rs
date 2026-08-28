@@ -705,6 +705,22 @@ async fn async_main() {
         });
     }
 
+    // AUTO-START THE TUNNEL RELAY, and only with an explicit target port
+    // (AMUX-2888, py:78089). Both halves are required: a token alone would
+    // default the target to amux's OWN port, and this port has no request auth
+    // — publishing it is unauthenticated RCE on a YOLO lane. `maybe_boot_start`
+    // owns that decision and returns what it did, so the log records a fact
+    // rather than an intention.
+    //
+    // Not a `spawn_loop`: it is a one-shot that ADOPTS the relay's own task
+    // under `ids::TUNNEL` if it manages to start one.
+    tokio::spawn(async {
+        let outcome = runtime_jobs::tunnel::maybe_boot_start().await;
+        if outcome != "no token" && outcome != "no AMUX_TUNNEL_PORT" {
+            tracing::info!(outcome, "tunnel: boot autostart");
+        }
+    });
+
     // THE LEGACY 8822 BIND IS GONE (Ethan, 2026-08-11: "no more 8822 just rust").
     //
     // It existed because the python retirement stranded every running lane:
