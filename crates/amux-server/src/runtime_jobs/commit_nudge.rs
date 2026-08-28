@@ -4119,4 +4119,57 @@ mod tests {
             "LEADING whitespace is content wherever indentation carries meaning"
         );
     }
+
+    /// The restore-safety discriminator must be pinned in EVERY arm that
+    /// prescribes a restore, not only the STALE renderer.
+    ///
+    /// `stale_section_prescribes_find_object_never_blob_existence` pins ONE
+    /// copy of the recipe. The advice is emitted from at least three places
+    /// (`build`, `append_only_note`, `commit_worthy_body`), and on 2026-08-28 a
+    /// mutation reverting `commit_worthy_body`'s copy to
+    /// `git cat-file -e $(git hash-object <path>)` left all 40 tests green,
+    /// while the commit-worthy and DIVERGED arms went to ZERO guards and went
+    /// on prescribing `git checkout origin/main -- <path>` 3 and 4 times each.
+    /// That is DESKT-10's own defect one arm over: a check pinning the wrong
+    /// layer is exactly as green as one pinning the right layer (ethos rule 7,
+    /// AF-161). The recipe it would restore to deletes never-committed
+    /// mid-edits, which is the cold-outbound near-miss of 2026-08-17.
+    ///
+    /// Asserted per arm rather than over the concatenation, because a guard in
+    /// the STALE section does not reach a reader in the commit-worthy one. The
+    /// restore prescription itself is the CONTROL: an arm that stopped
+    /// prescribing a restore would make the guard assertion vacuous, so it
+    /// fails there instead of passing quietly.
+    #[test]
+    fn every_arm_that_prescribes_a_restore_carries_the_find_object_guard() {
+        let dirty = s(&["FRUSTRATIONS.md", "a.rs"]);
+        let arms: [(&str, Freshness); 4] = [
+            ("commit-worthy", Freshness::default()),
+            ("diverged", Freshness { diverged: s(&["a.rs"]), ..Default::default() }),
+            ("stale", Freshness { stale: s(&["a.rs"]), ..Default::default() }),
+            ("revived", Freshness { revived: s(&["a.rs"]), ..Default::default() }),
+        ];
+        for (arm, fresh) in arms {
+            let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+                .unwrap_or_else(|| panic!("{arm}: must render"));
+            assert!(
+                m.contains("git checkout origin/main -- <path>"),
+                "{arm}: premise gone — this arm no longer prescribes a restore, so the guard \
+                 assertion below would pass vacuously: {m}"
+            );
+            assert!(
+                m.contains("--find-object=$(git hash-object <path>)"),
+                "{arm}: prescribes `git checkout origin/main -- <path>` with NO find-object \
+                 restore-safety check in the same message. Blob existence answers yes for a \
+                 `git add`ed mid-edit that is in no commit, so the restore it green-lights is an \
+                 irreversible delete: {m}"
+            );
+            assert!(
+                m.contains("Do NOT substitute `git cat-file -e"),
+                "{arm}: must name blob-existence as the recipe NOT to use — it is the one a \
+                 reader reaches for, and it was the prescribed check here until AMUX-3264: {m}"
+            );
+        }
+    }
+
 }
