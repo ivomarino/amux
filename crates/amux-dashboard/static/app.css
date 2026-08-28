@@ -2925,6 +2925,18 @@
     background: var(--card); border: 1px solid var(--border); border-radius: 6px;
     min-width: 150px; z-index: 200; padding: 6px 0;
     box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    /* AMUX-3163's own comment already named the failure mode this menu sits
+       inside — `position:absolute` under a bar with `overflow-x:auto`, which
+       forces overflow-y to auto and clips anything dropping below it — but
+       only gave the MOBILE variant below a max-height/scroll to survive it.
+       The desktop menu had none: it sizes to fit every item unconditionally,
+       so it was one list item away from tripping the exact bug the comment
+       warns about, and the central-secrets-sops PR's new Secrets tab (the
+       21st, up from 20) was that item — e2e caught it as a clipped menu, not
+       a missing tab. A cap here is not "enough for 21 today", it is the fix
+       for every count from here on: each future tab this dashboard grows
+       would otherwise silently re-trip the same ancestor-overflow clip. */
+    max-height: calc(100vh - 80px); overflow-y: auto;
   }
   #peek-tab-customizer-menu { position: fixed; z-index: 300; }
   .tab-customizer-item {
