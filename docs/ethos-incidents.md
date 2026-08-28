@@ -806,6 +806,31 @@ Rule 4's demand for an accompaniment applies to guards as much as to reports —
 detector whose silence is indistinguishable from success needs a rate, a last-fired
 timestamp, or a signal on the path it declines to act on.
 
+**A TEST WRITTEN TO SATISFY RULE 7 IS NOT THEREBY A TEST THAT CAN FAIL** (2026-08-28,
+amux + amux-frustrations, twice in one day). Both times a reviewer found a check that could
+not fail, and both times the check was one its author had written *specifically* to satisfy
+this rule.
+
+The clearest specimen: `human_blocked_root` walks a `depends_on` graph with a `seen` set to
+stop re-expansion, and carried a cell asserting `Some("C-1" -> "C-2" -> "C-1")` returns
+None, labelled "a cycle terminates". Deleting the seen-set entirely leaves that cell GREEN.
+`DEPENDS_ON_MAX_DEPTH` is 12 and the fixture is a two-node cycle, so the frontier is one
+element at every level and the walk runs out of depth — the right answer by the wrong
+mechanism. What `seen` actually buys is protection against re-expansion in a DIAMOND, and a
+cycle cannot exercise that. The discriminating fixture is a 12-level diamond asserting the
+LOOKUP CALL COUNT, not the return value, because the return is None either way and only a
+counter can see cost: neutered, it fails at 4,095 expansions.
+
+The mechanism of the failure is the point. Writing a test *because* the rule asks for one
+produces the feeling of coverage, and the feeling of coverage is exactly what stops anyone
+mutating it afterwards. The rule says a check must be able to fail; it does not say a check
+written in its name already can. So the obligation the rule creates is not "add a cell", it
+is "make the cell red on purpose, once, and watch it".
+
+Corollary worth keeping separate, because it bit on the same day: a fixture chosen to be
+*small enough to read* is often too small to reach the branch under test. Two nodes is a
+legible cycle and an unreachable diamond.
+
 ## 8. Are you deciding something that is the human's to decide?
 
 Getting out of the model's way includes getting out of the user's way.
