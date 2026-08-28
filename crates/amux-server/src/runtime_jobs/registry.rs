@@ -100,6 +100,7 @@ pub mod ids {
     pub const COMMIT_MENTION_NOTES: &str = "commit-mention-notes";
     pub const SELF_ADOPT: &str = "self-adoption";
     pub const TUNNEL: &str = "tunnel-relay";
+    pub const BROWSER_REAPER: &str = "browser-idle-reaper";
     // The PeriodicTask ids below are NOT referenced by any spawn site — they
     // register themselves through `spawn_periodic_every` under the name their
     // own module passes. They are listed here only so CATALOG rows and tests
@@ -133,6 +134,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::COMMIT_MENTION_NOTES,
     ids::SELF_ADOPT,
     ids::TUNNEL,
+    ids::BROWSER_REAPER,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
     ids::GHOST_RESCUE,
@@ -372,6 +374,25 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl { var: "AMUX_RS_BOOTSTRAP_SECS", effect: "pass seconds (default 2)", off: None }],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::BROWSER_REAPER,
+        name: "Browser idle reaper",
+        purpose: "Releases a browser profile that has had no real page open for the whole idle window. Logins live on disk and survive the stop; only a relaunch is lost. Idle means CONTINUOUSLY empty — one real page anywhere resets the clock — and a browser whose CDP does not answer is left alone, because silence is not emptiness.",
+        env: &[
+            EnvControl {
+                var: "AMUX_BROWSER_IDLE_REAP_S",
+                effect: "seconds a profile must be continuously empty before release (default 3600); 0 disables the job",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_BROWSER_REAP_TICK_S",
+                effect: "how often to check (default 120)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/browser/status"),
     },
     Doc {
         id: ids::TUNNEL,

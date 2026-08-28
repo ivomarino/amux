@@ -705,6 +705,11 @@ async fn async_main() {
         });
     }
 
+    // RELEASE IDLE BROWSERS (AMUX-3829, Ethan: "it should clean up
+    // automatically after idle use"). Nothing reaped one before, which is how a
+    // browser sat 18.1h with zero tabs and blocked him.
+    runtime_jobs::browser_reaper::spawn();
+
     // AUTO-START THE TUNNEL RELAY, and only with an explicit target port
     // (AMUX-2888, py:78089). Both halves are required: a token alone would
     // default the target to amux's OWN port, and this port has no request auth

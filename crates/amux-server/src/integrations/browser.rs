@@ -1849,12 +1849,39 @@ pub(crate) fn choose_target(
         })
     };
     let stale = bound.is_some() && bound == avoid;
+    let blank_url = |u: &str| u.is_empty() || u == "about:blank" || u.starts_with("chrome://");
+    let is_blank_tab = |tid: &str| {
+        tabs.iter().any(|t| {
+            id_of(t).as_deref() == Some(tid)
+                && blank_url(t.get("url").and_then(Value::as_str).unwrap_or(""))
+        })
+    };
+    let real_page_available = tabs.iter().any(|t| {
+        t.get("type").and_then(Value::as_str) == Some("page")
+            && t.get("webSocketDebuggerUrl").is_some()
+            && !blank_url(t.get("url").and_then(Value::as_str).unwrap_or(""))
+            && id_of(t).is_some_and(|id| !claimed_by_others.contains(&id))
+            && (avoid.is_none() || id_of(t).as_deref() != avoid)
+    });
     if let Some(tid) = bound {
         // A bound tab that is GONE from /json/list was already handled before
         // this card: it falls through and rebinds. The case this adds is a tab
         // still LISTED whose socket will not open, which /json/list reports
         // identically to a healthy one — only the failing caller knows.
-        if !stale && listed(tid) {
+        //
+        // A BLANK BINDING DOES NOT SURVIVE A REAL PAGE (AMUX-3834, second pass).
+        // The first fix taught the REBIND to prefer a real page, which stops the
+        // drift happening — and does nothing for a session ALREADY stuck on a
+        // blank tab, because a blank tab is listed and this arm kept it forever.
+        // tubescience was right to walk back the fix: their binding was already
+        // stuck, so preventing future drift could not help them, and I confirmed
+        // it here — screenshot and eval BOTH returned about:blank on this
+        // machine, agreeing with each other and both wrong.
+        //
+        // So: keep a blank binding only while there is nothing better. That
+        // makes a stuck session self-heal on its next verb rather than needing a
+        // navigate to break it out.
+        if !stale && listed(tid) && !(is_blank_tab(tid) && real_page_available) {
             return (TargetChoice::KeepBound(tid.to_string()), false);
         }
     }
@@ -2699,6 +2726,39 @@ mod tests {
             choose_target(&only_blank, None, &none, None).0,
             TargetChoice::Rebind("BLANK".into()),
             "with nothing else, a blank tab is still usable"
+        );
+
+        // THE SECOND PASS (AMUX-3834). Preventing bad rebinds does nothing for
+        // a session ALREADY bound to a blank tab: that tab is listed, so the
+        // KeepBound arm held it forever and only an explicit navigate escaped.
+        // tubescience walked back the first fix on exactly this, correctly — I
+        // then reproduced it here, with screenshot and eval BOTH returning
+        // about:blank, agreeing with each other and both wrong.
+        let stuck = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let (choice, stale) = choose_target(&stuck, Some("BLANK"), &none, None);
+        assert_eq!(
+            choice,
+            TargetChoice::Rebind("STUDIO".into()),
+            "a session stuck on blank must self-heal when a real page exists"
+        );
+        assert!(!stale, "self-healing off a blank tab is not the wedged-target case");
+
+        // AND IT MUST NOT CHURN. With nothing better available the blank
+        // binding is KEPT, or every verb rebinds on every call and the session
+        // never holds still.
+        let only_blank = vec![t("BLANK", "about:blank"), t("OTHER", "about:blank")];
+        assert_eq!(
+            choose_target(&only_blank, Some("BLANK"), &none, None).0,
+            TargetChoice::KeepBound("BLANK".into()),
+            "with nothing better, a blank binding is kept rather than churned"
+        );
+
+        // A REAL binding is never disturbed. This rule only ever demotes BLANK.
+        let two_real = vec![t("A", "https://a.com/"), t("B", "https://b.com/")];
+        assert_eq!(
+            choose_target(&two_real, Some("A"), &none, None).0,
+            TargetChoice::KeepBound("A".into()),
+            "a good binding must survive the presence of other pages"
         );
 
         // THE CONTROLS, so the preference cannot quietly override the rules it
