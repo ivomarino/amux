@@ -130,8 +130,27 @@ else
 #
 # Lowest precedence of cargo's three: CARGO_TARGET_DIR and --target-dir still
 # override it, which is what keeps the e2e worktree build and CI unaffected.
+#
+# jobs cap (FRONT-2, 2026-08-28): cargo's default parallelism (= nproc, so 4
+# rustc/linker jobs at once for amux-server, a large ~1466-test crate)
+# correlates with repeated session crashes on this box — every tmux session
+# in a shared checkout's fleet lives in the same container, so a kill under
+# memory pressure is not necessarily the build's own process; it can reap an
+# unrelated session's Claude Code process as collateral, which is what made
+# this read as "the worker randomly crashed" for months instead of "this
+# build ran out of room". EXACT MECHANISM NOT FULLY PINNED: an earlier pass
+# of this investigation claimed a specific 2.75GiB cgroup cap, which was a
+# misread (memory.current, current usage, mistaken for memory.max, the
+# limit) and has been retracted (see board card FRONT-2) — this container's
+# own cgroup shows no configured max. A host-level limit outside what is
+# visible from inside the container remains plausible but unverified. What
+# IS verified: jobs=2 was tried first and was NOT enough (three more crashes
+# followed in the same session). Serial (jobs=1) is the one value this
+# investigation has actually confirmed holds; revisit upward only with real
+# headroom evidence, not a guess.
 [build]
 target-dir = "$SHARED_TARGET_DIR"
+jobs = 1
 EOF
   say "cargo config: builds in this checkout target $SHARED_TARGET_DIR"
 fi
