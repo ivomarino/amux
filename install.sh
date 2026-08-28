@@ -148,9 +148,22 @@ else
 # followed in the same session). Serial (jobs=1) is the one value this
 # investigation has actually confirmed holds; revisit upward only with real
 # headroom evidence, not a guess.
+#
+# incremental=false (2026-08-28, same investigation): jobs=1 alone was NOT
+# enough once this checkout grew to the size of an 8-PR local integration
+# branch — a bare \`cargo check -p amux-server\` at jobs=1 still drove
+# available memory to ~48MiB and crashed the session. Measured the actual
+# culprit rather than guessing again: with CARGO_INCREMENTAL=0 added on top
+# of the same jobs=1, the identical check completed clean, bottoming out at
+# ~195MiB available instead of 0. Incremental compilation trades memory for
+# faster rebuilds by keeping extra state between runs; on a box this size
+# that trade isn't affordable. Costs slower rebuilds (no incremental cache
+# to reuse) — a real cost, worth it against a session-ending crash every
+# time this crate grows further.
 [build]
 target-dir = "$SHARED_TARGET_DIR"
 jobs = 1
+incremental = false
 EOF
   say "cargo config: builds in this checkout target $SHARED_TARGET_DIR"
 fi
