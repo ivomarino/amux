@@ -67,6 +67,17 @@ pub fn routes() -> Router<AppState> {
         // runs, so the rollback-on-failed-registration has one implementation
         // rather than two.
         .route("/{id}/duplicate", post(duplicate_worker))
+        // AF-288, the mechanical remainder of the RESOURCE set. Each delegates
+        // to the same `*_verb` fn the catch-all runs, so promoting a verb moves
+        // where it is ADDRESSED without forking what it DOES. `report` and
+        // `steer` are deliberately absent: the classification calls them
+        // load-bearing (D1's exit condition and turn-boundary delivery), and
+        // they need their store-managed semantics decided rather than extracted.
+        .route("/{id}/wake", post(wake_worker))
+        .route("/{id}/reset", post(reset_worker))
+        .route("/{id}/clear", post(clear_worker))
+        .route("/{id}/resize", post(resize_worker))
+        .route("/{id}/keys", post(keys_worker))
 }
 
 /// `GET /api/ollama/models` — list locally installed Ollama models by running
@@ -1102,6 +1113,91 @@ pub async fn send_worker(
     crate::api::session_verbs::send_verb(&state, &resolved, &headers, &body).await
 }
 
+/// Resolve a `/api/workers/{id}` path key to the session name the fleet verbs
+/// address, so a worker ID and its display name reach the same worker.
+///
+/// Factored out because every promoted verb needs it identically, and five
+/// copies of a resolution rule is five places for the id/name split to be
+/// fixed in only four of them.
+async fn resolve_key(state: &AppState, key: String) -> Result<String, Response> {
+    let store = state.store.clone();
+    let k = key.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        Ok(queries::get_worker(&conn, &k)?)
+    })
+    .await;
+    match joined {
+        Ok(Ok(Some(row))) if !row.display_name.is_empty() => Ok(row.display_name),
+        // A row with no display name has no env file to address either, so the
+        // key the caller used is the best remaining handle; the verb's own
+        // existence gate then reports the miss under the name they asked for.
+        Ok(Ok(_)) => Ok(key),
+        Ok(Err(e)) => Err(internal(e)),
+        Err(e) => Err(internal(e)),
+    }
+}
+
+/// `POST /api/workers/{id}/wake`
+pub async fn wake_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    match resolve_key(&state, key).await {
+        Ok(name) => crate::api::session_verbs::wake_verb(&state, &name).await,
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/workers/{id}/reset`
+pub async fn reset_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    match resolve_key(&state, key).await {
+        Ok(name) => crate::api::session_verbs::reset_verb(&state, &name).await,
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/workers/{id}/clear`
+pub async fn clear_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    match resolve_key(&state, key).await {
+        Ok(name) => crate::api::session_verbs::clear_verb(&name).await,
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/workers/{id}/resize`
+pub async fn resize_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::resize_verb(&name, &body).await
+}
+
+/// `POST /api/workers/{id}/keys` — write keystrokes to the terminal. NOT
+/// `send`, which delivers a prompt at a turn boundary; the classification keeps
+/// both because the names have to say which is which.
+pub async fn keys_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::keys_verb(&name, &body).await
+}
+
 /// `POST /api/workers/{id}/duplicate` — copy a worker's env file and register
 /// the twin in the worker store, or roll the copy back if it cannot.
 ///
@@ -2003,6 +2099,56 @@ mod tests {
         assert!(
             names.iter().any(|n| n == "twindst"),
             "the duplicate must be visible to /api/workers; got {names:?}"
+        );
+    }
+
+
+    /// AF-288: every promoted RESOURCE verb resolves a worker ID to the session
+    /// name, instead of handing the ulid to the fleet substrate verbatim.
+    ///
+    /// THE DISCRIMINATOR IS THE ID LEAK. Without a promoted route the request
+    /// does not 404 — it falls to `/api/workers/{name}/{*verb}`, which is
+    /// mounted and addresses BY NAME, so the ulid reaches `env_path()` and comes
+    /// back inside the answer. So "the id does not appear" is exactly the
+    /// property promotion buys, and the unpromoted verb at the end is the
+    /// CONTROL: it must still leak, or this assertion is passing for some
+    /// reason other than the one claimed.
+    ///
+    /// Asserted at the resolution gate rather than on a 200, for the reason the
+    /// send test gives: a 200 needs a live terminal and would launch one on the
+    /// machine running the suite.
+    #[tokio::test]
+    async fn promoted_resource_routes_resolve_a_worker_id_to_its_session_name() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+        let id = create(&app, "resverb").await;
+
+        for (verb, body) in [
+            ("wake", None),
+            ("reset", None),
+            ("clear", None),
+            ("resize", Some(json!({ "cols": 80, "rows": 24 }))),
+            ("keys", Some(json!({ "keys": "Enter" }))),
+        ] {
+            let (_, _, v) = send(&app, "POST", &format!("/api/workers/{id}/{verb}"), body).await;
+            assert!(
+                !v.to_string().contains(&id),
+                "{verb}: the raw worker id reached the answer, so this fell to the catch-all and \
+                 addressed the substrate BY ID instead of resolving it to the session name: {v}"
+            );
+        }
+
+        // CONTROL. `steer` is classified RESOURCE and deliberately NOT promoted
+        // (it needs its store-managed semantics decided, not extracted), so it
+        // still goes through the catch-all and must still leak the id. If this
+        // ever stops leaking, the loop above proves nothing.
+        let (_, _, v) = send(&app, "POST", &format!("/api/workers/{id}/steer"), None).await;
+        assert!(
+            v.to_string().contains(&id),
+            "control failed: an UNPROMOTED verb no longer addresses by id, so the loop above \
+             cannot distinguish a promoted route from an unpromoted one: {v}"
         );
     }
 

@@ -11958,41 +11958,8 @@ async fn post_dispatch(
                 "applied": applied,
             }))
         }
-        "keys" => {
-            let keys = body_str(body, "keys");
-            if keys.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'keys'"}));
-            }
-            let (ok, msg) = send_keys_op(name, &keys).await;
-            let code = if ok {
-                update_meta(name, &[("last_send", json!(now_i64()))]);
-                StatusCode::OK
-            } else if msg == "not running" {
-                StatusCode::CONFLICT
-            } else if msg.contains("not in allowed set") {
-                // 400 so the offline queue drops it instead of retrying
-                // forever (py:75700, 2026-07-18).
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            jresp(code, json!({"ok": ok, "message": msg}))
-        }
-        "resize" => {
-            let cols = body.get("cols").and_then(|v| v.as_i64());
-            let rows = body.get("rows").and_then(|v| v.as_i64()).unwrap_or(50);
-            let Some(cols) = cols else {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols/rows must be integers"}));
-            };
-            if cols == 0 {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols required"}));
-            }
-            if !is_running(name).await {
-                return jresp(StatusCode::CONFLICT, json!({"ok": false, "message": "not running"}));
-            }
-            let (ok, msg) = resize_pane(name, cols, rows).await;
-            j200(json!({"ok": true, "resized": ok, "message": msg}))
-        }
+        "keys" => keys_verb(name, body).await,
+        "resize" => resize_verb(name, body).await,
         // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
         // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
         // longer renders — 0 of 50 sessions matched, so the verb was wired
@@ -12154,13 +12121,7 @@ async fn post_dispatch(
             });
             jresp(StatusCode::ACCEPTED, json!({"ok": true, "message": "stopping"}))
         }
-        "clear" => {
-            let ptq = pt(name);
-            match tmux(&["clear-history", "-t", &ptq]).await {
-                Some(_) => j200(json!({"ok": true, "message": "cleared"})),
-                None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "message": "tmux clear-history timed out"})),
-            }
-        }
+        "clear" => clear_verb(name).await,
         "duplicate" => duplicate_verb(state, name, body),
         "clone" => clone_post(state, name, body).await,
         "archive" => {
@@ -12174,14 +12135,8 @@ async fn post_dispatch(
             let (ok, msg) = archive_session(state, name).await;
             verb_resp(ok, msg)
         }
-        "wake" => {
-            let (ok, msg) = wake_session(state, name).await;
-            verb_resp(ok, msg)
-        }
-        "reset" => {
-            let (ok, msg) = reset_session(state, name).await;
-            verb_resp(ok, msg)
-        }
+        "wake" => wake_verb(state, name).await,
+        "reset" => reset_verb(state, name).await,
         "commit-report" => {
             // Attach the commit to the in-flight card (py:76233-76246). The
             // cross-session sweep notice (py:76008-76230) is a named gap.
@@ -12819,6 +12774,76 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // credit-gate state (_session_auto_actions) — process state this origin
     // does not hold; named gap.
     jresp(code, resp)
+}
+
+/// `reset` as a callable verb, so the promoted `/api/workers/{id}/reset`
+/// route and the legacy `/api/sessions/{name}/reset` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn reset_verb(state: &AppState, name: &str) -> Response {
+    let (ok, msg) = reset_session(state, name).await;
+    verb_resp(ok, msg)
+}
+
+/// `wake` as a callable verb, so the promoted `/api/workers/{id}/wake`
+/// route and the legacy `/api/sessions/{name}/wake` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn wake_verb(state: &AppState, name: &str) -> Response {
+    let (ok, msg) = wake_session(state, name).await;
+    verb_resp(ok, msg)
+}
+
+/// `clear` as a callable verb, so the promoted `/api/workers/{id}/clear`
+/// route and the legacy `/api/sessions/{name}/clear` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn clear_verb(name: &str) -> Response {
+    let ptq = pt(name);
+    match tmux(&["clear-history", "-t", &ptq]).await {
+        Some(_) => j200(json!({"ok": true, "message": "cleared"})),
+        None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "message": "tmux clear-history timed out"})),
+    }
+}
+
+/// `resize` as a callable verb, so the promoted `/api/workers/{id}/resize`
+/// route and the legacy `/api/sessions/{name}/resize` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn resize_verb(name: &str, body: &Value) -> Response {
+    let cols = body.get("cols").and_then(|v| v.as_i64());
+    let rows = body.get("rows").and_then(|v| v.as_i64()).unwrap_or(50);
+    let Some(cols) = cols else {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols/rows must be integers"}));
+    };
+    if cols == 0 {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols required"}));
+    }
+    if !is_running(name).await {
+        return jresp(StatusCode::CONFLICT, json!({"ok": false, "message": "not running"}));
+    }
+    let (ok, msg) = resize_pane(name, cols, rows).await;
+    j200(json!({"ok": true, "resized": ok, "message": msg}))
+}
+
+/// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
+/// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn keys_verb(name: &str, body: &Value) -> Response {
+    let keys = body_str(body, "keys");
+    if keys.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'keys'"}));
+    }
+    let (ok, msg) = send_keys_op(name, &keys).await;
+    let code = if ok {
+        update_meta(name, &[("last_send", json!(now_i64()))]);
+        StatusCode::OK
+    } else if msg == "not running" {
+        StatusCode::CONFLICT
+    } else if msg.contains("not in allowed set") {
+        // 400 so the offline queue drops it instead of retrying
+        // forever (py:75700, 2026-07-18).
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    jresp(code, json!({"ok": ok, "message": msg}))
 }
 
 /// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`

@@ -1095,6 +1095,11 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/workers/{id}/peek", methods: &["GET"] },
     RouteEntry { path: "/api/workers/{id}/send", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/duplicate", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/wake", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/reset", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/clear", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/resize", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/keys", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/dead-letters", methods: &["GET"] },
     // -- memories / messages / schedules / verify / prefs / criteria
     RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },
