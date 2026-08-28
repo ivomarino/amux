@@ -4143,14 +4143,29 @@ mod tests {
     #[test]
     fn every_arm_that_prescribes_a_restore_carries_the_find_object_guard() {
         let dirty = s(&["FRUSTRATIONS.md", "a.rs"]);
-        let arms: [(&str, Freshness); 4] = [
+        // TWO AXES, because the advice is branched on BOTH and a matrix over
+        // one of them leaves whole message bodies unreachable. The first
+        // version of this test varied freshness only; `commit_worthy_body`
+        // emits an entirely separate recipe under `mine.is_empty()` (the
+        // OWNERSHIP IS UNKNOWN arm), so a mutation planted there rendered in no
+        // cell and the suite stayed green (amux, 2026-08-28).
+        let freshness: [(&str, Freshness); 4] = [
             ("commit-worthy", Freshness::default()),
             ("diverged", Freshness { diverged: s(&["a.rs"]), ..Default::default() }),
             ("stale", Freshness { stale: s(&["a.rs"]), ..Default::default() }),
             ("revived", Freshness { revived: s(&["a.rs"]), ..Default::default() }),
         ];
-        for (arm, fresh) in arms {
-            let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+        let ownership: [(&str, Ownership); 2] = [
+            ("mine", Ownership::default()),
+            ("unknown-owner", Ownership { unclaimed: s(&["a.rs", "FRUSTRATIONS.md"]), ..Default::default() }),
+        ];
+        for ((fname, fresh), (oname, own)) in freshness
+            .iter()
+            .flat_map(|f| ownership.iter().map(move |o| (f, o)))
+        {
+            let arm = format!("{fname}/{oname}");
+            let arm = arm.as_str();
+            let m = build("/repo", &dirty, own, fresh, "S")
                 .unwrap_or_else(|| panic!("{arm}: must render"));
             assert!(
                 m.contains("git checkout origin/main -- <path>"),
@@ -4164,12 +4179,56 @@ mod tests {
                  `git add`ed mid-edit that is in no commit, so the restore it green-lights is an \
                  irreversible delete: {m}"
             );
-            assert!(
-                m.contains("Do NOT substitute `git cat-file -e"),
-                "{arm}: must name blob-existence as the recipe NOT to use — it is the one a \
-                 reader reaches for, and it was the prescribed check here until AMUX-3264: {m}"
+            // NOT asserted universally. The unknown-ownership arm prescribes the
+            // correct find-object check and never names the wrong recipe at all,
+            // so requiring the warning here would fail on code that is right.
+            // Whether that arm SHOULD carry the warning is amux's call on their
+            // own message text; reported, not decided here (ethos rule 8). The
+            // STALE section's warning is pinned by
+            // `stale_section_prescribes_find_object_never_blob_existence`, so
+            // dropping it from this loop loses no coverage.
+            // EVERY occurrence, not merely one somewhere in the arm (amux,
+            // 2026-08-28). The `contains` checks above pin "this arm mentions
+            // the guard at least once". The advice is emitted from SIX
+            // production strings, so mutating one back to blob-existence left
+            // a sibling occurrence satisfying them and 41 tests stayed green.
+            //
+            // Counting guards against restore prescriptions does NOT work and
+            // was measured before being rejected: the restore command also
+            // appears in prose and in do-not warnings, so today's CORRECT code
+            // reads 3 prescriptions to 1 guard (commit-worthy), 4 to 1
+            // (diverged), 5 to 2 (stale), 4 to 2 (revived). That invariant is
+            // false on code that is right.
+            //
+            // This is the rule the section actually follows, and it holds with
+            // zero slack in all four arms: blob existence may appear ONLY
+            // inside a do-not warning. An occurrence outside one is a
+            // prescription, and a correct guard sitting paragraphs away does
+            // not reach a reader acting on the line in front of them, which is
+            // this test's own rationale applied within an arm instead of
+            // across arms.
+            // Matched by PROXIMITY, not by one exact phrasing. The first
+            // version keyed on "Do NOT substitute `git cat-file -e" and the
+            // unknown-ownership arm says "Do NOT use" — correct text, flagged
+            // as a live prescription. A matcher pinned to one wording reports
+            // the arms that phrase it differently, which is the same
+            // wrong-layer error this test exists to catch, pointed at prose.
+            let blob_total = m.matches("cat-file -e").count();
+            let blob_warned = m
+                .match_indices("cat-file -e")
+                .filter(|(i, _)| m[i.saturating_sub(40)..*i].contains("Do NOT"))
+                .count();
+            assert_eq!(
+                blob_total, blob_warned,
+                "{arm}: {} of {} blob-existence mention(s) are NOT inside a do-not warning, so \
+                 at least one is prescribed as a check. `git add` writes the blob without \
+                 committing, so that recipe green-lights an irreversible delete of a mid-edit \
+                 that is in no commit: {m}",
+                blob_total - blob_warned, blob_total
             );
         }
     }
+
+
 
 }
