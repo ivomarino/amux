@@ -813,7 +813,12 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              is not yours it is a peer's mid-edit: hands off either way. Do NOT use \
              `git cat-file -e $(git hash-object <path>)` for this: blob existence cannot separate \
              an OLD revision from a CURRENT one that is merely unpushed, so on a checkout ahead \
-             of origin it calls the whole tree STALE and its remedy reverts it. \
+             of origin it calls the whole tree STALE and its remedy reverts it. It also answers \
+             YES for a never-committed mid-edit, because `git add` writes the blob into the \
+             object DB without committing — and THIS arm is where that matters most, since \
+             ownership being unknown is exactly the state a peer's uncommitted work is in \
+             (cold-outbound, 2026-08-17: a file mid-keystroke and in no commit on any ref, which \
+             that recipe answered yes for; the restore it green-lit would have deleted it). \
              Stage only what you recognise as your work AND whose ancestry test prints nothing.",
             if n == 1 { "it" } else { "them" },
             if n == 1 { "it is" } else { "they are" },
