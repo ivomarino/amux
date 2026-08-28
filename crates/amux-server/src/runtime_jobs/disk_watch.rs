@@ -1024,7 +1024,7 @@ mod tests {
         s.write(|c| {
             crate::db::migrate::apply_one(
                 c,
-                include_str!("../../migrations/0029_regenerable_samples.sql"),
+                include_str!("../../migrations/0035_regenerable_samples.sql"),
             )
             .unwrap();
             Ok(crate::db::WriteOutcome { applied: false, events: vec![] })

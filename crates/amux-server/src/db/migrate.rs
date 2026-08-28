@@ -198,8 +198,8 @@ const MIGRATIONS: &[Migration] = &[
     },
     Migration {
         version: 35,
-        name: "0029_regenerable_samples",
-        sql: include_str!("../../migrations/0029_regenerable_samples.sql"),
+        name: "0035_regenerable_samples",
+        sql: include_str!("../../migrations/0035_regenerable_samples.sql"),
     },
 ];
 
