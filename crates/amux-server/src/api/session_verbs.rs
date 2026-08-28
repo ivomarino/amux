@@ -12230,15 +12230,29 @@ async fn post_dispatch(
             // write so it can ride the same log line the commit already adds:
             // a second write would put the warning somewhere other than where
             // the session goes to read what it shipped.
-            let shape = read_commit_shape(&body_str(body, "dir"), &sha).await;
+            let dir = body_str(body, "dir");
+            let shape = read_commit_shape(&dir, &sha).await;
             let empty = matches!(shape, commit_shape::Shape::Empty);
+            // WHAT THE HOOK SAW, held by the staged-guard (AMUX-3837).
+            // amux-frustrations demonstrated the mechanism: git writes the tree
+            // AFTER the hooks return, so anything that empties the index during
+            // our 30-90s pre-commit window (cargo check + clippy, on an index
+            // every lane shares) yields a zero-file commit reporting success.
+            // The hook already reports its staged set and this endpoint already
+            // knows what landed; joining them turns a forensic reconstruction
+            // into a stated pair. 300s, because the window is the pre-commit
+            // build, not a session.
+            let staged_at_hook =
+                crate::api::git_guard::staged_seen(name, &dir, crate::config::now_f64(), 300.0);
             if empty {
                 tracing::warn!(
                     session = %name, sha = %sha, subject = %subj,
+                    staged_at_hook = staged_at_hook.map(|n| n as i64).unwrap_or(-1),
                     "commit-report: EMPTY COMMIT — this sha contains no files, so the change it \
                      claims is still uncommitted in the working tree (AMUX-3837). On a shared \
                      checkout any peer's checkout or stash destroys it, and a card closed citing \
-                     this sha is citing nothing."
+                     this sha is citing nothing. staged_at_hook=-1 means the hook did not report, \
+                     which is not the same as it having seen nothing."
                 );
             }
             let session = name.to_string();
@@ -12247,8 +12261,24 @@ async fn post_dispatch(
             // the commit was fine, versus absent because nothing looked.
             let shape_note = match shape {
                 commit_shape::Shape::Empty => {
-                    " — **EMPTY: this commit contains no files. Your change is still uncommitted.**"
-                        .to_string()
+                    // The PAIR, when we have it: N staged at the hook and 0 in
+                    // the commit is the index emptying mid-window, demonstrated
+                    // rather than inferred. Absent when the hook did not report,
+                    // and it says so instead of implying zero.
+                    let seen = match staged_at_hook {
+                        Some(n) if n > 0 => format!(
+                            " The pre-commit hook saw {n} staged file(s) and this commit has none, \
+                             so the index was emptied between the hook and the write."
+                        ),
+                        Some(_) => " The pre-commit hook also saw nothing staged.".to_string(),
+                        None => " (The hook did not report a staged count, so what it saw is \
+                                 unknown rather than zero.)"
+                            .to_string(),
+                    };
+                    format!(
+                        " — **EMPTY: this commit contains no files. Your change is still \
+                         uncommitted.**{seen}"
+                    )
                 }
                 commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
                 _ => String::new(),
@@ -12295,7 +12325,8 @@ async fn post_dispatch(
                 // in-flight card is exactly the one whose commit lands with no
                 // trail, so it is the last place the warning may be dropped.
                 Ok(r) if !r.applied => {
-                    j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty}))
+                    j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty,
+                               "staged_at_hook": staged_at_hook}))
                 }
                 Ok(_) => {
                     // Re-read the card id for the response (the write closure
@@ -12310,7 +12341,8 @@ async fn post_dispatch(
                         )
                         .ok()
                     });
-                    j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty}))
+                    j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty,
+                                "staged_at_hook": staged_at_hook}))
                 }
                 Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
             }

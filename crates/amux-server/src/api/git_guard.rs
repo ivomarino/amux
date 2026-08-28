@@ -1999,6 +1999,60 @@ pub async fn staged_guard(
 /// Notifying an owner from it would tell them their file was being swept every
 /// time a nudge tick ran — a notice that is false, repeated, and precisely the
 /// noise that gets a channel muted (ethos rule 5).
+/// What the pre-commit hook SAW staged, per `(session, dir)` (AMUX-3837).
+///
+/// amux-frustrations demonstrated the mechanism behind the empty commit, and it
+/// needs no `--allow-empty`: git decides to proceed and writes the tree AFTER
+/// the hooks return, so anything that empties the index during the pre-commit
+/// window produces a zero-file commit that reports success. Two lines in a
+/// scratch repo reproduce it, confirmed independently here.
+///
+/// The route in THIS repo is not hypothetical. Sessions share one git index,
+/// and our pre-commit window is a full `cargo check --workspace --all-targets`
+/// plus clippy: 30 to 90 seconds of exposure per commit, during which a peer's
+/// `git reset` or `git restore --staged` lands in the same index.
+///
+/// So the pair is worth recording. The hook already tells the server what it
+/// saw; the commit report already knows what landed. Holding the first lets the
+/// second say "the hook saw N files and this commit has none" instead of
+/// leaving it to be reconstructed from request-log timestamps, which is what it
+/// cost this time.
+fn staged_seen_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn staged_seen_key(session: &str, dir: &str) -> String {
+    format!("{}\u{1}{}", session.trim().to_lowercase(), dir.trim())
+}
+
+/// Record what the hook saw. Called on every staged-guard POST.
+pub fn record_staged_seen(session: &str, dir: &str, count: usize, now: f64) {
+    if session.trim().is_empty() || dir.trim().is_empty() {
+        return;
+    }
+    let mut g = staged_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    g.insert(staged_seen_key(session, dir), (now, count));
+    // Bounded: one entry per lane per checkout, and a commit's hook-to-report
+    // gap is seconds. Anything older than an hour is a lane that has gone away.
+    g.retain(|_, (ts, _)| now - *ts < 3600.0);
+}
+
+/// How many files the hook saw for this lane's most recent commit attempt in
+/// this checkout, if that attempt is recent enough to be the SAME commit.
+///
+/// `None` where the answer is unknown, never 0: an absent record means the hook
+/// did not report (a lane on another machine, a disabled guard, a server that
+/// restarted between the two calls), and reporting that as "the hook saw no
+/// files" would turn a missing measurement into evidence (ethos rule 4).
+pub fn staged_seen(session: &str, dir: &str, now: f64, within_s: f64) -> Option<usize> {
+    let g = staged_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&staged_seen_key(session, dir))
+        .filter(|(ts, _)| now - *ts <= within_s)
+        .map(|(_, n)| *n)
+}
+
 pub async fn staged_guard_inner(
     state: Option<super::AppState>,
     headers: HeaderMap,
@@ -2045,6 +2099,12 @@ pub async fn staged_guard_inner(
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default();
+
+    // Hold what the hook saw, for the commit report to compare against
+    // (AMUX-3837). Recorded from the RAW paths, before any filtering, because
+    // the question is "did the index empty between here and the commit" and the
+    // guard's own opinion of those paths is a different question.
+    record_staged_seen(&session, &wd_raw, raw_paths.len(), crate::config::now_f64());
 
     let wd = std::fs::canonicalize(&wd_raw)
         .map(|p| p.to_string_lossy().into_owned())
@@ -4421,5 +4481,49 @@ mod cd_is_not_a_mutation {
         ] {
             assert!(!is_pure_read_command(cmd), "must NOT be a pure read: {cmd}");
         }
+    }
+}
+
+#[cfg(test)]
+mod staged_seen_tests {
+    use super::{record_staged_seen, staged_seen};
+
+    /// AMUX-3837. The pair that turns an empty commit from a forensic
+    /// reconstruction into a stated fact.
+    #[test]
+    fn what_the_hook_saw_is_scoped_recent_and_absent_rather_than_zero() {
+        let now = 5_000_000.0;
+        record_staged_seen("lane-a", "/repo/one", 3, now);
+        record_staged_seen("lane-b", "/repo/one", 7, now);
+        record_staged_seen("lane-a", "/repo/two", 1, now);
+
+        assert_eq!(staged_seen("lane-a", "/repo/one", now, 300.0), Some(3));
+        assert_eq!(staged_seen("LANE-A", "/repo/one", now, 300.0), Some(3), "lane name is case-folded");
+        // SCOPED BOTH WAYS. Another lane in the same checkout, and the same lane
+        // in another checkout, are different commits — reading either as this
+        // one's staged count would manufacture the discrepancy this detects.
+        assert_eq!(staged_seen("lane-b", "/repo/one", now, 300.0), Some(7));
+        assert_eq!(staged_seen("lane-a", "/repo/two", now, 300.0), Some(1));
+
+        // NEVER MEASURED IS NOT ZERO. A lane that did not report must come back
+        // None, or a missing measurement becomes evidence that nothing was
+        // staged (ethos rule 4).
+        assert_eq!(staged_seen("lane-c", "/repo/one", now, 300.0), None, "never reported");
+        assert_eq!(staged_seen("lane-a", "/repo/nope", now, 300.0), None, "different checkout");
+
+        // STALE IS ALSO NOT AN ANSWER. The window is a pre-commit build, so a
+        // record from an hour ago belongs to a different commit entirely.
+        assert_eq!(staged_seen("lane-a", "/repo/one", now + 301.0, 300.0), None, "past the window");
+        assert_eq!(staged_seen("lane-a", "/repo/one", now + 299.0, 300.0), Some(3), "inside it");
+
+        // A hook that genuinely saw nothing is Some(0), distinct from None.
+        record_staged_seen("lane-d", "/repo/one", 0, now);
+        assert_eq!(staged_seen("lane-d", "/repo/one", now, 300.0), Some(0));
+
+        // Blank inputs record nothing rather than colliding on one key.
+        record_staged_seen("", "/repo/one", 9, now);
+        record_staged_seen("lane-e", "", 9, now);
+        assert_eq!(staged_seen("", "/repo/one", now, 300.0), None);
+        assert_eq!(staged_seen("lane-e", "", now, 300.0), None);
     }
 }

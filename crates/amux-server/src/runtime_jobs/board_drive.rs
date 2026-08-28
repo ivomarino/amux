@@ -4839,6 +4839,11 @@ mod tests {
         assert_eq!(human_blocked_root("W-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "root is todo");
         assert_eq!(human_blocked_root("D-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "dangling id");
         assert_eq!(human_blocked_root("C-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "a cycle terminates");
+        // NOTE, from amux-frustrations' review: this cycle assertion does NOT
+        // test the seen-set. A two-node cycle keeps the frontier at one element
+        // per level, so the loop runs out of depth and returns None whether or
+        // not `seen` exists — they proved it by deleting the seen-set and
+        // watching the suite stay green. The cell that discriminates is below.
         assert_eq!(
             human_blocked_root("S-1", &lookup, DEPENDS_ON_MAX_DEPTH),
             None,
@@ -4846,6 +4851,50 @@ mod tests {
         );
         // The cap holds: one hop is not enough to reach MG-1369 from MG-1356.
         assert_eq!(human_blocked_root("MG-1356", &lookup, 1), None, "depth is bounded");
+    }
+
+    /// THE SEEN-SET, which the cycle cell above cannot test (amux-frustrations,
+    /// reviewing AMUX-3775). They mutation-tested my three named attacks; three
+    /// failed the suite as intended and DELETING THE SEEN-SET ENTIRELY left it
+    /// green. A two-node cycle terminates by the depth bound, giving the same
+    /// answer by the wrong mechanism.
+    ///
+    /// What `seen` actually buys is protection against RE-EXPANSION IN A
+    /// DIAMOND, which no cycle can exercise. This builds a lattice where every
+    /// level's nodes both point at both of the next level's, so the frontier
+    /// doubles per level without dedup: 2^12 expansions at the default depth.
+    /// The assertion is on the CALL COUNT, because the return value is `None`
+    /// either way — the defect is cost, not correctness, and only a counter can
+    /// see it.
+    #[test]
+    fn the_seen_set_stops_a_diamond_from_re_expanding() {
+        const LEVELS: usize = 12;
+        let calls = std::cell::Cell::new(0usize);
+        let lookup = |id: &str| -> CardLink {
+            calls.set(calls.get() + 1);
+            // "L<level>-<branch>" -> both nodes of the next level.
+            let (lvl, _) = id.split_once('-').and_then(|(l, b)| {
+                Some((l.strip_prefix('L')?.parse::<usize>().ok()?, b))
+            })?;
+            if lvl >= LEVELS {
+                return Some(("blocked".to_string(), vec![]));
+            }
+            Some((
+                "blocked".to_string(),
+                vec![format!("L{}-a", lvl + 1), format!("L{}-b", lvl + 1)],
+            ))
+        };
+        assert_eq!(human_blocked_root("L0-a", &lookup, DEPENDS_ON_MAX_DEPTH), None);
+        // With dedup the walk visits at most 2 nodes per level plus the start.
+        // Without it the frontier doubles: 2^12 = 4096 expansions before the
+        // depth bound stops it. The bound is deliberately far below that and far
+        // above the deduped count, so it cannot pass by luck either way.
+        assert!(
+            calls.get() < 64,
+            "the walk expanded {} times on a {LEVELS}-level diamond — the seen-set is not \
+             deduping, and a wide dependency graph will melt the nudge",
+            calls.get()
+        );
     }
 
     /// AMUX-3775, through `outstanding_work` — the shipped path, on the shape
