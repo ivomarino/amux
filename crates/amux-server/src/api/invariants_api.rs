@@ -40,13 +40,122 @@ async fn health(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> Response {
-    let results = monitor::evaluate_all(&state).await;
+    // ?id= re-evaluates live because only a full pass carries the known-ids set
+    // that tells "this id is not wired in" from "it has not run yet". ?live=1 is
+    // the explicit escape hatch for a caller that must have a synchronous fresh
+    // pass. Everything else serves the monitor's STORED results (AMUX-3841): a
+    // per-call re-evaluation of all 527 invariants cost 2.5-3.9s here and, worse,
+    // varied 0.75-12.4s on this box, so a caller could not tell a slow eval from
+    // a wedged one — an honesty problem, not a speed one. The monitor already
+    // evaluates every TICK_SECS and stores; this reads that in ~16ms AND reports
+    // the PRODUCER'S liveness, so stored green can never be served as if fresh
+    // while the monitor that produced it is dead.
     if let Some(want) = q.get("id").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        let results = monitor::evaluate_all(&state).await;
         return Json(filtered_body(&results, want)).into_response();
     }
-    let conf = rollup(&results);
+    let want_live = q
+        .get("live")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    if want_live {
+        let results = monitor::evaluate_all(&state).await;
+        return Json(live_body(&results, &state)).into_response();
+    }
+
+    // DEFAULT: stored + producer liveness.
+    let now = crate::config::now_f64();
+    let snap = crate::runtime_jobs::registry::snapshot()
+        .into_iter()
+        .find(|s| s.id == crate::runtime_jobs::registry::ids::INVARIANTS);
+    let facts = crate::runtime_jobs::registry::Facts {
+        spawned: snap.is_some(),
+        dead: snap.as_ref().map(|s| s.dead).unwrap_or(false),
+        disabled: snap.as_ref().map(|s| s.disabled_reason.is_some()).unwrap_or(false),
+        interval_s: snap.as_ref().and_then(|s| s.interval_s),
+        spawned_at: snap.as_ref().map(|s| s.spawned_at),
+        last_tick_at: snap.as_ref().and_then(|s| s.last_tick_at),
+        in_flight_since: snap.as_ref().and_then(|s| s.in_flight_since),
+        instrumented: snap.as_ref().map(|s| s.ticks > 0).unwrap_or(false),
+    };
+    let mon_state = crate::runtime_jobs::registry::classify(&facts, now);
+    let mon_fresh = matches!(mon_state, "ok" | "alive");
+
+    let latest = store::latest_per_invariant(&state.store).unwrap_or_default();
     let (mut pass, mut fail, mut unknown) = (0, 0, 0);
-    for r in &results {
+    for l in &latest {
+        match l["status"].as_str().unwrap_or("") {
+            "pass" => pass += 1,
+            "fail" => fail += 1,
+            "unknown" => unknown += 1,
+            _ => {}
+        }
+    }
+    let has_stored = !latest.is_empty();
+    let confidence = stored_confidence(mon_fresh, has_stored, fail, unknown);
+    let live = store::live_incidents(&state.store).unwrap_or_default();
+    let last_age = facts.last_tick_at.map(|t| ((now - t).max(0.0) * 10.0).round() / 10.0);
+
+    Json(json!({
+        "source": "stored",
+        "confidence": confidence,
+        // TOP-LEVEL, not a field a reader has to know to check (AMUX-3841): a
+        // monitor that is not `ok`/`alive` makes this endpoint say so here, and
+        // `stale` is true whenever the verdict cannot be trusted as current —
+        // dead/stalled/hung producer, OR nothing stored yet.
+        "stale": !mon_fresh || !has_stored,
+        "monitor": {
+            "state": mon_state,             // ok|alive|stalled|hung|dead|not_spawned|disabled|starting
+            "last_tick_age_s": last_age,    // null = never ticked; distinct from old (starting vs stalled)
+            "ticks": snap.as_ref().map(|s| s.ticks).unwrap_or(0),
+            "cadence_s": facts.interval_s,
+            "stall_after_s": facts.interval_s
+                .map(crate::runtime_jobs::registry::stall_after_s),
+        },
+        "checks": {"pass": pass, "fail": fail, "unknown": unknown, "total": latest.len()},
+        "live_incidents": live.len(),
+        "note": if !has_stored {
+            "no invariant results stored yet — the monitor has not completed a pass in this process; this is NOT healthy"
+        } else if !mon_fresh {
+            "the invariant MONITOR is not running fresh — these results may be stale; see monitor.state (add ?live=1 to force a synchronous re-evaluation)"
+        } else if unknown > 0 {
+            "some probes could not reach a verdict — unknown is not pass"
+        } else { "" },
+        "failures": latest.iter().filter(|l| l["status"] == "fail").map(|l| json!({
+            "invariant_id": l["invariant_id"], "entity": l["entity"],
+            "expected": l["expected"], "observed": l["observed"],
+        })).collect::<Vec<_>>(),
+        "unknowns": latest.iter().filter(|l| l["status"] == "unknown").map(|l| json!({
+            "invariant_id": l["invariant_id"], "why": l["observed"],
+        })).collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+/// The verdict a reader trusts, from the four facts that decide it. A pure
+/// function so the load-bearing rule of AMUX-3841 — a stored "healthy" must
+/// NEVER be served off a monitor that is not running fresh, nor off an empty
+/// store — has a test that can fail on that exact bug, rather than living only
+/// inside an async handler that reads global state.
+fn stored_confidence(mon_fresh: bool, has_stored: bool, fail: usize, unknown: usize) -> &'static str {
+    if !mon_fresh || !has_stored {
+        "unknown"
+    } else if fail > 0 {
+        "unhealthy"
+    } else if unknown > 0 {
+        "unknown"
+    } else {
+        "healthy"
+    }
+}
+
+/// The live (?live=1) full body — a synchronous re-evaluation, the pre-AMUX-3841
+/// default kept as an escape hatch. Extracted so the stored path and the live
+/// path are two named things, not one function with a branch.
+fn live_body(results: &[crate::invariants::InvariantResult], state: &AppState) -> serde_json::Value {
+    let conf = rollup(results);
+    let (mut pass, mut fail, mut unknown) = (0, 0, 0);
+    for r in results {
         match r.status {
             Status::Pass => pass += 1,
             Status::Fail => fail += 1,
@@ -55,15 +164,11 @@ async fn health(
         }
     }
     let live = store::live_incidents(&state.store).unwrap_or_default();
-    // 200 even when unhealthy: this endpoint's job is to REPORT, and a non-2xx
-    // makes generic uptime tooling retry/alert on the reporter rather than read
-    // the report. The verdict is in the body, where it can be precise.
-    Json(json!({
+    json!({
+        "source": "live",
         "confidence": conf.as_str(),
         "checks": {"pass": pass, "fail": fail, "unknown": unknown, "total": results.len()},
         "live_incidents": live.len(),
-        // Named explicitly so a caller cannot mistake "no failures" for
-        // "everything verified" when probes could not run.
         "note": if unknown > 0 {
             "some probes could not reach a verdict — unknown is not pass"
         } else { "" },
@@ -74,8 +179,7 @@ async fn health(
         "unknowns": results.iter().filter(|r| r.status == Status::Unknown).map(|r| json!({
             "invariant_id": r.invariant_id, "why": r.observed,
         })).collect::<Vec<_>>(),
-    }))
-    .into_response()
+    })
 }
 
 /// The `?id=` response, split out so the test drives THE SHIPPED CODE rather
@@ -179,8 +283,32 @@ async fn debug(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::filtered_body;
+    use super::{filtered_body, stored_confidence};
     use crate::invariants::InvariantResult;
+
+    /// The load-bearing rule of AMUX-3841, with the negative control that is the
+    /// whole point: a monitor that is NOT running fresh must not let a stored
+    /// all-pass render "healthy" (a dead monitor showing green is the invisible
+    /// failure this card exists to kill), and an EMPTY store must not either
+    /// (a fresh boot serving healthy off nothing is the same bug's other face).
+    /// The control — a fresh monitor with stored passes — must still be healthy,
+    /// or the check would be a detector that fires on everything and means nothing.
+    #[test]
+    fn stale_or_empty_never_renders_healthy_but_fresh_and_clean_does() {
+        // Fresh + stored + clean -> healthy (the control that must pass).
+        assert_eq!(stored_confidence(true, true, 0, 0), "healthy");
+        // Fresh + stored + a failure -> unhealthy; + an unknown -> unknown.
+        assert_eq!(stored_confidence(true, true, 1, 0), "unhealthy");
+        assert_eq!(stored_confidence(true, true, 0, 3), "unknown");
+        // Monitor NOT fresh, yet every stored check passed -> still unknown, NOT
+        // healthy. This is the assertion that fails on the exact bug.
+        assert_eq!(stored_confidence(false, true, 0, 0), "unknown");
+        // Monitor fresh but NOTHING stored yet -> unknown, not healthy.
+        assert_eq!(stored_confidence(true, false, 0, 0), "unknown");
+        // A dead monitor cannot be waved through even with a stored failure count
+        // of zero and no unknowns — the monitor state dominates.
+        assert_eq!(stored_confidence(false, false, 0, 0), "unknown");
+    }
 
     /// The `?id=` body, from the shipped function. The case that matters is the
     /// MISS: an unmatched id and a passing id must not produce the same body,
