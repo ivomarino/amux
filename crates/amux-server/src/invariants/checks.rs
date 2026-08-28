@@ -544,7 +544,7 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
 /// `sampled` is how many of the newest rows each `observed` value was taken
 /// from, or 0 for the whole table. It exists so a `None` says what it actually
 /// means: after AMUX-3836 the probe reads the newest rows rather than scanning
-/// the table, and "empty" and "nothing in the newest 5000 rows" are different
+/// the table, and "empty" and "nothing in the newest N rows" are different
 /// claims about the schema. Reporting the first when you measured the second is
 /// the shape ethos rule 4 is about, and the caller is the only one that knows.
 pub fn timestamp_units_are_what_readers_assume(

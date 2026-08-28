@@ -673,13 +673,29 @@ pub async fn callback(
             ),
         );
     }
-    let token_file = json!({
+    let mut token_file = json!({
         "token": access,
         "refresh_token": body.get("refresh_token").cloned().unwrap_or(Value::Null),
         "token_uri": cfg.token_uri,
         "client_id": cfg.client_id,
         "client_secret": cfg.client_secret,
     });
+    // A FAIL-OPEN WRITE SELF-ANNOUNCES (amux-cloud's review of AMUX-3839).
+    //
+    // Their point, and it is right: the Err arm's safety rested entirely on a
+    // `tracing::warn!` that nothing surfaces to a consumer. A token written
+    // without an identity check was honest in server-rs.log and invisible
+    // everywhere a human or a health check looks, which is the tag-in-a-store-
+    // nobody-reads shape (ethos rule 4).
+    //
+    // Only the UNVERIFIED case is stamped. Adding `identity_verified: true` to
+    // every file would change the shape that `load_token_file` and the Python
+    // round-trip test pin, for no gain: the ordinary file staying byte-identical
+    // is what keeps the formats ONE.
+    if let Err(why) = &granted {
+        token_file["identity_unverified"] = json!(true);
+        token_file["identity_unverified_why"] = json!(why);
+    }
     if let Err(e) = std::fs::write(tokens_dir.join(format!("{account}.json")), token_file.to_string())
     {
         return html(
@@ -712,13 +728,42 @@ pub async fn accounts(Extension(ctx): Extension<Arc<GmailAuthCtx>>) -> Response 
         }
         health.insert(a.clone(), json!(state));
     }
+    // SURFACE THE FAIL-OPEN WRITES (amux-cloud's review of AMUX-3839). The
+    // callback stamps a token it could not identity-check; without this the
+    // stamp lives only in a file nobody opens, which is the defect it was added
+    // to fix rather than a fix for it.
+    let unverified: Vec<Value> = accts
+        .iter()
+        .filter_map(|a| {
+            let raw = std::fs::read_to_string(
+                ctx.home.join("gmail-tokens").join(format!("{a}.json")),
+            )
+            .ok()?;
+            let v: Value = serde_json::from_str(&raw).ok()?;
+            v.get("identity_unverified")
+                .and_then(Value::as_bool)
+                .filter(|b| *b)
+                .map(|_| {
+                    json!({
+                        "account": a,
+                        "why": v.get("identity_unverified_why").cloned().unwrap_or(Value::Null),
+                    })
+                })
+        })
+        .collect();
     Json(json!({
         "accounts": accts,
         "health": health,
         "needs_reauth": needs_reauth,
+        // Empty is a real answer here, not a missing one: every account's token
+        // file was read, so [] means all of them carried a verified identity.
+        "identity_unverified": unverified,
         "note": "`accounts` = a token file exists. `health` = the token still works. \
                  A revoked token stays in `accounts` and fails every read, so check \
-                 `health` before concluding a mailbox is usable.",
+                 `health` before concluding a mailbox is usable. `identity_unverified` \
+                 lists accounts whose token was stored WITHOUT confirming which Google \
+                 account granted it (the mailbox lookup failed at consent time) — those \
+                 may be acting as someone else and should be reconnected.",
         "reauth": "GET /api/gmail/auth?account=<email>, open the url, approve",
     }))
     .into_response()
@@ -1142,6 +1187,82 @@ mod tests {
         assert!(
             v3.get("previous_attempt_never_completed").is_none_or(Value::is_null),
             "another account's abandoned consent is not this one's: {v3}"
+        );
+    }
+
+    /// amux-cloud's review of AMUX-3839: a fail-open write must SELF-ANNOUNCE.
+    /// Their point was that the Err arm's safety rested on a `tracing::warn!`
+    /// nothing surfaces, so a token stored without an identity check was honest
+    /// in the log and invisible everywhere a human or a health check looks.
+    #[tokio::test]
+    async fn a_token_stored_without_an_identity_check_says_so_where_someone_looks() {
+        let home = home_with_client_config();
+        // No profile answer scripted: the lookup fails, so the write is fail-open.
+        let http = MockHttp::new(vec![(
+            "FORM",
+            "oauth2.googleapis.com/token",
+            200,
+            json!({ "access_token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT" }),
+        )]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
+        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
+        let (st, _) =
+            send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+        assert_eq!(st, StatusCode::OK);
+
+        // ON DISK.
+        let tok: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("gmail-tokens").join(format!("{ACCT}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(tok["identity_unverified"], json!(true), "the file must carry the stamp: {tok}");
+        assert!(tok["identity_unverified_why"].is_string(), "with the reason: {tok}");
+
+        // AND WHERE SOMEONE LOOKS. The stamp existing only in the file would be
+        // the same defect one layer down.
+        let (_, acc) = send_json(&app, "GET", "/api/gmail/accounts").await;
+        let flagged = acc["identity_unverified"].as_array().expect("array");
+        assert_eq!(flagged.len(), 1, "the account must be listed: {acc}");
+        assert_eq!(flagged[0]["account"], json!(ACCT));
+    }
+
+    /// THE CONTROL for the test above: a VERIFIED write carries no stamp and the
+    /// accounts list is empty. Without this, a version that stamped every token
+    /// would pass, and the field would flag everything and mean nothing.
+    #[tokio::test]
+    async fn a_verified_token_carries_no_stamp_and_the_list_stays_empty() {
+        let home = home_with_client_config();
+        let http = MockHttp::new(vec![
+            (
+                "FORM",
+                "oauth2.googleapis.com/token",
+                200,
+                json!({ "access_token": "PLACEHOLDER_AT", "refresh_token": "PLACEHOLDER_RT" }),
+            ),
+            ("GET", "users/me/profile", 200, json!({ "emailAddress": ACCT })),
+        ]);
+        let (app, _d) = app_with(http.clone(), home.path());
+        let (_, v) = send_json(&app, "GET", "/api/gmail/auth?account=hello%40amux.io").await;
+        let state = qparam(v["url"].as_str().unwrap(), "state").unwrap().to_string();
+        send(&app, "GET", &format!("/api/gmail/callback?code=authcode123&state={state}")).await;
+
+        let tok: Value = serde_json::from_str(
+            &std::fs::read_to_string(home.path().join("gmail-tokens").join(format!("{ACCT}.json")))
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(tok.get("identity_unverified").is_none(), "a verified write is unstamped: {tok}");
+        // And the ordinary file shape stays byte-identical to what
+        // `load_token_file` and the Python round-trip pin.
+        assert_eq!(tok.as_object().unwrap().len(), 5, "no extra keys on the happy path: {tok}");
+
+        let (_, acc) = send_json(&app, "GET", "/api/gmail/accounts").await;
+        assert_eq!(
+            acc["identity_unverified"].as_array().map(Vec::len),
+            Some(0),
+            "nothing to flag: {acc}"
         );
     }
 

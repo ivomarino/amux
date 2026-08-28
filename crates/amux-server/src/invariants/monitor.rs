@@ -708,7 +708,16 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     // ORDER OF MAGNITUDE, not a true maximum: it is deciding seconds versus
     // milliseconds, a factor of 1000. The newest rows answer that. Same query,
     // bounded to the newest rows: 0.129s, identical value.
-    const SAMPLE: usize = 5_000;
+    //
+    // 500, not 5000 (AMUX-3836, second pass, after amux-cloud could not
+    // reproduce the first pass's headline number). MEASURED on the live schema:
+    // every one of the 47 declared columns returns the IDENTICAL value at 500 as
+    // at 5000, so the reduction is free in correctness and reads 10x fewer rows.
+    // No millisecond figure is claimed for it: this host runs the fleet and
+    // compiles continuously, and repeated timings of the same query ranged 0.84s
+    // to 6.48s at 5000 and 0.18s to 2.51s at 500. A single sample here is not a
+    // measurement, which is the mistake that put a wrong number on the card.
+    const SAMPLE: usize = 500;
     let mut observed: Vec<(String, Option<f64>)> = Vec::new();
     for (t, c, _) in checks::TIMESTAMP_COLUMNS {
         // rowid order, not `c` order: ordering by the column being probed would
