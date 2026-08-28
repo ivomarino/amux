@@ -24,7 +24,17 @@ fi
 export DISPLAY="${DISPLAY:-:0}"
 export NO_UPDATE_NOTIFIER=1
 
+# --browser only accepts chrome/firefox/webkit/msedge — none of those match
+# this box's actual browser (system chromium at /usr/bin/chromium, no
+# Google Chrome build installed under any of the channels). Point directly
+# at the real binary instead; falls through to Playwright's own bundled
+# chromium if the system one is ever removed, rather than hard-failing.
+CHROMIUM_BIN="/usr/bin/chromium"
+EXEC_ARGS=()
+[ -x "$CHROMIUM_BIN" ] && EXEC_ARGS=(--executable-path "$CHROMIUM_BIN")
+
 exec npx -y @playwright/mcp@latest \
   --port "$PORT" \
   --user-data-dir "$PROFILE" \
-  --host 0.0.0.0
+  --host 0.0.0.0 \
+  "${EXEC_ARGS[@]}"
