@@ -8804,11 +8804,40 @@ pub(crate) fn steer_dead_letter_s() -> f64 {
 /// for 6.5h and every queued row delivered on restart, and no age threshold
 /// can tell that outage from a dead lane.
 pub(crate) fn steer_dead_letter_verdict(reason: &str, age_s: f64) -> Option<&'static str> {
+    if !reason_is_reapable(reason) {
+        return None;
+    }
+    if age_s <= steer_dead_letter_s() {
+        return None;
+    }
     match reason {
-        "no-env-file" if age_s > steer_dead_letter_s() => Some("no-env-file"),
-        "archived" if age_s > steer_dead_letter_s() => Some("archived"),
+        "no-env-file" => Some("no-env-file"),
+        "archived" => Some("archived"),
         _ => None,
     }
+}
+
+/// Which block reasons the reaper will EVER act on, regardless of age.
+///
+/// Split out because the reaper is not the only consumer (AMUX-3814): the
+/// `queue.has_live_consumer` invariant reports a row as "PAST the dead-letter
+/// deadline and the reaper did not reap it", and it was computing reapability
+/// on its own by treating every reason except `not-running` as permanent. That
+/// swept in `rate-limited`, which the reaper deliberately never reaps, so the
+/// invariant went red for 56 evaluations over 8 days on a lane doing exactly
+/// what it should — waiting out a limit that lifts by itself.
+///
+/// That is ethos rule 1, and this function's own docstring had already named
+/// the shape: AMUX-3473 fixed the same view/predicate split for a different
+/// reason and enumerated rather than shared, so the next reason re-broke it.
+/// One list, two consumers.
+///
+/// PERMANENT ONLY. `not-running` cannot be told from a 6.5h outage by age (the
+/// 2026-08-19 panic: 41 registered lanes down, every queued row delivered on
+/// restart), and `rate-limited` lifts on a clock Claude publishes in its own
+/// banner (AMUX-3815).
+pub(crate) fn reason_is_reapable(reason: &str) -> bool {
+    matches!(reason, "no-env-file" | "archived")
 }
 
 /// THE DELIVERY DECISION (AMUX-2642). Pure, so the case that matters — a lane

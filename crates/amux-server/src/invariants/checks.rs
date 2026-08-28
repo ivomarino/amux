@@ -781,11 +781,18 @@ pub fn queue_has_live_consumer(
             continue;
         }
         match it.block_reason.as_deref() {
-            // A registered-but-stopped lane KEEPS its queue by design (the
-            // 08-19 panic lesson above); the sender was told "queued" at send
-            // time. Not a failure — a failing invariant on a deliberate state
-            // is the AF-132 shape.
-            Some("not-running") => {
+            // A reason the reaper will NEVER act on. Waiting is the design, so
+            // there is no deadline to be past and nothing for the reaper to
+            // have failed at (AMUX-3814).
+            //
+            // This arm exists because the one below claimed the reaper had
+            // failed on `rate-limited` rows, which the reaper deliberately
+            // never reaps: 56 failing evaluations over 8 days on a lane doing
+            // exactly the right thing. `not-running` used to be special-cased
+            // here by name and is now covered by the same predicate the reaper
+            // uses, so the next reason cannot re-break it the way AMUX-3473's
+            // enumerate-don't-share fix let this one through.
+            Some(reason) if !crate::api::session_verbs::reason_is_reapable(reason) => {
                 out.push(InvariantResult::pass(ID).entity(&it.target));
             }
             // no-env-file / archived: the dead-letter reaper OWNS this row's
@@ -3212,6 +3219,40 @@ mod negative_controls {
             rs.iter().all(|r| r.status == Status::Pass),
             "a stopped-but-registered lane keeps its queue deliberately: {rs:?}"
         );
+
+        // AMUX-3814: rate-limited is the reason AMUX-3473's fix did not
+        // enumerate, so this check claimed "the reaper did not reap it" about
+        // rows the reaper deliberately never reaps — 56 failing evaluations
+        // over 8 days on a lane doing exactly the right thing, waiting out a
+        // limit that lifts by itself.
+        //
+        // THE PREDICATE IS NOW SHARED, so the loop below is over the reaper's
+        // own answer rather than a list copied here. A new non-reapable reason
+        // added to `reason_is_reapable` cannot re-break this the way
+        // `rate-limited` did.
+        for reason in ["rate-limited", "not-running"] {
+            assert!(
+                !crate::api::session_verbs::reason_is_reapable(reason),
+                "{reason} must not be reapable, or this cell proves nothing"
+            );
+            let rs = queue_has_live_consumer(&[mk(reason, 0.0)], 7_560.0, 300.0, 3_600.0);
+            assert!(
+                rs.iter().all(|r| r.status == Status::Pass),
+                "{reason} waits by design at any age, so there is no deadline to be past: {rs:?}"
+            );
+        }
+        // THE CONTROL, restated against the shared predicate: the reasons the
+        // reaper DOES act on must still fail past the deadline. A version that
+        // passed everything would satisfy every assertion above and delete the
+        // wedge detection this invariant exists for.
+        for reason in ["no-env-file", "archived"] {
+            assert!(crate::api::session_verbs::reason_is_reapable(reason), "{reason} is reapable");
+            let rs = queue_has_live_consumer(&[mk(reason, 0.0)], 7_560.0, 300.0, 3_600.0);
+            assert!(
+                rs.iter().any(|r| r.status == Status::Fail),
+                "{reason} past the deadline is a wedged reaper and must still fail: {rs:?}"
+            );
+        }
     }
 
     /// AMUX-3084 / AMUX-3111: a target that is not a live consumer at all (its
