@@ -324,6 +324,32 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
 }
 
 #[cfg(test)]
+mod launch_latency_tests {
+    /// AMUX-3832: `profile/create` with a `url` spawns a HEADED Chrome and
+    /// waits for CDP. Seconds is the work, not a fault — its entire purpose is
+    /// opening a window for a human to sign in. A flat 10s threshold filed one
+    /// such request at 10.5s under 1.09x host load.
+    ///
+    /// Same seam as AMUX-3818, and the same rule: PER REQUEST, not per route.
+    #[test]
+    fn only_a_create_the_launch_dominated_declares_itself_slow() {
+        use crate::api::dominated_by_external;
+        // The filed specimen: 10.5s, essentially all of it Chrome starting.
+        assert!(dominated_by_external(10_489, 10_300));
+
+        // CONTROL 1 — a create with NO url launches nothing, so launch_ms is 0
+        // and it can never qualify however slow it is. If profile creation
+        // itself starts taking ten seconds, that is amux and must file.
+        assert!(!dominated_by_external(10_489, 0), "no launch means no excuse");
+
+        // CONTROL 2 — a fast launch inside a slow request leaves time that is
+        // amux's own. Without this the declaration is a route exemption wearing
+        // a per-request header.
+        assert!(!dominated_by_external(11_000, 200));
+    }
+}
+
+#[cfg(test)]
 mod idle_takeover_tests {
     /// The auto-takeover predicate, as a table (Ethan, 2026-08-28).
     ///
@@ -1016,6 +1042,7 @@ struct CreateBody {
 }
 
 async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Response {
+    let started = std::time::Instant::now();
     let name = body.name.trim().to_string();
     if name.is_empty()
         || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -1040,9 +1067,17 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
     // human can log in" — same intent as the Python create flow.
     let mut launched = false;
     let mut launch_error = Value::Null;
+    // TIME THE LAUNCH SEPARATELY FROM THE REQUEST (AMUX-3832, the AMUX-3818
+    // pattern). With a `url` this endpoint's work IS spawning a HEADED Chrome
+    // and waiting for CDP — seconds, by construction, since its entire purpose
+    // is opening a window for a human to sign in. A flat 10s threshold files
+    // that as a defect: one such request was reported at 10.5s under 1.09x host
+    // load, which is the work, not a fault.
+    let mut launch_ms: u128 = 0;
     if !body.url.trim().is_empty() {
         let session = resolve_session(body.session.as_deref(), &headers);
         let attrib = explicit_session(body.session.as_deref(), &headers);
+        let launch_started = std::time::Instant::now();
         match chrome::start(&home, &name, body.url.trim(), &session, attrib.as_deref().unwrap_or(""),
             // create-profile launches headfully by definition: its purpose is a
             // human logging in (AMUX-3508's headless is for REUSING the result).
@@ -1052,16 +1087,28 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
             Ok(_) => launched = true,
             Err(e) => launch_error = json!(e.to_string()),
         }
+        launch_ms = launch_started.elapsed().as_millis();
     }
-    Json(json!({
+    let body_v = Json(json!({
         "ok": true,
         "profile": name,
         "path": dir.display().to_string(),
         "launched": launched,
+        "launch_ms": launch_ms,
         "launch_error": launch_error,
         "note": "sign in through the opened window, then POST /api/browser/stop to flush the profile",
     }))
-    .into_response()
+    .into_response();
+    // Declare the wait as the LAUNCH's only when the launch dominated it. A
+    // create that took 11s around a 200ms launch is amux being slow and must
+    // still file — which is what keeps this a per-request declaration rather
+    // than a route exemption. A create with no `url` launches nothing, so
+    // `launch_ms` is 0 and it can never qualify.
+    let total_ms = started.elapsed().as_millis();
+    if crate::api::dominated_by_external(total_ms, launch_ms) {
+        return crate::api::slow_ok(body_v, &format!("chrome-launch {launch_ms}ms"));
+    }
+    body_v
 }
 
 async fn profile_delete(Path(name): Path<String>) -> Response {
@@ -1160,6 +1207,16 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
                 .unwrap_or(page.url);
             Json(json!({
                 "ok": true,
+                // WHICH SESSION'S BINDING THIS IS (AMUX-3834, tubescience).
+                // `resolve_session` falls back explicit-param -> X-Amux-Session
+                // -> "amux", silently. A caller who omits the header on ONE verb
+                // drives a different binding than their other calls and has no
+                // way to see it: tubescience spent a session on "screenshot and
+                // eval are on different targets" that was two SESSIONS, not two
+                // resolvers, and only found it by curling both ways side by
+                // side. Echoing the resolved name makes the next occurrence
+                // self-evident from a single response.
+                "session": session,
                 "backend": "native",
                 "path": path.display().to_string(),
                 "size": size,
