@@ -4709,8 +4709,20 @@ function _orchRenderPlan(d) {
     drop.textContent = bits.length ? '⚠ ' + bits.join(' · ') : '';
   }
   if (!_orchPlanData.length) {
-    if (summary) summary.textContent = 'No workers matched';
-    list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">The router did not find a worker for this command. Edit the wording above (Re-record → edit) and re-route, or start over.</div>';
+    // AN EMPTY PLAN AFTER A REFUSAL IS NOT "NOTHING MATCHED". Measured live:
+    // "delete the tubescience worker" produced an empty plan because the router
+    // understood it perfectly and declined, and this branch told the human the
+    // opposite — that it had not found a worker. Say which happened.
+    const ref = d.refused_verbs || [];
+    if (ref.length) {
+      if (summary) summary.textContent = 'Understood, and refused';
+      list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">amux will not take <b>'
+        + esc(ref.join(', ')) + '</b> from a spoken command &mdash; a misheard word is too cheap for an action that expensive. '
+        + 'Only <b>' + esc((d.verbs_available || []).join(', ')) + '</b> are voice-proposable; do this one by hand.</div>';
+    } else {
+      if (summary) summary.textContent = 'No workers matched';
+      list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">The router did not find a worker for this command. Edit the wording above (Re-record → edit) and re-route, or start over.</div>';
+    }
     if (sendBtn) sendBtn.style.display = 'none';
     return;
   }
@@ -8005,7 +8017,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.746';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.747';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

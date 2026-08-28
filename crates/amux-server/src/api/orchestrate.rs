@@ -94,9 +94,10 @@ fn build_prompt(roster: &[(String, Vec<String>, String)], transcript: &str) -> S
            Use `verb` only when the human is plainly asking for a lifecycle change \
            (\"start\", \"stop\", \"wake\").\n\
          - {} are the ONLY verbs available. Anything else — delete, archive, reset, \
-           clear, rename, deploy — is NOT yours to propose: send a message saying what \
-           is wanted instead, and let the human do it.\n\
-         - If nothing should be done, return an empty array.\n\n\
+           clear, rename, deploy — is NOT yours to propose. Do NOT silently skip it: \
+           emit {{\"action\":\"refused\",\"worker\":\"<name>\",\"verb\":\"<what they asked for>\"}} \
+           so the human is told you understood and declined, and can do it by hand.\n\
+         - Return an empty array ONLY when the command asked for nothing at all.\n\n\
          WORKERS:\n{roster_txt}\n\
          SPOKEN COMMAND:\n\"{transcript}\"\n\n\
          Return ONLY a JSON array, no prose and no markdown fence. Each entry is ONE of:\n\
@@ -306,6 +307,19 @@ fn validate_plan(
                     out.push(json!({"action":"board","worker":w,"title":title,"why":why}));
                 }
             }
+            // THE MODEL DECLINING IS A RESULT, NOT AN ABSENCE. Measured live:
+            // asked to "delete the tubescience worker", the router obeyed the
+            // allow-list and returned an EMPTY array — correct, and the UI
+            // rendered "No workers matched", which is the one thing that did
+            // not happen. The prompt now asks for this marker so a refusal
+            // reaches the human through the same field a validator-side
+            // refusal does.
+            "refused" => {
+                let verb = s("verb").to_lowercase();
+                if !verb.is_empty() {
+                    v.refused_verbs.push(verb);
+                }
+            }
             "verb" => {
                 let verb = s("verb").to_lowercase();
                 if verb.is_empty() {
@@ -436,6 +450,33 @@ mod tests {
             let mut v = Validation::default();
             assert_eq!(validate_plan(&arr, &names(), None, &mut v).len(), 1, "{good} must plan");
         }
+    }
+
+    /// A REFUSAL THE MODEL MAKES MUST REACH THE HUMAN (ethos rule 4).
+    ///
+    /// Measured live: asked to "delete the tubescience worker and archive the
+    /// backend one", the router obeyed the prompt's allow-list and returned an
+    /// empty array. Correct, and the UI rendered "No workers matched" — the one
+    /// thing that had not happened. The prompt now asks for a `refused` marker
+    /// so a model-side refusal lands in the same field a validator-side one
+    /// does, and an empty plan goes back to meaning what it says.
+    #[test]
+    fn a_refusal_the_model_makes_itself_is_reported_not_swallowed() {
+        let arr = json!([
+            {"action":"refused","worker":"amux","verb":"delete"},
+            {"action":"send","worker":"backend","message":"do the safe part"},
+        ]);
+        let mut v = Validation::default();
+        let out = validate_plan(&arr, &names(), None, &mut v);
+        assert_eq!(v.refused_verbs, vec!["delete"], "the refusal must survive to the response");
+        // CONTROL 1: a refusal is NOT a plan entry — it must never become
+        // something the human can tick and run.
+        assert_eq!(out.len(), 1, "only the send is runnable: {out:#?}");
+        assert_eq!(out[0]["action"], json!("send"));
+        // CONTROL 2: the prompt has to ask for the marker, or the model never
+        // emits one and this branch is dead code that tests green forever.
+        let p = build_prompt(&[("amux".into(), vec![], "d".into())], "delete amux");
+        assert!(p.contains("\"action\":\"refused\""), "the prompt must request it: {p}");
     }
 
     /// An UNREADABLE board is not a clean board (ethos rule 4).
