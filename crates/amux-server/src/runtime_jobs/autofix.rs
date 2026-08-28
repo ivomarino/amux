@@ -169,6 +169,22 @@ fn latency_min_samples() -> i64 {
 /// on these routes that IS wrong.
 const LONG_BY_DESIGN: &[(&str, f64)] = &[
     ("/api/files/mdai/run", 150_000.0),
+    // POST /api/browser/navigate (AMUX-3835). The duration is a REMOTE PAGE
+    // LOAD plus a settle, so the wait belongs to the site, not to amux. The
+    // budget is this endpoint's OWN bound, added up rather than guessed:
+    // `Page.navigate` is called with a 20s CDP timeout, the readyState settle
+    // deadline is 10s, and the trailing CAPTURE_JS eval is 10s
+    // (integrations/browser.rs `navigate_and_settle`). 40s is therefore the
+    // point past which the endpoint's own timeouts failed to bound the call —
+    // which is the one latency story on this route that IS wrong, and it stays
+    // detectable.
+    //
+    // Measured over 7 days: 106 requests, min 0ms, mean 1746ms, worst 12906ms,
+    // and exactly ONE past the 10s floor — the filing that produced this entry.
+    // So the flat threshold sits between this route's normal (1.7s) and its
+    // design bound (40s), which is the threshold-below-baseline defect the
+    // card's own closing line names.
+    ("/api/browser/navigate", 40_000.0),
     // GET /api/email/inbox (AMUX-3519, third filing in one day on the same
     // residual): a count=480 metadata fetch is quota-bound at ~12-15s — the
     // 8-wide concurrency sits deliberately under Gmail's 250 units/s budget
@@ -7557,6 +7573,42 @@ mod tests {
     /// timeout, so past it the number cannot be a big-but-legitimate fetch; it
     /// is a hung transport, and that is the one latency story on this route that
     /// is genuinely wrong.
+    /// AMUX-3835: a browser navigate is a REMOTE PAGE LOAD, so the flat 10s
+    /// outlier sits between this route's normal and its own design bound.
+    ///
+    /// Measured over 7 days: 106 requests, mean 1746ms, worst 12906ms, exactly
+    /// ONE past the floor — which filed a card. The budget is the endpoint's
+    /// own arithmetic (20s CDP navigate + 10s settle + 10s capture), not a
+    /// number picked to silence the filing.
+    ///
+    /// THE PAST-BUDGET CELL IS THE POINT. Past 40s the endpoint's own timeouts
+    /// failed to bound the call, and that is the one latency story on this
+    /// route that IS wrong — a budget that silenced everything would be an
+    /// exemption, not a threshold.
+    #[tokio::test]
+    async fn a_browser_navigate_is_judged_against_its_own_timeouts() {
+        let (st, _d) = state();
+        let now = unix_now();
+        for ms in [12_906.0, 9_772.0] {
+            log_row(&st, Row { ts: now - 500.0, method: "POST", path: "/api/browser/navigate", family: "/api/browser", status: 200, body: "", worker: "", ua: "curl/8", ms });
+        }
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        assert!(
+            !f.iter().any(|x| x.signature.contains("/api/browser/navigate")),
+            "a page load inside its own 40s bound is designed behaviour: {f:?}"
+        );
+
+        // PAST the budget: the navigate timeout failed to bound it, which is a
+        // real defect and must still file.
+        let (st2, _d2) = state();
+        log_row(&st2, Row { ts: now - 500.0, method: "POST", path: "/api/browser/navigate", family: "/api/browser", status: 200, body: "", worker: "", ua: "curl/8", ms: 41_000.0 });
+        let (f2, _) = detect_latency(&st2.store.read().unwrap(), now);
+        assert!(
+            f2.iter().any(|x| x.signature.contains("/api/browser/navigate")),
+            "past its own timeouts, a navigate is a hang and must file: {f2:?}"
+        );
+    }
+
     #[tokio::test]
     async fn the_gmail_backed_routes_share_a_budget_because_they_share_an_implementation() {
         let (st, _d) = state();
