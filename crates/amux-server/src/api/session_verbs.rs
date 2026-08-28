@@ -12161,42 +12161,7 @@ async fn post_dispatch(
                 None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "message": "tmux clear-history timed out"})),
             }
         }
-        "duplicate" => {
-            let new_name = body_str(body, "new_name").trim().to_string();
-            if new_name.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
-            }
-            let re = cached_re!(r"[^a-zA-Z0-9_-]");
-            let new_name = re.replace_all(&new_name, "-").into_owned();
-            let new_file = env_path(&new_name);
-            if new_file.exists() {
-                return jresp(StatusCode::CONFLICT, json!({"error": format!("session '{new_name}' already exists")}));
-            }
-            if std::fs::copy(env_path(name), &new_file).is_err() {
-                return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
-            }
-            let registered = match register_twin(state, name, &new_name) {
-                Ok(applied) => applied,
-                // FAIL WHOLE, NOT HALF. Leaving the copied env file behind after
-                // a failed insert would produce exactly the unregistered twin
-                // this code exists to prevent, and it would do so on the error
-                // path where nobody looks.
-                Err(e) => {
-                    let _ = std::fs::remove_file(&new_file);
-                    return jresp(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({"error": format!("could not register '{new_name}' in the worker store; the duplicate was rolled back rather than left invisible: {e}")}),
-                    );
-                }
-            };
-            j200(json!({
-                "ok": true,
-                "message": format!("duplicated as {new_name}"),
-                // Say which shape happened, so a caller can tell a registered
-                // twin from a plain env-file copy without going to the store.
-                "registered": registered,
-            }))
-        }
+        "duplicate" => duplicate_verb(state, name, body),
         "clone" => clone_post(state, name, body).await,
         "archive" => {
             if !session_destructive_allowed(state, headers) {
@@ -12854,6 +12819,52 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // credit-gate state (_session_auto_actions) — process state this origin
     // does not hold; named gap.
     jresp(code, resp)
+}
+
+/// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`
+/// route and the legacy `/api/sessions/{name}/duplicate` spelling run the SAME
+/// code instead of one being a re-implementation of the other (AF-288).
+///
+/// Extracted rather than copied for the reason #137 (@tsukimiya) made explicit
+/// about this verb: the rollback on a failed `register_twin` is what stops a
+/// duplicate existing as an env file the worker store cannot see. A second
+/// implementation of that ordering is a second place for it to be wrong, on the
+/// error path, where nobody looks.
+pub(crate) fn duplicate_verb(state: &AppState, name: &str, body: &Value) -> Response {
+    let new_name = body_str(body, "new_name").trim().to_string();
+    if new_name.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
+    }
+    let re = cached_re!(r"[^a-zA-Z0-9_-]");
+    let new_name = re.replace_all(&new_name, "-").into_owned();
+    let new_file = env_path(&new_name);
+    if new_file.exists() {
+        return jresp(StatusCode::CONFLICT, json!({"error": format!("session '{new_name}' already exists")}));
+    }
+    if std::fs::copy(env_path(name), &new_file).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
+    }
+    let registered = match register_twin(state, name, &new_name) {
+        Ok(applied) => applied,
+        // FAIL WHOLE, NOT HALF. Leaving the copied env file behind after
+        // a failed insert would produce exactly the unregistered twin
+        // this code exists to prevent, and it would do so on the error
+        // path where nobody looks.
+        Err(e) => {
+            let _ = std::fs::remove_file(&new_file);
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("could not register '{new_name}' in the worker store; the duplicate was rolled back rather than left invisible: {e}")}),
+            );
+        }
+    };
+    j200(json!({
+        "ok": true,
+        "message": format!("duplicated as {new_name}"),
+        // Say which shape happened, so a caller can tell a registered
+        // twin from a plain env-file copy without going to the store.
+        "registered": registered,
+    }))
 }
 
 /// Give a copied session its own `_amux_workers` row, when the source has one.

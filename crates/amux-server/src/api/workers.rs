@@ -58,6 +58,15 @@ pub fn routes() -> Router<AppState> {
             "/{id}/send",
             post(send_worker).layer(axum::extract::DefaultBodyLimit::disable()),
         )
+        // AF-288, first of the nine RESOURCE verbs AF-203 classified. Promoted
+        // now rather than with the rest because its precondition was the one
+        // that had to land first: #137 (@tsukimiya) showed that exempting
+        // `duplicate` is exactly what makes an unregistered twin reachable, so
+        // the route had to wait on `register_twin`. That is settled (AF-236),
+        // and the handler delegates to the SAME `duplicate_verb` the catch-all
+        // runs, so the rollback-on-failed-registration has one implementation
+        // rather than two.
+        .route("/{id}/duplicate", post(duplicate_worker))
 }
 
 /// `GET /api/ollama/models` — list locally installed Ollama models by running
@@ -694,6 +703,40 @@ enum StepOutcome {
 /// process spawn is the orchestrator's job (RR-0041) and lands there — this
 /// endpoint accepts the request, it does not pretend the process exists.
 pub async fn start_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    // Host admission check BEFORE any state is written (AMUX-3396 follow-through).
+    //
+    // amux published memory pressure on /health for nine days and never acted on
+    // it. The 2026-08-24 JetsamEvent names the top holders at kill time and they
+    // are Claude Code binaries — amux's own lanes — and three WindowServer
+    // watchdog kills followed in a week. Refusing here is the cheap half: it does
+    // not fix Apple's TCC deadlock, it stops amux being the reason the machine is
+    // too starved to service it inside the watchdog's 40-second budget.
+    //
+    // Deliberately a REFUSAL and not a kill. Draining someone's in-flight lane is
+    // a decision about a human's work (ethos rule 8); declining to start a NEW one
+    // costs nobody anything they had.
+    if crate::api::health::admission() == crate::api::health::Admission::Deny {
+        let m = crate::api::health::mem_health();
+        tracing::warn!(
+            worker = %key,
+            pressure = m.pressure,
+            swap_used_mb = m.swap_used_mb,
+            "REFUSED to start worker — the host is out of memory headroom. amux lanes were \
+             the top holders in the 2026-08-24 jetsam, and starvation is what turns the \
+             recurring WindowServer/tccd stall into a watchdog kill. Nothing was stopped; \
+             this only declines to start MORE (AMUX-3396)"
+        );
+        return err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            json!({
+                "error": "host is out of memory headroom — refusing to start another worker",
+                "pressure": m.pressure,
+                "swap_used_mb": m.swap_used_mb,
+                "hint": "nothing was stopped. Free memory or stop a lane, then retry. \
+                         Threshold: AMUX_MEM_SWAP_DENY_MB (default 8192).",
+            }),
+        );
+    }
     let slot: Arc<Mutex<Option<StepOutcome>>> = Arc::new(Mutex::new(None));
     let slot_w = slot.clone();
     let key_w = key.clone();
@@ -1057,6 +1100,37 @@ pub async fn send_worker(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
     crate::api::session_verbs::send_verb(&state, &resolved, &headers, &body).await
+}
+
+/// `POST /api/workers/{id}/duplicate` — copy a worker's env file and register
+/// the twin in the worker store, or roll the copy back if it cannot.
+///
+/// Resolves the path key through the store exactly as `send_worker` does, so
+/// `/api/workers/{id}` accepts a worker id or its display name and the verb
+/// addresses the same worker either spelling reaches.
+pub async fn duplicate_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let store = state.store.clone();
+    let k = key.clone();
+    let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let conn = store.read()?;
+        Ok(queries::get_worker(&conn, &k)?)
+    })
+    .await;
+    let resolved = match joined {
+        Ok(Ok(Some(row))) if !row.display_name.is_empty() => row.display_name,
+        Ok(Ok(_)) => key,
+        Ok(Err(e)) => return internal(e),
+        Err(e) => return internal(e),
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::duplicate_verb(&state, &resolved, &body)
 }
 
 #[cfg(test)]
@@ -1871,4 +1945,65 @@ mod tests {
         assert_eq!(st, StatusCode::BAD_GATEWAY, "{body}");
         assert!(body["error"].as_str().unwrap().contains("socket timeout"));
     }
+
+    /// AF-288: the promoted `duplicate` route resolves a worker ID, and the
+    /// twin it creates is registered in the store rather than left as a bare
+    /// env file.
+    ///
+    /// THE DEFECT THIS FAILS ON is the one `send` had: without a real
+    /// `/{id}/duplicate` route this falls to the catch-all
+    /// `/api/workers/{name}/{*verb}`, which addresses the fleet substrate BY
+    /// NAME. The ulid reaches `env_path(<id>)` verbatim, matches nothing, and
+    /// answers `session '<id>' not found`. So a caller holding the only handle
+    /// a rename does not move cannot duplicate with it.
+    ///
+    /// The `registered` flag is asserted, not just the 200, because that is the
+    /// half #137 was about: a copy that succeeds while the store insert fails
+    /// is precisely the invisible twin, and a 200 alone cannot tell the two
+    /// apart.
+    #[tokio::test]
+    async fn duplicate_route_resolves_a_worker_id_and_registers_the_twin() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+        let id = create(&app, "twinsrc").await;
+        // `duplicate` copies the source's env file, so the fixture needs one;
+        // without it the verb answers "copy failed" before it ever reaches the
+        // registration this test is about.
+        std::fs::write(home.path().join("sessions/twinsrc.env"), "CC_TAGS=\"x\"\n").unwrap();
+
+        let (st, _, v) = send(
+            &app,
+            "POST",
+            &format!("/api/workers/{id}/duplicate"),
+            Some(json!({ "new_name": "twindst" })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "promoted duplicate route must answer: {v}");
+        assert_eq!(
+            v["registered"],
+            json!(true),
+            "the twin must be registered in the worker store, not left as an env file \
+             /api/workers cannot see (#137): {v}"
+        );
+
+        let (st, _, list) = send(&app, "GET", "/api/workers", None).await;
+        assert_eq!(st, StatusCode::OK, "{list}");
+        // `{"items":[...]}`, not a bare array — asserted against the shape the
+        // live endpoint returns rather than the one that reads naturally.
+        let names: Vec<String> = list["items"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter_map(|w| w["display_name"].as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            names.iter().any(|n| n == "twindst"),
+            "the duplicate must be visible to /api/workers; got {names:?}"
+        );
+    }
+
 }
