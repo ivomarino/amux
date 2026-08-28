@@ -21,11 +21,16 @@ pub fn routes() -> Router<AppState> {
         .route("/api/debug/invariants", axum::routing::get(debug))
 }
 
-/// GET /api/health/invariants — rollup + counts + freshness.
+/// GET /api/health/invariants — rollup + counts + producer liveness.
 ///
-/// Evaluates FRESH rather than replaying the last stored pass: a health
-/// endpoint that can only report the previous poll cannot answer "is it broken
-/// right now", which is the only question worth asking it.
+/// Serves the monitor's STORED results plus the PRODUCER'S liveness (AMUX-3841),
+/// not a per-call re-evaluation. Re-evaluating all 527 invariants cost 2.5-3.9s
+/// and varied 0.75-12.4s here, so the endpoint's own latency could not tell a
+/// slow eval from a wedged one — it could not answer the question it exists to
+/// answer. The monitor already evaluates every TICK_SECS and stores; this reads
+/// that in ~16ms and reports whether the monitor is fresh, so stored green is
+/// never served as if current while the monitor that produced it is dead.
+/// `?live=1` forces a synchronous fresh pass for the caller that needs it.
 ///
 /// `?id=<invariant_id>` answers the OTHER question, which the rollup cannot
 /// (AF-55): "did check X run at all?" Passes are a bare count here — by design,
@@ -68,18 +73,7 @@ async fn health(
     let snap = crate::runtime_jobs::registry::snapshot()
         .into_iter()
         .find(|s| s.id == crate::runtime_jobs::registry::ids::INVARIANTS);
-    let facts = crate::runtime_jobs::registry::Facts {
-        spawned: snap.is_some(),
-        dead: snap.as_ref().map(|s| s.dead).unwrap_or(false),
-        disabled: snap.as_ref().map(|s| s.disabled_reason.is_some()).unwrap_or(false),
-        interval_s: snap.as_ref().and_then(|s| s.interval_s),
-        spawned_at: snap.as_ref().map(|s| s.spawned_at),
-        last_tick_at: snap.as_ref().and_then(|s| s.last_tick_at),
-        in_flight_since: snap.as_ref().and_then(|s| s.in_flight_since),
-        instrumented: snap.as_ref().map(|s| s.ticks > 0).unwrap_or(false),
-    };
-    let mon_state = crate::runtime_jobs::registry::classify(&facts, now);
-    let mon_fresh = matches!(mon_state, "ok" | "alive");
+    let (mon_state, mon_fresh) = monitor_liveness(snap.as_ref(), now);
 
     let latest = store::latest_per_invariant(&state.store).unwrap_or_default();
     let (mut pass, mut fail, mut unknown) = (0, 0, 0);
@@ -94,7 +88,7 @@ async fn health(
     let has_stored = !latest.is_empty();
     let confidence = stored_confidence(mon_fresh, has_stored, fail, unknown);
     let live = store::live_incidents(&state.store).unwrap_or_default();
-    let last_age = facts.last_tick_at.map(|t| ((now - t).max(0.0) * 10.0).round() / 10.0);
+    let last_age = snap.as_ref().and_then(|s| s.last_tick_at).map(|t| ((now - t).max(0.0) * 10.0).round() / 10.0);
 
     Json(json!({
         "source": "stored",
@@ -108,8 +102,8 @@ async fn health(
             "state": mon_state,             // ok|alive|stalled|hung|dead|not_spawned|disabled|starting
             "last_tick_age_s": last_age,    // null = never ticked; distinct from old (starting vs stalled)
             "ticks": snap.as_ref().map(|s| s.ticks).unwrap_or(0),
-            "cadence_s": facts.interval_s,
-            "stall_after_s": facts.interval_s
+            "cadence_s": snap.as_ref().and_then(|s| s.interval_s),
+            "stall_after_s": snap.as_ref().and_then(|s| s.interval_s)
                 .map(crate::runtime_jobs::registry::stall_after_s),
         },
         "checks": {"pass": pass, "fail": fail, "unknown": unknown, "total": latest.len()},
@@ -130,6 +124,32 @@ async fn health(
         })).collect::<Vec<_>>(),
     }))
     .into_response()
+}
+
+/// The monitor's liveness verdict and whether it is fresh enough to TRUST its
+/// stored results, from a registry snapshot. Takes the snapshot as a parameter
+/// (`None` = the monitor is not even registered) so the TRIP arm — the half that
+/// prevents serving hours-old green as fresh — has its own can-fail test, rather
+/// than only inheriting registry::classify's controls through the global
+/// snapshot() the handler reads. AMUX-3845: inheriting a control is not having
+/// one; a test that hands this a dead/stalled snapshot and asserts non-fresh is
+/// the deliberate trip neither peer could manufacture on a shared host.
+fn monitor_liveness(
+    snap: Option<&crate::runtime_jobs::registry::Snapshot>,
+    now: f64,
+) -> (&'static str, bool) {
+    let facts = crate::runtime_jobs::registry::Facts {
+        spawned: snap.is_some(),
+        dead: snap.map(|s| s.dead).unwrap_or(false),
+        disabled: snap.map(|s| s.disabled_reason.is_some()).unwrap_or(false),
+        interval_s: snap.and_then(|s| s.interval_s),
+        spawned_at: snap.map(|s| s.spawned_at),
+        last_tick_at: snap.and_then(|s| s.last_tick_at),
+        in_flight_since: snap.and_then(|s| s.in_flight_since),
+        instrumented: snap.map(|s| s.ticks > 0).unwrap_or(false),
+    };
+    let state = crate::runtime_jobs::registry::classify(&facts, now);
+    (state, matches!(state, "ok" | "alive"))
 }
 
 /// The verdict a reader trusts, from the four facts that decide it. A pure
@@ -283,8 +303,63 @@ async fn debug(State(state): State<AppState>) -> Response {
 
 #[cfg(test)]
 mod tests {
-    use super::{filtered_body, stored_confidence};
+    use super::{filtered_body, monitor_liveness, stored_confidence};
     use crate::invariants::InvariantResult;
+    use crate::runtime_jobs::registry::Snapshot;
+
+    fn snap(dead: bool, ticks: u64, last_tick_at: Option<f64>, spawned_at: f64) -> Snapshot {
+        Snapshot {
+            id: "invariants-monitor".into(),
+            kind: "loop",
+            interval_s: Some(30.0), // stall_after_s(30) = 90
+            spawned_at,
+            ticks,
+            last_tick_at,
+            last_tick_ms: None,
+            in_flight_since: None,
+            dead,
+            disabled_reason: None,
+        }
+    }
+
+    /// The TRIP arm, given its own can-fail test (AMUX-3845). It previously only
+    /// inherited registry::classify's controls through the global snapshot the
+    /// handler reads — inheriting a control is not having one. This injects the
+    /// snapshot directly and asserts the deliberate trip neither peer could
+    /// manufacture on a shared host: a monitor that is NOT running fresh is
+    /// reported not-fresh, and the whole chain then renders `unknown` even when
+    /// every stored check passed. The fresh control must stay fresh, or the arm
+    /// would fire on everything and catch nothing.
+    #[test]
+    fn a_dead_or_stalled_monitor_trips_not_fresh_and_never_renders_stored_green() {
+        let now = 1_000_000.0;
+        // Control: a live monitor that ticked 2s ago is fresh.
+        let (state, fresh) = monitor_liveness(Some(&snap(false, 18, Some(now - 2.0), now - 600.0)), now);
+        assert_eq!(state, "ok");
+        assert!(fresh, "a monitor ticking on cadence must read fresh (the control)");
+
+        // Trip 1 — DEAD: the driving task exited. Not fresh, whatever it stored.
+        let (state, fresh) = monitor_liveness(Some(&snap(true, 18, Some(now - 2.0), now - 600.0)), now);
+        assert_eq!(state, "dead");
+        assert!(!fresh);
+
+        // Trip 2 — STALLED: last tick is older than stall_after_s(30)=90s.
+        let (state, fresh) = monitor_liveness(Some(&snap(false, 18, Some(now - 200.0), now - 600.0)), now);
+        assert_eq!(state, "stalled");
+        assert!(!fresh);
+
+        // Trip 3 — NOT SPAWNED: no snapshot at all (the AMUX-2647 hours-lost shape).
+        let (state, fresh) = monitor_liveness(None, now);
+        assert_eq!(state, "not_spawned");
+        assert!(!fresh);
+
+        // The end-to-end consequence: a not-fresh monitor renders `unknown` even
+        // with an all-pass stored result. This is the exact bug the trip prevents
+        // — serving hours-old green as fresh — asserted, not observed.
+        assert_eq!(stored_confidence(fresh, true, 0, 0), "unknown");
+        // And the control chains through to a real verdict.
+        assert_eq!(stored_confidence(true, true, 0, 0), "healthy");
+    }
 
     /// The load-bearing rule of AMUX-3841, with the negative control that is the
     /// whole point: a monitor that is NOT running fresh must not let a stored
