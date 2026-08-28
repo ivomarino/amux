@@ -4442,6 +4442,47 @@ mod reviewer_renag_tests {
         );
     }
 
+    /// BOTH DIRECTIONS, against REAL card logs (amux-frustrations' suggestion).
+    ///
+    /// The two edges are complements and a synthetic log proves that only for
+    /// the shape I invented. These are the two specimens that actually fired
+    /// today, one per direction:
+    ///
+    /// - AF-203 (above): reviewer LEFT review. The new edge fires, the old one
+    ///   does not, because the card is no longer in `review`.
+    /// - AMUX-3057: card STAYS in review naming `ethan`, who is not a worker.
+    ///   The old edge fires (reviewer-unreachable); the new one must NOT, or a
+    ///   single card gets nudged by both.
+    ///
+    /// AMUX-3057's log is also the reason "is the newest line the reviewer's"
+    /// is the wrong test — its last eight lines are all `commit` rows.
+    #[test]
+    fn the_two_reviewer_edges_are_complements_on_real_logs() {
+        // AMUX-3057 as stored: in review, no actor line since, all commit rows.
+        const STUCK_IN_REVIEW: &str = "\
+`14:20` amux: doing -> review
+`09:46` commit f6a80ece — fix(build): say when the builder log cannot see the range
+`10:07` commit b64236e6 — fix(guard): the OUTDATED HOOK remedy names a path its audience can run";
+        assert!(
+            !reviewer_left_review(STUCK_IN_REVIEW, "ethan"),
+            "nobody left review — this card is the OTHER edge's, and firing both \
+             would nudge one card twice"
+        );
+        assert!(
+            !reviewer_acted_since_review(STUCK_IN_REVIEW, "ethan"),
+            "and the reviewer has not acted either, which is why it parked"
+        );
+        // THE CONTROL: the AF-203 shape must classify the opposite way on both
+        // predicates, or this test would pass against a pair that always
+        // answers false.
+        const LEFT_REVIEW: &str = "\
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars
+`14:52` amux: review -> doing";
+        assert!(reviewer_left_review(LEFT_REVIEW, "amux"));
+        assert!(reviewer_acted_since_review(LEFT_REVIEW, "amux"));
+    }
+
     /// A card still sitting IN review is the OTHER edge's business. Firing here
     /// too would double-nudge the reviewer for one card.
     #[test]
