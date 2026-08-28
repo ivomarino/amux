@@ -1814,6 +1814,45 @@ pub struct SessionPromptStats {
 ///   "filter that matches everything" trap.
 /// - `carded == 0`: one card proves the pipeline works for this lane; a low
 ///   ratio is a separate, quieter concern, not this outage.
+#[cfg(test)]
+mod capture_isolation_tests {
+    use super::*;
+
+    /// AMUX-3824: the check must not fire on a lane the mint deliberately skips.
+    ///
+    /// The mint's gate is `is_user && !skip_board && !session_is_isolated(..)`.
+    /// The monitor's loop replicated only the first, so an ISOLATED lane — a raw
+    /// agent with no session or URL to run `amux board`, whose prompts are left
+    /// off the board on purpose because a card there would name work nobody can
+    /// drive — read as a lane whose board leg had been silently dropped. `self`
+    /// failed it 67 times over 13 days while behaving exactly as specified.
+    ///
+    /// The exclusion itself lives in the monitor (it needs the session env that
+    /// this pure function deliberately does not read). What is pinned HERE is
+    /// the shape the monitor must feed it: an isolated lane must not reach this
+    /// function at all, and a NON-isolated lane with the same numbers must still
+    /// fail — otherwise the fix is a blanket mute rather than an exclusion.
+    #[test]
+    fn a_lane_with_uncarded_prompts_still_fails_when_it_is_not_isolated() {
+        let s = |session: &str| SessionPromptStats {
+            session: session.to_string(),
+            cardable: 3,
+            carded: 0,
+            span_s: 933,
+        };
+        // The specimen's exact numbers, for a lane the monitor DID pass through.
+        let rs = user_prompts_produce_cards(&[s("a-real-lane")], 3, 45);
+        assert_eq!(rs[0].status, Status::Fail, "a genuine dropped board leg must still fire");
+        assert!(rs[0].observed.contains("0 carded"), "{}", rs[0].observed);
+
+        // CONTROL: an isolated lane is filtered UPSTREAM, so this function never
+        // sees it. Passing an empty slice is what that looks like here, and it
+        // must PASS rather than produce a spurious entity-less failure.
+        let rs = user_prompts_produce_cards(&[], 3, 45);
+        assert!(rs.iter().all(|r| r.status == Status::Pass), "no stats is not a failure: {rs:?}");
+    }
+}
+
 pub fn user_prompts_produce_cards(
     stats: &[SessionPromptStats],
     min_cardable: i64,

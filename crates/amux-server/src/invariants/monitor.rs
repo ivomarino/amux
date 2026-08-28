@@ -422,6 +422,24 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         if session.is_empty() || amux_core::board::title_from_prompt(&text).is_none() {
             continue;
         }
+        // AN ISOLATED LANE IS NOT CARDED BY DESIGN (AMUX-3232, AMUX-3824).
+        //
+        // The mint's gate is `is_user && !skip_board && !session_is_isolated(..)`,
+        // and this loop replicated only the first. So a raw agent — which has no
+        // session or URL to run `amux board`, and whose prompts are deliberately
+        // left off the board because a card there would name work nobody can
+        // drive — read as a lane whose board leg had been "silently dropped".
+        //
+        // Measured: `self` (CC_ISOLATED=1, Ethan's personal notes lane) failed
+        // this check 67 times from 2026-08-15 to 2026-08-28 while behaving
+        // exactly as specified. A permanently-red check on deliberate behaviour
+        // is the AF-132 shape, and it trains people to skim the invariants page.
+        //
+        // Calls the MINT'S OWN predicate rather than re-reading CC_ISOLATED here,
+        // so the exclusion cannot drift from the rule it mirrors (ethos rule 1).
+        if crate::api::session_verbs::session_is_isolated(&session) {
+            continue;
+        }
         let e = map.entry(session).or_insert(Acc {
             cardable: 0,
             carded: 0,
