@@ -300,26 +300,61 @@ def main():
                 if a["session"] != b["session"]:
                     continue
                 if gap_s < 60 and sim > 0.98:
-                    # SAME SESSION OR IT IS NOT A DELIVERY DEFECT. Measured
-                    # 2026-08-23: ids 31157/31158 are the SAME text 12s apart to
-                    # nissan and autodesk — Ethan fanning one instruction to two
-                    # lanes, which is ordinary operation. This branch called it
-                    # "a DELIVERY defect, not frustration" and told the reader to
-                    # go check send_dedup, which is a confident wrong answer
-                    # about a bug that does not exist. A cross-session pair is
-                    # also NOT a `repeat` (he did not ask twice, he addressed two
-                    # workers), so it is skipped outright rather than falling
-                    # through to the repeat branch below.
-                    key = f"double-delivery:{a['id']}"
-                    f = findings[key]
-                    f["score"] = max(f["score"], 8)
-                    f["why"].append(
-                        f"IDENTICAL messages {gap_s:.0f}s apart (ids {a['id']}/{b['id']}) — "
-                        "this is a DELIVERY defect, not frustration: check send_dedup and "
-                        "cmd_history.delivery before reading anything into the wording"
-                    )
-                    f["msgs"] = [a, b]
-                    continue
+                    # THE COMPOSER'S PREFIX IS THE DISCRIMINATOR, and `normalize`
+                    # throws it away (AF-280, 2026-08-28).
+                    #
+                    # `[HH:MM AM/PM]` is stamped ONCE, at composition. So one
+                    # message delivered twice carries the SAME prefix on both
+                    # rows, while two separate submissions carry two different
+                    # ones. Stripping it is right for the repeat branch below --
+                    # the same complaint sent twice really does have two clock
+                    # times -- and it destroys the only evidence that separates
+                    # "amux delivered it twice" from "he sent it twice".
+                    #
+                    # Live specimen: ids 34324/34325 to refresh-house, 22s apart,
+                    # bodies identical, prefixes `[06:46 PM]` and `[06:47 PM]`.
+                    # Reported as a DELIVERY defect telling the reader to go check
+                    # send_dedup; both rows are `delivery=direct` and both
+                    # delivered, and the store has 4 send_dedup rows in total, so
+                    # the pointed-at evidence could not have settled it either.
+                    #
+                    # THIRD correction to this one branch (cross-session fan-out,
+                    # then the 31h pair one branch over, now this). Each time the
+                    # detector was confidently naming a bug that did not exist,
+                    # which is worse than silence because the reader acts on it.
+                    #
+                    # Differing prefixes fall THROUGH to the repeat branch rather
+                    # than being skipped: he did send the same thing twice to one
+                    # lane, which is a true and reportable fact -- it is just not
+                    # a delivery defect. A missing prefix on either side keeps the
+                    # old behaviour, because a prefix-less pair carries no
+                    # discriminator and a real double-delivery must still surface.
+                    _pa = TIME_PREFIX.match(a["text"] or "")
+                    _pb = TIME_PREFIX.match(b["text"] or "")
+                    _two_sends = bool(_pa and _pb) and _pa.group(0).strip() != _pb.group(0).strip()
+                    if _two_sends:
+                        pass  # -> repeat branch
+                    else:
+                        # SAME SESSION OR IT IS NOT A DELIVERY DEFECT. Measured
+                        # 2026-08-23: ids 31157/31158 are the SAME text 12s apart to
+                        # nissan and autodesk — Ethan fanning one instruction to two
+                        # lanes, which is ordinary operation. This branch called it
+                        # "a DELIVERY defect, not frustration" and told the reader to
+                        # go check send_dedup, which is a confident wrong answer
+                        # about a bug that does not exist. A cross-session pair is
+                        # also NOT a `repeat` (he did not ask twice, he addressed two
+                        # workers), so it is skipped outright rather than falling
+                        # through to the repeat branch below.
+                        key = f"double-delivery:{a['id']}"
+                        f = findings[key]
+                        f["score"] = max(f["score"], 8)
+                        f["why"].append(
+                            f"IDENTICAL messages {gap_s:.0f}s apart (ids {a['id']}/{b['id']}) — "
+                            "this is a DELIVERY defect, not frustration: check send_dedup and "
+                            "cmd_history.delivery before reading anything into the wording"
+                        )
+                        f["msgs"] = [a, b]
+                        continue
                 key = f"repeat:{a['id']}"
                 f = findings[key]
                 f["score"] = max(f["score"], 6 + int(sim * 4))

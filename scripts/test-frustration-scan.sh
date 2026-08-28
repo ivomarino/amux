@@ -94,6 +94,24 @@ rows = [
     # stripping everything passes cell I by scoring nothing.
     (18, "this still doesnt work and i said already you didnt fix it",
          "user", "jj", now - 140_000, "", "", "direct"),
+    # K: identical bodies 22s apart to ONE lane, but with DIFFERENT composer
+    # prefixes. The prefix is stamped once at composition, so two prefixes means
+    # two submissions -- he sent it twice. Live specimen 2026-08-27: ids
+    # 34324/34325 to refresh-house, reported as a DELIVERY defect pointing the
+    # reader at send_dedup, which holds 4 rows in total and could not have
+    # settled it. Both rows were delivery=direct and both delivered.
+    (19, "[06:46 PM] we got a couple responses from the lob check our inbox",
+         "user", "kk", now - 130_000, "", "", "direct"),
+    (20, "[06:47 PM] we got a couple responses from the lob check our inbox",
+         "user", "kk", now - 108_000, "", "", "direct"),
+    # L: identical bodies AND the SAME prefix, 8s apart, one lane -- one
+    # composition that reached the store twice, which is the real defect this
+    # branch exists for and must still fire. Without this, cell K passes by
+    # classifying nothing as a double-delivery.
+    (21, "[06:46 PM] we got a couple responses from the lob check our inbox",
+         "user", "ll", now - 100_000, "", "", "direct"),
+    (22, "[06:46 PM] we got a couple responses from the lob check our inbox",
+         "user", "ll", now -  92_000, "", "", "direct"),
 ]
 c.executemany("INSERT INTO cmd_history VALUES (?,?,?,?,?,?,?,?)", rows)
 c.commit()
@@ -232,6 +250,38 @@ sys.exit(0 if 18 in ids else 1)'; then
 else
   bad "J: marker detection is now inert — stripping went too far"
   echo "$OUT" | head -40 | sed 's/^/       /'
+fi
+
+
+# Cell K: differing composer prefixes -> NOT a double-delivery. It may be reported
+# as a repeat (he did send twice), but never as a delivery defect.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for f in d["findings"]:
+    ids={m["id"] for m in f["messages"]}
+    if ids & {19,20} and f["kind"]=="double-delivery":
+        sys.exit(1)
+sys.exit(0)'; then
+  ok "K: identical bodies with DIFFERENT composer prefixes are two sends, not a delivery defect"
+else
+  bad "K: a pair with different [HH:MM] prefixes was still called a DELIVERY defect"
+fi
+
+# Cell L: the SAME prefix on both rows is one composition delivered twice, and it
+# must STILL be classified double-delivery. Without this, cell K is satisfied by a
+# scanner that never classifies anything.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for f in d["findings"]:
+    ids={m["id"] for m in f["messages"]}
+    if ids & {21,22} and f["kind"]=="double-delivery":
+        sys.exit(0)
+sys.exit(1)'; then
+  ok "L: the SAME prefix twice IS still a double-delivery (cell K did not hollow it out)"
+else
+  bad "L: a genuine double-delivery (same prefix) was not classified"
 fi
 
 echo "frustration-scan cells: $PASS passed, $FAIL failed"
