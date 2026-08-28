@@ -4665,14 +4665,49 @@ async function _orchPlan() {
     list.innerHTML = '<div style="color:#f85149;padding:12px;">' + esc(e.message || 'error') + '</div>';
   }
 }
+// The plan is no longer send-only (AMUX-2984). An entry is a send, a board
+// action (create a card, or append a note to an existing one) or a lifecycle
+// verb. `action` is absent on entries from an older server, and that means
+// send — the shape this endpoint had for its first two weeks.
+//
+// Each type keeps ONE editable field, because the review step is where a
+// misheard word gets corrected and a field you cannot edit is a field you have
+// to reject and re-record.
+function _orchEditableOf(p) {
+  const a = p.action || 'send';
+  if (a === 'board') return p.card ? 'note' : 'title';
+  if (a === 'verb') return null;              // a verb has nothing to word
+  return 'message';
+}
+function _orchLabelOf(p) {
+  const a = p.action || 'send';
+  if (a === 'board') return p.card ? 'note on ' + p.card : 'new card';
+  if (a === 'verb') return p.verb;
+  return 'message';
+}
 function _orchRenderPlan(d) {
-  _orchPlanData = (d.plan || []).map((p, i) => ({ worker: p.worker, message: p.message, why: p.why || '', include: true, idx: i }));
+  _orchPlanData = (d.plan || []).map((p, i) => ({
+    action: p.action || 'send', worker: p.worker, message: p.message || '',
+    title: p.title || '', card: p.card || '', note: p.note || '', verb: p.verb || '',
+    why: p.why || '', include: true, idx: i,
+  }));
   const summary = document.getElementById('orch-plan-summary');
   const list = document.getElementById('orch-plan-list');
   const drop = document.getElementById('orch-plan-dropped');
   const sendBtn = document.getElementById('orch-send-btn');
-  if (drop) drop.textContent = (d.dropped_unknown_workers && d.dropped_unknown_workers.length)
-    ? '⚠ dropped unknown worker(s): ' + d.dropped_unknown_workers.join(', ') : '';
+  // EVERY DROPPED CLASS, SEPARATELY. A refused verb is amux declining something
+  // it understood; an unknown worker is a mis-hearing. Collapsing them would
+  // tell the reader something was discarded without telling them whether the
+  // command needs re-wording or was simply not allowed.
+  if (drop) {
+    const bits = [];
+    if ((d.dropped_unknown_workers || []).length) bits.push('unknown worker(s): ' + d.dropped_unknown_workers.join(', '));
+    if ((d.dropped_unknown_cards || []).length) bits.push('unknown card(s): ' + d.dropped_unknown_cards.join(', '));
+    if ((d.dropped_unknown_verbs || []).length) bits.push('not a verb: ' + d.dropped_unknown_verbs.join(', '));
+    if ((d.refused_verbs || []).length) bits.push('refused from voice: ' + d.refused_verbs.join(', ')
+      + ' (do these by hand; only ' + (d.verbs_available || []).join('/') + ' are voice-proposable)');
+    drop.textContent = bits.length ? '⚠ ' + bits.join(' · ') : '';
+  }
   if (!_orchPlanData.length) {
     if (summary) summary.textContent = 'No workers matched';
     list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">The router did not find a worker for this command. Edit the wording above (Re-record → edit) and re-route, or start over.</div>';
@@ -4680,14 +4715,17 @@ function _orchRenderPlan(d) {
     return;
   }
   if (sendBtn) sendBtn.style.display = '';
-  if (summary) summary.innerHTML = _orchPlanData.length + ' message' + (_orchPlanData.length === 1 ? '' : 's')
-    + ' &mdash; review, edit, then send' + (d.via ? ' <span style="color:var(--dim);font-size:0.7rem;">via ' + esc(d.via) + '</span>' : '');
-  list.innerHTML = _orchPlanData.map(p =>
-    '<div class="orch-plan-item" data-idx="' + p.idx + '">'
-    + '<div class="orch-plan-top"><label class="orch-plan-inc"><input type="checkbox" checked onchange="_orchToggleInc(' + p.idx + ',this.checked)"> <span class="orch-plan-worker">' + esc(p.worker) + '</span></label>'
-    + (p.why ? '<span class="orch-plan-why">' + esc(p.why) + '</span>' : '') + '</div>'
-    + '<textarea class="orch-plan-msg" rows="2" oninput="_orchEditMsg(' + p.idx + ',this.value)">' + esc(p.message) + '</textarea>'
-    + '</div>').join('');
+  if (summary) summary.innerHTML = _orchPlanData.length + ' action' + (_orchPlanData.length === 1 ? '' : 's')
+    + ' &mdash; review, edit, then run' + (d.via ? ' <span style="color:var(--dim);font-size:0.7rem;">via ' + esc(d.via) + '</span>' : '');
+  list.innerHTML = _orchPlanData.map(p => {
+    const f = _orchEditableOf(p);
+    return '<div class="orch-plan-item" data-idx="' + p.idx + '">'
+      + '<div class="orch-plan-top"><label class="orch-plan-inc"><input type="checkbox" checked onchange="_orchToggleInc(' + p.idx + ',this.checked)"> <span class="orch-plan-worker">' + esc(p.worker) + '</span></label>'
+      + '<span class="orch-plan-act">' + esc(_orchLabelOf(p)) + '</span>'
+      + (p.why ? '<span class="orch-plan-why">' + esc(p.why) + '</span>' : '') + '</div>'
+      + (f ? '<textarea class="orch-plan-msg" rows="2" oninput="_orchEditMsg(' + p.idx + ',this.value)">' + esc(p[f]) + '</textarea>' : '')
+      + '</div>';
+  }).join('');
   _orchUpdateSendBtn();
 }
 function _orchToggleInc(idx, on) {
@@ -4695,33 +4733,62 @@ function _orchToggleInc(idx, on) {
   document.querySelector('.orch-plan-item[data-idx="' + idx + '"]')?.classList.toggle('excluded', !on);
   _orchUpdateSendBtn();
 }
-function _orchEditMsg(idx, v) { const p = _orchPlanData.find(x => x.idx === idx); if (p) p.message = v; }
+function _orchEditMsg(idx, v) {
+  const p = _orchPlanData.find(x => x.idx === idx); if (!p) return;
+  const f = _orchEditableOf(p); if (f) p[f] = v;
+}
+// A verb has no text, so "has text" cannot be the readiness test any more —
+// that would silently exclude every verb from the count and the run.
+function _orchReady(p) {
+  const f = _orchEditableOf(p);
+  return p.include && (!f || (p[f] || '').trim() !== '');
+}
 function _orchUpdateSendBtn() {
-  const n = _orchPlanData.filter(p => p.include && p.message.trim()).length;
+  const n = _orchPlanData.filter(_orchReady).length;
   const b = document.getElementById('orch-send-btn');
-  if (b) { b.textContent = 'Send ' + n + ' message' + (n === 1 ? '' : 's'); b.disabled = n === 0; }
+  if (b) { b.textContent = 'Run ' + n + ' action' + (n === 1 ? '' : 's'); b.disabled = n === 0; }
+}
+// Each action goes through the endpoint that ALREADY owns it — send, board,
+// session verb. The orchestrator composes primitives; it does not grow a
+// private execution path, and every one of these carries the same attribution
+// and gates a human clicking the same button by hand would get.
+function _orchRequestFor(p) {
+  const w = encodeURIComponent(p.worker);
+  if (p.action === 'board' && p.card) {
+    return { url: API + '/api/board/' + encodeURIComponent(p.card), method: 'PATCH',
+             body: { desc_append: '`voice` ' + p.note } };
+  }
+  if (p.action === 'board') {
+    return { url: API + '/api/board', method: 'POST',
+             body: { title: p.title, session: p.worker, status: 'todo' } };
+  }
+  if (p.action === 'verb') {
+    return { url: API + '/api/sessions/' + w + '/' + encodeURIComponent(p.verb), method: 'POST', body: {} };
+  }
+  return { url: API + '/api/sessions/' + w + '/send', method: 'POST',
+           body: { text: p.message, record_history: true, deliver_now: true } };
 }
 async function _orchSendAll() {
-  const items = _orchPlanData.filter(p => p.include && p.message.trim());
+  const items = _orchPlanData.filter(_orchReady);
   if (!items.length) return;
-  const btn = document.getElementById('orch-send-btn'); if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  const btn = document.getElementById('orch-send-btn'); if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
   const results = [];
   for (const p of items) {
+    const label = p.worker + ' · ' + _orchLabelOf(p);
     try {
-      const r = await fetch(API + '/api/sessions/' + encodeURIComponent(p.worker) + '/send',
-        { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ text: p.message, record_history: true, deliver_now: true }) });
+      const q = _orchRequestFor(p);
+      const r = await fetch(q.url, { method: q.method, headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(q.body) });
       const d = await r.json().catch(() => ({}));
-      results.push({ worker: p.worker, ok: r.ok && d.ok !== false, msg: d.error || (typeof d.msg === 'string' ? d.msg : '') || (r.ok ? 'sent' : 'failed') });
-    } catch (e) { results.push({ worker: p.worker, ok: false, msg: e.message || 'error' }); }
+      results.push({ label, ok: r.ok && d.ok !== false, msg: d.error || (typeof d.msg === 'string' ? d.msg : '') || (r.ok ? 'done' : 'failed') });
+    } catch (e) { results.push({ label, ok: false, msg: e.message || 'error' }); }
   }
   const ok = results.filter(r => r.ok).length;
   _orchShowStep('');
   const res = document.getElementById('orch-result');
   if (res) {
     res.style.display = '';
-    res.innerHTML = '<div class="orch-label">Sent ' + ok + ' of ' + results.length + '</div>'
-      + results.map(r => '<div class="orch-res-row ' + (r.ok ? 'ok' : 'bad') + '">' + (r.ok ? '&#10003;' : '&#10007;') + ' <b>' + esc(r.worker) + '</b> <span style="color:var(--dim);">' + esc(r.msg) + '</span></div>').join('')
+    res.innerHTML = '<div class="orch-label">Ran ' + ok + ' of ' + results.length + '</div>'
+      + results.map(r => '<div class="orch-res-row ' + (r.ok ? 'ok' : 'bad') + '">' + (r.ok ? '&#10003;' : '&#10007;') + ' <b>' + esc(r.label) + '</b> <span style="color:var(--dim);">' + esc(r.msg) + '</span></div>').join('')
       + '<div class="orch-actions" style="margin-top:12px;"><button class="btn" onclick="_orchReset()">Orchestrate again</button><button class="btn primary" onclick="_orchClose()">Done</button></div>';
   }
 }
@@ -7938,7 +8005,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.745';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.746';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

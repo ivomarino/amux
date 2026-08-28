@@ -309,6 +309,13 @@
   .orch-plan-inc { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; cursor: pointer; }
   .orch-plan-worker { font-weight: 600; color: var(--accent); }
   .orch-plan-why { font-size: 0.7rem; color: var(--dim); text-align: right; }
+  /* WHICH ACTION this row is (AMUX-2984). The plan used to be send-only, so a
+     row needed no type; now a card, a message and a `stop` sit in one list and
+     the reader is approving all three from the same checkbox. `flex-shrink:0`
+     because at 375px the why-text is what should wrap, not the verb. */
+  .orch-plan-act { font-size: 0.68rem; color: var(--dim); background: var(--card);
+    border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px;
+    white-space: nowrap; flex-shrink: 0; }
   .orch-plan-msg { width: 100%; font-size: 0.85rem; padding: 6px 8px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--card); color: var(--text); font-family: inherit;
     box-sizing: border-box; resize: vertical; }
