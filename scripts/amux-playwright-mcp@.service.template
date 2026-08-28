@@ -1,0 +1,16 @@
+[Unit]
+Description=amux playwright MCP server (%i)
+Documentation=https://amux.dev/docs
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=$SCRIPT_DIR/scripts/amux-playwright-mcp.sh %i
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=amux-playwright-mcp-%i
+
+[Install]
+WantedBy=default.target
