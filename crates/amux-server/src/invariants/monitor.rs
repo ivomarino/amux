@@ -408,9 +408,31 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         .map(|it| it.flatten().collect())
         .unwrap_or_default()
     };
-    // Group per session over the mint's predicate. A prompt whose text yields no
+    // Group per session over AS MUCH of the mint's predicate as this table can
+    // express, which is not all of it (AMUX-3826). A prompt whose text yields no
     // title is not something the mint would card, so it is excluded from BOTH
     // numerator and denominator — the denominator is "prompts that SHOULD card".
+    //
+    // WHAT THIS CANNOT SEE, said plainly because the comment used to claim
+    // parity it did not have: the mint also requires `guard.is_empty()` and
+    // `sender.is_empty()`, and `cmd_history` HAS NEITHER COLUMN — they live on
+    // the steering_queue row. So this loop cannot reconstruct two of the mint's
+    // three conditions even in principle.
+    //
+    // MEASURED RATHER THAN ASSUMED (2026-08-28): over 7 days, 475 `type='user'`
+    // rows, of which 0 were auto-pickups, board-drive nudges, board notes or
+    // peer relays. Guarded and sender-carrying messages are typed `session` or
+    // `schedule`, never `user`, so the `type='user'` filter above is an
+    // empirical proxy for the two conditions this table cannot hold, and the
+    // divergence is currently zero rather than merely believed small.
+    //
+    // WHAT WOULD MAKE IT LIVE: `ctype` is a CALLER-PASSED parameter
+    // (session_verbs.rs:3533), not a value derived in one place. A future caller
+    // that records a guarded send as `user` would break the proxy silently, and
+    // this check would start counting prompts the mint correctly declines. The
+    // real fix if that happens is for the mint to RECORD ITS VERDICT — the
+    // `submit_verdict` column is the precedent — so this view reads the
+    // mechanism's own answer instead of reconstructing it.
     struct Acc {
         cardable: i64,
         carded: i64,
