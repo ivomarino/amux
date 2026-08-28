@@ -1087,7 +1087,82 @@ static INFERRED_WARNED: Mutex<Option<HashMap<String, f64>>> = Mutex::new(None);
 /// fleet-wide — the number was in a draft card before its author read the
 /// function. Returns None for a pure-read command; "redirect" when only the
 /// output redirection blocks.
+/// Drop heredoc BODIES before any shell tokenising (AMUX-3822).
+///
+/// A heredoc body is DATA, and this file's tokenisers treat the whole command
+/// string as shell. The cost is not hypothetical: `first_blocking_verb` splits
+/// on `(`, so a conventional-commit subject written through the form this
+/// repo's own CLAUDE.md prescribes —
+///
+/// ```text
+/// cat > /tmp/msg.txt <<'EOF'
+/// fix(board-drive): `done` is a resting place, not a debt
+/// EOF
+/// ```
+///
+/// — yields a segment beginning `fix`, and the `inferred-edit` WARN then
+/// reports `blocked_by=fix` as though it were a shell verb. Four of eight WARNs
+/// on 2026-08-28 were the reporter's own commit subjects (`fix`, `feat`,
+/// `test`). That field is the one the WARN's own text tells a reader to
+/// classify, so the instrument was answering with the reader's prose.
+///
+/// The opener LINE is kept — `cat > f <<'EOF'` is a real write and must still
+/// read as one. Only the body is dropped.
+///
+/// `<<<` is a herestring, not a heredoc: it has no body and no terminator, so
+/// treating it as one would swallow the rest of the command.
+fn strip_heredoc_bodies(cmd: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut lines = cmd.lines();
+    while let Some(line) = lines.next() {
+        out.push(line);
+        let Some(delim) = heredoc_delimiter(line) else { continue };
+        // Skip to the terminator. An UNTERMINATED heredoc consumes the rest,
+        // which is correct: everything after the opener is body.
+        for body in lines.by_ref() {
+            if body.trim() == delim {
+                break;
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// The delimiter word of a heredoc opener on this line, if any.
+fn heredoc_delimiter(line: &str) -> Option<String> {
+    let i = line.find("<<")?;
+    let rest = &line[i + 2..];
+    // `<<<` is a herestring.
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let (quote, rest) = match rest.chars().next() {
+        Some(q @ ('\'' | '"')) => (Some(q), &rest[1..]),
+        _ => (None, rest),
+    };
+    let end = match quote {
+        Some(q) => rest.find(q)?,
+        None => rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len()),
+    };
+    let d = &rest[..end];
+    (!d.is_empty()).then(|| d.to_string())
+}
+
+/// Is `verb` a token this file can actually classify as a READ? (AMUX-3822)
+///
+/// The `inferred-edit` WARN asks its reader to decide whether `blocked_by` is a
+/// READ verb — the case that means a reader was mistaken for a co-author. A
+/// token that is in neither vocabulary cannot support that judgement, and
+/// saying so is more useful than passing it through as though it were a verb.
+fn is_known_read_verb(verb: &str) -> bool {
+    READ_ONLY_VERBS.contains(&verb) || GIT_READ_SUBCMDS.contains(&verb)
+}
+
 fn first_blocking_verb(cmd: &str) -> Option<String> {
+    let cmd = strip_heredoc_bodies(cmd);
     for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
         let seg = seg.trim();
         if seg.is_empty() || seg.starts_with('#') {
@@ -1122,14 +1197,17 @@ fn first_blocking_verb(cmd: &str) -> Option<String> {
             return Some(verb);
         }
     }
-    if has_output_redirection(cmd) {
+    if has_output_redirection(&cmd) {
         return Some("redirect".into());
     }
     None
 }
 
 fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
-    let verb = cmd
+    // Same stripper as `first_blocking_verb` (AMUX-3822): this extractor had
+    // the identical defect and produced `verb=persona_tick.json`, a filename.
+    let cmd_shell = strip_heredoc_bodies(cmd);
+    let verb = cmd_shell
         .split(['|', ';', '&', '\n', '(', ')', '`'])
         .filter_map(|s| s.split_whitespace().next())
         .next()
@@ -1151,17 +1229,37 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
         }
         m.insert(key, now);
     }
+    // CLASSIFY IT HERE RATHER THAN ASKING THE READER TO (AMUX-3822). The old
+    // sentence told the reader to decide whether `blocked_by` was a READ verb.
+    // That is only answerable if the field holds a verb, and before the heredoc
+    // stripper above it often held the reporter's own commit subject — four of
+    // eight WARNs on 2026-08-28 read `fix`, `feat`, `test`. Handing someone a
+    // field they must interpret, when it can hold something uninterpretable, is
+    // the `['s]` shape from AMUX-3816.
+    //
+    // So the WARN now states the verdict it can support. `unknown` is a real
+    // third answer and must stay distinguishable from both others: it means the
+    // token is in neither vocabulary, so this row cannot be classified and is
+    // not evidence either way.
+    let verdict = if is_known_read_verb(&blocked_by) {
+        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
+         FALSE co-authorship. This is the specimen AMUX-2841 wants"
+    } else if blocked_by == "redirect" {
+        "output redirection — a write, the record working as designed"
+    } else {
+        "NOT a known read verb, and not classifiable from this token alone — treat as \
+         unmeasured rather than as a write (AMUX-3822)"
+    };
     tracing::warn!(
         target: "staged_guard",
-        "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} blocked_by={} — \
-         ownership INFERRED from a bash command, not a firsthand Edit/Write. A READ verb in \
-         blocked_by means is_pure_read_command missed a reader and may be minting false \
-         co-authorship; a WRITE verb there is the record working as designed (AF-126: the \
-         first segment's verb is usually `cd` and says nothing).",
+        "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} blocked_by={} \
+         verdict={} — ownership INFERRED from a bash command, not a firsthand Edit/Write. \
+         (AF-126: the first segment's verb is usually `cd` and says nothing.)",
         if session.is_empty() { "(none)" } else { session },
         base,
         verb,
         blocked_by,
+        verdict,
     );
 }
 
@@ -3945,6 +4043,64 @@ mod tests {
     }
 
     /// AMUX-3128 RECURRED (gtm-ticker): a careful VERIFIER reads a digest with
+    /// AMUX-3822: a heredoc body is DATA, and tokenising it as shell made the
+    /// WARN report the reporter's own prose as a shell verb.
+    ///
+    /// THE SPECIMEN IS THIS REPO'S PRESCRIBED COMMIT FORM. CLAUDE.md tells
+    /// every lane to write commit messages with `git commit -F` and a heredoc,
+    /// and conventional-commit subjects are parenthesised by convention — so
+    /// `fix(board-drive): ...` split at the `(` and yielded `fix`. Four of the
+    /// eight `inferred-edit` WARNs on 2026-08-28 were commit subjects.
+    #[test]
+    fn a_heredoc_body_is_not_tokenised_as_shell() {
+        let cmd = "cat > /tmp/msg.txt <<'EOF'\n\
+                   fix(board-drive): `done` is a resting place, not a debt\n\
+                   feat(x): another line\n\
+                   EOF\n\
+                   git commit -F /tmp/msg.txt";
+        let stripped = strip_heredoc_bodies(cmd);
+        assert!(!stripped.contains("fix(board-drive)"), "body must be gone: {stripped}");
+        // THE OPENER SURVIVES. `cat > f <<EOF` is a real write and must still
+        // read as one — dropping the whole line would turn a write into a
+        // silent no-op, which is the opposite and worse failure.
+        assert!(stripped.contains("cat > /tmp/msg.txt"), "the opener is command: {stripped}");
+        assert!(stripped.contains("git commit"), "and so is everything after the terminator");
+        // The verb must no longer be a word from the message.
+        let v = first_blocking_verb(cmd).unwrap_or_default();
+        assert_ne!(v, "fix", "the commit subject is not a shell verb");
+        assert_ne!(v, "feat");
+
+        // CONTROLS.
+        // 1. A herestring has no body; treating it as a heredoc would swallow
+        //    the rest of the command and hide real writes.
+        let hs = "grep -q x <<< \"$VAR\"\ncat > f.md";
+        assert!(strip_heredoc_bodies(hs).contains("cat > f.md"), "`<<<` is not a heredoc");
+        // 2. Quoted, unquoted and dash forms all parse.
+        assert_eq!(heredoc_delimiter("cat <<'PY'").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<\"PY\"").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<PY").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<-PY").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<< x"), None);
+        assert_eq!(heredoc_delimiter("echo hello"), None);
+        // 3. A command with NO heredoc must be unchanged, or the stripper is
+        //    silently rewriting every command it sees.
+        let plain = "cd /repo && python3 -c 'open(\"x\",\"w\")'";
+        assert_eq!(strip_heredoc_bodies(plain), plain);
+    }
+
+    /// The WARN must state the verdict it can support, not hand the reader a
+    /// token to classify (AMUX-3822). `unknown` is a real third answer.
+    #[test]
+    fn the_read_verb_vocabulary_separates_classifiable_from_unmeasured() {
+        assert!(is_known_read_verb("cat"), "a read verb is the specimen case");
+        assert!(is_known_read_verb("blame"), "git read subcommands count too");
+        // THE CONTROLS: neither a write verb nor a commit-subject word may
+        // classify as a read, or the WARN would name the wrong verdict.
+        assert!(!is_known_read_verb("fix"), "a commit subject word is not a verb");
+        assert!(!is_known_read_verb("feat"));
+        assert!(!is_known_read_verb("cp"), "a write verb is not a read verb");
+    }
+
     /// `git show` / `git log --stat` / `git diff` / `git grep` / `git blame`, whose
     /// verb is `git` (absent from READ_ONLY_VERBS), so each minted an inferred edit
     /// and flagged the reader as co-author — blocking the committer and PUNISHING
