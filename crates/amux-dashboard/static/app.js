@@ -8017,7 +8017,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.747';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.748';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -15603,22 +15603,33 @@ let _filesShowHidden = true;
 
 async function openInFinder() {
   const path = _filesPath || '/';
-  // If accessing remote server, construct smb:// or sftp:// URL for Finder
-  const isRemote = location.hostname !== 'localhost' && location.hostname !== '127.0.0.1' && !location.hostname.endsWith('.local');
-  if (isRemote) {
-    // Open as SFTP remote folder in Finder via sftp:// URL scheme
-    const host = location.hostname;
-    const url = 'sftp://' + host + path;
-    window.open(url, '_blank');
-    showToast('Opening remote folder: ' + host + ':' + path);
-    return;
-  }
+  // THE CLIENT CANNOT KNOW IF IT IS LOCAL, SO IT NO LONGER GUESSES (AF-282).
+  //
+  // This used to test `location.hostname` against localhost/127.0.0.1/.local and
+  // treat everything else as remote, emitting `sftp://<host><path>`. Reaching
+  // your own desktop by its Tailscale name is none of those three, so a LOCAL
+  // machine took the remote branch: Chrome handed `sftp://` to whatever
+  // registered the scheme (VLC) and it failed with "Your input can't be opened".
+  // macOS Finder has no `sftp://` handler either, so the branch was broken for
+  // genuinely-remote too — it could not succeed in either case it split on.
+  //
+  // The server is the only party that can answer this: it compares the request's
+  // peer IP against the addresses the Host header resolves to. So we always ask,
+  // and render whatever it says. A 409 here is a real answer, not a failure.
   try {
     const r = await apiCall(API + '/api/fs/open', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ path })
     });
-    if (r) showToast('Opened in Finder');
+    if (r && r.ok) { showToast('Opened in Finder'); return; }
+    if (r && r.local === false) {
+      // Remote browser: the folder lives on the server's machine. Say so and
+      // leave the path where it can be copied, rather than reporting a success
+      // the user would never see.
+      showToast('That folder is on the amux server, not this machine — ' + (r.path || path));
+      return;
+    }
+    showToast((r && r.error) ? r.error : 'Failed to open folder');
   } catch(e) { showToast('Failed to open folder'); }
 }
 
