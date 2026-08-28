@@ -112,6 +112,14 @@ rows = [
          "user", "ll", now - 100_000, "", "", "direct"),
     (22, "[06:46 PM] we got a couple responses from the lob check our inbox",
          "user", "ll", now -  92_000, "", "", "direct"),
+    # M/N: delivery annotation (AF-281). Two QUEUED rows forming a repeat. This
+    # store has no steering_history, and the deliverer's record is the only
+    # thing that knows -- so the honest verdict is `unknown`, never `not
+    # delivered`. cmd_history.delivered_at is deliberately NOT stamped for
+    # queued rows (AMUX-3541), and one sweep read that NULL as loss and was a
+    # step from filing 92 lost messages.
+    (23, "did the nightly sync run", "user", "mm", now - 80_000, "", "", "queued"),
+    (24, "did the nightly sync run", "user", "mm", now - 70_000, "", "", "queued"),
 ]
 c.executemany("INSERT INTO cmd_history VALUES (?,?,?,?,?,?,?,?)", rows)
 c.commit()
@@ -282,6 +290,56 @@ sys.exit(1)'; then
   ok "L: the SAME prefix twice IS still a double-delivery (cell K did not hollow it out)"
 else
   bad "L: a genuine double-delivery (same prefix) was not classified"
+fi
+
+
+# Cell M: a `direct` send is annotated delivered, computed rather than looked up
+# by hand. Two sweeps checked this one message at a time through the HTTP API
+# before daring to call a repeat ordinary.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for f in d["findings"]:
+    for m in f["messages"]:
+        if m["id"] in (7,8):
+            if m.get("delivered") != "delivered": sys.exit(1)
+sys.exit(0)'; then
+  ok "M: a direct send is annotated delivered, without a per-message HTTP lookup"
+else
+  bad "M: a direct send was not annotated delivered"
+fi
+
+# Cell N: THE CONTROL, and the one that matters. A queued row with no
+# steering_history must read `unknown`, not `not delivered` — absence of the
+# deliverer's record is not evidence of loss. Without this, an annotator that
+# defaulted to "not delivered" would pass cell M and report every queued
+# message in a synthetic store as lost.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+seen=False
+for f in d["findings"]:
+    for m in f["messages"]:
+        if m["id"] in (23,24):
+            seen=True
+            if m.get("delivered") != "unknown": sys.exit(1)
+sys.exit(0 if seen else 1)'; then
+  ok "N: a queued row with no steering_history reads unknown, NOT 'not delivered'"
+else
+  bad "N: a queued row was not reported as unknown (absence read as loss)"
+fi
+
+# Cell O: the scan must PUBLISH what it structurally cannot answer, in the same
+# payload as the findings. A caveat that lives only in a sweep's prose has to be
+# remembered; two sweeps in a row had to add it by hand.
+if echo "$OUT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+cd=" ".join(d.get("cannot_discriminate") or [])
+sys.exit(0 if "ANSWERED" in cd else 1)'; then
+  ok "O: the scan publishes that reply-status is not knowable, beside the findings"
+else
+  bad "O: cannot_discriminate does not name the reply-status gap"
 fi
 
 echo "frustration-scan cells: $PASS passed, $FAIL failed"

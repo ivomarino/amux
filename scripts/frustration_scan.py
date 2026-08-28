@@ -212,6 +212,64 @@ def similarity(a, b):
     return len(A & B) / len(A | B)
 
 
+
+# ---- DELIVERY IS COMPUTABLE; "WAS IT ANSWERED" IS NOT (AF-281) -------------
+#
+# Two consecutive sweeps hand-checked delivery one message at a time through
+# `GET /api/history/<id>` before daring to call a `repeat` ordinary -- four
+# lookups on 2026-08-28 alone. That is the model doing arithmetic (ethos rule
+# 2), and worse, it made the CHEAP question look as expensive as the one that
+# genuinely cannot be answered, so both got the same shrug in the write-up.
+#
+# The verdict logic is AF-267's, and its three states matter: `cmd_history`
+# alone CANNOT answer this. AMUX-3541 deliberately stopped stamping
+# `delivered_at` for queued rows, so a NULL there means "nobody writes here",
+# not "not delivered" -- one sweep read it the first way and was one step from
+# filing 92 lost messages. `steering_history` is stamped by the deliverer and
+# is the only thing that knows.
+#
+# The join is on SESSION and a +/-10s window around the timestamp, NEVER on
+# text: cmd_history keeps the "[08:19 AM] " prefix the composer adds and
+# steering_history does not, so a text match silently misses exactly the rows
+# that matter.
+def annotate_delivery(conn, msgs):
+    """Stamp each message with delivered / not delivered / unknown."""
+    have_steer = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='steering_history'"
+    ).fetchone() is not None
+    for m in msgs:
+        if (m.get("delivery") or "") == "direct":
+            m["delivered"] = "delivered"
+            m["delivered_why"] = "cmd_history - a direct send is delivered when it is recorded"
+            continue
+        if not have_steer:
+            # ABSENCE OF THE TABLE IS NOT ABSENCE OF DELIVERY. Saying "unknown"
+            # here is the whole point: a synthetic store has no steering_history
+            # and must not therefore report every message as undelivered.
+            m["delivered"] = "unknown"
+            m["delivered_why"] = "no steering_history in this store - the deliverer's record is absent"
+            continue
+        ts_s = (m["ts"] or 0) / 1000.0
+        row = conn.execute(
+            "SELECT delivered_at FROM steering_history "
+            "WHERE session = ? AND queued_at BETWEEN ? AND ? "
+            "ORDER BY ABS(queued_at - ?) LIMIT 1",
+            (m["session"], ts_s - 10, ts_s + 10, ts_s),
+        ).fetchone()
+        if row is None:
+            m["delivered"] = "unknown"
+            m["delivered_why"] = (
+                "no matching steering_history row, and cmd_history.delivered_at is NOT "
+                "stamped for queued rows (AMUX-3541), so its NULL is not evidence either way"
+            )
+        elif row[0] is None:
+            m["delivered"] = "not delivered"
+            m["delivered_why"] = "steering_history - the deliverer holds this row and has not stamped it"
+        else:
+            m["delivered"] = "delivered"
+            m["delivered_why"] = "steering_history - stamped by the deliverer when it landed"
+
+
 def main():
     if not os.path.exists(DB):
         print(json.dumps({"error": f"no db at {DB}"}))
@@ -219,14 +277,14 @@ def main():
     cutoff_ms = int((time.time() - DAYS * 86400) * 1000)
     conn = sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
     rows = conn.execute(
-        "SELECT id, ts, COALESCE(session,''), text FROM cmd_history "
+        "SELECT id, ts, COALESCE(session,''), text, COALESCE(delivery,'') FROM cmd_history "
         "WHERE type='user' AND COALESCE(origin,'')='' AND ts >= ? "
         "AND COALESCE(text,'') <> '' ORDER BY ts ASC",
         (cutoff_ms,),
     ).fetchall()
 
     msgs = []
-    for mid, ts, sess, text in rows:
+    for mid, ts, sess, text, _delivery in rows:
         norm = normalize(text)
         # SHORT = NOT A REQUEST, which is a statement about the REPEAT branch and
         # was being applied to both (AF-224). Its own comment says "cannot be a
@@ -250,7 +308,7 @@ def main():
         # repeat branch (what the gate wanted) and kept for the re-prompt branch,
         # where the timing carries the meaning.
         if len(norm) < 8:
-            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
+            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery,
                          "norm": norm, "own": own_words(text), "control": True})
             continue
         # CONTROL WORDS ARE NOT REQUESTS. "continue" appeared six times in the
@@ -260,11 +318,13 @@ def main():
         # forever. They are still eligible for the re-prompt signal, where the
         # timing is what carries the meaning.
         if CONTROL.fullmatch(norm):
-            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
+            msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery,
                          "norm": norm, "own": own_words(text), "control": True})
             continue
-        msgs.append({"id": mid, "ts": ts, "session": sess, "text": text,
+        msgs.append({"id": mid, "ts": ts, "session": sess, "text": text, "delivery": _delivery,
                      "norm": norm, "own": own_words(text), "control": False})
+
+    annotate_delivery(conn, msgs)
 
     findings = defaultdict(lambda: {"score": 0, "why": [], "msgs": []})
 
@@ -420,6 +480,8 @@ def main():
                         "when": time.strftime("%m-%d %H:%M", time.localtime(m["ts"] / 1000)),
                         "session": m["session"],
                         "text": m["text"][:400],
+                        "delivered": m.get("delivered", "unknown"),
+                        "delivered_why": m.get("delivered_why", ""),
                     }
                     for m in f["msgs"]
                 ],
@@ -434,6 +496,23 @@ def main():
                 "candidates": len(out),
                 "shown": min(len(out), MAX_OUT),
                 "findings": out[:MAX_OUT],
+                # ETHOS RULE 4, IN THE PAYLOAD RATHER THAN IN A SWEEP WRITE-UP.
+                # Two sweeps in a row concluded a `repeat` was ordinary on the
+                # strength of "every message was delivered", and both had to add
+                # by hand that the axis which would ACTUALLY explain a repeat was
+                # never checked -- because it cannot be. A lane answers in its
+                # own pane; nothing server-side records that a message was
+                # answered, so "he asked again because nobody replied" and "he
+                # asked again having read the reply" are the same absence of
+                # data. Stating it here means the next sweep reads it instead of
+                # rediscovering it, and cannot report a clean repeat without
+                # seeing the caveat attached to the same object.
+                "cannot_discriminate": [
+                    "whether a lane ANSWERED a message. Replies land in the lane's pane and "
+                    "are not recorded server-side, so a `repeat` cannot distinguish 'no reply "
+                    "arrived' from 'a reply arrived and he asked anyway'. `delivered` below "
+                    "answers only whether the message REACHED the lane."
+                ],
                 "note": (
                     "CANDIDATES, not verdicts. Judge each one: is there an amux defect "
                     "under it, or was this ordinary iteration? An empty list is a real "
