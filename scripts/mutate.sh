@@ -30,7 +30,54 @@
 # Exit 0 on success, 1 if the target is absent or not unique.
 set -uo pipefail
 
-usage() { echo "usage: $0 <apply|revert> <file> <old-string> <new-string>" >&2; exit 2; }
+usage() {
+  echo "usage: $0 <apply|revert> <file> <old-string> <new-string>" >&2
+  echo "       $0 run <file> <old-string> <new-string> -- <command...>" >&2
+  exit 2
+}
+
+# ── `run`: APPLY, TEST, REVERT IN ONE PROCESS, WITH A TRAP (AF-284) ──────────
+#
+# `apply` and `revert` are two invocations, so the revert is conditional on the
+# CALLER surviving to make it. That is the half of the hazard this script did not
+# close, and it bit on 2026-08-28: amux-frustrations ran apply, then a
+# `cargo test` that hit a 10-minute tool timeout, and the revert on the next line
+# of the same shell block never ran. `or(Some(0))` sat in a peer's git_guard.rs
+# for ten minutes on the shared checkout. No commit took it, but only because
+# nobody ran `git add -A` in the window.
+#
+# The byte-scoped apply/revert this script already does bounds the BLAST RADIUS.
+# It cannot bound the DURATION, because a two-call API hands cleanup back to a
+# caller that may die. `run` keeps both calls in one process and reverts from a
+# trap, so a timeout, a Ctrl-C, a failing test or a `set -e` abort all restore.
+#
+# The command's exit status is preserved and returned, because the whole point is
+# to read the suite's colour under the mutation.
+if [[ "${1:-}" == "run" ]]; then
+  shift
+  [[ $# -ge 5 ]] || usage
+  file="$1"; old="$2"; new="$3"; shift 3
+  [[ "${1:-}" == "--" ]] || usage
+  shift
+  [[ -f "$file" ]] || { echo "mutate: no such file: $file" >&2; exit 1; }
+  self="${BASH_SOURCE[0]}"
+  "$self" apply "$file" "$old" "$new" || exit 1
+  # Armed only AFTER a successful apply: a trap set earlier would "revert" a
+  # mutation that never landed, and on a shared checkout that writes bytes
+  # nobody asked for.
+  # DISARM FIRST, THEN REVERT. A killed command fires TERM and then EXIT, so a
+  # naive trap reverts twice — and the second pass finds 0 occurrences and
+  # prints "NOT applied", which reads as a FAILED restore immediately after a
+  # successful one. The file was fine both times; only the message lied. That is
+  # the shape this repo keeps filing, so it does not ship in the tool that exists
+  # to prevent it.
+  trap 'trap - EXIT INT TERM; "$self" revert "$file" "$old" "$new" >&2' EXIT INT TERM
+  "$@"
+  rc=$?
+  echo "mutate run: command exited $rc; reverting" >&2
+  exit "$rc"
+fi
+
 [[ $# -eq 4 ]] || usage
 op="$1"; file="$2"; old="$3"; new="$4"
 [[ -f "$file" ]] || { echo "mutate: no such file: $file" >&2; exit 1; }
