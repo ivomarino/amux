@@ -14,7 +14,7 @@ After=network-online.target
 # ends up trying to (re)start a unit that's already being restarted. The
 # timer is the only thing that should be starting this.
 Type=oneshot
-ExecStart=$SCRIPT_DIR/rust-auto-build.sh
+ExecStart=$SCRIPT_DIR/scripts/rust-auto-build.sh
 Environment="CARGO_TARGET_DIR=$HOME/.amux/rust-build-target"
 WorkingDirectory=$SCRIPT_DIR
 StandardOutput=journal
