@@ -33,8 +33,22 @@ CHROMIUM_BIN="/usr/bin/chromium"
 EXEC_ARGS=()
 [ -x "$CHROMIUM_BIN" ] && EXEC_ARGS=(--executable-path "$CHROMIUM_BIN")
 
+# This box has a link-local-only IPv6 address on eth0 (no default route, no
+# global address) — enough for Cloudflare's Turnstile client-side capability
+# check to conclude the browser "has" IPv6 and route it to an AAAA-only
+# challenge host, which is then genuinely unreachable (confirmed 2026-08-28:
+# brunhild.challenges.cloudflare.com has no A record at all). --disable-ipv6
+# makes Chromium stop reporting IPv6 capability entirely, so Cloudflare falls
+# back to an IPv4-reachable challenge host like it would for a real
+# IPv4-only visitor. Passed via --config since --disable-ipv6 is a Chromium
+# flag, not a playwright-mcp CLI flag.
+CONFIG_FILE="$HOME/.amux/playwright-mcp-config.json"
+CONFIG_ARGS=()
+[ -f "$CONFIG_FILE" ] && CONFIG_ARGS=(--config "$CONFIG_FILE")
+
 exec npx -y @playwright/mcp@latest \
   --port "$PORT" \
   --user-data-dir "$PROFILE" \
   --host 0.0.0.0 \
-  "${EXEC_ARGS[@]}"
+  "${EXEC_ARGS[@]}" \
+  "${CONFIG_ARGS[@]}"
