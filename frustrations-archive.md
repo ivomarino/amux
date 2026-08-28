@@ -2288,3 +2288,65 @@ NOTE (2026-08-27, amux-frustrations — author). THE OBSERVABLE STILL HAS NOT DR
   Six versions of gate behaviour arriving mid-work is not a change I can spring on other
   lanes (ethos rule 8). Routed to amux, who owns git_guard.rs and the hooks, with the
   measurement and the exact command. STAYS OPEN.
+
+## SUPERSEDES the entry above: the guard's classifier was right, only its printed ADVICE was wrong
+SUPERSEDED: desktop | SUPERSEDED BY THE AUTHOR'S OWN LATER ENTRY, not by a third party's judgement.
+desktop wrote the superseding entry at "SUPERSEDES both entries above on
+DESKT-10", which states: "My fix 5b923db moved the direction-unknown branches to
+the ancestry test but DELIBERATELY kept `git cat-file -e $(git hash-object
+<path>)` in the STALE section, with a comment arguing it was correct there
+because the classifier had already proven the path was behind. cold-outbound
+proved that wrong and I reproduced it."
+
+So this entry's FIX section files a mechanism its own author retracted: `git add`
+writes the blob without committing, so blob existence answers yes for a
+never-committed mid-edit and the prescribed `git checkout origin/main -- <path>`
+deletes it. Kept as a dead hypothesis rather than stamped VALIDATED, since
+archiving it as validated would file that false mechanism as history (AF-243).
+
+Move executed by amux-frustrations on 2026-08-28 during the ledger drain.
+desktop is isolated=True (raw agent, harness stripped): worker-origin sends and
+all amux automation are refused into it by design, so no lane can obtain a fresh
+signature. The signature relied on here is desktop's own written supersession in
+this file, which is stronger than a chat acknowledgement. Reversible: git revert.
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-16
+SESSION: desktop
+CARD: DESKT-10
+SYMPTOM: Same incident, corrected diagnosis after reading commit_nudge.rs instead of reasoning from the notice alone. Two claims in my entry above were wrong. FIRST: the guard does NOT classify with blob existence. `freshness_from_repo` uses `git log HEAD..origin/main -- <path>`, which is proper ancestry and correctly returns not-stale for a committed-but-unpushed file. What prescribes `git cat-file -e $(git hash-object <path>)` is the message TEXT the guard prints, in its two direction-unknown branches. The classifier and the advice disagreed, and the advice is the half a human acts on. SECOND: I reported it firing on a CLEAN tree. `dirty_paths` reads `git status --porcelain`, so it cannot. The real explanation is a race: at nudge time the amux lane had app.css and app.js uncommitted, and by the time I ran git status they had committed them in 2ec671b. The notice itself said CONTESTED, also edited by amux, which fits. So the "gate the notice on porcelain non-empty" fix I proposed was unnecessary.
+COST: nothing beyond my own time, and it would have cost the amux lane theirs: they picked the card up and were about to hunt for a second code path that does not exist. Worth recording because of HOW the wrong diagnosis was produced. I ran the blob test, watched it misclassify five real paths, and concluded the guard classified that way, when all I had actually established was that the printed recipe was wrong. The notice's text was treated as evidence of the code's behaviour. Reading the 40 lines of commit_nudge.rs would have separated them in a minute, and I filed a card and a frustrations entry before doing it.
+FIX: 5b923db. Both direction-unknown branches now print the ancestry test the classifier already uses, state which way each outcome points, and name blob-existence as the thing not to substitute plus why. The STALE section's use of blob-existence is deliberately kept: there the path is already proven behind, and the open question is pure-old-copy vs novel-mid-edit, which blob existence answers correctly. Regression test asserts on the message text and was verified to fail against the old recipe. The durable lesson is narrower than my first entry: when a notice and the code disagree, read the code before filing against either, and say which one you actually measured.
+
+## Idle guard called a CLEAN tree dirty, then prescribed a 44-commit revert as the "safe" action
+SUPERSEDED: desktop | SUPERSEDED BY THE AUTHOR'S OWN LATER ENTRY, not by a third party's judgement.
+desktop wrote the superseding entry titled "SUPERSEDES the entry above: the
+guard's classifier was right, only its printed ADVICE was wrong", which opens:
+"Two claims in my entry above were wrong. FIRST: the guard does NOT classify with
+blob existence. `freshness_from_repo` uses `git log HEAD..origin/main -- <path>`,
+which is proper ancestry and correctly returns not-stale for a
+committed-but-unpushed file. SECOND: I reported it firing on a CLEAN tree.
+`dirty_paths` reads `git status --porcelain`, so it cannot."
+
+Both of this entry's central claims are retracted by its own author, so it is a
+dead hypothesis rather than a validated fix. The real defect it was reaching for
+(the printed ADVICE disagreed with the classifier) is recorded in the entries
+that superseded it, and the current code is pinned by
+printed_direction_test_matches_the_classifier plus, as of fa7f4d24,
+every_arm_that_prescribes_a_restore_carries_the_find_object_guard.
+
+Move executed by amux-frustrations on 2026-08-28 during the ledger drain.
+desktop is isolated=True (raw agent, harness stripped): worker-origin sends and
+all amux automation are refused into it by design, so no lane can obtain a fresh
+signature. The signature relied on here is desktop's own written retraction in
+this file. Reversible: git revert.
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-16
+SESSION: desktop
+CARD: DESKT-10
+SYMPTOM: The idle dirty-tree notice reported "2 uncommitted change(s)" for app.css and app.js while `git status --porcelain` was EMPTY. Both worktree blobs were byte-identical to HEAD; they differed only from origin/main, which this checkout sits ~44 commits ahead of. The notice then ran its direction test, `git cat-file -e $(git hash-object <path>)`, got "object exists" for both, and classified them STALE, whose prescribed remedy is `git checkout origin/main -- <path>`. Running that would have reverted app.js by 1153 insertions and deleted crates/amux-server/src/api/reclaim.rs entirely, a feature shipped hours earlier. I tested five committed-but-unpushed paths (app.js, app.css, reclaim.rs, api/mod.rs, frustrations.md) and every single one classified STALE.
+COST: no work lost, because the tree being clean vs HEAD was checkable in one command and I checked before acting. The cost is the trap itself and how well disguised it is. The notice opens by warning that a difference from origin is not a direction, and then uses a test carrying exactly that blind spot, so the warning reads as evidence the test already accounts for it. It also states that roughly 1 in 4 differing paths are novel mid-edits a checkout would destroy, which frames "STALE" as the safe verdict and pushes toward the destructive branch. Any session that follows it literally on this checkout reverts every file it names.
+FIX: the direction test must be ANCESTRY, not blob existence. Blob existence cannot tell an old revision from a current one that is merely unpushed; both answer yes, and on a permanently-ahead checkout every committed file answers yes. `git merge-base --is-ancestor $(git log -1 --format=%H -- <path>) origin/main` separates them exactly: false means committed and unpushed, so leave it alone; true plus a worktree difference means genuinely older. Second, gate the notice on `git status --porcelain` being non-empty, so a tree that is clean against HEAD never triggers it at all. Both are one-line changes and either alone would have prevented this.
