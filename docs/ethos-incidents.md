@@ -736,6 +736,25 @@ fire". There was nothing matched to print. The discriminator is the EXIT STATUS,
 separates "ran and passed", "ran and failed" and "never ran"; the printed body collapses the
 first and third into the same blankness.
 
+A THIRD failure mode joined the pair the same day, from the other lane, and its rule is
+the narrowest and most usable of the three. Verifying a frustrations entry, amux ran
+
+    grep -n "AMUX_FOREIGN_CONSENT\\|AMUX_ALLOW_FOREIGN" scripts/git-hooks/pre-push | head -4
+
+Four `AMUX_ALLOW_FOREIGN` hits at lines 18/182/196/217 filled the budget, `head -4` cut the
+output, and the `AMUX_FOREIGN_CONSENT` lines at 358+ never printed. That read as "the
+tracked source lacks the escape", and sent them looking for a hook divergence that does not
+exist — the files are byte-identical at 41360 bytes. One step from reporting a fix as
+missing when ten mentions of it were in the file.
+
+**Never `head` a grep whose ABSENCE you intend to act on. Cap the output when you are
+SAMPLING; never when you are CONCLUDING. `grep -c` first, then look.** The count costs
+nothing and it cannot be truncated.
+
+Note the symmetry with the `grep -q ... | head -3` failure hours earlier in the other lane:
+there `head` masked the EXIT STATUS, here it truncated the RESULT SET. Same command, two
+different ways of turning an incomplete read into a confident negative.
+
 So the pair, and both halves are needed:
 - For a search: print what it matched, not only what it concluded.
 - For a harness: read the exit status, not the output. `cargo test` returning non-zero with
