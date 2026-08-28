@@ -12225,8 +12225,34 @@ async fn post_dispatch(
             if sha.is_empty() {
                 return jresp(StatusCode::BAD_REQUEST, json!({"error": "sha required"}));
             }
+            // DID THE COMMIT CONTAIN ANYTHING (AMUX-3837). See `commit_shape`
+            // for why this lives here. The verdict is computed BEFORE the card
+            // write so it can ride the same log line the commit already adds:
+            // a second write would put the warning somewhere other than where
+            // the session goes to read what it shipped.
+            let shape = read_commit_shape(&body_str(body, "dir"), &sha).await;
+            let empty = matches!(shape, commit_shape::Shape::Empty);
+            if empty {
+                tracing::warn!(
+                    session = %name, sha = %sha, subject = %subj,
+                    "commit-report: EMPTY COMMIT — this sha contains no files, so the change it \
+                     claims is still uncommitted in the working tree (AMUX-3837). On a shared \
+                     checkout any peer's checkout or stash destroys it, and a card closed citing \
+                     this sha is citing nothing."
+                );
+            }
             let session = name.to_string();
             let sha2 = sha.clone();
+            // Named so the log line can say WHY it is silent: absent because
+            // the commit was fine, versus absent because nothing looked.
+            let shape_note = match shape {
+                commit_shape::Shape::Empty => {
+                    " — **EMPTY: this commit contains no files. Your change is still uncommitted.**"
+                        .to_string()
+                }
+                commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
+                _ => String::new(),
+            };
             let reply = state
                 .store
                 .write_async(move |conn| {
@@ -12246,7 +12272,9 @@ async fn post_dispatch(
                         .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
                         .unwrap_or_default();
                     let ts = chrono::Local::now().format("%H:%M");
-                    let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}", log.trim_end()).trim().to_string();
+                    let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}{shape_note}", log.trim_end())
+                        .trim()
+                        .to_string();
                     conn.execute(
                         "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
                         rusqlite::params![new_log, now_i64(), issue_id],
@@ -12263,7 +12291,12 @@ async fn post_dispatch(
                 })
                 .await;
             match reply {
-                Ok(r) if !r.applied => j200(json!({"ok": true, "attached": Value::Null})),
+                // The emptiness verdict rides BOTH arms. A session with no
+                // in-flight card is exactly the one whose commit lands with no
+                // trail, so it is the last place the warning may be dropped.
+                Ok(r) if !r.applied => {
+                    j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty}))
+                }
                 Ok(_) => {
                     // Re-read the card id for the response (the write closure
                     // cannot return it through WriteReply).
@@ -12277,7 +12310,7 @@ async fn post_dispatch(
                         )
                         .ok()
                     });
-                    j200(json!({"ok": true, "attached": attached, "sha": sha}))
+                    j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty}))
                 }
                 Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
             }
@@ -20392,4 +20425,215 @@ mod roster_tests {
         assert!(r.is_empty() || r.contains("| `"), "header without rows: {r}");
     }
 
+}
+
+/// Did the commit that just reported itself actually contain anything?
+///
+/// AMUX-3837. `2ee153e2` carried a correct subject, a correct card id, and ZERO
+/// files. `git commit` printed a success line, `git log` showed the commit, and
+/// the change stayed dirty in a SHARED checkout where any lane's `checkout` or
+/// `stash` would have destroyed it. The card was then closed citing that sha.
+/// The defect is not that one commit was wrong: it is that every instrument a
+/// session reaches for to confirm work shipped (the success line, the log, the
+/// card's own commit trail) reads the MESSAGE, and none of them reads the diff.
+///
+/// So the check belongs where a commit already announces itself, which is this
+/// endpoint. That covers any lane, any shell form, and any way the commit was
+/// produced, rather than one hook in one checkout.
+pub mod commit_shape {
+    /// What the reported commit turned out to be.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Shape {
+        /// Non-merge, touched at least one path. The ordinary case.
+        Normal(usize),
+        /// Non-merge and touched NOTHING.
+        Empty,
+        /// A merge carries no diff against its first parent here, and that is
+        /// correct rather than suspicious. Seven of the eight zero-file commits
+        /// in this repo's last 120 were merges, so a check that did not carve
+        /// them out would be almost entirely false alarm.
+        Merge,
+        /// The check DID NOT RUN, with the reason. Deliberately distinct from
+        /// `Empty`: a zero we could not measure must never be published as a
+        /// zero we measured (ethos rule 4).
+        Unchecked(&'static str),
+    }
+
+    /// Pure classifier, so the rule has cells without needing a repo on disk.
+    pub fn classify(parents: usize, files: Option<usize>) -> Shape {
+        if parents > 1 {
+            return Shape::Merge;
+        }
+        match files {
+            None => Shape::Unchecked("git did not answer"),
+            Some(0) => Shape::Empty,
+            Some(n) => Shape::Normal(n),
+        }
+    }
+
+    /// A sha we are willing to hand to git. The value arrives from a hook over
+    /// HTTP, so it is validated rather than trusted; `git` is invoked without a
+    /// shell, and this keeps a hostile value from being a plausible ref at all.
+    pub fn usable_sha(sha: &str) -> bool {
+        (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
+    }
+}
+
+/// Read the shape of `sha` in `dir`. Never panics and never blocks the report:
+/// an unreadable repo yields `Unchecked`, which says so rather than passing.
+pub async fn read_commit_shape(dir: &str, sha: &str) -> commit_shape::Shape {
+    use commit_shape::Shape;
+    if dir.trim().is_empty() {
+        return Shape::Unchecked("no repo dir in the report");
+    }
+    if !commit_shape::usable_sha(sha) {
+        return Shape::Unchecked("sha is not a plain hex object name");
+    }
+    if !std::path::Path::new(dir).is_dir() {
+        return Shape::Unchecked("reported dir is not a directory here");
+    }
+    let git = |args: Vec<String>| {
+        let dir = dir.to_string();
+        async move {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+    };
+    // Parent count first: a merge is classified without ever counting files, so
+    // the expensive walk only runs where its answer can mean something.
+    let Some(parents) = git(vec!["show".into(), "-s".into(), "--format=%P".into(), sha.into()]).await
+    else {
+        return Shape::Unchecked("git could not read the commit");
+    };
+    let parents = parents.split_whitespace().count();
+    if parents > 1 {
+        return Shape::Merge;
+    }
+    // `--root` IS LOAD-BEARING. Without it `diff-tree` prints nothing for a
+    // commit with no parent, because there is no parent to diff against, and
+    // the very first commit of any repo would be reported as empty. The live
+    // test below caught exactly that, which is the reason it exercises this
+    // function rather than only the classifier.
+    let files = git(vec![
+        "diff-tree".into(),
+        "--no-commit-id".into(),
+        "--name-only".into(),
+        "-r".into(),
+        "--root".into(),
+        sha.into(),
+    ])
+    .await
+    .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count());
+    commit_shape::classify(parents, files)
+}
+
+#[cfg(test)]
+mod commit_shape_tests {
+    use super::commit_shape::{classify, usable_sha, Shape};
+
+    /// The three states are three states. Collapsing `Unchecked` into `Empty`
+    /// would turn "we could not look" into "your work is missing", which is the
+    /// false alarm that gets a warning ignored.
+    #[test]
+    fn an_unmeasured_commit_is_not_an_empty_one() {
+        assert_eq!(classify(1, Some(3)), Shape::Normal(3));
+        assert_eq!(classify(1, Some(0)), Shape::Empty);
+        assert!(matches!(classify(1, None), Shape::Unchecked(_)));
+        // A merge has no diff of its own here and is never the alarm, even
+        // though its file count is the same zero.
+        assert_eq!(classify(2, Some(0)), Shape::Merge);
+        assert_eq!(classify(3, Some(0)), Shape::Merge);
+        // A root commit has zero parents and IS checkable.
+        assert_eq!(classify(0, Some(0)), Shape::Empty);
+        assert_eq!(classify(0, Some(1)), Shape::Normal(1));
+    }
+
+    /// The sha reaches `git` from an HTTP body, so it is validated, not trusted.
+    #[test]
+    fn only_a_plain_hex_object_name_is_handed_to_git() {
+        assert!(usable_sha("2ee153e2"));
+        assert!(usable_sha("2ee153e26242d9cdbcf5de555e27a8ec513e53b7"));
+        assert!(!usable_sha(""), "empty");
+        assert!(!usable_sha("2ee153"), "too short to be an object name");
+        assert!(!usable_sha("HEAD"), "a ref is not an object name");
+        assert!(!usable_sha("main; rm -rf /"), "no shell metacharacters");
+        assert!(!usable_sha("../../etc/passwd"), "no path traversal");
+        assert!(!usable_sha(&"a".repeat(41)), "longer than any object name");
+    }
+
+    /// THE SHIPPED PATH, against a real git repo, because the pure classifier
+    /// above would stay green if `read_commit_shape` counted the wrong thing or
+    /// never ran git at all. This is the layer the incident happened at.
+    #[tokio::test]
+    async fn a_real_empty_commit_is_told_apart_from_a_real_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let d = tmp.path().to_str().expect("utf8 path").to_string();
+        let git = |args: Vec<&str>| {
+            let d = d.clone();
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            async move {
+                let out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&d)
+                    .args(&args)
+                    .output()
+                    .await
+                    .expect("git runs");
+                assert!(out.status.success(), "git {args:?} failed");
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+        };
+        git(vec!["init", "-q", "--initial-branch=main", "."]).await;
+        git(vec!["config", "user.email", "t@t"]).await;
+        git(vec!["config", "user.name", "t"]).await;
+        std::fs::write(tmp.path().join("f.txt"), "one\n").expect("write");
+        git(vec!["add", "f.txt"]).await;
+        git(vec!["commit", "-qm", "real"]).await;
+        let real = git(vec!["rev-parse", "HEAD"]).await;
+        // The specimen: a commit that reports success and contains nothing.
+        git(vec!["commit", "-q", "--allow-empty", "-m", "empty"]).await;
+        let empty = git(vec!["rev-parse", "HEAD"]).await;
+        // And a merge, whose identical zero must NOT read as the alarm.
+        git(vec!["checkout", "-q", "-b", "side", &real]).await;
+        std::fs::write(tmp.path().join("g.txt"), "two\n").expect("write");
+        git(vec!["add", "g.txt"]).await;
+        git(vec!["commit", "-qm", "side"]).await;
+        git(vec!["checkout", "-q", "main"]).await;
+        git(vec!["merge", "-q", "--no-ff", "-m", "merge", "side"]).await;
+        let merge = git(vec!["rev-parse", "HEAD"]).await;
+
+        // `real` is also the ROOT commit, which has no parent to diff against. It
+        // read as Empty until `--root` was added, so this cell is the root case.
+        assert_eq!(super::read_commit_shape(&d, &real).await, Shape::Normal(1));
+        assert_eq!(
+            super::read_commit_shape(&d, &empty).await,
+            Shape::Empty,
+            "an empty commit must be caught by the code that actually runs"
+        );
+        assert_eq!(
+            super::read_commit_shape(&d, &merge).await,
+            Shape::Merge,
+            "a merge's zero is not the alarm"
+        );
+        // AND THE REFUSALS SAY SO RATHER THAN PASSING. Each of these would be a
+        // silent `Normal`/`Empty` if the guard clauses were dropped.
+        assert!(matches!(super::read_commit_shape("", &real).await, Shape::Unchecked(_)));
+        assert!(matches!(super::read_commit_shape(&d, "HEAD").await, Shape::Unchecked(_)));
+        assert!(matches!(
+            super::read_commit_shape(&format!("{d}/nope"), &real).await,
+            Shape::Unchecked(_)
+        ));
+        // A well-formed sha that is not in THIS repo is unreadable, not empty.
+        assert!(matches!(
+            super::read_commit_shape(&d, &"0".repeat(40)).await,
+            Shape::Unchecked(_)
+        ));
+    }
 }
