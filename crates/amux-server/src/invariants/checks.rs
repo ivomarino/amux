@@ -541,10 +541,17 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
 /// `undeclared` is any timestamp-shaped column the schema has and
 /// [`TIMESTAMP_COLUMNS`] does not. Those fail: an undeclared unit is exactly the
 /// state that produced every incident above.
+/// `sampled` is how many of the newest rows each `observed` value was taken
+/// from, or 0 for the whole table. It exists so a `None` says what it actually
+/// means: after AMUX-3836 the probe reads the newest rows rather than scanning
+/// the table, and "empty" and "nothing in the newest 5000 rows" are different
+/// claims about the schema. Reporting the first when you measured the second is
+/// the shape ethos rule 4 is about, and the caller is the only one that knows.
 pub fn timestamp_units_are_what_readers_assume(
     observed: &[(String, Option<f64>)],
     undeclared: &[String],
     now: f64,
+    sampled: usize,
 ) -> Vec<InvariantResult> {
     const ID: &str = "schema.timestamp_units_declared";
     // Generous: a year ahead for clock skew, ten years back for old rows. The
@@ -572,10 +579,15 @@ pub fn timestamp_units_are_what_readers_assume(
             .map(|(_, _, ms)| *ms);
         let Some(is_millis) = declared else { continue };
         let Some(v) = *max else {
-            out.push(
-                InvariantResult::unknown(ID, format!("{name} is empty — no rows to check the unit against"))
-                    .entity(name),
-            );
+            let why = if sampled > 0 {
+                format!(
+                    "{name} has no value in the newest {sampled} rows — nothing to check the unit \
+                     against. This is a bounded probe, so it is not a claim that the table is empty"
+                )
+            } else {
+                format!("{name} is empty — no rows to check the unit against")
+            };
+            out.push(InvariantResult::unknown(ID, why).entity(name));
             continue;
         };
         let as_declared = if is_millis { v / 1000.0 } else { v };
@@ -4016,6 +4028,7 @@ mod negative_controls {
             ],
             &[],
             now,
+            0,
         );
         assert!(ok.iter().all(|r| r.status == Status::Pass), "{ok:?}");
         assert_eq!(ok.len(), 2, "every declared column reports, not just the bad ones");
@@ -4027,6 +4040,7 @@ mod negative_controls {
             &[("_amux_request_log.ts".into(), Some(now * 1000.0))],
             &[],
             now,
+            0,
         );
         assert_eq!(bad[0].status, Status::Fail, "{bad:?}");
         assert!(bad[0].observed.contains("MILLISECONDS"), "name the reading that fits: {:?}", bad[0].observed);
@@ -4036,6 +4050,7 @@ mod negative_controls {
             &[("cmd_history.ts".into(), Some(now))],
             &[],
             now,
+            0,
         );
         assert_eq!(bad2[0].status, Status::Fail, "{bad2:?}");
         assert!(bad2[0].observed.contains("SECONDS"), "{:?}", bad2[0].observed);
@@ -4047,14 +4062,47 @@ mod negative_controls {
             &[("token_ledger.ts".into(), None)],
             &[],
             now,
+            0,
         );
         assert_eq!(empty[0].status, Status::Unknown, "{empty:?}");
+        assert!(
+            empty[0].observed.contains("is empty"),
+            "an unbounded probe's None IS a claim the table is empty: {:?}",
+            empty[0].observed
+        );
+
+        // AND A BOUNDED PROBE'S None IS A DIFFERENT CLAIM (AMUX-3836). Same
+        // input, same Unknown verdict, different sentence: the caller sampled
+        // the newest rows, so it did not learn that the table is empty and must
+        // not say so. Reading "token_ledger.ts is empty" off a probe that only
+        // looked at 5000 rows sends the reader to the schema for a fact nobody
+        // measured.
+        let sampled = timestamp_units_are_what_readers_assume(
+            &[("token_ledger.ts".into(), None)],
+            &[],
+            now,
+            5_000,
+        );
+        assert_eq!(sampled[0].status, Status::Unknown, "{sampled:?}");
+        // The CLAIM form, not the substring: the bounded sentence ends by
+        // disclaiming emptiness, so `contains("is empty")` matches its own
+        // denial. Assert on "<name> is empty", which only the unbounded arm says.
+        assert!(
+            !sampled[0].observed.contains("token_ledger.ts is empty"),
+            "a bounded probe must not claim the table is empty: {:?}",
+            sampled[0].observed
+        );
+        assert!(
+            sampled[0].observed.contains("newest 5000 rows"),
+            "and it must say what it DID look at: {:?}",
+            sampled[0].observed
+        );
 
         // An UNDECLARED timestamp column fails. This is the half that keeps
         // working as the schema grows: a sixth table with a bare `ts` inherits
         // the trap silently, and only a check that goes red makes its author
         // state the unit.
-        let undecl = timestamp_units_are_what_readers_assume(&[], &["new_table.ts".into()], now);
+        let undecl = timestamp_units_are_what_readers_assume(&[], &["new_table.ts".into()], now, 0);
         assert_eq!(undecl[0].status, Status::Fail, "{undecl:?}");
         assert!(undecl[0].entity_key.contains("new_table"), "{:?}", undecl[0]);
 
@@ -4072,6 +4120,7 @@ mod negative_controls {
             &[("_amux_request_log.ts".into(), Some(now - 86_400.0 * 3_000.0))],
             &[],
             now,
+            0,
         );
         assert_eq!(oldrow[0].status, Status::Pass, "a 3000-day-old row is old, not mis-united: {oldrow:?}");
     }

@@ -696,16 +696,43 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
         .filter(|n| !declared.contains(n))
         .collect();
     undeclared.sort();
+    // BOUNDED, and this is the whole cost of /api/health/invariants (AMUX-3836).
+    // The unbounded `SELECT MAX("c") FROM "t"` is O(1) on an indexed column and
+    // a FULL SCAN on any other. `_amux_request_log.boot_at` is the second kind:
+    // 1.2M rows, no index, MEASURED at 8.3s in a single query, which was 88% of
+    // the endpoint's entire 8.3s and the reason it files as a latency outlier on
+    // every load spike.
+    //
+    // Indexing `boot_at` would be the wrong fix — a write-side cost on the
+    // hottest table in the database to serve a diagnostic. This check needs an
+    // ORDER OF MAGNITUDE, not a true maximum: it is deciding seconds versus
+    // milliseconds, a factor of 1000. The newest rows answer that. Same query,
+    // bounded to the newest rows: 0.129s, identical value.
+    const SAMPLE: usize = 5_000;
     let mut observed: Vec<(String, Option<f64>)> = Vec::new();
     for (t, c, _) in checks::TIMESTAMP_COLUMNS {
-        let max: Option<f64> = conn
-            .query_row(&format!("SELECT MAX(\"{c}\") FROM \"{t}\""), [], |r| r.get(0))
-            .ok()
-            .flatten();
+        // rowid order, not `c` order: ordering by the column being probed would
+        // need the index this exists to avoid needing.
+        let bounded = format!(
+            "SELECT MAX(\"{c}\") FROM (SELECT \"{c}\" FROM \"{t}\" ORDER BY rowid DESC LIMIT {SAMPLE})"
+        );
+        // FALL BACK RATHER THAN REPORT A NULL. A WITHOUT ROWID table has no
+        // rowid to order by and the bounded form errors; `.ok()` on it alone
+        // would turn that into "this column is empty", which the check reports
+        // as unknown and a reader reads as a schema fact. Two such tables exist
+        // in this database today (the FTS shadow tables), and the next declared
+        // column could live in one.
+        let max: Option<f64> = match conn.query_row(&bounded, [], |r| r.get(0)) {
+            Ok(v) => v,
+            Err(_) => conn
+                .query_row(&format!("SELECT MAX(\"{c}\") FROM \"{t}\""), [], |r| r.get(0))
+                .ok()
+                .flatten(),
+        };
         observed.push((format!("{t}.{c}"), max));
     }
     let now = crate::runtime_jobs::registry::unix_now();
-    checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now)
+    checks::timestamp_units_are_what_readers_assume(&observed, &undeclared, now, SAMPLE)
 }
 
 /// Gather what [`checks::request_arrival_follows_boot`] needs (AMUX-3647).
