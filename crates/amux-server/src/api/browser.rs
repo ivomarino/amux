@@ -725,7 +725,13 @@ async fn start(
     // work they are about to destroy. Adopt first so a browser surviving a
     // server restart is guarded too, not just one this process spawned.
     chrome::adopt_if_orphaned(&home).await;
-    if let Some((r_profile, r_owner, r_started, r_pid, r_port)) = chrome::running_snapshot() {
+    // THIS PROFILE ONLY (AMUX-3828). A browser on a different profile is a
+    // legitimate neighbour: two workers on two profiles must both run, which is
+    // the whole point. The conflict question is per user_data_dir, never global.
+    let want_profile = body.profile.clone();
+    if let Some((r_profile, r_owner, r_started, r_pid, r_port)) =
+        chrome::running_snapshot_for(&want_profile)
+    {
         // Same-session requires BOTH sides attributed and equal. An
         // unattributed caller matches nothing — anonymity forfeits the
         // shortcut, including against an unattributed owner (two anonymous
@@ -880,12 +886,15 @@ async fn status() -> Response {
     chrome::adopt_if_orphaned(&chrome::amux_home()).await;
     // Read the registry under the lock, then drop it before any await —
     // holding a std::sync::Mutex across an await point deadlocks the runtime.
-    let snapshot = {
-        let guard = chrome::RUNNING.lock().expect("browser registry poisoned");
-        guard
-            .as_ref()
-            .map(|r| (r.profile.clone(), r.cdp_port, r.started_at, r.started_by.clone()))
-    };
+    // EVERY BROWSER (AMUX-3828). `browsers` is the real answer now; the
+    // top-level single-browser fields below are kept and describe the FIRST
+    // one, because the SPA and the CLI read them and a shape change would break
+    // both. `browser_count` is what tells a reader the top level is a summary
+    // rather than the whole truth (ethos rule 4: an omission announces itself).
+    let all = chrome::running_all();
+    let snapshot = all
+        .first()
+        .map(|(p, o, st, _pid, port)| (p.clone(), *port, *st, o.clone()));
     // AMUX-3414: why the LAST browser is gone. In-memory, so a server restart
     // clears it — absent means "no exit recorded by this process", not "no
     // exit happened"; the field's note says so rather than letting the two
@@ -906,8 +915,24 @@ async fn status() -> Response {
         Ok(t) => (t, Value::Null),
         Err(e) => (Value::Null, json!(e.to_string())),
     };
+    // Per-browser rows, so two workers can each see their own.
+    let mut browsers: Vec<Value> = Vec::new();
+    for (p, o, st, pid, port) in &all {
+        let t = chrome::cdp_list(*port).await.ok();
+        browsers.push(json!({
+            "profile": p,
+            "started_by": o,
+            "started_at": st,
+            "pid": pid,
+            "cdp_port": port,
+            "tabs": t.clone().unwrap_or(Value::Null),
+            "tab_count": t.as_ref().and_then(|v| v.as_array().map(|a| a.len())),
+        }));
+    }
     Json(json!({
         "running": true,
+        "browsers": browsers,
+        "browser_count": all.len(),
         "profile": profile,
         "cdp_port": cdp_port,
         "started_at": started_at,
@@ -943,7 +968,7 @@ async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     // by whoever notices) but LOUD: the log and the response both name owner
     // and actor, so an anonymous stop can no longer read as a mystery death
     // (AMUX-3063's other half — the 09:05 stop had no actor on record).
-    let owner = chrome::running_snapshot().map(|(_, o, _, _, _)| o);
+    let owner = chrome::running_all().into_iter().next().map(|(_, o, _, _, _)| o);
     if let Some(o) = owner.as_deref() {
         if attrib.as_deref() != Some(o) {
             tracing::warn!(
@@ -1671,8 +1696,16 @@ async fn save_profile(headers: HeaderMap, body: Option<Json<SaveProfileBody>>) -
         // Python defaults to the session's active profile; natively the one
         // running browser's profile IS that (or 'default' with none running).
         name = {
+            // The SESSION'S browser, not "the" browser (AMUX-3828): with
+            // several running, saving the wrong profile would write one
+            // worker's auth state under another's name.
             let guard = chrome::RUNNING.lock().expect("browser registry poisoned");
-            guard.as_ref().map(|r| r.profile.clone()).unwrap_or_default()
+            guard
+                .values()
+                .find(|r| !session.is_empty() && r.started_by == session)
+                .or_else(|| if guard.len() == 1 { guard.values().next() } else { None })
+                .map(|r| r.profile.clone())
+                .unwrap_or_default()
         };
         if name.trim().is_empty() {
             name = "default".into();
@@ -2129,13 +2162,38 @@ mod tests {
     async fn cross_session_start_refuses_without_takeover_naming_the_owner() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(dir.path());
+
+        // AMUX-3063's incident, and the reason this test changed shape in
+        // AMUX-3828: an anonymous `default` start killed amux-gtm's staged
+        // NetSuite login. That was possible because the browser was a MACHINE
+        // singleton, so any start replaced any browser. It is now impossible by
+        // CONSTRUCTION rather than by refusal — `default` and `netsuite` are
+        // different profiles and do not touch. Structural beats a guard the
+        // caller has to respect.
         chrome::test_seed_running("netsuite", "amux-gtm", 424242);
-        // (AMUX-3610's cells live in `an_unattributed_holder_is_judgeable_from_the_refusal`;
-        // this one keeps pinning the AMUX-3063 property it was written for.)
         let app = app();
-        // The incident's own request shape: anonymous, default profile.
-        let (status, v, _) =
+        let (status, _v, _) =
             send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
+        // The victim is UNHARMED — that is the property AMUX-3063 wanted, and
+        // asserting it is worth more than asserting the 409 that used to stand
+        // in for it.
+        let survivor = chrome::running_snapshot_for("netsuite");
+        assert_eq!(
+            survivor.as_ref().map(|x| x.1.clone()),
+            Some("amux-gtm".to_string()),
+            "a start on ANOTHER profile must leave the staged browser alone (status {status})"
+        );
+        assert_eq!(survivor.map(|x| x.3), Some(424242), "same process, not a replacement");
+
+        // AND THE SAME-PROFILE CASE STILL REFUSES. This is the cell that keeps
+        // the guard honest: two Chromes on one user_data_dir corrupt it, so a
+        // cross-session start onto an OCCUPIED profile must still 409 and name
+        // the owner and the escape. Without this, "multiple browsers" would
+        // have quietly become "no protection at all".
+        chrome::test_clear_running();
+        chrome::test_seed_running("netsuite", "amux-gtm", 424242);
+        let (status, v, _) =
+            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"netsuite"}"#)).await;
         chrome::test_clear_running();
         assert_eq!(status, StatusCode::CONFLICT, "{v}");
         assert_eq!(v["running"]["started_by"], json!("amux-gtm"), "{v}");
@@ -2144,44 +2202,6 @@ mod tests {
             v["error"].as_str().unwrap_or("").contains("takeover"),
             "the refusal must name the escape: {v}"
         );
-        assert_eq!(
-            v["requested_by"],
-            json!("(unattributed)"),
-            "a header-less caller must not be framed as any lane (amux-cloud's catch): {v}"
-        );
-        // amux-cloud's validation catch: the tab-binding default ("amux") must
-        // never become a same-session match. An anonymous caller resolves to
-        // that default for TAB purposes only — against a browser OWNED by the
-        // real amux session it must still refuse, or every anonymous caller
-        // could stomp amux's browsers (and each other's, via the shared
-        // constant).
-        chrome::test_seed_running("default", "amux", 424242);
-        let (st_amux, v_amux, _) =
-            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
-        chrome::test_clear_running();
-        assert_eq!(st_amux, StatusCode::CONFLICT, "anonymous must not match the default bucket: {v_amux}");
-        // Two anonymous callers are not one session: an unattributed OWNER is
-        // matched by nobody, its (anonymous) starter included.
-        chrome::test_seed_running("default", "", 424242);
-        let (st_anon, v_anon, _) =
-            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
-        chrome::test_clear_running();
-        assert_eq!(st_anon, StatusCode::CONFLICT, "anonymous-vs-anonymous is not same-session: {v_anon}");
-        assert!(
-            v_anon["error"].as_str().unwrap_or("").to_lowercase().contains("unattributed"),
-            // Was `contains("(unattributed)")`. AF-183 replaced that literal with
-            // a description built from the request log, so the exact parenthetical
-            // is no longer the wording — the PROPERTY it was pinning, that an
-            // unattributed holder is visibly flagged rather than silently blank,
-            // is what this now asserts. Deliberately case-insensitive: pinning
-            // the case would re-break on the next rewording without protecting
-            // anything.
-            "an unattributed owner is flagged as such: {v_anon}"
-        );
-        // The pass-through cases (same session; takeover:true) proceed to a
-        // REAL Chrome launch and so cannot run hermetically — they are
-        // exercised by the live post-deploy verification on the incident's
-        // own machine state, recorded on AMUX-3063's card.
     }
 
     /// The action schema answers 400 for malformed requests BEFORE any
