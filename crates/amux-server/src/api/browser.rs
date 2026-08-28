@@ -324,6 +324,40 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
 }
 
 #[cfg(test)]
+mod idle_takeover_tests {
+    /// The auto-takeover predicate, as a table (Ethan, 2026-08-28).
+    ///
+    /// He hit the refusal twice in twenty minutes on a browser held 18h with
+    /// ZERO tabs. "Nothing to lose" must not be a conflict — but every other
+    /// case must still refuse, and those are what this pins.
+    fn auto_takes(pages_empty: bool, cdp_answered: bool, held_s: i64, grace_s: i64) -> bool {
+        pages_empty && cdp_answered && held_s > grace_s
+    }
+
+    #[test]
+    fn only_an_idle_browser_with_no_real_pages_is_taken_without_asking() {
+        // Ethan's case: 18.4h, zero real pages, CDP answered.
+        assert!(auto_takes(true, true, 66_240, 600));
+
+        // CONTROL 1 — a single real page is STATE. The refusal's own history is
+        // that "4 tabs" was two omnibox popups, an iframe, and one live Google
+        // sign-in; destroying that is not recoverable by reopening a tab.
+        assert!(!auto_takes(false, true, 66_240, 600), "an open page must still refuse");
+
+        // CONTROL 2 — CDP SILENCE IS NOT ZERO. This file draws that distinction
+        // deliberately ("that is not the same as zero"); unknown must refuse.
+        assert!(!auto_takes(true, false, 66_240, 600), "unknown tab count must still refuse");
+
+        // CONTROL 3 — the grace window. A browser started seconds ago has not
+        // opened its first tab yet; without this, two concurrent starts resolve
+        // by stomping each other.
+        assert!(!auto_takes(true, true, 30, 600), "inside the grace window must still refuse");
+        assert!(!auto_takes(true, true, 600, 600), "at the boundary, not past it");
+        assert!(auto_takes(true, true, 601, 600), "one second past is past");
+    }
+}
+
+#[cfg(test)]
 mod takeover_wording_tests {
     use super::*;
 
@@ -714,6 +748,43 @@ async fn start(
                 .and_then(|v| v.as_array())
                 .map(|a| summarize_pages(a))
                 .unwrap_or_default();
+            // NOTHING TO LOSE IS NOT A CONFLICT (Ethan, 2026-08-28 12:39: "the
+            // browser shit needs to be more intuitive"). He hit this refusal
+            // TWICE in twenty minutes against a browser held 18+ hours with
+            // ZERO tabs, and the second time the wording was already accurate.
+            // Accuracy was not the problem: being made to read a paragraph and
+            // adjudicate a judgement call, to open a browser, when the honest
+            // answer to "what would this destroy" is NOTHING.
+            //
+            // The evidence to decide is already in hand three lines up, and
+            // this file already draws the conclusion in prose — the Some(n)
+            // arm of the refusal says "ZERO real pages open ... so there is no
+            // page state to lose". It said it and then refused anyway.
+            //
+            // So: no real pages, CDP answered, and held past the grace window
+            // -> take it over and SAY SO, rather than asking a human to
+            // approve the obvious. Every condition is load-bearing:
+            //   pages.is_empty() — a single real page is state, and the
+            //     tab-count arm of the refusal exists because "4 tabs" was
+            //     once one live Google sign-in.
+            //   tabs.is_some()   — CDP silence is NOT zero (this file's own
+            //     distinction). Unknown means refuse, as before.
+            //   held > grace     — a browser started seconds ago by another
+            //     lane has not opened its first tab yet; without this, a race
+            //     between two starts resolves by stomping.
+            let grace_s = std::env::var("AMUX_BROWSER_IDLE_TAKEOVER_S")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(600);
+            let held_s = (now_epoch() - r_started).max(0);
+            if pages.is_empty() && tabs.is_some() && held_s > grace_s {
+                tracing::info!(
+                    profile = %r_profile, owner = %r_owner, held_s, pid = r_pid,
+                    requested_by = attrib.as_deref().unwrap_or("(unattributed)"),
+                    "browser: auto-takeover — holder had ZERO real pages and was past the \
+                     idle grace window, so the start proceeded without asking (AMUX-3828)"
+                );
+            } else {
             return err(
                 StatusCode::CONFLICT,
                 takeover_refusal(
@@ -736,6 +807,7 @@ async fn start(
                     },
                 ),
             );
+            }
         }
         if !same {
             tracing::warn!(
