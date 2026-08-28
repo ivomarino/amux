@@ -84,6 +84,8 @@ pub struct Health {
     /// soon be unable to say so, so the useful move is publishing the
     /// approach continuously on the endpoint everyone already polls.
     pub mem: MemHealth,
+    /// Whether the host has room to admit another worker (AMUX-3396 follow-through).
+    pub admission: Admission,
     /// Free space where amux keeps its DB and logs. Same rationale as `mem`
     /// (DESKT-21): the ENOSPC that took this machine to 741 MB free on
     /// 2026-08-10 was invisible to every amux instrument at the time.
@@ -105,7 +107,7 @@ pub struct FdHealth {
     pub ratio: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 pub struct MemHealth {
     /// The KERNEL's own verdict, not a tuned amux threshold (ethos rule 7:
     /// prefer the structurally-present signal): macOS
@@ -220,6 +222,92 @@ fn statvfs_exact(path: &std::path::Path) -> Option<(f64, f64)> {
     // f_bavail, not f_bfree: bfree counts root-reserved blocks that amux (which
     // does not run as root) can never actually use.
     Some((st.f_bavail as f64 * unit / GB, st.f_blocks as f64 * unit / GB))
+}
+
+/// Whether the host has room to admit ANOTHER worker right now.
+///
+/// # Why this exists
+///
+/// `mem_health` has been published on /health since the 2026-08-19 kernel panic
+/// (memory/swap exhaustion, AMUX-3396) — and nothing ever ACTED on it. amux kept
+/// admitting lanes while macOS was already shedding processes. The JetsamEvent of
+/// 2026-08-24 21:01 names the top memory holders at kill time and they are
+/// Claude Code binaries (`2.1.237`) at 0.7-1.2 GB each: amux's own lanes.
+///
+/// Three WindowServer watchdog kills followed in a week (08-22, 08-24, 08-28),
+/// all three with the identical signature — `blocked by turnstile waiting for
+/// tccd after 2 hops`. The deadlock itself is Apple's and amux cannot fix it: a
+/// synchronous TCC preflight on WindowServer's main thread. What amux CAN do is
+/// stop being the reason the machine is too starved to service that XPC round
+/// trip inside the 40-second watchdog budget.
+///
+/// # Why this does NOT gate on free RAM, which is the obvious design
+///
+/// A "keep 20 GB free" reserve would deny EVERY admission on this machine,
+/// permanently. macOS drives free pages to near zero by design: measured
+/// 2026-08-28 on a healthy box, raw free was **0.27 GB** while effective
+/// available (free + inactive + speculative) was 28.96 GB. A reserve rule fed
+/// the wrong number is a detector that fires on the healthy baseline, which is
+/// ethos rule 7's exact failure.
+///
+/// Computing true "available" needs `host_statistics64`, and the kernel already
+/// publishes its own summary of that computation as
+/// `kern.memorystatus_vm_pressure_level`. Preferring the structurally-present
+/// signal over a re-derived threshold is what this file's `MemHealth` comment
+/// already says it does, so this follows it rather than inventing a second
+/// opinion that can disagree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Admission {
+    /// Room to start another lane.
+    Allow,
+    /// Startable, but the kernel is already reporting pressure. Logged, not blocked.
+    Strained,
+    /// Do not start another lane.
+    Deny,
+}
+
+/// The admission decision, as a pure function of the two signals, so it is
+/// testable without a machine in any particular state.
+///
+/// `pressure_level` is the kernel's own verdict (1 normal, 2 warn, 4 critical).
+/// `swap_used_mb` is absolute rather than a fraction on purpose: macOS GROWS the
+/// swap file on demand, so "percent of swap used" stays flat as the problem gets
+/// worse and is close to useless as a signal.
+pub(crate) fn admission_for(
+    pressure_level: Option<u32>,
+    swap_used_mb: Option<f64>,
+    swap_deny_mb: f64,
+) -> Admission {
+    // Unknown must not deny: a host where these are unreadable (non-macOS, a
+    // sandbox) would otherwise be unable to start any worker at all.
+    if pressure_level == Some(4) {
+        return Admission::Deny;
+    }
+    if swap_used_mb.is_some_and(|mb| mb >= swap_deny_mb) {
+        return Admission::Deny;
+    }
+    if pressure_level == Some(2) {
+        return Admission::Strained;
+    }
+    Admission::Allow
+}
+
+/// Swap in use, in MB, at or above which amux stops admitting workers.
+/// Default 8192 (8 GB). Sustained swapping of that size on a 96 GB box means the
+/// working set no longer fits, which is the state that precedes jetsam.
+pub fn swap_deny_mb() -> f64 {
+    std::env::var("AMUX_MEM_SWAP_DENY_MB")
+        .ok()
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| *v > 0.0)
+        .unwrap_or(8192.0)
+}
+
+/// Live admission check against this host.
+pub fn admission() -> Admission {
+    let m = mem_health();
+    admission_for(m.pressure_level, m.swap_used_mb, swap_deny_mb())
 }
 
 /// One syscall per field on macOS (`sysctlbyname`), `/proc/meminfo` on Linux
@@ -363,6 +451,7 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
                 .and_then(|g| g.cause)
                 .map(|c| c.as_str()),
             mem: mem_health(),
+            admission: admission(),
             disk: disk_health(),
             tailnet: crate::runtime_jobs::tailnet_watch::cached(),
         }),
@@ -653,5 +742,65 @@ mod disk_tests {
         assert!(free > 0.0 && total > 0.0, "free {free} total {total}");
         assert!(free <= total, "free {free} cannot exceed total {total}");
         assert_ne!(h.state, "unknown", "a readable volume must not report unknown");
+    }
+}
+
+#[cfg(test)]
+mod admission_tests {
+    use super::*;
+
+    /// TODAY's real reading on a healthy box: kernel says normal, 2.2 GB swapped.
+    /// It must ALLOW. A gate that denies at the healthy baseline stops the fleet
+    /// dead and gets switched off within the hour (ethos rule 7).
+    #[test]
+    fn the_healthy_2026_08_28_baseline_allows() {
+        assert_eq!(admission_for(Some(1), Some(2207.4), 8192.0), Admission::Allow);
+    }
+
+    /// The kernel's own critical verdict denies. This is the signal preferred over
+    /// any threshold amux could pick, because the kernel computed it from the real
+    /// page accounting.
+    #[test]
+    fn a_kernel_critical_verdict_denies() {
+        assert_eq!(admission_for(Some(4), Some(0.0), 8192.0), Admission::Deny);
+    }
+
+    /// Kernel `warn` is reported, not blocked. Refusing on warn would deny during
+    /// ordinary heavy builds, and a gate that cries wolf is a gate people disable.
+    #[test]
+    fn kernel_warn_is_strained_not_denied() {
+        assert_eq!(admission_for(Some(2), Some(100.0), 8192.0), Admission::Strained);
+    }
+
+    /// Heavy sustained swap denies on its own, because the kernel's pressure level
+    /// can still read `normal` while the working set has stopped fitting.
+    #[test]
+    fn heavy_swap_denies_even_when_the_kernel_says_normal() {
+        assert_eq!(admission_for(Some(1), Some(9000.0), 8192.0), Admission::Deny);
+        assert_eq!(admission_for(Some(1), Some(8192.0), 8192.0), Admission::Deny, "boundary is inclusive");
+        assert_eq!(admission_for(Some(1), Some(8191.9), 8192.0), Admission::Allow);
+    }
+
+    /// UNKNOWN must never deny. On a host where these are unreadable — Linux, the
+    /// cloud container, a sandbox — denying would make amux unable to start any
+    /// worker at all, which is a far worse failure than not having the gate.
+    #[test]
+    fn unreadable_signals_allow_rather_than_brick_the_fleet() {
+        assert_eq!(admission_for(None, None, 8192.0), Admission::Allow);
+        assert_eq!(admission_for(None, Some(100.0), 8192.0), Admission::Allow);
+        assert_eq!(admission_for(Some(1), None, 8192.0), Admission::Allow);
+    }
+
+    /// And the live check must not be denying right now, or every lane start on
+    /// this machine is already broken.
+    #[test]
+    fn the_live_host_is_not_currently_denying() {
+        let a = admission();
+        assert_ne!(
+            a,
+            Admission::Deny,
+            "the gate is DENYING on this host right now — mem: {:?}",
+            mem_health()
+        );
     }
 }
