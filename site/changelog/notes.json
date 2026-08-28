@@ -1,5 +1,32 @@
 [
   {
+    "hash": "33e4d206",
+    "short": "33e4d20",
+    "title": "Create an isolated worker with no harness tools injected",
+    "date": "2026-08-28",
+    "type": "feat",
+    "tags": ["sessions", "dashboard"],
+    "description": "A new ISOLATED option in the session create dialog strips all amux harness tools from the worker at creation time. Use it when you want to run a tool — Plandex, a custom CLI, or a raw Claude Code session — inside amux's monitoring layer without amux's own steering instructions interfering. The dialog also now scrolls to reach the option on small screens."
+  },
+  {
+    "hash": "064d6ebe",
+    "short": "064d6eb",
+    "title": "amux-worker: cross-CLI amux API client for any terminal",
+    "date": "2026-08-28",
+    "type": "feat",
+    "tags": ["cli", "fleet"],
+    "description": "amux-worker is a new cross-CLI API client that lets any terminal — one without a local amux install — make fleet calls against a remote amux server. Point it at AMUX_URL and your auth token to read the board, send messages to workers, peek at session output, and manage the fleet from scripts or CI pipelines. Phase 0/MVP of the amux skills system."
+  },
+  {
+    "hash": "7add17ec",
+    "short": "7add17e",
+    "title": "Creating a Claude session no longer accidentally targets a Gemini worker",
+    "date": "2026-08-28",
+    "type": "fix",
+    "tags": ["sessions", "dashboard"],
+    "description": "The create-session dialog's model default could land on a Gemini worker configuration even when Claude was selected, silently routing the new session to the wrong runtime. The default now resolves to a Claude worker correctly. If you saw new sessions starting with unexpected model behavior, this is the fix."
+  },
+  {
     "hash": "0ae647b1",
     "short": "0ae647b",
     "title": "Real-time backbone health is now visible in the dashboard",
