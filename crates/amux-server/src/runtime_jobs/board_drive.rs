@@ -3103,9 +3103,43 @@ pub fn select_advance_with(
                  cannot reach — the nudge goes nowhere or the conversation about it does, \
                  and the card looks healthy in `review` either way"
             );
-            return Advance::None {
-                reason: "reviewer-unreachable",
-                detail: format!("{card_id} names reviewer `{rev}`: {why}"),
+            // TELL THE AUTHOR, DO NOT JUST WARN (AMUX-3821). This used to
+            // return `Advance::None`, so the one party who can fix it — the
+            // card's owner, who wrote the reviewer field — was the only party
+            // never told. The WARN reached a log; the card sat in `review`
+            // claiming to await a reviewer who will never be reached.
+            //
+            // Measured 2026-08-28: 18 non-terminal cards fleet-wide name
+            // `ethan`, 6 of them sitting in `review`. Naming the human owner is
+            // SEMANTICALLY RIGHT — some work wants his eyes and no peer
+            // substitutes — and mechanically dead, so refusing it at write time
+            // would forbid a true intent and push people to name a peer who is
+            // not the right reviewer (ethos rule 3). The honest move is to say
+            // so and hand over the two ways out.
+            //
+            // `why` already carries both ("reassign to a lane, or move the card
+            // to needsyou if a human owes the review"), which is why this needs
+            // no new vocabulary and covers the typo and renamed-lane cases too
+            // — those were parking just as silently.
+            let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
+            if spent >= budget {
+                return Advance::None {
+                    reason: "budget-spent",
+                    detail: format!("{card_id} unreachable-reviewer nudged {spent}x in 24h"),
+                };
+            }
+            return Advance::Nudge {
+                text: format!(
+                    "`{card_id}` ({}) is in `{status}` naming reviewer `{rev}`, and that review \
+                     will never arrive: {why} Nothing is nudging them and nothing was nudging \
+                     you either, so the card has been reading as healthy while waiting on \
+                     nobody. It is YOUR field to correct — you wrote it.",
+                    row.title
+                ),
+                target: session.to_string(),
+                card: card_id,
+                status,
+                kind: "advance-nudged",
             };
         }
         match reviewer_has_responded(conn, &card_id, &rev) {
@@ -6415,14 +6449,28 @@ mod tests {
         add_card(&conn, "R-9", "lane", "review", "needs a peer", "SCOPE: x");
         conn.execute("UPDATE issues SET reviewer='amux-rust' WHERE id='R-9'", []).expect("rev");
 
+        // AMUX-3821: the guarantee here is that no nudge is addressed to a
+        // session that does not exist. It used to be enforced by nudging NOBODY,
+        // which left the one party who can fix it — the owner, who wrote the
+        // reviewer field — as the only party never told. The card then read
+        // `review` while waiting on nobody. So the assertion is sharpened
+        // rather than relaxed: the dead reviewer must not be the target, AND
+        // the owner must be.
         match select_advance_with(&conn, "lane", &[], now_f64(), &|_, r| {
             Some(format!("`{r}` is not a registered worker"))
         }) {
-            Advance::None { reason, detail } => {
-                assert_eq!(reason, "reviewer-unreachable");
-                assert!(detail.contains("amux-rust"), "must name the dead reviewer: {detail}");
+            Advance::Nudge { target, text, .. } => {
+                assert_ne!(target, "amux-rust", "never address a session that does not exist");
+                assert_eq!(target, "lane", "the OWNER wrote the field and is the one who can fix it");
+                assert!(text.contains("amux-rust"), "must name the dead reviewer: {text}");
+                assert!(
+                    text.contains("not a registered worker"),
+                    "and must carry the REASON, which already names both ways out: {text}"
+                );
             }
-            Advance::Nudge { kind, target, .. } => panic!("an unreachable reviewer must not be nudged (kind={kind}, target={target})"),
+            Advance::None { reason, detail } => {
+                panic!("silence is what left the author untold ({reason}: {detail})")
+            }
         }
 
         match select_advance_with(&conn, "lane", &[], now_f64(), &|_, n| {
