@@ -1858,15 +1858,43 @@ pub(crate) fn choose_target(
             return (TargetChoice::KeepBound(tid.to_string()), false);
         }
     }
+    // PREFER A REAL PAGE OVER A BLANK ONE (AMUX-3834, tubescience).
+    //
+    // This used to take the FIRST listed page, and `/json/list` order is
+    // Chrome's, not ours. So when a bound tab died while a fresh `about:blank`
+    // was open — a new-tab page, a popup, an opener Chrome spawned — the rebind
+    // took the blank one, and because a blank tab IS listed the `KeepBound` arm
+    // above then held the session there permanently. Screenshot and eval both
+    // read that binding and both showed a blank page; only `navigate` escaped,
+    // because it passes a URL and re-targets. That asymmetry is what made this
+    // look like "screenshot resolves differently from action" when in fact every
+    // verb shared one drifted binding.
+    //
+    // The cost of the old behaviour was not a blank screenshot. It was a
+    // screenshot that LOOKS like evidence: tubescience cross-checked with eval
+    // and caught it, and someone who did not would have concluded their UI
+    // change did not render.
+    //
+    // A PREFERENCE, NOT A FILTER. If the only tab is blank, bind to it — the
+    // alternative is opening tabs forever when blank is genuinely all there is.
+    let is_blank = |t: &Value| {
+        let u = t.get("url").and_then(Value::as_str).unwrap_or("");
+        u.is_empty() || u == "about:blank" || u.starts_with("chrome://")
+    };
+    let usable = |t: &&Value| {
+        t.get("type").and_then(Value::as_str) == Some("page")
+            && id_of(t).is_some_and(|id| !claimed_by_others.contains(&id))
+            // Never rebind to the target the caller just told us is
+            // unreachable. Dropping the binding makes it "unclaimed", so
+            // without this the rebind picks straight back up the tab we are
+            // abandoning.
+            && (avoid.is_none() || id_of(t).as_deref() != avoid)
+            && t.get("webSocketDebuggerUrl").is_some()
+    };
     let pick = tabs
         .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        .filter(|t| id_of(t).is_some_and(|id| !claimed_by_others.contains(&id)))
-        // Never rebind to the target the caller just told us is unreachable.
-        // Dropping the binding makes it "unclaimed", so without this the rebind
-        // picks straight back up the tab we are abandoning.
-        .filter(|t| avoid.is_none() || id_of(t).as_deref() != avoid)
-        .find(|t| t.get("webSocketDebuggerUrl").is_some())
+        .find(|t| usable(t) && !is_blank(t))
+        .or_else(|| tabs.iter().find(usable))
         .and_then(id_of);
     match pick {
         Some(tid) => (TargetChoice::Rebind(tid), stale),
@@ -2621,6 +2649,77 @@ mod tests {
     /// FOUR CELLS, and the last two are the ones that keep this honest. Without
     /// the no-avoid cell, dropping every binding unconditionally would pass. Without
     /// the peer cell, avoiding a target by hijacking a peer's tab would pass.
+    /// AMUX-3834 (tubescience): a rebind must not land on a blank tab while a
+    /// real page is available, because a blank binding is PERMANENT.
+    ///
+    /// THE TRAP IS THE `KeepBound` ARM. Once the session is bound to an
+    /// about:blank, that tab IS listed, so every later resolve keeps it — the
+    /// binding never recovers on its own. Closing the blank tabs did not help
+    /// the reporter, because Chrome respawns one and the next rebind takes it
+    /// again.
+    ///
+    /// AND WHY IT LOOKED LIKE A SCREENSHOT BUG: screenshot, eval and action all
+    /// resolve through this one rule, so all three showed the blank page. Only
+    /// `navigate` escaped, because it passes a URL and re-targets. The reporter
+    /// read that asymmetry as "screenshot resolves differently from action";
+    /// their own follow-up disproved it when eval hit the blank origin too.
+    #[test]
+    fn a_rebind_prefers_a_real_page_over_a_blank_one() {
+        let t = |id: &str, url: &str| {
+            json!({"id": id, "type": "page",
+                   "webSocketDebuggerUrl": format!("ws://127.0.0.1:9/devtools/page/{id}"),
+                   "url": url, "title": ""})
+        };
+        let none = std::collections::HashSet::new();
+
+        // The reporter's shape: a blank tab listed FIRST, the real page after.
+        // Chrome's /json/list order is Chrome's, not ours.
+        let tabs = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let (choice, _) = choose_target(&tabs, None, &none, None);
+        assert_eq!(
+            choice,
+            TargetChoice::Rebind("STUDIO".into()),
+            "a real page must win over a blank one regardless of list order"
+        );
+
+        // chrome:// internals are blank-equivalent: a new-tab page is not what
+        // a caller means either.
+        let tabs = vec![t("NEWTAB", "chrome://newtab/"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        assert_eq!(
+            choose_target(&tabs, None, &none, None).0,
+            TargetChoice::Rebind("STUDIO".into()),
+            "chrome:// internals lose to a real page too"
+        );
+
+        // A PREFERENCE, NOT A FILTER. If blank is all there is, bind to it —
+        // the alternative is opening tabs forever when the browser genuinely
+        // has nothing else.
+        let only_blank = vec![t("BLANK", "about:blank")];
+        assert_eq!(
+            choose_target(&only_blank, None, &none, None).0,
+            TargetChoice::Rebind("BLANK".into()),
+            "with nothing else, a blank tab is still usable"
+        );
+
+        // THE CONTROLS, so the preference cannot quietly override the rules it
+        // sits inside. `avoid` still wins: a real page the caller just proved
+        // unreachable must NOT be picked over a blank one.
+        let tabs = vec![t("BLANK", "about:blank"), t("DEAD", "https://studio.mixpeek.com/x")];
+        assert_eq!(
+            choose_target(&tabs, Some("DEAD"), &none, Some("DEAD")).0,
+            TargetChoice::Rebind("BLANK".into()),
+            "an unreachable real page loses to a usable blank one"
+        );
+        // And a peer's claim still wins over the preference.
+        let claimed: std::collections::HashSet<String> = ["STUDIO".to_string()].into();
+        let tabs = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        assert_eq!(
+            choose_target(&tabs, None, &claimed, None).0,
+            TargetChoice::Rebind("BLANK".into()),
+            "a real page claimed by a peer must not be hijacked for being real"
+        );
+    }
+
     #[test]
     fn a_listed_but_unreachable_target_is_abandoned_and_not_picked_up_again() {
         let tab = |id: &str| {
