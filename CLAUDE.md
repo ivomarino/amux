@@ -175,12 +175,16 @@ If secrets cannot be loaded, server logs a warning and continues (allows operati
 - Modal dialogs for editing
 - Dark mode support
 
-**Phase 6: MCP Integration** ✅
-- Claude agents can request secrets via MCP
-- `REQUEST_SECRET` tool for specific paths
-- `LIST_SECRETS` and `INSPECT_SCHEMA` tools
-- Secure request logging
-- Ready for rate limiting
+**Phase 6: MCP Integration — NOT actually wired up.** `mcp_secrets.rs` existed
+with `request_secret`/`list_secrets`/`inspect_schema` functions and this
+section claimed ✅, but there is no MCP tool dispatcher anywhere in the
+codebase that calls them by name — `dead_pub_api.rs`'s bare-name scanner
+caught `request_secret` (the other two escaped detection only because they
+share a name with unrelated functions in `api/secrets.rs`). Removed
+2026-08-27: the real, working path for secret access is the REST API below
+(`/api/secrets/*`), already used by the dashboard's Secrets tab. If MCP tool
+access is wanted, it needs an actual dispatcher wired to a real MCP server,
+not just handler functions sitting in a module nothing calls.
 
 **Phase 7: GitHub OAuth Connector** ✅
 - Full OAuth 2.0 flow with GitHub
