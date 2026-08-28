@@ -601,6 +601,28 @@ fn browser_is_on_this_machine_with(
     resolve(&hostname).into_iter().any(|ip| ip == peer)
 }
 
+
+/// The authority the client addressed, from EITHER protocol version.
+///
+/// HTTP/2 HAS NO `Host` HEADER (RFC 9113 §8.3.1): the authority travels as the
+/// `:authority` pseudo-header, which axum surfaces on the URI. This server
+/// negotiates h2 by default, so browsers — the only client that matters for
+/// this endpoint — never send `Host`, and reading the header alone returned
+/// None for every real request.
+///
+/// Found by testing the shipped endpoint rather than the function: under
+/// `--http1.1` the same call answered `local:true`, and unforced it answered
+/// 409. The unit cells passed a Host string straight in, so they proved the
+/// DECISION and could not see the EXTRACTION. A guard tested against a fixture
+/// proves it can fail, not that it is wired to what ships.
+fn request_authority(req: &Request) -> Option<String> {
+    req.headers()
+        .get(axum::http::header::HOST)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().authority().map(|a| a.to_string()))
+}
+
 async fn open_native(req: Request) -> Response {
     if req.method() != Method::POST {
         return not_found().await;
@@ -611,11 +633,7 @@ async fn open_native(req: Request) -> Response {
         .extensions()
         .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
         .map(|ci| ci.0.ip());
-    let host_header = req
-        .headers()
-        .get(axum::http::header::HOST)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string);
+    let host_header = request_authority(&req);
     let local_browser = browser_is_on_this_machine(peer, host_header.as_deref());
     let bytes = match axum::body::to_bytes(req.into_body(), usize::MAX).await {
         Ok(b) => b,
@@ -2137,6 +2155,50 @@ mod open_native_locality_tests {
             !browser_is_on_this_machine_with(Some(ip("100.66.26.84")), host, dns),
             "a DIFFERENT tailnet node reaching the same host is REMOTE"
         );
+    }
+
+    /// HTTP/2 CARRIES NO `Host` HEADER, and this endpoint's only real client
+    /// speaks h2. The first version of this fix read the header alone, so every
+    /// browser request resolved an authority of None and refused as remote —
+    /// the four cells above all passed, because they hand a Host string
+    /// straight to the decision and never touch the extraction.
+    ///
+    /// Caught by curling the SHIPPED endpoint: `--http1.1` answered
+    /// {"local":true}, unforced answered 409, and the server negotiates h2 by
+    /// default. This cell pins the extraction so the two protocol shapes cannot
+    /// diverge again.
+    #[test]
+    fn the_authority_is_read_from_h2_as_well_as_from_the_host_header() {
+        use axum::http::Request as HttpRequest;
+
+        // HTTP/1.1: authority in the Host header, URI is origin-form.
+        let h1 = HttpRequest::builder()
+            .uri("/api/fs/open")
+            .header("host", "desktop.tail5ce8f5.ts.net:8824")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            super::request_authority(&h1).as_deref(),
+            Some("desktop.tail5ce8f5.ts.net:8824"),
+            "HTTP/1.1 puts it in the Host header"
+        );
+
+        // HTTP/2: no Host header at all; :authority lands on the URI.
+        let h2 = HttpRequest::builder()
+            .uri("https://desktop.tail5ce8f5.ts.net:8824/api/fs/open")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert!(h2.headers().get(axum::http::header::HOST).is_none(), "fixture must have NO Host");
+        assert_eq!(
+            super::request_authority(&h2).as_deref(),
+            Some("desktop.tail5ce8f5.ts.net:8824"),
+            "h2 carries it as :authority on the URI — reading the header alone refuses \
+             every browser request as remote"
+        );
+
+        // Neither: still None, so the caller's fail-safe (remote) applies.
+        let bare = HttpRequest::builder().uri("/api/fs/open").body(axum::body::Body::empty()).unwrap();
+        assert_eq!(super::request_authority(&bare), None);
     }
 
     /// Loopback short-circuits before DNS: a resolver that answers nothing must
