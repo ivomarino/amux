@@ -188,15 +188,39 @@ def restart_gateway():
 def escalate_board(summary, detail):
     """Board-only escalation: for problems worth a human's queue but not the owner
     fire-alarm (e.g. cloud serves traffic fine but the env-check instrument is down).
-    escalate() layers the alert on top of this for real outages."""
+    escalate() layers the alert on top of this for real outages.
+
+    DEDUPED by title-prefix: a persistent condition (a multi-day CI freeze, a
+    standing warn) must UPDATE its existing open card, not file a new one every
+    daily run — otherwise the sweep accumulates instead of discriminating (ethos
+    rule 5; the AC-344 freeze escalation would have spawned one card per day)."""
     trace("escalate_board", summary, None)
+    title = "cloud-autofix: %s" % summary
+    # A stable key: the summary up to its first em-dash/number so "FROZEN — 4
+    # commits" and "FROZEN — 5 commits" collapse to one running card.
+    key = title.split("—")[0].strip().rstrip("0123456789 ")
     try:
         base = subprocess.run(["amux", "url"], capture_output=True, text=True, timeout=10).stdout.strip()
-        subprocess.run(["curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
-                        "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
-                        "-d", json.dumps({"title": "cloud-autofix: %s" % summary, "desc": detail,
-                                          "status": "needsyou", "session": "amux-cloud"}),
-                        "%s/api/board" % base], capture_output=True, text=True, timeout=15)
+        existing = None
+        rows = subprocess.run(["curl", "-sk", "%s/api/board" % base],
+                              capture_output=True, text=True, timeout=15).stdout
+        for it in json.loads(rows):
+            t = it.get("title") or ""
+            if t.split("—")[0].strip().rstrip("0123456789 ") == key and it.get("status") in ("needsyou", "todo", "doing"):
+                existing = it.get("id"); break
+        if existing:
+            # Refresh title + append a dated line; keep the human's context intact.
+            subprocess.run(["curl", "-sk", "-X", "PATCH", "-H", "Content-Type: application/json",
+                            "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
+                            "-d", json.dumps({"title": title,
+                                              "desc_append": "\n\n[autofix re-observed %d] %s" % (int(time.time()), detail)}),
+                            "%s/api/board/%s" % (base, existing)], capture_output=True, text=True, timeout=15)
+        else:
+            subprocess.run(["curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
+                            "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
+                            "-d", json.dumps({"title": title, "desc": detail,
+                                              "status": "needsyou", "session": "amux-cloud"}),
+                            "%s/api/board" % base], capture_output=True, text=True, timeout=15)
     except Exception:
         pass
 
