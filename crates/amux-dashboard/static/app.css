@@ -2935,8 +2935,21 @@
        21st, up from 20) was that item — e2e caught it as a clipped menu, not
        a missing tab. A cap here is not "enough for 21 today", it is the fix
        for every count from here on: each future tab this dashboard grows
-       would otherwise silently re-trip the same ancestor-overflow clip. */
-    max-height: calc(100vh - 80px); overflow-y: auto;
+       would otherwise silently re-trip the same ancestor-overflow clip.
+
+       THE FIRST ATTEMPT AT THIS FIX WAS A NO-OP, measured, not guessed:
+       `calc(100vh - 80px)` = 720px on the e2e desktop fixture (1280x800),
+       but the menu's own unclipped content height was only 652px — the cap
+       never engaged because it was LARGER than the thing it was supposed to
+       constrain. `top: calc(100% + 2px)` positions this menu below the
+       button, ~174px down the page (the nav bar it lives in), which a bare
+       100vh subtraction does not account for — the button's row easily eats
+       more than 80px on its own once padding/borders are counted. -200px
+       leaves real headroom for that offset (600px at the 800px-tall e2e
+       fixture, comfortably under the 626px actually available) while still
+       giving a normal desktop window (1080px+) enough room to show all
+       items without scrolling. */
+    max-height: calc(100vh - 200px); overflow-y: auto;
   }
   #peek-tab-customizer-menu { position: fixed; z-index: 300; }
   .tab-customizer-item {
