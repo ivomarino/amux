@@ -1721,3 +1721,181 @@ FIX: NOT more care. This is the THIRD entry on AF-182 (the others at L2070 and L
   reaches the three-entry threshold that makes it an argument rather than a complaint,
   I think the answer is a real one (per-lane worktrees for anything that runs a test
   server) and not more care from me. Count it." Counted.
+
+## The log sweep's own instrument could only show it 1.6% of the window it was judging
+VALIDATED: amux-frustrations | Re-verified 2026-08-28 against the entry's own FIX claim, not the subsystem. `until` is
+honoured (`since < ts <= until`; every returned row satisfied the upper bound), and the
+response now carries `truncated`, `page_span_h` and a `note` reading "TRUNCATED: these are
+the newest rows, not the whole window. Page backward with `until=...`".
+
+Exercised on its author the same day: today's log sweep called /api/logs for step 5, got
+`page_span_h=0.79 truncated=True`, and I changed approach BECAUSE the response said so
+rather than by noticing `total_matched` disagreed. That is precisely the cost this entry
+records - the sweep was reaching "the accusation you cannot un-say" from one capped page,
+and the mismatch had to be noticed rather than read.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-26
+SESSION: amux-frustrations
+CARD: AF-230
+SYMPTOM: `GET /api/logs?since=<24h ago>&limit=2000` answered `total_matched: 123645`,
+  `count: 2000`, and the rows it returned spanned 0.48 HOURS. `since` ("ts > ?") was the
+  only time bound, and the query is `ORDER BY ts DESC LIMIT <=2000`, so every call returns
+  the same newest rows and there is no way to page backward. Nothing in the response said
+  the page was a slice — `total_matched` disagreed with the window being described, but the
+  mismatch had to be noticed rather than read.
+COST: Sweep step 5 decides whether a lane is doing mutating work with no board trace — the
+  contract's own words are that this is "the accusation you cannot un-say", and it lists
+  seven qualifications, each added after a false positive. That step has been reaching its
+  verdict from one capped page for as long as it has existed. Today's answer was clean, so
+  the cost was not a wrong accusation; it was that a clean 29 minutes was on its way to
+  being reported as a clean day. The contract already carried a workaround telling the
+  reader to state the blind spot "or read the store directly for the full window" — routing
+  a caller off the sanctioned instrument onto raw SQL, which is the rule 6 shape.
+FIX: fcff219e. `until` ("ts <= ?") makes the window walkable (`since < ts <= until`), and
+  the response now admits when it is a slice: `truncated`, `page_span_h`, and a note naming
+  the paging move. `analyze` and `stats` already publish `scan_truncated`/`actual_window_h`
+  for exactly this reason; this is the same admission on the endpoint that lacked it, so the
+  next capped read announces itself in the payload the caller already opens. The contract's
+  step 5 now carries the paging loop instead of the workaround.
+
+## The ledger cannot express that an entry is unvalidatable, so 20% of the open set can never drain
+VALIDATED: amux-frustrations | Re-verified 2026-08-28 by running the shipped audit and checking BOTH directions, because
+this entry's complaint was that the two cases read byte-identically.
+
+  AEAB-* (non-fleet namespace, author absent from the fleet):
+    "STRANDED: prefix AEAB exists nowhere on this board and author
+     amux-errors-and-bugs is not in this fleet"  x12
+  AC-227 (amux-cloud, a LIVE lane here): not flagged at all - no line emitted.
+
+So the discriminator fires on the stranded set and stays silent on the ordinary
+cross-instance id, which is the distinction the entry says did not exist. The summary line
+now states the number outright: "STRANDED 12 entr(ies) cite a card no one in this fleet can
+reach", against the 12 of 59 the entry measured.
+
+The discriminator is the PREFIX NAMESPACE plus author liveness rather than author liveness
+alone, which is what keeps a live lane's cross-instance card out of the stranded bucket.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux-frustrations
+CARD: AF-229
+SYMPTOM: `frustrations_audit.py` resolves every CARD: against the live board and printed one
+  advisory when it missed: "not on this board (other instance, or deleted)". Byte-identical
+  for AC-227 (amux-cloud, a LIVE lane here) and AEAB-18 (amux-errors-and-bugs, absent from
+  all 120 sessions, working out of a `~/Developer/amux` that does not exist on this machine).
+  12 of 59 open entries are AEAB-*; direct GET returns 404 for each, and 0 of 9,296 cards
+  carry that prefix while DESKT-*, also a non-fleet lane, carries 25.
+COST: The deletion protocol keys removal to the ORIGINATING session's sign-off, so those 12
+  have no party who can ever sign them off — they accumulate in the open set forever while
+  reading as ordinary work. This file's entire argument is a COUNT ("three entries sharing an
+  AREA is an argument"), so a fifth of the open set being permanently unactionable distorts
+  every AREA tally computed from it, including the ones used to decide what to rebuild next.
+  Not hypothetical: it is why the drive-to-zero sweep stalled at 59 rather than finishing.
+FIX: 04721906. The advisory stays advisory — a cross-instance id is not an error — but it now
+  discriminates, and the discriminator is the PREFIX NAMESPACE rather than author liveness.
+  That distinction is load-bearing: amux-rust is not live either, yet AR-114 answers HTTP 200,
+  so judging on liveness alone called six drainable AR-* entries permanently stranded on the
+  first run. Same commit fixes a defect it exposed rather than caused: `board.get()` was called
+  on the whole CARD string, so multi-id fields ("AR-114, AR-115, AR-116") had ALWAYS reported
+  unresolved, invisibly, until the branch started saying something specific and said it wrongly.
+  Two of three predicate mutations survived the first draft of the test suite, which is why the
+  roll-up and the empty-session-list controls exist as their own cells.
+  STILL OPEN, and it is Ethan's call, not mine: what actually happens to those 12 entries.
+  Reaching amux-errors-and-bugs, or retiring them with a rationale, is a decision about another
+  party's contributions (ethos rule 8). The audit now names them; it does not presume to sweep them.
+
+## The archive tool took evidence as an argv positional, so my shell executed the code I quoted
+VALIDATED: amux-frustrations | Re-verified 2026-08-28. Both safe paths exist on the tool and the usage text prefers them:
+
+    scripts/frustrations-archive.py <line> <validated-by> --evidence-stdin
+    scripts/frustrations-archive.py <line> <validated-by> --evidence-file <path>
+    PREFER --evidence-stdin/--evidence-file whenever the evidence quotes code.
+
+Exercised rather than read: this validation and the two archived alongside it were all
+written through --evidence-stdin, and the heredoc bodies contain backticks and $(...)
+that reached the archive byte-for-byte. That is the exact substitution which corrupted
+AF-130's archive line in two places and left only a misleading `now: command not found`
+on screen.
+
+The argv positional form still exists and is still unsafe with quoted code. That is a
+choice rather than a trap now: the safe path is documented and preferred at the point of
+use, which is what this entry asked for.
+AREA: cli
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: amux-frustrations
+CARD: AF-223
+SYMPTOM: Archiving AF-130 with evidence that quoted code, via
+  `scripts/frustrations-archive.py <line> <who> "<evidence...>"`. Bash printed
+  `line 1: now: command not found` and the archive line landed corrupted in TWO places:
+  "asserts it comes back as , with the comment" (backtick-now evaluated to empty) and
+  "so 0 returned 0 across the whole window" — where `grep -c 'WORK ITSELF is at risk'`
+  was EXECUTED by my shell and replaced by its own output. The archive succeeded; only
+  the one visible bash error hinted anything was wrong, and it named the wrong half.
+COST: a mangled quotation written into the file that exists to be the DURABLE RECORD of
+  what was verified, and the least recoverable place for it: the entry it describes had
+  just been deleted from frustrations.md in the same operation. Caught only because the
+  stray `now: command not found` was on screen. A quieter substitution — `$(date)`, or a
+  grep that returns nothing — would have left a plausible sentence and no error at all.
+FIX: shipped in the same breath. `--evidence-stdin` / `--evidence-file` on the tool, with
+  the usage text saying to prefer them whenever the evidence quotes code. Verified the
+  file path preserves backticks and $(...) byte-for-byte.
+NOTE: this is AMUX-1888's shape, and the rule already exists — `amux send` and
+  `amux board add` both grew --stdin/--file for exactly this, and CLAUDE.md states it as a
+  fleet convention I have cited repeatedly this week. My own tool was written in the old
+  shape and I used it the old way. The lesson is not "remember the rule": it is that a
+  tool taking free text as an argv positional MAKES the trap, and every such tool in this
+  repo has now had to learn the same lesson separately.
+
+## The e2e suite restarts its own servers mid-run, and blames whichever specs were mid-navigation
+VALIDATED: amux-frustrations | Validated 2026-08-28 on the OUTCOME half of the entry's own prediction, with the other half
+stated as unverified rather than assumed.
+
+The entry predicted two things of "the next e2e job": zero `binary changed on disk` lines,
+and no ERR_CONNECTION_REFUSED failures.
+
+CONFIRMED - the failure it describes did not occur, on real specimens of the exact shape
+that motivated it. Two OUTSIDE CONTRIBUTOR PRs ran full e2e yesterday and both passed:
+#161 e2e 17m38s, #162 e2e 21m9s. Both branches were based on cad635ea, and 67474428 is an
+ancestor of it, so those runs contained the fix. The mechanism is still in place:
+e2e/serve-head.sh:59 exports AMUX_NO_SELF_ADOPT=1.
+
+That is the COST this entry records, gone: "a contributor's PR blocked on a red check that
+was never theirs". Two contributor PRs went green through e2e and merged.
+
+NOT CONFIRMED, and I will not claim it: zero `binary changed on disk` lines in the job log.
+I tried to read run 33083312377's log and got 0 BYTES back. Grepping it returned 0 for the
+predicted strings - which is what a genuinely clean log returns and also what an empty file
+returns. A positive control (grep for "passed", "playwright", "e2e") returned 0 for those
+too, which is how I know the fetch failed rather than the log being clean. Sixth instance
+of that shape today and the first one caught before it became evidence.
+
+The outcome half is the one that carries the cost, and it is confirmed twice.
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-23
+SESSION: amux-frustrations
+CARD: AF-185
+SYMPTOM: PR 148 (an outside contributor's) was red with e2e 4 failed / 228 passed, every failure
+  `net::ERR_CONNECTION_REFUSED at https://localhost:18823/`, and nothing anywhere said why. The
+  suite starts three servers (desktop/mobile/ios-safari), each a `cargo run` rebuilding into the
+  SAME target dir; every rebuild rewrites target/debug/amux-server, and a running server watches
+  that path and exec's itself. Run 32671387493's log has three `binary changed on disk —
+  exec'ing the new build in place` lines, each right after a sibling target's build finished,
+  each costing ~10s of refused connections while the suite drove that server.
+COST: A contributor's PR blocked on a red check that was never theirs, with no way to tell from
+  the PR. Because the victims are chosen by timing they move run to run, so no spec is reliably
+  guilty and the whole thing reads as flakiness rather than a defect with a cause. That is the
+  same misattribution shape as AF-179 and AF-182: a true statement about the environment
+  delivered as a statement about the thing under test.
+FIX: 67474428 — the suite sets AMUX_NO_SELF_ADOPT=1. The capability already existed (AEAB-52)
+  and its own doc comment says what it is for, "a test harness pins its build on purpose"; the
+  one harness in this repo that pins its build was not enrolled. Rule 1 exactly. Not yet proven
+  in CI: the prediction is zero `binary changed on disk` lines in the next e2e job and no
+  ERR_CONNECTION_REFUSED failures, and if they persist the env is not reaching the server through
+  serve-head.sh.
