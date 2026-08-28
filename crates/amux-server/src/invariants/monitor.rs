@@ -418,6 +418,13 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         max_ts: i64,
     }
     let mut map: std::collections::HashMap<String, Acc> = std::collections::HashMap::new();
+    // ISOLATED LANES MUST STILL REPORT (AMUX-3824, second pass). Skipping them
+    // outright was my first fix and it was wrong in the way this file keeps
+    // teaching: a skipped entity emits NO result, so `latest_per_invariant`
+    // holds its last one forever — `self` stayed RED after the fix deployed,
+    // because the check simply stopped speaking about it. Absence is not health
+    // (ethos rule 4). An isolated lane is a PASS with a reason, not a silence.
+    let mut isolated_seen: std::collections::BTreeSet<String> = Default::default();
     for (session, text, carded, ts) in rows {
         if session.is_empty() || amux_core::board::title_from_prompt(&text).is_none() {
             continue;
@@ -438,6 +445,7 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
         // Calls the MINT'S OWN predicate rather than re-reading CC_ISOLATED here,
         // so the exclusion cannot drift from the rule it mirrors (ethos rule 1).
         if crate::api::session_verbs::session_is_isolated(&session) {
+            isolated_seen.insert(session);
             continue;
         }
         let e = map.entry(session).or_insert(Acc {
@@ -462,7 +470,15 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
             span_s: (a.max_ts - a.min_ts) / 1000,
         })
         .collect();
-    checks::user_prompts_produce_cards(&stats, min_cardable, dedup_window_s)
+    let mut out = checks::user_prompts_produce_cards(&stats, min_cardable, dedup_window_s);
+    // An isolated lane PASSES, explicitly and by name, so its entity keeps
+    // reporting. Appended rather than folded into `stats` because it is a
+    // different claim: not "this lane carded its prompts" but "this lane is not
+    // supposed to card them" (AMUX-3232), and the two should not be one row.
+    for session in isolated_seen {
+        out.push(InvariantResult::pass(ID).entity(&session));
+    }
+    out
 }
 
 /// The derived card status against the physical pane, per lane (AMUX-2646).
