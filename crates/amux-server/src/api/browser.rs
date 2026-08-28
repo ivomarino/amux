@@ -941,6 +941,15 @@ async fn status() -> Response {
         Ok(t) => (t, Value::Null),
         Err(e) => (Value::Null, json!(e.to_string())),
     };
+    // THE REAP COUNTDOWN, VISIBLE (AMUX-3829, second pass). It used to live only
+    // in the reaper's process memory, so a reaper about to fire and one that
+    // could never fire looked identical from outside — which is exactly how the
+    // in-memory clock's restart bug survived being shipped.
+    let idle = crate::runtime_jobs::browser_reaper::idle_ages(
+        &chrome::amux_home(),
+        crate::config::now_f64(),
+    );
+    let reap_after = crate::runtime_jobs::browser_reaper::reap_after_s();
     // Per-browser rows, so two workers can each see their own.
     let mut browsers: Vec<Value> = Vec::new();
     for (p, o, st, pid, port) in &all {
@@ -953,6 +962,11 @@ async fn status() -> Response {
             "cdp_port": port,
             "tabs": t.clone().unwrap_or(Value::Null),
             "tab_count": t.as_ref().and_then(|v| v.as_array().map(|a| a.len())),
+            // Absent (null) when the profile is not currently empty, which is a
+            // different fact from "empty for 0 seconds" and the one a reader
+            // needs: null here means nothing is counting down.
+            "idle_s": idle.get(p).map(|v| v.round()),
+            "reap_after_s": if reap_after == 0 { Value::Null } else { json!(reap_after) },
         }));
     }
     Json(json!({

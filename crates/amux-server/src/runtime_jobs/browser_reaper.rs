@@ -28,7 +28,6 @@
 //! wedge into a destroyed session.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
 /// How long a profile must be CONTINUOUSLY empty before it is released.
@@ -54,9 +53,38 @@ fn tick_secs() -> u64 {
 }
 
 /// When each profile was FIRST seen empty. Absent = not currently empty.
-fn empty_since() -> &'static Mutex<HashMap<String, f64>> {
-    static M: std::sync::OnceLock<Mutex<HashMap<String, f64>>> = std::sync::OnceLock::new();
-    M.get_or_init(Default::default)
+///
+/// ON DISK, NOT IN MEMORY, AND THAT IS THE WHOLE POINT (AMUX-3829, second pass).
+///
+/// The first version held this in a process-global map. The builder installs a
+/// new binary and the server self-adopts on EVERY commit, which resets it, so
+/// the window restarted every time anyone committed. Measured on the day this
+/// was found: 22 builds between 06:33 and 16:26, median gap 16.7 minutes, and
+/// only TWO gaps of 60 minutes or more. Against a 3600s window that is a reaper
+/// which on a working day can almost never fire, while reporting `spawned:
+/// true, ticks: N, status: ok` throughout.
+///
+/// So the card's claim that "the 18-hour zombie cannot recur" was false as
+/// shipped. Nothing would have shown it: the job's own health is about the LOOP
+/// running, and the loop was running perfectly.
+///
+/// The file is the reaper's alone. It is rewritten each tick, so a stale entry
+/// for a profile that is no longer running is pruned rather than accumulated.
+fn idle_path(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("browser-idle.json")
+}
+
+fn read_idle(home: &std::path::Path) -> HashMap<String, f64> {
+    std::fs::read_to_string(idle_path(home))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HashMap<String, f64>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn write_idle(home: &std::path::Path, m: &HashMap<String, f64>) {
+    if let Ok(text) = serde_json::to_string(m) {
+        let _ = std::fs::write(idle_path(home), text);
+    }
 }
 
 /// Does this CDP listing contain a real page?
@@ -107,31 +135,39 @@ async fn tick(home: &std::path::Path) -> Vec<String> {
     }
     let mut reaped = vec![];
     let now = now_f64();
+    // `None` when the process never recorded a boot (tests), which the log line
+    // then reports as absent rather than as "none of the window predates this
+    // process" — a 0 there would be a claim nobody measured.
+    let boot = crate::runtime_jobs::heartbeat::boot_at();
+    let prior = read_idle(home);
+    let mut next: HashMap<String, f64> = HashMap::new();
     for (profile, owner, _started, _pid, port) in crate::integrations::browser::running_all() {
         // CDP SILENCE IS NOT EMPTINESS. A browser that will not answer is left
         // alone: killing it would turn a transient wedge into a destroyed
         // session, and this job's whole safety argument rests on knowing there
-        // is nothing open.
+        // is nothing open. Dropping the entry (rather than carrying it) resets
+        // the window, which is the conservative direction.
         let Ok(listed) = crate::integrations::browser::cdp_list(port).await else {
-            empty_since().lock().unwrap_or_else(|e| e.into_inner()).remove(&profile);
             continue;
         };
         let empty = listed.as_array().map(|a| !has_real_page(a)).unwrap_or(false);
-        let first_empty = {
-            let mut g = empty_since().lock().unwrap_or_else(|e| e.into_inner());
-            if !empty {
-                g.remove(&profile);
-                None
-            } else {
-                Some(*g.entry(profile.clone()).or_insert(now))
-            }
-        };
-        if !should_reap(first_empty, now, after_s) {
+        if !empty {
+            // One real page anywhere resets the clock: the entry is simply not
+            // carried into `next`, which is written back at the end.
             continue;
         }
-        let idle_s = first_empty.map(|t| now - t).unwrap_or(0.0);
+        let first_empty = *prior.get(&profile).unwrap_or(&now);
+        next.insert(profile.clone(), first_empty);
+        if !should_reap(Some(first_empty), now, after_s) {
+            continue;
+        }
+        let idle_s = now - first_empty;
         tracing::info!(
             profile = %profile, owner = %owner, idle_s = idle_s as i64, after_s,
+            // How much of the window predates this process. A non-zero value here
+            // IS the restart-survival working; the in-memory version could only
+            // ever print 0 and nobody would have known to look (AMUX-3829).
+            pre_boot_s = boot.map(|b| (b - first_empty).max(0.0) as i64).unwrap_or(-1),
             "browser: releasing a profile with no real page open for the whole idle window \
              (AMUX-3829). Logins are on disk and survive; only a relaunch is lost."
         );
@@ -139,10 +175,24 @@ async fn tick(home: &std::path::Path) -> Vec<String> {
         // what happened rather than leaving the AMUX-3414 silence — a browser
         // that vanished with nothing on record cost two sessions a morning.
         crate::integrations::browser::stop_profile_as(home, &profile, "idle-reaper").await;
-        empty_since().lock().unwrap_or_else(|e| e.into_inner()).remove(&profile);
+        next.remove(&profile);
         reaped.push(profile);
     }
+    // Rewritten whole, so a profile that stopped running drops out instead of
+    // accumulating: at 100x the browsers this is still one small file.
+    if next != prior {
+        write_idle(home, &next);
+    }
     reaped
+}
+
+/// How long each running profile has been continuously empty, for
+/// `/api/browser/status` (AMUX-3829). The countdown was invisible: the only way
+/// to know whether a browser was about to be reaped was to read the process's
+/// memory, so a reaper that could never fire looked identical to one that was
+/// about to.
+pub fn idle_ages(home: &std::path::Path, now: f64) -> HashMap<String, f64> {
+    read_idle(home).into_iter().map(|(k, t)| (k, (now - t).max(0.0))).collect()
 }
 
 /// Spawn the loop, registered so a dead reaper is visible on
@@ -187,6 +237,45 @@ mod tests {
         // CONTROL: one real page among blanks keeps it alive. A predicate that
         // ignored the real one would reap a browser someone is using.
         assert!(has_real_page(&[page("about:blank"), page("https://x.com/")]));
+    }
+
+    /// AMUX-3829, second pass. The window must SURVIVE a restart, because the
+    /// builder installs a new binary and the server self-adopts on every commit.
+    /// Measured the day this was found: 22 builds in 10 hours, median gap 16.7
+    /// minutes, only TWO gaps past the 3600s window. An in-memory clock made
+    /// this a reaper that could almost never fire while reporting itself
+    /// healthy, since the loop was running perfectly the whole time.
+    #[test]
+    fn the_idle_clock_is_read_back_from_disk_rather_than_restarting() {
+        let tmp = std::env::temp_dir().join(format!("amux-reap-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).expect("tmpdir");
+
+        // Nothing recorded yet: absent, not zero.
+        assert!(super::read_idle(&tmp).is_empty());
+        assert!(super::idle_ages(&tmp, 1000.0).is_empty());
+
+        // A window that began 50 minutes ago, written by a PREVIOUS process.
+        let mut m = std::collections::HashMap::new();
+        m.insert("atlas".to_string(), 1000.0);
+        super::write_idle(&tmp, &m);
+
+        // A fresh process reads it back and the clock keeps running. This is the
+        // assertion the in-memory version could not pass.
+        assert_eq!(super::read_idle(&tmp).get("atlas"), Some(&1000.0));
+        assert_eq!(super::idle_ages(&tmp, 4000.0).get("atlas"), Some(&3000.0));
+        // And the reap decision therefore fires on the CARRIED window: 3600s
+        // after the original first-empty, not 3600s after this process started.
+        assert!(should_reap(Some(1000.0), 4600.0, 3600));
+        assert!(!should_reap(Some(1000.0), 4599.0, 3600));
+
+        // A corrupt or truncated file reads as "nothing recorded" rather than
+        // panicking or inventing a timestamp — the conservative direction, since
+        // it restarts the window instead of reaping early.
+        std::fs::write(super::idle_path(&tmp), "{not json").expect("write");
+        assert!(super::read_idle(&tmp).is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// Idle is CONTINUOUS emptiness, and the window is a floor not a ceiling.

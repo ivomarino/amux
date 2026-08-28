@@ -12248,11 +12248,16 @@ async fn post_dispatch(
                 tracing::warn!(
                     session = %name, sha = %sha, subject = %subj,
                     staged_at_hook = staged_at_hook.map(|n| n as i64).unwrap_or(-1),
+                    // The gloss follows what THIS line actually carries. It used
+                    // to explain the -1 sentinel unconditionally, so a line
+                    // reading `staged_at_hook=1` came with a sentence about a
+                    // value it did not have. Caught by probing the arm rather
+                    // than by reading the code.
                     "commit-report: EMPTY COMMIT — this sha contains no files, so the change it \
                      claims is still uncommitted in the working tree (AMUX-3837). On a shared \
                      checkout any peer's checkout or stash destroys it, and a card closed citing \
-                     this sha is citing nothing. staged_at_hook=-1 means the hook did not report, \
-                     which is not the same as it having seen nothing."
+                     this sha is citing nothing. {}",
+                    empty_commit_hook_gloss(staged_at_hook)
                 );
             }
             let session = name.to_string();
@@ -12260,26 +12265,7 @@ async fn post_dispatch(
             // Named so the log line can say WHY it is silent: absent because
             // the commit was fine, versus absent because nothing looked.
             let shape_note = match shape {
-                commit_shape::Shape::Empty => {
-                    // The PAIR, when we have it: N staged at the hook and 0 in
-                    // the commit is the index emptying mid-window, demonstrated
-                    // rather than inferred. Absent when the hook did not report,
-                    // and it says so instead of implying zero.
-                    let seen = match staged_at_hook {
-                        Some(n) if n > 0 => format!(
-                            " The pre-commit hook saw {n} staged file(s) and this commit has none, \
-                             so the index was emptied between the hook and the write."
-                        ),
-                        Some(_) => " The pre-commit hook also saw nothing staged.".to_string(),
-                        None => " (The hook did not report a staged count, so what it saw is \
-                                 unknown rather than zero.)"
-                            .to_string(),
-                    };
-                    format!(
-                        " — **EMPTY: this commit contains no files. Your change is still \
-                         uncommitted.**{seen}"
-                    )
-                }
+                commit_shape::Shape::Empty => empty_commit_card_note(staged_at_hook),
                 commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
                 _ => String::new(),
             };
@@ -20459,6 +20445,45 @@ mod roster_tests {
 
 }
 
+/// The gloss that belongs beside THIS `staged_at_hook` value (AMUX-3837).
+///
+/// Written as a function because the first version hardcoded the explanation of
+/// the `-1` sentinel into the message, so a WARN carrying `staged_at_hook=1`
+/// arrived with a sentence about a value it did not have. A live probe of the
+/// arm found it; reading the code had not.
+pub fn empty_commit_hook_gloss(staged_at_hook: Option<usize>) -> &'static str {
+    match staged_at_hook {
+        Some(n) if n > 0 => {
+            "The pre-commit hook saw files staged for this commit, so the index was emptied \
+             between the hook and the write."
+        }
+        Some(_) => "The pre-commit hook also saw nothing staged, so the index was already empty.",
+        None => "staged_at_hook=-1 means the hook did not report, which is not the same as it \
+                 having seen nothing.",
+    }
+}
+
+/// The line an empty commit adds to its card's log.
+///
+/// Pure and separate so the SENTENCE has cells. amux-frustrations' review noted
+/// that the `Some(n)` arm had never rendered in production and that manufacturing
+/// an `--allow-empty` commit in the shared checkout to see it would leave debris
+/// outliving the test. That is right, and it is also the reason the sentence
+/// should not depend on production to be checked at all.
+pub fn empty_commit_card_note(staged_at_hook: Option<usize>) -> String {
+    let seen = match staged_at_hook {
+        Some(n) if n > 0 => format!(
+            " The pre-commit hook saw {n} staged file(s) and this commit has none, so the index \
+             was emptied between the hook and the write."
+        ),
+        Some(_) => " The pre-commit hook also saw nothing staged.".to_string(),
+        None => " (The hook did not report a staged count, so what it saw is unknown rather \
+                 than zero.)"
+            .to_string(),
+    };
+    format!(" — **EMPTY: this commit contains no files. Your change is still uncommitted.**{seen}")
+}
+
 /// Did the commit that just reported itself actually contain anything?
 ///
 /// AMUX-3837. `2ee153e2` carried a correct subject, a correct card id, and ZERO
@@ -20569,6 +20594,45 @@ pub async fn read_commit_shape(dir: &str, sha: &str) -> commit_shape::Shape {
 #[cfg(test)]
 mod commit_shape_tests {
     use super::commit_shape::{classify, usable_sha, Shape};
+
+    /// The SENTENCE, which amux-frustrations' review flagged as never having
+    /// rendered in production — and which they were right to refuse to
+    /// manufacture, since an `--allow-empty` commit in a shared checkout to see
+    /// a warning is debris that outlives the test. So it gets cells instead.
+    #[test]
+    fn the_empty_commit_note_says_which_of_the_three_things_it_knows() {
+        use super::{empty_commit_card_note, empty_commit_hook_gloss};
+
+        // THE PAIR. This is the arm the join exists for: N staged at the hook,
+        // zero in the commit, so the index emptied in between.
+        let pair = empty_commit_card_note(Some(3));
+        assert!(pair.contains("saw 3 staged file(s)"), "{pair}");
+        assert!(pair.contains("emptied between the hook and the write"), "{pair}");
+
+        // NOTHING STAGED EITHER. A different fact, and not evidence of the
+        // mid-window emptying.
+        let none_staged = empty_commit_card_note(Some(0));
+        assert!(none_staged.contains("also saw nothing staged"), "{none_staged}");
+        assert!(!none_staged.contains("emptied between"), "must not claim the pair: {none_staged}");
+
+        // NEVER MEASURED. Must not read as either of the above.
+        let unknown = empty_commit_card_note(None);
+        assert!(unknown.contains("unknown rather"), "{unknown}");
+        assert!(!unknown.contains("emptied between"), "{unknown}");
+        assert!(!unknown.contains("also saw nothing"), "{unknown}");
+
+        // All three still lead with the fact that matters to the author.
+        for n in [pair, none_staged, unknown] {
+            assert!(n.contains("still uncommitted"), "{n}");
+        }
+
+        // AND THE WARN GLOSS FOLLOWS THE VALUE IT IS PRINTED BESIDE. The
+        // original explained the -1 sentinel unconditionally, so a line reading
+        // `staged_at_hook=1` carried a sentence about a value it did not have.
+        assert!(empty_commit_hook_gloss(None).contains("staged_at_hook=-1"));
+        assert!(!empty_commit_hook_gloss(Some(3)).contains("-1"), "the -1 gloss is for -1 only");
+        assert!(!empty_commit_hook_gloss(Some(0)).contains("-1"));
+    }
 
     /// The three states are three states. Collapsing `Unchecked` into `Empty`
     /// would turn "we could not look" into "your work is missing", which is the
