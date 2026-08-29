@@ -105,3 +105,23 @@ pub fn set_last_update_id(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     )?;
     Ok(())
 }
+
+/// Mark a message as successfully relayed back to Telegram. Clears any previous error.
+pub fn mark_relayed(conn: &Connection, chat_id: i64, line_number: i64) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE telegram_mappings
+         SET last_relayed_line = ?1, last_relayed_at = datetime('now'), relay_error = NULL
+         WHERE chat_id = ?2",
+        params![line_number, chat_id],
+    )?;
+    Ok(())
+}
+
+/// Record a relay error for this mapping (informational, for observability).
+pub fn mark_relay_error(conn: &Connection, chat_id: i64, error: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE telegram_mappings SET relay_error = ?1 WHERE chat_id = ?2",
+        params![error, chat_id],
+    )?;
+    Ok(())
+}

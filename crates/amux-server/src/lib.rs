@@ -465,6 +465,9 @@ async fn async_main() {
     // unset — see runtime_jobs::telegram_poll's module doc for why polling,
     // not a webhook).
     drop(runtime_jobs::telegram_poll::spawn(state.clone()));
+    // Auto-relay: send session replies back to Telegram when linked sessions respond
+    // to Telegram-routed messages. Works for all workers without per-session configuration.
+    drop(runtime_jobs::telegram_relay::spawn(state.clone()));
     // Compaction-generation watch (AMUX-3742): the reason "amux claude performs
     // worse than raw claude" was invisible for months is that nothing counted
     // how many times a lane's conversation had been summarized away.

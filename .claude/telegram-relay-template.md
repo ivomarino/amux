@@ -1,44 +1,55 @@
-# Telegram Auto-Reply Hook — Amux Reference
+# Telegram Auto-Reply — Server-Side Relay
 
-**Status**: The relay hook is built into amux and works. Universal worker setup is future work.
+**Status**: ✅ Auto-relay works for ALL workers automatically. No per-session configuration needed.
 
-## Current State (Proven)
+## How It Works (Automatic)
 
-**Amux** has auto-reply built-in:
-- When someone sends `message` to amux, it routes to the amux session
-- Amux's Claude responds
-- The Stop hook fires and auto-sends the reply back to Telegram
-- Formatting (bold, italic, code, etc.) preserved via HTML
-- ✅ Tested and verified live
+When any session receives a Telegram-routed message (stamped `[from Telegram @user]: ...`) and the session's Claude responds:
 
-## For Other Workers (Interim)
+1. **Poll Inbound** (every 45s) — `telegram_poll` detects Telegram messages and routes them to linked sessions
+2. **Session Responds** — The session's Claude generates a reply in its pane
+3. **Relay Automatically** (every 30s) — `telegram_relay` job scans sessions:
+   - Finds sessions with active Telegram mappings
+   - Detects `[from Telegram @...]` in the pane
+   - Extracts NEW text after that message (checkpoint-based)
+   - Sends it back to Telegram with HTML formatting
+   - Updates checkpoint to avoid duplicate sends
 
-Until the relay hook setup works universally, **any worker can explicitly call the Telegram API** to reply:
+**Zero configuration needed.** Just link a chat (`/link <session>` in Telegram) and send a message.
+
+## Architecture
+
+- **Inbound**: `telegram_poll` (45s interval) → routes Telegram messages to linked sessions
+- **Outbound**: `telegram_relay` (30s interval) → auto-sends session replies back to Telegram
+- **State**: SQLite checkpoints (last_relayed_line) prevent duplicate sends across server restarts
+
+## For Advanced Users (Explicit Control)
+
+You can also **manually send messages** via the API if you want direct control:
 
 ```bash
-# From your session: reply to a Telegram message routed to you
+# From your session: explicitly send a reply
 curl -sk -X POST -H 'Content-Type: application/json' \
   -d '{"session":"your-session-name","text":"Your reply"}' \
   $AMUX_URL/api/telegram/send
 ```
 
-This gives you **direct control** over when and what gets sent to Telegram (ethos rule 8).
+This gives you **explicit control** over when and what gets sent (ethos rule 8).
 
-## How the Hook Works (Reference)
+## Monitoring
 
-1. Telegram message routed via `@session-name` → `[from Telegram @user]: ...` appears in pane
-2. Session's Claude responds normally
-3. Stop event fires (turn ends)
-4. Relay hook detects `[from Telegram @...]` attribution
-5. Hook calls `POST /api/telegram/send` with formatted reply
-6. Message appears on Telegram with HTML formatting
+Check relay status and last-seen errors:
 
-## Code Reference
+```bash
+# Relay job status + messages_routed counter
+curl -sk $AMUX_URL/api/telegram/status
 
-- `.claude/telegram-relay.py` — the hook script (generic, session-agnostic)
-- `.claude/settings.json` — amux's Stop hook configuration
-- Markdown→Telegram HTML converter inside the hook
+# Mapping details (including last_relayed_at)
+curl -sk $AMUX_URL/api/telegram/mappings
+```
 
-## Future
+## Reference Implementation Details
 
-The relay hook pattern should work for any worker once Claude Code's hook system supports dynamic registration or session-specific configurations. Until then, the explicit REST API approach is the reliable path.
+- `.claude/telegram-relay.py` — old Stop hook (kept as reference, amux uses it)
+- `crates/amux-server/src/runtime_jobs/telegram_relay.rs` — new server-side relay
+- `crates/amux-server/migrations/0039_telegram_relay.sql` — relay state tracking (DB)

@@ -201,6 +201,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0035_telegram",
         sql: include_str!("../../migrations/0035_telegram.sql"),
     },
+    Migration {
+        version: 39,
+        name: "0039_telegram_relay",
+        sql: include_str!("../../migrations/0039_telegram_relay.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

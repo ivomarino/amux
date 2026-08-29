@@ -111,6 +111,7 @@ pub mod ids {
     pub const HEARTBEAT: &str = "heartbeat";
     pub const TAILNET_WATCH: &str = "tailnet-watch";
     pub const TELEGRAM_POLL: &str = "telegram-poll";
+    pub const TELEGRAM_RELAY: &str = "telegram-relay";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -140,6 +141,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::HEARTBEAT,
     ids::TAILNET_WATCH,
     ids::TELEGRAM_POLL,
+    ids::TELEGRAM_RELAY,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -396,6 +398,18 @@ pub const CATALOG: &[Doc] = &[
         env: &[EnvControl {
             var: "TELEGRAM_BOT_TOKEN",
             effect: "unset = loop idles, checking every 5 minutes; set = polls continuously",
+            off: Some(""),
+        }],
+        pref: None,
+        detail: Some("/api/telegram/status"),
+    },
+    Doc {
+        id: ids::TELEGRAM_RELAY,
+        name: "Telegram relay",
+        purpose: "Auto-relays session replies back to Telegram when a session responds to a Telegram-routed message; works for all sessions without per-session configuration.",
+        env: &[EnvControl {
+            var: "TELEGRAM_BOT_TOKEN",
+            effect: "unset = relay idles; set = relays enabled",
             off: Some(""),
         }],
         pref: None,
