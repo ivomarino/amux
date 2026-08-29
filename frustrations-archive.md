@@ -2526,3 +2526,79 @@ NOTE (2026-08-27, amux-frustrations, card AF-265): OPTION (c) IS DEAD, and two n
   distinct path writing into the shared dir on every Rust commit where a peer's file is
   the offender. More writers at more paths is exactly the condition this entry describes,
   so if the race recurs, that is the first change to correlate against.
+
+## "Is this badge accurate" is unanswerable by the time the screenshot arrives
+VALIDATED: amux | session.status_decided now exists and RUNS: runtime_jobs/status_history.rs defines EVENT, lib.rs:470 spawns it, and status-explain surfaces the history (session_verbs.rs:9024) plus history_sample_secs (:11081). The entry's prescribed FIX was record-on-change plus return-recent-history-from-status-explain; both shipped. The test status_history_tells_a_stable_lane_from_an_unsampled_one is the part that matters most: it separates a genuinely stable lane from one that was never sampled, so a quiet history cannot be read as a confident answer.
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-26
+SESSION: amux
+CARD: AMUX-3761
+SYMPTOM: `derive_status_explain` is computed fresh per request and never persisted, and `session_events` records no lane status rows at all (verified against the live DB: zero for gtm-research across the whole window in question). So `status-explain` answers "which rule decided this lane is WORKING right now", while the question anyone actually asks is "why WAS it WORKING when I looked" — and a screenshot always arrives minutes later, by which time the lane has taken another turn and the evidence is gone.
+COST: Ethan sent a screenshot of gtm-research reading WORKING + AGENTS over a pane whose visible text was the agent saying it had no task queued, and asked whether that was accurate. It reads `idle` now, correctly and for a good reason, and which rule fired 31 minutes earlier cannot be recovered. AMUX-3434 built status-explain specifically so a wrong badge would not cost a screenshot investigation; it still does, one layer up.
+FIX: none yet. Record a `session.status_decided` event on CHANGE of status or `decided_by`, and return recent history from status-explain. The natural home is the ScanLoop, and a write-on-change into a 2.2GB SQLite from a 15s loop over 52 lanes needs its row rate measured before it ships.
+
+## staged-guard named a co-editing session that never edited the file — ownership inferred from API traffic
+VALIDATED: amux | Fixed in git_guard.rs:970-985, which cites AMUX-3497 by name and reproduces this entry's exact specimen (a session whose window held only HTTP probes named co-editor of board_store.rs). The fix suppresses the echo: an observed mtime row EXPLAINED by the other side's transcript record of the same path at the same instant is one write seen twice, not two editors. Tests at :1471-1525 assert the co-edit signal knows what it claims. The echo test deliberately runs against the ENTRY state of the firsthand sets, so the loop's own inserts cannot redefine firsthand mid-pass.
+AREA: attribution
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-22
+SESSION: amux
+CARD: AMUX-3497
+SYMPTOM: committing board_store.rs, the guard's NOTE said the file "was also edited by
+  session 'amux-cloud' 28m ago". amux-cloud made no source edit in that window — their
+  12:28 activity was HTTP board probes (card create/PATCH/discard). The edit-ownership
+  row behind d.get("shared") attributed a FILE edit to API traffic against the
+  subsystem.
+COST: a needless wipe-apology sweep to a peer (made plausible by a real git-checkout
+  hazard in the same window), plus the standing cost of the shape: once the guard is
+  known to name phantom co-editors, its real co-edit warnings get discounted — on the
+  exact commit type (shared-file sweeps) it exists to catch.
+FIX: shipped same day (see AMUX-3497 for the sha). Root cause was not command parsing
+  but the OBSERVED-edit mechanism: the Bash hook pair reports every file whose mtime
+  moved during a session's command, and on a shared checkout a CONCURRENT session's
+  tool edit lands in the observer's window — one write, two claimants. apply_observed
+  now drops an observed row explained by the other side's transcript record within the
+  clock-skew margin (both directions degrade toward protection), and an unresolvable
+  observed-vs-observed coincidence keeps both claims but the shared row carries
+  co_signal naming the ambiguity, which the guard hook prints. Five test cells incl.
+  the rebuilt specimen; over-broad-drop mutant fails the real-second-write control.
+REOPENED 2026-08-23 by its own author, on live evidence, when asked to sign this entry
+  off for retirement. Probing GET /api/git/staged-guard for
+  crates/amux-server/src/api/alerts.rs returned
+  shared: [{"owner":"amux-frustrations","peer":true,"age_secs":4848,"mine_age_secs":4848}]
+  — and every commit that has ever touched that file is mine (17710e9, d7f9545,
+  024894a, 2d57c7b). age_secs == mine_age_secs is precisely the coincident signature
+  357a54e was written to resolve, so the phantom co-editor still reproduces by a route
+  the fix does not cover: 357a54e drops an OBSERVED row explained by the other side's
+  TRANSCRIPT record, which cannot fire when the phantom claim is itself
+  transcript-derived. What remains to establish is which mechanism minted that row.
+  Do not retire this on the sha alone — the sha is real and the symptom outlived it,
+  which is the whole reason the entry is worth keeping.
+
+---
+
+NOTE (2026-08-24, amux — author, superseding their own 2026-08-23 reading): STILL LIVE, and
+  the mechanism is now named. Their 08-23 reopening read two equal ages as "amux-frustrations
+  is a phantom co-editor on my file"; on re-probing, THE DIRECTION IS INVERSE and the phantom
+  was theirs.
+  They first probed the original alerts.rs specimen and got `shared: []` — and explicitly did
+  NOT stop there, because the tree was clean and nobody had touched that file in the 6h window,
+  so an empty result and a working fix are indistinguishable. They then probed five hot files,
+  got a `shared` row on all five, and checked one against git:
+    crates/amux-server/src/api/board.rs -> age_secs 455, mine_age_secs 455,
+    owner: amux-frustrations, NO co_signal.
+  That identical-age signature is what they could not explain on 08-23. Resolved: commit
+  8575cc6f at 12:18:08 is amux-frustrations' and really does touch board.rs (mtime 12:17:22).
+  amux's own claim is the manufactured one — all they did to that file was `sed -n '2270,2300p'`,
+  a READ, at 12:17, and the Bash observer saw the mtime move during their command and minted an
+  edit claim for them.
+  WHY 357a54e's MITIGATION CANNOT REACH IT: that fix drops an OBSERVED row explained by the
+  other side's TRANSCRIPT record. Here the transcript record belongs to the side whose claim is
+  TRUE, and the phantom is the observed SELF-claim. The probe presents the two symmetrically
+  and emits no co_signal, so nothing in the output says which of the two is manufactured.
+  Working where it applies: three of the five probes DID carry a co_signal (autofix.rs and
+  session_verbs.rs with the AF-179 wording, app.js with the AMUX-3497 wording). The gap is
+  specifically observed-vs-transcript where the transcript side is the real one.

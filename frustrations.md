@@ -1100,69 +1100,6 @@ FIX: none here — this IS AMUX-1315 (per-lane worktrees), and today is its stro
 
 ---
 
-## staged-guard named a co-editing session that never edited the file — ownership inferred from API traffic
-AREA: attribution
-SEVERITY: annoys
-STATUS: open
-DATE: 2026-08-22
-SESSION: amux
-CARD: AMUX-3497
-SYMPTOM: committing board_store.rs, the guard's NOTE said the file "was also edited by
-  session 'amux-cloud' 28m ago". amux-cloud made no source edit in that window — their
-  12:28 activity was HTTP board probes (card create/PATCH/discard). The edit-ownership
-  row behind d.get("shared") attributed a FILE edit to API traffic against the
-  subsystem.
-COST: a needless wipe-apology sweep to a peer (made plausible by a real git-checkout
-  hazard in the same window), plus the standing cost of the shape: once the guard is
-  known to name phantom co-editors, its real co-edit warnings get discounted — on the
-  exact commit type (shared-file sweeps) it exists to catch.
-FIX: shipped same day (see AMUX-3497 for the sha). Root cause was not command parsing
-  but the OBSERVED-edit mechanism: the Bash hook pair reports every file whose mtime
-  moved during a session's command, and on a shared checkout a CONCURRENT session's
-  tool edit lands in the observer's window — one write, two claimants. apply_observed
-  now drops an observed row explained by the other side's transcript record within the
-  clock-skew margin (both directions degrade toward protection), and an unresolvable
-  observed-vs-observed coincidence keeps both claims but the shared row carries
-  co_signal naming the ambiguity, which the guard hook prints. Five test cells incl.
-  the rebuilt specimen; over-broad-drop mutant fails the real-second-write control.
-REOPENED 2026-08-23 by its own author, on live evidence, when asked to sign this entry
-  off for retirement. Probing GET /api/git/staged-guard for
-  crates/amux-server/src/api/alerts.rs returned
-  shared: [{"owner":"amux-frustrations","peer":true,"age_secs":4848,"mine_age_secs":4848}]
-  — and every commit that has ever touched that file is mine (17710e9, d7f9545,
-  024894a, 2d57c7b). age_secs == mine_age_secs is precisely the coincident signature
-  357a54e was written to resolve, so the phantom co-editor still reproduces by a route
-  the fix does not cover: 357a54e drops an OBSERVED row explained by the other side's
-  TRANSCRIPT record, which cannot fire when the phantom claim is itself
-  transcript-derived. What remains to establish is which mechanism minted that row.
-  Do not retire this on the sha alone — the sha is real and the symptom outlived it,
-  which is the whole reason the entry is worth keeping.
-
----
-
-NOTE (2026-08-24, amux — author, superseding their own 2026-08-23 reading): STILL LIVE, and
-  the mechanism is now named. Their 08-23 reopening read two equal ages as "amux-frustrations
-  is a phantom co-editor on my file"; on re-probing, THE DIRECTION IS INVERSE and the phantom
-  was theirs.
-  They first probed the original alerts.rs specimen and got `shared: []` — and explicitly did
-  NOT stop there, because the tree was clean and nobody had touched that file in the 6h window,
-  so an empty result and a working fix are indistinguishable. They then probed five hot files,
-  got a `shared` row on all five, and checked one against git:
-    crates/amux-server/src/api/board.rs -> age_secs 455, mine_age_secs 455,
-    owner: amux-frustrations, NO co_signal.
-  That identical-age signature is what they could not explain on 08-23. Resolved: commit
-  8575cc6f at 12:18:08 is amux-frustrations' and really does touch board.rs (mtime 12:17:22).
-  amux's own claim is the manufactured one — all they did to that file was `sed -n '2270,2300p'`,
-  a READ, at 12:17, and the Bash observer saw the mtime move during their command and minted an
-  edit claim for them.
-  WHY 357a54e's MITIGATION CANNOT REACH IT: that fix drops an OBSERVED row explained by the
-  other side's TRANSCRIPT record. Here the transcript record belongs to the side whose claim is
-  TRUE, and the phantom is the observed SELF-claim. The probe presents the two symmetrically
-  and emits no co_signal, so nothing in the output says which of the two is manufactured.
-  Working where it applies: three of the five probes DID carry a co_signal (autofix.rs and
-  session_verbs.rs with the AF-179 wording, app.js with the AMUX-3497 wording). The gap is
-  specifically observed-vs-transcript where the transcript side is the real one.
-
 ## Every checkout's git hooks are 18 days stale, and amux has been saying so into a log for 11
 AREA: instruments
 SEVERITY: blocks
@@ -2132,17 +2069,6 @@ CARD: AMUX-3759
 SYMPTOM: `pickup_prompt` built the card's `desc + log` and then wrote `.chars().take(500)`. The lane received an ID and a 500-character stub, and spent tool calls reading back text the function had in hand one line earlier. Measured over 11,117 turns across 67 lane transcripts: an auto-pickup turn takes a MEDIAN OF 22 TOOL STEPS where a human-prompted turn takes 3, at a median resident context of 308,059 tokens per model call (p90 738k, max 966k). The cap saves ~1k tokens of steering text and costs ~308k per avoidable fetch — the wrong resource by three orders of magnitude. Silent, too: a truncated excerpt was indistinguishable from a short card.
 COST: On the live queue it truncated 86% of todo cards (median definition 1,933 chars, p90 6,658) and discarded 108,820 characters of card definition. 43.8% of fleet turns and 49.7% of input tokens are amux-initiated, so this rides the largest single class of spend. Ethan noticed by feel — "theres also way too much tokens used for some reason in between tasks" — because no instrument reported steps-per-turn by what started the turn.
 FIX: ade006c2 — `AMUX_PICKUP_EXCERPT_CHARS`, default 4000, config rather than a constant because this is D4 in the ethos ledger. A cut excerpt now says it was cut and names the read.
-
-## "Is this badge accurate" is unanswerable by the time the screenshot arrives
-AREA: instruments
-SEVERITY: slows
-STATUS: open
-DATE: 2026-08-26
-SESSION: amux
-CARD: AMUX-3761
-SYMPTOM: `derive_status_explain` is computed fresh per request and never persisted, and `session_events` records no lane status rows at all (verified against the live DB: zero for gtm-research across the whole window in question). So `status-explain` answers "which rule decided this lane is WORKING right now", while the question anyone actually asks is "why WAS it WORKING when I looked" — and a screenshot always arrives minutes later, by which time the lane has taken another turn and the evidence is gone.
-COST: Ethan sent a screenshot of gtm-research reading WORKING + AGENTS over a pane whose visible text was the agent saying it had no task queued, and asked whether that was accurate. It reads `idle` now, correctly and for a good reason, and which rule fired 31 minutes earlier cannot be recovered. AMUX-3434 built status-explain specifically so a wrong badge would not cost a screenshot investigation; it still does, one layer up.
-FIX: none yet. Record a `session.status_decided` event on CHANGE of status or `decided_by`, and return recent history from status-explain. The natural home is the ScanLoop, and a write-on-change into a 2.2GB SQLite from a 15s loop over 52 lanes needs its row rate measured before it ships.
 
 ## Fixing a mechanism made its own nudge text false, and the false nudge went to the lane that wrote the fix
 AREA: instruments
