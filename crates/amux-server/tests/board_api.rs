@@ -2975,3 +2975,84 @@ async fn the_contract_publishes_both_machine_checked_constraints() {
     .await;
     assert_eq!(refused["code"], "verified_requires_gate_checked");
 }
+
+// ---- full export (AMUX-3868) ---------------------------------------------
+
+/// The export carries COMPLETE descriptions, which is the only reason this
+/// endpoint exists.
+///
+/// The contrast is the test: `GET /api/board` deliberately omits `desc` and
+/// sends `desc_head`/`desc_len` instead (AMUX-3861), so the dashboard's own
+/// client-side export physically cannot include full text. If a future change
+/// made the list carry `desc` again this test would still pass on the export
+/// half — so it asserts the LIST omission too, and the day that stops being
+/// true someone should be told, because this endpoint's justification changed.
+#[tokio::test]
+async fn export_carries_full_descriptions_where_the_list_deliberately_does_not() {
+    let (app, _dir) = app();
+    // Long enough that any head-truncation shows up as a real difference.
+    let long = "D".repeat(4000);
+    create(
+        &app,
+        json!({ "title": "big card", "session": "alpha", "desc": long.clone() }),
+    )
+    .await;
+
+    let (_, _, list) = send(&app, "GET", "/api/board", None).await;
+    let row = &list.as_array().expect("array")[0];
+    assert!(
+        row.get("desc").is_none(),
+        "the LIST must keep omitting desc — if it does not, this endpoint's reason for \
+         existing has changed and the docs on both sides are now wrong: {row}"
+    );
+    assert_eq!(row["desc_len"], json!(4000), "the list reports the true length");
+
+    let (st, h, ex) = send(&app, "GET", "/api/board/export?format=json", None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(ex["issues"][0]["desc"], json!(long), "export must carry the WHOLE desc");
+    assert_eq!(ex["count"], json!(1));
+    assert_eq!(ex["scoped"], json!(false), "no filters were given");
+    assert!(
+        hdr(&h, "content-disposition").contains("attachment; filename=\"amux-board-"),
+        "a download needs a filename: {}",
+        hdr(&h, "content-disposition")
+    );
+}
+
+/// A SCOPED export says so, and an unscoped one says that instead of staying
+/// quiet. Silence would make the two indistinguishable, which is the whole
+/// failure mode (ethos rule 4).
+#[tokio::test]
+async fn a_scoped_export_declares_its_scope_and_an_unscoped_one_declares_that() {
+    let (app, _dir) = app();
+    create(&app, json!({ "title": "a1", "session": "alpha", "desc": "AAA" })).await;
+    create(&app, json!({ "title": "b1", "session": "beta", "desc": "BBB" })).await;
+
+    let (_, _, all) = send(&app, "GET", "/api/board/export?format=json", None).await;
+    assert_eq!(all["count"], json!(2));
+    assert_eq!(all["scoped"], json!(false));
+
+    let (_, _, one) = send(&app, "GET", "/api/board/export?format=json&worker=alpha", None).await;
+    assert_eq!(one["count"], json!(1), "worker filter must actually filter");
+    assert_eq!(one["scoped"], json!(true));
+    assert!(
+        one["scope"].as_array().expect("scope array").iter().any(|s| s
+            .as_str()
+            .unwrap_or_default()
+            .contains("alpha")),
+        "the scope must NAME the filter, not merely flag that one ran: {}",
+        one["scope"]
+    );
+
+    // Markdown: the two headers must be different TEXT, not present-vs-absent.
+    let (_, _, md_all) = send(&app, "GET", "/api/board/export?format=md", None).await;
+    let (_, _, md_one) =
+        send(&app, "GET", "/api/board/export?format=md&worker=alpha", None).await;
+    let a = md_all.as_str().expect("md is text");
+    let b = md_one.as_str().expect("md is text");
+    assert!(a.contains("Whole board"), "unscoped md must say so: {}", &a[..a.len().min(200)]);
+    assert!(b.contains("Scoped export"), "scoped md must say so: {}", &b[..b.len().min(200)]);
+    assert!(b.contains("alpha"), "scoped md must name the worker");
+    assert!(b.contains("AAA"), "scoped md must carry the full desc");
+    assert!(!b.contains("BBB"), "scoped md must not leak the other worker's card");
+}

@@ -1079,6 +1079,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/events", methods: &["GET"] },
     // -- board
     RouteEntry { path: "/api/board", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/board/export", methods: &["GET"] },
     RouteEntry { path: "/api/board/statuses", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
     RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },

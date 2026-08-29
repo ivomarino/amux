@@ -8017,7 +8017,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.750';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.751';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -24371,6 +24371,11 @@ function _boardExportMd(items, query) {
   md += query && query.trim()
     ? `\n> **Filtered view.** Query: \`${query.trim()}\`. This is not the whole board.\n`
     : `\n> Unfiltered: every issue currently visible on the board.\n`;
+  // NAME THE WAY OUT, not just the limitation (AMUX-3868). Descriptions here
+  // are heads because the list API sends heads; disclosing that without saying
+  // where the full text lives leaves the reader stuck with a known-partial file
+  // and no next step.
+  md += `>\n> Descriptions are heads. For complete text: \`GET /api/board/export?format=md\` (add \`&worker=NAME\` to scope).\n`;
   const keys = order.concat(Object.keys(groups).filter(k => !order.includes(k)));
   keys.forEach(st => {
     const g = groups[st];

@@ -37,6 +37,8 @@ use std::sync::{Arc, Mutex};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_board).post(create_item))
+        // Static /export outranks /{id}, same as /statuses below.
+        .route("/export", get(export_board))
         // Static segment outranks /{id} in axum: /statuses never collides.
         .route("/statuses", get(list_statuses).post(create_status))
         // Static /reorder outranks /{sid}; both outrank /api/board/{id}.
@@ -1480,6 +1482,183 @@ mod truncation_caller_tests {
         assert_eq!(ua.chars().count(), 60);
         assert!(ua.starts_with("Mozilla/5.0 (iPhone"), "the prefix is what identifies it: {ua}");
     }
+}
+
+/// `GET /api/board/export?format=md|json[&worker=][&status=][&archived=]`
+///
+/// # Why this is a SERVER endpoint and not more client code (AMUX-3868)
+///
+/// The dashboard already exports the view you are looking at (AMUX-3873), and
+/// it cannot ever be a FULL export: `GET /api/board` omits `desc` entirely and
+/// sends `desc_head` + `desc_len` instead, so the browser does not hold the
+/// text. Getting it client-side means one request per card, which at the
+/// current board is over 1,500.
+///
+/// `IssueRow.desc` is the complete string, so reading it here costs one query.
+///
+/// SCOPE IS STATED IN THE OUTPUT, never implied by its absence. A scoped export
+/// that does not say it was scoped is indistinguishable from a whole-board one,
+/// and it is the version that gets pasted somewhere as evidence. Both formats
+/// carry the filters that ran and the count, and the unscoped case says so in
+/// its own words rather than by staying quiet (ethos rule 4).
+#[derive(serde::Deserialize, Default)]
+pub struct ExportParams {
+    format: Option<String>,
+    worker: Option<String>,
+    status: Option<String>,
+    archived: Option<String>,
+}
+
+pub async fn export_board(
+    State(state): State<AppState>,
+    Query(p): Query<ExportParams>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+    let statuses: Vec<String> = p
+        .status
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    let workers: Vec<String> = p
+        .worker
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    // Default ActiveOnly: an export is a working document, and silently
+    // including archived cards would overstate the board. `archived=all`
+    // opts in, and the header below always says which was used.
+    let arch = match p.archived.as_deref().unwrap_or("") {
+        "all" => ArchivedFilter::All,
+        "1" | "true" | "yes" | "only" => ArchivedFilter::ArchivedOnly,
+        _ => ArchivedFilter::ActiveOnly,
+    };
+    let rows = match bs::list_issues(&conn, &statuses, &workers, arch) {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    drop(conn);
+
+    let scope = {
+        let mut parts: Vec<String> = Vec::new();
+        if !workers.is_empty() {
+            parts.push(format!("worker = {}", workers.join(", ")));
+        }
+        if !statuses.is_empty() {
+            parts.push(format!("status = {}", statuses.join(", ")));
+        }
+        match arch {
+            ArchivedFilter::All => parts.push("including archived".into()),
+            ArchivedFilter::ArchivedOnly => parts.push("archived only".into()),
+            ArchivedFilter::ActiveOnly => {}
+        }
+        parts
+    };
+    let stamp = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let want_md = matches!(p.format.as_deref(), Some("md") | Some("markdown"));
+
+    let (body, mime, ext) = if want_md {
+        let mut md = String::new();
+        md.push_str("# amux board\n\n");
+        md.push_str(&format!(
+            "_{} issue(s) · full descriptions · exported {}_\n\n",
+            rows.len(),
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        ));
+        if scope.is_empty() {
+            md.push_str("> Whole board: every active issue, no worker or status filter.\n");
+        } else {
+            md.push_str(&format!(
+                "> **Scoped export.** {}. This is not the whole board.\n",
+                scope.join(" · ")
+            ));
+        }
+        // Grouped by status, the order the board itself reads in.
+        let order = [
+            "doing", "review", "todo", "backlog", "done", "verified", "discarded",
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for s in order.iter() {
+            seen.push((*s).to_string());
+        }
+        for r in &rows {
+            if !seen.iter().any(|s| s == &r.status) {
+                seen.push(r.status.clone());
+            }
+        }
+        for st in seen {
+            let group: Vec<&IssueRow> = rows.iter().filter(|r| r.status == st).collect();
+            if group.is_empty() {
+                continue;
+            }
+            md.push_str(&format!("\n## {} ({})\n\n", st, group.len()));
+            for r in group {
+                md.push_str(&format!("### {} — {}\n\n", r.id, r.title));
+                md.push_str(&format!(
+                    "- worker: {} · type: {} · created: {}\n",
+                    r.session.as_deref().unwrap_or("—"),
+                    r.item_type,
+                    r.created
+                ));
+                if let Some(g) = r.gate.as_deref().filter(|g| !g.is_empty()) {
+                    md.push_str(&format!("- gate: {g}\n"));
+                }
+                if !r.depends_on.is_empty() {
+                    md.push_str(&format!("- depends_on: {}\n", r.depends_on.join(", ")));
+                }
+                // The whole point of this endpoint: the COMPLETE description,
+                // not a head. No truncation note, because nothing is truncated.
+                if !r.desc.trim().is_empty() {
+                    md.push_str(&format!("\n{}\n", r.desc.trim()));
+                }
+                md.push('\n');
+            }
+        }
+        (md, "text/markdown; charset=utf-8", "md")
+    } else {
+        let issues: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id, "title": r.title, "desc": r.desc, "status": r.status,
+                    "session": r.session, "type": r.item_type, "creator": r.creator,
+                    "gate": r.gate, "depends_on": r.depends_on, "reviewer": r.reviewer,
+                    "created": r.created, "updated": r.updated, "archived": r.archived,
+                    "owner_type": r.owner_type, "pinned": r.pinned,
+                })
+            })
+            .collect();
+        let v = json!({
+            "exported_at": chrono::Local::now().to_rfc3339(),
+            "count": issues.len(),
+            "scoped": !scope.is_empty(),
+            "scope": scope,
+            // Said explicitly so nobody has to compare this against /api/board
+            // to discover the difference.
+            "desc": "complete — unlike GET /api/board, which sends desc_head/desc_len only",
+            "issues": issues,
+        });
+        (
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()),
+            "application/json; charset=utf-8",
+            "json",
+        )
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, mime.to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"amux-board-{stamp}.{ext}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 pub async fn list_board(
