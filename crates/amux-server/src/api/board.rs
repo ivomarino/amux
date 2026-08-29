@@ -210,6 +210,16 @@ async fn get_contract(
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
             "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
         },
+        // Global `verified` constraint (Ethan, 2026-08-29). Published HERE and
+        // not only in the 409, because a gate you can only learn by tripping it
+        // is the AF-112 shape — the reader who most needs it is the one about
+        // to be refused.
+        "verified_requires_gate_checked": {
+            "rule": "a multi-criterion verified gate must be acknowledged criterion by criterion; gate_ack: true is refused",
+            "why": "the four default criteria fail in different ways and are checked by different acts; one boolean asserts all of them and records which you looked at nowhere",
+            "enforced": "server-validated on any transition to verified whose effective gate has 2+ criteria; force bypasses it (logged and attributed)",
+            "not_enforced_on": "single-criterion gates (acking one criterion is identical to checking it) and every other status, `done` included — done carries the machine-checked asset link instead",
+        },
         "how_to_ack": {
             "cli": "amux board <status> <id> --checked \"criterion 1\" \"criterion 2\"",
             "api": "PATCH /api/board/<id> with gate_checked: [\"criterion 1\", ...] or gate_ack: true",
@@ -3829,6 +3839,93 @@ pub async fn patch_item(
                             }
                             ack_via = Some(format!("gate_checked ({}/{})", gc.len(), eff_gate.len()));
                         } else if map.get("gate_ack").and_then(Value::as_bool).unwrap_or(false) {
+                            // ONE BOOLEAN CANNOT STAND FOR FOUR CLAIMS AT
+                            // `verified` (Ethan, 2026-08-29: "i thought our
+                            // gates per status were clear, maybe make them
+                            // stronger enforced").
+                            //
+                            // `verified` is the board's highest claim and its
+                            // default gate is four INDEPENDENT assertions — CI
+                            // green, deployed, confirmed in prod, zero
+                            // regressions — that fail in different ways and are
+                            // checked by different acts. `gate_ack: true`
+                            // asserts all four with a single bit, and nothing
+                            // afterwards records which of them the acker
+                            // actually looked at. That is the "name which
+                            // clause you tested" failure the frustrations rule
+                            // names, one status down.
+                            //
+                            // Measured before shipping, fleet-wide, on every
+                            // ack this board has ever recorded:
+                            //
+                            //   target    gate_checked  gate_ack  ack share
+                            //   done              2881       342      10.6%
+                            //   verified          1303       302      18.8%
+                            //   review             428        31       6.8%
+                            //   doing              342        16       4.5%
+                            //
+                            // So 81% of verifications already enumerate, and
+                            // this refuses the other 19% — a real number with a
+                            // cheap truthful remedy, not a wall (ethos rule 3).
+                            // The remedy is walkable with sanctioned tooling,
+                            // checked by reading the CLI rather than assuming:
+                            // `amux`'s refusal printer keys on `gate` being in
+                            // the error text and echoes `d["gate"]` back as a
+                            // ready `--checked "..." "..."` line, so this body
+                            // carries both and the operator gets the exact
+                            // command. Refusing on a gate whose remedy needed a
+                            // hand-rolled PATCH would manufacture the
+                            // unattributed writes this system depends on being
+                            // attributed (AMUX-2325).
+                            //
+                            // TWO DELIBERATE NARROWINGS, both so the check
+                            // cannot fire where it would only be ceremony:
+                            //
+                            // 1. `verified` only. `done` carries 10.6% and is
+                            //    already machine-gated on an asset link, so it
+                            //    has a check a blanket ack cannot fake. Leaving
+                            //    it out is a decision, not an oversight.
+                            // 2. Multi-criterion gates only. Blanket-acking a
+                            //    ONE-criterion gate is byte-identical to
+                            //    checking it — the non-code default at
+                            //    `verified` is the single "Outcome confirmed to
+                            //    still hold", and refusing that would extract a
+                            //    retype of the same sentence for no information.
+                            if target == TaskStatus::Verified && eff_gate.len() > 1 {
+                                tracing::warn!(
+                                    "verified_blanket_ack: blocked {} -> verified for session {} ({} criteria acked with one boolean)",
+                                    next.id,
+                                    next.session.as_deref().unwrap_or("-"),
+                                    eff_gate.len()
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        json!({
+                                            "error": "verified needs the gate checked criterion by criterion, not a blanket gate_ack",
+                                            "code": "verified_requires_gate_checked",
+                                            "ok": false,
+                                            "blocked": true,
+                                            "item": next.id,
+                                            "item_type": next.item_type,
+                                            "attempted_status": target_raw,
+                                            "gate": eff_gate,
+                                            "why": format!(
+                                                "these {} criteria fail in different ways and are checked by different acts; one boolean asserts all of them and records which you looked at nowhere",
+                                                eff_gate.len()
+                                            ),
+                                            "how_to_fix": {
+                                                "cli": format!("amux board verified {} --checked <each criterion>", next.id),
+                                                "api": "PATCH with gate_checked: [ ...every criterion... ]",
+                                                "if_one_is_not_true": "do not ack it. If the criterion does not fit the work, the TYPE is wrong — fix the type, not the truth.",
+                                                "force": "true with a reason (explicit bypass; logged and attributed)",
+                                            },
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
                             ack_via = Some("gate_ack".into());
                         }
                         match &ack_via {

@@ -2862,3 +2862,116 @@ async fn statuses_that_have_a_next_actor_are_not_stamped() {
         assert!(due.is_empty(), "{status} must not be stamped, got due={due:?}");
     }
 }
+
+/// `verified` is the board's highest claim and its default code gate is four
+/// INDEPENDENT assertions. `gate_ack: true` asserted all four with one bit and
+/// recorded which of them the acker looked at nowhere. Fleet-wide that was 302
+/// of 1605 verifications (18.8%); the other 81% already enumerate.
+#[tokio::test]
+async fn verified_refuses_a_blanket_ack_and_takes_the_enumeration() {
+    let (app, _tmp) = app();
+    let c = create(&app, json!({ "title": "shipped it", "type": "code" })).await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "blanket ack must be refused: {v}");
+    assert_eq!(v["code"], "verified_requires_gate_checked");
+
+    // The refusal must carry the criteria back. The `amux` CLI's refusal
+    // printer keys on "gate" appearing in the error text and echoes
+    // `d["gate"]` as a ready `--checked ...` line — without BOTH, the operator
+    // is pushed to a hand-rolled PATCH, which is the unattributed write this
+    // whole gate system depends on not happening (AMUX-2325).
+    assert!(
+        v["error"].as_str().unwrap_or("").contains("gate"),
+        "CLI remedy printer keys on this: {}", v["error"]
+    );
+    let gate: Vec<String> = v["gate"]
+        .as_array()
+        .expect("refusal must return the gate")
+        .iter()
+        .map(|g| g.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert!(gate.len() > 1, "the multi-criterion case is the one refused: {gate:?}");
+
+    // Enumerating exactly what came back is accepted — the honest path is the
+    // one the refusal just printed.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_checked": gate })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "enumerated ack must be accepted: {v}");
+}
+
+/// Both narrowings, which exist so the check cannot fire where it would only
+/// be ceremony. If either regresses the gate starts refusing transitions that
+/// carry no extra information, and the pressure to `--force` goes up.
+#[tokio::test]
+async fn the_blanket_ack_refusal_is_narrow_by_design() {
+    let (app, _tmp) = app();
+
+    // 1. A ONE-criterion verified gate (the non-code default, "Outcome
+    //    confirmed to still hold"): blanket-acking it is byte-identical to
+    //    checking it, so it is allowed.
+    let c = create(&app, json!({ "title": "looked again", "type": "investigation" })).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "single-criterion gate must still take an ack: {v}");
+
+    // 2. `done` is deliberately excluded: it already carries a machine-checked
+    //    asset link that no ack can fake, so it needs no second mechanism.
+    let c = create(&app, json!({ "title": "landed it", "type": "code", "desc": "landed in crates/amux-server/src/api/board.rs" })).await;
+    let id = c["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "done must still take a blanket ack: {v}");
+}
+
+/// A gate you can only learn by tripping it is the AF-112 shape. Both global
+/// machine-checked constraints must be readable from the contract, and the
+/// contract's claim about each must match what the handler actually does.
+#[tokio::test]
+async fn the_contract_publishes_both_machine_checked_constraints() {
+    let (app, _tmp) = app();
+    let (st, _, v) = send(&app, "GET", "/api/board/contract", None).await;
+    assert_eq!(st, StatusCode::OK);
+    for key in ["done_requires_asset_link", "verified_requires_gate_checked"] {
+        assert!(v[key].is_object(), "contract must publish {key}: {v}");
+        assert!(
+            v[key]["enforced"].as_str().unwrap_or("").contains("force bypasses"),
+            "{key} must say force bypasses it — the audited exit is part of the contract"
+        );
+    }
+    // The contract's `code` must be the one the refusal actually returns, or a
+    // caller keying on it reads the docs and matches nothing.
+    let c = create(&app, json!({ "title": "x", "type": "code" })).await;
+    let id = c["id"].as_str().unwrap();
+    let (_, _, refused) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "verified", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(refused["code"], "verified_requires_gate_checked");
+}
