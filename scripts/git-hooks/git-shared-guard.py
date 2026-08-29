@@ -418,12 +418,29 @@ def _discard_verdict(cmd, scrubbed, run_dir):
             continue
         if sub == "checkout":
             if "--" not in toks:
-                continue            # `git checkout <branch>` — switches, destroys nothing
-            # Anything non-flag BEFORE the `--` is the source ref.
-            pre = [t for t in toks[:toks.index("--")] if not t.startswith("-")]
-            if pre:
-                src_refs.add(pre[-1])
-            cand = toks[toks.index("--") + 1:]
+                # `git checkout <tree-ish> <paths>...` WITHOUT `--` IS A PATH
+                # RESTORE and was skipped entirely (amux-frustrations, AMUX-3859
+                # round 4 — pre-existing since ea2a5731, 2026-08-14). The old
+                # comment here said "`git checkout <branch>` — switches, destroys
+                # nothing", which is true of ONE operand and false of two: with
+                # two, git reads the first as a tree-ish and the rest as paths,
+                # overwriting index and worktree. Measured: `git checkout
+                # origin-main run.sh` reverted a staged 100755 to 100644 while
+                # the `--` spelling of the same operation was correctly blocked.
+                #
+                # A comment describing a different command is why it sat for two
+                # weeks. One operand still switches and is still skipped.
+                ops = [t for t in toks if not t.startswith("-")]
+                if len(ops) < 2:
+                    continue
+                src_refs.add(ops[0])
+                cand = ops[1:]
+            else:
+                # Anything non-flag BEFORE the `--` is the source ref.
+                pre = [t for t in toks[:toks.index("--")] if not t.startswith("-")]
+                if pre:
+                    src_refs.add(pre[-1])
+                cand = toks[toks.index("--") + 1:]
         else:
             staged = any(t in ("--staged", "-S") for t in toks)
             worktree = any(t in ("--worktree", "-W") for t in toks)
