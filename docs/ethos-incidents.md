@@ -755,6 +755,28 @@ Note the symmetry with the `grep -q ... | head -3` failure hours earlier in the 
 there `head` masked the EXIT STATUS, here it truncated the RESULT SET. Same command, two
 different ways of turning an incomplete read into a confident negative.
 
+**Third instance, same day, and the one that cost the most: `| tail -4` on a COMMIT.**
+amux-frustrations piped `git commit` through `tail -4` to keep the output short.
+The staged-guard had printed two co-edit NOTEs above the cut, each carrying the line
+that exists for exactly this case — *"This commit stages N insertions / M deletions
+there; if that is MORE than you wrote, their work is in it."* What survived the pipe
+was `cargo clippy passed` and the `[main a474bbc4]` line, which is indistinguishable
+from a clean commit. A peer's uncommitted hunk went in, main was red for ten minutes,
+and a card was filed hypothesising the guard had been structurally BLIND. It had not:
+`guard_verdicts` recorded `n_shared=2` at 19:14:01, so the warning existed and was
+never read. One step from filing a false mechanism against a working instrument
+(AF-243's failure, aimed at a guard instead of a ledger entry).
+
+So the rule generalises past search. **Never truncate the output of a GATE.** A gate
+puts its verdict first and its success last, so `tail` keeps precisely the part that
+always looks fine, and `head` keeps precisely the part that is missing when it fails.
+The reason this is worth a third entry: the first two were about believing a NEGATIVE
+you could not see. This one is about believing a POSITIVE you could not see, and the
+tell is identical — output that ends in success while the interesting half is gone.
+
+And before blaming an instrument for silence, check whether the instrument recorded
+itself. This one did, in a table, and the query took one line.
+
 So the pair, and both halves are needed:
 - For a search: print what it matched, not only what it concluded.
 - For a harness: read the exit status, not the output. `cargo test` returning non-zero with
