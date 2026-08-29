@@ -2869,3 +2869,25 @@ NOTE: This is AF-161's own predicted next occurrence, arriving on schedule. That
   and `gate` is the one that governs transitions, `last_verified_at` the one a `verified` audit
   reads. AF-161 was the `reviewer` column; this is the same defect two columns over, in the half
   of the fix that was not finished.
+
+## Worker session does not auto-restart when server restarts
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-29
+SESSION: 6527367a-8ff6-431a-ace9-e421554fb30d
+CARD: none
+SYMPTOM: After `systemctl --user restart amux.service` (from a deployment), the amux
+  worker session stays down: `GET /api/sessions/amux` returns `running: false`. Inbound
+  Telegram messages have nowhere to route into until someone manually calls `POST
+  /api/sessions/amux/start`. The `amux-worker-start.service` is a boot-time-only unit
+  (runs once at `systemd --user` init), not triggered by manual server restarts.
+COST: 5 minutes of diagnostics; live Telegram messages silently drop inbound until
+  manually restarted. In production with unattended amux, a server restart from a
+  deployment would leave Telegram routing dead until noticed and fixed manually.
+FIX: Either (a) change `amux-worker-start.service` to have `Restart=always` so it
+  auto-restarts with amux.service, or (b) add a post-startup hook to amux.service
+  that calls `POST /api/sessions/amux/start`, or (c) wire the worker start into a
+  systemd timer that verifies worker is up on server start. The root cause is that
+  system-startup and service-restart are different events (both need the worker up),
+  and the current unit only handles the first.
