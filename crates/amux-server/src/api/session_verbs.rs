@@ -8279,6 +8279,13 @@ fn compose_worker_block(name: &str, session_content: &str) -> String {
 /// rooted at `AMUX_HOME`, so it is safe to exercise directly.
 fn compose_memory_doc(name: &str, global_content: &str, session_content: &str) -> String {
     let mut parts = Vec::new();
+    // RULES FIRST (AF-297). Binding constraints buried under prose are
+    // constraints the model has to go looking for, which is the python call
+    // site's own reason for this ordering.
+    let rules = compose_rules_block(name);
+    if !rules.is_empty() {
+        parts.push(rules);
+    }
     if !global_content.trim().is_empty() {
         parts.push(format!(
             "- [amux inter-session API]({MEM_TOPIC_FILE}) — \
@@ -13074,6 +13081,61 @@ pub(crate) async fn git_checkout_verb(name: &str, body: &Value) -> Response {
         }
         None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "git timed out"})),
     }
+}
+
+/// The binding rules section, composed global -> group -> worker (AF-297).
+///
+/// NOT A NEW DESIGN. `rules` shipped complete in the python server and the rust
+/// port kept the WRITER and dropped the READER: scope.rs still writes
+/// `memory/_rules.md`, `memory/tags/<g>.rules.md` and `memory/<worker>.rules.md`,
+/// and until this function nothing in the repo read any of them. Measured
+/// repo-wide before the fix: two hits for `.rules.md`, both in scope.rs's own
+/// path builder. So a user setting binding rules at any level got a saved file
+/// and zero effect, and `merge: concat` in SCOPE_CAPS described a composition
+/// no code performed.
+///
+/// The meaning is RECOVERED, not guessed — `_compose_rules_block` at
+/// `792ce1f^:amux-server.py:21955`. Three properties come from there and are
+/// worth keeping deliberately:
+///
+/// - Each rule is LABELLED with the layer that set it, so a session can see why
+///   it is constrained without reading source. The python docstring names the
+///   incident: a GEMINI.md that told a lane to bypass gates was invisible for
+///   exactly this reason.
+/// - A more specific layer ADDS to the ones above rather than replacing them,
+///   which is what `merge: concat` has been claiming all along.
+/// - Rules go FIRST in the document. The python call site says why: "a
+///   constraint buried under prose is a constraint the model has to go looking
+///   for."
+fn compose_rules_block(name: &str) -> String {
+    let mut layers: Vec<(String, String)> = Vec::new();
+    let mut take = |label: String, path: std::path::PathBuf| {
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            if !t.trim().is_empty() {
+                layers.push((label, t.trim().to_string()));
+            }
+        }
+    };
+    take("global".to_string(), memory_dir().join("_rules.md"));
+    for g in lane_groups(name) {
+        take(format!("tag:{g}"), memory_dir().join("tags").join(format!("{g}.rules.md")));
+    }
+    take(format!("session:{name}"), memory_dir().join(format!("{name}.rules.md")));
+    if layers.is_empty() {
+        return String::new();
+    }
+    let body = layers
+        .iter()
+        .map(|(l, t)| format!("<!-- from {l} -->\n{t}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "# Rules — binding\n\n         These are constraints, not notes. They are composed from your scope \
+         (global, then any tags, then this session); a more specific layer adds to the \
+         ones above it rather than replacing them. If a rule here conflicts with \
+         something you infer, the rule wins — and if a rule cannot be followed \
+         honestly, say so rather than working around it.\n\n{body}"
+    )
 }
 
 /// Is `name` a fleet lane? The env file is the definition — it is what
@@ -21111,6 +21173,65 @@ mod commit_shape_tests {
              precedence /api/scope advertises: {after}"
         );
         assert!(after.contains("alpha"), "the group must be named in its block: {after}");
+    }
+
+
+    /// AF-297: binding rules compose from all three layers, labelled, and FIRST.
+    ///
+    /// Inert-when-absent is asserted first and is the safety property: no
+    /// `.rules.md` file exists anywhere on this machine, so restoring the
+    /// dropped consumer must change nothing until someone uses the capability.
+    ///
+    /// The LABELS are asserted because they are the point, not decoration. The
+    /// python original records why: a GEMINI.md that told a lane to bypass gates
+    /// was invisible precisely because nothing said which layer a constraint came
+    /// from.
+    #[tokio::test]
+    async fn binding_rules_compose_labelled_and_first_and_are_inert_when_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("sessions")).unwrap();
+        std::fs::create_dir_all(h.join("memory/tags")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(h);
+        std::fs::write(h.join("sessions/ruled.env"), "CC_TAGS=\"alpha\"\n").unwrap();
+
+        let before = super::compose_memory_doc("ruled", "GLOBALTEXT", "WORKERTEXT");
+        assert!(
+            before.contains("WORKERTEXT"),
+            "premise gone — an empty document would pass the absence check below: {before}"
+        );
+        assert!(
+            !before.contains("Rules — binding"),
+            "no .rules.md exists, so restoring the consumer must compose nothing: {before}"
+        );
+
+        std::fs::write(h.join("memory/_rules.md"), "GLOBALRULE").unwrap();
+        std::fs::write(h.join("memory/tags/alpha.rules.md"), "GROUPRULE").unwrap();
+        std::fs::write(h.join("memory/ruled.rules.md"), "WORKERRULE").unwrap();
+        let after = super::compose_memory_doc("ruled", "GLOBALTEXT", "WORKERTEXT");
+
+        assert!(
+            after.starts_with("# Rules — binding"),
+            "rules must come FIRST: a constraint buried under prose is one the model has to \
+             go looking for: {after}"
+        );
+        for (label, text) in [
+            ("<!-- from global -->", "GLOBALRULE"),
+            ("<!-- from tag:alpha -->", "GROUPRULE"),
+            ("<!-- from session:ruled -->", "WORKERRULE"),
+        ] {
+            assert!(after.contains(text), "{text} did not reach the document: {after}");
+            assert!(
+                after.contains(label),
+                "{text} is present but unlabelled — a session cannot see WHICH layer \
+                 constrained it, which is the defect the labels exist for: {after}"
+            );
+        }
+        let (gi, wi) = (
+            after.find("GLOBALRULE").unwrap(),
+            after.find("WORKERRULE").unwrap(),
+        );
+        assert!(gi < wi, "layers compose least-specific first: {after}");
     }
 
 }
