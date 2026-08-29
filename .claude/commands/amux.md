@@ -242,6 +242,33 @@ There is no automatic "every session message also goes to Telegram" wiring —
 background forwarder (ethos rule 8: which events go to which chat is the
 operator's call, not a default this connector should assume).
 
+**Any worker can reply to Telegram** — the connector is available to all sessions
+equally. If you want your session to send replies back to Telegram (e.g., in response
+to messages routed via `@your-session-name` mentions), call the send endpoint:
+
+```bash
+# From your session: reply to a message routed from Telegram
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"session":"your-session-name","text":"Your reply here"}' \
+  $AMUX_URL/api/telegram/send
+
+# Or target a specific chat directly (if you know the chat_id)
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"chat_id":123456,"text":"Direct message"}' \
+  $AMUX_URL/api/telegram/send
+
+# With HTML formatting (bold, italic, code, etc.)
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"session":"your-session-name","text":"<b>Bold</b> reply","parse_mode":"HTML"}' \
+  $AMUX_URL/api/telegram/send
+```
+
+Messages sent from your session resolve to the most-recently-linked chat for that
+session (if multiple chats linked the same session, the newest one wins). The API
+returns `{"sent": true}` on success or an error if the chat doesn't exist or the
+network fails. Ethos rule 8 applies: **you decide when and what to send** — no
+automatic forwarding.
+
 If `/link` or a manual mapping ever comes back with a write/database error,
 that is a real bug, not transient contention — every DB write in this
 codebase goes through the single writer thread (`Store::write_async`, see
