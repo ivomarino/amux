@@ -4582,6 +4582,29 @@ pub(crate) enum FrameRead {
     /// Our text is still sitting in the composer with the lane idle. Nothing is
     /// going to submit it.
     StillThereIdle,
+    /// The composer holds a COLLAPSED PASTE (`[Pasted text #12 +4 lines]`), so
+    /// the text itself is not in the frame and cannot be compared to ours.
+    ///
+    /// Its own variant rather than folded into `NoUi` (AMUX-3880), because the
+    /// two want opposite handling and folding them cost a real delivery.
+    /// `NoUi` means "Claude Code has not painted yet", and the right response is
+    /// to WAIT. This means "the composer is painted and holding something
+    /// unsubmitted", and waiting is exactly wrong — the Enter needs pressing
+    /// again.
+    ///
+    /// AMUX-3876 mapped this to `NoUi` to stop it reading as `Cleared`, which
+    /// fixed the false CONFIRMED and left the message stranded: the retry lives
+    /// past the `StillThereIdle` arm, and a waiting arm never reaches it.
+    ///
+    /// WHY THE SEND MAY ACT ON THIS WHERE `ghost_rescue` MAY NOT. That sweep
+    /// refuses to submit a collapsed paste because it cannot prove the content
+    /// is the message it means, and it is right: it runs minutes later, holding
+    /// no lock. Inside `send_text` the claim is provable — `session_send_lock`
+    /// is held across paste, Enter and verify precisely so nothing else can type
+    /// into the pane (its own doc says the sweep must never fire an Enter into a
+    /// pane a send is mid-way through), and we pasted seconds ago. Same evidence
+    /// standard, different evidence available.
+    CollapsedPaste,
 }
 
 /// Does the FINAL frame — the one read after the retry loop gives up — PROVE
@@ -4619,6 +4642,9 @@ pub(crate) fn final_frame_confirms(frame: FrameRead) -> bool {
         FrameRead::NoUi => false,
         // Sitting in an idle composer: nothing is going to submit it.
         FrameRead::StillThereIdle => false,
+        // A collapsed paste is something UNSUBMITTED in a painted composer.
+        // Never a confirmation, whatever else is done about it.
+        FrameRead::CollapsedPaste => false,
     }
 }
 
@@ -4654,7 +4680,7 @@ pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
     // this is the same refusal, one layer earlier, where it can still be
     // reported to the sender rather than only logged.
     if state.typed().is_some_and(crate::runtime_jobs::ghost_rescue::is_collapsed_paste) {
-        return FrameRead::NoUi;
+        return FrameRead::CollapsedPaste;
     }
     // Only REAL input counts as "still there". A dim suggestion that happens to
     // repeat our text is not our message sitting unsent — and treating it as
@@ -4888,6 +4914,18 @@ async fn verify_submitted(
             // interrupt).
             FrameRead::StillThereGenerating => return (Submission::Confirmed, retried),
             FrameRead::StillThereIdle => {}
+            // TREATED AS "still there", because it IS (AMUX-3880). The composer
+            // is painted and holding something unsubmitted; the text is merely
+            // hidden behind the TUI's chip. Falling through here is the whole
+            // fix: the Escape+Enter retry lives below, and the previous
+            // `NoUi` mapping waited instead of reaching it, so a pasted message
+            // was correctly reported stuck and then left in the box.
+            //
+            // Ownership is provable at THIS site and only at this site: the
+            // send lock is held from paste through verify, and we pasted
+            // seconds ago. `ghost_rescue` cannot make that claim and correctly
+            // does not try.
+            FrameRead::CollapsedPaste => {}
         }
         cleared_once = false;
         // ONE stuck look is not proof either: for ~1s after a successful submit
@@ -19430,13 +19468,21 @@ mod submission_gate_tests {
             let f = read_frame(&frame_stuck_idle(chip), &t);
             assert_eq!(
                 f,
-                FrameRead::NoUi,
-                "a collapsed paste hides the content that would prove ownership, so the only \
-                 honest read is 'assert nothing' — got {f:?} for {chip:?}"
+                FrameRead::CollapsedPaste,
+                "a collapsed paste is its OWN verdict: the composer is painted and holding \
+                 something unsubmitted. Folding it into NoUi (AMUX-3876) stopped the false \
+                 CONFIRMED and left the message stranded, because the retry lives past the \
+                 StillThereIdle arm and a waiting arm never reaches it — got {f:?} for {chip:?}"
             );
             assert!(
                 !final_frame_confirms(f),
                 "and it must never confirm the send: the message is still in the box"
+            );
+            assert_ne!(
+                f,
+                FrameRead::NoUi,
+                "specifically NOT NoUi: that means 'not painted yet, wait', which is the \
+                 opposite of what an unsubmitted paste needs (AMUX-3880)"
             );
         }
         // CONTROL: an ordinary composer holding our text is unchanged, so the
