@@ -66,8 +66,20 @@ else
   # SAID EXPLICITLY, not left as silence. "No line printed" would be
   # indistinguishable from "this script did not run", which is the same
   # absent-versus-measured confusion the whole entry is about.
+  #
+  # NAMES THE AUTO-BUILDER, not "a build" (2026-08-29). This arm used to read
+  # "no build was in flight", and the first real run of this script printed it
+  # directly under cargo's own "Compiling amux-server ... Finished in 1m 04s".
+  # Both were true and the sentence still read as false, because what is
+  # sampled is $LOCK, the AUTO-BUILDER's lock: the hazard is another process
+  # rewriting the shared binary underneath a test that spawns it, not the
+  # compile this very command is doing. A probe has to say what it measured,
+  # or the one line that exists to settle "real or contention?" becomes the
+  # thing you have to go and check.
   echo ""
-  echo "contention: no build was in flight during this run — a failure here is real."
+  echo "contention: the auto-builder was NOT rebuilding during this run, so the shared"
+  echo "contention: binary was stable under it. A failure here is real. (Cargo's own"
+  echo "contention: compile for this command is not the hazard; a peer's is.)"
 fi
 
 exit "$RC"

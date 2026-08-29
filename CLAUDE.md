@@ -57,7 +57,14 @@ Verify a hook by what it WROTE, not by the settings file.
 - **Pre-fix specimen: `<your-sha>^`**, never `HEAD~1` (shared checkout).
 - **Client JS: bump `APP_VER` (app.js) + `CACHE` (sw.js) together.**
 - Syntax gates: `cargo check --workspace`. Before push: `cargo clippy --workspace --all-targets -- -D warnings`.
-  Tests: `cargo test -p amux-server`.
+  Tests: `scripts/test-contended.sh -p amux-server` (same args as `cargo test`, same exit status).
+  **A red suite here is not automatically a regression.** This box builds and tests amux
+  continuously, so the auto-builder can rewrite the shared binary while your tests spawn it,
+  and the ETXTBSY family surfaces as failures in modules you never touched (AMUX-3853: 8
+  failures in `opencode::structured`, 15/15 green on an immediate rerun). Plain `cargo test`
+  cannot tell you which kind of run you got, so every green also silently means "and nothing
+  was building" and every red looks like your fault. The wrapper prints that missing clause
+  beside the result, in both directions. Use plain `cargo test` when you want the raw thing.
 
 ## Observability
 
