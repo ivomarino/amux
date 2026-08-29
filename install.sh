@@ -130,9 +130,41 @@ else
 #
 # Lowest precedence of cargo's three: CARGO_TARGET_DIR and --target-dir still
 # override it, which is what keeps the e2e worktree build and CI unaffected.
+#
+# incremental=false (FRONT-2, 2026-08-28): cargo's default parallelism (=
+# nproc) correlated with repeated session crashes on one memory-constrained
+# box in this fleet — every tmux session in a shared checkout lives in the
+# same container, so a kill under memory pressure is not necessarily the
+# build's own process; it can reap an unrelated session's Claude Code
+# process as collateral. Measured the actual culprit rather than guessing:
+# with incremental compilation on, a bare \`cargo check -p amux-server\`
+# drove available memory to ~48MiB and crashed the session; with
+# CARGO_INCREMENTAL=0, the identical check completed clean at ~195MiB
+# available. Incremental trades memory for faster rebuilds by keeping extra
+# state between runs — on a box this size that trade isn't affordable.
+# Costs slower rebuilds everywhere, but that cost doesn't scale with fleet
+# size the way serializing every lane's build would, so it applies
+# unconditionally rather than behind a knob.
 [build]
 target-dir = "$SHARED_TARGET_DIR"
+incremental = false
 EOF
+  # jobs cap: opt-in, NOT unconditional like incremental above. Cargo's
+  # default (jobs = nproc) is correct almost everywhere in this fleet — one
+  # constrained box needing jobs=1 does not mean every box should serialize.
+  # The pre-commit hook runs `cargo check --workspace --all-targets` on
+  # every commit across ~50 shared-checkout lanes; hardcoding jobs=1 here
+  # would take that gate from N-way to 1-way parallelism for all of them on
+  # boxes with no memory pressure at all — a permanent, fleet-wide cost to
+  # fix a condition that exists on one box. Same shape this repo already
+  # uses for other machine-specific policy constants (AMUX_HELPER_MODEL,
+  # AMUX_OLLAMA_DEFAULT_MODEL, deviation D4): env-overridable, so a
+  # constrained box sets it once (`AMUX_CARGO_JOBS=1 ./install.sh`) and
+  # nobody else pays for it.
+  if [[ -n "${AMUX_CARGO_JOBS:-}" ]]; then
+    printf 'jobs = %s\n' "$AMUX_CARGO_JOBS" >> "$SCRIPT_DIR/.cargo/config.toml"
+    say "cargo config: jobs capped at $AMUX_CARGO_JOBS (AMUX_CARGO_JOBS set)"
+  fi
   say "cargo config: builds in this checkout target $SHARED_TARGET_DIR"
 fi
 
@@ -259,19 +291,71 @@ if [[ -f "$SCRIPT_DIR/scripts/hooks/hook-report.sh" ]]; then
 fi
 
 # ── 5. Service ──────────────────────────────────────────────────────────────
+if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
+  # envsubst ships in gettext-base (Debian/Ubuntu) / gettext (Fedora), not
+  # always present on a minimal install — checked explicitly (review
+  # @esteininger, PR #166) alongside the other tool checks above (cargo,
+  # tmux, herdr) instead of letting it fail inside the `|| die` below with
+  # a message that names the template, not the missing package.
+  command -v envsubst >/dev/null 2>&1 || die "envsubst required (apt install gettext-base / dnf install gettext)"
+
+  # Create systemd user services from templates.
+  SYSTEMD_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$SYSTEMD_DIR"
+
+  # Substitute variables in service templates and write to systemd directory.
+  # Export variables so envsubst can find them.
+  export BIN_DIR PORT AMUX_HOME SCRIPT_DIR
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-server.service.template" \
+    > "$SYSTEMD_DIR/amux-server.service" || die "failed to create amux-server.service"
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-builder.service.template" \
+    > "$SYSTEMD_DIR/amux-builder.service" || die "failed to create amux-builder.service"
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-builder.timer.template" \
+    > "$SYSTEMD_DIR/amux-builder.timer" || die "failed to create amux-builder.timer"
+
+  # Reload systemd to recognize the new units.
+  systemctl --user daemon-reload || die "systemctl daemon-reload failed"
+
+  say "systemd user services created:"
+  say "  $SYSTEMD_DIR/amux-server.service"
+  say "  $SYSTEMD_DIR/amux-builder.service"
+  say "  $SYSTEMD_DIR/amux-builder.timer"
+  echo ""
+  say "Next: enable and start the services"
+  echo "  ${DIM}systemctl --user enable amux-server${RESET}"
+  echo "  ${DIM}systemctl --user enable amux-builder.timer${RESET}"
+  echo "  ${DIM}systemctl --user start amux-server${RESET}"
+  echo ""
+  say "View logs: ${DIM}journalctl --user -u amux-server -f${RESET}"
+  echo ""
+  echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
+  echo ""
+  say "See docs/systemd-setup.md for full documentation"
+  echo ""
+  # Deliberate, not incidental (review @esteininger, PR #166): this path
+  # never starts the server — it prints the enable/start commands above and
+  # exits — so there is nothing running yet to wait on. The macOS path
+  # below this one DOES start the service and polls /health before
+  # declaring success; saying so here keeps the two honest with each other
+  # instead of leaving Linux users to notice the asymmetry on their own.
+  say "Unlike the macOS path, this installer does not start the service or"
+  say "verify /health on Linux — run the two 'systemctl --user' commands"
+  say "above, then check https://localhost:$PORT/health yourself."
+  exit 0
+fi
+
+# Non-systemd Linux or unsupported OS.
 if [[ "$OS" != "Darwin" ]]; then
-  # Honest degrade: no launchd here, and pretending to manage systemd from a
-  # bash installer is how services half-exist. Print exactly what to run.
-  warn "$OS: no service manager configured by this installer."
+  warn "$OS: systemd not detected. No service manager configured."
   echo ""
   echo "Run the server in the foreground:"
   echo "    AMUX_RS_PORT=$PORT $BIN_DIR/amux-server-rs"
   echo ""
   echo "Or wrap it in a systemd user unit (~/.config/systemd/user/amux.service):"
-  echo "    [Service]"
-  echo "    ExecStart=$BIN_DIR/amux-server-rs"
-  echo "    Environment=AMUX_RS_PORT=$PORT"
-  echo "    Restart=always"
+  echo "    See docs/systemd-setup.md for template"
   echo ""
   echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
   exit 0
