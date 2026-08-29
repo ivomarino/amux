@@ -10991,23 +10991,7 @@ async fn get_dispatch(
             )
             .await
         }
-        "peek" => {
-            let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
-            let live_only = qs_flag(qs, "live");
-            let no_trim = qs_flag(qs, "notrim");
-            // Geometry is attached HERE rather than inside peek_response because
-            // that function has six return points (live_only, alt-screen, normal,
-            // short-output, empty…) and a key added to one of them is a key the
-            // reader cannot rely on. One injection site covers every shape.
-            let mut resp = peek_response(name, lines, live_only, no_trim).await;
-            if let (Some((cols, rows)), Some(obj)) =
-                (tmux_pane_geometry(name).await, resp.as_object_mut())
-            {
-                obj.insert("pane_cols".into(), json!(cols));
-                obj.insert("pane_rows".into(), json!(rows));
-            }
-            j200(resp)
-        }
+        "peek" => peek_verb(name, qs).await,
         "transcript" => {
             // Codex/Ollama run a native TUI whose raw mirror is what Ethan saw
             // looked nothing like Claude (AMUX-3201). They also write a
@@ -13090,6 +13074,38 @@ pub(crate) async fn git_checkout_verb(name: &str, body: &Value) -> Response {
         }
         None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "git timed out"})),
     }
+}
+
+/// Is `name` a fleet lane? The env file is the definition — it is what
+/// `lane_groups` reads for CC_TAGS and what `scope_env_layers` treats as the
+/// worker layer, so this is not a fourth spelling of "does a lane exist".
+pub(crate) fn lane_env_exists(name: &str) -> bool {
+    env_path(name).is_file()
+}
+
+/// `peek` against the FLEET SUBSTRATE, by name (AF-298).
+///
+/// The promoted `/api/workers/{id}/peek` resolves through the worker STORE and
+/// 404s on a miss. The fleet is ~50 env-file-plus-tmux lanes and only one of
+/// them is a store row, so that route answered 404 for essentially every lane
+/// it was asked about. `send` never had the problem because it falls back to
+/// the key and lands here; this is the same landing spot for peek.
+pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
+    let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
+    let live_only = qs_flag(qs, "live");
+    let no_trim = qs_flag(qs, "notrim");
+    // Geometry is attached HERE rather than inside peek_response because
+    // that function has six return points (live_only, alt-screen, normal,
+    // short-output, empty…) and a key added to one of them is a key the
+    // reader cannot rely on. One injection site covers every shape.
+    let mut resp = peek_response(name, lines, live_only, no_trim).await;
+    if let (Some((cols, rows)), Some(obj)) =
+        (tmux_pane_geometry(name).await, resp.as_object_mut())
+    {
+        obj.insert("pane_cols".into(), json!(cols));
+        obj.insert("pane_rows".into(), json!(rows));
+    }
+    j200(resp)
 }
 
 /// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`

@@ -1029,7 +1029,27 @@ pub async fn peek_worker(
     .await;
     let (row, live) = match joined {
         Ok(Ok(Some(v))) => v,
-        Ok(Ok(None)) => return not_found(&key),
+        // A STORE MISS IS NOT A MISSING WORKER (AF-298). The fleet is ~50
+        // env-file-plus-tmux lanes and exactly one of them is a row in this
+        // table, so returning not_found here answered 404 for essentially every
+        // lane anyone asked about. `send_worker` never had the problem: it falls
+        // back to the key and lets the fleet substrate answer by name. Same
+        // fallback, same landing spot — the substrate's own existence gate then
+        // reports a genuine miss under the name the caller used.
+        Ok(Ok(None)) => {
+            // ONLY for a name that IS a fleet lane. Delegating on every store
+            // miss turned "unknown worker" into whatever the substrate says for
+            // a name it also does not have, and in this crate's own test that
+            // was a 200 — a clean 404 becoming a plausible answer, which is the
+            // failure this surface exists to prevent. The existence gate is the
+            // lane's env file, the same artifact `lane_groups` and
+            // `scope_env_layers` treat as the definition of a lane.
+            if !crate::api::session_verbs::lane_env_exists(&key) {
+                return not_found(&key);
+            }
+            let qs = vec![("lines".to_string(), p.lines.unwrap_or(80).to_string())];
+            return crate::api::session_verbs::peek_verb(&key, &qs).await;
+        }
         Ok(Err(e)) => return internal(e),
         Err(e) => return internal(e),
     };
@@ -2572,6 +2592,43 @@ mod tests {
             "control failed: an unrouted git sub-verb must 404 now that the catch-all is gone. \
              This is the assertion the explicit-per-sub-verb routing exists to make true, and \
              it is why /{{id}}/git/{{*sub}} was never an option: a wildcard would answer here: {v}"
+        );
+    }
+
+
+    /// AF-298: peek at the workers spelling reaches a FLEET lane, which is not a
+    /// row in the workers store.
+    ///
+    /// The two misses have different bodies and that is what makes this test
+    /// possible: the store answers `{"error":"worker not found","key":...}`,
+    /// the substrate answers about the SESSION. Asserting the store shape is
+    /// absent is therefore "the fallback ran", not "something returned".
+    ///
+    /// Measured before the fix: GET /api/workers returns ONE row on this
+    /// machine while the fleet is ~50 lanes, so this route answered the store's
+    /// 404 for essentially every lane anyone asked about — and had since peek
+    /// was promoted in ea65b5bf, because axum prefers the static suffix over the
+    /// catch-all that used to sit beside it.
+    #[tokio::test]
+    async fn peek_at_the_workers_spelling_reaches_a_fleet_lane_not_in_the_store() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        std::fs::write(home.path().join("sessions/fleetlane.env"), "CC_TAGS=\"x\"\n").unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+
+        let (_, _, v) = send(&app, "GET", "/api/workers/fleetlane/peek", None).await;
+        let body = v.to_string();
+        assert!(
+            !body.contains("worker not found"),
+            "peek fell back to the STORE's miss for a lane that exists in the fleet: {v}"
+        );
+        // CONTROL: the substrate answered about this lane by NAME. Without it,
+        // "the store shape is absent" would also pass on an empty body.
+        assert!(
+            body.contains("fleetlane"),
+            "premise gone — the answer does not name the lane, so the assertion above \
+             cannot tell a fallback from an empty response: {v}"
         );
     }
 
