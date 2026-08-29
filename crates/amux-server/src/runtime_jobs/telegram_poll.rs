@@ -267,28 +267,98 @@ async fn link_chat(state: &AppState, chat_id: i64, session: &str, username: Opti
 /// still holding real Telegram updates to process.
 async fn send_reply(chat_id: i64, text: &str) {
     let Some(token) = bot_token() else { return };
-    if let Err(e) = send_message(&token, chat_id, text).await {
+    // Plain text, no formatting — these are short fixed status strings
+    // ("Linked.", the unlinked nudge), never worth the entity-parsing risk.
+    if let Err(e) = send_message(&token, chat_id, text, None).await {
         tracing::warn!("telegram_poll: reply to chat {chat_id} failed: {e}");
     }
+}
+
+/// Strip HTML tags for the plain-text fallback below — not a sanitizer (this
+/// text is going TO Telegram, not being embedded in a page we render), just
+/// good enough to turn `<b>x</b>` into `x` instead of a user reading raw
+/// angle brackets when entity parsing rejected the formatted version. Also
+/// unwinds the handful of entities the sender's HTML converter produces
+/// (`&amp;`/`&lt;`/`&gt;`/`&quot;`/`&#39;`) — no crate for this, the input is
+/// our own converter's output, not arbitrary untrusted HTML.
+fn strip_html_tags(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut in_tag = false;
+    for c in s.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
 }
 
 /// `POST {base}/sendMessage`. `pub(crate)` so `api::telegram`'s
 /// `POST /api/telegram/send` can reuse the exact same call rather than a
 /// second HTTP-shape spelling of it (D6).
-pub(crate) async fn send_message(token: &str, chat_id: i64, text: &str) -> Result<(), String> {
+///
+/// `parse_mode: Some("HTML")` lets a caller send Telegram's HTML-subset
+/// markup (core.telegram.org/bots/api#formatting-options — bold/italic/
+/// strikethrough/code/pre/links/blockquote; no native headings/lists/
+/// tables). Telegram REJECTS the whole message on a single malformed
+/// entity (an unclosed tag, a bad href) — since the caller's HTML came from
+/// a regex-based converter over arbitrary markdown, not a real parser, that
+/// is a real failure mode, not a hypothetical one. On that specific
+/// rejection this retries ONCE as plain text (tags stripped) rather than
+/// dropping the message: a reply with visible `<b>` tags, or no reply at
+/// all, is worse than one that lost its formatting but still arrived
+/// (ethos rule 3 — the honest degradation, not a silent loss).
+pub(crate) async fn send_message(
+    token: &str,
+    chat_id: i64,
+    text: &str,
+    parse_mode: Option<&str>,
+) -> Result<(), String> {
     let client = reqwest::Client::new();
+    let mut body = serde_json::json!({ "chat_id": chat_id, "text": text });
+    if let Some(mode) = parse_mode {
+        body["parse_mode"] = serde_json::Value::String(mode.to_string());
+    }
     let resp = client
         .post(format!("{}/sendMessage", api_base(token)))
-        .json(&serde_json::json!({ "chat_id": chat_id, "text": text }))
+        .json(&body)
         .send()
         .await
         .map_err(|e| format!("sendMessage request: {e}"))?;
     let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("sendMessage rejected (status {status}): {body}"));
+    if status.is_success() {
+        return Ok(());
     }
-    Ok(())
+    let err_body = resp.text().await.unwrap_or_default();
+    // Only retry when formatting was actually in play and Telegram's error
+    // shape says it choked on the entities, not on rate limits/auth/network.
+    if parse_mode.is_some() && status.as_u16() == 400 && err_body.to_lowercase().contains("parse entities") {
+        tracing::warn!(
+            "telegram_poll: sendMessage rejected formatted text for chat {chat_id}, retrying as plain: {err_body}"
+        );
+        let plain = strip_html_tags(text);
+        let retry = client
+            .post(format!("{}/sendMessage", api_base(token)))
+            .json(&serde_json::json!({ "chat_id": chat_id, "text": plain }))
+            .send()
+            .await
+            .map_err(|e| format!("sendMessage plain-text retry: {e}"))?;
+        let retry_status = retry.status();
+        if retry_status.is_success() {
+            return Ok(());
+        }
+        let retry_body = retry.text().await.unwrap_or_default();
+        return Err(format!(
+            "sendMessage rejected formatted (status {status}): {err_body}; plain-text retry also rejected (status {retry_status}): {retry_body}"
+        ));
+    }
+    Err(format!("sendMessage rejected (status {status}): {err_body}"))
 }
 
 pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {

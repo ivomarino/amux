@@ -129,6 +129,12 @@ struct SendReq {
     session: Option<String>,
     chat_id: Option<i64>,
     text: String,
+    /// Telegram's `parse_mode` — "HTML" is the only mode this codebase's
+    /// senders (the amux-relay Stop hook) produce; MarkdownV2 is valid
+    /// Telegram-side too but nothing here generates it. `None` = Telegram's
+    /// default plain-text interpretation, unchanged from before this field
+    /// existed.
+    parse_mode: Option<String>,
 }
 
 async fn send(State(state): State<AppState>, Json(body): Json<SendReq>) -> Response {
@@ -161,7 +167,7 @@ async fn send(State(state): State<AppState>, Json(body): Json<SendReq>) -> Respo
     let Some(token) = std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.trim().is_empty()) else {
         return err(StatusCode::PRECONDITION_FAILED, json!({ "error": "TELEGRAM_BOT_TOKEN not set" }));
     };
-    match telegram_poll::send_message(&token, chat_id, &body.text).await {
+    match telegram_poll::send_message(&token, chat_id, &body.text, body.parse_mode.as_deref()).await {
         Ok(()) => (StatusCode::OK, Json(json!({ "sent": true, "chat_id": chat_id }))).into_response(),
         Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e })),
     }
