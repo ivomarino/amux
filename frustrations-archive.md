@@ -2350,3 +2350,179 @@ CARD: DESKT-10
 SYMPTOM: The idle dirty-tree notice reported "2 uncommitted change(s)" for app.css and app.js while `git status --porcelain` was EMPTY. Both worktree blobs were byte-identical to HEAD; they differed only from origin/main, which this checkout sits ~44 commits ahead of. The notice then ran its direction test, `git cat-file -e $(git hash-object <path>)`, got "object exists" for both, and classified them STALE, whose prescribed remedy is `git checkout origin/main -- <path>`. Running that would have reverted app.js by 1153 insertions and deleted crates/amux-server/src/api/reclaim.rs entirely, a feature shipped hours earlier. I tested five committed-but-unpushed paths (app.js, app.css, reclaim.rs, api/mod.rs, frustrations.md) and every single one classified STALE.
 COST: no work lost, because the tree being clean vs HEAD was checkable in one command and I checked before acting. The cost is the trap itself and how well disguised it is. The notice opens by warning that a difference from origin is not a direction, and then uses a test carrying exactly that blind spot, so the warning reads as evidence the test already accounts for it. It also states that roughly 1 in 4 differing paths are novel mid-edits a checkout would destroy, which frames "STALE" as the safe verdict and pushes toward the destructive branch. Any session that follows it literally on this checkout reverts every file it names.
 FIX: the direction test must be ANCESTRY, not blob existence. Blob existence cannot tell an old revision from a current one that is merely unpushed; both answer yes, and on a permanently-ahead checkout every committed file answers yes. `git merge-base --is-ancestor $(git log -1 --format=%H -- <path>) origin/main` separates them exactly: false means committed and unpushed, so leave it alone; true plus a worktree difference means genuinely older. Second, gate the notice on `git status --porcelain` being non-empty, so a tree that is clean against HEAD never triggers it at all. Both are one-line changes and either alone would have prevented this.
+
+## The passenger check compares SHAs, so an already-upstream cherry-pick reads foreign forever
+VALIDATED: amux-cloud | VALIDATED BY ITS ORIGINATING SESSION, amux-cloud, who flipped their own
+STILL-LIVE verdict of Aug 24/26 after checking the code today rather than
+recalling it.
+
+The entry's whole claim was that the passenger check compared SHAs, so an
+already-upstream cherry-pick read as unpushed, and that the remedy was a recipe a
+human runs by hand rather than a check. That gap is closed in code:
+scripts/git-hooks/pre-push `_upstream_duplicates()` computes
+`git patch-id --stable` and excludes already-upstream replays from the foreign
+set.
+
+Confirmed independently by amux-frustrations before executing this move (the
+archive files a claim as history, so it is worth one look): `_upstream_duplicates`
+is present and called, `git patch-id --stable` is the mechanism, and the hook's
+own docstring at line 107 names the entry's specimen — acdbfdf and 9ebc42c
+sharing patch-id dff284cf093aecaa. scripts/test-push-guard-range.sh reports 16
+passing cells.
+
+The check DISCRIMINATES rather than merely passing, which is the part that makes
+this a validation instead of a green light: cell L proves a replayed commit
+already on origin is not foreign, cell M proves a foreign commit origin has never
+seen is STILL REFUSED, and cell N proves an applied-and-reverted patch is NOT
+cleared — the inverse hazard this entry itself named.
+
+Fitting close, and worth recording where the next reader will find it: AC-227 is
+the card the ledger's fingerprint invariant was NAMED FROM — an entry closed by
+somebody who was not its author, where only the documentation half had shipped.
+This time the author verified it, the executable half shipped, and the test
+proves it can fail.
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-06
+SESSION: amux-cloud
+CARD: AC-227
+SYMPTOM: CLAUDE.md's pre-push recipe lists `origin/main..main` and says to ask the author
+  about any foreign commit. A commit already upstream under a different sha (cherry-pick,
+  rebase, replay) sits in that range permanently. Confirmed: `acdbfdf` and `9ebc42c` share
+  patch-id `dff284cf093aecaa`.
+COST: Blocked my own push, asked a peer for permission they did not need to give. The
+  dangerous direction is the inverse — a session assuming a familiar-looking commit is
+  last week's duplicate and shipping something genuinely unreviewed.
+FIX: CLAUDE.md pre-push recipe now adds `git fetch origin` first and includes a patch-id
+  comparison step to identify cherry-picks/rebases before asking about foreign commits.
+  Validated by amux-cloud.
+
+REFUSED 2026-08-11 by amux-cloud — only the DOCUMENTATION half shipped. CLAUDE.md carries
+  the patch-id recipe (and I used it myself), but NO executable path computes a patch-id
+  anywhere: grep across *.sh, *.rs and the amux CLI returns nothing. The check still compares
+  SHAs and still reads an already-upstream cherry-pick as foreign; the doc just tells a human
+  how to work around it by hand.
+  PROTOCOL NOTE: their card is in `review`, not done, and its own last paragraph declines to
+  claim the pre-push path. So whoever marked this entry `fixed` was NOT the author — which is
+  the one thing this protocol is supposed to make impossible. Flipped back to open.
+
+## A shared CARGO_TARGET_DIR is mandated, and concurrent builds in it evict each other's artifacts
+VALIDATED: amux-frustrations | VALIDATED BY ITS AUTHOR (amux-frustrations), and validated at the depth the entry
+actually claimed rather than at the depth of the subsystem.
+
+WHAT THIS ENTRY DEMANDED, in its own words: "nobody has established WHICH of the
+three is happening — the diagnosis is missing, not the remedy." That is now
+answered, and the answer was a FOURTH thing none of the three options named.
+
+THE DIAGNOSIS. It is not cargo GC (a later note already killed that: `-Z gc` is
+nightly-only on cargo 1.97.1), and it is not cargo evicting its own cache. It is
+amux deleting the directory: scripts/rust-auto-build.sh's disk-pressure block
+runs `rm -rf "$HOME/.amux/rust-build-target"` — the shared dir every lane builds
+in — with no check for in-flight builds, on a script that runs every 60s.
+
+THE DATES MATCH THE SPECIMEN EXACTLY. Line 206 of that script records that until
+2026-08-19 it deleted the shared dir UNCONDITIONALLY whenever free space fell
+below 25GB. This entry's incident is 2026-08-15 — inside that window, three
+failures in one session, which is what an unconditional every-60s `rm -rf` of a
+directory you are building in looks like. The two-tier threshold that made it
+rare landed 2026-08-20 in 79abbb09 (AEAB-35, PR #131), five days after this entry
+and for a different reason.
+
+Measured today: 199GB free, so the sacrifice branch is nowhere near firing; the
+builder log shows the KEEP branch 8 times against the CLEAR branch once
+(2026-08-24 08:59:13, 5GB free, 195GB dir cleared).
+
+AND THE ENTRY WAS WRONG ABOUT ITS OWN OPTION (b). It proposed giving the
+auto-builder its own target dir, calling it "the one process that never benefits
+from a warm shared cache". rust-auto-build.sh:285 says the opposite in as many
+words: the shared cache is what makes builds ~15s instead of ~3min cold. So (b)
+would have cost every deploy three minutes to fix a race that a threshold fixed
+for free. Recorded because the wrong remedy was the one this entry recommended
+most confidently.
+
+THE RESIDUAL IS CARDED, NOT BURIED: AF-303. Below 8GB the reaper still deletes
+the shared dir with no in-flight check, and it has fired once. That is a narrower
+claim than this entry makes, which is why the entry retires and the card opens —
+retiring the shallow claim while naming the deeper one beside it.
+AREA: build
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-15
+SESSION: amux-frustrations
+CARD: AMUX-2936
+SYMPTOM: `error: extern location for serde_core does not exist: ~/.amux/rust-build-target/debug/deps/libserde_core-0d2476c6ed9be3cc.rmeta`, and separately 42 errors inside the `nix` crate ("cannot find type `ControlFlags` in this scope") — artifacts deleted underneath an in-flight build, three times in one session.
+  CLAUDE.md requires ONE shared build dir (~/.amux/rust-build-target) and the reasoning is sound — per-session dirs filled the disk with ~37 copies at 10-15GB each. But with several lanes plus the auto-builder building concurrently, I hit repeated hard failures of the form "extern location for serde_core does not exist: .../libserde_core-<hash>.rmeta" and 42 errors inside the `nix` crate, i.e. artifacts deleted underneath an in-flight build. Not a lock contention wait, which is what the CLAUDE.md note measured and correctly called cheap; this is cache eviction, and the only recovery is a full rebuild. Hit it three times in one session, roughly 4 minutes of rebuild each.
+COST: ~12 min of pure rebuild, and worse, it masqueraded as a code error twice — the first failure looked like my own change had broken the build, which is exactly the wrong instrument reading (a red result on code you just verified by hand means the instrument is a candidate before the code is).
+FIX: Not fixed; needs a decision, not a workaround. Options: (a) leave it — the failure is loud and self-recovering, just expensive; (b) give the auto-builder its own target dir, since it is the one builder that runs unattended every 60s and is the most likely evictor, accepting ~15GB for the one process that never benefits from a warm shared cache; (c) find whether this is cargo GC (CARGO_GC / cache auto-clean) rather than eviction, in which case pinning the retention setting fixes it outright and costs nothing. (c) is worth checking first because it would be a one-line fix, and nobody has established WHICH of the three is happening — the diagnosis is missing, not the remedy.
+
+NOTE (2026-08-24, amux-frustrations): STAYS OPEN, and the reason is a trap worth naming.
+  This entry's CARD, AMUX-2936, reads `done` — and that is not evidence about this entry,
+  because the CARD WAS REPURPOSED. Its description is now entirely about the staged-guard
+  blind-cotenant WARN (321 WARNs measured over 8h53m, 29 distinct committing lanes); its
+  log shows it passed through amux, went backlog, was reassigned to me, and closed on that
+  subject. Nothing in it addresses artifact eviction under a shared CARGO_TARGET_DIR.
+  So a validation sweep keyed on "is the linked card closed" would have archived this as
+  fixed. Card=done is weaker evidence than AC-227 already says: not only can a card close
+  without the work landing, the card can stop being ABOUT the entry while keeping the id
+  the entry points at.
+  On the substance: no eviction failure observed today across roughly 20 builds run
+  concurrently with at least one other lane and the auto-builder. That is absence of a
+  race in one session, which is not a fix, and no fix was ever made — so it stays open
+  until either the race recurs or someone changes how concurrent builds share the dir.
+
+NOTE (2026-08-27, amux-frustrations, card AF-265): OPTION (c) IS DEAD, and two new facts.
+  The FIX above says "(c) is worth checking first because it would be a one-line fix,
+  and nobody has established WHICH of the three is happening — the diagnosis is missing,
+  not the remedy." Checked, and it is not cargo GC:
+    cargo 1.97.1 — `-Z gc` ("Track cache usage and garbage collect unused files") is
+    UNSTABLE, so it is nightly-gated and off on this toolchain, and there is no gc or
+    cache setting in ~/.cargo/config.toml (no such file). Cargo's stable auto-clean
+    covers the CARGO_HOME registry/src cache, not a target dir; `cargo clean` is the
+    only thing that removes one and it is manual.
+  So the one-line fix does not exist, and (a) leave it / (b) give the auto-builder its
+  own dir are the surviving options. Recording the DEAD one so nobody re-runs it — it
+  was the cheapest to check and therefore the most likely to be checked twice.
+
+  NEW FACT 1, and it points at (b): the shared dir is 156GB (155G debug, 1.1G release,
+  839 fingerprint entries), against the 10-15GB-per-tree figure CLAUDE.md uses to justify
+  sharing it. Not urgent — 226GiB free, 88% capacity, and zero stray /private/tmp target
+  trees — but the disk argument FOR one shared dir is weakening as that one dir grows,
+  and (b) costs ~15GB against a 156GB status quo, which is a different trade than the
+  entry assumed.
+
+  HYPOTHESIS (d), WHICH THE ENTRY NEVER NAMED, IS ALSO DEAD — and it was the strongest
+  looking one. amux's OWN server runs a `reclaim` job on a `disk-watch` trigger, and
+  `crates/amux-server/src/api/reclaim.rs:395` lists `~/.amux/rust-build-target` by name,
+  labelled "Shared cargo target dir". A server job holding a list that contains the exact
+  directory, firing unattended, is precisely the shape of "artifacts deleted underneath an
+  in-flight build" — and it is a much better candidate than cargo GC ever was, because it
+  demonstrably runs on this machine every boot. I only saw it because an unrelated e2e run
+  printed `reclaim scan started ... roots=3 by=disk-watch` in its server log.
+  IT IS NOT THE EVICTOR, and the probe can express a positive. Scanning is read-only; the
+  only operation that MOVES a file is quarantine (`std::fs::rename`, :1827) and the only
+  one that deletes is purge, which requires `?confirm=<batch_id>` and only ever removes
+  from the quarantine root. So the quarantine ledger is the complete record of anything
+  reclaim has relocated. Live: 2 batches, both by session `desktop`, both purged —
+  `/Users/ethan/.cache/huggingface` (41.1GB) and `/Users/ethan/.cache/whisper` (5.5GB).
+  Nothing under `rust-build-target`. The ledger is not pruned (the only DELETE in the file
+  is on `reclaim_skipped`, :1621/:2421), so the absence is real history, not a short window.
+  WHAT THIS LEAVES, and it is now a narrower claim than the entry started with: nothing
+  EXTERNAL is deleting these artifacts. Both "something else is cleaning up behind me"
+  candidates — cargo's own GC (c) and amux's reclaim (d) — are ruled out with evidence, so
+  the evictor is cargo responding to concurrent builds from DIFFERENT PATHS into one dir,
+  which is what the SYMPTOM described before anyone went looking for a tidier explanation.
+  That strengthens (b): if the cause is path-diverse concurrent writers, giving the one
+  unattended every-60s builder its own dir removes a writer rather than papering over a
+  cleanup job. Still not mine to decide — it changes a CLAUDE.md-mandated policy for every
+  lane (ethos rule 8) — but the decision is now between two options with a known mechanism
+  instead of four with none.
+
+  NEW FACT 2, and it makes the race MORE likely rather than less: PR #158 (merged today,
+  cad635ea) made the pre-commit hook build into this same shared dir, where it previously
+  used a repo-local ./target. That is correct on CLAUDE.md's disk rule. But amux's own
+  measurement for the staged-recheck is that a build from a DIFFERENT PATH re-fingerprints
+  the workspace crates — and the staged recheck builds a scratch worktree, so it is a new
+  distinct path writing into the shared dir on every Rust commit where a peer's file is
+  the offender. More writers at more paths is exactly the condition this entry describes,
+  so if the race recurs, that is the first change to correlate against.
