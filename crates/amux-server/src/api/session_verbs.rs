@@ -4584,6 +4584,44 @@ pub(crate) enum FrameRead {
     StillThereIdle,
 }
 
+/// Does the FINAL frame — the one read after the retry loop gives up — PROVE
+/// the message was submitted?
+///
+/// `false` does not mean "not submitted". It means this frame did not prove it,
+/// and the durable JSONL record is the arbiter instead.
+///
+/// # This was `!matches!(frame, StillThereIdle)`, and that is a bug (AMUX-3870)
+///
+/// Negating ONE variant of FOUR sends the other three to Confirmed. Two belong
+/// there. The third is [`FrameRead::NoUi`], whose own doc says "NOT
+/// \"submitted\" (AC-271)" — so the variant documented as not-submitted was
+/// reported as submitted, at the very site the retry loop's own `NoUi` arm
+/// exists to prevent. That arm carries the incident: a schedule fired into a
+/// container that was still waking, send reported sent, `_run_schedule`
+/// recorded ok, and the worker never ran. Nine workers across three customer
+/// envs (amux-cloud, 2026-08-06). The loop refused to claim it; the
+/// fall-through claimed it anyway.
+///
+/// THE DEFECT IS THE SHAPE, NOT THE OVERSIGHT. AC-271 *added* `NoUi` to the
+/// enum, and a negative match silently absorbs every variant added after it is
+/// written — no compiler error, no test, and the new variant lands on whichever
+/// side the author of the negation never considered. Matching exhaustively is
+/// what makes the next addition fail to compile here so a human decides.
+pub(crate) fn final_frame_confirms(frame: FrameRead) -> bool {
+    match frame {
+        // The composer is drawn and no longer holds our text: it went in.
+        FrameRead::Cleared => true,
+        // Still in the box while the lane generates. That is queued input and
+        // the turn boundary submits it, so Confirmed is right.
+        FrameRead::StillThereGenerating => true,
+        // We cannot read our own message back, so the frame proves nothing in
+        // either direction. Defer to the durable record.
+        FrameRead::NoUi => false,
+        // Sitting in an idle composer: nothing is going to submit it.
+        FrameRead::StillThereIdle => false,
+    }
+}
+
 pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
     let state = composer_state(raw);
     // No composer, or a composer that is not this lane's (the background
@@ -4780,8 +4818,25 @@ async fn verify_submitted(
             // ran — 9 workers across 3 customer envs.
             FrameRead::NoUi => {
                 no_ui_looks += 1;
+                // THE 12 IS UNREACHABLE AND THE COMMENT OVERSTATED THE GRACE
+                // (AMUX-3870). `continue` goes back to `for _ in 0..5`, so each
+                // NoUi look SPENDS an iteration and this counter can never pass
+                // 5. The branch below it is dead code, and the real cold-start
+                // window is ~3s (300ms at the loop top plus 300ms here, five
+                // times) rather than the ~4s more this line used to claim on top
+                // of the loop's own.
+                //
+                // Left at 12 deliberately rather than "corrected" to 5: the
+                // number a reader should see is the one the author INTENDED,
+                // and lowering it would encode the cap as the design. Whether
+                // to actually give a cold Claude Code its 12 looks is a timing
+                // change on every send in the fleet and wants its own
+                // measurement, so it stays on the card and not in this fix.
+                //
+                // What made it dangerous was never the short window; it was
+                // what waited at the end of it. That is fixed below: falling
+                // out of this loop no longer reports NoUi as submitted.
                 if no_ui_looks <= 12 {
-                    // ~4s more; a cold Claude Code needs it
                     sleep_ms(300).await;
                     continue;
                 }
@@ -4854,11 +4909,16 @@ async fn verify_submitted(
         stuck_looks = 0;
     }
     let raw = tmux_capture(name, 25).await;
-    if !matches!(read_frame(&raw, &tail_sq), FrameRead::StillThereIdle) {
+    if final_frame_confirms(read_frame(&raw, &tail_sq)) {
         return (Submission::Confirmed, retried);
     }
     // Last resort before reporting a failure (which makes callers re-send):
     // trust the durable JSONL record over a possibly-torn final frame.
+    //
+    // This is also why routing `NoUi` here is safe rather than merely stricter.
+    // A re-send now happens only when the message is genuinely absent from the
+    // durable record, which is precisely when re-sending is the right move; the
+    // old path traded that for a silent drop.
     if sent_at > 0.0 && jsonl_user_msg_since(name, text, sent_at) {
         (Submission::Confirmed, retried)
     } else {
@@ -19278,6 +19338,57 @@ mod submission_gate_tests {
         assert_eq!(read_frame(&frame_stuck_active(GHOST), &t), FrameRead::StillThereGenerating);
         // A DIFFERENT message in the box is not our message.
         assert_eq!(read_frame(&frame_stuck_idle("[06:50 PM] something else"), &t), FrameRead::Cleared);
+    }
+
+    /// The FINAL frame, after the retry loop gives up, must not confirm a send
+    /// the composer never showed (AMUX-3870).
+    ///
+    /// WHY THIS IS NOT COVERED BY `no_ui_is_never_reported_as_submitted` below,
+    /// which is named for exactly this property and passes. That test calls
+    /// `send_outcome(Submission::Unverified, ..)` and pins the WORDING once the
+    /// submission is already classified. The bug was upstream of it: the
+    /// fall-through decided `NoUi` meant `Confirmed`, so the Unverified branch
+    /// that test guards was never reached. A check pinning the wrong layer is
+    /// exactly as green as one pinning the right layer (ethos rule 7), and this
+    /// pair is the demonstration.
+    ///
+    /// Driven through the REAL reader and the REAL fixtures rather than by
+    /// constructing variants, because frame -> verdict is the path the incident
+    /// took.
+    #[test]
+    fn the_final_frame_does_not_confirm_a_composer_that_never_painted() {
+        let t = tail_sq(GHOST);
+        assert!(
+            !final_frame_confirms(read_frame(&frame_no_ui(), &t)),
+            "an unpainted composer proves nothing; confirming it here is the AC-271 incident \
+             (9 workers across 3 customer envs) reached from the fall-through"
+        );
+        // CONTROLS, so the assertion above cannot be satisfied by a function
+        // that simply returns false for everything.
+        assert!(
+            final_frame_confirms(read_frame(&frame_cleared(), &t)),
+            "a drawn, empty composer IS a submitted send and must stay confirmed"
+        );
+        assert!(
+            final_frame_confirms(read_frame(&frame_stuck_active(GHOST), &t)),
+            "text queued while the lane generates submits at the turn boundary"
+        );
+
+        // EXHAUSTIVE over the enum. The original defect was a negative match
+        // absorbing a variant added later, so the guard has to be that every
+        // variant is a decision somebody made, not that today's four are right.
+        for (frame, confirms) in [
+            (FrameRead::Cleared, true),
+            (FrameRead::StillThereGenerating, true),
+            (FrameRead::NoUi, false),
+            (FrameRead::StillThereIdle, false),
+        ] {
+            assert_eq!(
+                final_frame_confirms(frame),
+                confirms,
+                "{frame:?} must be a deliberate decision at this site"
+            );
+        }
     }
 
     #[test]
