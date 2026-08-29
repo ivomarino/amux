@@ -2304,6 +2304,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <button id="piv-scope" class="btn" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This worker</button>
       <span id="peek-issues-count" style="flex:0 0 auto;font-size:0.78rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
+      <!-- Export THIS worker's board, FULL descriptions, straight from the
+           server (AMUX-3868). Not the main Board tab's client-side export:
+           that one can only carry desc_head, because GET /api/board never
+           sends desc. Honours the "This worker / All workers" toggle above.
+           flex:0 0 auto like every other control here, so it wraps below 600px
+           rather than squeezing the search input. -->
+      <div class="board-view-toggle" id="peek-board-export" style="flex:0 0 auto;">
+        <button class="bv-btn" onclick="exportPeekBoard('md')" title="Export this worker's board as Markdown, with complete descriptions">MD</button>
+        <button class="bv-btn" onclick="exportPeekBoard('json')" title="Export this worker's board as JSON, with complete descriptions">JSON</button>
+      </div>
       <button id="piv-filter" class="btn pbt-compact" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;"><span class="pbt-text">+ Filter</span><span class="pbt-ico" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg></span></button>
       <span class="board-search-wrap" style="flex:1 1 160px;min-width:0;display:flex;position:relative;">
         <input id="peek-issues-search" class="search-input" type="text" style="width:100%;min-width:0;"

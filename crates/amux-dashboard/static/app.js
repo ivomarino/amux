@@ -7342,6 +7342,34 @@ function setPeekIssuesView(mode) {
   renderPeekIssues();
 }
 
+/// Export THIS worker's board, from the server, with complete descriptions.
+///
+/// Deliberately not the client-side `exportBoard()` the main Board tab uses.
+/// That one exports what is rendered, and the rendered rows carry `desc_head`
+/// because `GET /api/board` never sends `desc` (AMUX-3861). On a worker page
+/// the thing you want is that worker's cards IN FULL, which only the server can
+/// produce — so this hits `/api/board/export` and lets the browser download the
+/// response.
+///
+/// Honours the "This worker / All workers" toggle rather than ignoring it: the
+/// scope you can see in the panel is the scope you get in the file, and the
+/// export's own header restates it so the file is readable out of context.
+function exportPeekBoard(fmt) {
+  const scoped = !_peekIssuesAllSessions && peekSession;
+  const qs = new URLSearchParams({ format: fmt });
+  if (scoped) qs.set('worker', peekSession);
+  const url = '/api/board/export?' + qs.toString();
+  const a = document.createElement('a');
+  a.href = url;
+  // The server sets Content-Disposition with the filename; this attribute only
+  // matters if that header is ever dropped by a proxy.
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  showToast(`Exporting ${scoped ? peekSession + "'s" : 'the whole'} board as ${fmt.toUpperCase()} (full descriptions)`);
+}
+
 function togglePeekIssuesAll() {
   _peekIssuesAllSessions = !_peekIssuesAllSessions;
   localStorage.setItem('amux_peek_issues_all', _peekIssuesAllSessions ? '1' : '0');
@@ -8017,7 +8045,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.751';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.752';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
