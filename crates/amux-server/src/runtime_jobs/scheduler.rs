@@ -1256,9 +1256,13 @@ impl LiveDeliverer {
             .unwrap_or_default();
 
         let run_once = |cmd: String| async move {
+            // kill_on_drop: SHELL_TIMEOUT_S firing drops this future, and a
+            // scheduled shell command is precisely the kind that hangs. Without
+            // it the bash child is left unreaped (DESKT-30).
             let fut = tokio::process::Command::new("/bin/bash")
                 .arg("-c")
                 .arg(cmd)
+                .kill_on_drop(true)
                 .output();
             match tokio::time::timeout(std::time::Duration::from_secs(SHELL_TIMEOUT_S), fut).await {
                 Ok(Ok(o)) => Ok((

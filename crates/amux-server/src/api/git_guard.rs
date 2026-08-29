@@ -201,6 +201,12 @@ fn realpath(p: &Path) -> String {
 async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
+    // Without this, a fired GIT_TIMEOUT drops the future and leaves the child
+    // neither killed nor reaped — a zombie per timeout. Measured 2026-08-29: 97
+    // zombies parented to amux-server-rs, accumulated in bursts over 15 hours.
+    // git runs constantly here (a shared checkout, ~50 lanes), so this site is
+    // the highest-frequency one that was missing it (DESKT-30).
+    cmd.kill_on_drop(true);
     let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
