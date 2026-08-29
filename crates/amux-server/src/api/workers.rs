@@ -2406,13 +2406,12 @@ mod tests {
     /// AF-288: every promoted RESOURCE verb resolves a worker ID to the session
     /// name, instead of handing the ulid to the fleet substrate verbatim.
     ///
-    /// THE DISCRIMINATOR IS THE ID LEAK. Without a promoted route the request
-    /// does not 404 — it falls to `/api/workers/{name}/{*verb}`, which is
-    /// mounted and addresses BY NAME, so the ulid reaches `env_path()` and comes
-    /// back inside the answer. So "the id does not appear" is exactly the
-    /// property promotion buys, and the unpromoted verb at the end is the
-    /// CONTROL: it must still leak, or this assertion is passing for some
-    /// reason other than the one claimed.
+    /// THE DISCRIMINATOR WAS THE ID LEAK, and since AF-204 it is a 404. While
+    /// the catch-all existed an unrouted verb reached the substrate BY NAME and
+    /// the ulid came back in the answer; now it 404s. Both forms distinguish a
+    /// routed verb from an unrouted one, which is what the control at the end
+    /// pins — the id-absence assertions in the loop are meaningless without a
+    /// path that behaves differently.
     ///
     /// Asserted at the resolution gate rather than on a 200, for the reason the
     /// send test gives: a 200 needs a live terminal and would launch one on the
@@ -2494,16 +2493,18 @@ mod tests {
              catch-all while the write half was promoted: {v}"
         );
 
-        // CONTROL. `commit-report` is classified SUB-RESOURCE — it belongs under
-        // /{id}/git/..., so it stays on the catch-all by design — and must still
-        // leak the id. Without a verb that still leaks, "no id in the response"
-        // could hold for some reason other than promotion and the loop above
-        // would prove nothing.
-        let (_, _, v) = send(&app, "POST", &format!("/api/workers/{id}/commit-report"), None).await;
-        assert!(
-            v.to_string().contains(&id),
-            "control failed: the UNPROMOTED control verb no longer addresses by id, so the \
-             loop above cannot distinguish a promoted route from an unpromoted one: {v}"
+        // CONTROL, flipped by AF-204. `commit-report` moved to /{id}/git/, so
+        // the FLAT spelling is unrouted — and with the catch-all retired an
+        // unrouted path now 404s instead of reaching the substrate by name. That
+        // 404 is the property this whole epic bought: a wrong guess FAILS rather
+        // than answering plausibly. Before the retirement this same call leaked
+        // the ulid, which is what the assertion used to pin.
+        let (st, _, v) = send(&app, "POST", &format!("/api/workers/{id}/commit-report"), None).await;
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "control failed: an unrouted worker verb must 404 now that the catch-all is gone, \
+             or the loop above cannot distinguish a routed verb from an unrouted one: {v}"
         );
     }
 
@@ -2558,17 +2559,19 @@ mod tests {
             );
         }
 
-        let (_, _, v) = send(
+        let (st, _, v) = send(
             &app,
             "POST",
             &format!("/api/workers/{id}/git/not-a-subverb"),
             None,
         )
         .await;
-        assert!(
-            v.to_string().contains(&id),
-            "control failed: an UNROUTED git sub-verb no longer addresses by id, so the loop \
-             above cannot distinguish a grouped route from the catch-all: {v}"
+        assert_eq!(
+            st,
+            StatusCode::NOT_FOUND,
+            "control failed: an unrouted git sub-verb must 404 now that the catch-all is gone. \
+             This is the assertion the explicit-per-sub-verb routing exists to make true, and \
+             it is why /{{id}}/git/{{*sub}} was never an option: a wildcard would answer here: {v}"
         );
     }
 

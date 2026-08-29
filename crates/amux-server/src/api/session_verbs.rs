@@ -10555,7 +10555,21 @@ pub fn routes() -> Router<AppState> {
         // reaches machines that reinstall, while the route fixes every already
         // installed copy at once (ethos rule 1 — capability has to actually
         // reach everyone, not just exist).
-        .route("/api/workers/{name}/{*verb}", any(session_verb_handler))
+        // /api/workers/{name}/{*verb} RETIRED 2026-08-28 (AF-204). Kept in
+        // history rather than silently dropped, because the reason it existed is
+        // still true: the INSTALLED `amux send` posts to /api/workers/<n>/send,
+        // and after the python cutover that 405'd and the CLI fell back to raw
+        // tmux keystrokes — unstamped, unaudited, two long messages confirmed
+        // lost the same afternoon. That is why send was PROMOTED (AF-202) rather
+        // than left to a wildcard. Every verb any caller reaches by this spelling
+        // now has its own route in api/workers.rs; measured repo-wide before the
+        // deletion, they were peek, send, start, stop and dead-letters.
+        //
+        // The wildcard is what made the surface unable to answer "is this
+        // capability implemented": an unrouted verb returned whatever it returned
+        // instead of 404ing. Everything it used to serve is still reachable at
+        // /api/sessions/{name}/{verb} below — aliases.rs:82 exempts that path
+        // from the alias layer, so this deletion changes the SPELLING only.
         // Long prompts ride /send bodies; axum's 2MB default is Python's cap
         // too (none), so disable rather than invent one.
         .layer(axum::extract::DefaultBodyLimit::disable())
@@ -17743,11 +17757,17 @@ mod tests {
         // applies its OWN session check. 404 is the proof the guard let go —
         // and it keeps the test from auto-waking a session and launching a
         // terminal on the machine running it.
+        // The /api/workers/hw/{peek,send} rows are GONE with the catch-all
+        // (AF-204): this router no longer mounts that spelling, so asserting on
+        // it here would pin an axum 404 rather than the exemption. The same
+        // property at the workers spelling is covered where the routes now
+        // live — api::workers::tests::send_route_resolves_a_worker_id_to_its_
+        // session_name and peek_reads_the_live_terminal_and_names_every_non_answer.
+        // Naming them because deleting a row without saying what still covers it
+        // is how a check quietly stops checking (ethos rule 7).
         for (method, path) in [
             ("GET", "/api/sessions/hw/peek"),
             ("POST", "/api/sessions/hw/send"),
-            ("GET", "/api/workers/hw/peek"),
-            ("POST", "/api/workers/hw/send"),
         ] {
             let body = (method == "POST").then(|| json!({"text": "hi"}));
             let (st, v) = call(&app, method, path, body).await;
