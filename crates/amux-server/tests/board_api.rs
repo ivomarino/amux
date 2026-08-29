@@ -2775,3 +2775,90 @@ async fn archiving_a_trigger_bearing_card_records_that_it_de_arms_it() {
     assert!(plog.contains("ARCHIVED"), "it still records the archive: {plog}");
     assert!(!plog.contains("DE-ARMS"), "but must not warn about a trigger it does not have: {plog}");
 }
+
+/// `backlog` and `needsyou` were the only two statuses in the vocabulary with
+/// NO gate and no exit any automated loop could produce, and fleet-wide on
+/// 2026-08-29 they held 963 of 1029 open cards against 64 in the one status
+/// the drive loop dispatches. Zero of 589 backlog cards carried a due date.
+///
+/// A card entering either now leaves with a revisit date, so the drive loop's
+/// due arm can hand it back rather than a human triaging 219 cards at once.
+#[tokio::test]
+async fn entering_an_undrained_status_stamps_a_revisit_date() {
+    let (app, _tmp) = app();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+
+    for (status, days) in [("backlog", 14i64), ("needsyou", 3)] {
+        let c = create(&app, json!({ "title": format!("park me to {status}") })).await;
+        let id = c["id"].as_str().unwrap().to_string();
+        let (st, _, v) = send(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({ "status": status, "gate_ack": true })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{status} transition refused: {v}");
+
+        let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        let due = got["due"].as_str().unwrap_or("");
+        let want = (chrono::Local::now() + chrono::Duration::days(days))
+            .format("%Y-%m-%d")
+            .to_string();
+        assert_eq!(due, want, "{status} must be stamped {days}d out, got {due:?}");
+        // NOT already due, or the drain promotes it straight back on the next
+        // tick and the park never happened.
+        assert!(due > today.as_str(), "{status} date {due} must be in the future");
+        // The stamp is on the card's own history, not only in a response the
+        // caller may never read (Ethan: the card is the source of truth for
+        // its own history).
+        let log = got["log"].as_str().unwrap_or("");
+        assert!(log.contains(&format!("revisit {due}")), "log must name the date: {log}");
+    }
+}
+
+/// The stamp fills a blank; it never overwrites a date a human chose. This is
+/// the clause that keeps the default from being a decision taken away from the
+/// owner (ethos rule 8) — and it is the one that silently reverses if the
+/// stamp is ever moved above `set_opt`.
+#[tokio::test]
+async fn a_caller_supplied_revisit_date_survives_the_default() {
+    let (app, _tmp) = app();
+    let c = create(&app, json!({ "title": "i know when to look at this" })).await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "backlog", "due": "2027-01-15", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(got["due"].as_str(), Some("2027-01-15"), "the caller's date must win");
+}
+
+/// Every status with a next actor must be left alone. A `doing` card carrying
+/// an auto-stamped due date would read as a deadline nobody set, and `done`
+/// would acquire one after the work finished.
+#[tokio::test]
+async fn statuses_that_have_a_next_actor_are_not_stamped() {
+    let (app, _tmp) = app();
+    for status in ["doing", "review", "blocked"] {
+        let c = create(&app, json!({ "title": format!("move to {status}") })).await;
+        let id = c["id"].as_str().unwrap().to_string();
+        let (st, _, v) = send(
+            &app,
+            "PATCH",
+            &format!("/api/board/{id}"),
+            Some(json!({ "status": status, "gate_ack": true })),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{status}: {v}");
+        let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+        let due = got["due"].as_str().unwrap_or("");
+        assert!(due.is_empty(), "{status} must not be stamped, got due={due:?}");
+    }
+}

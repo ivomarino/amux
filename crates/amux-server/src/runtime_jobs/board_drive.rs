@@ -310,6 +310,16 @@ pub struct DriveReport {
     /// look like it "wouldn't stay parked" was invisible in this report until
     /// the field existed (ethos rule 4).
     pub held_on_trigger: usize,
+    /// Cards re-activated this tick because their own revisit date arrived.
+    pub promoted_due: usize,
+    /// Every backlog card whose revisit date has arrived, promoted or not.
+    /// Published beside `promoted_due` because the two come apart on purpose:
+    /// the drain fills a lane's `todo` to a ceiling and stops, so a large
+    /// `revisit_due_total` with a small `promoted_due` is the rate limit
+    /// working, and is indistinguishable from a broken scan without this field
+    /// (ethos rule 4 — a count that can read zero must publish whether the
+    /// measurement ran).
+    pub revisit_due_total: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -1182,6 +1192,181 @@ fn parked_on_live_trigger(row: &bs::IssueRow) -> bool {
 /// parsing cannot drift from the canonical decode. Runs once per tick; the
 /// cost profile matches a single dashboard board refresh, of which there are
 /// already many per minute.
+/// Which rule licensed a `backlog` -> `todo` promotion. Both arms share one
+/// write path (`promote_ready_backlog` / `promote_due_backlog` differ only in
+/// their scan), so the re-check under the write lock and the card's log line
+/// cannot drift apart from the rule that selected the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromoteArm {
+    /// Every `depends_on` reached a terminal status.
+    DepsCleared,
+    /// The card's own revisit date arrived.
+    RevisitDue,
+}
+
+impl PromoteArm {
+    fn log_line(self) -> &'static str {
+        match self {
+            Self::DepsCleared => {
+                "Re-activated: all depends_on dependencies reached a terminal status"
+            }
+            Self::RevisitDue => "Re-activated: the revisit date on this card arrived",
+        }
+    }
+}
+
+/// Re-check under the write lock that this card is STILL promotable by `arm`.
+/// It could have been moved, archived, deleted, retyped or re-parked between
+/// the read scan and here; `WHERE status='backlog'` on the UPDATE makes the
+/// swap atomic against a concurrent move, and this makes it correct.
+///
+/// The two arms share every clause except the one that licensed them, which is
+/// the point of routing both through one function: a new common rule (a type
+/// exclusion, an ownership rule) lands on both arms or neither.
+fn still_promotable(conn: &Connection, row: &bs::IssueRow, arm: PromoteArm) -> bool {
+    if row.status != "backlog"
+        || row.owner_type != "agent"
+        || row.archived != 0
+        || is_dormant_type(&row.item_type)
+    {
+        return false;
+    }
+    match arm {
+        PromoteArm::DepsCleared => {
+            !parked_on_live_trigger(row) && promotable_deps(conn, row).is_some()
+        }
+        // A REVISIT DATE OUTRANKS A `source_ref` TRIGGER, deliberately.
+        //
+        // The deps arm lets any non-empty `source_ref` hold a card, and that
+        // escape hatch was measured covering essentially the whole fleet's
+        // backlog: 509 of 514 cards carried one, 450 of them stale (see
+        // `SOURCE_REF_STALE_S`). Honouring it here would mean the revisit date
+        // reaches 1% of the cards it exists to drain, which is ethos rule 1's
+        // failure exactly — a capability that exists without reaching anything.
+        //
+        // A due date is also a STRICTLY more specific statement than a trigger:
+        // "look at this again on the 12th" names a date, "wake me when X" names
+        // a condition nothing re-verifies. So the date wins, and the card
+        // arrives in `todo` where its owner can re-park it with a new date.
+        //
+        // Unmet dependencies still hold it. A date cannot make a blocker
+        // finish, and promoting a card whose blocker is open would put
+        // unworkable work in front of a lane — the thing this whole module
+        // exists to stop.
+        PromoteArm::RevisitDue => {
+            revisit_due_now(row)
+                && (row.depends_on.is_empty() || promotable_deps(conn, row).is_some())
+        }
+    }
+}
+
+/// Has this card's own revisit date arrived, in local time?
+fn revisit_due_now(row: &bs::IssueRow) -> bool {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    bs::revisit_arrived(row.due.as_deref(), &today)
+}
+
+/// How deep a lane's `todo` column may be filled by the revisit drain.
+///
+/// The drain exists to stop a lane idling on hundreds of parked cards; it must
+/// not create the other half of the same complaint by emptying 219 backlog
+/// cards into `todo`. So it fills to a ceiling and stops, and next tick it
+/// fills whatever the lane worked off. The backlog then drains at exactly the
+/// rate the lane completes work, which is the only rate that is ever right.
+///
+/// `AMUX_BACKLOG_DRAIN_TODO_CEIL` moves it; `0` disables the drain entirely.
+fn drain_todo_ceiling() -> i64 {
+    std::env::var("AMUX_BACKLOG_DRAIN_TODO_CEIL")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(5)
+        .max(0)
+}
+
+/// Pure: given due-dated candidates (already ordered most-overdue first) and
+/// each lane's current `todo` depth, which may promote this tick?
+///
+/// Split out as a pure function because the rate limit is the part that can be
+/// wrong in a way no integration test would notice: an off-by-one that lets
+/// every candidate through still promotes cards, still logs, still looks
+/// healthy, and floods the column it was written to protect.
+fn due_drain_plan(
+    candidates: &[(String, String)],
+    todo_depth: &std::collections::BTreeMap<String, i64>,
+    ceiling: i64,
+) -> Vec<String> {
+    if ceiling <= 0 {
+        return Vec::new();
+    }
+    let mut room: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut out = Vec::new();
+    for (card, lane) in candidates {
+        let left = room
+            .entry(lane.clone())
+            .or_insert_with(|| ceiling - todo_depth.get(lane).copied().unwrap_or(0));
+        if *left > 0 {
+            *left -= 1;
+            out.push(card.clone());
+        }
+    }
+    out
+}
+
+/// Scan for backlog cards whose revisit date has arrived, most overdue first,
+/// and apply the per-lane ceiling. Returns `(to_promote, due_total)` — the
+/// second number is every card whose date has arrived, promoted or not, so the
+/// report can say "12 due, 3 promoted, the rest are waiting on a full column"
+/// rather than leaving a held card indistinguishable from no card (rule 4).
+fn backlog_due_promotions(conn: &Connection) -> (Vec<String>, usize) {
+    let rows = bs::list_issues(
+        conn,
+        &["backlog".to_string()],
+        &[],
+        bs::ArchivedFilter::ActiveOnly,
+    )
+    .unwrap_or_default();
+    let mut cands: Vec<(String, String, String)> = Vec::new();
+    for r in rows {
+        if r.owner_type != "agent" || is_dormant_type(&r.item_type) {
+            continue;
+        }
+        if !revisit_due_now(&r) {
+            continue;
+        }
+        if !r.depends_on.is_empty() && promotable_deps(conn, &r).is_none() {
+            continue;
+        }
+        let lane = r.session.clone().unwrap_or_default();
+        if lane.is_empty() {
+            // An unowned card has no lane to drain into and no todo depth to
+            // measure. Skipping it is not a silent drop: it stays `backlog`
+            // with its date visibly past, which is what an unowned overdue
+            // card is.
+            continue;
+        }
+        cands.push((r.id.clone(), lane, r.due.clone().unwrap_or_default()));
+    }
+    // Most overdue first, then by id so the order is total and a tie cannot
+    // make two ticks disagree about which card got the last slot.
+    cands.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let due_total = cands.len();
+    let mut todo_depth: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT COALESCE(session,''), COUNT(*) FROM issues \
+         WHERE status='todo' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+         GROUP BY COALESCE(session,'')",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for kv in rows.flatten() {
+                todo_depth.insert(kv.0, kv.1);
+            }
+        }
+    }
+    let pairs: Vec<(String, String)> =
+        cands.into_iter().map(|(id, lane, _)| (id, lane)).collect();
+    (due_drain_plan(&pairs, &todo_depth, drain_todo_ceiling()), due_total)
+}
+
 fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usize) {
     let rows = bs::list_issues(
         conn,
@@ -1232,69 +1417,7 @@ async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
     };
     let mut promoted = 0;
     for (card, deps) in candidates {
-        let card_w = card.clone();
-        let reply = state
-            .store
-            .write_async(move |conn| {
-                // Re-check under the write lock. The card must STILL be a
-                // dependency-parked agent backlog card whose deps are all
-                // terminal — it could have been moved, archived, deleted, or
-                // its deps changed between the read scan and here. `WHERE
-                // status='backlog'` makes the swap atomic against a concurrent
-                // move (mirrors claim_card's `WHERE status='todo'`).
-                let Some(row) = bs::get_issue(conn, &card_w)? else {
-                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                };
-                if row.status != "backlog"
-                    || row.owner_type != "agent"
-                    || row.archived != 0
-                    || is_dormant_type(&row.item_type)
-                    || parked_on_live_trigger(&row)
-                    || promotable_deps(conn, &row).is_none()
-                {
-                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                }
-                let now = now_f64() as i64;
-                let existing: Option<String> = conn
-                    .query_row(
-                        "SELECT log FROM issues WHERE id=?1",
-                        rusqlite::params![card_w],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let hhmm = chrono::Local::now().format("%H:%M").to_string();
-                let log = bs::append_log(
-                    existing.as_deref(),
-                    &hhmm,
-                    "Re-activated: all depends_on dependencies reached a terminal status",
-                );
-                let n = conn.execute(
-                    "UPDATE issues SET status='todo', updated=?1, log=?2 \
-                     WHERE id=?3 AND status='backlog'",
-                    rusqlite::params![now, log, card_w],
-                )?;
-                if n == 0 {
-                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                }
-                // The post-mutation snapshot the SSE/replay journal carries —
-                // the identical shape board.rs emits on a status PATCH, so the
-                // fan-out is a real StatusChanged, not a bare revision bump.
-                let next = bs::get_issue(conn, &card_w)?
-                    .expect("row present immediately after its own promote");
-                let event = crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Task,
-                    entity_id: next.id.clone(),
-                    mutation: amux_core::revision::MutationKind::StatusChanged {
-                        from: "backlog".into(),
-                        to: "todo".into(),
-                    },
-                    payload: Some(next.snapshot()),
-                };
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![event] })
-            })
-            .await;
-        if matches!(reply, Ok(r) if r.applied) {
+        if promote_card(state, &card, PromoteArm::DepsCleared).await {
             promoted += 1;
             let cleared = deps.join(",");
             tracing::info!(
@@ -1304,6 +1427,89 @@ async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
         }
     }
     (promoted, held_on_trigger)
+}
+
+/// The revisit-date arm: promote `backlog` cards whose own due date arrived,
+/// up to the per-lane `todo` ceiling. Returns `(promoted, due_total)`.
+///
+/// This is the half that answers "workers have an infinite # of growing
+/// backlogs and todo then they go idle". The deps arm above only ever fires
+/// for a card someone explicitly wired to a blocker (34 of 589 backlog cards
+/// fleet-wide carried any `depends_on` at all), so before this arm existed the
+/// overwhelming majority of parked work had NO automated exit whatsoever.
+async fn promote_due_backlog(state: &AppState) -> (usize, usize) {
+    let (candidates, due_total) = match state.store.read() {
+        Ok(conn) => backlog_due_promotions(&conn),
+        Err(_) => return (0, 0),
+    };
+    let mut promoted = 0;
+    for card in candidates {
+        if promote_card(state, &card, PromoteArm::RevisitDue).await {
+            promoted += 1;
+            tracing::info!(
+                target: "amux::board_drive", %card,
+                "board_drive: re-activated {card} — its revisit date arrived"
+            );
+        }
+    }
+    (promoted, due_total)
+}
+
+/// The one `backlog` -> `todo` write, shared by both promotion arms.
+///
+/// Re-checks the arm's own predicate under the write lock and emits the SAME
+/// `StatusChanged` event a status PATCH from the board API emits (with the
+/// post-mutation snapshot), so SSE clients refetch and the card is dispatchable
+/// in this same tick's lane loop.
+async fn promote_card(state: &AppState, card: &str, arm: PromoteArm) -> bool {
+    let card_w = card.to_string();
+    let reply = state
+        .store
+        .write_async(move |conn| {
+            // The card could have been moved, archived, deleted, retyped or
+            // re-parked between the read scan and here. `WHERE status='backlog'`
+            // on the UPDATE makes the swap atomic against a concurrent move
+            // (mirrors claim_card's `WHERE status='todo'`); this makes it right.
+            let Some(row) = bs::get_issue(conn, &card_w)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if !still_promotable(conn, &row, arm) {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let now = now_f64() as i64;
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT log FROM issues WHERE id=?1",
+                    rusqlite::params![card_w],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .flatten();
+            let hhmm = chrono::Local::now().format("%H:%M").to_string();
+            let log = bs::append_log(existing.as_deref(), &hhmm, arm.log_line());
+            let n = conn.execute(
+                "UPDATE issues SET status='todo', updated=?1, log=?2 \
+                 WHERE id=?3 AND status='backlog'",
+                rusqlite::params![now, log, card_w],
+            )?;
+            if n == 0 {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            let next = bs::get_issue(conn, &card_w)?
+                .expect("row present immediately after its own promote");
+            let event = crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Task,
+                entity_id: next.id.clone(),
+                mutation: amux_core::revision::MutationKind::StatusChanged {
+                    from: "backlog".into(),
+                    to: "todo".into(),
+                },
+                payload: Some(next.snapshot()),
+            };
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![event] })
+        })
+        .await;
+    matches!(reply, Ok(r) if r.applied)
 }
 
 fn card_needsyou_asked_at(conn: &Connection, card: &str) -> Option<f64> {
@@ -3551,8 +3757,13 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     // dependency clearing does not care which lane is at a boundary), and FIRST
     // so a freshly promoted card is dispatchable in this same tick's lane loop.
     let (promoted, held_on_trigger) = promote_ready_backlog(state).await;
+    // The revisit arm runs in the same pre-lane-loop position as the deps arm,
+    // so a card whose date arrived this tick is dispatchable in this tick.
+    let (promoted_due, revisit_due_total) = promote_due_backlog(state).await;
     report.promoted = promoted;
     report.held_on_trigger = held_on_trigger;
+    report.promoted_due = promoted_due;
+    report.revisit_due_total = revisit_due_total;
     for lane in fleet.lanes() {
         let trace = drive_lane(state, fleet, &lane).await;
         match trace.outcome.as_str() {
@@ -4311,11 +4522,13 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
         async move {
             let fleet = LiveFleet { state: state.clone() };
             let r = drive_tick(&state, &fleet).await;
-            if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 {
+            if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 || r.promoted_due > 0 {
                 tracing::info!(
                     assigned = r.assigned,
                     nudged = r.nudged,
                     promoted = r.promoted,
+                    promoted_due = r.promoted_due,
+                    revisit_due_total = r.revisit_due_total,
                     held_on_trigger = r.held_on_trigger,
                     lanes = r.lanes.len(),
                     "[board-drive] tick"
@@ -4724,6 +4937,63 @@ mod reviewer_renag_tests {
 
 #[cfg(test)]
 mod tests {
+
+    /// The rate limit is the part that fails INVISIBLY: an off-by-one that
+    /// lets every candidate through still promotes cards, still logs, still
+    /// looks healthy in the report, and floods the column the drain exists to
+    /// protect. One lane on this board held 219 backlog cards.
+    #[test]
+    fn due_drain_fills_a_lane_to_the_ceiling_and_stops() {
+        let cands: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("C-{i}"), "backend".to_string()))
+            .collect();
+        let mut depth = std::collections::BTreeMap::new();
+
+        // Empty column, ceiling 5 -> exactly 5, and they are the FIRST five
+        // (the scan hands them over most-overdue-first, so the order is the
+        // priority and a plan that reorders would drain the wrong cards).
+        depth.insert("backend".to_string(), 0i64);
+        let got = due_drain_plan(&cands, &depth, 5);
+        assert_eq!(got, vec!["C-0", "C-1", "C-2", "C-3", "C-4"]);
+
+        // A column already at the ceiling takes nothing. This is the clause
+        // that makes the backlog drain at the rate the lane completes work.
+        depth.insert("backend".to_string(), 5);
+        assert!(due_drain_plan(&cands, &depth, 5).is_empty());
+
+        // OVER the ceiling is also nothing, not a negative slot count.
+        depth.insert("backend".to_string(), 99);
+        assert!(due_drain_plan(&cands, &depth, 5).is_empty());
+
+        // Partial room takes exactly the remainder.
+        depth.insert("backend".to_string(), 3);
+        assert_eq!(due_drain_plan(&cands, &depth, 5).len(), 2);
+
+        // Ceiling 0 disables the drain entirely — the documented off switch.
+        depth.insert("backend".to_string(), 0);
+        assert!(due_drain_plan(&cands, &depth, 0).is_empty());
+        assert!(due_drain_plan(&cands, &depth, -1).is_empty());
+    }
+
+    /// The ceiling is PER LANE. A shared counter would let one lane's deep
+    /// backlog consume every slot on the board and starve the other 48.
+    #[test]
+    fn due_drain_ceiling_is_per_lane_not_global() {
+        let cands: Vec<(String, String)> = vec![
+            ("A-1".into(), "backend".into()),
+            ("B-1".into(), "mvs-infra".into()),
+            ("A-2".into(), "backend".into()),
+            ("B-2".into(), "mvs-infra".into()),
+        ];
+        let mut depth = std::collections::BTreeMap::new();
+        depth.insert("backend".to_string(), 1i64);
+        // mvs-infra is absent from the map — an unmeasured lane is an EMPTY
+        // one, not a full one. Reading a missing key as "at the ceiling" would
+        // silently exclude every lane with a clean todo column, which is
+        // exactly the set the drain is for.
+        let got = due_drain_plan(&cands, &depth, 2);
+        assert_eq!(got, vec!["A-1", "B-1", "B-2"], "backend gets 1 slot, mvs-infra 2");
+    }
     use super::*;
     use rusqlite::Connection;
 

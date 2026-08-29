@@ -234,6 +234,109 @@ pub fn done_link_required(session: Option<&str>) -> bool {
     }
 }
 
+/// The env keys that tune (or disable) the automatic revisit date. `0` turns
+/// the default off for a scope; a positive integer is a number of days.
+pub const BACKLOG_REVISIT_DAYS_KEY: &str = "AMUX_BACKLOG_REVISIT_DAYS";
+pub const NEEDSYOU_REVISIT_DAYS_KEY: &str = "AMUX_NEEDSYOU_REVISIT_DAYS";
+
+/// How many days ahead to stamp a revisit date on a card entering `target`,
+/// or `None` for statuses that do not get one.
+///
+/// # Why these two statuses have a default and the others do not
+///
+/// `backlog` and `needsyou` were the only two statuses in the whole vocabulary
+/// with NO gate (`default_gates_for` returns `&[]` for both) and no exit any
+/// automated loop can produce: `backlog` waits for a trigger, `needsyou` waits
+/// for a human. Everything else has a next actor. Measured fleet-wide
+/// 2026-08-29, that combination had eaten the board:
+///
+/// | status     | open cards | with a due date | with any revisit condition |
+/// |------------|-----------:|----------------:|---------------------------:|
+/// | `backlog`  |        589 |               0 |                34 (6%)     |
+/// | `needsyou` |        374 |               2 |                16 (4%)     |
+/// | `todo`     |         64 |               - |                    -       |
+///
+/// 963 of the 1029 open cards (94%) sat in the two statuses nothing drains,
+/// against 64 the drive loop can dispatch — and one lane held 219 backlog
+/// cards, 147 of them untouched for over two weeks, while reporting idle.
+/// That is the state Ethan named: "some workers have an infinite # of growing
+/// backlogs and todo then they go idle". The drive loop is not at fault and
+/// its own trace says so correctly ("its queue is real and its workable queue
+/// is empty"); the defect is one level up, in a board that lets a card enter a
+/// status from which nothing can ever move it.
+///
+/// # Why a DEFAULT and not a gate
+///
+/// The obvious fix is to refuse the transition until the caller names a
+/// revisit condition. That would be an opt-in mechanism wearing a gate's
+/// clothes: it reaches only the callers who learn the flag, and 96% of current
+/// practice would start failing at once (ethos rule 3 — a constraint every
+/// legitimate state trips is not a constraint, it is a wall). Stamping a date
+/// reaches every card by default and nothing has to be acknowledged, so
+/// `gate_ack` cannot fake it and no honest transition is refused (rule 1:
+/// prefer opt-out over opt-in).
+///
+/// The date is the OWNER'S to change and the card carries the stamp in its own
+/// log, so a wrong default is visible and one PATCH away from corrected. It
+/// never deletes, archives or discards anything — the sweep that would is
+/// rule 8's territory and stays Ethan's call (AMUX-2499).
+pub fn default_revisit_days(target: TaskStatus, session: Option<&str>) -> Option<i64> {
+    let (key, fallback) = match target {
+        TaskStatus::Backlog => (BACKLOG_REVISIT_DAYS_KEY, 14),
+        TaskStatus::NeedsYou => (NEEDSYOU_REVISIT_DAYS_KEY, 3),
+        _ => return None,
+    };
+    let raw = scoped_or_process_env(key, session);
+    let days = match raw {
+        Some(v) => v.trim().parse::<i64>().ok()?,
+        None => fallback,
+    };
+    (days > 0).then_some(days)
+}
+
+/// Read a setting from the process env first (the global operator switch in
+/// `~/.amux/server.env`), then the worker > group > global scope ladder — the
+/// same resolution order [`done_link_required`] uses, shared rather than
+/// re-derived so the two cannot drift.
+fn scoped_or_process_env(key: &str, session: Option<&str>) -> Option<String> {
+    if let Ok(v) = std::env::var(key) {
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+    let lane = session.filter(|s| !s.is_empty())?;
+    crate::api::session_verbs::scoped_setting_in(
+        &crate::api::session_verbs::home(),
+        lane,
+        key,
+    )
+}
+
+/// `YYYY-MM-DD`, `days` from now in LOCAL time — the format every existing
+/// `due` value on the board already uses, so a stamped date sorts and compares
+/// against a hand-set one by plain string comparison.
+pub fn revisit_date(days: i64) -> String {
+    (chrono::Local::now() + chrono::Duration::days(days))
+        .format("%Y-%m-%d")
+        .to_string()
+}
+
+/// True when `due` is a date that has arrived (today or earlier), by string
+/// comparison against today in local time. A malformed or empty `due` is NOT
+/// due — an unparseable date must never promote a card, because "I could not
+/// read this" and "the date arrived" are different answers (ethos rule 4).
+pub fn revisit_arrived(due: Option<&str>, today: &str) -> bool {
+    let d = due.unwrap_or("").trim();
+    // Exactly `YYYY-MM-DD`: 10 chars, digits and dashes in the right places.
+    let ok = d.len() == 10
+        && d.as_bytes()[4] == b'-'
+        && d.as_bytes()[7] == b'-'
+        && d.bytes().enumerate().all(|(i, c)| {
+            if i == 4 || i == 7 { c == b'-' } else { c.is_ascii_digit() }
+        });
+    ok && d <= today
+}
+
 /// True when `text` contains at least one pointer to a produced artifact: an
 /// http(s) URL, a markdown link, a repo-relative file path (`a/b.ext`), a
 /// commit-sha-shaped token (7..=40 hex as a whole word), or a `#<number>`
@@ -1894,6 +1997,66 @@ mod tests {
         assert_eq!(at("TXT-2"), Some(1787840686), "legacy TEXT is trimmed");
         assert_eq!(at("NUL-1"), None, "NULL is genuine absence");
         assert_eq!(at("BAD-1"), None, "unreadable text degrades to None (and warns)");
+    }
+
+    #[test]
+    fn revisit_arrived_reads_only_a_well_formed_date_and_can_fail() {
+        // The whole point of the predicate: today and earlier are due.
+        assert!(bs_revisit("2026-08-28", "2026-08-29"));
+        assert!(bs_revisit("2026-08-29", "2026-08-29"));
+        // The future is not due. Without this the drain promotes everything
+        // the moment a date is stamped, which is the opposite of the feature.
+        assert!(!bs_revisit("2026-08-30", "2026-08-29"));
+        assert!(!bs_revisit("2026-12-01", "2026-08-29"));
+        // ABSENT IS NOT DUE. 589 of 589 backlog cards had no due date when
+        // this shipped; reading None as "" and comparing "" <= today would
+        // have promoted the entire fleet backlog into `todo` on the first tick.
+        assert!(!revisit_arrived(None, "2026-08-29"));
+        assert!(!bs_revisit("", "2026-08-29"));
+        assert!(!bs_revisit("   ", "2026-08-29"));
+        // UNPARSEABLE IS NOT DUE either — "I could not read this" and "the
+        // date arrived" are different answers (ethos rule 4). Every one of
+        // these string-compares as <= "2026-08-29" and must still be refused.
+        assert!(!bs_revisit("2026-8-29", "2026-08-29"));
+        assert!(!bs_revisit("2026/08/28", "2026-08-29"));
+        assert!(!bs_revisit("yesterday", "2026-08-29"));
+        assert!(!bs_revisit("2026-08-28T09:00", "2026-08-29"));
+        assert!(!bs_revisit("20260828", "2026-08-29"));
+    }
+
+    fn bs_revisit(due: &str, today: &str) -> bool {
+        revisit_arrived(Some(due), today)
+    }
+
+    #[test]
+    fn revisit_default_applies_to_the_two_undrained_statuses_only() {
+        // The two statuses with no gate and no automated exit get a date.
+        assert_eq!(default_revisit_days(TaskStatus::Backlog, None), Some(14));
+        assert_eq!(default_revisit_days(TaskStatus::NeedsYou, None), Some(3));
+        // Every status that HAS a next actor must not be stamped — a `doing`
+        // card with a due date would read as a deadline nobody set.
+        for st in [
+            TaskStatus::Todo,
+            TaskStatus::Doing,
+            TaskStatus::Review,
+            TaskStatus::Done,
+            TaskStatus::Verified,
+            TaskStatus::Blocked,
+            TaskStatus::Discarded,
+        ] {
+            assert_eq!(default_revisit_days(st, None), None, "{st:?} must not be stamped");
+        }
+    }
+
+    #[test]
+    fn revisit_date_is_the_stored_due_format_and_sorts_against_a_hand_set_one() {
+        let d = revisit_date(14);
+        assert_eq!(d.len(), 10, "must be YYYY-MM-DD, got {d}");
+        // The format must be the one `revisit_arrived` accepts, or the stamp
+        // and the reader disagree and nothing ever promotes. Round-trip it
+        // through the real predicate rather than a second regex.
+        assert!(!revisit_arrived(Some(&d), &revisit_date(0)), "14d out must not be due today");
+        assert!(revisit_arrived(Some(&revisit_date(-1)), &revisit_date(0)));
     }
 
     #[test]

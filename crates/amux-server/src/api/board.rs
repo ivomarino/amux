@@ -4018,6 +4018,40 @@ pub async fn patch_item(
                                 Some(bs::append_log(next.log.as_deref(), &stamp, &authz_line));
                             next.status = target_raw.clone();
                             next.version = i64::try_from(updated.version).unwrap_or(next.version + 1);
+
+                            // REVISIT DATE ON THE TWO STATUSES NOTHING DRAINS
+                            // (Ethan, 2026-08-29: "some workers have an
+                            // infinite # of growing backlogs and todo then they
+                            // go idle"). `backlog` and `needsyou` are the only
+                            // statuses with no gate AND no exit an automated
+                            // loop can produce, and they held 963 of the 1029
+                            // open cards. A card entering either without a date
+                            // is a decision nobody made; see
+                            // `bs::default_revisit_days` for the measurement
+                            // and for why this is a default rather than a gate.
+                            //
+                            // A caller-supplied `due` in this same PATCH is
+                            // already in `next.due` (`set_opt` runs well above
+                            // this block), so this only ever fills a blank —
+                            // it cannot overwrite a date someone chose.
+                            if next.due.as_deref().unwrap_or("").trim().is_empty() {
+                                if let Some(days) =
+                                    bs::default_revisit_days(target, next.session.as_deref())
+                                {
+                                    let when = bs::revisit_date(days);
+                                    next.log = Some(bs::append_log(
+                                        next.log.as_deref(),
+                                        &stamp,
+                                        &format!(
+                                            "revisit {when} (default {days}d for {target_raw}): a \
+                                             {target_raw} card with no revisit date is one nobody \
+                                             looks at again — change or clear it if that is wrong"
+                                        ),
+                                    ));
+                                    next.due = Some(when);
+                                    changed.push("due".into());
+                                }
+                            }
                             status_event = Some((from_raw, target_raw));
                             changed.push("status".into());
                         }
