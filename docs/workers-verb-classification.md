@@ -175,7 +175,39 @@ it.
 This is where "awkward composition is a UX defect *in* the primitives" applies most
 directly — fixing the shape here beats routing around it.
 
-## OBSERVABILITY READS — NOT DECIDED, and that is the verdict. (9)
+## OBSERVABILITY READS — DECIDED 2026-08-28 (AF-292). (9)
+
+Every one is a GET arm, so this was only ever a shape question. The verdicts below
+come from reading what each arm DOES, and two of the nine turned out not to belong
+in this bucket at all.
+
+| verb | verdict | why |
+|---|---|---|
+| `transcript` | **promote** `/transcript` | the live conversation, uniform TranscriptEvent for Codex/Ollama and ANSI for Claude. No equivalent anywhere; this is the bucket's real member. |
+| `transcripts` | **group** `/transcripts` + `/transcripts/{file}` | NOT the plural of the above. It lists transcript BACKUP files and downloads one by subid. A different resource. |
+| `last-message` | **fold** into `/transcript` | it is one field of the transcript read, not a resource. |
+| `log` | **group** `/log`, `/log/info` | already sub-resource shaped and already called that way by the SPA (`/log/info?plain=1`). Nothing to decide, only to route. |
+| `stats` | **promote** `/stats` | `get_claude_stats(CC_DIR)`. Flat, no sub-resource. |
+| `subagents` | **promote** `/subagents` | live Claude Code state, flat. |
+| `tasks` | **promote** `/tasks` | live Claude Code state, flat. |
+| `status-explain` | **promote** `/status/explain` | the status derivation's WHY over the same snapshot the list uses. It is an EXPLAIN, the same family as `env-explain`, and the grouped spelling says so. |
+| `search` | **RECLASSIFY to DUPLICATE** | it greps `session_work_dir`, so it is a file read, not an observability read — and `/api/fs/search?root=&q=` already expresses it. What the verb adds is resolving the work dir for you, which `GET /api/workers/{id}` already returns. |
+
+### `transcript` and `transcripts` differ by one letter and are different resources
+
+This is the naming defect this epic exists to avoid freezing. One is the live
+conversation; the other is a directory of backup files. A caller who guesses gets
+a plausible-looking wrong answer rather than a 404, which is the worst failure
+mode a route table can have. Promoting them side by side as they stand would make
+that permanent, so the recommendation is to promote `transcript` under its own
+name and give the archives a name that says archive.
+
+**Recommendation, not a fait accompli.** These are nine paths on a public surface
+and the classification's previous verdict was a deliberate "not decided". Recorded
+here for review rather than implemented, so the shape can be argued with before it
+is frozen.
+
+
 
 `log` · `transcript` · `transcripts` · `last-message` · `tasks` · `subagents` ·
 `stats` · `status-explain` · `search`
