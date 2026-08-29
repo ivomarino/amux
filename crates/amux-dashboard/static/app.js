@@ -8017,7 +8017,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.749';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.750';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -19537,6 +19537,9 @@ function _fmtRelTime(ts) {
 // ═══════ BOARD ═══════
 let activeView = 'sessions';
 let boardItems = [];
+// The exact set the last renderBoard() painted, after every filter. Export uses
+// it so "export" always means "what I am looking at". See renderBoard().
+let _boardLastVisible = [];
 // Archived cards are fetched LAZILY (AMUX-2271). They are 1577 of 1624 rows and
 // 97% of the payload, and the board hides them everywhere unless something asks
 // for them: `_bqWantsArchived` for the global board, the per-session peek panel
@@ -24337,6 +24340,86 @@ function _boardStatsHTML(rows) {
     + '</div>';
 }
 
+// ── Board export ────────────────────────────────────────────────────────────
+//
+// Exports WHAT IS ON SCREEN: `_boardLastVisible`, the set renderBoard() last
+// painted, after the owner toggle, the archived rule and the structured query.
+//
+// THE HEADER NAMES THE FILTER, and that is not decoration. An export of a
+// filtered board that does not say it was filtered is indistinguishable from an
+// export of the whole board, and it is the version that gets pasted into a
+// status update. Any output that can read partial has to publish whether it was
+// (.claude/rules/ethos.md rule 4), so the count and the active query travel with
+// the file.
+//
+// DESCRIPTIONS ARE TRUNCATED AT THE SOURCE and the file says so per card.
+// `GET /api/board` returns `desc_head` + `desc_len`, never the full `desc`
+// (AMUX-3861), so this cannot emit complete descriptions no matter how it is
+// written. Marking each cut one beats shipping a file that looks whole.
+function _boardExportName(ext) {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `amux-board-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.${ext}`;
+}
+
+function _boardExportMd(items, query) {
+  const order = ['doing', 'review', 'todo', 'backlog', 'done', 'verified', 'discarded'];
+  const groups = {};
+  items.forEach(i => { const st = _statusCanon(i.status || 'todo'); (groups[st] = groups[st] || []).push(i); });
+  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 16);
+  let md = `# amux board\n\n_${items.length} issue(s) · exported ${stamp}_\n`;
+  md += query && query.trim()
+    ? `\n> **Filtered view.** Query: \`${query.trim()}\`. This is not the whole board.\n`
+    : `\n> Unfiltered: every issue currently visible on the board.\n`;
+  const keys = order.concat(Object.keys(groups).filter(k => !order.includes(k)));
+  keys.forEach(st => {
+    const g = groups[st];
+    if (!g || !g.length) return;
+    md += `\n## ${st} (${g.length})\n\n`;
+    g.forEach(i => {
+      const who = i.session || i.worker || '—';
+      md += `- **${i.id}** ${i.title || ''}\n`;
+      md += `  - worker: ${who} · type: ${i.type || 'code'}`;
+      if (i.gate && i.gate.length) md += ` · gate: ${[].concat(i.gate).join(' / ')}`;
+      md += `\n`;
+      const head = (i.desc_head || '').trim();
+      if (head) {
+        const cut = i.desc_len && i.desc_len > head.length;
+        md += `  - ${head.replace(/\n+/g, ' ')}${cut ? ` … _(truncated: ${i.desc_len} chars total; the board list API returns only a head)_` : ''}\n`;
+      }
+    });
+  });
+  return md;
+}
+
+function exportBoard(fmt) {
+  const items = (_boardLastVisible || []).slice();
+  if (!items.length) { showToast('Nothing to export — no issues match the current filter.'); return; }
+  const q = (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') || '';
+  let body, mime, ext;
+  if (fmt === 'json') {
+    body = JSON.stringify({
+      exported_at: new Date().toISOString(),
+      filtered: !!q.trim(),
+      query: q.trim() || null,
+      count: items.length,
+      // Stated in the payload rather than left for the reader to discover.
+      desc_note: 'desc_head is a prefix; desc_len is the true length. The board list API does not return full desc (AMUX-3861).',
+      issues: items,
+    }, null, 2);
+    mime = 'application/json'; ext = 'json';
+  } else {
+    body = _boardExportMd(items, q);
+    mime = 'text/markdown'; ext = 'md';
+  }
+  const url = URL.createObjectURL(new Blob([body], { type: mime + ';charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = _boardExportName(ext);
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast(`Exported ${items.length} issue(s) as ${ext.toUpperCase()}${q.trim() ? ' (filtered)' : ''}`);
+}
+
 function renderBoard() {
   _boardEnsureFull();
   // Skip re-render while a drag is in progress — queue it for when drag ends
@@ -24370,6 +24453,13 @@ function renderBoard() {
   // so the old search behaviour is a strict subset of this.
   visible = _bqHideArchived(visible, boardSearchQuery);
   visible = _bqFilter(visible, boardSearchQuery);
+
+  // EXPORT READS THIS, rather than re-deriving the filter pipeline (owner
+  // toggle -> archived rule -> structured query). Two implementations of "what
+  // is on screen" drift the moment either side gains a facet, and the drift is
+  // invisible: the file looks fine, it is just not what you were looking at.
+  // Captured at the one point where `visible` is final for every view mode.
+  _boardLastVisible = visible;
 
   if (boardViewMode === 'list') {
     // Linear-dense List view (AMUX-2152): grouped by status with counts,

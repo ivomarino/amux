@@ -605,6 +605,13 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button id="bv-session" class="bv-btn" onclick="setBoardView('worker')" title="Group by worker">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
     </div>
+    <!-- Export the CURRENT view. Reuses .board-view-toggle so it inherits the
+         group styling and the 44px mobile touch targets already tuned for it,
+         rather than introducing a second control shape in the same toolbar. -->
+    <div class="board-view-toggle" id="board-export">
+      <button class="bv-btn" onclick="exportBoard('md')" title="Export the issues currently shown (filters applied) as Markdown">MD</button>
+      <button class="bv-btn" onclick="exportBoard('json')" title="Export the issues currently shown (filters applied) as JSON">JSON</button>
+    </div>
   </div>
   <div class="board-views" id="board-views"></div>
   <div class="board-filters" id="board-filters"></div>
