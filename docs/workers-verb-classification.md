@@ -138,10 +138,22 @@ disposition; silently promoting it is not.
 Retiring means the alias keeps answering until callers move, not breaking them the
 day the canonical route lands.
 
-## SUB-RESOURCE — real capability, wrong shape. Group, do not promote flat. (7)
+## SUB-RESOURCE — real capability, wrong shape. GROUPED (AF-291). (6 done, 1 other)
 
 `git` · `git-push` · `dirty` · `tracked-files` · `commit-guard` · `commit-report` ·
 `apply-template`
+
+**GROUPED 2026-08-28 (AF-291, d8ae41c9).** The checkout six now live under
+`/api/workers/{id}/git/...`: `POST /git` (checkout), `GET /git/{commits,
+commit-detail, diff, dirty}`, `POST /git/{push, commit-report}`, and
+`/git/{tracked-files, commit-guard}` carrying their own method splits.
+`git-push` became `git/push`, since the prefix was doing the grouping the path
+now does.
+
+Each sub-verb is routed EXPLICITLY. A `/{id}/git/{*sub}` wildcard would reproduce
+the defect AF-204 exists to remove, one level down: an unrouted sub-verb would
+answer rather than 404, and the table could not say which parts of the
+sub-resource exist.
 
 **`apply-template` RECLASSIFIED out of RESOURCE, 2026-08-28 (AF-288).** It takes no
 session. The handler reads its target directory from the BODY (`dir`) and never
