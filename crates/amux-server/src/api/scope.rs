@@ -86,17 +86,27 @@ pub struct ScopeCap {
     /// descriptor as documentation (Python keeps it there too and, like us,
     /// never emits it in the read payload).
     ///
-    /// THREE OF THESE POINT AT AN ENDPOINT THAT ANSWERS 501 (AF-293, measured
-    /// 2026-08-28): `memory` and `rules` name `memory-explain`, `env` names
-    /// `env-explain`, and both verbs return NOT_IMPLEMENTED with a pointer to
-    /// the Python source, calling layered env/memory composition a named
-    /// residual gap. The blast radius is bounded because this field never
+    /// `env` NOW ANSWERS; `memory` and `rules` STILL DO NOT (AF-295).
+    ///
+    /// All three pointed at a 501 until 2026-08-28. `env-explain` is
+    /// implemented: it walks `scope_env_layers`, the same ordered list every
+    /// consumer reads, and reports which layer supplied the value. It returns
+    /// key names and never values, because these files are 0600 and carry
+    /// credentials; an explain that echoed them would be a credential read over
+    /// HTTP.
+    ///
+    /// `memory` and `rules` keep pointing at `memory-explain`, which is still
+    /// 501 — now for a stated reason rather than a port gap. The composition it
+    /// would explain is itself incomplete: these caps advertise a `group` level
+    /// and `write_claude_memory` reads only global + worker, so
+    /// `memory/tags/<group>.md` is written here and consumed by nothing
+    /// (AF-296). An explain built on that would report a defect rather than
+    /// explain a behaviour. Fix the composition first.
+    ///
+    /// Bounded either way, and checked rather than assumed: this field never
     /// reaches a consumer — nothing in the read payload carries it, verified
-    /// against the live endpoint — so the only reader misled is someone
-    /// reading this table. Said out loud here rather than left for them to
-    /// discover by calling it (ethos rule 6: is the audit trail real, or just
-    /// claimed?). Tracked as its own card; do not "fold" these into /api/scope
-    /// without implementing them, which relocates the gap instead of closing it.
+    /// against the live endpoint — so the only reader misled is someone reading
+    /// this table, and the table now says so (ethos rule 6).
     pub explain: &'static str,
 }
 

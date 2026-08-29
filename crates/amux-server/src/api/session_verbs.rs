@@ -180,6 +180,13 @@ pub(crate) fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
 }
 
 impl EnvFile {
+    /// The key names this file defines, in file order. Names only: the VALUES
+    /// are credentials (these files are 0600), and every caller so far wants to
+    /// know which file defines a key rather than what it holds.
+    pub(crate) fn keys(&self) -> Vec<String> {
+        self.pairs.iter().map(|(k, _)| k.clone()).collect()
+    }
+
     fn load(path: &Path) -> Self {
         let mut pairs = Vec::new();
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -11223,12 +11230,25 @@ async fn get_dispatch(
             jresp(status, Value::Object(out))
         }
         "steer" => steer_history_verb(state, name, qs).await,
-        "env-explain" | "memory-explain" => jresp(
+        "env-explain" => env_explain_verb(name, qs),
+        // STILL 501, and now for a REASON rather than a port gap. `memory` and
+        // `rules` are advertised at [global, group, worker] and the scope UI
+        // writes all three, but `write_claude_memory` composes only global +
+        // worker: `memory/tags/<group>.md` is written by scope and read by
+        // nothing (AF-296). An explain built today would have to report that
+        // one of the three advertised levels is inert, which is a defect
+        // report, not an explanation. Fix the composition, then explain what
+        // actually happens.
+        "memory-explain" => jresp(
             StatusCode::NOT_IMPLEMENTED,
             json!({
-                "error": format!("{action} is not ported to the rust origin yet"),
-                "python_source": "amux-server.py:74901 (env-explain) / 74957 (memory-explain)",
-                "note": "layered env/memory composition is a named residual gap in api/session_verbs.rs",
+                "error": "memory-explain is not implemented",
+                "why": "the composition it would explain is itself incomplete: group-level \
+                        memory is written by /api/scope and read by no consumer (AF-296)",
+                "meanwhile": format!("GET /api/sessions/{name}/memory-inherited shows the \
+                                      CLAUDE.md inheritance, which is a DIFFERENT layering \
+                                      (loaded by Claude Code, not composed by amux)"),
+                "card": "AF-296",
             }),
         ),
         _ => not_found(),
@@ -12890,6 +12910,82 @@ pub(crate) fn instructions_get_verb(name: &str) -> Response {
     j200(json!({
         "name": name,
         "instructions": meta_str(&load_meta(name), "instructions").trim(),
+    }))
+}
+
+/// `env-explain` — which env layer supplied a worker's value, and which did not.
+///
+/// The scope API advertises `env` at [global, group, worker] and names this
+/// endpoint as the per-worker "why did I get this value" answer (SCOPE_CAPS's
+/// `explain` field). It answered 501 until AF-295. The layering itself was never
+/// the missing part: `scope_env_layers` already resolves the same ordered files
+/// every consumer reads, so this walks THAT list rather than re-deriving one,
+/// which is the only way the answer can stay true when the resolver changes.
+///
+/// VALUES ARE NEVER RETURNED, and that is a security property rather than a
+/// convenience. These files are 0600 because they carry credentials
+/// (`api/scope.rs`'s own storage note says so), and an explain that echoed them
+/// would turn a documentation endpoint into a credential read over HTTP. Key
+/// NAMES are returned, matching the repo's existing line — `docs/credentials.md`
+/// is a committed inventory of names, and the values live only in server.env.
+///
+/// "Which layer won" is the whole question anyway. A caller who needs the value
+/// already has it; what they cannot see is which of three files produced it.
+pub(crate) fn env_explain_verb(name: &str, qs: &[(String, String)]) -> Response {
+    let h = home();
+    let key = qs_first(qs, "key", "").trim().to_string();
+    let layers = scope_env_layers(&h, name);
+    let level_of = |p: &std::path::Path| -> &'static str {
+        if p.file_name().map(|f| f == "amux.env").unwrap_or(false) {
+            "global"
+        } else if p.parent().map(|d| d.ends_with("env")).unwrap_or(false) {
+            "group"
+        } else {
+            "worker"
+        }
+    };
+    let mut rows = Vec::new();
+    let mut winner: Option<Value> = None;
+    for p in &layers {
+        let ef = EnvFile::load(p);
+        let level = level_of(p);
+        let mut row = json!({
+            "level": level,
+            "path": p.to_string_lossy(),
+            "keys": ef.keys().len(),
+        });
+        if !key.is_empty() {
+            // PRESENT-BUT-EMPTY IS NOT ABSENT, the same distinction
+            // `effective_env` had to learn the hard way: an empty value is a
+            // deliberate clear, and reporting it as "does not define" would send
+            // a reader looking for a layer that is doing exactly its job.
+            let defines = ef.get(&key).is_some();
+            let empty = ef.get(&key).map(|v| v.trim().is_empty()).unwrap_or(false);
+            row["defines"] = json!(defines);
+            row["empty"] = json!(empty);
+            if defines {
+                // LAST writer wins: the list is least-specific first, so this
+                // keeps overwriting and ends on the most specific layer.
+                winner = Some(json!({"level": level, "path": p.to_string_lossy()}));
+            }
+        } else {
+            let mut names: Vec<String> = ef.keys();
+            names.sort();
+            row["defined_keys"] = json!(names);
+        }
+        rows.push(row);
+    }
+    j200(json!({
+        "worker": name,
+        "key": if key.is_empty() { Value::Null } else { json!(key) },
+        "order": ["global", "group", "worker"],
+        "layers": rows,
+        "winner": winner,
+        "values_withheld": true,
+        "note": "Values are never returned: these files are 0600 and carry credentials. \
+                 This answers WHICH layer supplied the value, which is the part a caller \
+                 cannot see for themselves.",
+        "resolver": "scope_env_layers — the same ordered list every consumer reads",
     }))
 }
 
@@ -20815,4 +20911,58 @@ mod commit_shape_tests {
             Shape::Unchecked(_)
         ));
     }
+
+    /// AF-295: `env-explain` answers WHICH layer supplied a value, and never the
+    /// value itself.
+    ///
+    /// The secret-leak assertion is the point of the endpoint's design, so it
+    /// carries a CONTROL: the key NAME must appear. Without that, "no secret in
+    /// the body" passes just as well on an error response, an empty body, or a
+    /// 404 — which is the failure mode this whole session has been about.
+    #[tokio::test]
+    async fn env_explain_names_the_winning_layer_and_never_the_value() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("sessions")).unwrap();
+        std::fs::create_dir_all(h.join("env")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(h);
+
+        std::fs::write(h.join("amux.env"), "SECRETKEY=global-sekrit\n").unwrap();
+        std::fs::write(h.join("env/alpha.env"), "SECRETKEY=group-sekrit\n").unwrap();
+        std::fs::write(
+            h.join("sessions/explainee.env"),
+            "CC_TAGS=\"alpha\"\nSECRETKEY=worker-sekrit\n",
+        )
+        .unwrap();
+
+        let qs = vec![("key".to_string(), "SECRETKEY".to_string())];
+        let resp = super::env_explain_verb("explainee", &qs);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let text = v.to_string();
+
+        // CONTROL FIRST: if this fails the assertions below prove nothing.
+        assert!(
+            text.contains("SECRETKEY"),
+            "premise gone — the key name is absent, so a leak check would pass on an empty \
+             answer: {v}"
+        );
+        assert_eq!(
+            v["winner"]["level"],
+            serde_json::json!("worker"),
+            "the most specific layer that defines the key must win: {v}"
+        );
+        assert_eq!(
+            v["layers"].as_array().map(|a| a.len()),
+            Some(3),
+            "all three layers must be walked, global/group/worker: {v}"
+        );
+        for secret in ["global-sekrit", "group-sekrit", "worker-sekrit"] {
+            assert!(
+                !text.contains(secret),
+                "env-explain leaked a value from a 0600 credential file ({secret}): {v}"
+            );
+        }
+    }
+
 }
