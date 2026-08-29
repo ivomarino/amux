@@ -4629,6 +4629,33 @@ pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
     if matches!(state, ComposerState::NotVisible | ComposerState::BackgroundManager) {
         return FrameRead::NoUi;
     }
+    // A COLLAPSED PASTE HIDES OUR OWN MESSAGE (AMUX-3876).
+    //
+    // Claude Code renders a large or multi-line paste as `[Pasted text #54 +8
+    // lines]`. The real text is not in the frame, so the `contains(tail_sq)`
+    // test below cannot find it and falls to `Cleared` — which means SUBMITTED.
+    // The message is sitting in the box, and the sender is told it went.
+    //
+    // Live specimen: paid-social -> gtm-playbooks at 13:15:41, recorded
+    // `submit_verdict = confirmed`, and the lane still held
+    // `[Pastedtext#54+8lines]` unsubmitted fifty minutes later. Not rare by
+    // construction either: `must_paste` chooses this path whenever the lane is
+    // generating OR the text is over 400 chars, which is most inter-worker
+    // traffic.
+    //
+    // `NoUi` is the honest verdict and its doc already says exactly this: "we
+    // cannot read our own message back, so we assert nothing". It routes to the
+    // durable JSONL check (AMUX-3870), which CAN tell a landed message from a
+    // stranded one, instead of guessing from a frame that is hiding the answer.
+    //
+    // Deliberately not `StillThereIdle`: that asserts the text IS ours, and the
+    // TUI has hidden the content that would prove it. `ghost_rescue` reaches the
+    // same conclusion from the other side and refuses to submit on a guess —
+    // this is the same refusal, one layer earlier, where it can still be
+    // reported to the sender rather than only logged.
+    if state.typed().is_some_and(crate::runtime_jobs::ghost_rescue::is_collapsed_paste) {
+        return FrameRead::NoUi;
+    }
     // Only REAL input counts as "still there". A dim suggestion that happens to
     // repeat our text is not our message sitting unsent — and treating it as
     // one would make the verifier press Escape+Enter and re-submit a message
@@ -19374,6 +19401,53 @@ mod submission_gate_tests {
         assert_eq!(read_frame(&frame_stuck_active(GHOST), &t), FrameRead::StillThereGenerating);
         // A DIFFERENT message in the box is not our message.
         assert_eq!(read_frame(&frame_stuck_idle("[06:50 PM] something else"), &t), FrameRead::Cleared);
+    }
+
+    /// A COLLAPSED PASTE MUST NOT READ AS SUBMITTED (AMUX-3876).
+    ///
+    /// Claude Code renders a large or multi-line paste as `[Pasted text #54 +8
+    /// lines]`, so the message text is not in the frame at all. The
+    /// `contains(tail_sq)` test therefore fails and the old code fell to
+    /// `Cleared`, which means submitted — while the message sat in the box.
+    ///
+    /// The live specimen this was found from: paid-social sent to gtm-playbooks
+    /// at 13:15:41, `submit_verdict` recorded `confirmed`, and the lane still
+    /// held `[Pastedtext#54+8lines]` unsubmitted fifty minutes later. Ethan
+    /// noticed it as "workers are receiving text in their chat that is
+    /// unsubmitted".
+    ///
+    /// It is not an edge case: `must_paste` picks the paste path whenever the
+    /// lane is generating OR the text exceeds 400 chars, which is most
+    /// worker-to-worker traffic.
+    #[test]
+    fn a_collapsed_paste_is_never_read_as_a_cleared_composer() {
+        let t = tail_sq(GHOST);
+        // The TUI shows the placeholder, never the text we sent.
+        for chip in [
+            "[Pasted text #54 +8 lines]",
+            "[Pasted text #137 +44 lines]",
+        ] {
+            let f = read_frame(&frame_stuck_idle(chip), &t);
+            assert_eq!(
+                f,
+                FrameRead::NoUi,
+                "a collapsed paste hides the content that would prove ownership, so the only \
+                 honest read is 'assert nothing' — got {f:?} for {chip:?}"
+            );
+            assert!(
+                !final_frame_confirms(f),
+                "and it must never confirm the send: the message is still in the box"
+            );
+        }
+        // CONTROL: an ordinary composer holding our text is unchanged, so the
+        // guard above cannot be passing by swallowing every frame.
+        assert_eq!(
+            read_frame(&frame_stuck_idle(GHOST), &t),
+            FrameRead::StillThereIdle,
+            "a normal unsent message must still read as StillThereIdle"
+        );
+        // CONTROL: a genuinely empty composer still means submitted.
+        assert_eq!(read_frame(&frame_cleared(), &t), FrameRead::Cleared);
     }
 
     /// The FINAL frame, after the retry loop gives up, must not confirm a send
