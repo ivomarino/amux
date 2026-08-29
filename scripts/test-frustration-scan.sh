@@ -342,5 +342,67 @@ else
   bad "O: cannot_discriminate does not name the reply-status gap"
 fi
 
+# ---------------------------------------------------------------------------
+# Cells P/Q: a SECOND store, because these need steering_history to EXIST and
+# cell N needs it to be ABSENT. Adding the table to the first fixture would
+# still leave N green (no matching row also reads `unknown`) while silently
+# moving it off the table-absent path it was written for — the exact
+# hollowing-out this file guards against between K/L and I/J.
+DB2="$TMP/fixture2.db"
+python3 - "$DB2" <<'PY2'
+import sqlite3, sys, time
+c = sqlite3.connect(sys.argv[1])
+c.execute("""CREATE TABLE cmd_history (id INTEGER PRIMARY KEY, text TEXT, type TEXT,
+             session TEXT, ts INTEGER, origin TEXT, card_id TEXT, delivery TEXT)""")
+c.execute("""CREATE TABLE steering_history (id TEXT, session TEXT, text TEXT,
+             queued_at REAL, delivered_at REAL)""")
+now = int(time.time() * 1000)
+t1 = now - 200_000
+t2 = t1 + 40_000          # 40s apart: inside the 60s double-delivery gap, and
+                          # outside each other's +/-10s steering match window
+c.executemany("INSERT INTO cmd_history VALUES (?,?,?,?,?,?,?,?)", [
+    (1, "restart the ingestion worker", "user", "pp", t1, "", "", "queued"),
+    (2, "restart the ingestion worker", "user", "pp", t2, "", "", "queued"),
+    (3, "roll the shard", "user", "qq", t1, "", "", "queued"),
+    (4, "roll the shard", "user", "qq", t2, "", "", "queued"),
+])
+c.executemany("INSERT INTO steering_history VALUES (?,?,?,?,?)", [
+    # pp: the FIRST reached the lane, the second was suppressed -> dedupe worked
+    ("s1", "pp", "restart the ingestion worker", t1/1000.0, t1/1000.0 + 2),
+    ("s2", "pp", "restart the ingestion worker", t2/1000.0, None),
+    # qq: BOTH reached the lane -> a genuine double-delivery
+    ("s3", "qq", "roll the shard", t1/1000.0, t1/1000.0 + 2),
+    ("s4", "qq", "roll the shard", t2/1000.0, t2/1000.0 + 2),
+])
+c.commit()
+PY2
+
+OUT2=$(AMUX_DB="$DB2" python3 "$SCAN" 2>&1)
+
+if echo "$OUT2" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for f in d["findings"]:
+    if f["kind"]=="double-delivery" and any(m["id"] in (1,2) for m in f["messages"]):
+        sys.exit(1)
+sys.exit(0)'; then
+  ok "P: one delivered + one suppressed is the DEDUPE WORKING, not a delivery defect"
+else
+  bad "P: reported a delivery defect for a pair the dedupe correctly suppressed"
+fi
+
+if echo "$OUT2" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for f in d["findings"]:
+    if f["kind"]=="double-delivery" and any(m["id"] in (3,4) for m in f["messages"]):
+        sys.exit(0 if "BOTH were delivered" in " ".join(f["why"]) else 1)
+sys.exit(1)'; then
+  bad_unused=0
+  ok "Q: BOTH delivered IS still a double-delivery (cell P did not hollow it out)"
+else
+  bad "Q: a genuine double-delivery stopped being reported"
+fi
+
 echo "frustration-scan cells: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

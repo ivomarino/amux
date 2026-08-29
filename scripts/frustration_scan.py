@@ -405,14 +405,47 @@ def main():
                         # also NOT a `repeat` (he did not ask twice, he addressed two
                         # workers), so it is skipped outright rather than falling
                         # through to the repeat branch below.
+                        # ASK DELIVERY BEFORE CALLING IT A DELIVERY DEFECT.
+                        #
+                        # This branch asserted "this is a DELIVERY defect" from
+                        # identical text plus a time gap alone, which is a claim
+                        # about delivery made without consulting delivery.
+                        # `annotate_delivery` already ran (line ~327) and the
+                        # verdicts are sitting on these very messages.
+                        #
+                        # Measured 2026-08-29 on the pair this caught: ids
+                        # 34662/34664, same text 16s apart to tubescience. Exactly
+                        # ONE of them reached the lane — steer-1787938118562,
+                        # delivered 13:32:29, matching 34664's ts to within 562ms.
+                        # Two sends, one delivery: that is the DEDUPE WORKING, and
+                        # reporting it as a delivery defect sends the reader to
+                        # audit a mechanism that just did its job. Same shape as
+                        # the cross-session fan-out this branch already learned
+                        # about, one field over.
+                        da = (a.get("delivered") or "unknown")
+                        db = (b.get("delivered") or "unknown")
+                        if da == "delivered" and db == "delivered":
+                            note = (
+                                f"IDENTICAL messages {gap_s:.0f}s apart (ids {a['id']}/{b['id']}) "
+                                "and BOTH were delivered — a genuine double-delivery: check "
+                                "send_dedup and cmd_history.delivery, and do not read anything "
+                                "into the wording"
+                            )
+                        elif "unknown" in (da, db):
+                            note = (
+                                f"IDENTICAL messages {gap_s:.0f}s apart (ids {a['id']}/{b['id']}), "
+                                f"delivery UNKNOWN for at least one ({a['id']}={da}, {b['id']}={db}) "
+                                "— cannot tell a double-delivery from the dedupe working. Not a "
+                                "finding on its own"
+                            )
+                        else:
+                            # One delivered, one not: the dedupe suppressed the
+                            # duplicate. Nothing to report.
+                            continue
                         key = f"double-delivery:{a['id']}"
                         f = findings[key]
-                        f["score"] = max(f["score"], 8)
-                        f["why"].append(
-                            f"IDENTICAL messages {gap_s:.0f}s apart (ids {a['id']}/{b['id']}) — "
-                            "this is a DELIVERY defect, not frustration: check send_dedup and "
-                            "cmd_history.delivery before reading anything into the wording"
-                        )
+                        f["score"] = max(f["score"], 8 if "BOTH were delivered" in note else 3)
+                        f["why"].append(note)
                         f["msgs"] = [a, b]
                         continue
                 key = f"repeat:{a['id']}"
