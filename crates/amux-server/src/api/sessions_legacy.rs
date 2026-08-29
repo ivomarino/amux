@@ -204,6 +204,62 @@ fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
 /// being bounded is the part that can be wrong, so the mechanism is what the
 /// test drives — with `sh -c "sleep 30"`, which hangs for real rather than
 /// standing in for hanging.
+/// The budget for the fleet-list PROBES — `tmux list-sessions`, the two
+/// `tmux list-panes`, and the per-shell-pane `pgrep` (AF-301).
+///
+/// Separate from `AMUX_PANE_CAPTURE_TIMEOUT_S` because they answer different
+/// questions: pane capture reads ONE lane's screen and 3s is generous, while
+/// these enumerate the whole fleet and a slow-but-working tmux should not be
+/// mistaken for a wedged one.
+fn probe_budget() -> std::time::Duration {
+    std::time::Duration::from_secs_f64(env_secs("AMUX_SESSIONS_PROBE_TIMEOUT_S", 5.0))
+}
+
+/// `run_bounded`, but returning the whole `Output` so a caller can read
+/// `status` and `stderr` (AF-301).
+///
+/// `run_bounded` returns stdout only, which is why `tmux list-sessions` at the
+/// call site below kept using bare `.output()`: it WARNs with the exit status
+/// and stderr when tmux fails, and converting it to the stdout-only helper
+/// would have silently dropped that diagnostic to buy the timeout. Widening the
+/// helper keeps both.
+fn run_bounded_output(
+    mut cmd: std::process::Command,
+    budget: std::time::Duration,
+    lane: &str,
+) -> Option<std::process::Output> {
+    let mut child = cmd.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= budget {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(mut l) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
+                        *l = Some((lane.to_string(), crate::config::now_f64()));
+                    }
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        lane = %lane,
+                        budget_s = budget.as_secs_f64(),
+                        "fleet-list probe exceeded its budget and was killed (AF-301). Before \
+                         this bound the same call was a bare `.output()` with no timeout, and a \
+                         wedged tmux held GET /api/sessions for as long as tmux took — 697s on \
+                         2026-08-28, which starved the runtime and 500'd the dashboard."
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+    child.wait_with_output().ok()
+}
+
 fn run_bounded(
     mut cmd: std::process::Command,
     budget: std::time::Duration,
@@ -637,22 +693,28 @@ impl FleetSignals {
         // field's doc for the measurement. It resolves to the session's
         // CURRENT window; amux creates one window per session, and the agent
         // runs in it.
-        let tmux_out = std::process::Command::new("tmux")
-            .args([
-                "list-sessions",
-                "-F",
-                "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}",
-            ])
-            .output();
+        // BOUNDED (AF-301). This was a bare `.output()`, which blocks until the
+        // child exits with no timeout; a wedged tmux held this request open for
+        // 697s on 2026-08-28. `run_bounded_output` rather than `run_bounded`
+        // because the WARN below needs `status` and `stderr`.
+        let mut lsc = std::process::Command::new("tmux");
+        lsc.args([
+            "list-sessions",
+            "-F",
+            "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        let tmux_out = run_bounded_output(lsc, probe_budget(), "list-sessions").ok_or(());
         match &tmux_out {
             Ok(o) if !o.status.success() => tracing::warn!(
                 status = %o.status,
                 stderr = %String::from_utf8_lossy(&o.stderr).trim(),
                 "tmux list-sessions failed — fleet will read as not-running"
             ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "tmux spawn failed — fleet will read as not-running"
+            Err(_) => tracing::warn!(
+                "tmux list-sessions did not answer within the probe budget, or failed to \
+                 spawn — fleet will read as not-running (AF-301)"
             ),
             _ => {}
         }
@@ -680,11 +742,16 @@ impl FleetSignals {
         // running lanes have no tmux session", which was absurd on its face and
         // entirely an artifact. A liveness filter that can empty the fleet is
         // worse than the bug it fixes.
-        let all_panes_dead = std::process::Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"])
-            .output()
-            .map(|o| sessions_with_all_panes_dead(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or_default();
+        // BOUNDED (AF-301) — was a bare `.output()`.
+        let all_panes_dead = {
+            let mut c = std::process::Command::new("tmux");
+            c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            run_bounded(c, probe_budget(), "list-panes/dead")
+                .map(|out| sessions_with_all_panes_dead(&out))
+                .unwrap_or_default()
+        };
         if !all_panes_dead.is_empty() {
             tracing::warn!(
                 target: "sessions",
@@ -717,10 +784,15 @@ impl FleetSignals {
         // and a stopped lane shows as `bash`. A session with several panes
         // counts as shell-only only if EVERY pane is a shell.
         let mut shell_only = BTreeSet::new();
-        if let Ok(o) = std::process::Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"])
-            .output()
-        {
+        // BOUNDED (AF-301) — was a bare `.output()`.
+        let panes_probe = {
+            let mut c = std::process::Command::new("tmux");
+            c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            run_bounded(c, probe_budget(), "list-panes/pids")
+        };
+        if let Some(o) = panes_probe {
             const SHELLS: [&str; 8] = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
             let mut any_live: BTreeSet<String> = BTreeSet::new();
             let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -728,7 +800,7 @@ impl FleetSignals {
             // an agent as a CHILD: (session, pane_pid). Collected here and probed
             // below only for sessions not already proven live by another pane.
             let mut shell_panes: Vec<(String, String)> = Vec::new();
-            for l in String::from_utf8_lossy(&o.stdout).lines() {
+            for l in o.lines() {
                 // format is session:pid:cmd, but a session NAME can contain ':',
                 // so split from the RIGHT twice: cmd, then pid.
                 let Some((rest, cmd)) = l.rsplit_once(':') else { continue };
@@ -748,15 +820,47 @@ impl FleetSignals {
             // fleet list agrees with it instead of hiding a running lane behind a
             // shell it never actually returned to. Bounded: only shell-foreground
             // panes whose session is not already proven live by another pane.
+            // BOUNDED PER CALL *AND* IN TOTAL (AF-301). This was a bare
+            // `.output()` inside a per-shell-pane loop, so a 50-lane fleet did
+            // ~50 unbounded subprocess spawns per cache miss (TTL 2s) — the
+            // densest place in the request for a wedge to start. A per-call
+            // bound alone is not enough: 50 calls each just under budget is
+            // still minutes, so the LOOP carries its own deadline.
+            //
+            // Skipping is disclosed rather than silent (ethos rule 4). A lane
+            // dropped here is simply not proven live by its children, which
+            // reads as shell-only — so the count has to be visible or the fleet
+            // quietly looks idler than it is.
+            let probe_start = std::time::Instant::now();
+            let loop_budget = probe_budget();
+            let mut pgrep_skipped = 0usize;
             for (sess, pid) in shell_panes {
                 if any_live.contains(&sess) || pid.is_empty() {
                     continue;
                 }
-                if let Ok(ch) = std::process::Command::new("pgrep").args(["-P", &pid]).output() {
-                    if !ch.stdout.iter().all(|b| b.is_ascii_whitespace()) {
+                if probe_start.elapsed() >= loop_budget {
+                    pgrep_skipped += 1;
+                    continue;
+                }
+                let mut pg = std::process::Command::new("pgrep");
+                pg.args(["-P", &pid])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null());
+                if let Some(out) = run_bounded(pg, loop_budget, "pgrep") {
+                    if !out.is_empty() {
                         any_live.insert(sess.clone());
                     }
                 }
+            }
+            if pgrep_skipped > 0 {
+                tracing::warn!(
+                    target: "amux::sessions",
+                    skipped = pgrep_skipped,
+                    budget_s = loop_budget.as_secs_f64(),
+                    "child-process liveness probe hit its TOTAL budget — these lanes were not \
+                     checked for a live child and will read as shell-only. Raise \
+                     AMUX_SESSIONS_PROBE_TIMEOUT_S if this is routine rather than a wedge."
+                );
             }
             for s in seen {
                 if !any_live.contains(&s) {
@@ -2731,10 +2835,16 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     .map(|d| {
                         let d = d.clone();
                         std::thread::spawn(move || {
-                            let out = std::process::Command::new("git")
-                                .args(["-C", &d, "rev-parse", "--abbrev-ref", "HEAD"])
-                                .output()
-                                .ok()?;
+                            // BOUNDED (AF-301). `git rev-parse` on a repo whose
+                            // index is locked, or on a network filesystem, blocks
+                            // as long as git does — and this runs per checkout on
+                            // a spawned thread, so the join below waits for the
+                            // slowest one.
+                            let mut gc = std::process::Command::new("git");
+                            gc.args(["-C", &d, "rev-parse", "--abbrev-ref", "HEAD"])
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::null());
+                            let out = run_bounded_output(gc, probe_budget(), "git-branch")?;
                             out.status.success().then(|| {
                                 (d, String::from_utf8_lossy(&out.stdout).trim().to_string())
                             })
@@ -2806,11 +2916,15 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                         std::thread::spawn(move || {
                             if running {
                                 let pt = pane_target(&format!("amux-{n}"));
-                                let out = std::process::Command::new("tmux")
-                                    .args(["capture-pane", "-t", &pt, "-p", "-e", "-S", "-30"])
-                                    .output()
-                                    .ok()?;
-                                Some((n, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+                                // BOUNDED (AF-301). This was a bare `.output()`
+                                // capture-pane — the exact operation
+                                // `capture_pane_bounded` exists to bound, done
+                                // unbounded, in the same file. It runs on a
+                                // spawned thread rather than the async runtime,
+                                // so a wedge here blocks the `h.join()` below
+                                // instead of a worker; still unbounded, still
+                                // holds the request open.
+                                Some((n.clone(), capture_pane_bounded(&pt, &n)?))
                             } else {
                                 let raw = stopped_session_raw(&n);
                                 (!raw.is_empty()).then_some((n, raw))
