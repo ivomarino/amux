@@ -14570,7 +14570,7 @@ async fn apply_live_config_change(
 /// several branches write one field and then reject a second. Clearing a cache
 /// that did not need clearing costs one rebuild; NOT clearing one that did is
 /// the bug this fixes.
-async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
+pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
     let out = config_patch_inner(state, name, body).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
     out
@@ -15112,7 +15112,7 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
 // share (py:65953-65999) — token CRUD over the shared share_tokens table.
 // ---------------------------------------------------------------------------
 
-async fn share_handler(
+pub(crate) async fn share_handler(
     state: &AppState,
     name: &str,
     method: &Method,

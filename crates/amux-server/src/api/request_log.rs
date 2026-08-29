@@ -1107,6 +1107,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // would 405 a PATCH the catch-all currently passes through to steer_mutate,
     // which forks the promoted spelling's behaviour from the legacy one.
     RouteEntry { path: "/api/workers/{id}/steer", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/config", methods: &["PATCH"] },
+    RouteEntry { path: "/api/workers/{id}/share", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/dead-letters", methods: &["GET"] },
     // -- memories / messages / schedules / verify / prefs / criteria
     RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },

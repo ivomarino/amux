@@ -91,6 +91,11 @@ pub fn routes() -> Router<AppState> {
         // split lives inside the verb already, and splitting it here would put
         // the same decision in two places that can disagree.
         .route("/{id}/steer", axum::routing::any(steer_worker))
+        // AF-294, the GUARDS pair: reachable ONLY through the catch-all until
+        // now, which is what made them the awkward two. `config` is PATCH-only
+        // and `share` is its own family that takes any method.
+        .route("/{id}/config", axum::routing::patch(config_worker))
+        .route("/{id}/share", axum::routing::any(share_worker))
 }
 
 /// `GET /api/ollama/models` — list locally installed Ollama models by running
@@ -1151,6 +1156,52 @@ async fn resolve_key(state: &AppState, key: String) -> Result<String, Response> 
     }
 }
 
+/// `PATCH /api/workers/{id}/config` — edit the worker's env file.
+///
+/// PATCH-only because that is the whole verb: there is no `config` arm in
+/// `get_dispatch`, so mounting a GET here would invent a read that does not
+/// exist rather than promote one that does.
+///
+/// This does NOT displace the bare-PATCH alias on `/api/sessions/{name}`, which
+/// routes an empty action to `config` and exists because a tags edit sent to the
+/// resource once answered an unreadable 404. That alias lives on the sessions
+/// route and is untouched by anything the workers surface does.
+pub async fn config_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::config_patch(&state, &name, &body).await
+}
+
+/// `ANY /api/workers/{id}/share` — the share family, whose method split is its
+/// own (`share_handler` reads the method), so the router does not re-express it.
+pub async fn share_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::share_handler(&state, &name, &method, &headers, &body).await
+}
+
 /// `GET|POST|DELETE /api/workers/{id}/steer` — the lane's steering queue.
 ///
 /// Carries BOTH halves deliberately. The GET arm reads like an observability
@@ -2205,6 +2256,31 @@ mod tests {
                 !v.to_string().contains(&id),
                 "{verb}: the raw worker id reached the answer, so this fell to the catch-all and \
                  addressed the substrate BY ID instead of resolving it to the session name: {v}"
+            );
+        }
+
+        // The GUARDS pair (AF-294), each at its own method: `config` is
+        // PATCH-only and `share` takes any. Covered here rather than in the
+        // POST loop above because a promoted route mounted at the wrong method
+        // 405s. The leak check alone WOULD catch that — the 405 body echoes the
+        // path, id included, as the mutation confirms — but it would report it
+        // as "the id reached the answer", which reads as a routing failure and
+        // sends the next reader to resolve_key. The explicit method assertion
+        // names the actual fault instead.
+        for (verb, m, body) in [
+            ("config", "PATCH", Some(json!({ "CC_TAGS": "x" }))),
+            ("share", "POST", None),
+        ] {
+            let (st, _, v) = send(&app, m, &format!("/api/workers/{id}/{verb}"), body).await;
+            assert_ne!(
+                st,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{verb}: promoted at the wrong method, so the route exists and cannot be \
+                 reached: {v}"
+            );
+            assert!(
+                !v.to_string().contains(&id),
+                "{verb}: the raw worker id reached the answer: {v}"
             );
         }
 
