@@ -11236,66 +11236,7 @@ async fn get_dispatch(
             };
             jresp(status, Value::Object(out))
         }
-        "steer" => {
-            let conn = match state.store.read() {
-                Ok(c) => c,
-                Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
-            };
-            if qs_first(qs, "history", "0") == "1" {
-                let mut out = vec![];
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT id, text, queued_at, delivered_at FROM steering_history \
-                     WHERE session=? ORDER BY delivered_at DESC LIMIT 100",
-                ) {
-                    if let Ok(rows) = stmt.query_map([name], |r| {
-                        Ok(json!({
-                            "id": r.get::<_, String>(0)?,
-                            "text": r.get::<_, String>(1)?,
-                            "queued_at": r.get::<_, Option<f64>>(2)?,
-                            "delivered_at": r.get::<_, f64>(3)?,
-                        }))
-                    }) {
-                        out = rows.flatten().collect();
-                    }
-                }
-                return j200(json!(out));
-            }
-            let mut out: Vec<Value> = vec![];
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT id, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') FROM steering_queue \
-                 WHERE session=? ORDER BY queued_at ASC",
-            ) {
-                if let Ok(rows) = stmt.query_map([name], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, String>(0)?,
-                        "text": r.get::<_, String>(1)?,
-                        "queued_at": r.get::<_, f64>(2)?,
-                        "guard": r.get::<_, String>(3)?,
-                        "sender": r.get::<_, String>(4)?,
-                    }))
-                }) {
-                    out = rows.flatten().collect();
-                }
-            }
-            drop(conn);
-            // AGE AND REACHABILITY PER ROW (AMUX-2785). A queue listing that
-            // shows only text and a timestamp cannot answer the one question a
-            // sender staring at it has — "is this coming, or is it stuck?" —
-            // and the caller cannot compute it, because whether the lane can
-            // receive at all is not in the row. Same predicate as the drain
-            // loop, so the list cannot claim what the loop will not do.
-            let blocked = lane_block_reason(name).await;
-            let max_age = steer_max_age_s();
-            let now = now_f64();
-            for row in out.iter_mut() {
-                let age = now - row["queued_at"].as_f64().unwrap_or(now);
-                row["age_s"] = json!(age as i64);
-                row["overdue"] = json!(age >= max_age);
-                row["deliverable"] = json!(blocked.is_none());
-                row["blocked_reason"] = json!(blocked);
-            }
-            j200(json!(out))
-        }
+        "steer" => steer_history_verb(state, name, qs).await,
         "env-explain" | "memory-explain" => jresp(
             StatusCode::NOT_IMPLEMENTED,
             json!({
@@ -11720,7 +11661,7 @@ pub(crate) fn steer_guard_is_system(guard: &str) -> bool {
     !guard.is_empty() && guard != "selector-answer"
 }
 
-async fn steer_mutate(
+pub(crate) async fn steer_mutate(
     state: &AppState,
     name: &str,
     method: &Method,
@@ -12254,56 +12195,7 @@ async fn post_dispatch(
             }
         }
         "report" => report_post(state, name, headers, body).await,
-        "apply-template" => {
-            let re = cached_re!(r"[^a-z0-9\-]");
-            let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
-            let work_dir = body_str(body, "dir").trim().to_string();
-            // Two different failures, two different messages. They shared one
-            // string until 2026-08-11, and that is precisely why a dead
-            // templates_dir() went unnoticed: "template not found" reads as
-            // "you asked for a template that doesn't exist", so nobody
-            // suspected the ROOT was missing. Name which one it is.
-            let Some(tmpl_root) = templates_dir() else {
-                return jresp(
-                    StatusCode::NOT_FOUND,
-                    json!({"error": "no templates directory on this machine",
-                           "hint": "set AMUX_TEMPLATES_DIR, or install templates/ to ~/.amux/templates (install.sh does this)",
-                           "tried": [std::env::var("AMUX_TEMPLATES_DIR").unwrap_or_default(),
-                                     home().join("templates").display().to_string()]}),
-                );
-            };
-            let tmpl_path = tmpl_root.join(&tmpl_id);
-            if tmpl_id.is_empty() || !tmpl_path.is_dir() {
-                return jresp(
-                    StatusCode::NOT_FOUND,
-                    json!({"error": format!("no template '{tmpl_id}'"),
-                           "templates_dir": tmpl_root.display().to_string()}),
-                );
-            }
-            if !work_dir.is_empty() {
-                let work = expanduser(&work_dir);
-                let _ = std::fs::create_dir_all(&work);
-                if let Ok(meta_text) = std::fs::read_to_string(tmpl_path.join("template.json")) {
-                    if let Ok(meta) = serde_json::from_str::<Value>(&meta_text) {
-                        for d in meta["dirs"].as_array().cloned().unwrap_or_default() {
-                            if let Some(d) = d.as_str() {
-                                let _ = std::fs::create_dir_all(work.join(d));
-                            }
-                        }
-                    }
-                }
-                let claude_file = tmpl_path.join("CLAUDE.md");
-                if claude_file.exists() {
-                    let dest = work.join("CLAUDE.md");
-                    if !dest.exists() {
-                        if let Ok(t) = std::fs::read_to_string(&claude_file) {
-                            let _ = std::fs::write(&dest, t);
-                        }
-                    }
-                }
-            }
-            j200(json!({"ok": true}))
-        }
+        "apply-template" => apply_template_verb(body),
         "delete" => delete_post(state, name, headers).await,
         // CONVENTIONAL SPELLINGS, routed to the SAME handlers (AMUX-2669/2665).
         //
@@ -12846,6 +12738,143 @@ pub(crate) async fn keys_verb(name: &str, body: &Value) -> Response {
     jresp(code, json!({"ok": ok, "message": msg}))
 }
 
+/// `apply-template` as a callable verb.
+///
+/// IT TAKES NO SESSION, and that is the finding rather than an oversight in the
+/// extraction: the arm reads its target directory from the BODY (`dir`) and
+/// never consults the name it was addressed to. The compiler said so — `name`
+/// was unused the moment this became a function — which is why the parameter is
+/// gone rather than underscored.
+///
+/// So `apply-template` is not an operation on a worker as a resource, and it is
+/// reclassified out of RESOURCE on AF-203 rather than promoted (AF-288).
+/// Mounting it at `/api/workers/{id}/apply-template` would make the id
+/// decorative and freeze that fiction into the supported API, which is the
+/// specific failure AF-201 says a one-for-one promotion causes.
+pub(crate) fn apply_template_verb(body: &Value) -> Response {
+    let re = cached_re!(r"[^a-z0-9\-]");
+    let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
+    let work_dir = body_str(body, "dir").trim().to_string();
+    // Two different failures, two different messages. They shared one
+    // string until 2026-08-11, and that is precisely why a dead
+    // templates_dir() went unnoticed: "template not found" reads as
+    // "you asked for a template that doesn't exist", so nobody
+    // suspected the ROOT was missing. Name which one it is.
+    let Some(tmpl_root) = templates_dir() else {
+        return jresp(
+            StatusCode::NOT_FOUND,
+            json!({"error": "no templates directory on this machine",
+                   "hint": "set AMUX_TEMPLATES_DIR, or install templates/ to ~/.amux/templates (install.sh does this)",
+                   "tried": [std::env::var("AMUX_TEMPLATES_DIR").unwrap_or_default(),
+                             home().join("templates").display().to_string()]}),
+        );
+    };
+    let tmpl_path = tmpl_root.join(&tmpl_id);
+    if tmpl_id.is_empty() || !tmpl_path.is_dir() {
+        return jresp(
+            StatusCode::NOT_FOUND,
+            json!({"error": format!("no template '{tmpl_id}'"),
+                   "templates_dir": tmpl_root.display().to_string()}),
+        );
+    }
+    if !work_dir.is_empty() {
+        let work = expanduser(&work_dir);
+        let _ = std::fs::create_dir_all(&work);
+        if let Ok(meta_text) = std::fs::read_to_string(tmpl_path.join("template.json")) {
+            if let Ok(meta) = serde_json::from_str::<Value>(&meta_text) {
+                for d in meta["dirs"].as_array().cloned().unwrap_or_default() {
+                    if let Some(d) = d.as_str() {
+                        let _ = std::fs::create_dir_all(work.join(d));
+                    }
+                }
+            }
+        }
+        let claude_file = tmpl_path.join("CLAUDE.md");
+        if claude_file.exists() {
+            let dest = work.join("CLAUDE.md");
+            if !dest.exists() {
+                if let Ok(t) = std::fs::read_to_string(&claude_file) {
+                    let _ = std::fs::write(&dest, t);
+                }
+            }
+        }
+    }
+    j200(json!({"ok": true}))
+}
+
+/// The GET half of `steer`: the lane's steering queue, annotated per row with
+/// age and whether the lane can actually receive (AMUX-2785).
+///
+/// Extracted for the promoted `/api/workers/{id}/steer` route (AF-288).
+/// `steer` is READ AND WRITE, which is worth stating because the GET arm alone
+/// reads like an observability endpoint: every non-GET method on this action
+/// goes to `steer_mutate` instead, so a promoted route has to carry both or it
+/// silently drops the half that queues work.
+pub(crate) async fn steer_history_verb(
+    state: &AppState,
+    name: &str,
+    qs: &[(String, String)],
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
+    };
+    if qs_first(qs, "history", "0") == "1" {
+        let mut out = vec![];
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id, text, queued_at, delivered_at FROM steering_history \
+             WHERE session=? ORDER BY delivered_at DESC LIMIT 100",
+        ) {
+            if let Ok(rows) = stmt.query_map([name], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "text": r.get::<_, String>(1)?,
+                    "queued_at": r.get::<_, Option<f64>>(2)?,
+                    "delivered_at": r.get::<_, f64>(3)?,
+                }))
+            }) {
+                out = rows.flatten().collect();
+            }
+        }
+        return j200(json!(out));
+    }
+    let mut out: Vec<Value> = vec![];
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') FROM steering_queue \
+         WHERE session=? ORDER BY queued_at ASC",
+    ) {
+        if let Ok(rows) = stmt.query_map([name], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "text": r.get::<_, String>(1)?,
+                "queued_at": r.get::<_, f64>(2)?,
+                "guard": r.get::<_, String>(3)?,
+                "sender": r.get::<_, String>(4)?,
+            }))
+        }) {
+            out = rows.flatten().collect();
+        }
+    }
+    drop(conn);
+    // AGE AND REACHABILITY PER ROW (AMUX-2785). A queue listing that
+    // shows only text and a timestamp cannot answer the one question a
+    // sender staring at it has — "is this coming, or is it stuck?" —
+    // and the caller cannot compute it, because whether the lane can
+    // receive at all is not in the row. Same predicate as the drain
+    // loop, so the list cannot claim what the loop will not do.
+    let blocked = lane_block_reason(name).await;
+    let max_age = steer_max_age_s();
+    let now = now_f64();
+    for row in out.iter_mut() {
+        let age = now - row["queued_at"].as_f64().unwrap_or(now);
+        row["age_s"] = json!(age as i64);
+        row["overdue"] = json!(age >= max_age);
+        row["deliverable"] = json!(blocked.is_none());
+        row["blocked_reason"] = json!(blocked);
+    }
+    j200(json!(out))
+}
+
 /// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`
 /// route and the legacy `/api/sessions/{name}/duplicate` spelling run the SAME
 /// code instead of one being a re-implementation of the other (AF-288).
@@ -13237,7 +13266,7 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
     }
 }
 
-async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // ATTRIBUTION (AMUX-2646). A self-report is the one write in amux that is
     // ONLY ever legitimate from inside the session it describes: the hooks
     // that produce it run in that process and post to

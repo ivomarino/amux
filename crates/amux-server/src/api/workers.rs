@@ -78,6 +78,19 @@ pub fn routes() -> Router<AppState> {
         .route("/{id}/clear", post(clear_worker))
         .route("/{id}/resize", post(resize_worker))
         .route("/{id}/keys", post(keys_worker))
+        // `report` is the harness reporting its own state — D1's exit condition
+        // in ethos.md, the durable inverse of terminal scraping. Promoted last
+        // of the routine set because it is the one whose UNAVAILABILITY on the
+        // canonical surface is most costly, not because it was hard: the arm
+        // was already a one-line delegation. Attribution is unchanged, since the
+        // headers ride through to the same `report_post`.
+        .route("/{id}/report", post(report_worker))
+        // `steer` is the last RESOURCE verb and the only one that is READ AND
+        // WRITE at one action: GET lists the lane's steering queue, POST queues,
+        // DELETE cancels. `any` rather than `get`+`post` because the method
+        // split lives inside the verb already, and splitting it here would put
+        // the same decision in two places that can disagree.
+        .route("/{id}/steer", axum::routing::any(steer_worker))
 }
 
 /// `GET /api/ollama/models` — list locally installed Ollama models by running
@@ -1138,6 +1151,59 @@ async fn resolve_key(state: &AppState, key: String) -> Result<String, Response> 
     }
 }
 
+/// `GET|POST|DELETE /api/workers/{id}/steer` — the lane's steering queue.
+///
+/// Carries BOTH halves deliberately. The GET arm reads like an observability
+/// endpoint on its own, and a promoted route that served only it would silently
+/// drop the half that queues work — the verb the classification calls
+/// load-bearing, since this is how board state reaches a lane at its turn
+/// boundary. The method split is the verb's own, not re-decided here.
+pub async fn steer_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    method: axum::http::Method,
+    headers: axum::http::HeaderMap,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        let qs = crate::api::fs::parse_qs(q.as_deref().unwrap_or(""));
+        return crate::api::session_verbs::steer_history_verb(&state, &name, &qs).await;
+    }
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::steer_mutate(&state, &name, &method, &headers, &body).await
+}
+
+/// `POST /api/workers/{id}/report` — a session reporting its own state.
+///
+/// The headers are passed through deliberately: a self-report is the one write
+/// in amux that is only ever legitimate from inside the session it describes,
+/// and `report_post` enforces that from them. Promoting the route must not
+/// become a way to post a report for somebody else.
+pub async fn report_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    headers: axum::http::HeaderMap,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::report_post(&state, &name, &headers, &body).await
+}
+
 /// `POST /api/workers/{id}/wake`
 pub async fn wake_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
     match resolve_key(&state, key).await {
@@ -2131,6 +2197,8 @@ mod tests {
             ("clear", None),
             ("resize", Some(json!({ "cols": 80, "rows": 24 }))),
             ("keys", Some(json!({ "keys": "Enter" }))),
+            ("report", Some(json!({ "state": "idle" }))),
+            ("steer", Some(json!({ "text": "hi" }))),
         ] {
             let (_, _, v) = send(&app, "POST", &format!("/api/workers/{id}/{verb}"), body).await;
             assert!(
@@ -2140,15 +2208,26 @@ mod tests {
             );
         }
 
-        // CONTROL. `steer` is classified RESOURCE and deliberately NOT promoted
-        // (it needs its store-managed semantics decided, not extracted), so it
-        // still goes through the catch-all and must still leak the id. If this
-        // ever stops leaking, the loop above proves nothing.
-        let (_, _, v) = send(&app, "POST", &format!("/api/workers/{id}/steer"), None).await;
+        // The GET half of steer too: it is the one promoted verb that is read
+        // AND write at one action, so a route carrying only POST would drop the
+        // queue listing without failing anything above.
+        let (_, _, v) = send(&app, "GET", &format!("/api/workers/{id}/steer"), None).await;
+        assert!(
+            !v.to_string().contains(&id),
+            "steer GET: the raw worker id reached the answer, so the read half fell to the \
+             catch-all while the write half was promoted: {v}"
+        );
+
+        // CONTROL. `commit-report` is classified SUB-RESOURCE — it belongs under
+        // /{id}/git/..., so it stays on the catch-all by design — and must still
+        // leak the id. Without a verb that still leaks, "no id in the response"
+        // could hold for some reason other than promotion and the loop above
+        // would prove nothing.
+        let (_, _, v) = send(&app, "POST", &format!("/api/workers/{id}/commit-report"), None).await;
         assert!(
             v.to_string().contains(&id),
-            "control failed: an UNPROMOTED verb no longer addresses by id, so the loop above \
-             cannot distinguish a promoted route from an unpromoted one: {v}"
+            "control failed: the UNPROMOTED control verb no longer addresses by id, so the \
+             loop above cannot distinguish a promoted route from an unpromoted one: {v}"
         );
     }
 

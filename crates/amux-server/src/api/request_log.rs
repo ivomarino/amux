@@ -1100,6 +1100,13 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/workers/{id}/clear", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/resize", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/keys", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/report", methods: &["POST"] },
+    // `*`, not GET/POST/DELETE: the route is mounted with `any`, so the router
+    // advertises no Allow set and the table must say what the ROUTER accepts,
+    // not what the verb happens to implement. Mounting the three explicitly
+    // would 405 a PATCH the catch-all currently passes through to steer_mutate,
+    // which forks the promoted spelling's behaviour from the legacy one.
+    RouteEntry { path: "/api/workers/{id}/steer", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/dead-letters", methods: &["GET"] },
     // -- memories / messages / schedules / verify / prefs / criteria
     RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },

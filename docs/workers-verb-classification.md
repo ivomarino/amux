@@ -44,25 +44,47 @@ action literal from any other literal. `done` is the more dangerous: an earlier
 revision carried it under DUPLICATE with "survivor: `PATCH /api/workers/{id}`" — a
 plausible-sounding verdict about a verb that was never there.
 
-## ALREADY PROMOTED (3)
+## ALREADY PROMOTED (12)
 
-`start` · `stop` · `peek` — first-class routes today. They still resolve through the
-catch-all as well, so they are listed for completeness.
+`start` · `stop` · `peek` · `send` · `duplicate` · `wake` · `reset` · `clear` ·
+`resize` · `keys` · `report` · `steer` — first-class routes today. They still resolve through
+the catch-all as well, so they are listed for completeness.
 
-## RESOURCE — operations on a worker as a resource. Promote. (10)
+`send` landed on AF-202; the rest on AF-288 (a474bbc4, 6ec23d21 and the `report`
+commit). Each delegates to the same `*_verb` fn the catch-all runs, so the verb is
+addressed from the canonical surface without its behaviour being forked.
+
+## RESOURCE — operations on a worker as a resource. Promote. (0 left)
 
 | verb | note |
 |---|---|
 | `send` | **First.** The gap #134's title names. `peek` is promoted and its counterpart is not, so a rust-managed worker can be observed and not driven. AF-202 — and see its scope finding: this is not a route addition, because tmux does not implement `ProcessBackend::send_text` and its delivery discipline lives in `session_verbs`. |
 | `report` | The harness reporting its own state — D1's exit condition in `ethos.md`, the durable inverse of terminal scraping. |
-| `steer` | How board state reaches a lane at its turn boundary (the 2026-08-03 decision against a global bus). Load-bearing. |
+| `steer` | How board state reaches a lane at its turn boundary (the 2026-08-03 decision against a global bus). Load-bearing. **Promoted (AF-288); see the note below — it is the one verb that is read AND write at a single action.** |
 | `keys` | **Not** a duplicate of `send`: `keys` writes to the terminal, `send` delivers a prompt at a turn boundary. Both are needed and the names should say which is which. |
 | `duplicate` | Survivor of the `clone`/`duplicate` pair. **Precondition [#137](https://github.com/mixpeek/amux/issues/137) is MET — promoted.** See below. |
 | `resize` | Terminal geometry. |
 | `wake` | |
 | `clear` | |
 | `reset` | |
-| `apply-template` | |
+
+### `steer` is read AND write at one action, and a promoter has to know that
+
+The GET arm lists the lane's steering queue and reads exactly like an
+observability endpoint. It is not the whole verb: `dispatch` routes every non-GET
+method on this action to `steer_mutate` BEFORE the GET match is reached, so POST
+queues and DELETE cancels. A promoted route serving only the arm you find by
+searching for `"steer" =>` would drop the half that queues work, and drop it
+silently — the read would keep answering.
+
+The write path a reader expects to find is not a route at all: `steer_enqueue`,
+`steer_enqueue_store` and `steer_enqueue_precond` are called internally by
+board-drive. So "load-bearing" in the row above describes the MECHANISM, and the
+verb is the queue's own surface. Both are true and they are different things.
+
+`/api/workers/{id}/steer` is mounted with `any` for this reason: the method split
+already lives inside the verb, and expressing it again at the router would put one
+decision in two places that can disagree.
 
 ### `duplicate` had a precondition; it is met, and the verb is promoted
 
@@ -115,9 +137,21 @@ disposition; silently promoting it is not.
 Retiring means the alias keeps answering until callers move, not breaking them the
 day the canonical route lands.
 
-## SUB-RESOURCE — real capability, wrong shape. Group, do not promote flat. (6)
+## SUB-RESOURCE — real capability, wrong shape. Group, do not promote flat. (7)
 
-`git` · `git-push` · `dirty` · `tracked-files` · `commit-guard` · `commit-report`
+`git` · `git-push` · `dirty` · `tracked-files` · `commit-guard` · `commit-report` ·
+`apply-template`
+
+**`apply-template` RECLASSIFIED out of RESOURCE, 2026-08-28 (AF-288).** It takes no
+session. The handler reads its target directory from the BODY (`dir`) and never
+consults the name it was addressed to — the compiler said so the moment the arm
+became a function, and the parameter is now gone rather than underscored. So it is
+an operation on a DIRECTORY that happens to be reachable at a session URL, and
+mounting it at `/api/workers/{id}/apply-template` would make the id decorative and
+freeze that fiction into the supported API. That is precisely the failure this
+epic's scope note warns a one-for-one promotion causes. Its real shape is a
+template applied to a work dir; grouping it belongs with the sub-resource question,
+not with the worker's verb set.
 
 These are operations on the worker's **checkout**, not on the worker. Promoting them
 flat puts six sibling routes on a worker for one sub-resource; they belong under
