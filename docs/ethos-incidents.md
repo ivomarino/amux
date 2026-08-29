@@ -1105,3 +1105,56 @@ The general form, worth more than the instance: **ask what the mechanism's FAILU
 is for, before replacing it with one that cannot fail.** An optimistic-concurrency
 conflict is not friction to be engineered away; it is the moment the system tells you
 two parties disagreed, which is exactly what an attributed ledger exists to surface.
+
+---
+
+## A rigorous-sounding check that would have been 57% wrong (AF-311, 2026-08-29)
+
+The proposal was mine and it sounded unarguable. `has_asset_link` pattern-matches a
+commit-sha-shaped token and never checks whether the commit exists, so a `done` card
+can cite `deadbee` and pass. Resolve the pointer against the owner's repo, refuse only
+on positive refutation, done.
+
+Measured across 4753 open done/verified cards before writing the gate:
+
+| outcome | n | |
+|---|---:|---|
+| sha resolves in the owner's repo | 3296 | 95.4% of the 3454 carrying one |
+| absent but another pointer present | 44 | would pass the narrowing |
+| **would refuse** | **35** | **1.0%** |
+| unmeasured (no repo for the lane) | 79 | never refused |
+
+A 1% refusal rate on a board this size is the profile of a good gate, and at that point
+the work looked finished. Reading all 35 changed the answer completely:
+
+| class | n | |
+|---|---:|---|
+| not a commit identifier at all | 20 | 57% |
+| explicit commit claim | 6 | 17% |
+| ambiguous | 9 | 26% |
+
+The 57% are amux **build ids** (`live on build 767a8a2`, `build 6a7425d9` on three
+cards), Kubernetes **replicaset and pod names** (`gha-runner-87f58f4b5`,
+`gpu-warmpool-746d6475fd`), **Gmail message ids** (`1a0446e1d1b998cb`), UUIDs, an X post
+id, a file digest. Every one is a card doing precisely what the asset-link gate asks:
+writing down what it produced. The new gate would have refused them for it.
+
+The 17% is not clean either. Two of the six are cards *reporting* an unresolvable sha
+(`MHC-350's recorded sha eb3b790ad8 ... not on origin/main at all`), which no detector
+can separate from a card *claiming* one.
+
+**The general form.** `has_asset_link`'s docstring already stated the asymmetry it was
+built on: generous on accept, because "a false accept only lets an honest-looking card
+through; a false reject would block real work." Resolution converts a harmless false
+accept into a false accusation. A repo has exactly one namespace of commit shas; a
+fleet has many namespaces of hex identifiers, and **nothing in the token distinguishes
+them** — the detector was reading a type it could not observe.
+
+Two things to carry forward:
+
+1. **A refusal rate is not a verdict; read the refusals.** 1% looked shippable and was
+   mostly wrong. The aggregate could not express which kind of card it had selected,
+   which is rule 4 about a metric rather than a probe.
+2. **When a check reads a token whose meaning depends on context the token does not
+   carry, the fix belongs on the WRITER, not the reader.** Any future version needs the
+   card to say which namespace it means. Guessing is what produced the 57%.
