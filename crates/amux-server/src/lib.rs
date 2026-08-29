@@ -461,6 +461,10 @@ async fn async_main() {
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
+    // Telegram long-poll (idles with no error when TELEGRAM_BOT_TOKEN is
+    // unset — see runtime_jobs::telegram_poll's module doc for why polling,
+    // not a webhook).
+    drop(runtime_jobs::telegram_poll::spawn(state.clone()));
     // Compaction-generation watch (AMUX-3742): the reason "amux claude performs
     // worse than raw claude" was invisible for months is that nothing counted
     // how many times a lane's conversation had been summarized away.

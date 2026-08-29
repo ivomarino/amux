@@ -21,6 +21,7 @@ pub mod memories;
 pub mod migrate;
 pub mod queries;
 pub mod replay;
+pub mod telegram;
 
 use amux_core::revision::{MutationKind, StateEvent, StateRevision};
 use r2d2_sqlite::SqliteConnectionManager;
