@@ -291,7 +291,7 @@ def _amend_staged_decision(d):
             "(~/.amux/guard-allow-once, audit-logged)." % (len(foreign), shown))
 
 
-def _content_is_committed(top, rel):
+def _content_is_committed(top, rel, base=None):
     """Are this file's CURRENT bytes already inside a commit? (AMUX-3859)
 
     The discard guard exists to stop a restore destroying work that exists
@@ -341,7 +341,22 @@ def _content_is_committed(top, rel):
         # reasoning about it: `git diff --raw` reports old and new mode, and a
         # difference means the restore would overwrite an uncommitted change git
         # itself is calling modified. Catches M and T together.
-        raw = subprocess.run(["git", "-C", top, "diff", "--raw", "--", rel],
+        # THE BASE DEPENDS ON THE RESTORE FORM (amux-frustrations, second review).
+        # `git diff --raw` compares worktree vs INDEX, but `git checkout <ref> --
+        # <path>` restores from the REF and overwrites index AND worktree. So a
+        # STAGED mode change was invisible: `chmod +x && git add` leaves
+        # worktree-vs-index empty while worktree-vs-ref still reports M, and the
+        # restore killed the staged exec bit.
+        #
+        #   git checkout -- <path>        source is the index -> base None
+        #   git checkout <ref> -- <path>  source is <ref>      -> base <ref>
+        #
+        # `__AMBIGUOUS__` is what the caller passes when one command names more
+        # than one ref: we cannot say which base applies, so keep the block.
+        if base == "__AMBIGUOUS__":
+            return False
+        raw = subprocess.run(["git", "-C", top, "diff", "--raw"]
+                             + ([base] if base else []) + ["--", rel],
                              capture_output=True, text=True, timeout=10)
         if raw.returncode != 0:
             return False
@@ -394,6 +409,7 @@ def _discard_verdict(cmd, scrubbed, run_dir):
     # match), but extract the operands from the ORIGINAL cmd — scrubbing removes
     # quoted strings, which is where a filename with a space would live.
     paths = []
+    src_refs = set()
     for m in re.finditer(r'\bgit\s+(?:-C\s+\S+\s+)?(checkout|restore)\b([^\n;&|]*)', cmd):
         sub, tail = m.group(1), m.group(2)
         try:
@@ -403,12 +419,21 @@ def _discard_verdict(cmd, scrubbed, run_dir):
         if sub == "checkout":
             if "--" not in toks:
                 continue            # `git checkout <branch>` — switches, destroys nothing
+            # Anything non-flag BEFORE the `--` is the source ref.
+            pre = [t for t in toks[:toks.index("--")] if not t.startswith("-")]
+            if pre:
+                src_refs.add(pre[-1])
             cand = toks[toks.index("--") + 1:]
         else:
             staged = any(t in ("--staged", "-S") for t in toks)
             worktree = any(t in ("--worktree", "-W") for t in toks)
             if staged and not worktree:
                 continue            # unstage only; the worktree copy survives
+            for i, t in enumerate(toks):
+                if t.startswith("--source="):
+                    src_refs.add(t.split("=", 1)[1])
+                elif t in ("-s", "--source") and i + 1 < len(toks):
+                    src_refs.add(toks[i + 1])
             cand = (toks[toks.index("--") + 1:] if "--" in toks
                     else [t for t in toks if not t.startswith("-")])
         paths += [p for p in cand if p != "." and not p.startswith("-")]
@@ -458,8 +483,10 @@ def _discard_verdict(cmd, scrubbed, run_dir):
     # current bytes are already in a commit before deciding to block: the
     # attribution says who touched it, the blob says whether anything is at
     # risk, and only the second speaks to what this guard protects.
+    base = (src_refs.pop() if len(src_refs) == 1
+            else ("__AMBIGUOUS__" if src_refs else None))
     safe = [h for h in hits
-            if h.get("path") and _content_is_committed(top, h.get("path"))]
+            if h.get("path") and _content_is_committed(top, h.get("path"), base)]
     if safe:
         hits = [h for h in hits if h not in safe]
         foreign = [h for h in foreign if h not in safe]
