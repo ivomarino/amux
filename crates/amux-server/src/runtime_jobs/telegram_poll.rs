@@ -43,9 +43,12 @@ use std::time::Duration;
 
 const JOB: &str = registry::ids::TELEGRAM_POLL;
 
-/// Telegram's own recommended long-poll timeout. The HTTP client timeout
-/// below must exceed this or every poll looks like a network failure.
-const POLL_TIMEOUT_SECS: u64 = 25;
+/// Long-poll timeout: balance responsiveness (< 1 min for work messages)
+/// vs. resource efficiency (fewer polls = less battery/bandwidth).
+/// Telegram's max recommended is 30s; we use 45s to reduce polling by ~45%
+/// while staying responsive for real-time work interaction.
+/// The HTTP client timeout below must exceed this or every poll looks like a network failure.
+const POLL_TIMEOUT_SECS: u64 = 45;
 
 fn bot_token() -> Option<String> {
     std::env::var("TELEGRAM_BOT_TOKEN").ok().filter(|s| !s.trim().is_empty())
