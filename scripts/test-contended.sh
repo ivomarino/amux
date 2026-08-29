@@ -76,10 +76,28 @@ else
   # compile this very command is doing. A probe has to say what it measured,
   # or the one line that exists to settle "real or contention?" becomes the
   # thing you have to go and check.
+  # SAYS WHAT IT RULED OUT, not "a failure here is real" (2026-08-29, second
+  # pass). That phrasing was fixed once already this morning for naming "a
+  # build" when it samples the AUTO-BUILDER, and it was still overclaiming in a
+  # second dimension: a reader takes "real" to mean "a code regression", and
+  # this script only ever knew about ONE environmental cause.
+  #
+  # The specimen arrived the same day. A full lib suite came back 1552 passed /
+  # 6 failed under this exact clean verdict, and all six were host memory
+  # pressure — swap at 8700MB over the 8192MB AMUX_MEM_SWAP_DENY_MB threshold,
+  # so worker start was refused 503 where the tests expect 202. Real failures,
+  # nothing to do with the code under test, and this line called them real.
+  #
+  # An instrument that rules out one cause has to say WHICH, or the next reader
+  # generalises it to all of them. Which is the whole argument the top of this
+  # file makes about plain `cargo test`, arriving one level up.
   echo ""
   echo "contention: the auto-builder was NOT rebuilding during this run, so the shared"
-  echo "contention: binary was stable under it. A failure here is real. (Cargo's own"
-  echo "contention: compile for this command is not the hazard; a peer's is.)"
+  echo "contention: binary was stable under it. A failure here is NOT build contention."
+  echo "contention: (Cargo's own compile for this command is not the hazard; a peer's is.)"
+  echo "contention: THAT IS THE ONLY THING RULED OUT. Host pressure still fails tests that"
+  echo "contention: start workers — check the failure body for a 503 admission refusal"
+  echo "contention: before reading a red as a regression."
 fi
 
 exit "$RC"
