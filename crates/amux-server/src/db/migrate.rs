@@ -576,7 +576,18 @@ mod registration_guard {
     fn versions_are_dense_and_match_their_filenames() {
         for (i, m) in MIGRATIONS.iter().enumerate() {
             let expected = i as i64 + 1;
-            assert_eq!(m.version, expected, "{} is out of order", m.name);
+            assert_eq!(
+                m.version, expected,
+                "{} is out of order — expected version {expected} at this position.\n\
+                 If this fired while merging an OUTSIDE PR, it is very likely the \
+                 contributor-collision case rather than their error: they pick a number \
+                 against origin/main, this branch runs ahead of it, and a number that is free \
+                 from outside can already be taken here. CI cannot see it (their branch builds \
+                 against origin/main, where there is no conflict), so this guard is the first \
+                 thing that can. Renumber the incoming migration and its MIGRATIONS entry; do \
+                 not send it back as their bug. Twice on PR #160; see CONTRIBUTING.md.",
+                m.name
+            );
             let prefix = format!("{:04}_", m.version);
             assert!(
                 m.name.starts_with(&prefix),
