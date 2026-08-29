@@ -264,6 +264,36 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // worst case: measure a script today and the number is wrong the next time
     // someone edits it.
     ("/api/schedules/{id}/run", 600_000.0),
+    // POST /api/sessions/{name}/send (AMUX-3869, filed from AMUX-3865).
+    //
+    // ONLY EXPRESSIBLE SINCE THE OUTLIER AXIS BECAME PER-VERB. This table
+    // matches with `target == *p`, and until the grouping key stopped folding
+    // `{*verb}`, the sole budget available here covered the whole wildcard —
+    // which would have blinded the detector to `report`, 99.2% of that group's
+    // traffic. The entry is small; the axis change under it is the work.
+    //
+    // DERIVED FROM THE PATH'S OWN BOUNDS, as every entry above is, not from the
+    // observed worst case. send is long by DESIGN and the design is
+    // load-bearing: `send_text_inner` and `verify_submitted` both space Escape
+    // presses >=1.3s apart, because two Escapes inside ~1s read as a
+    // double-press and EAT the pending message (v2.1.205). Adding it up:
+    //   ~1.5s  verify_submitted's `for _ in 0..5`, 300ms at each loop top
+    //   ~1.5s  the NoUi arm's extra 300ms per look (capped by that same loop
+    //          at 5, not the 12 its condition names — see AMUX-3870)
+    //   ~1.3s  Escape spacing before a retry
+    //   ~1.8s  sleep_ms(1200) + sleep_ms(500) + sleep_ms(60) on the retry path
+    //   ~0.8s  send_text_inner's own fixed sleeps
+    //   ~0.5s  six tmux_capture round trips
+    // = ~7.4s of legitimate, deliberate waiting on the worst honest path.
+    //
+    // Measured p50 985ms and p99 5677ms over 625 requests in 7 days, which
+    // agrees with that derivation rather than being its source.
+    //
+    // 15s = ~2x the derived bound, the same ratio `/api/email/inbox` uses. A
+    // wedged tmux or a stuck send lock still blows it, so an outlier past this
+    // budget keeps meaning what an outlier should: something hung, not
+    // something that waited on purpose.
+    ("/api/sessions/{name}/send", 15_000.0),
 ];
 
 fn design_budget_ms(target: &str) -> f64 {
@@ -1567,7 +1597,29 @@ pub(crate) fn detect_latency_at(
                     outliers_failed += 1;
                     continue;
                 }
-                let target = rl::normalize_target(&path);
+                // PER-VERB, not per-route-pattern (AMUX-3869). `normalize_target`
+                // returns the route-table entry, so a `{*wildcard}` route folds
+                // verbs with unrelated baselines into one group: measured over
+                // 7 days, `/api/sessions/{name}/{*verb}` is ONE target holding
+                // peek (424,888 rows), report (82,313 at a 21ms mean), send
+                // (625 at a 1216ms mean) and wake (3 at 5302ms).
+                //
+                // A flat floor over that is a floor over `peek`. send's own
+                // p99 is 5677ms, so 10s is roughly its p99.7 and its ordinary
+                // tail files cards (AMUX-3865), while a genuinely sick report
+                // would need ~475x its own mean to trip.
+                //
+                // It also unblocks LONG_BY_DESIGN, which matches on the target
+                // with `target == *p`. Before this, the only budget expressible
+                // for send was one covering the whole wildcard, which would
+                // have blinded the detector to report — 99.2% of the group's
+                // traffic. Splitting the axis is what makes a truthful entry
+                // possible at all; the budget itself is just an entry now.
+                //
+                // Only the LATENCY axis moves. The 5xx detector above keeps the
+                // coarse target deliberately: a 500 is a 500 whatever the verb,
+                // and its rollup wants the route shape.
+                let target = rl::normalize_target_verb(&path);
                 let e = seen.entry((method.clone(), target)).or_insert_with(|| OutlierGroup {
                     n: 0,
                     worst_ms: 0.0,
@@ -1764,10 +1816,23 @@ pub(crate) fn detect_latency_at(
             signature: format!("latency|outlier|{method}|{target}|{}", last_ts as i64),
             title: format!("{method} {target} took {:.1}s ({n}x over {:.0}s)", worst / 1000.0, outlier_ms() / 1000.0),
             evidence: vec![
+                // SAYS WHAT IT MEASURED (AMUX-3869). This read "This is not a
+                // percentile shift — it is individual requests going wrong, so
+                // look at the request, not the family." The detector counts
+                // rows over a FIXED floor and holds no per-target baseline, so
+                // it cannot know that, and AMUX-3865 is the counterexample: a
+                // 10.2s send was that route's own p99.7 tail on a loaded host,
+                // not an individual request going wrong. A probe stating a
+                // conclusion its own grouping cannot support is ethos rule 4,
+                // and this one stated it in the very field a reader trusts most.
                 ("verdict".into(), format!(
                     "{n} request(s) to {method} {target} exceeded {:.0}s in the last {:.1}h; \
-                     worst {:.1}s. This is not a percentile shift — it is individual requests \
-                     going wrong, so look at the request, not the family.",
+                     worst {:.1}s. This counts rows over a FIXED floor and does not compare \
+                     them to this target's own baseline, so a route whose normal work takes \
+                     seconds can appear here on an ordinary tail. Check this target's p50/p99 \
+                     before treating it as a fault; if the duration is by design, the fix is a \
+                     LONG_BY_DESIGN entry derived from the route's own bounds, not a threshold \
+                     nudge.",
                     outlier_ms() / 1000.0, window_h(), worst / 1000.0
                 )),
                 ("worst_ms".into(), format!("{worst:.0}")),
@@ -4144,7 +4209,9 @@ fn ci_cache() -> &'static std::sync::RwLock<Option<(f64, Vec<CiRun>, Vec<Suppres
 }
 
 async fn gh(args: &[String], timeout_s: u64) -> Result<String, String> {
-    let fut = tokio::process::Command::new("gh").args(args).output();
+    // kill_on_drop: a fired timeout drops this future, and without it the `gh`
+    // child is left unreaped as a zombie (DESKT-30).
+    let fut = tokio::process::Command::new("gh").args(args).kill_on_drop(true).output();
     let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_s), fut).await {
         Err(_) => return Err(format!("`gh {}` timed out after {timeout_s}s", args.join(" "))),
         Ok(Err(e)) => return Err(format!("cannot run `gh`: {e}")),
@@ -7345,11 +7412,17 @@ mod tests {
     async fn outlier_evidence_all_describes_the_worst_request_not_merely_the_first_seen() {
         let (st, _d) = state();
         let now = unix_now();
-        // Logged report-first and NEWEST-last, so insertion order, timestamp
-        // order and latency order all disagree. Any one of them standing in for
-        // "worst" picks a different row.
+        // THREE ROWS OF THE SAME VERB, different lanes. Since AMUX-3869 the
+        // outlier axis is per-verb, so mixing `send` in here would split the
+        // group and this test would be asserting about a one-row group, which
+        // proves nothing about picking the worst OF SEVERAL. `report` carries
+        // no LONG_BY_DESIGN budget, so all three stay candidates.
+        //
+        // Logged oldest-first with the worst in the MIDDLE, so insertion order,
+        // timestamp order and latency order all disagree. Any one of them
+        // standing in for "worst" picks a different row.
         log_row(&st, Row { ts: now - 300.0, method: "POST", path: "/api/sessions/alpha/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 11_000.0 });
-        log_row(&st, Row { ts: now - 200.0, method: "POST", path: "/api/sessions/beta/send", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 20_000.0 });
+        log_row(&st, Row { ts: now - 200.0, method: "POST", path: "/api/sessions/beta/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 20_000.0 });
         log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/sessions/gamma/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 12_000.0 });
 
         let (f, _s) = detect_latency_at(&st.store.read().unwrap(), now, None);
@@ -7359,12 +7432,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no outlier finding at all: {f:?}"));
 
         // FIXTURE GUARD: the three rows must really share ONE group, or this
-        // asserts nothing — a per-verb split would let it pass while proving
-        // the opposite of what it claims to test.
+        // asserts nothing about choosing among several.
         assert_eq!(
             card.count, 3,
-            "all three rows must collapse into one wildcard group for this to mean anything; \
-             got {} in {:?}",
+            "all three rows must land in one group for this to mean anything; got {} in {:?}",
             card.count, card.signature
         );
 
@@ -7373,15 +7444,65 @@ mod tests {
         };
         let sample = ev("sample_request");
         assert!(
-            sample.contains("/send"),
-            "sample_request must quote the WORST row (the 20s send), got {sample:?}"
+            sample.contains("beta"),
+            "sample_request must quote the WORST row (beta's 20s), got {sample:?}"
         );
         assert!(
-            !sample.contains("/report"),
-            "sample_request quoted a report while worst_ms describes the send — the evidence \
-             fields disagree about which request the card is about: {sample:?}"
+            !sample.contains("alpha") && !sample.contains("gamma"),
+            "sample_request quoted a row that is not the worst, while worst_ms describes beta — \
+             the evidence fields disagree about which request the card is about: {sample:?}"
         );
-        assert_eq!(ev("worst_ms"), "20000", "worst_ms must be the send's latency");
+        assert_eq!(ev("worst_ms"), "20000", "worst_ms must be beta's latency");
+    }
+
+    /// A long-by-design verb can be budgeted WITHOUT blinding its siblings.
+    ///
+    /// This is the whole of AMUX-3869 in one cell. `normalize_target` returns
+    /// the route-table entry, so `/api/sessions/{name}/{*verb}` used to be one
+    /// group holding peek, report, send and wake. `design_budget_ms` matches on
+    /// the target, so the only budget expressible covered all of them: size it
+    /// for `send` and a sick `report` (99.2% of that group's traffic) goes
+    /// unreported; leave it unset and `send`'s ordinary p99 tail files cards.
+    /// Neither arm is a true statement about the route, which is ethos rule 3
+    /// arriving at the config layer.
+    ///
+    /// So the fixture puts BOTH on the wire in one window:
+    ///   send   12s — over the 10s floor, UNDER its derived 15s budget
+    ///   report 11s — over the floor, and it has no budget at all
+    /// Exactly one card must come out, and it must be the report's.
+    ///
+    /// Under the pre-fix axis both rows share a group whose worst is 12s with a
+    /// zero budget, so it files ONE card against `{*verb}` and the report is
+    /// invisible inside it. Both assertions below fail on that code.
+    #[tokio::test]
+    async fn a_long_by_design_verb_is_budgeted_without_blinding_its_wildcard_siblings() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(&st, Row { ts: now - 200.0, method: "POST", path: "/api/sessions/alpha/send", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 12_000.0 });
+        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/sessions/beta/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 11_000.0 });
+
+        let (f, _s) = detect_latency_at(&st.store.read().unwrap(), now, None);
+        let sigs: Vec<&str> = f
+            .iter()
+            .map(|x| x.signature.as_str())
+            .filter(|s| s.starts_with("latency|outlier|"))
+            .collect();
+
+        assert!(
+            sigs.iter().any(|s| s.contains("/api/sessions/{name}/report")),
+            "report has no design budget and exceeded the floor — it MUST still file, or the \
+             budget for its sibling has blinded it: {sigs:?}"
+        );
+        assert!(
+            !sigs.iter().any(|s| s.contains("/api/sessions/{name}/send")),
+            "a 12s send sits under its derived 15s budget and must not file: {sigs:?}"
+        );
+        // And the coarse wildcard must be gone entirely, since a card naming
+        // `{*verb}` is the old axis by another name.
+        assert!(
+            !sigs.iter().any(|s| s.contains("{*verb}")),
+            "no card may still be keyed on the wildcard itself: {sigs:?}"
+        );
     }
 
     /// AMUX-3513, rebuilt from the incident's numbers: twelve browser `wait`
@@ -7877,8 +7998,21 @@ mod tests {
         assert_ne!(sig1, sig3, "a NEW slow request must be a NEW signature, filed whatever became of the old card");
     }
 
-    /// A single absurd request is not a percentile shift and must not be
-    /// folded into one — 27s on an upload chunk is one request going wrong.
+    /// A single absurd request files on its own rather than being folded into a
+    /// percentile report: 27s on an upload chunk is one request going wrong.
+    ///
+    /// THE VERDICT ASSERTION CHANGED WITH AMUX-3869, and the reason matters more
+    /// than the wording. This used to assert the card said "not a percentile
+    /// shift", which pinned a sentence the detector could not support: it counts
+    /// rows over a FIXED floor and holds no per-target baseline, so it cannot
+    /// know whether a given outlier is a distinct fault or the ordinary tail of
+    /// a route whose normal work takes seconds. AMUX-3865 was the counterexample
+    /// that made it concrete, a 10.2s send that was its own p99.7 on a loaded
+    /// host. A test asserting the presence of an unsupportable claim keeps that
+    /// claim alive, so this now pins what the detector actually measured.
+    ///
+    /// The behaviour under test is unchanged: the card still fires, still on its
+    /// own, still with the number in the title.
     #[tokio::test]
     async fn absurd_single_requests_file_on_their_own() {
         let (st, _d) = state();
@@ -7889,7 +8023,17 @@ mod tests {
             .expect("a 27s request must file on its own: {f:?}");
         assert!(hit.title.contains("27.0s"), "the number belongs in the title: {}", hit.title);
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
-        assert!(ev["verdict"].contains("not a percentile shift"));
+        let verdict = &ev["verdict"];
+        assert!(
+            verdict.contains("FIXED floor"),
+            "the verdict must say what it measured, not assert a comparison it never made: \
+             {verdict:?}"
+        );
+        assert!(
+            !verdict.contains("not a percentile shift"),
+            "the detector holds no per-target baseline and cannot claim this (AMUX-3869): \
+             {verdict:?}"
+        );
     }
 
     /// AMUX-3574 end to end: a card whose incident has resolved gets TOLD, and

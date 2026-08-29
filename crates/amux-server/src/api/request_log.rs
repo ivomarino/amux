@@ -1482,16 +1482,64 @@ pub fn normalize_target(path: &str) -> String {
     if let Some(e) = best_route(path) {
         return e.path.to_string();
     }
-    let id_ish = |seg: &str| {
-        seg.contains('%')
-            || seg.len() >= 24
-            || seg.chars().any(|c| c.is_ascii_digit())
-    };
     path.split('/')
         .enumerate()
         .map(|(i, seg)| if i >= 3 && !seg.is_empty() && id_ish(seg) { "{id}" } else { seg })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Is this path segment an identifier rather than a route word?
+///
+/// Lifted out of `normalize_target`'s closure so `normalize_target_verb` below
+/// applies the SAME rule. Two spellings of "is this an id" would drift, and the
+/// one that drifts is the one that decides whether a target fragments per id.
+fn id_ish(seg: &str) -> bool {
+    seg.contains('%') || seg.len() >= 24 || seg.chars().any(|c| c.is_ascii_digit())
+}
+
+/// `normalize_target`, with a WILDCARD route's first tail segment restored.
+///
+/// # Why a second normalizer instead of changing the first (AMUX-3869)
+///
+/// `normalize_target` returns the route-table pattern, which is right for
+/// request-log grouping: a thousand ids fold into one row. But a `{*wildcard}`
+/// route folds *verbs* too, and verbs are not interchangeable the way ids are.
+/// Measured over 7 days, `/api/sessions/{name}/{*verb}` is ONE target holding
+/// `peek` (424,888 rows), `report` (82,313 at a 21ms mean), `send` (625 at a
+/// 1216ms mean, long by design) and `wake` (3 at 5302ms). A latency floor
+/// judged against that group is judged against `peek`, so `send`'s ordinary
+/// p99 tail files cards while a genuinely sick `report` would need ~475x its
+/// own mean to trip.
+///
+/// Only the FIRST tail segment is taken, and only when it is not id-shaped.
+/// Both guards exist to bound cardinality: the SPA shell is `GET /{*path}`, and
+/// restoring its whole tail would mint a target per URL. One non-id segment
+/// keeps this at the number of VERBS a route has, which is what the caller
+/// wants a baseline per.
+///
+/// This is deliberately NOT what `normalize_target` does, because the request
+/// log's own rollups want the coarse shape. Only latency outlier detection
+/// needs the finer axis.
+pub fn normalize_target_verb(path: &str) -> String {
+    let target = normalize_target(path);
+    let tsegs: Vec<&str> = target.split('/').collect();
+    let Some(wi) = tsegs.iter().position(|s| s.starts_with("{*")) else {
+        return target;
+    };
+    // Strip a query string before reading the segment: `?` is not a path
+    // separator, so it would otherwise ride along into the target.
+    let clean = path.split(['?', '#']).next().unwrap_or(path);
+    let psegs: Vec<&str> = clean.split('/').collect();
+    let Some(verb) = psegs.get(wi) else {
+        return target;
+    };
+    if verb.is_empty() || id_ish(verb) {
+        return target;
+    }
+    let mut out: Vec<&str> = tsegs[..wi].to_vec();
+    out.push(verb);
+    out.join("/")
 }
 
 /// The literal values sitting where the matched route declares a `{param}`.
@@ -2438,6 +2486,56 @@ mod tests {
                 "a {{*wildcard}} segment must not be reported as a param literal ({p} -> {l:?})"
             );
         }
+    }
+
+    /// `normalize_target_verb` splits a wildcard by verb WITHOUT fragmenting
+    /// per id (AMUX-3869).
+    ///
+    /// The two failure modes pull in opposite directions and both are here.
+    /// Refine too little and `send` keeps sharing a latency baseline with
+    /// `peek`, which is the bug. Refine too much and `GET /{*path}` (the SPA
+    /// shell) mints one target per URL, so the request log grows a target per
+    /// visitor and the rollups stop meaning anything.
+    #[test]
+    fn normalize_target_verb_splits_by_verb_but_never_by_id() {
+        use super::{normalize_target, normalize_target_verb as nv};
+
+        // THE POINT: one wildcard route, distinct targets per verb.
+        assert_eq!(nv("/api/sessions/amux/send"), "/api/sessions/{name}/send");
+        assert_eq!(nv("/api/sessions/gtm-ticker/send"), "/api/sessions/{name}/send");
+        assert_eq!(nv("/api/sessions/amux/peek"), "/api/sessions/{name}/peek");
+        assert_ne!(nv("/api/sessions/amux/send"), nv("/api/sessions/amux/peek"));
+
+        // The lane name still folds. Splitting by VERB must not reintroduce a
+        // target per session, which is what `normalize_target` exists to stop.
+        assert_eq!(nv("/api/sessions/a/send"), nv("/api/sessions/b/send"));
+
+        // A query string is not a path segment and must not ride along.
+        assert_eq!(nv("/api/sessions/amux/peek?lines=200"), "/api/sessions/{name}/peek");
+
+        // NON-WILDCARD ROUTES ARE UNTOUCHED: this is a strictly additive axis,
+        // so everything else must agree with `normalize_target` exactly.
+        for p in ["/api/board/AMUX-9999", "/api/health", "/api/sessions"] {
+            assert_eq!(nv(p), normalize_target(p), "non-wildcard target changed for {p}");
+        }
+
+        // THE CARDINALITY GUARD. An id-shaped tail refuses to refine, so a
+        // wildcard route carrying ids collapses instead of exploding into one
+        // target per id.
+        //
+        // Specimen chosen so it actually reaches the wildcard branch: an
+        // earlier version used `/api/fs/12345`, which never gets there because
+        // `best_route` does not match it and `normalize_target`'s fallback
+        // collapse returns `/api/fs/{id}`. The guard held; the assertion about
+        // HOW was testing a path the code had not taken.
+        let a = nv("/api/sessions/amux/12345");
+        let b = nv("/api/sessions/amux/67890");
+        assert_eq!(a, b, "id-shaped wildcard tails must not each become their own target");
+        assert_eq!(
+            a,
+            normalize_target("/api/sessions/amux/12345"),
+            "an id-shaped tail must leave the target exactly as normalize_target had it: {a}"
+        );
 
         // CONTROL: a fully-static routed path has no literals, so the detector
         // is silent on the majority of traffic instead of flagging all of it.
