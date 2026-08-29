@@ -511,6 +511,11 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("owner_alerts", "ts", false),
     ("proxies", "created_at", false),
     ("reclaim_quarantine", "created_at", false),
+    // SECONDS, and MEASURED rather than assumed from the sibling convention:
+    // `disk_watch::record_sample` passes an `f64` wall-clock and the one live
+    // row reads 1787960274.53855 against a `now` of 1787961628 — seconds, with a
+    // fractional part, not milliseconds (AMUX-3858).
+    ("regenerable_samples", "ts", false),
     ("reclaim_quarantine", "purged_at", false),
     ("reclaim_scans", "finished_at", false),
     ("reclaim_scans", "started_at", false),
