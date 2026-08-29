@@ -772,6 +772,18 @@ pub fn outcome_for(id: &str) -> Option<String> {
         ids::BOARD_DRIVE => super::board_drive::last_report().map(|r| {
             format!("{} assigned, {} nudged across {} lane(s)", r.assigned, r.nudged, r.lanes.len())
         }),
+        // Was `None`, so the one job whose entire purpose is finding
+        // unsubmitted messages reported nothing about whether it had found any.
+        ids::GHOST_RESCUE => super::ghost_rescue::last_report().map(|r| {
+            format!(
+                "{} lane(s) examined, {} rescued, {} left alone ({} holding a collapsed paste the sweep cannot claim), {} empty composer(s)",
+                r.examined,
+                r.rescued.len(),
+                r.left_alone.len(),
+                r.chips.len(),
+                r.placeholders
+            )
+        }),
         ids::STORAGE => super::storage::last_report().map(|r| {
             format!(
                 "{} table(s) swept, {} file(s) removed, {} freed",

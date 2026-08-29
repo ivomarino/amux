@@ -4938,6 +4938,26 @@ mod reviewer_renag_tests {
 #[cfg(test)]
 mod tests {
 
+    /// amux's review question, made into a test rather than answered in prose:
+    /// "can a card promoted by the revisit arm be distinguished, after the
+    /// fact, from one promoted by the original arm? If both write the same
+    /// shape, the first 'why did this move?' is unanswerable."
+    ///
+    /// The card's own log is where that question gets asked (Ethan: the board
+    /// task is the source of truth for its own history), so the two arms must
+    /// write DIFFERENT lines there — not merely differ in a counter the card
+    /// does not carry.
+    #[test]
+    fn the_two_promotion_arms_are_distinguishable_on_the_card_itself() {
+        let a = PromoteArm::DepsCleared.log_line();
+        let b = PromoteArm::RevisitDue.log_line();
+        assert_ne!(a, b, "both arms would write the same history line");
+        // Each must name its OWN cause, not just differ. "Re-activated" alone
+        // on both would pass assert_ne while leaving the reader no better off.
+        assert!(a.contains("depends_on"), "deps arm must name its cause: {a}");
+        assert!(b.contains("revisit date"), "revisit arm must name its cause: {b}");
+    }
+
     /// The rate limit is the part that fails INVISIBLY: an off-by-one that
     /// lets every candidate through still promotes cards, still logs, still
     /// looks healthy in the report, and floods the column the drain exists to

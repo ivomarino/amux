@@ -9690,6 +9690,24 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         }
         // Delivered — move the row to history under the SAME contract the
         // manual deliver path uses (redacted text, queued_at preserved).
+        // COLUMN THE WRITERS FORGOT (Ethan, 2026-08-29: "why are you sending
+        // unsubmitted text?"). `outcome` has existed on this table since it was
+        // created and 5 of its 6 writers omitted it, so 10,957 of 10,989 rows
+        // carry a blank verdict. That is why nobody noticed a lane holding an
+        // unsubmitted message: amux does not record whether its own sends
+        // submitted, so it cannot count, alert on, or even answer the question.
+        // `msg` is already bound above (it is what the delivery log prints as
+        // `detail=`) — the value was in scope the whole time.
+        //
+        // SCOPE, precisely: this insert is reached only when `ok`, so what it
+        // captures is the DELIVERED outcomes, including
+        // "sent (Enter was dropped; submitted on retry)" — the leading
+        // indicator that a lane's keystroke path is failing. A HARD-stuck send
+        // returns ok=false, takes the `continue` above, and never reaches this
+        // table at all: its row stays in `steering_queue` and the only record
+        // is `skip()`, which writes DEBUG and an in-process map that a restart
+        // erases. That remaining hole is named on the card, not fixed here.
+        let outcome2 = msg.clone();
         let (id2, sess2, text2) = (id.clone(), session.clone(), text.clone());
         let _ = state
             .store
@@ -9705,9 +9723,9 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                     VALUES(?,?,?,?,?,?,?)",
-                    rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), src_guard, src_sender],
+                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                     VALUES(?,?,?,?,?,?,?,?)",
+                    rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), outcome2, src_guard, src_sender],
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -10176,6 +10194,24 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
     }
     let Some((msg, age)) = sent else { return false };
     steer_skips().lock().unwrap().remove(session);
+    // COLUMN THE WRITERS FORGOT (Ethan, 2026-08-29: "why are you sending
+    // unsubmitted text?"). `outcome` has existed on this table since it was
+    // created and 5 of its 6 writers omitted it, so 10,957 of 10,989 rows
+    // carry a blank verdict. That is why nobody noticed a lane holding an
+    // unsubmitted message: amux does not record whether its own sends
+    // submitted, so it cannot count, alert on, or even answer the question.
+        // `msg` is already bound above (it is what the delivery log prints as
+    // `detail=`) — the value was in scope the whole time.
+    //
+    // SCOPE, precisely: this insert is reached only when `ok`, so what it
+    // captures is the DELIVERED outcomes, including
+    // "sent (Enter was dropped; submitted on retry)" — the leading
+    // indicator that a lane's keystroke path is failing. A HARD-stuck send
+    // returns ok=false, takes the `continue` above, and never reaches this
+    // table at all: its row stays in `steering_queue` and the only record
+    // is `skip()`, which writes DEBUG and an in-process map that a restart
+    // erases. That remaining hole is named on the card, not fixed here.
+    let outcome2 = msg.clone();
     let (id2, sess2, text2) = (id.clone(), session_s.clone(), text.clone());
     let _ = state
         .store
@@ -10191,9 +10227,9 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
             let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
             conn.execute(
-                "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                 VALUES(?,?,?,?,?,?,?)",
-                rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), src_guard, src_sender],
+                "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                 VALUES(?,?,?,?,?,?,?,?)",
+                rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), outcome2, src_guard, src_sender],
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
