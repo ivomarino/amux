@@ -1,5 +1,32 @@
 [
   {
+    "hash": "679f93a1",
+    "short": "679f93a",
+    "title": "amux refuses to start new agents when your server is running low on memory",
+    "date": "2026-08-29",
+    "type": "feat",
+    "tags": ["health", "fleet", "stability"],
+    "description": "Before admitting each new worker, amux now checks available memory headroom on the host. If RAM is critically low, the new session is refused and the reason surfaces in the dashboard and via GET /api/health/invariants. Existing agents keep running — only new session creation is blocked until memory frees up. No configuration required. Prevents the 3am OOM cascade where starting too many agents all at once swaps every process to disk."
+  },
+  {
+    "hash": "d3851425",
+    "short": "d3851425",
+    "title": "The auto-compact toggle now shows the memory threshold that actually fires it",
+    "date": "2026-08-29",
+    "type": "fix",
+    "tags": ["dashboard", "compaction"],
+    "description": "The auto-compact toggle in the dashboard was displaying a description that didn't match the real compaction threshold in effect. The setting now accurately states the percentage-of-context-used threshold it's configured to fire at. If you set a custom threshold via AMUX_AUTO_COMPACT_THRESHOLD, the toggle reflects that value rather than a hardcoded display."
+  },
+  {
+    "hash": "7082b54c",
+    "short": "7082b54",
+    "title": "Peeking a worker's output now reaches the live fleet lane, not just the database record",
+    "date": "2026-08-29",
+    "type": "fix",
+    "tags": ["workers", "api", "fleet"],
+    "description": "GET /api/workers/{name}/peek was reading the database row rather than querying the live tmux session, so you could get stale output for an actively-running worker. The endpoint now resolves to the fleet lane and reads current terminal output. If you use peek from scripts or CI to monitor active agents, this gives you accurate real-time data."
+  },
+  {
     "hash": "33e4d206",
     "short": "33e4d20",
     "title": "Create an isolated worker with no harness tools injected",
