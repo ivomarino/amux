@@ -556,10 +556,12 @@ async fn mkdir(req: Request) -> Response {
 /// addresses that hostname resolves to. A browser elsewhere on the tailnet
 /// carries a different one. Measured on the live store, 24h:
 ///
-///     100.108.219.90  94252   <- this machine's own tailnet IP == same machine
-///     127.0.0.1       34689   <- loopback
-///     100.66.26.84    10255   <- a different node: genuinely remote
-///     100.71.171.37    8354   <- ditto
+/// ```text
+/// 100.108.219.90  94252   <- this machine's own tailnet IP == same machine
+/// 127.0.0.1       34689   <- loopback
+/// 100.66.26.84    10255   <- a different node: genuinely remote
+/// 100.71.171.37    8354   <- ditto
+/// ```
 ///
 /// Resolution failure returns false: refusing to open is recoverable (the path
 /// is in the response), opening a Finder window on someone else's desktop is not.
