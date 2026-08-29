@@ -101,6 +101,25 @@ pub fn routes() -> Router<AppState> {
         // `get` would promote half a verb. Reclassified to RESOURCE in the doc.
         .route("/{id}/instructions", axum::routing::any(instructions_worker))
         .route("/{id}/memory", axum::routing::any(memory_worker))
+        // AF-291: the checkout SUB-RESOURCE, grouped rather than promoted flat.
+        // Six sibling routes on a worker for one sub-resource is the shape the
+        // classification calls a UX defect IN the primitives; git/commits,
+        // git/commit-detail and git/diff already had the right shape and are
+        // the argument for it.
+        //
+        // EXPLICIT PER SUB-VERB, never `/{id}/git/{*sub}`. A wildcard here would
+        // reproduce AF-204's defect one level down: an unrouted sub-verb would
+        // answer whatever it answers instead of 404ing, and the route table
+        // could not say which parts of the sub-resource exist.
+        .route("/{id}/git", post(git_checkout_worker))
+        .route("/{id}/git/commits", get(git_sub_read))
+        .route("/{id}/git/commit-detail", get(git_sub_read))
+        .route("/{id}/git/diff", get(git_sub_read))
+        .route("/{id}/git/dirty", get(git_dirty_worker))
+        .route("/{id}/git/push", post(git_push_worker))
+        .route("/{id}/git/commit-report", post(git_commit_report_worker))
+        .route("/{id}/git/tracked-files", axum::routing::any(git_tracked_files_worker))
+        .route("/{id}/git/commit-guard", axum::routing::any(git_commit_guard_worker))
 }
 
 /// `GET /api/ollama/models` — list locally installed Ollama models by running
@@ -1205,6 +1224,119 @@ pub async fn memory_worker(
         Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     };
     crate::api::session_verbs::memory_post_verb(&name, &body)
+}
+
+/// The read sub-verbs of the git group: `commits`, `commit-detail`, `diff`.
+///
+/// One handler for three routes because `git_get` already dispatches on the
+/// sub-verb; the LAST path segment is passed through as that key. Routing them
+/// explicitly rather than with a wildcard is the point (AF-291) — the table has
+/// to be able to say which sub-verbs exist.
+pub async fn git_sub_read(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    uri: axum::http::Uri,
+    axum::extract::RawQuery(q): axum::extract::RawQuery,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let sub = uri.path().rsplit('/').next().unwrap_or("").to_string();
+    let qs = crate::api::fs::parse_qs(q.as_deref().unwrap_or(""));
+    crate::api::session_verbs::git_get(&name, &sub, &qs).await
+}
+
+/// `POST /api/workers/{id}/git` — check out a branch in the worker's checkout.
+pub async fn git_checkout_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::git_checkout_verb(&name, &body).await
+}
+
+/// `GET /api/workers/{id}/git/dirty`
+pub async fn git_dirty_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    match resolve_key(&state, key).await {
+        Ok(name) => crate::api::session_verbs::dirty_verb(&name).await,
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/workers/{id}/git/push` — the grouped spelling of `git-push`.
+pub async fn git_push_worker(State(state): State<AppState>, Path(key): Path<String>) -> Response {
+    match resolve_key(&state, key).await {
+        Ok(name) => crate::api::session_verbs::git_push_verb(&state, &name).await,
+        Err(r) => r,
+    }
+}
+
+/// `POST /api/workers/{id}/git/commit-report`
+pub async fn git_commit_report_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::commit_report_verb(&state, &name, &body).await
+}
+
+/// `GET|POST|DELETE /api/workers/{id}/git/tracked-files`
+pub async fn git_tracked_files_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    method: axum::http::Method,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        return crate::api::session_verbs::tracked_files_verb(&name);
+    }
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::tracked_files_mutate(&name, &method, &body)
+}
+
+/// `GET|PATCH /api/workers/{id}/git/commit-guard`
+pub async fn git_commit_guard_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    method: axum::http::Method,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        return crate::api::session_verbs::commit_guard_verb(&name);
+    }
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::commit_guard_patch_verb(&name, &body)
 }
 
 /// `PATCH /api/workers/{id}/config` — edit the worker's env file.
@@ -2372,6 +2504,71 @@ mod tests {
             v.to_string().contains(&id),
             "control failed: the UNPROMOTED control verb no longer addresses by id, so the \
              loop above cannot distinguish a promoted route from an unpromoted one: {v}"
+        );
+    }
+
+
+    /// AF-291: every git sub-verb resolves a worker ID at its own explicit route.
+    ///
+    /// THE CONTROL IS AN UNROUTED SUB-VERB. While the catch-all still exists,
+    /// `/api/workers/{id}/git/not-a-subverb` does not 404 — it matches
+    /// `/api/workers/{name}/{*verb}` and reaches the substrate BY NAME, so the
+    /// ulid comes back in the answer. That is what makes "the id is absent" mean
+    /// "an explicit route handled this" rather than "something returned an empty
+    /// body". When AF-204 retires the catch-all this control flips to a 404, and
+    /// the assertion it guards is the reason the sub-verbs are routed explicitly
+    /// instead of behind a `/{*sub}` wildcard.
+    #[tokio::test]
+    async fn git_group_sub_verbs_resolve_a_worker_id_at_explicit_routes() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(home.path().join("sessions")).unwrap();
+        let _home = crate::api::settings::test_env::set_home(home.path());
+        let (app, _dir) = app();
+        let id = create(&app, "gitgroup").await;
+
+        for (path, m) in [
+            ("git", "POST"),
+            ("git/commits", "GET"),
+            ("git/commit-detail", "GET"),
+            ("git/diff", "GET"),
+            ("git/dirty", "GET"),
+            ("git/push", "POST"),
+            ("git/commit-report", "POST"),
+            ("git/tracked-files", "GET"),
+            ("git/tracked-files", "POST"),
+            ("git/commit-guard", "GET"),
+            ("git/commit-guard", "PATCH"),
+        ] {
+            let (st, _, v) = send(
+                &app,
+                m,
+                &format!("/api/workers/{id}/{path}"),
+                Some(json!({ "branch": "x", "sha": "deadbeef", "subject": "s" })),
+            )
+            .await;
+            assert_ne!(
+                st,
+                StatusCode::METHOD_NOT_ALLOWED,
+                "{m} {path}: mounted at the wrong method: {v}"
+            );
+            assert!(
+                !v.to_string().contains(&id),
+                "{m} {path}: the raw worker id reached the answer, so this fell to the \
+                 catch-all instead of the grouped route: {v}"
+            );
+        }
+
+        let (_, _, v) = send(
+            &app,
+            "POST",
+            &format!("/api/workers/{id}/git/not-a-subverb"),
+            None,
+        )
+        .await;
+        assert!(
+            v.to_string().contains(&id),
+            "control failed: an UNROUTED git sub-verb no longer addresses by id, so the loop \
+             above cannot distinguish a grouped route from the catch-all: {v}"
         );
     }
 

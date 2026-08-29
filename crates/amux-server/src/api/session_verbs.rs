@@ -11106,34 +11106,8 @@ async fn get_dispatch(
             }))
         }
         "instructions" => instructions_get_verb(name),
-        "dirty" => {
-            let wd = session_work_dir(name);
-            let files = if wd.is_empty() { vec![] } else { session_dirty_files(name, &wd).await };
-            j200(json!({
-                "name": name,
-                "dirty": !files.is_empty(),
-                "count": files.len(),
-                "files": files.iter().take(50).collect::<Vec<_>>(),
-            }))
-        }
-        "commit-guard" => {
-            let cfg = parse_env(name);
-            let per = cfg.get_or("AMUX_COMMIT_GUARD_SESSION", "").trim().to_lowercase();
-            let global = !matches!(
-                std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            );
-            let override_v: Value = if per.is_empty() {
-                Value::Null
-            } else {
-                json!(!matches!(per.as_str(), "0" | "false" | "off" | "no"))
-            };
-            let enabled = match &override_v {
-                Value::Bool(b) => *b,
-                _ => global,
-            };
-            j200(json!({"name": name, "enabled": enabled, "global": global, "override": override_v}))
-        }
+        "dirty" => dirty_verb(name).await,
+        "commit-guard" => commit_guard_verb(name),
         "meta" => {
             // py:75162 — merged meta + env-derived fields.
             let cfg = parse_env(name);
@@ -11193,10 +11167,7 @@ async fn get_dispatch(
             }
             j200(json!({"transcripts": list_session_transcripts(name)}))
         }
-        "tracked-files" => {
-            let meta = load_meta(name);
-            j200(json!({"files": meta.get("tracked_files").cloned().unwrap_or(json!([]))}))
-        }
+        "tracked-files" => tracked_files_verb(name),
         "stats" => {
             let cfg = parse_env(name);
             j200(get_claude_stats(cfg.get_or("CC_DIR", "")))
@@ -11391,7 +11362,7 @@ fn log_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
 /// GET git (+ commits / commit-detail / diff), py:75277-75361. The
 /// _install_amux_commit_hook side effect is not ported (Python still owns
 /// hook installation during coexistence).
-async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
+pub(crate) async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
     let wd = session_work_dir(name);
     match subid {
         "commits" => {
@@ -11643,7 +11614,7 @@ pub(crate) fn adopt_reported_conv_id(name: &str, reported: &str) -> ConvAdopt {
     ConvAdopt::Adopted { was }
 }
 
-fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
+pub(crate) fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
     let mut meta = load_meta(name);
     let mut tracked: Vec<String> = meta
         .get("tracked_files")
@@ -11925,69 +11896,8 @@ async fn post_dispatch(
         // end-to-end and reached nobody. The durable replacement is
         // GET .../subagents (AMUX-2635). Resurrection: git log -S agent_nav.
         "memory" => memory_post_verb(name, body),
-        "git" => {
-            let branch = body_str(body, "branch").trim().to_string();
-            let create = body.get("create").map(py_truthy).unwrap_or(false)
-                || (body.get("worktree").map(py_truthy).unwrap_or(false)
-                    && body.get("create").map(py_truthy).unwrap_or(false));
-            let wd = session_work_dir(name);
-            if wd.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "session has no directory"}));
-            }
-            if branch.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "branch name required"}));
-            }
-            let re = cached_re!(r"^[a-zA-Z0-9_./@\-]+$");
-            if !re.is_match(&branch) {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid branch name"}));
-            }
-            let mut args: Vec<&str> = vec!["-C", &wd, "checkout"];
-            if create {
-                args.push("-b");
-            }
-            args.push(&branch);
-            match run_cmd("git", &args, Duration::from_secs(10)).await {
-                Some(o) if o.status.success() => j200(json!({"ok": true, "branch": branch})),
-                Some(o) => {
-                    let err = String::from_utf8_lossy(if o.stderr.is_empty() { &o.stdout } else { &o.stderr })
-                        .trim()
-                        .to_string();
-                    jresp(StatusCode::BAD_REQUEST, json!({"ok": false, "error": err}))
-                }
-                None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "git timed out"})),
-            }
-        }
-        "git-push" => {
-            if !is_running(name).await {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "session not running — start it first"}));
-            }
-            let cfg = parse_env(name);
-            let branch = cfg.get_or("CC_BRANCH", "").to_string();
-            let msg = if !branch.is_empty() && branch != "none" {
-                format!(
-                    "Deploy now. Your branch is `{branch}`. Run these steps:\n\
-                     1. `git stash` (if needed to allow checkout)\n\
-                     2. `git checkout {branch}` and `git stash pop` (if stashed)\n\
-                     3. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified.\n\
-                     4. `git commit` with a good commit message summarizing YOUR changes only\n\
-                     5. `git checkout main && git pull --ff-only origin main`\n\
-                     6. `git merge {branch}` (resolve conflicts if any)\n\
-                     7. `git push origin main`\n\
-                     8. `git checkout {branch}` (go back to your branch)\n\
-                     Do all steps now. If any step fails, fix it and continue."
-                )
-            } else {
-                "Deploy now. You are on `main`. Run these steps:\n\
-                 1. `git pull --ff-only origin main`\n\
-                 2. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified. Review `git diff` and only add files related to your task.\n\
-                 3. `git commit` with a good commit message summarizing YOUR changes only\n\
-                 4. `git push origin main`\n\
-                 Do all steps now. If any step fails, fix it and continue."
-                    .to_string()
-            };
-            let _ = send_text(state, name, &msg, false, SendOrigin::Owner).await;
-            j200(json!({"ok": true, "message": "deploy instructions sent to session"}))
-        }
+        "git" => git_checkout_verb(name, body).await,
+        "git-push" => git_push_verb(state, name).await,
         "start" => {
             // RESPOND BEFORE THE CHOREOGRAPHY (AMUX-2557): validations
             // inline, launch in the background, instant 202.
@@ -12084,122 +11994,7 @@ async fn post_dispatch(
         }
         "wake" => wake_verb(state, name).await,
         "reset" => reset_verb(state, name).await,
-        "commit-report" => {
-            // Attach the commit to the in-flight card (py:76233-76246). The
-            // cross-session sweep notice (py:76008-76230) is a named gap.
-            let sha: String = body_str(body, "sha").trim().chars().take(16).collect();
-            let subj: String = body_str(body, "subject").trim().chars().take(140).collect();
-            if sha.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "sha required"}));
-            }
-            // DID THE COMMIT CONTAIN ANYTHING (AMUX-3837). See `commit_shape`
-            // for why this lives here. The verdict is computed BEFORE the card
-            // write so it can ride the same log line the commit already adds:
-            // a second write would put the warning somewhere other than where
-            // the session goes to read what it shipped.
-            let dir = body_str(body, "dir");
-            let shape = read_commit_shape(&dir, &sha).await;
-            let empty = matches!(shape, commit_shape::Shape::Empty);
-            // WHAT THE HOOK SAW, held by the staged-guard (AMUX-3837).
-            // amux-frustrations demonstrated the mechanism: git writes the tree
-            // AFTER the hooks return, so anything that empties the index during
-            // our 30-90s pre-commit window (cargo check + clippy, on an index
-            // every lane shares) yields a zero-file commit reporting success.
-            // The hook already reports its staged set and this endpoint already
-            // knows what landed; joining them turns a forensic reconstruction
-            // into a stated pair. 300s, because the window is the pre-commit
-            // build, not a session.
-            let staged_at_hook =
-                crate::api::git_guard::staged_seen(name, &dir, crate::config::now_f64(), 300.0);
-            if empty {
-                tracing::warn!(
-                    session = %name, sha = %sha, subject = %subj,
-                    staged_at_hook = staged_at_hook.map(|n| n as i64).unwrap_or(-1),
-                    // The gloss follows what THIS line actually carries. It used
-                    // to explain the -1 sentinel unconditionally, so a line
-                    // reading `staged_at_hook=1` came with a sentence about a
-                    // value it did not have. Caught by probing the arm rather
-                    // than by reading the code.
-                    "commit-report: EMPTY COMMIT — this sha contains no files, so the change it \
-                     claims is still uncommitted in the working tree (AMUX-3837). On a shared \
-                     checkout any peer's checkout or stash destroys it, and a card closed citing \
-                     this sha is citing nothing. {}",
-                    empty_commit_hook_gloss(staged_at_hook)
-                );
-            }
-            let session = name.to_string();
-            let sha2 = sha.clone();
-            // Named so the log line can say WHY it is silent: absent because
-            // the commit was fine, versus absent because nothing looked.
-            let shape_note = match shape {
-                commit_shape::Shape::Empty => empty_commit_card_note(staged_at_hook),
-                commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
-                _ => String::new(),
-            };
-            let reply = state
-                .store
-                .write_async(move |conn| {
-                    let row: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                             AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                             AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                            [&session],
-                            |r| r.get(0),
-                        )
-                        .ok();
-                    let Some(issue_id) = row else {
-                        return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                    };
-                    let log: String = conn
-                        .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
-                        .unwrap_or_default();
-                    let ts = chrono::Local::now().format("%H:%M");
-                    let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}{shape_note}", log.trim_end())
-                        .trim()
-                        .to_string();
-                    conn.execute(
-                        "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
-                        rusqlite::params![new_log, now_i64(), issue_id],
-                    )?;
-                    Ok(crate::db::WriteOutcome {
-                        applied: true,
-                        events: vec![crate::db::PendingEvent {
-                            entity_type: amux_core::revision::EntityType::Other("issue".into()),
-                            entity_id: issue_id,
-                            mutation: amux_core::revision::MutationKind::Updated,
-                            payload: None,
-                        }],
-                    })
-                })
-                .await;
-            match reply {
-                // The emptiness verdict rides BOTH arms. A session with no
-                // in-flight card is exactly the one whose commit lands with no
-                // trail, so it is the last place the warning may be dropped.
-                Ok(r) if !r.applied => {
-                    j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty,
-                               "staged_at_hook": staged_at_hook}))
-                }
-                Ok(_) => {
-                    // Re-read the card id for the response (the write closure
-                    // cannot return it through WriteReply).
-                    let attached: Option<String> = state.store.read().ok().and_then(|conn| {
-                        conn.query_row(
-                            "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                             AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                             AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                            [name],
-                            |r| r.get(0),
-                        )
-                        .ok()
-                    });
-                    j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty,
-                                "staged_at_hook": staged_at_hook}))
-                }
-                Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
-            }
-        }
+        "commit-report" => commit_report_verb(state, name, body).await,
         "report" => report_post(state, name, headers, body).await,
         "apply-template" => apply_template_verb(body),
         "delete" => delete_post(state, name, headers).await,
@@ -13026,6 +12821,261 @@ pub(crate) fn env_explain_verb(name: &str, qs: &[(String, String)]) -> Response 
                  cannot see for themselves.",
         "resolver": "scope_env_layers — the same ordered list every consumer reads",
     }))
+}
+
+/// `commit-report` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Value) -> Response {
+    // Attach the commit to the in-flight card (py:76233-76246). The
+    // cross-session sweep notice (py:76008-76230) is a named gap.
+    let sha: String = body_str(body, "sha").trim().chars().take(16).collect();
+    let subj: String = body_str(body, "subject").trim().chars().take(140).collect();
+    if sha.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "sha required"}));
+    }
+    // DID THE COMMIT CONTAIN ANYTHING (AMUX-3837). See `commit_shape`
+    // for why this lives here. The verdict is computed BEFORE the card
+    // write so it can ride the same log line the commit already adds:
+    // a second write would put the warning somewhere other than where
+    // the session goes to read what it shipped.
+    let dir = body_str(body, "dir");
+    let shape = read_commit_shape(&dir, &sha).await;
+    let empty = matches!(shape, commit_shape::Shape::Empty);
+    // WHAT THE HOOK SAW, held by the staged-guard (AMUX-3837).
+    // amux-frustrations demonstrated the mechanism: git writes the tree
+    // AFTER the hooks return, so anything that empties the index during
+    // our 30-90s pre-commit window (cargo check + clippy, on an index
+    // every lane shares) yields a zero-file commit reporting success.
+    // The hook already reports its staged set and this endpoint already
+    // knows what landed; joining them turns a forensic reconstruction
+    // into a stated pair. 300s, because the window is the pre-commit
+    // build, not a session.
+    let staged_at_hook =
+        crate::api::git_guard::staged_seen(name, &dir, crate::config::now_f64(), 300.0);
+    if empty {
+        tracing::warn!(
+            session = %name, sha = %sha, subject = %subj,
+            staged_at_hook = staged_at_hook.map(|n| n as i64).unwrap_or(-1),
+            // The gloss follows what THIS line actually carries. It used
+            // to explain the -1 sentinel unconditionally, so a line
+            // reading `staged_at_hook=1` came with a sentence about a
+            // value it did not have. Caught by probing the arm rather
+            // than by reading the code.
+            "commit-report: EMPTY COMMIT — this sha contains no files, so the change it \
+             claims is still uncommitted in the working tree (AMUX-3837). On a shared \
+             checkout any peer's checkout or stash destroys it, and a card closed citing \
+             this sha is citing nothing. {}",
+            empty_commit_hook_gloss(staged_at_hook)
+        );
+    }
+    let session = name.to_string();
+    let sha2 = sha.clone();
+    // Named so the log line can say WHY it is silent: absent because
+    // the commit was fine, versus absent because nothing looked.
+    let shape_note = match shape {
+        commit_shape::Shape::Empty => empty_commit_card_note(staged_at_hook),
+        commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
+        _ => String::new(),
+    };
+    let reply = state
+        .store
+        .write_async(move |conn| {
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
+                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
+                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
+                    [&session],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(issue_id) = row else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let log: String = conn
+                .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
+                .unwrap_or_default();
+            let ts = chrono::Local::now().format("%H:%M");
+            let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}{shape_note}", log.trim_end())
+                .trim()
+                .to_string();
+            conn.execute(
+                "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
+                rusqlite::params![new_log, now_i64(), issue_id],
+            )?;
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("issue".into()),
+                    entity_id: issue_id,
+                    mutation: amux_core::revision::MutationKind::Updated,
+                    payload: None,
+                }],
+            })
+        })
+        .await;
+    match reply {
+        // The emptiness verdict rides BOTH arms. A session with no
+        // in-flight card is exactly the one whose commit lands with no
+        // trail, so it is the last place the warning may be dropped.
+        Ok(r) if !r.applied => {
+            j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty,
+                       "staged_at_hook": staged_at_hook}))
+        }
+        Ok(_) => {
+            // Re-read the card id for the response (the write closure
+            // cannot return it through WriteReply).
+            let attached: Option<String> = state.store.read().ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
+                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
+                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .ok()
+            });
+            j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty,
+                        "staged_at_hook": staged_at_hook}))
+        }
+        Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    }
+}
+
+/// `git-push` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) async fn git_push_verb(state: &AppState, name: &str) -> Response {
+    if !is_running(name).await {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "session not running — start it first"}));
+    }
+    let cfg = parse_env(name);
+    let branch = cfg.get_or("CC_BRANCH", "").to_string();
+    let msg = if !branch.is_empty() && branch != "none" {
+        format!(
+            "Deploy now. Your branch is `{branch}`. Run these steps:\n\
+             1. `git stash` (if needed to allow checkout)\n\
+             2. `git checkout {branch}` and `git stash pop` (if stashed)\n\
+             3. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified.\n\
+             4. `git commit` with a good commit message summarizing YOUR changes only\n\
+             5. `git checkout main && git pull --ff-only origin main`\n\
+             6. `git merge {branch}` (resolve conflicts if any)\n\
+             7. `git push origin main`\n\
+             8. `git checkout {branch}` (go back to your branch)\n\
+             Do all steps now. If any step fails, fix it and continue."
+        )
+    } else {
+        "Deploy now. You are on `main`. Run these steps:\n\
+         1. `git pull --ff-only origin main`\n\
+         2. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified. Review `git diff` and only add files related to your task.\n\
+         3. `git commit` with a good commit message summarizing YOUR changes only\n\
+         4. `git push origin main`\n\
+         Do all steps now. If any step fails, fix it and continue."
+            .to_string()
+    };
+    let _ = send_text(state, name, &msg, false, SendOrigin::Owner).await;
+    j200(json!({"ok": true, "message": "deploy instructions sent to session"}))
+}
+
+/// `tracked-files` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) fn tracked_files_verb(name: &str) -> Response {
+    let meta = load_meta(name);
+    j200(json!({"files": meta.get("tracked_files").cloned().unwrap_or(json!([]))}))
+}
+
+/// `commit-guard` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) fn commit_guard_verb(name: &str) -> Response {
+    let cfg = parse_env(name);
+    let per = cfg.get_or("AMUX_COMMIT_GUARD_SESSION", "").trim().to_lowercase();
+    let global = !matches!(
+        std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    );
+    let override_v: Value = if per.is_empty() {
+        Value::Null
+    } else {
+        json!(!matches!(per.as_str(), "0" | "false" | "off" | "no"))
+    };
+    let enabled = match &override_v {
+        Value::Bool(b) => *b,
+        _ => global,
+    };
+    j200(json!({"name": name, "enabled": enabled, "global": global, "override": override_v}))
+}
+
+/// `dirty` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) async fn dirty_verb(name: &str) -> Response {
+    let wd = session_work_dir(name);
+    let files = if wd.is_empty() { vec![] } else { session_dirty_files(name, &wd).await };
+    j200(json!({
+        "name": name,
+        "dirty": !files.is_empty(),
+        "count": files.len(),
+        "files": files.iter().take(50).collect::<Vec<_>>(),
+    }))
+}
+
+/// The mutating half of `commit-guard`, for the grouped git surface (AF-291).
+pub(crate) fn commit_guard_patch_verb(name: &str, body: &Value) -> Response {
+    let global = !matches!(
+        std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    );
+    let raw = body.get("enabled");
+    let override_v = match raw {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(py_truthy(v)),
+    };
+    let f = env_path(name);
+    let mut cfg = parse_env(name);
+    match override_v {
+        None => cfg.remove("AMUX_COMMIT_GUARD_SESSION"),
+        Some(b) => cfg.set("AMUX_COMMIT_GUARD_SESSION", if b { "1" } else { "0" }),
+    }
+    if cfg.write(&f).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+    }
+    let enabled = override_v.unwrap_or(global);
+    j200(json!({
+        "ok": true, "enabled": enabled, "global": global,
+        "override": override_v.map(Value::Bool).unwrap_or(Value::Null),
+    }))
+}
+
+/// The mutating half of `git`, for the grouped git surface (AF-291).
+pub(crate) async fn git_checkout_verb(name: &str, body: &Value) -> Response {
+    let branch = body_str(body, "branch").trim().to_string();
+    let create = body.get("create").map(py_truthy).unwrap_or(false)
+        || (body.get("worktree").map(py_truthy).unwrap_or(false)
+            && body.get("create").map(py_truthy).unwrap_or(false));
+    let wd = session_work_dir(name);
+    if wd.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "session has no directory"}));
+    }
+    if branch.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "branch name required"}));
+    }
+    let re = cached_re!(r"^[a-zA-Z0-9_./@\-]+$");
+    if !re.is_match(&branch) {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid branch name"}));
+    }
+    let mut args: Vec<&str> = vec!["-C", &wd, "checkout"];
+    if create {
+        args.push("-b");
+    }
+    args.push(&branch);
+    match run_cmd("git", &args, Duration::from_secs(10)).await {
+        Some(o) if o.status.success() => j200(json!({"ok": true, "branch": branch})),
+        Some(o) => {
+            let err = String::from_utf8_lossy(if o.stderr.is_empty() { &o.stdout } else { &o.stderr })
+                .trim()
+                .to_string();
+            jresp(StatusCode::BAD_REQUEST, json!({"ok": false, "error": err}))
+        }
+        None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "git timed out"})),
+    }
 }
 
 /// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`
@@ -13884,31 +13934,7 @@ pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMa
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value) -> Response {
     match action {
-        "commit-guard" => {
-            let global = !matches!(
-                std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            );
-            let raw = body.get("enabled");
-            let override_v = match raw {
-                None | Some(Value::Null) => None,
-                Some(v) => Some(py_truthy(v)),
-            };
-            let f = env_path(name);
-            let mut cfg = parse_env(name);
-            match override_v {
-                None => cfg.remove("AMUX_COMMIT_GUARD_SESSION"),
-                Some(b) => cfg.set("AMUX_COMMIT_GUARD_SESSION", if b { "1" } else { "0" }),
-            }
-            if cfg.write(&f).is_err() {
-                return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
-            }
-            let enabled = override_v.unwrap_or(global);
-            j200(json!({
-                "ok": true, "enabled": enabled, "global": global,
-                "override": override_v.map(Value::Bool).unwrap_or(Value::Null),
-            }))
-        }
+        "commit-guard" => commit_guard_patch_verb(name, body),
         "config" => config_patch(state, name, body).await,
         _ => not_found(),
     }

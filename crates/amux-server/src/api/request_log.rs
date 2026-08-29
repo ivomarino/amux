@@ -1111,6 +1111,18 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/workers/{id}/share", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/instructions", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/memory", methods: &["*"] },
+    // The checkout sub-resource (AF-291). Listed per sub-verb on purpose: a
+    // wildcard would make the table unable to say which parts exist, which is
+    // the defect AF-204 retires the catch-all for.
+    RouteEntry { path: "/api/workers/{id}/git", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/git/commits", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/commit-detail", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/diff", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/dirty", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/push", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/git/commit-report", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/git/tracked-files", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/git/commit-guard", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/dead-letters", methods: &["GET"] },
     // -- memories / messages / schedules / verify / prefs / criteria
     RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },
