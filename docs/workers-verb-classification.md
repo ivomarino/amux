@@ -184,7 +184,7 @@ in this bucket at all.
 | verb | verdict | why |
 |---|---|---|
 | `transcript` | **promote** `/transcript` | the live conversation, uniform TranscriptEvent for Codex/Ollama and ANSI for Claude. No equivalent anywhere; this is the bucket's real member. |
-| `transcripts` | **group** `/transcripts` + `/transcripts/{file}` | NOT the plural of the above. It lists transcript BACKUP files and downloads one by subid. A different resource. |
+| `transcripts` | **sub-resource** `/transcript/archives` + `/transcript/archives/{subid}` | NOT the plural of the above. It lists transcript BACKUP files and downloads one by subid. The name `transcripts` belongs to nobody. |
 | `last-message` | **fold** into `/transcript` | it is one field of the transcript read, not a resource. |
 | `log` | **group** `/log`, `/log/info` | already sub-resource shaped and already called that way by the SPA (`/log/info?plain=1`). Nothing to decide, only to route. |
 | `stats` | **promote** `/stats` | `get_claude_stats(CC_DIR)`. Flat, no sub-resource. |
@@ -195,17 +195,35 @@ in this bucket at all.
 
 ### `transcript` and `transcripts` differ by one letter and are different resources
 
-This is the naming defect this epic exists to avoid freezing. One is the live
-conversation; the other is a directory of backup files. A caller who guesses gets
-a plausible-looking wrong answer rather than a 404, which is the worst failure
-mode a route table can have. Promoting them side by side as they stand would make
-that permanent, so the recommendation is to promote `transcript` under its own
-name and give the archives a name that says archive.
+**THE DANGER IS NOT THE WRONG GUESS. IT IS THAT BOTH ANSWER 200** (amux, 2026-08-28,
+sharpening this entry). A 404 is self-correcting: you misspelled it, you find out
+at once, nothing downstream believes anything. Two near-identical names over
+DIFFERENT resources both returning plausible JSON is the failure that survives —
+the caller gets transcript-shaped data and never learns it asked the wrong
+question. Same class as an empty commit reporting success, and as a stored green
+served off a dead monitor: the tell is always that the wrong answer LOOKS like the
+right one. A route table's job is to make a wrong guess FAIL, and one letter
+between "the live conversation" and "a list of backup files" defeats that by
+construction. No amount of documentation fixes a name that reads correct.
 
-**Recommendation, not a fait accompli.** These are nine paths on a public surface
-and the classification's previous verdict was a deliberate "not decided". Recorded
-here for review rather than implemented, so the shape can be argued with before it
-is frozen.
+**Decide it NOW, at promotion, because that is when it is free.** The first
+version of this entry deferred the rename as "a bigger call than routing one".
+That is backwards. Nothing depends on the promoted spelling yet, so naming these
+at promotion costs nothing; renaming a SUPPORTED public route later costs a
+deprecation cycle and an alias that outlives everyone who remembers why. AF-201's
+warning about freezing today's naming into the supported API is an argument for
+deciding now — deferring is how the freeze happens.
+
+So the archives become a SUB-RESOURCE of the transcript rather than a homograph
+beside it: `/transcript/archives` and `/transcript/archives/{subid}`. That
+expresses the real relationship (they are archives OF the transcript) and makes
+every wrong guess a 404. The name `transcripts` then belongs to nobody, which is
+the correct state for a name that misleads.
+
+**Review status, stated precisely.** The naming above is reviewed and agreed by
+amux. The other seven verdicts are NOT reviewed — they wanted a reader with the
+room to go through the classification properly, and said so rather than nodding
+them through.
 
 
 
