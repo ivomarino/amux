@@ -3090,6 +3090,7 @@ ${BOLD}Worker management:${RESET}
 
 ${BOLD}Interaction:${RESET}
   amux attach <name>             Attach to a running worker (detach: Ctrl-b d)
+  amux grid [-c N] <name>...     Tile those workers' terminals in a grid (macOS/iTerm2)
   amux peek <name> [lines]       View last N lines without attaching (default: 30)
   amux send <name> --stdin       Send a message read from stdin ${GREEN}(preferred)${RESET}
                                  ${DIM}amux send api --stdin <<'EOF'${RESET}
@@ -3524,6 +3525,29 @@ cmd_url() {
   return 0
 }
 
+# ── grid ─────────────────────────────────────────────────────────────────────
+# Tile N worker terminals across a display. The whole implementation lives in
+# scripts/amux-grid.sh; this is a thin exec so that a macOS/AppleScript feature
+# cannot add surface area to the CLI every lane runs on Linux too.
+#
+# `~/.local/bin/amux` is a SYMLINK into the repo, so resolve the link before
+# looking for a sibling script: dirname of the symlink is ~/.local/bin, where
+# scripts/ does not exist.
+cmd_grid() {
+  local src="${BASH_SOURCE[0]}" dir
+  while [ -L "$src" ]; do
+    local target; target="$(readlink "$src")"
+    case "$target" in
+      /*) src="$target" ;;
+      *)  src="$(dirname -- "$src")/$target" ;;
+    esac
+  done
+  dir="$(cd -- "$(dirname -- "$src")" && pwd)"
+  local sh="$dir/scripts/amux-grid.sh"
+  [ -x "$sh" ] || { echo "amux grid: missing $sh" >&2; return 1; }
+  "$sh" "$@"
+}
+
 # ── Main dispatch ────────────────────────────────────────────────────────────
 #
 # Source guard: when this script is run normally as `amux ...`, BASH_SOURCE[0]
@@ -3568,6 +3592,7 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
     start)            shift; cmd_start "$@" ;;
     exec|run)         shift; cmd_exec "$@" ;;
     attach|a)         shift; cmd_attach "$@" ;;
+    grid)             shift; cmd_grid "$@" ;;
     peek|p)           shift; cmd_peek "$@" ;;
     send)             shift; cmd_send "$@" ;;
     stop|kill)        shift; cmd_stop "$@" ;;
