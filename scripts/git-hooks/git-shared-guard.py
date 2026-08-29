@@ -291,6 +291,45 @@ def _amend_staged_decision(d):
             "(~/.amux/guard-allow-once, audit-logged)." % (len(foreign), shown))
 
 
+def _content_is_committed(top, rel):
+    """Are this file's CURRENT bytes already inside a commit? (AMUX-3859)
+
+    The discard guard exists to stop a restore destroying work that exists
+    NOWHERE ELSE. When the on-disk blob is already committed, a restore cannot
+    destroy anything: content equal to a commit's blob is by definition not
+    unsaved keystrokes. That holds regardless of WHO edited the file or whether
+    their session resolved, which is what makes it stronger than the attribution
+    it overrules.
+
+    This is the guard's OWN prescribed restore-safety recipe. It printed the
+    recipe and never ran it, so an operator could pass the test the guard
+    recommended and still be refused — CD-79, where a fleet-wide `graft-push.sh`
+    sat two commits behind because the update the guard recommends was the update
+    the guard blocked.
+
+    Conservative on every failure: an unreadable blob, a timeout, or a git error
+    returns False, which keeps the block. A guard that opens on an error is worse
+    than one that is occasionally too strict.
+    """
+    # LOCAL import, matching this file's convention (see the ones at :177 and
+    # :236). There is no module-level `import subprocess`, so a module-level
+    # helper using it NameErrors on first call — and neither py_compile nor the
+    # 51-test suite catches that, because neither one calls this function.
+    import subprocess
+    try:
+        blob = subprocess.run(["git", "-C", top, "hash-object", "--", rel],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+        if not blob:
+            return False
+        out = subprocess.run(
+            ["git", "-C", top, "log", "--all", "--format=%H", "--find-object", blob,
+             "--", rel],
+            capture_output=True, text=True, timeout=30)
+        return out.returncode == 0 and bool(out.stdout.strip())
+    except Exception:
+        return False
+
+
 def _discard_verdict(cmd, scrubbed, run_dir):
     """AC-212 (2026-08-04): block a PATH-SCOPED discard that would destroy ANOTHER
     session's uncommitted work.
@@ -388,7 +427,28 @@ def _discard_verdict(cmd, scrubbed, run_dir):
     if not foreign and not shared:
         return None
     hits = foreign + shared
-    who = ", ".join(sorted({f.get("owner", "?") for f in hits}))
+    # A COMMITTED BLOB IS NOT UNSAVED WORK (AMUX-3859). Drop any hit whose
+    # current bytes are already in a commit before deciding to block: the
+    # attribution says who touched it, the blob says whether anything is at
+    # risk, and only the second speaks to what this guard protects.
+    safe = [h for h in hits
+            if h.get("path") and _content_is_committed(top, h.get("path"))]
+    if safe:
+        hits = [h for h in hits if h not in safe]
+        foreign = [h for h in foreign if h not in safe]
+        shared = [h for h in shared if h not in safe]
+        sys.stderr.write(
+            "amux shared-guard: %d path(s) NOT blocked — their on-disk bytes are "
+            "already committed, so a restore cannot destroy unsaved work: %s\n"
+            % (len(safe), ", ".join(h.get("path", "?") for h in safe[:5])))
+    if not hits:
+        return None
+    # NAME THE BLANK OWNER AS BLANK. `.get("owner", "?")` only defaults a MISSING
+    # key, so an owner that is present and empty rendered as nothing at all and
+    # the refusal claimed "another session" it could not name. A reader who goes
+    # looking for that peer and finds none stops, correctly, and is stuck.
+    who = ", ".join(sorted({(f.get("owner") or "").strip() or "an edit record with no session attached"
+                            for f in hits}))
     what = ", ".join(f.get("path", "?") for f in hits[:5])
     # Distinct wording: "also edited" is a different fact from "is theirs", and a
     # guard that says the wrong one gets argued with instead of obeyed.
