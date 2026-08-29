@@ -210,6 +210,12 @@ tell a Telegram message apart from other input arriving in its pane. A chat
 that sends text before linking gets a one-line nudge back (`/link
 <session-name>` first), never silently dropped.
 
+**Routing to a specific lane from Telegram** — start a message with `@lane_name` to
+route it to that lane instead of your default mapped session. Example: `@frontstage
+what's the status?` sends the message to the `frontstage` session. If the lane name
+is invalid, the message routes to your mapped session as usual (graceful fallback).
+Available lane names are shown in the link prompt if you don't know them yet.
+
 ```bash
 curl -sk $AMUX_URL/api/telegram/status                          # bot_token_set, mapping_count, last_poll_at, last_error, messages_routed/unlinked
 curl -sk $AMUX_URL/api/telegram/mappings                        # list chat<->session links

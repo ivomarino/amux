@@ -214,20 +214,39 @@ async fn handle_update(state: &AppState, update: &Value) {
         .await;
 
     let who = username.as_deref().unwrap_or("telegram");
-    let stamped = format!("[from Telegram @{who}]: {text}");
+
+    // Check for @lane mention at start of message: "@session_name remaining text"
+    // If present, route to that lane; otherwise use the mapped session.
+    let (target_session, message_text) = if text.starts_with('@') {
+        let parts: Vec<&str> = text.splitn(2, ' ').collect();
+        let mention = parts[0].trim_start_matches('@');
+        let known = session_verbs::all_lane_names();
+        if known.iter().any(|n| n == mention) {
+            // Valid lane mention found
+            let remaining = if parts.len() > 1 { parts[1] } else { "" };
+            (mention.to_string(), remaining.to_string())
+        } else {
+            // Invalid mention, treat whole thing as text to default session
+            (mapping.session.clone(), text.to_string())
+        }
+    } else {
+        (mapping.session.clone(), text.to_string())
+    };
+
+    let stamped = format!("[from Telegram @{who}]: {message_text}");
     let (ok, msg) =
-        session_verbs::send_text(state, &mapping.session, &stamped, true, session_verbs::SendOrigin::Automation)
+        session_verbs::send_text(state, &target_session, &stamped, true, session_verbs::SendOrigin::Automation)
             .await;
     if ok {
         record_routed();
     } else {
         tracing::warn!(
             "telegram_poll: delivery to session '{}' failed for chat {}: {}",
-            mapping.session,
+            target_session,
             chat_id,
             msg
         );
-        send_reply(chat_id, &format!("Couldn't deliver to '{}': {}", mapping.session, msg)).await;
+        send_reply(chat_id, &format!("Couldn't deliver to '{}': {}", target_session, msg)).await;
     }
 }
 
