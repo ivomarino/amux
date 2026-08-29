@@ -8270,14 +8270,14 @@ fn compose_worker_block(name: &str, session_content: &str) -> String {
     )
 }
 
-fn write_claude_memory(name: &str, work_dir: &str) {
-    let pname = project_name(work_dir);
-    let session_file = mem_file(name);
-    let global_file = memory_dir().join("_global.md");
-
-    let global_content = std::fs::read_to_string(&global_file).unwrap_or_default();
-    let session_content = std::fs::read_to_string(&session_file).unwrap_or_default();
-
+/// The composed MEMORY.md text, separated from writing it (AF-296).
+///
+/// Extracted so the composition is testable WITHOUT touching real data.
+/// `claude_home()` reads `$HOME`, which the test harness does not redirect (only
+/// `AMUX_HOME`), so a test that called `write_claude_memory` would overwrite the
+/// developer's own `~/.claude/.../MEMORY.md`. Everything this function reads is
+/// rooted at `AMUX_HOME`, so it is safe to exercise directly.
+fn compose_memory_doc(name: &str, global_content: &str, session_content: &str) -> String {
     let mut parts = Vec::new();
     if !global_content.trim().is_empty() {
         parts.push(format!(
@@ -8287,11 +8287,50 @@ fn write_claude_memory(name: &str, work_dir: &str) {
         ));
     }
     parts.push(MEM_MARKER.to_string());
-    let worker_block = compose_worker_block(name, &session_content);
+    // GROUP MEMORY, between global and worker (AF-296).
+    //
+    // `/api/scope` advertises `memory` at [global, group, worker] and the scope
+    // UI writes all three, but this composer read only two — so a group-level
+    // write saved `memory/tags/<group>.md` and nothing ever consulted it. The
+    // setting appeared to save and changed nothing, which is ethos rule 1's
+    // exact shape and the SAME defect the docstring on `scope_env_layers`
+    // records for env. env was fixed; memory was not.
+    //
+    // Groups come from `lane_groups`, the same CC_TAGS source `scope_env_layers`
+    // uses, rather than a second spelling. BTreeSet gives a stable order, so a
+    // lane in two groups composes the same way on every write.
+    //
+    // A lane with no groups, or whose group files do not exist, appends NOTHING
+    // and the output is byte-identical to before this change. That is what makes
+    // a fleet-wide composition change safe to land: today no `memory/tags/`
+    // directory exists at all, so this is inert until someone uses the level.
+    for g in lane_groups(name) {
+        let gf = memory_dir().join("tags").join(format!("{g}.md"));
+        let gc = std::fs::read_to_string(&gf).unwrap_or_default();
+        if !gc.trim().is_empty() {
+            parts.push(format!(
+                "## Group memory — `{g}`\n\n                 <!-- Written at the GROUP level in the scope UI. It reaches every lane \
+                 tagged `{g}`, so it is shared context rather than any one lane's notes. -->\n\n{}",
+                gc.trim()
+            ));
+        }
+    }
+    let worker_block = compose_worker_block(name, session_content);
     if !worker_block.is_empty() {
         parts.push(worker_block);
     }
-    let composed = parts.join("\n\n") + "\n";
+    parts.join("\n\n") + "\n"
+}
+
+fn write_claude_memory(name: &str, work_dir: &str) {
+    let pname = project_name(work_dir);
+    let session_file = mem_file(name);
+    let global_file = memory_dir().join("_global.md");
+
+    let global_content = std::fs::read_to_string(&global_file).unwrap_or_default();
+    let session_content = std::fs::read_to_string(&session_file).unwrap_or_default();
+
+    let composed = compose_memory_doc(name, &global_content, &session_content);
 
     let claude_mem_dir = claude_home().join("projects").join(&pname).join("memory");
     let claude_mem_file = claude_mem_dir.join("MEMORY.md");
@@ -20963,6 +21002,53 @@ mod commit_shape_tests {
                 "env-explain leaked a value from a 0600 credential file ({secret}): {v}"
             );
         }
+    }
+
+
+    /// AF-296: group-level memory reaches the composed document, and its ABSENCE
+    /// changes nothing.
+    ///
+    /// The second half is what makes a fleet-wide composition change safe to
+    /// land. Every lane's MEMORY.md is rebuilt by this code, so the claim that
+    /// matters is not "the group block appears" but "nothing appears when there
+    /// is no group file" — today no `memory/tags/` directory exists anywhere, so
+    /// the change must be inert until someone uses the level.
+    ///
+    /// Ordering is asserted by INDEX, not by presence: global, then group, then
+    /// worker. A composer that appended the group block last would satisfy a
+    /// contains() check while inverting the precedence the scope UI advertises.
+    #[tokio::test]
+    async fn group_memory_composes_between_global_and_worker_and_is_inert_when_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("sessions")).unwrap();
+        std::fs::create_dir_all(h.join("memory/tags")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(h);
+        std::fs::write(h.join("sessions/memtest.env"), "CC_TAGS=\"alpha\"\n").unwrap();
+
+        // CONTROL FIRST: no group file yet, so the composition must be exactly
+        // what it was before this change.
+        let before = super::compose_memory_doc("memtest", "GLOBALTEXT", "WORKERTEXT");
+        assert!(
+            before.contains("WORKERTEXT"),
+            "premise gone — the worker block is missing, so the absence check below would \
+             pass on an empty document: {before}"
+        );
+        assert!(
+            !before.contains("Group memory"),
+            "a lane whose group file does not exist must compose no group block: {before}"
+        );
+
+        std::fs::write(h.join("memory/tags/alpha.md"), "GROUPTEXT").unwrap();
+        let after = super::compose_memory_doc("memtest", "GLOBALTEXT", "WORKERTEXT");
+        let gi = after.find("GROUPTEXT").expect("group memory must reach the document");
+        let wi = after.find("WORKERTEXT").expect("worker memory must still be there");
+        assert!(
+            gi < wi,
+            "group memory must precede worker memory, matching the [global, group, worker] \
+             precedence /api/scope advertises: {after}"
+        );
+        assert!(after.contains("alpha"), "the group must be named in its block: {after}");
     }
 
 }
