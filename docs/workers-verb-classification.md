@@ -184,7 +184,7 @@ These read per-scope config, which the uniform scope read/write endpoint already
 exists for (`api/mod.rs`, AMUX-2608). Route them there rather than giving the worker
 five bespoke config verbs.
 
-## GUARDS — reachable ONLY through the catch-all today. (2)
+## GUARDS — reachable ONLY through the catch-all. PROMOTED, 0 left. (2)
 
 | verb | site | verdict |
 |---|---|---|
