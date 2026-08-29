@@ -16,6 +16,41 @@
 # checkout carried the dead address forward. The literal is deliberately not
 # repeated here: tests/legacy_port_guard.rs greps for it, and a comment
 # containing it is exactly how it spreads.
+# ── AN EMPTY COMMIT SAYS SO, OUT LOUD (AMUX-3872) ────────────────────────────
+#
+# git reports a commit containing ZERO FILES with exactly the same `[main
+# <sha>]` line as a full one, and nothing in this repo's hooks ever looked at
+# what a commit actually CONTAINED. Every other guard asks whether the commit
+# should PROCEED.
+#
+# Three of them landed in a single session, from three unrelated causes: an
+# index emptied during the pre-commit window, a peer's `git reset` inside it,
+# and the staged-recheck writing the pending commit's own temporary index. Each
+# time the message shipped, the work did not, and each was found later by
+# accident. One card was closed citing a sha that contained nothing.
+#
+# So this runs BEFORE the `AMUX_SESSION` guard below: an empty commit is a bug
+# in every checkout, not only inside amux.
+#
+# `--root` is load-bearing. `diff-tree` prints nothing at all for a parentless
+# commit, so without it the very first commit in a repo always reads as empty.
+# A merge legitimately carries no changes of its own against its first parent,
+# so merges are exempted by parent count rather than by guessing from the diff.
+_ec_parents=$(git rev-list --parents -n 1 HEAD 2>/dev/null | wc -w | tr -d ' ')
+_ec_files=$(git diff-tree --no-commit-id --name-only -r --root HEAD 2>/dev/null | wc -l | tr -d ' ')
+if [ "$_ec_files" = "0" ] && [ "${_ec_parents:-0}" -lt 3 ]; then
+  echo "" >&2
+  echo "amux: ⚠ THIS COMMIT CONTAINS ZERO FILES — $(git rev-parse --short HEAD 2>/dev/null)" >&2
+  echo "      The message shipped and the work did not. git prints the same line for" >&2
+  echo "      an empty commit as a full one, which is why this needs saying." >&2
+  echo "      Your changes are most likely still sitting unstaged: check \`git status\`" >&2
+  echo "      before recording this sha anywhere. Do NOT close a card citing it." >&2
+  echo "      Known causes: something emptied the index during the pre-commit window" >&2
+  echo "      (a peer's reset on a shared checkout), or a hook wrote GIT_INDEX_FILE" >&2
+  echo "      while a pathspec commit was pending (AMUX-3872)." >&2
+  echo "" >&2
+fi
+
 [ -n "$AMUX_SESSION" ] || exit 0
 sha=$(git rev-parse --short HEAD 2>/dev/null)
 # tr strips the two JSON-hostile characters instead of escaping them — a
