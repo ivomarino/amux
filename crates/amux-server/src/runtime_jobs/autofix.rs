@@ -1580,8 +1580,34 @@ pub(crate) fn detect_latency_at(
                 // The age travels WITH the worst latency, so the evidence line
                 // describes the request the title quotes rather than whichever
                 // row happened to be last.
+                //
+                // `sample` is reassigned here to make that LOCAL (AMUX-3865).
+                // It was already correct: the scan above is `ORDER BY
+                // latency_ms DESC`, so the first row reaching `or_insert_with`
+                // for a group is already that group's worst, and the seed value
+                // and this branch pick the same row. I read the assignment
+                // without the query and filed it as a bug; it was not one.
+                //
+                // Written anyway, because the invariant "every evidence field
+                // describes the request the title quotes" then rests entirely on
+                // an ORDER BY ninety lines away, with nothing next to `sample`
+                // saying so. Changing that clause to `ts DESC` would silently
+                // point `sample_request` at a different request from
+                // `worst_ms`, `arrived_into_process_life` and
+                // `host_load_at_worst`, and no test would notice. One
+                // assignment makes the group's own code carry the property
+                // instead of inheriting it.
+                //
+                // It would bite hardest on a WILDCARD target, which is what
+                // sent me looking: `rl::normalize_target` returns the
+                // route-table entry, so every session verb collapses into
+                // `/api/sessions/{name}/{*verb}` — one group holding `send`
+                // (measured p50 985ms, long by design) and `report` (82,313
+                // rows, mean 21ms). Quoting a slow `report` beside a `send`'s
+                // worst latency would send a reader at the wrong endpoint.
                 if ms > e.worst_ms {
                     e.worst_ms = ms;
+                    e.sample = format!("{method} {path} → {status}");
                     e.worst_since_boot = row_boot.map(|b| ts - b);
                     e.worst_load1 = row_load;
                 }
@@ -7286,6 +7312,76 @@ mod tests {
             !s.iter().any(|x| x.signature == "latency|p95|/api/hist"),
             "120 intact rows need no suppression — this firing means the baseline was eaten: {s:?}"
         );
+    }
+
+    /// Every evidence field must describe the SAME request: the worst one.
+    ///
+    /// `sample_request` sits beside `worst_ms`, `arrived_into_process_life` and
+    /// `host_load_at_worst`, and a reader treats the four as one story. They are
+    /// only one story if `sample` is the worst row, and until AMUX-3865 that
+    /// held because the scan is `ORDER BY latency_ms DESC` rather than because
+    /// anything near `sample` said so.
+    ///
+    /// The specimen is a WILDCARD target, where a mismatch does real damage:
+    /// `normalize_target` collapses every session verb into
+    /// `/api/sessions/{name}/{*verb}`, so one group holds `send` (p50 985ms on
+    /// this fleet, long by design because the send path spaces Escapes >=1.3s)
+    /// and `report` (82,313 rows at a 21ms mean). Quoting the wrong one sends
+    /// the reader at an endpoint that was never slow.
+    ///
+    /// TO SEE THIS FAIL, mutate the `e.sample` assignment in the worst-row
+    /// branch to `String::new()`; the first assertion below then reports an
+    /// empty sample. Verified that way, not assumed.
+    ///
+    /// To see what the assignment BUYS, instead break the ordering the property
+    /// used to rest on: replace the outlier scan's `ORDER BY latency_ms DESC`
+    /// (the `LIMIT 2000` one, above) with an ordering by `ts`. The test still
+    /// passes with the assignment and fails without it. Quote the target with
+    /// its `LIMIT` clause so it is unique in this file, and note that this
+    /// sentence deliberately does not spell the whole string: an earlier
+    /// version of this doc did, which put a second copy in the file and made
+    /// `mutate.sh` refuse its own instructions as an ambiguous revert.
+    #[tokio::test]
+    async fn outlier_evidence_all_describes_the_worst_request_not_merely_the_first_seen() {
+        let (st, _d) = state();
+        let now = unix_now();
+        // Logged report-first and NEWEST-last, so insertion order, timestamp
+        // order and latency order all disagree. Any one of them standing in for
+        // "worst" picks a different row.
+        log_row(&st, Row { ts: now - 300.0, method: "POST", path: "/api/sessions/alpha/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 11_000.0 });
+        log_row(&st, Row { ts: now - 200.0, method: "POST", path: "/api/sessions/beta/send", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 20_000.0 });
+        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/sessions/gamma/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 12_000.0 });
+
+        let (f, _s) = detect_latency_at(&st.store.read().unwrap(), now, None);
+        let card = f
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|POST"))
+            .unwrap_or_else(|| panic!("no outlier finding at all: {f:?}"));
+
+        // FIXTURE GUARD: the three rows must really share ONE group, or this
+        // asserts nothing — a per-verb split would let it pass while proving
+        // the opposite of what it claims to test.
+        assert_eq!(
+            card.count, 3,
+            "all three rows must collapse into one wildcard group for this to mean anything; \
+             got {} in {:?}",
+            card.count, card.signature
+        );
+
+        let ev = |k: &str| {
+            card.evidence.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default()
+        };
+        let sample = ev("sample_request");
+        assert!(
+            sample.contains("/send"),
+            "sample_request must quote the WORST row (the 20s send), got {sample:?}"
+        );
+        assert!(
+            !sample.contains("/report"),
+            "sample_request quoted a report while worst_ms describes the send — the evidence \
+             fields disagree about which request the card is about: {sample:?}"
+        );
+        assert_eq!(ev("worst_ms"), "20000", "worst_ms must be the send's latency");
     }
 
     /// AMUX-3513, rebuilt from the incident's numbers: twelve browser `wait`
