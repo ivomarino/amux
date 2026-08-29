@@ -96,6 +96,11 @@ pub fn routes() -> Router<AppState> {
         // and `share` is its own family that takes any method.
         .route("/{id}/config", axum::routing::patch(config_worker))
         .route("/{id}/share", axum::routing::any(share_worker))
+        // AF-293. These two were filed under CONFIG READS, and they are not
+        // reads: each has a GET arm and a POST arm, so a route mounted with
+        // `get` would promote half a verb. Reclassified to RESOURCE in the doc.
+        .route("/{id}/instructions", axum::routing::any(instructions_worker))
+        .route("/{id}/memory", axum::routing::any(memory_worker))
 }
 
 /// `GET /api/ollama/models` — list locally installed Ollama models by running
@@ -1154,6 +1159,52 @@ async fn resolve_key(state: &AppState, key: String) -> Result<String, Response> 
         Ok(Err(e)) => Err(internal(e)),
         Err(e) => Err(internal(e)),
     }
+}
+
+/// `GET|POST /api/workers/{id}/instructions` — the worker's standing
+/// instructions, read and written.
+pub async fn instructions_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    method: axum::http::Method,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        return crate::api::session_verbs::instructions_get_verb(&name);
+    }
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::instructions_post_verb(&state, &name, &body).await
+}
+
+/// `GET|POST /api/workers/{id}/memory` — the worker's memory file.
+///
+/// NOT the same thing as the `memory` SCOPE capability, which is about which
+/// level a value comes from. This is the file's content.
+pub async fn memory_worker(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    method: axum::http::Method,
+    body_bytes: axum::body::Bytes,
+) -> Response {
+    let name = match resolve_key(&state, key).await {
+        Ok(n) => n,
+        Err(r) => return r,
+    };
+    if method == axum::http::Method::GET || method == axum::http::Method::HEAD {
+        return crate::api::session_verbs::memory_get_verb(&name);
+    }
+    let body = match crate::api::fs::parse_body(&body_bytes) {
+        Ok(v) => v,
+        Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
+    };
+    crate::api::session_verbs::memory_post_verb(&name, &body)
 }
 
 /// `PATCH /api/workers/{id}/config` — edit the worker's env file.
@@ -2281,6 +2332,23 @@ mod tests {
             assert!(
                 !v.to_string().contains(&id),
                 "{verb}: the raw worker id reached the answer: {v}"
+            );
+        }
+
+        // AF-293's pair, both halves each: filed as CONFIG READS and actually
+        // read AND write, so a `get`-only route would have promoted half a verb
+        // and the POST half would have kept falling to the catch-all.
+        for (verb, m) in [
+            ("instructions", "GET"),
+            ("instructions", "POST"),
+            ("memory", "GET"),
+            ("memory", "POST"),
+        ] {
+            let (_, _, v) = send(&app, m, &format!("/api/workers/{id}/{verb}"), Some(json!({}))).await;
+            assert!(
+                !v.to_string().contains(&id),
+                "{verb} {m}: the raw worker id reached the answer, so this half fell to the \
+                 catch-all: {v}"
             );
         }
 

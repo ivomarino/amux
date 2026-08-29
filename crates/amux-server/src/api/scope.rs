@@ -85,6 +85,18 @@ pub struct ScopeCap {
     /// The per-worker "why did I get this value" endpoint. Carried in the
     /// descriptor as documentation (Python keeps it there too and, like us,
     /// never emits it in the read payload).
+    ///
+    /// THREE OF THESE POINT AT AN ENDPOINT THAT ANSWERS 501 (AF-293, measured
+    /// 2026-08-28): `memory` and `rules` name `memory-explain`, `env` names
+    /// `env-explain`, and both verbs return NOT_IMPLEMENTED with a pointer to
+    /// the Python source, calling layered env/memory composition a named
+    /// residual gap. The blast radius is bounded because this field never
+    /// reaches a consumer — nothing in the read payload carries it, verified
+    /// against the live endpoint — so the only reader misled is someone
+    /// reading this table. Said out loud here rather than left for them to
+    /// discover by calling it (ethos rule 6: is the audit trail real, or just
+    /// claimed?). Tracked as its own card; do not "fold" these into /api/scope
+    /// without implementing them, which relocates the gap instead of closing it.
     pub explain: &'static str,
 }
 

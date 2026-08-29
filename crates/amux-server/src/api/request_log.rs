@@ -1109,6 +1109,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/workers/{id}/steer", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/config", methods: &["PATCH"] },
     RouteEntry { path: "/api/workers/{id}/share", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/instructions", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/memory", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/dead-letters", methods: &["GET"] },
     // -- memories / messages / schedules / verify / prefs / criteria
     RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },

@@ -11059,10 +11059,7 @@ async fn get_dispatch(
                 "raw": std::fs::read_to_string(env_path(name)).unwrap_or_default(),
             }))
         }
-        "instructions" => j200(json!({
-            "name": name,
-            "instructions": meta_str(&load_meta(name), "instructions").trim(),
-        })),
+        "instructions" => instructions_get_verb(name),
         "dirty" => {
             let wd = session_work_dir(name);
             let files = if wd.is_empty() { vec![] } else { session_dirty_files(name, &wd).await };
@@ -11159,18 +11156,7 @@ async fn get_dispatch(
             j200(get_claude_stats(cfg.get_or("CC_DIR", "")))
         }
         "git" => git_get(name, subid, qs).await,
-        "memory" => {
-            let mf = mem_file(name);
-            let content = std::fs::read_to_string(&mf).unwrap_or_default();
-            let wd = session_work_dir(name);
-            j200(json!({
-                "content": content,
-                "path": mf.to_string_lossy(),
-                "work_dir": wd,
-                "claude_project": if wd.is_empty() { String::new() } else { project_name(&wd) },
-                "shared_with": memory_shared_with(name),
-            }))
-        }
+        "memory" => memory_get_verb(name),
         "memory-inherited" => {
             let wd = session_work_dir(name);
             let names: Vec<String> = qs_first(qs, "file", "")
@@ -11871,34 +11857,7 @@ async fn post_dispatch(
             None => j200(json!({"ok": false, "message": "nothing to backup"})),
         },
         "send" => send_post(state, name, headers, body).await,
-        "instructions" => {
-            let mut saved = false;
-            if let Some(instr) = body.get("instructions") {
-                let v = instr.as_str().unwrap_or("").trim().to_string();
-                update_meta(name, &[("instructions", json!(v))]);
-                saved = true;
-            }
-            let mut applied = false;
-            if body.get("apply").map(py_truthy).unwrap_or(false) {
-                let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
-                if !instr.is_empty() {
-                    if is_running(name).await {
-                        let _ = send_text(state, name, &instr, false, SendOrigin::Owner).await;
-                    } else {
-                        let st2 = state.clone();
-                        let n = name.to_string();
-                        tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
-                    }
-                    applied = true;
-                }
-            }
-            j200(json!({
-                "ok": true,
-                "instructions": meta_str(&load_meta(name), "instructions").trim(),
-                "saved": saved,
-                "applied": applied,
-            }))
-        }
+        "instructions" => instructions_post_verb(state, name, body).await,
         "keys" => keys_verb(name, body).await,
         "resize" => resize_verb(name, body).await,
         // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
@@ -11906,19 +11865,7 @@ async fn post_dispatch(
         // longer renders — 0 of 50 sessions matched, so the verb was wired
         // end-to-end and reached nobody. The durable replacement is
         // GET .../subagents (AMUX-2635). Resurrection: git log -S agent_nav.
-        "memory" => {
-            let content = body_str(body, "content");
-            let mf = mem_file(name);
-            let _ = std::fs::create_dir_all(memory_dir());
-            if std::fs::write(&mf, content).is_err() {
-                return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write memory file"}));
-            }
-            let wd = session_work_dir(name);
-            if !wd.is_empty() {
-                write_claude_memory(name, &wd);
-            }
-            j200(json!({"ok": true}))
-        }
+        "memory" => memory_post_verb(name, body),
         "git" => {
             let branch = body_str(body, "branch").trim().to_string();
             let create = body.get("create").map(py_truthy).unwrap_or(false)
@@ -12873,6 +12820,77 @@ pub(crate) async fn steer_history_verb(
         row["blocked_reason"] = json!(blocked);
     }
     j200(json!(out))
+}
+
+/// `memory` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/memory` route (AF-293).
+pub(crate) fn memory_post_verb(name: &str, body: &Value) -> Response {
+    let content = body_str(body, "content");
+    let mf = mem_file(name);
+    let _ = std::fs::create_dir_all(memory_dir());
+    if std::fs::write(&mf, content).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write memory file"}));
+    }
+    let wd = session_work_dir(name);
+    if !wd.is_empty() {
+        write_claude_memory(name, &wd);
+    }
+    j200(json!({"ok": true}))
+}
+
+/// `instructions` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/instructions` route (AF-293).
+pub(crate) async fn instructions_post_verb(state: &AppState, name: &str, body: &Value) -> Response {
+    let mut saved = false;
+    if let Some(instr) = body.get("instructions") {
+        let v = instr.as_str().unwrap_or("").trim().to_string();
+        update_meta(name, &[("instructions", json!(v))]);
+        saved = true;
+    }
+    let mut applied = false;
+    if body.get("apply").map(py_truthy).unwrap_or(false) {
+        let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
+        if !instr.is_empty() {
+            if is_running(name).await {
+                let _ = send_text(state, name, &instr, false, SendOrigin::Owner).await;
+            } else {
+                let st2 = state.clone();
+                let n = name.to_string();
+                tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
+            }
+            applied = true;
+        }
+    }
+    j200(json!({
+        "ok": true,
+        "instructions": meta_str(&load_meta(name), "instructions").trim(),
+        "saved": saved,
+        "applied": applied,
+    }))
+}
+
+/// `memory` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/memory` route (AF-293).
+pub(crate) fn memory_get_verb(name: &str) -> Response {
+    let mf = mem_file(name);
+    let content = std::fs::read_to_string(&mf).unwrap_or_default();
+    let wd = session_work_dir(name);
+    j200(json!({
+        "content": content,
+        "path": mf.to_string_lossy(),
+        "work_dir": wd,
+        "claude_project": if wd.is_empty() { String::new() } else { project_name(&wd) },
+        "shared_with": memory_shared_with(name),
+    }))
+}
+
+/// `instructions` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/instructions` route (AF-293).
+pub(crate) fn instructions_get_verb(name: &str) -> Response {
+    j200(json!({
+        "name": name,
+        "instructions": meta_str(&load_meta(name), "instructions").trim(),
+    }))
 }
 
 /// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`

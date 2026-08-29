@@ -44,10 +44,11 @@ action literal from any other literal. `done` is the more dangerous: an earlier
 revision carried it under DUPLICATE with "survivor: `PATCH /api/workers/{id}`" — a
 plausible-sounding verdict about a verb that was never there.
 
-## ALREADY PROMOTED (12)
+## ALREADY PROMOTED (16)
 
 `start` · `stop` · `peek` · `send` · `duplicate` · `wake` · `reset` · `clear` ·
-`resize` · `keys` · `report` · `steer` — first-class routes today. They still resolve through
+`resize` · `keys` · `report` · `steer` · `config` · `share` · `instructions` ·
+`memory` — first-class routes today. They still resolve through
 the catch-all as well, so they are listed for completeness.
 
 `send` landed on AF-202; the rest on AF-288 (a474bbc4, 6ec23d21 and the `report`
@@ -176,13 +177,38 @@ promoting it onto the worker would be the ninth-thing-that-re-expresses-the-prim
 **No verb here is promoted until that pass runs with the actual callers in hand.**
 Deferring with the deciding question stated is a verdict; deferring silently is not.
 
-## CONFIG READS — fold into the scope API. (5)
+## CONFIG READS — fold into the scope API. (3 left, and 2 were not reads)
 
 `memory` · `memory-inherited` · `memory-explain` · `env-explain` · `instructions`
 
 These read per-scope config, which the uniform scope read/write endpoint already
 exists for (`api/mod.rs`, AMUX-2608). Route them there rather than giving the worker
 five bespoke config verbs.
+
+### `instructions` and `memory` were NOT reads, and are promoted (AF-293)
+
+Each has a GET arm in `get_dispatch` AND a POST arm in `post_dispatch`:
+`instructions` reads and writes `meta.instructions`, `memory` reads the memory
+file and writes it plus the project CLAUDE.md. Filing them under CONFIG READS put
+a write in a read bucket, and a route mounted with `get` would have promoted half
+a verb while the POST half kept falling to the catch-all. Both are now `any`.
+
+`memory` the VERB is also not `memory` the SCOPE CAPABILITY. The capability is
+about which level a value comes from; the verb is the file's content. Same word,
+two surfaces, and the fold verdict came from reading the word.
+
+### The remaining three are scope's OWN explain surface, and two of them 501
+
+`env-explain` and `memory-explain` are not verbs waiting to be folded somewhere.
+They are what `SCOPE_CAPS` already points at: the `explain` field on the `memory`,
+`rules` and `env` capabilities names them as the per-worker "why did I get this
+value" endpoint. Both answer 501 NOT_IMPLEMENTED today. `memory-inherited` is the
+genuine read of the layered composition those two would explain.
+
+So the verdict "fold into the scope API" is right and incomplete: scope already
+claims them. Folding without implementing moves a 501 behind a different URL. The
+claim is now stated in the descriptor itself rather than left for a caller to
+find (ethos rule 6).
 
 ## GUARDS — reachable ONLY through the catch-all. PROMOTED, 0 left. (2)
 
