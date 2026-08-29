@@ -325,7 +325,34 @@ def _content_is_committed(top, rel):
             ["git", "-C", top, "log", "--all", "--format=%H", "--find-object", blob,
              "--", rel],
             capture_output=True, text=True, timeout=30)
-        return out.returncode == 0 and bool(out.stdout.strip())
+        if out.returncode != 0 or not out.stdout.strip():
+            return False
+        # A RESTORE OVERWRITES CONTENT *AND MODE*, and this check only compared
+        # content (amux-frustrations' review of AMUX-3859, two repros). A file
+        # can be modified without its bytes changing, so a matching blob is not
+        # sufficient:
+        #
+        #   chmod +x run.sh          :100644 100755 ... M   -> exec bit reverted
+        #   symlink -> regular file  :120000 100644 ... T   -> symlink restored
+        #
+        # Neither is unsaved keystrokes, so the original sentence stayed
+        # technically true while the guard's PROMISE — "a restore destroys
+        # nothing" — became false. Ask git for the mode pair instead of
+        # reasoning about it: `git diff --raw` reports old and new mode, and a
+        # difference means the restore would overwrite an uncommitted change git
+        # itself is calling modified. Catches M and T together.
+        raw = subprocess.run(["git", "-C", top, "diff", "--raw", "--", rel],
+                             capture_output=True, text=True, timeout=10)
+        if raw.returncode != 0:
+            return False
+        line = (raw.stdout.strip().splitlines() or [""])[0]
+        if line:
+            parts = line.split()
+            if len(parts) < 2:
+                return False          # unparseable -> fail closed, like everything here
+            if parts[0].lstrip(":") != parts[1]:
+                return False          # mode or type change: the restore would revert it
+        return True
     except Exception:
         return False
 
