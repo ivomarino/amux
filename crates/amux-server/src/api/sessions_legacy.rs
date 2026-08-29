@@ -1766,7 +1766,30 @@ pub async fn list_sessions_legacy(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    match legacy_sessions_array(&state.store) {
+    // OFF THE ASYNC RUNTIME (AF-300). `legacy_sessions_array` is synchronous and
+    // shells out — `tmux list-sessions`, two `tmux list-panes`, and a `pgrep`
+    // PER SESSION — so awaiting it inline blocks a tokio WORKER thread, and
+    // there are only as many of those as CPUs. On 2026-08-28 eight concurrent
+    // requests from one iPhone each ran ~696s (18:17:19 -> 18:28:58); while
+    // they held worker threads, every other read failed `timed out waiting for
+    // connection` at 30s — 22 x 500 across /api/sessions, /api/board,
+    // /api/board/statuses and /api/board/session-gates, all dashboard UAs. The
+    // same burst happened on 08-24 (29 rows). This is the most-polled endpoint
+    // in the system (81,935 requests in 24h), so it is the worst possible place
+    // to block on a subprocess.
+    //
+    // `spawn_blocking` moves it to the blocking pool (512 threads by default),
+    // where a hung tmux costs one pool thread instead of starving the runtime.
+    // NOT A NEW PATTERN: api/graph.rs:123 already calls this exact function this
+    // exact way. The fix existed on the LOW-traffic caller and was missing on
+    // the hot one.
+    //
+    // It does not stop a single request taking 11 minutes — the four unbounded
+    // `.output()` calls in this file are AF-301 — but it stops one client's slow
+    // request from taking the server down for everyone else.
+    let store = state.store.clone();
+    let built = tokio::task::spawn_blocking(move || legacy_sessions_array(&store)).await;
+    match built.unwrap_or_else(|e| Err(anyhow::anyhow!("sessions build panicked: {e}"))) {
         Ok(json) => {
             let body = filter_isolated_for_peer(&json, &headers);
             // CONTENT-hash ETag (AMUX-3504), not a store-rev one: this payload
