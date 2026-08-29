@@ -160,8 +160,14 @@ async fn poll_once(client: &reqwest::Client, token: &str, state: &AppState) -> R
         handle_update(state, update).await;
     }
     if max_update_id > offset {
-        let conn = state.store.read().map_err(|e| e.to_string())?;
-        tg_db::set_last_update_id(&conn, max_update_id).map_err(|e| e.to_string())?;
+        state
+            .store
+            .write_async(move |conn| {
+                tg_db::set_last_update_id(conn, max_update_id)?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -196,9 +202,13 @@ async fn handle_update(state: &AppState, update: &Value) {
         return;
     };
 
-    if let Ok(conn) = state.store.read() {
-        let _ = tg_db::touch_last_message(&conn, chat_id);
-    }
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            tg_db::touch_last_message(conn, chat_id)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
 
     let who = username.as_deref().unwrap_or("telegram");
     let stamped = format!("[from Telegram @{who}]: {text}");
@@ -232,15 +242,18 @@ async fn link_chat(state: &AppState, chat_id: i64, session: &str, username: Opti
         .await;
         return;
     }
-    let stored = {
-        let Ok(conn) = state.store.read() else {
-            send_reply(chat_id, "Internal error linking — try again.").await;
-            return;
-        };
-        tg_db::upsert(&conn, chat_id, session, username)
-    };
+    let session_owned = session.to_string();
+    let username_owned = username.map(str::to_string);
+    let stored = state
+        .store
+        .write_async(move |conn| {
+            tg_db::upsert(conn, chat_id, &session_owned, username_owned.as_deref())?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .map_err(|e| e.to_string());
     match stored {
-        Ok(()) => send_reply(chat_id, &format!("Linked. Messages here now go to '{session}'.")).await,
+        Ok(_) => send_reply(chat_id, &format!("Linked. Messages here now go to '{session}'.")).await,
         Err(e) => {
             tracing::warn!("telegram_poll: link write failed for chat {chat_id}: {e}");
             send_reply(chat_id, "Internal error linking — try again.").await;

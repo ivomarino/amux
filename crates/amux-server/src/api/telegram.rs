@@ -87,23 +87,34 @@ async fn create_mapping(State(state): State<AppState>, Json(body): Json<CreateMa
             json!({ "error": "no such session", "session": body.session, "known": known }),
         );
     }
+    let chat_id = body.chat_id;
+    let session = body.session.clone();
     let result = state
         .store
-        .read()
-        .map_err(|e| e.to_string())
-        .and_then(|conn| tg_db::upsert(&conn, body.chat_id, &body.session, None).map_err(|e| e.to_string()));
+        .write_async(move |conn| {
+            tg_db::upsert(conn, chat_id, &session, None)?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await
+        .map_err(|e| e.to_string());
     match result {
-        Ok(()) => (StatusCode::OK, Json(json!({ "chat_id": body.chat_id, "session": body.session }))).into_response(),
+        Ok(_) => (StatusCode::OK, Json(json!({ "chat_id": body.chat_id, "session": body.session }))).into_response(),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     }
 }
 
 async fn delete_mapping(State(state): State<AppState>, Path(chat_id): Path<i64>) -> Response {
-    match state.store.read().map_err(|e| e.to_string()).and_then(|conn| {
-        tg_db::remove(&conn, chat_id).map_err(|e| e.to_string())
-    }) {
-        Ok(true) => StatusCode::NO_CONTENT.into_response(),
-        Ok(false) => err(StatusCode::NOT_FOUND, json!({ "error": "no mapping for that chat_id" })),
+    let result = state
+        .store
+        .write_async(move |conn| {
+            let removed = tg_db::remove(conn, chat_id)?;
+            Ok(crate::db::WriteOutcome { applied: removed, events: vec![] })
+        })
+        .await
+        .map_err(|e| e.to_string());
+    match result {
+        Ok(reply) if reply.applied => StatusCode::NO_CONTENT.into_response(),
+        Ok(_) => err(StatusCode::NOT_FOUND, json!({ "error": "no mapping for that chat_id" })),
         Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e })),
     }
 }
