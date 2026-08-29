@@ -1,7 +1,7 @@
 ---
-description: Use when you need to interact with the amux system — manage board tasks, check sessions, send emails, automate browsers, or work with CRM contacts
+description: Use when you need to interact with the amux system — manage board tasks, check sessions, send emails, message via Telegram, automate browsers, or work with CRM contacts
 allowed-tools: Bash, Read, Edit, Write
-argument-hint: [board|memory|sessions|schedule|notes|email|browser|crm|help] [args...]
+argument-hint: [board|memory|sessions|schedule|notes|email|telegram|browser|crm|help] [args...]
 ---
 
 # /amux — amux Session Integration
@@ -187,6 +187,63 @@ curl -sk $AMUX_URL/api/email/events
 
 ---
 
+## Telegram
+
+Bot connector — **inbound** via long-polling
+(`runtime_jobs::telegram_poll`; `GET /api/telegram/status` reports
+last-poll time/error and routing counts), **outbound** via
+`POST /api/telegram/send`. The bot token itself is a connector credential
+(`api/connectors.rs`'s `telegram` row, `TELEGRAM_BOT_TOKEN` env — set it via
+`POST /api/connectors/telegram/credentials`), not managed by this section.
+
+**Linking a chat to a session** happens two ways:
+- From Telegram itself: send `/link <session-name>` to the bot in that chat.
+  The bot validates the session exists (against the live lane list) and
+  confirms in-chat.
+- From the API — e.g. pre-linking a `chat_id` found via Telegram's own
+  `getUpdates` before the bot has received anything from it:
+  `POST /api/telegram/mappings`.
+
+Once linked, any other text sent to the bot in that chat is routed into the
+mapped session, stamped `[from Telegram @username]: ...` so the session can
+tell a Telegram message apart from other input arriving in its pane. A chat
+that sends text before linking gets a one-line nudge back (`/link
+<session-name>` first), never silently dropped.
+
+```bash
+curl -sk $AMUX_URL/api/telegram/status                          # bot_token_set, mapping_count, last_poll_at, last_error, messages_routed/unlinked
+curl -sk $AMUX_URL/api/telegram/mappings                        # list chat<->session links
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"chat_id":123456,"session":"SESSION_NAME"}' \
+  $AMUX_URL/api/telegram/mappings                                # manually link a chat_id to a session
+curl -sk -X DELETE $AMUX_URL/api/telegram/mappings/CHAT_ID        # unlink
+
+# Outbound: session -> Telegram. Exactly one of session (resolved to its
+# most-recently-linked chat) or chat_id.
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"session":"SESSION_NAME","text":"your message"}' \
+  $AMUX_URL/api/telegram/send
+```
+
+**A session's outbound target is whichever chat linked it most recently** —
+if two chats `/link` the same session, the newer link wins for
+`{"session":...}` sends (both chats still deliver inbound either way
+regardless). Pass `chat_id` directly in `/send` to disambiguate or to reach
+a chat that never linked a session at all.
+
+There is no automatic "every session message also goes to Telegram" wiring —
+`POST /api/telegram/send` is an explicit call a session or hook makes, not a
+background forwarder (ethos rule 8: which events go to which chat is the
+operator's call, not a default this connector should assume).
+
+If `/link` or a manual mapping ever comes back with a write/database error,
+that is a real bug, not transient contention — every DB write in this
+codebase goes through the single writer thread (`Store::write_async`, see
+`db/mod.rs`); a `state.store.read()` connection has `query_only=ON`
+permanently and cannot legitimately succeed on retry where it just failed.
+
+---
+
 ## Browser Automation
 
 **Live backend** — same verbs, executed in YOUR real Chrome (real logins, real IP). Opens a NEW tab (never touches existing tabs); first use needs one "Allow debugging?" click. Use when acting-as-you matters (SSO dashboards, bot-walled sites); the default profile backend is for parallel/unattended work.
@@ -260,6 +317,7 @@ amux crm fu
 - Document / reference → `/api/memories` (see Notes section above)
 - Task / action item → `/api/board`
 - Recurring automation → `/api/schedules`
+- Telegram chat <-> session link, or a message out to Telegram → `/api/telegram/*`
 
 ---
 
@@ -286,6 +344,7 @@ Parse the arguments to determine what the user wants:
 - **`schedule add <title>`** → create a new schedule interactively
 - **`notes`** → list notes
 - **`email send`** → compose and send an email
+- **`telegram`** → Telegram bot status / link a chat to a session / send a message via `/api/telegram`
 - **`browser`** → browser automation help
 - **`crm`** → CRM operations
 - **`help`** or empty → show a brief summary of available /amux commands and APIs
