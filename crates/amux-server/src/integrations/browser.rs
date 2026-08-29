@@ -336,11 +336,6 @@ pub fn running_all() -> Vec<(String, String, i64, u32, u16)> {
     v
 }
 
-/// Is ANY browser running? Used only where the question is genuinely
-/// "is Chrome up at all", never as a stand-in for "is this profile taken".
-pub fn any_running() -> bool {
-    !RUNNING.lock().expect("browser registry poisoned").is_empty()
-}
 
 /// Why the last browser is gone (AMUX-3414: a silent Chrome exit left NOTHING
 /// on record — no API call in the window, no exit reason anywhere, and two
