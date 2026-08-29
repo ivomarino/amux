@@ -130,9 +130,41 @@ else
 #
 # Lowest precedence of cargo's three: CARGO_TARGET_DIR and --target-dir still
 # override it, which is what keeps the e2e worktree build and CI unaffected.
+#
+# incremental=false (FRONT-2, 2026-08-28): cargo's default parallelism (=
+# nproc) correlated with repeated session crashes on one memory-constrained
+# box in this fleet — every tmux session in a shared checkout lives in the
+# same container, so a kill under memory pressure is not necessarily the
+# build's own process; it can reap an unrelated session's Claude Code
+# process as collateral. Measured the actual culprit rather than guessing:
+# with incremental compilation on, a bare \`cargo check -p amux-server\`
+# drove available memory to ~48MiB and crashed the session; with
+# CARGO_INCREMENTAL=0, the identical check completed clean at ~195MiB
+# available. Incremental trades memory for faster rebuilds by keeping extra
+# state between runs — on a box this size that trade isn't affordable.
+# Costs slower rebuilds everywhere, but that cost doesn't scale with fleet
+# size the way serializing every lane's build would, so it applies
+# unconditionally rather than behind a knob.
 [build]
 target-dir = "$SHARED_TARGET_DIR"
+incremental = false
 EOF
+  # jobs cap: opt-in, NOT unconditional like incremental above. Cargo's
+  # default (jobs = nproc) is correct almost everywhere in this fleet — one
+  # constrained box needing jobs=1 does not mean every box should serialize.
+  # The pre-commit hook runs `cargo check --workspace --all-targets` on
+  # every commit across ~50 shared-checkout lanes; hardcoding jobs=1 here
+  # would take that gate from N-way to 1-way parallelism for all of them on
+  # boxes with no memory pressure at all — a permanent, fleet-wide cost to
+  # fix a condition that exists on one box. Same shape this repo already
+  # uses for other machine-specific policy constants (AMUX_HELPER_MODEL,
+  # AMUX_OLLAMA_DEFAULT_MODEL, deviation D4): env-overridable, so a
+  # constrained box sets it once (`AMUX_CARGO_JOBS=1 ./install.sh`) and
+  # nobody else pays for it.
+  if [[ -n "${AMUX_CARGO_JOBS:-}" ]]; then
+    printf 'jobs = %s\n' "$AMUX_CARGO_JOBS" >> "$SCRIPT_DIR/.cargo/config.toml"
+    say "cargo config: jobs capped at $AMUX_CARGO_JOBS (AMUX_CARGO_JOBS set)"
+  fi
   say "cargo config: builds in this checkout target $SHARED_TARGET_DIR"
 fi
 
