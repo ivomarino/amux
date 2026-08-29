@@ -775,7 +775,51 @@ you could not see. This one is about believing a POSITIVE you could not see, and
 tell is identical — output that ends in success while the interesting half is gone.
 
 And before blaming an instrument for silence, check whether the instrument recorded
-itself. This one did, in a table, and the query took one line.
+itself. This one did, in a table, and the query took one line. The list of instruments
+here that persist their own verdicts, so far: `guard_verdicts` (every staged-guard
+decision with its counts), `_amux_migrations` (what actually applied, by version),
+`_amux_invariant_result` (every evaluation with its verdict), `session_events` (which
+settled a 24h-vs-1h dispute outright, because the nudge's own firing was in there with
+its card ids), `steering_queue.queued_at` (how long a delivery has really been pending,
+which no log line carries), and the builder's `rust-build-stamp` beside its log, which
+separates "did not build" from "built something else". Reasoning about any of these
+from stdout is a choice to use the worse source.
+
+## The sibling class: a check that ran in full and still could not answer
+
+Truncation hides output you DID have. This one is the opposite cause with the same
+symptom: the check ran completely, nothing was hidden, and the question was too small.
+It is the worse of the two, because there is no missing output to go looking for. The
+green is real; it is just green about something narrower than you think.
+
+Four specimens, two lanes, one day:
+
+- **A trigger I wrote myself.** AF-204 retires the `/api/workers` catch-all. Its
+  trigger read "every RESOURCE verb has its own route", and the card said, in writing,
+  that this was *checkable in one command rather than by judgement*. It was. It became
+  true. It fired, and auto-pickup delivered the card as ready while the catch-all still
+  served 29 verbs across five other categories, whose deletion would also have broken
+  the bare-PATCH alias onto `config`.
+- **A guard assertion.** `every_arm_that_prescribes_a_restore...` asserted
+  `m.contains(guard)` per arm: "this arm mentions the guard at least once", not "every
+  prescription is guarded". A sibling occurrence in the same message satisfied it, and
+  a mutation of one of six production strings stayed green across 41 tests.
+- **A cycle assertion.** A seen-set test asserted the walk TERMINATES (necessary) and
+  not that it DEDUPES (sufficient). Deleting the seen-set left the suite green.
+- **The counter-example, and it is the useful one.** `is_pool_exhaustion` shipped with
+  a control asserting that two unrelated 500s stay two cards. Its author says they wrote
+  it only because they had been mutation-tested that morning. The habit transferred
+  between lanes in hours; it was not present the day before.
+
+**Mechanising a check makes it repeatable, not correct.** That is the whole trap, and
+"checkable in one command rather than by judgement" is the sentence to distrust,
+because it sounds like rigour. A trigger that needs judgement and SAYS so is more
+honest than a green one-liner testing a corner of the condition.
+
+The operational form, which is ethos rule 4 pointed at your own check: name what your
+check CANNOT express, in the same breath as what it can. A necessary condition stated
+as a necessary condition is useful. The failure is only ever in reading it as the
+whole answer.
 
 So the pair, and both halves are needed:
 - For a search: print what it matched, not only what it concluded.
