@@ -8045,7 +8045,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.752';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.753';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -10227,6 +10227,38 @@ function retryCardFile(name, idx) {
   const f = (_cardFiles[name] || [])[idx];
   if (!f || f.inflight || f.path) return;
   _runUpload(f, _cardSink(name));
+}
+
+/// Clear the composer: text, the saved draft, and any staged attachments.
+///
+/// CLEARS THE DRAFT, NOT JUST THE BOX. Blanking `inp.value` alone leaves
+/// `_draftGet(session)` holding the text, and the next open puts it back — which
+/// is the ghost AMUX-3388 was about, where an already-sent message reappeared
+/// and got sent twice. The comment above `_draftGet` says drafts live in ONE
+/// place precisely so a clear cannot hit one store and miss another; this uses
+/// that one place.
+///
+/// Attachments go too, because a "clear" that silently left files staged would
+/// put them on the NEXT message, which is a worse surprise than losing them. The
+/// toast names what went so it is not silent either way. This is the same
+/// four-step sequence the send path uses, deliberately: the composer has exactly
+/// one notion of "emptied", and two spellings of it would drift.
+function _peekClearInput() {
+  const inp = document.getElementById('peek-cmd-input');
+  if (!inp) return;
+  const hadText = (inp.value || '').trim().length > 0;
+  const nFiles = (typeof peekFiles !== 'undefined' && peekFiles) ? peekFiles.length : 0;
+  if (!hadText && !nFiles) { showToast('Composer is already empty'); return; }
+  inp.value = '';
+  inp.style.height = 'auto';
+  _draftClear(peekSession);
+  if (nFiles) clearPeekFiles();
+  try { inp.focus(); } catch (e) {}
+  showToast(
+    nFiles
+      ? `Cleared${hadText ? ' input and' : ''} ${nFiles} attachment${nFiles === 1 ? '' : 's'}`
+      : 'Cleared input'
+  );
 }
 
 function clearPeekFiles() {

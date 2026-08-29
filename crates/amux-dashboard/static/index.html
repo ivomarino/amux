@@ -2196,6 +2196,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
             <button type="button" onclick="_peekMoreClose();_readLatestMessage(peekSession)" title="Read the worker's most recent full message aloud">&#x1F50A; Read aloud latest</button>
             <button type="button" onclick="_peekMoreClose();setPeekTab('readalouds')">&#x1F50A; Read-aloud history</button>
+            <!-- Last, and separated: the only DESTRUCTIVE entry in this menu.
+                 Everything above opens something; this throws work away, so it
+                 does not sit where a thumb lands by accident reaching for
+                 "Attach file" at the top. -->
+            <button type="button" class="peek-more-danger" onclick="_peekMoreClose();_peekClearInput()" title="Clear the composer: text, saved draft, and any staged attachments">&#x1F5D1; Clear input</button>
           </div>
           <!-- Compact recording popup: live volume bars + timer, right above the
                composer. Stop → transcribe → text lands in the input. -->

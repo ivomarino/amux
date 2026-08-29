@@ -1999,6 +1999,19 @@
     background: none; border: none; color: var(--text); font-size: 0.85rem; padding: 9px 10px;
     border-radius: 6px; cursor: pointer; white-space: nowrap; -webkit-tap-highlight-color: transparent; }
   .peek-more-menu button:hover { background: var(--bg); }
+  /* The one destructive entry. A rule above it rather than a colour alone,
+     because on the phone this menu is a thumb-sized stack of near-identical
+     rows and "Clear input" is the only one that throws work away. The tint is
+     deliberately mild: this is not an error state, it is a reminder to aim. */
+  .peek-more-menu button.peek-more-danger { color: var(--red, #d9534f); margin-top: 4px;
+    padding-top: 11px; border-top: 1px solid var(--border); border-radius: 0 0 6px 6px; }
+  .peek-more-menu button.peek-more-danger:hover { background: rgba(217,83,79,0.12); }
+  /* 44px touch targets on the phone (.claude/rules/css-mobile.md). The desktop
+     padding gives ~34px, which is under the minimum on exactly the surface this
+     menu is mostly used from. */
+  @media (max-width: 600px) {
+    .peek-more-menu button { min-height: 44px; padding: 11px 12px; }
+  }
   /* Expand-to-fullscreen affordance inside the input's top-right corner */
   #peek-cmd-input { padding-right: 30px; }
   .peek-input-expand { position: absolute; top: 5px; right: 5px; z-index: 3; line-height: 1;
