@@ -240,6 +240,11 @@ pub async fn tick(state: AppState) -> (usize, usize, usize) {
                     gate: vec![],
                     depends_on: vec![],
                     tags: vec![DISPOSITION_TAG.to_string()],
+                    // Not an ask: this producer files ordinary cards, and a card
+                    // filed into needsyou without one is what AMUX-3929 is about.
+                    ask_type: None,
+                    ask_question: None,
+                    ask_unblocks: None,
                 };
                 let _ = state
                     .store

@@ -2055,6 +2055,16 @@ pub struct NewIssue {
     pub gate: Vec<String>,
     pub depends_on: Vec<String>,
     pub tags: Vec<String>,
+    /// The typed ask, for a card FILED straight into `needsyou` (AMUX-3929).
+    ///
+    /// The insert used to omit these three columns entirely, so a create that
+    /// supplied a perfectly good ask stored NULL and the card landed in the
+    /// untyped population it was trying to stay out of. The create-side gate
+    /// that now demands them would otherwise be demanding data it discards,
+    /// which is worse than the hole it closes.
+    pub ask_type: Option<String>,
+    pub ask_question: Option<String>,
+    pub ask_unblocks: Option<String>,
 }
 
 /// Insert a new card, replicating the Python POST exactly: id minted from
@@ -2083,9 +2093,10 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
     conn.execute(
         "INSERT INTO issues (id, title, \"desc\", status, session, shepherd, type, creator, \
              due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on, \
+             ask_type, ask_question, ask_unblocks, \
              notified, pinned, archived, rev, version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             0, 0, 0, 0, 0)",
+             ?18, ?19, ?20, 0, 0, 0, 0, 0)",
         params![
             id,
             new.title,
@@ -2104,6 +2115,9 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             gate_json,
             new.reviewer,
             dep_json,
+            new.ask_type.as_deref().filter(|x| !x.trim().is_empty()),
+            new.ask_question.as_deref().filter(|x| !x.trim().is_empty()),
+            new.ask_unblocks.as_deref().filter(|x| !x.trim().is_empty()),
         ],
     )?;
     for tag in &new.tags {
@@ -3004,6 +3018,9 @@ mod tests {
             gate: vec![],
             depends_on: vec![],
             tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
         }
     }
 

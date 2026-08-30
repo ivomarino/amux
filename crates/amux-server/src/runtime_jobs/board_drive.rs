@@ -412,6 +412,11 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
         gate: vec![],
         depends_on: vec![],
         tags: vec!["nudge:escalated".to_string()],
+        // Not an ask: this producer files ordinary cards, and a card
+        // filed into needsyou without one is what AMUX-3929 is about.
+        ask_type: None,
+        ask_question: None,
+        ask_unblocks: None,
     };
     let l = lane.to_string();
     let _ = state

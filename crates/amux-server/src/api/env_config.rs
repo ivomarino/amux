@@ -649,6 +649,10 @@ async fn apply(
                         gate: vec![],
                         depends_on: vec![],
                         tags: vec![],
+                        // Not an ask: this producer files ordinary cards.
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
                     };
                     let row = crate::db::board_store::create_issue(conn, &new, now)?;
                     if !epic.is_empty() {

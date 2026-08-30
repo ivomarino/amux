@@ -1384,6 +1384,11 @@ impl Runtime {
                         } else {
                             vec![]
                         },
+                        // Not an ask: this producer files ordinary cards, and a card
+                        // filed into needsyou without one is what AMUX-3929 is about.
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
                     },
                     now.timestamp(),
                 )?;
@@ -1927,6 +1932,9 @@ mod adherence_tests {
                         gate: vec![],
                         depends_on: vec![],
                         tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
                     },
                     1_700_000_000,
                 )?;

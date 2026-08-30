@@ -2192,6 +2192,69 @@ const VALID_STATUSES: [&str; 11] = [
 
 // ---- POST /api/board -----------------------------------------------------
 
+/// The typed-ask refusal, for BOTH doors into `needsyou` (AMUX-3929).
+///
+/// The transition gate shipped first and worked: `amux board status <id>
+/// needsyou` and `PATCH {"status":"needsyou"}` are both refused without a typed
+/// ask. CREATION was never gated, and creation is the door most of this traffic
+/// uses — "I found something the human must decide" is naturally expressed by
+/// filing the card already parked, not by filing it in `todo` and moving it.
+///
+/// Measured by mixpeek-general on the live board: 491 in `needsyou`, 68 typed,
+/// 423 untyped (86%), untyped median age 16 days, oldest 59. Still leaking at
+/// the time of measurement — 13 untyped created in 24h against 15 typed, 40 in
+/// 72h, 106 in 7d — across every lane (backend 53, amux 53, ts-gke 41,
+/// gtm-engine 39, ETHAN 33), which is what makes it the API and not a habit.
+///
+/// ONE BUILDER, TWO CALLERS, on purpose. A second copy of this vocabulary would
+/// drift from the first, and the caller must learn the SAME contract at whichever
+/// door they arrive at — a create-path message that differed from the
+/// transition-path message would teach two contracts for one rule.
+fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>) -> Response {
+    let (why, code) = match verdict {
+        bs::AskVerdict::NoType => (
+            "This card does not say what KIND of human act it is waiting on. 86% of the cards already parked here are not blocked on a human at all (423 of 491, live, untyped median age 16 days) — they are work someone stopped doing, and they are why the real asks go unanswered.",
+            "needsyou_requires_ask_type",
+        ),
+        bs::AskVerdict::UnknownType => (
+            "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
+            "needsyou_ask_type_unknown",
+        ),
+        bs::AskVerdict::NoQuestion => (
+            "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
+            "needsyou_ask_has_no_question",
+        ),
+        bs::AskVerdict::NoUnblocks => (
+            "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
+            "needsyou_ask_has_no_exit",
+        ),
+        bs::AskVerdict::Ok => unreachable!("Ok is not a refusal"),
+    };
+    tracing::warn!(
+        "needsyou_ask_gate: blocked {} -> needsyou for session {} (verdict {:?})",
+        id,
+        session.unwrap_or("-"),
+        verdict
+    );
+    err(
+        StatusCode::CONFLICT,
+        json!({
+            "error": "needsyou requires a typed ask",
+            "code": code,
+            "ok": false,
+            "blocked": true,
+            "item": id,
+            "why": why,
+            "ask_types": bs::ASK_TYPES,
+            "how_to_fix": {
+                "fields": "ask_type (one of the five), ask_question (the question, in a sentence), ask_unblocks (what ends the block).",
+                "cli": "amux board needsyou <ID> --ask-type <type> --ask-question \"...\" --ask-unblocks \"...\"",
+                "not_an_ask": "If nobody is actually waiting on a person, this is not a needsyou card — put it back in todo/backlog, or discard it.",
+            },
+        }),
+    )
+}
+
 pub async fn create_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2225,6 +2288,29 @@ pub async fn create_item(
     };
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
+    // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
+    // held — `PATCH {"status":"needsyou"}` and `amux board status <id> needsyou`
+    // are both refused — while `POST {"status":"needsyou"}` returned 201 with
+    // ask_type NULL. Reproduced before fixing: the same card refused on PATCH
+    // that had just been created in that state.
+    //
+    // `force` is not read here: creation has no `force` parameter and inventing
+    // one would add a bypass the transition door does not have.
+    if bs::parse_status(&status_in) == Some(TaskStatus::NeedsYou) {
+        let session_for_gate = body_str(&map, "session")
+            .or_else(|| Some(actor_from_headers(&headers).1))
+            .filter(|s| !s.trim().is_empty());
+        if bs::needsyou_ask_required(session_for_gate.as_deref()) {
+            let verdict = bs::ask_verdict(
+                body_str(&map, "ask_type").unwrap_or_default().as_str(),
+                body_str(&map, "ask_question").unwrap_or_default().as_str(),
+                body_str(&map, "ask_unblocks").unwrap_or_default().as_str(),
+            );
+            if verdict != bs::AskVerdict::Ok {
+                return needsyou_ask_refusal(verdict, "(new card)", session_for_gate.as_deref());
+            }
+        }
+    }
     // AMUX-2609: a status outside the typed vocabulary may still be a real
     // user-created column. The `statuses` table is the vocabulary for those —
     // see the long note in `patch_item` for why `TaskStatus` stays closed.
@@ -2406,6 +2492,9 @@ pub async fn create_item(
         gate,
         depends_on,
         tags,
+        ask_type: body_str(&map, "ask_type"),
+        ask_question: body_str(&map, "ask_question"),
+        ask_unblocks: body_str(&map, "ask_unblocks"),
     };
 
     enum Out {
@@ -6435,6 +6524,9 @@ mod slim_tests {
             gate: vec![],
             depends_on: vec![],
             tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
         }
     }
 

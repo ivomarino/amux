@@ -594,6 +594,11 @@ async fn tick(state: AppState) {
                 gate: vec![],
                 depends_on: vec![],
                 tags: vec!["disk".into(), "reclaim".into()],
+                // Not an ask: this producer files ordinary cards, and a card
+                // filed into needsyou without one is what AMUX-3929 is about.
+                ask_type: None,
+                ask_question: None,
+                ask_unblocks: None,
             };
             let row = bs::create_issue(conn, &new, crate::api::reclaim::now_secs())?;
             conn.execute(

@@ -5787,6 +5787,11 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                 gate: vec![],
                 depends_on: vec![],
                 tags: vec!["autofix".into(), format!("detector:{kind_slug}")],
+                // Not an ask: this producer files ordinary cards, and a card
+                // filed into needsyou without one is what AMUX-3929 is about.
+                ask_type: None,
+                ask_question: None,
+                ask_unblocks: None,
             };
             let row = bs::create_issue(conn, &new, now_s)?;
             conn.execute(

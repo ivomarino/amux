@@ -1598,6 +1598,87 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
     assert_eq!(v["status"], json!("done"));
 }
 
+/// AMUX-3929, reported and measured by mixpeek-general. The typed-ask gate held
+/// on the TRANSITION door and creation walked past it.
+///
+/// `POST /api/board {"status":"needsyou"}` returned 201 with ask_type NULL while
+/// `PATCH {"status":"needsyou"}` on the same card was refused. Creation is the
+/// door most of this traffic uses, because "I found something the human must
+/// decide" is naturally expressed by filing the card already parked.
+///
+/// Live measurement at the time: 491 in needsyou, 68 typed, 423 untyped (86%),
+/// untyped median age 16 days, oldest 59 — and still leaking, 13 untyped created
+/// in 24h against 15 typed, across every lane.
+///
+/// The typed control is the half that matters. A gate that refused every
+/// needsyou creation would push lanes to file in `todo` and transition, which is
+/// the same hole one step later; the point is that a REAL ask must sail through.
+#[tokio::test]
+async fn creating_a_needsyou_card_needs_a_typed_ask_just_like_the_transition_does() {
+    let (app, _dir) = app();
+
+    // The hole: parked at birth, no ask.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({ "title": "parked at birth", "status": "needsyou", "type": "chore" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "creation must be gated like the transition: {v}");
+    assert_eq!(v["code"], json!("needsyou_requires_ask_type"));
+
+    // CONTROL: a REAL ask is created, not refused. Without this the fix would be
+    // indistinguishable from banning needsyou creation outright, which just moves
+    // the untyped cards to a two-step path.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({
+            "title": "a real ask",
+            "status": "needsyou",
+            "type": "chore",
+            "ask_type": "decision",
+            "ask_question": "Should we raise the browser profile TTL above 30 days?",
+            "ask_unblocks": "A yes or no from Ethan; either answer closes this.",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "a typed ask must be creatable: {v}");
+    assert_eq!(v["status"], json!("needsyou"));
+    assert_eq!(v["ask_type"], json!("decision"));
+
+    // CONTROL: the vocabulary stays closed at this door too, with the same code
+    // the transition door uses — one contract, whichever door you arrive at.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({
+            "title": "invented type",
+            "status": "needsyou",
+            "type": "chore",
+            "ask_type": "vibes",
+            "ask_question": "Is this ok?",
+            "ask_unblocks": "Someone says yes.",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("needsyou_ask_type_unknown"));
+
+    // CONTROL: an ordinary card is untouched. The gate must not tax todo.
+    let (st, _, _) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({ "title": "ordinary", "type": "chore" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "a normal create must not be gated");
+}
+
 // ---- full lifecycle through the named transitions ------------------------
 
 #[tokio::test]

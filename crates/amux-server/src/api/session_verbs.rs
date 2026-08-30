@@ -3528,6 +3528,11 @@ fn mint_capture_card(
             } else {
                 vec![]
             },
+            // Not an ask: this producer files ordinary cards, and a card
+            // filed into needsyou without one is what AMUX-3929 is about.
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
         },
         now_ms / 1000,
     )?;
@@ -19477,6 +19482,9 @@ mod steer_boundary_tests {
                         gate: vec![],
                         depends_on: vec![],
                         tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
                     },
                     now_ms / 1000,
                 )?;
