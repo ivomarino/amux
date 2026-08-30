@@ -15,7 +15,7 @@
 //! these run (Phase 11 rollback requirement), so migrations are ADDITIVE
 //! ONLY: no drops, no renames, no type changes.
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 struct Migration {
     version: i64,
@@ -211,25 +211,33 @@ const MIGRATIONS: &[Migration] = &[
         name: "0037_telegram_routed_session",
         sql: include_str!("../../migrations/0037_telegram_routed_session.sql"),
     },
-    // NOTE: version 38 is permanently unusable on this box's live DB — it was
-    // consumed 2026-08-29 by an unrelated migration ("0038_telegram") built
-    // from a DIFFERENT, un-merged branch that happened to be live at the
-    // time (this dev box's single shared amux.db gets migrations from
-    // whatever OFF-MAIN branch the auto-builder last installed, per the
-    // freshness hook's own warning — see frustrations.md 2026-08-30). Migration
-    // application is matched by VERSION NUMBER ALONE (`db/migrate.rs`'s
-    // `apply_all`: `SELECT 1 FROM _amux_migrations WHERE version = ?1`), so a
-    // second, unrelated migration also claiming 38 is silently skipped
-    // forever regardless of its actual SQL content — no error, just a column
-    // that never arrives. This is the SAME class of incident 324116fb fixed
-    // once already ("renumber relay migrations to close the gap CI's
-    // dense-ordering guard enforces"); CI's dense-ordering check only sees
-    // ONE branch's migrations/ directory, never this box's actual applied
-    // history, so it cannot catch a cross-branch collision like this one.
+    // version 38 IS the correct, dense next number for this branch's own
+    // migrations/ directory (35, 36, 37, 38 — matches
+    // versions_are_dense_and_match_their_filenames, and origin/main tops out
+    // at 34, so no real code-level conflict exists here or once this
+    // branch merges).
+    //
+    // It collides only with THIS SHARED DEV BOX'S live amux.db, which
+    // already has version 38 recorded under an unrelated name
+    // ("0038_telegram") from a different off-main branch the auto-builder
+    // had installed on 2026-08-29 — identical shape to 324116fb
+    // ("renumber relay migrations to close the gap CI's dense-ordering
+    // guard enforces"), which hit the SAME thing at 36/37 that same day and
+    // resolved it the same way this one is: keep the code dense, reconcile
+    // the local box's DB by hand (`ALTER TABLE telegram_mappings ADD COLUMN
+    // last_relayed_hash TEXT` applied directly, verified via PRAGMA
+    // table_info before/after — see frustrations.md 2026-08-30), and leave
+    // `_amux_migrations` untouched: `version` is that table's PRIMARY KEY,
+    // so this migration's real content can never be recorded under 38 on
+    // THIS box without conflicting with what is already there, and writing
+    // false provenance over it would be worse than the mismatch it would
+    // paper over. `version_collision_warning` below exists so this
+    // divergence is a loud, greppable log line on every boot instead of a
+    // silent gap that resurfaces as a confusing downstream error.
     Migration {
-        version: 39,
-        name: "0039_telegram_relay_dedup",
-        sql: include_str!("../../migrations/0039_telegram_relay_dedup.sql"),
+        version: 38,
+        name: "0038_telegram_relay_dedup",
+        sql: include_str!("../../migrations/0038_telegram_relay_dedup.sql"),
     },
 ];
 
@@ -405,6 +413,25 @@ fn truthy_env(key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Pure so the collision itself is testable without a database: given what
+/// THIS binary's code expects at `version` (`expected_name`) and what the
+/// live DB actually has recorded there (`recorded_name`), returns a log
+/// message when they disagree, `None` when the recorded row is simply this
+/// same migration re-checked on a later boot (the ordinary, non-colliding
+/// case — every version this binary has ever successfully applied hits this
+/// path on every subsequent startup, and must stay silent).
+fn version_collision_warning(version: i64, expected_name: &str, recorded_name: &str) -> Option<String> {
+    if recorded_name == expected_name {
+        return None;
+    }
+    Some(format!(
+        "migration VERSION COLLISION at {version}: this database recorded it as \
+         {recorded_name:?}, but this binary's code expects {expected_name:?} there. \
+         {expected_name}'s schema change will NEVER run against this database under \
+         version {version} — renumber it in db/migrate.rs."
+    ))
+}
+
 /// Guard + apply. `Store::open` calls this; the bare [`apply_all`] stays for
 /// tests, which run against temp and in-memory databases.
 pub fn apply_all_guarded(conn: &mut Connection, db_path: &std::path::Path) -> anyhow::Result<()> {
@@ -426,14 +453,30 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
         );",
     )?;
     for m in MIGRATIONS {
-        let already: bool = conn
+        let recorded_name: Option<String> = conn
             .query_row(
-                "SELECT 1 FROM _amux_migrations WHERE version = ?1",
+                "SELECT name FROM _amux_migrations WHERE version = ?1",
                 [m.version],
-                |_| Ok(true),
+                |r| r.get(0),
             )
-            .unwrap_or(false);
-        if already {
+            .optional()?;
+        if let Some(recorded) = recorded_name {
+            if let Some(msg) = version_collision_warning(m.version, m.name, &recorded) {
+                // VERSION COLLISION, not a benign re-run. On a box that
+                // builds arbitrary off-main branches (this one, and every
+                // dev box the freshness hook warns about), the SAME version
+                // number can get consumed by UNRELATED migrations from
+                // different branches' own dense-ordered sequences (this
+                // exact shape cost a live outage 2026-08-30, see
+                // frustrations.md — telegram_relay ran for ~15 minutes
+                // erroring "no such column" because version 38 here was
+                // already someone else's migration). `m`'s SQL will NEVER
+                // run against this database under this number — the only
+                // fix is renumbering `m` in code — so this must be LOUD at
+                // startup, not a downstream error the first time the
+                // missing schema is actually touched.
+                tracing::error!("{msg}");
+            }
             continue;
         }
         // TIME EVERY MIGRATION. This function used to log nothing, so 0031
@@ -636,6 +679,79 @@ mod tests {
             .query_row("SELECT rev FROM _amux_rev WHERE id = 1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(rev, 0);
+    }
+
+    /// The 2026-08-30 incident, reproduced directly: a version number this
+    /// binary expects to mean one thing is already recorded in the DB under
+    /// a completely different migration's name (an unrelated branch's
+    /// migration having consumed the same number first). `apply_all` must
+    /// neither error nor silently pretend everything is fine — it skips the
+    /// colliding version (its SQL genuinely cannot run there) and leaves
+    /// every OTHER migration to apply normally.
+    #[test]
+    fn a_version_recorded_under_a_different_name_is_skipped_not_reapplied_or_fatal() {
+        // Collide a NON-foundational migration (this crate's own telegram
+        // relay dedup ALTER TABLE, found by name rather than a hardcoded
+        // number so this survives a future renumbering) — colliding version
+        // 1 would fake away the baseline schema every other migration here
+        // depends on, and this test wants to isolate ONE collision, not
+        // cascade-fail the whole suite.
+        let target = super::MIGRATIONS
+            .iter()
+            .find(|m| m.name.contains("telegram_relay_dedup"))
+            .expect("the migration this test collides must still exist")
+            .version;
+
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(&format!(
+            "CREATE TABLE _amux_migrations (
+                version INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                applied_at TEXT NOT NULL, duration_ms INTEGER
+             );
+             INSERT INTO _amux_migrations (version, name, applied_at, duration_ms)
+             VALUES ({target}, 'some_other_branchs_migration', '2026-08-29T00:00:00Z', 1);"
+        ))
+        .unwrap();
+
+        // Must not error, must not touch the colliding row, and every
+        // migration whose version was NOT already taken still applies.
+        apply_all(&mut conn).unwrap();
+
+        let (name, duration): (String, Option<i64>) = conn
+            .query_row("SELECT name, duration_ms FROM _amux_migrations WHERE version = ?1", [target], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(name, "some_other_branchs_migration", "the colliding row must be left exactly as found");
+        assert_eq!(duration, Some(1), "not re-timed — it was never actually re-run");
+
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM _amux_migrations", [], |r| r.get(0))
+            .unwrap();
+        // Every real migration except the one whose version collided.
+        assert_eq!(n as usize, super::MIGRATIONS.len(), "every non-colliding migration still applied");
+
+        let has_col: bool = conn
+            .query_row("SELECT COUNT(*) FROM pragma_table_info('telegram_mappings') WHERE name = 'last_relayed_hash'", [], |r| {
+                r.get::<_, i64>(0)
+            })
+            .map(|n| n > 0)
+            .unwrap();
+        assert!(!has_col, "the colliding migration's actual SQL must never have run");
+    }
+
+    #[test]
+    fn version_collision_warning_is_silent_on_a_genuine_rerun() {
+        assert_eq!(version_collision_warning(5, "0005_foo", "0005_foo"), None);
+    }
+
+    #[test]
+    fn version_collision_warning_names_both_sides_on_a_real_collision() {
+        let msg = version_collision_warning(38, "0038_telegram_relay_dedup", "0038_telegram")
+            .expect("names differ, must warn");
+        assert!(msg.contains("38"), "{msg:?}");
+        assert!(msg.contains("0038_telegram_relay_dedup"), "{msg:?}");
+        assert!(msg.contains("0038_telegram"), "{msg:?}");
     }
 
     /// AMUX-3609's backfill, driven through the SHIPPED migration body rather
