@@ -79,6 +79,69 @@ pub fn ttl_s() -> u64 {
         .unwrap_or(4 * 3600)
 }
 
+/// How long an UNREGISTERED profile may sit unused before it is deleted.
+/// `0` disables this arm entirely. Thirty days by default.
+///
+/// WHY THIS EXISTS (Ethan, 2026-08-30): "we should have a ttl for the browser
+/// profiles. that way we don't create so many at any point and never use them."
+/// Measured that day: 50 profiles, 5.4 GB. Thirty-two of them had not been
+/// touched in 60+ days and the oldest in 171 — `studio-e2e-test2`,
+/// `anonymous-1776949356827`, `mxp-studio-v3`, the sediment of one-off e2e runs
+/// that each created a profile and none cleaned up.
+///
+/// WHY THIRTY DAYS. The distribution has a natural gap rather than a slope:
+/// everything in real rotation was under 31 days, the next profile after that
+/// was 60 days, and nothing sat between. So the line is drawn where the data
+/// already separates, and moving it to 45 or 60 would delete the same 32.
+///
+/// WHY REGISTERED PROFILES ARE EXEMT AT ANY AGE. A registry entry is a
+/// deliberate save with domains and a label — a login someone set up on purpose
+/// and may need twice a year (`recreation-gov` was 31 days idle and is exactly
+/// the kind of thing this must never eat). Ad-hoc profiles are made by a script
+/// that needed a browser once. The registry is the line between the two, and it
+/// is the user's own declaration rather than our inference.
+pub fn profile_ttl_days() -> u64 {
+    std::env::var("AMUX_PROFILE_TTL_DAYS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(30)
+}
+
+/// Should this profile be deleted? Pure, so the policy is testable without a
+/// filesystem full of real logins.
+///
+/// The three exemptions are not interchangeable and each has its own reason:
+///   `registered` — a deliberate save; see `profile_ttl_days`.
+///   `running`    — a browser is open on it right now. Age is measured from the
+///                  directory mtime, and a browser can be driven for hours
+///                  without Chrome touching the dir, so a long-lived session on
+///                  an old profile would otherwise be deleted from under a peer.
+///                  This is also what makes the arm safe under the multi-slot
+///                  registry: N workers on N profiles, and a reap of one must
+///                  never touch another's.
+///   `default`    — `delete_profile` refuses it too; belt and braces, because
+///                  the reaper reaching it at all would be the bug.
+pub fn should_reap_profile(
+    name: &str,
+    registered: bool,
+    running: bool,
+    age_days: Option<f64>,
+    ttl_days: u64,
+) -> bool {
+    if ttl_days == 0 || registered || running || name == "default" {
+        return false;
+    }
+    // AN UNREADABLE MTIME IS UNKNOWN AGE, NOT INFINITE AGE. `last_used` is an
+    // Option because the stat can fail, and the tempting readings are both
+    // wrong: `None` as 0 keeps junk forever, `None` as huge deletes a profile
+    // whose age was never measured. Unknown declines to act, same rule the
+    // conversation-claim expiry follows.
+    match age_days {
+        Some(d) => d >= ttl_days as f64,
+        None => false,
+    }
+}
+
 fn tick_secs() -> u64 {
     std::env::var("AMUX_BROWSER_REAP_TICK_S")
         .ok()
@@ -174,7 +237,56 @@ fn now_f64() -> f64 {
 
 /// One pass. Returns the profiles it released, so the caller can log a fact
 /// rather than an intention.
+/// Delete unregistered profiles nobody has used inside the TTL.
+///
+/// Goes through `delete_profile`, which already refuses `default` and anything
+/// resolving outside the amux-owned tree, rather than adding a second
+/// `remove_dir_all` to a subsystem whose comments record three separate
+/// incidents of destroying people's staged logins. One producer, one set of
+/// guards.
+///
+/// Returns the names removed, for the caller's log line.
+pub async fn reap_stale_profiles(home: &std::path::Path) -> Vec<String> {
+    let ttl = profile_ttl_days();
+    if ttl == 0 {
+        return vec![];
+    }
+    let running: std::collections::HashSet<String> = crate::integrations::browser::running_all()
+        .into_iter()
+        .map(|(profile, ..)| profile)
+        .collect();
+    let now = now_f64();
+    let mut removed = vec![];
+    for p in crate::integrations::browser::list_profiles(home, false) {
+        let age_days = p.last_used.map(|lu| (now - lu as f64) / 86_400.0);
+        if !should_reap_profile(&p.name, p.registered, running.contains(&p.name), age_days, ttl) {
+            continue;
+        }
+        match crate::integrations::browser::delete_profile(home, &p.name) {
+            Ok(_) => {
+                tracing::info!(
+                    profile = %p.name, age_days = age_days.unwrap_or(-1.0) as i64, ttl_days = ttl,
+                    "browser: deleted an unregistered profile unused for the whole TTL                      (AMUX_PROFILE_TTL_DAYS). Registered profiles are exempt at any age;                      save a profile to keep it."
+                );
+                removed.push(p.name);
+            }
+            // Reported, not swallowed: a profile that keeps failing to delete
+            // would otherwise retry silently every tick forever.
+            Err((code, body)) => tracing::warn!(
+                profile = %p.name, code, error = %body,
+                "browser: profile TTL could not delete this profile"
+            ),
+        }
+    }
+    removed
+}
+
 async fn tick(home: &std::path::Path) -> Vec<String> {
+    // Runs BEFORE the early return below: the profile TTL is about disk that
+    // nobody is using, and the idle arm is about a running browser with no
+    // pages. Disabling one must not silently disable the other — they were
+    // independent knobs the moment there were two of them.
+    reap_stale_profiles(home).await;
     let after_s = reap_after_s();
     if after_s == 0 {
         return vec![];
@@ -406,5 +518,81 @@ mod tests {
         // DISABLED means disabled, at any age — the off switch has to work or
         // it is not an off switch (ethos rule 6).
         assert!(!should_reap(Some(0.0), 99_999.0, 0));
+    }
+}
+
+#[cfg(test)]
+mod profile_ttl_tests {
+    use super::*;
+
+    /// Ethan, 2026-08-30: "we should have a ttl for the browser profiles. that
+    /// way we don't create so many at any point and never use them."
+    ///
+    /// The danger in a profile reaper is not failing to delete. It is deleting a
+    /// login someone needs, in a subsystem whose own module doc records three
+    /// separate incidents of destroying people's staged logins. So every
+    /// exemption below carries the reaping case next to it: an exemption that
+    /// never lets anything through is indistinguishable from a disabled job.
+    #[test]
+    fn the_profile_ttl_reaps_sediment_and_spares_everything_with_a_reason() {
+        const TTL: u64 = 30;
+        let old = Some(171.1); // `test-heroku`, the oldest real one on 2026-08-30
+        let new = Some(0.2);
+
+        // The 32 profiles this exists for: unregistered, unused, not running.
+        assert!(should_reap_profile("test-heroku", false, false, old, TTL));
+        // CONTROL, or the assertion above only proves the function returns true.
+        assert!(
+            !should_reap_profile("propelauth", false, false, new, TTL),
+            "a profile used today must survive"
+        );
+
+        // REGISTERED IS EXEMPT AT ANY AGE. `recreation-gov` was 30.7 days idle
+        // and is a deliberate save someone may need twice a year.
+        assert!(
+            !should_reap_profile("recreation-gov", true, false, old, TTL),
+            "a registered profile is a deliberate login and must never age out"
+        );
+
+        // RUNNING IS EXEMPT. Age comes from the directory mtime and a browser
+        // can be driven for hours without Chrome touching the dir, so this is
+        // what stops one worker's reap deleting the profile another worker is
+        // driving right now.
+        assert!(
+            !should_reap_profile("mixpeek-studio", false, true, old, TTL),
+            "a profile with a live browser must not be deleted under it"
+        );
+
+        // `default` is refused here as well as in delete_profile.
+        assert!(!should_reap_profile("default", false, false, old, TTL));
+
+        // UNKNOWN AGE DECLINES TO ACT. `last_used` is an Option because the stat
+        // can fail; reading None as "very old" would delete a profile whose age
+        // was never measured.
+        assert!(
+            !should_reap_profile("unmeasurable", false, false, None, TTL),
+            "an unreadable mtime is unknown age, not infinite age"
+        );
+
+        // The knob genuinely disables the arm.
+        assert!(!should_reap_profile("test-heroku", false, false, old, 0));
+
+        // The boundary is a decision, not an accident of `>` vs `>=`.
+        assert!(should_reap_profile("x", false, false, Some(30.0), TTL));
+        assert!(!should_reap_profile("x", false, false, Some(29.9), TTL));
+    }
+
+    /// MULTIPLE PROFILES AT ONCE (Ethan's other requirement in the same breath).
+    /// The reap decision is per profile and keys on THAT profile's own running
+    /// flag, so N workers on N browsers is N independent verdicts. A rule that
+    /// consulted "is any browser running" would spare everything whenever one
+    /// lane held a browser, which reads as working and quietly never reaps.
+    #[test]
+    fn one_running_profile_does_not_spare_or_doom_its_neighbours() {
+        const TTL: u64 = 30;
+        let old = Some(200.0);
+        // Worker A is driving `alpha`; worker B's `beta` is ancient junk.
+        assert!(!should_reap_profile("alpha", false, true, old, TTL));
+        assert!(should_reap_profile("beta", false, false, old, TTL));
     }
 }

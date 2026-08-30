@@ -1106,7 +1106,60 @@ async fn profiles(Query(q): Query<ProfilesQuery>) -> Response {
             Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) })),
         };
     let chrome_profiles = chrome::list_chrome_profiles();
-    Json(json!({ "profiles": list, "backends": ["native"], "chrome_profiles": chrome_profiles })).into_response()
+    // THE TTL AND THE COUNTDOWN, BESIDE THE THING THEY DELETE. A reaper whose
+    // only trace is a log line is one nobody knows about until a profile is
+    // gone; `reap_in_days` on each row makes the schedule readable before it
+    // fires, the same reason the idle arm publishes `idle_s`/`reap_after_s`.
+    // Null means exempt, and `reap_exempt_reason` says which of the three
+    // reasons applies rather than leaving the reader to infer it.
+    let ttl_days = crate::runtime_jobs::browser_reaper::profile_ttl_days();
+    let running: std::collections::HashSet<String> =
+        chrome::running_all().into_iter().map(|(p, ..)| p).collect();
+    let now = crate::config::now_f64();
+    let rows: Vec<Value> = list
+        .iter()
+        .map(|p| {
+            let age_days = p.last_used.map(|lu| (now - lu as f64) / 86_400.0);
+            let is_running = running.contains(&p.name);
+            let exempt = if ttl_days == 0 {
+                Some("ttl disabled (AMUX_PROFILE_TTL_DAYS=0)")
+            } else if p.registered {
+                Some("registered — a deliberate save, exempt at any age")
+            } else if is_running {
+                Some("a browser is running on this profile")
+            } else if p.name == "default" {
+                Some("the default profile is never deleted")
+            } else if age_days.is_none() {
+                Some("last-used time could not be read, so age is unknown")
+            } else {
+                None
+            };
+            let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("age_days".into(), json!(age_days.map(|d| (d * 10.0).round() / 10.0)));
+                o.insert("reap_exempt_reason".into(), json!(exempt));
+                o.insert(
+                    "reap_in_days".into(),
+                    json!(match (exempt, age_days) {
+                        (None, Some(d)) => json!(((ttl_days as f64 - d).max(0.0) * 10.0).round() / 10.0),
+                        _ => Value::Null,
+                    }),
+                );
+            }
+            v
+        })
+        .collect();
+    Json(json!({
+        "profiles": rows,
+        "backends": ["native"],
+        "chrome_profiles": chrome_profiles,
+        "profile_ttl_days": ttl_days,
+        "profile_ttl_note": "unregistered profiles unused for this many days are deleted by the \
+                             reaper. Registered profiles (a deliberate save with domains/label) \
+                             are exempt at any age, as is any profile with a browser running on \
+                             it. 0 disables the arm.",
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
