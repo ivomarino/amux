@@ -234,6 +234,89 @@ pub fn done_link_required(session: Option<&str>) -> bool {
     }
 }
 
+/// Scope key for the AF-321 evidence requirement on `done`.
+pub const DONE_EVIDENCE_REQUIRED_KEY: &str = "AMUX_DONE_EVIDENCE_REQUIRED";
+
+/// Is the AF-321 evidence requirement enforced for `session`?
+///
+/// Same resolver shape as [`done_link_required`] on purpose: process env wins
+/// (the operator switch in `~/.amux/server.env`, and how the test rigs that are
+/// not testing this gate turn it off), then the worker > group > global scope
+/// files. Default ON — an advisory rule that loses to the mechanism is exactly
+/// what this card is about, and ethos rule 1 asks for opt-out, not opt-in.
+pub fn done_evidence_required(session: Option<&str>) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    }
+    if let Ok(v) = std::env::var(DONE_EVIDENCE_REQUIRED_KEY) {
+        if !v.trim().is_empty() {
+            return !is_off(&v);
+        }
+    }
+    let lane = match session.filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return true,
+    };
+    match crate::api::session_verbs::scoped_setting_in(
+        &crate::api::session_verbs::home(),
+        lane,
+        DONE_EVIDENCE_REQUIRED_KEY,
+    ) {
+        Some(v) => !is_off(&v),
+        None => true,
+    }
+}
+
+/// Why a piece of evidence was refused, or that it was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvidenceVerdict {
+    /// Names an artifact: a command, path, URL, sha or #N.
+    Ok,
+    /// Nothing recorded at all.
+    Missing,
+    /// Prose with nothing to check: "implemented", "done", "fixed it".
+    NoArtifact,
+    /// `none:` with no reason after it. The escape exists, but an unexplained
+    /// escape is the thing it is meant to prevent.
+    UnexplainedNone,
+}
+
+/// Does `text` say what was actually run or produced?
+///
+/// Accepts three shapes:
+///   1. anything [`has_asset_link`] recognises (URL, repo path, sha, `#N`);
+///   2. a shell invocation — a line starting `$ `, or fenced/backticked text;
+///   3. the honest no-artifact answer `none: <reason>`.
+///
+/// (3) is not a loophole, it is ethos rule 3: an escalation that closed because
+/// the owner decided, or a watch that stood down, produces no artifact, and a
+/// gate with no truthful path in a legitimate state forces a lie. It is stored
+/// verbatim so `evidence LIKE 'none:%'` counts them, which is the difference
+/// between an escape and a blind spot.
+pub fn evidence_verdict(text: &str) -> EvidenceVerdict {
+    let t = text.trim();
+    if t.is_empty() {
+        return EvidenceVerdict::Missing;
+    }
+    if let Some(rest) = t.strip_prefix("none:").or_else(|| t.strip_prefix("NONE:")) {
+        // A reason, not a shrug. "none: n/a" is 3 chars and says nothing, so
+        // require enough words that someone had to think.
+        return if rest.split_whitespace().count() >= 3 {
+            EvidenceVerdict::Ok
+        } else {
+            EvidenceVerdict::UnexplainedNone
+        };
+    }
+    if has_asset_link(t) {
+        return EvidenceVerdict::Ok;
+    }
+    // A command: `$ cargo test`, or anything backticked/fenced.
+    if t.contains('`') || t.lines().any(|l| l.trim_start().starts_with("$ ")) {
+        return EvidenceVerdict::Ok;
+    }
+    EvidenceVerdict::NoArtifact
+}
+
 /// The env keys that tune (or disable) the automatic revisit date. `0` turns
 /// the default off for a scope; a positive integer is a number of days.
 pub const BACKLOG_REVISIT_DAYS_KEY: &str = "AMUX_BACKLOG_REVISIT_DAYS";
@@ -985,6 +1068,21 @@ pub struct IssueRow {
     /// The Python optimistic-concurrency counter (`expect_rev` checks this).
     pub rev: i64,
     pub source_ref: Option<String>,
+    /// What was actually RUN or produced to close this card (AF-321): a
+    /// command, a URL exercised, a screenshot path, a commit sha.
+    ///
+    /// Its own column on purpose. `done_requires_asset_link` looks for a
+    /// path/sha/URL-shaped token anywhere in `desc`, which the card's own
+    /// PROBLEM STATEMENT supplies: measured 2026-08-29, 843 of 1372 open cards
+    /// (61%) satisfied that gate on their filed text with no work done. A field
+    /// nobody has written yet cannot be filled by the statement of the problem,
+    /// which is the whole property this column buys.
+    ///
+    /// NULL means NOT RECORDED, never "no evidence exists" — most of the board
+    /// predates the column. The honest "there is no artifact" answer is the
+    /// text `none: <reason>`, which is stored, countable, and deliberately NOT
+    /// the same as NULL.
+    pub evidence: Option<String>,
     pub last_verified_at: Option<i64>,
     /// Rust per-row version (migration 0002). Bumped alongside `rev`.
     pub version: i64,
@@ -1050,6 +1148,12 @@ impl IssueRow {
             "epic": self.epic,
             "source_ref": self.source_ref,
             "last_verified_at": self.last_verified_at,
+            // In BOTH snapshots, for the reason `closed_at` gives below: the
+            // question this column exists to answer ("which done cards closed
+            // without real evidence") is a LIST query, so withholding it from
+            // the list body would ship the column and hide it from its only
+            // caller.
+            "evidence": self.evidence,
             // In BOTH snapshots deliberately, i.e. NOT in `slim_omits`. The
             // motivating question ("which cards closed in this window") is a
             // LIST query, so omitting it from the list body would ship the
@@ -1150,7 +1254,7 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.gcal_event_id, COALESCE(i.pos,0), COALESCE(i.notified,0), i.gate, i.shepherd, \
      i.type, COALESCE(i.archived,0), i.depends_on, i.reviewer, i.log, \
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
-     i.epic, i.closed_at, GROUP_CONCAT(t.tag)";
+     i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence";
 
 fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
     let depends_raw: Option<String> = r.get(19)?;
@@ -1196,6 +1300,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         log: r.get(21)?,
         rev: r.get(22)?,
         source_ref: r.get(23)?,
+        evidence: r.get(29)?,
         // Some Python-era databases stored this column as TEXT despite the
         // schema saying INTEGER (legacy-data mismatch, not a live schema
         // bug) — rusqlite's FromSql is strict per storage type, so EITHER
@@ -1747,8 +1852,8 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
              rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
-             epic = ?22, closed_at = ?23 \
-         WHERE id = ?24 AND deleted IS NULL",
+             epic = ?22, closed_at = ?23, evidence = ?24 \
+         WHERE id = ?25 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -1773,6 +1878,7 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.last_verified_at,
             row.epic,
             row.closed_at,
+            row.evidence,
             row.id,
         ],
     )
@@ -1947,7 +2053,7 @@ mod tests {
                 gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
+                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0, evidence TEXT,
                 epic TEXT, closed_at INTEGER, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));",
@@ -2076,6 +2182,54 @@ mod tests {
         assert!(!has_asset_link("the cafe was open in 2026"));
     }
 
+    /// THE GAP THIS CARD IS ABOUT, pinned so it cannot be argued away.
+    ///
+    /// Every accepting case in the test above pairs a path with an outcome verb
+    /// ("landed in", "updated", "shipped as"), which reads as though the check
+    /// requires one. It does not: it looks for a path-shaped token anywhere in
+    /// the text, so the card's own PROBLEM STATEMENT satisfies it. Measured on
+    /// the live board 2026-08-29: 843 of 1372 open cards (61%) passed this gate
+    /// on their filed text with no work done.
+    #[test]
+    fn asset_link_cannot_tell_a_plan_from_an_outcome() {
+        let plan = "Location: crates/amux-server/src/api/board.rs. \
+                    Add the check there. Source: docs/fleet-friction-review.md";
+        assert!(
+            has_asset_link(plan),
+            "the done link gate is satisfied by a card that has done nothing yet"
+        );
+        // Which is precisely why evidence is a separate column: this same text,
+        // as evidence, is a plan, but nothing in its SHAPE says so — the
+        // discrimination comes from the field being one nobody has written yet
+        // when the card is filed, not from parsing the prose.
+        assert_eq!(evidence_verdict(plan), EvidenceVerdict::Ok);
+    }
+
+    #[test]
+    fn evidence_verdict_separates_proof_from_prose() {
+        // Prose with nothing to re-run: the closes this card exists to stop.
+        for prose in ["implemented", "done", "fixed it and closed out", "addressed review"] {
+            assert_eq!(evidence_verdict(prose), EvidenceVerdict::NoArtifact, "{prose}");
+        }
+        assert_eq!(evidence_verdict(""), EvidenceVerdict::Missing);
+        assert_eq!(evidence_verdict("   \n  "), EvidenceVerdict::Missing);
+
+        // Things a reader can actually check.
+        assert_eq!(evidence_verdict("ran `cargo test -p amux-server`, 412 passed"), EvidenceVerdict::Ok);
+        assert_eq!(evidence_verdict("$ scripts/test-contended.sh -p amux-server"), EvidenceVerdict::Ok);
+        assert_eq!(evidence_verdict("shipped as 53a868f"), EvidenceVerdict::Ok);
+        assert_eq!(evidence_verdict("verified at https://amux.io/board"), EvidenceVerdict::Ok);
+        assert_eq!(evidence_verdict("screenshot at /tmp/shots/board-mobile.png"), EvidenceVerdict::Ok);
+
+        // The honest no-artifact answer (ethos rule 3) — and its abuse.
+        assert_eq!(
+            evidence_verdict("none: owner decided to stand this down, no code changed"),
+            EvidenceVerdict::Ok
+        );
+        assert_eq!(evidence_verdict("none: n/a"), EvidenceVerdict::UnexplainedNone);
+        assert_eq!(evidence_verdict("none:"), EvidenceVerdict::UnexplainedNone);
+    }
+
     #[test]
     fn done_link_rule_is_a_handler_constraint_not_a_gate_criterion() {
         // The label is stable (the contract shows it).
@@ -2174,7 +2328,7 @@ mod tests {
                 gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
+                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0, evidence TEXT,
                 epic TEXT, closed_at INTEGER, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));
@@ -2559,6 +2713,7 @@ mod tests {
             log: None,
             rev: 0,
             source_ref: None,
+            evidence: None,
             last_verified_at: None,
             closed_at: None,
             version: 0,
@@ -2662,7 +2817,8 @@ mod configured_gate_tests {
             due_time: None, pinned: 0, gcal_event_id: None, pos: 0.0, notified: 0,
             gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
             archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
-            source_ref: None, last_verified_at: None, closed_at: None, version: 0, tags: vec![],
+            source_ref: None, evidence: None, last_verified_at: None, closed_at: None,
+            version: 0, tags: vec![],
         }
     }
 

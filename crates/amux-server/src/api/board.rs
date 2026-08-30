@@ -212,6 +212,20 @@ async fn get_contract(
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
             "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
         },
+        // Global done constraint (AF-321). Sits IN FRONT of the asset-link rule
+        // above, which it does not replace: that one is a shape check over the
+        // whole desc and the card's own problem statement satisfies it (843 of
+        // 1372 open cards, measured 2026-08-29). Published here for the AF-112
+        // reason the `verified` block gives below.
+        "done_requires_evidence": {
+            "rule": "a card entering done must carry `evidence`: what was actually run or produced",
+            "why": "the asset-link rule looks for a path-shaped token anywhere in the desc, which the FILING supplies — a card that names the file it intends to edit passes its own done gate before anyone touches that file",
+            "accepts": "a command (backticked, or on a `$ ` line), a repo file path, a URL, a commit sha, a #PR — or `none: <reason>` (3+ words) when the card genuinely produced no artifact",
+            "field": "`evidence`, writable on its own so it can be recorded BEFORE the transition that needs it",
+            "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
+            "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "what_to_run": "the repo's VERIFY.md names the proof for each surface",
+        },
         // Global `verified` constraint (Ethan, 2026-08-29). Published HERE and
         // not only in the 409, because a gate you can only learn by tripping it
         // is the AF-112 shape — the reader who most needs it is the one about
@@ -2429,7 +2443,7 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 19] = [
+const PATCH_WRITABLE: [&str; 20] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -2441,6 +2455,11 @@ const PATCH_WRITABLE: [&str; 19] = [
     // good trigger and nothing ever re-checks it — "parking without it buys
     // silence with no expiry", which is the flag's own promise inverted.
     "last_verified_at",
+    // AF-321: what was actually run/produced. Writable as its own field so it
+    // can be recorded BEFORE the transition that needs it (the two-write shape
+    // `--outcome` already uses, so a refused `done` cannot discard the very
+    // text the retry needs).
+    "evidence",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -3227,6 +3246,7 @@ pub async fn patch_item(
             set_opt("epic", &mut next.epic, &mut changed); // AMUX-2992: assign/clear a card's epic
             set_opt("due", &mut next.due, &mut changed);
             set_opt("due_time", &mut next.due_time, &mut changed);
+            set_opt("evidence", &mut next.evidence, &mut changed);
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -3907,6 +3927,83 @@ pub async fn patch_item(
                                         "how_to_fix": {
                                             "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
                                             "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-321 sits BEHIND the link rule above, deliberately. The link check is a SHAPE
+                    // check over the whole desc, so the card's own PROBLEM
+                    // STATEMENT satisfies it: measured on the live board
+                    // 2026-08-29, 843 of 1372 open cards (61%) passed it on
+                    // their filed text with no work done, because a card that
+                    // names the file it intends to edit contains a path. The
+                    // evidence column cannot be filled that way — nobody has
+                    // written it yet when the card is filed. Same opt-out
+                    // ladder, same `force` bypass, both audited.
+                    //
+                    // ORDER MATTERS: the coarser rule answers first, so a card
+                    // with no artifact anywhere still gets the older, broader
+                    // message it has always got, and this narrower one fires
+                    // only once that has been satisfied.
+                    let evidence_required = !force
+                        && target == TaskStatus::Done
+                        && bs::done_evidence_required(next.session.as_deref());
+                    if evidence_required {
+                        let ev = next.evidence.clone().unwrap_or_default();
+                        let verdict = bs::evidence_verdict(&ev);
+                        if verdict != bs::EvidenceVerdict::Ok {
+                            let (why, code) = match verdict {
+                                bs::EvidenceVerdict::Missing => (
+                                    "This card records nothing that was run or produced. `done` is where work stops on this board (3302 done against 3631 verified), so closing one has to name the proof: the command, the URL exercised, the screenshot path, the commit.",
+                                    "done_requires_evidence",
+                                ),
+                                bs::EvidenceVerdict::NoArtifact => (
+                                    "The evidence on this card is prose with nothing in it to check. Name the artifact: a command in backticks, a repo path, a URL, a commit sha, or a #PR.",
+                                    "done_evidence_has_no_artifact",
+                                ),
+                                bs::EvidenceVerdict::UnexplainedNone => (
+                                    "`none:` is the honest answer when a card genuinely produced no artifact, but it needs the reason after it — that text is what makes the escape countable instead of a blind spot.",
+                                    "done_evidence_none_unexplained",
+                                ),
+                                bs::EvidenceVerdict::Ok => unreachable!(),
+                            };
+                            // Two-fixes rule: grep `done_evidence_gate` in
+                            // server-rs.log, and the structured `code` splits
+                            // these from other 409s in /api/logs/analyze.
+                            tracing::warn!(
+                                "done_evidence_gate: blocked {} -> done for session {} (verdict {:?})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-"),
+                                verdict
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "done requires evidence of what was run",
+                                        "code": code,
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "why": why,
+                                        "recorded_evidence": next.evidence,
+                                        "how_to_fix": {
+                                            "cli": format!("amux board done {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", next.id),
+                                            "api": "PATCH /api/board/<id> with {\"evidence\": \"...\"} — writable on its own, so record it first and the transition cannot discard it",
+                                            "accepted": [
+                                                "a command, in backticks or on a `$ ` line",
+                                                "a repo file path, a URL, a commit sha, or #PR",
+                                                "`none: <reason>` when the card genuinely produced no artifact (stored and counted, not a bypass)"
+                                            ],
+                                            "what_to_run": "the repo's VERIFY.md names the proof for each surface",
+                                            "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5877,7 +5974,7 @@ mod slim_tests {
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
                 source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, closed_at INTEGER, deleted INTEGER);
+                epic TEXT, closed_at INTEGER, evidence TEXT, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));
              CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",

@@ -15,8 +15,18 @@ use axum::http::{header, HeaderMap, Request, StatusCode};
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
+/// Evidence that satisfies the global AF-321 `done` constraint.
+///
+/// The tests below assert about gate ACKS, retyping, reviewers and the
+/// lifecycle — not about evidence. They carry this so a constraint they are
+/// not testing does not decide their result, which is the same reason they
+/// already carry an asset link. The evidence gate has its own coverage in
+/// `done_requires_evidence_a_plan_cannot_supply`.
+const EV: &str = "ran `cargo test -p amux-server`";
+
 fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) {
     std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
+    std::env::set_var("AMUX_DONE_EVIDENCE_REQUIRED", "1");
     let dir = tempfile::tempdir().unwrap();
     let store = std::sync::Arc::new(Store::open(&dir.path().join("amux-test.db")).unwrap());
     let state = AppState {
@@ -33,6 +43,7 @@ fn app() -> (axum::Router, tempfile::TempDir) {
     // on whether the real ~/.amux disables it): the gate tests here provide a
     // link where they reach done, and done_requires_an_asset_link asserts it.
     std::env::set_var("AMUX_DONE_LINK_REQUIRED", "1");
+    std::env::set_var("AMUX_DONE_EVIDENCE_REQUIRED", "1");
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("amux-test.db")).unwrap();
     let state = AppState {
@@ -453,7 +464,7 @@ async fn gate_blocks_with_python_body_then_gate_checked_satisfies() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done" })),
+        Some(json!({ "status": "done", "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -484,7 +495,7 @@ async fn gate_blocks_with_python_body_then_gate_checked_satisfies() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "gate_checked": ["Implemented and merged"] })),
+        Some(json!({ "status": "done", "evidence": EV, "gate_checked": ["Implemented and merged"] })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -497,7 +508,7 @@ async fn gate_blocks_with_python_body_then_gate_checked_satisfies() {
         "PATCH",
         &format!("/api/board/{id}"),
         Some(json!({
-            "status": "done",
+            "status": "done", "evidence": EV,
             "gate_checked": ["Implemented and merged", "Tests / lint pass"]
         })),
         &[("X-Amux-Session", "worker-1")],
@@ -527,7 +538,7 @@ async fn gates_derive_from_type_and_retyping_is_the_honest_exit() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done" })),
+        Some(json!({ "status": "done", "evidence": EV })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT);
@@ -541,7 +552,7 @@ async fn gates_derive_from_type_and_retyping_is_the_honest_exit() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "gate_ack": true })),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -585,7 +596,7 @@ async fn retyping_clears_a_gate_override_so_the_gate_re_derives_from_the_new_typ
     let id = card["id"].as_str().unwrap().to_string();
 
     // Before the fix: done demanded the code override even for an investigation.
-    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({ "status": "done" }))).await;
+    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({ "status": "done", "evidence": EV }))).await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert_eq!(v["gate"], json!(["Implemented and merged", "Tests / lint pass"]), "the override pins code criteria pre-retype");
 
@@ -598,7 +609,7 @@ async fn retyping_clears_a_gate_override_so_the_gate_re_derives_from_the_new_typ
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "gate_checked": ["Outcome recorded in the item (what happened, and why it is closed)"] })),
+        Some(json!({ "status": "done", "evidence": EV, "gate_checked": ["Outcome recorded in the item (what happened, and why it is closed)"] })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "the type-derived chore gate must be satisfiable after retype: {v}");
@@ -612,7 +623,7 @@ async fn retyping_clears_a_gate_override_so_the_gate_re_derives_from_the_new_typ
         &app,
         "PATCH",
         &format!("/api/board/{cid}"),
-        Some(json!({ "status": "done", "gate_checked": ["Implemented and merged", "Tests / lint pass"] })),
+        Some(json!({ "status": "done", "evidence": EV, "gate_checked": ["Implemented and merged", "Tests / lint pass"] })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "code criteria must NOT satisfy a chore gate: {v}");
@@ -1042,6 +1053,131 @@ async fn stale_expect_rev_is_409_with_current_rev() {
     assert_eq!(detail["desc"], json!("writer A"));
 }
 
+// ---- global done-evidence gate (AF-321): done needs proof, not a plan -----
+
+/// THE PROPERTY THIS GATE EXISTS FOR.
+///
+/// `done_requires_asset_link` is a shape check over the whole desc, so a card
+/// that merely NAMES the file it intends to edit satisfies it before anyone
+/// touches that file. Measured on the live board 2026-08-29: 843 of 1372 open
+/// cards (61%) passed it on their filed text with no work done.
+///
+/// So the test is not "does done refuse an empty card" — the older gate already
+/// did that. It is that a realistic, fully-linked PROBLEM STATEMENT, the exact
+/// text a card is filed with, still cannot close it.
+#[tokio::test]
+async fn done_requires_evidence_a_plan_cannot_supply() {
+    let (app, _dir) = app();
+    // A real filing: names the source file and the source doc. Both gates that
+    // read `desc` see artifact links here.
+    let card = create(
+        &app,
+        json!({
+            "title": "add the check",
+            "status": "doing",
+            "type": "chore",
+            "desc": "Location: crates/amux-server/src/api/board.rs — add the check there. \
+                     Source: docs/fleet-friction-review-2026-08-29.md Theme 4",
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    // The OLD gate is satisfied by this text. Assert that directly, so the test
+    // below cannot pass for the wrong reason (a control that can distinguish
+    // "the new gate fired" from "the old gate fired").
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(
+        v["code"],
+        json!("done_requires_evidence"),
+        "the plan must get PAST the link gate and be stopped by the evidence gate: {v}"
+    );
+
+    // Prose is not evidence either.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "gate_ack": true, "evidence": "implemented" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("done_evidence_has_no_artifact"), "{v}");
+    // The refused text is handed back, so a caller can see what it sent.
+    assert_eq!(v["recorded_evidence"], json!("implemented"));
+
+    // Something a reader can re-run closes it.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "done",
+            "gate_ack": true,
+            "evidence": "ran `cargo test -p amux-server --test board_api`, 51 passed",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["status"], json!("done"));
+    // And it is READABLE afterwards: a gate whose input is not stored is a
+    // gate nobody can audit (ethos rule 6).
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert!(
+        detail["evidence"].as_str().unwrap_or("").contains("cargo test"),
+        "evidence must survive onto the card: {detail}"
+    );
+}
+
+/// The no-artifact escape is real, and it is not a shrug. Both halves matter:
+/// without the first, an escalation that closed because the owner decided has
+/// no truthful path to done (ethos rule 3); without the second, `none:` is a
+/// blanket bypass and the gate means nothing.
+#[tokio::test]
+async fn none_needs_a_reason_and_then_it_is_accepted_and_stored() {
+    let (app, _dir) = app();
+    let card = create(
+        &app,
+        json!({ "title": "stand down", "status": "doing", "type": "escalation",
+                "desc": "raised in docs/x.md" }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "gate_ack": true, "evidence": "none: n/a" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("done_evidence_none_unexplained"), "{v}");
+
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({
+            "status": "done", "gate_ack": true,
+            "evidence": "none: owner decided to stand this down, nothing was built",
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    // Stored verbatim, so `evidence LIKE 'none:%'` counts the escapes. An escape
+    // nobody can count is the blind spot the escape was meant not to be.
+    let (_, _, detail) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert!(detail["evidence"].as_str().unwrap_or("").starts_with("none: owner decided"));
+}
+
 // ---- global done-link gate (AMUX-3275): done needs a real asset link ------
 
 /// The done-link gate is validated against the card text, so a full gate_ack
@@ -1063,7 +1199,7 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "gate_ack": true })),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
@@ -1082,7 +1218,7 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "gate_ack": true })),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "{v}");
@@ -1094,8 +1230,9 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
 #[tokio::test]
 async fn lifecycle_todo_doing_review_done_verified_via_state_machine() {
     let (app, _dir) = app();
-    // desc carries an artifact link for the global done-link gate (AMUX-3275);
-    // this test is about the lifecycle state machine, not the link gate.
+    // desc carries an artifact link for the global done-link gate (AMUX-3275),
+    // and the body below carries evidence for the AF-321 one; this test is about
+    // the lifecycle state machine, not about either global constraint.
     let card = create(
         &app,
         json!({ "title": "full run", "type": "chore", "desc": "artifact: crates/amux-server/src/api/board.rs" }),
@@ -1114,7 +1251,7 @@ async fn lifecycle_todo_doing_review_done_verified_via_state_machine() {
             &app,
             "PATCH",
             &format!("/api/board/{id}"),
-            Some(json!({ "status": target, "gate_ack": true })),
+            Some(json!({ "status": target, "gate_ack": true, "evidence": EV })),
             &[("X-Amux-Session", "runner")],
         )
         .await;
@@ -2125,7 +2262,7 @@ async fn a_gate_without_a_named_peer_criterion_needs_no_reviewer() {
         "PATCH",
         &format!("/api/board/{id}"),
         Some(json!({
-            "status": "done",
+            "status": "done", "evidence": EV,
             "gate_checked": ["Implemented and merged", "Tests / lint pass"]
         })),
         &[("X-Amux-Session", "amux")],
@@ -2158,7 +2295,7 @@ async fn the_retype_hint_prints_only_when_retyping_would_actually_help() {
         "desc": "artifact: crates/amux-server/src/api/board.rs",
     })).await;
     let id = card["id"].as_str().unwrap().to_string();
-    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({ "status": "done" }))).await;
+    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(json!({ "status": "done", "evidence": EV }))).await;
     assert_eq!(st, StatusCode::CONFLICT);
     assert!(
         v["how_to_ack"]["wrong_type?"].is_string(),
@@ -2179,7 +2316,7 @@ async fn the_retype_hint_prints_only_when_retyping_would_actually_help() {
     )
     .await;
     let sid = scoped["id"].as_str().unwrap().to_string();
-    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{sid}"), Some(json!({ "status": "done" }))).await;
+    let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{sid}"), Some(json!({ "status": "done", "evidence": EV }))).await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
     assert!(
         v["how_to_ack"]["wrong_type?"].is_null(),
@@ -2941,7 +3078,7 @@ async fn the_blanket_ack_refusal_is_narrow_by_design() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "gate_ack": true })),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
     )
     .await;
     assert_eq!(st, StatusCode::OK, "done must still take a blanket ack: {v}");
@@ -2951,11 +3088,17 @@ async fn the_blanket_ack_refusal_is_narrow_by_design() {
 /// machine-checked constraints must be readable from the contract, and the
 /// contract's claim about each must match what the handler actually does.
 #[tokio::test]
-async fn the_contract_publishes_both_machine_checked_constraints() {
+async fn the_contract_publishes_every_machine_checked_constraint() {
     let (app, _tmp) = app();
     let (st, _, v) = send(&app, "GET", "/api/board/contract", None).await;
     assert_eq!(st, StatusCode::OK);
-    for key in ["done_requires_asset_link", "verified_requires_gate_checked"] {
+    // AF-321 added the third. A totalizing name ("both", "every") has to be
+    // tested at the widest scope the mechanism touches — ethos rule 7 — so this
+    // list is the list, and adding a constraint without adding it here is the
+    // failure the rename is guarding against.
+    for key in
+        ["done_requires_asset_link", "done_requires_evidence", "verified_requires_gate_checked"]
+    {
         assert!(v[key].is_object(), "contract must publish {key}: {v}");
         assert!(
             v[key]["enforced"].as_str().unwrap_or("").contains("force bypasses"),

@@ -66,6 +66,24 @@ Verify a hook by what it WROTE, not by the settings file.
   was building" and every red looks like your fault. The wrapper prints that missing clause
   beside the result, in both directions. Use plain `cargo test` when you want the raw thing.
 
+## Verification
+
+`VERIFY.md` names the proof for each surface: the literal command, and what a
+pass looks like. The board refuses `done` without evidence (AF-321) and its
+refusal points here.
+
+Paste the command AND its result line into `--evidence`. A command with no
+result is a claim that you ran it.
+
+```bash
+amux board done <ID> --evidence-stdin <<'EOF'
+scripts/test-contended.sh -p amux-server -> test result: ok. 1571 passed
+EOF
+```
+
+`none: <reason>` is the honest answer when a card genuinely produced no artifact.
+It is stored and counted, not a bypass.
+
 ## Observability
 
 Use the server's diagnostic endpoints before writing a grep:

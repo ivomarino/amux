@@ -1582,7 +1582,7 @@ _board_id_guard() {
 _board_transition() {
   local id="$1" status="$2"; shift 2
   local ack="" newtype="" override="" rev="" outcome="" trigger="" force_reason=""
-  local reviewer="" want_stdin=""
+  local reviewer="" want_stdin="" evidence="" want_ev_stdin=""
   local checked=()
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1612,6 +1612,17 @@ _board_transition() {
       # them was a hand-rolled PATCH, which is the same unaudited back door
       # AMUX-2325 was about, and it is the reason a parked card could sleep
       # forever: nothing machine-readable said what it was waiting for.
+      # --evidence records WHAT WAS RUN, into the `evidence` column the server
+      # requires on `done` (AF-321). Deliberately not the same field as
+      # --outcome: an outcome is prose about the card, evidence is the thing a
+      # reader can re-run. --outcome falls back into it below so lanes already
+      # closing cards with a substantive outcome keep working untouched.
+      # Same shell-evaluation trap as --outcome, and worse here, because
+      # evidence is USUALLY a command: prefer --evidence-stdin.
+      --evidence) evidence="${2:-}"; [[ -n "$evidence" ]] || die "--evidence needs text"; shift 2 ;;
+      --evidence-stdin) want_ev_stdin=1; shift ;;
+      --evidence-file) [[ -r "${2:-}" ]] || die "--evidence-file needs a readable path"
+                       evidence="$(cat "$2")"; shift 2 ;;
       --trigger) trigger="${2:-}"; [[ -n "$trigger" ]] || die "--trigger needs text"; shift 2 ;;
       --ack) ack=1; shift ;;
       --checked)
@@ -1633,15 +1644,27 @@ _board_transition() {
       --rev) rev="${2:-}"; shift 2 ;;
       --force) force_reason="${2:-}"; [[ -n "$force_reason" ]] || die "--force requires a reason (why you are bypassing the gate)"; shift 2 ;;
       *) die "amux board: unknown flag '$1'
-Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--force \"reason\"]" ;;
+Usage: amux board <status> <ID> [--checked \"crit\" ...] [--ack] [--type T] [--reviewer W] [--override-doing] [--trigger \"cond\"] [--evidence-stdin] [--force \"reason\"]" ;;
     esac
   done
   # Now that argv is known-good, drain stdin. See --outcome-stdin above: doing
   # this inside the loop meant an unknown flag AFTER it swallowed the heredoc
   # and then died, and the retry had nothing left to pipe.
+  if [[ -n "$want_stdin" && -n "$want_ev_stdin" ]]; then
+    die "--outcome-stdin and --evidence-stdin both read stdin; there is only one.
+Pipe one and pass the other with --outcome-file / --evidence-file."
+  fi
   if [[ -n "$want_stdin" ]]; then
     outcome="$(cat)"; [[ -n "$outcome" ]] || die "--outcome-stdin got empty input"
   fi
+  if [[ -n "$want_ev_stdin" ]]; then
+    evidence="$(cat)"; [[ -n "$evidence" ]] || die "--evidence-stdin got empty input"
+  fi
+  # An --outcome that already names an artifact IS evidence. Falling back keeps
+  # every lane that closes cards with a substantive outcome working unchanged;
+  # the ones this refuses are the ones closing on "implemented", which is the
+  # card this gate came from.
+  [[ -z "$evidence" && -n "$outcome" ]] && evidence="$outcome"
   # Record the outcome as its OWN write, BEFORE attempting the transition.
   # A PATCH is atomic, so `{"desc":...,"status":"done"}` that trips the gate
   # discards the outcome text TOO — and the retry then has nothing to satisfy
@@ -1691,6 +1714,48 @@ if d.get("error") or d.get("blocked"):
 ign = [f for f in (d.get("ignored_fields") or []) if f]
 if ign:
     sys.stderr.write("warning: reviewer NOT set — server ignored %s\n" % ", ".join(ign))
+'
+  fi
+
+  # EVIDENCE IS WRITTEN FIRST, for the reason the reviewer block above gives:
+  # a PATCH is atomic, so sending it together with `status:done` means a gate
+  # 409 rolls back the evidence too — and the retry then has nothing to satisfy
+  # the very gate that refused it. That is the AC-323 shape this file has now
+  # been bitten by on four fields; do not fold this into the status body.
+  if [[ -n "$evidence" ]]; then
+    local _evresp _evcurl=0
+    _evresp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' \
+      -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+      -d "$(V="$evidence" python3 -c 'import json,os;print(json.dumps({"evidence":os.environ["V"]}))')" \
+      "${AMUX_API:-https://localhost:8824}/api/board/$id" 2>/dev/null) || _evcurl=$?
+    if [[ "$_evcurl" -ne 0 ]]; then
+      die "cannot reach the board at ${AMUX_API:-https://localhost:8824} (curl exit $_evcurl).
+NOTHING was applied — not the evidence, and not the '$status' transition.
+The card is unchanged."
+    fi
+    printf '%s' "$_evresp" | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception:
+    sys.stderr.write("warning: evidence NOT recorded — server sent no JSON. "
+                     "The transition below was still attempted; check its result.\n"); sys.exit(0)
+if d.get("error") or d.get("blocked"):
+    sys.stderr.write("warning: evidence NOT recorded: %s\n" % (d.get("error") or "blocked")); sys.exit(0)
+ign = [f for f in (d.get("ignored_fields") or []) if f]
+if "evidence" in ign:
+    # SAY WHAT SURVIVED, NOT ONLY WHAT DID NOT. This first read "Upgrade it",
+    # which points at a build that may not exist yet: the CLI half of AF-321
+    # ships on SAVE (this file is a symlink into the worktree) and the server
+    # half ships on commit + build, so for a while every lane in the fleet saw
+    # this on every close. Two lanes read it as "my outcome was dropped, the
+    # server is stale"; one re-posted its outcome as a status-update and another
+    # was about to restart the server. Neither was true — the outcome had
+    # persisted in full both times. A warning that names only the casualty
+    # invites the reader to guess at the blast radius, and they guessed wide.
+    sys.stderr.write("note: the separate `evidence` field was not stored — this server "
+                     "predates AF-321. Your --outcome/--evidence TEXT still persisted to "
+                     "the card in full; only the dedicated column was dropped. Nothing is "
+                     "stale and nothing needs restarting.\n")
 '
   fi
 
@@ -2891,6 +2956,7 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    (prose, --stdin or --file <path>; NOT the gate flags below)
   amux board discard <ID>          Retire a card that is not a unit of work (ungated)
   amux board done <ID>             Move issue to done
+  amux board verified <ID>         Confirmed working in prod — needs --checked per criterion
   amux board doing <ID>            Move issue to doing (in progress)
   amux board review <ID>           Move issue to in review
   amux board todo <ID>             Move issue to todo
@@ -2914,6 +2980,18 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
     --outcome "what happened"      record the outcome FIRST, as its own write,
                                    so a refused transition cannot discard it
     --outcome-stdin                read the outcome from stdin ${GREEN}(preferred)${RESET}
+    --evidence "what was run"      WHAT WAS ACTUALLY RUN OR PRODUCED. Required by
+                                   the server on `done` (AF-321): a command, a
+                                   repo path, a URL, a commit sha, a #PR — or
+                                   `none: <reason>` when the card genuinely made
+                                   no artifact. An --outcome that already names
+                                   an artifact is used as evidence, so a lane
+                                   already passing a substantive --outcome needs
+                                   no change.
+    --evidence-stdin               read the evidence from stdin (PREFERRED —
+                                   evidence is usually a command, and inline
+                                   text is evaluated by YOUR shell first)
+    --evidence-file <path>         read the evidence from a file
     --outcome-file <path>          read the outcome from a file
                                    Inline text is evaluated by YOUR shell, so
                                    \`backticks\` and \$(...) in an outcome are
