@@ -48,6 +48,9 @@ run_probe() {
   sleep 1
   echo a > "$R/top/above.txt"
   echo b > "$R/sub/deep/below.txt"
+  # A second in-scope file so the cap has something to cut. With one file under
+  # cwd there is nothing to truncate and the cell could not fail.
+  echo c > "$R/sub/deep/below2.txt"
   # `cp` rather than `echo`: a pure-read command claims nothing (AF-124) and the
   # hook correctly returns before walking.
   printf '{"cwd":"%s","tool_input":{"command":"cp src dst"}}' "$R/sub" \
@@ -59,13 +62,23 @@ run_probe() {
 echo "observed-edits walk cells (AMUX-3920)"
 
 line="$(run_probe "$HOOK")"
+# WITHDRAWN AND INVERTED (AMUX-3933). This cell used to assert that a file ABOVE
+# cwd is recorded. Widening the root to get that is unsound: mtime says a file
+# was written in this window, never BY WHOM, and cwd was the only thing bounding
+# the smear. Live specimen: byo-ray recorded another lane's uncommitted file,
+# written 22s earlier and never touched by byo-ray, and the staged guard reads
+# exactly these records to decide ownership.
+#
+# So the assertion is now that a file above cwd is NOT claimed. That is a real
+# blind spot and AMUX-3933 owns it; claiming a peer's work is worse, which is the
+# module's own doctrine (cross-linking is strictly worse than staying blind).
 case "$line" in
-  *top/above.txt*) ok "a file ABOVE the session cwd is recorded" ;;
-  *) no "the above-cwd file is still invisible — the whole defect" "$line" ;;
+  *top/above.txt*) no "a file above cwd must NOT be claimed — that is a peer's work" "$line" ;;
+  *) ok "a file above the session cwd is not claimed (bounded smear, AMUX-3933)" ;;
 esac
 # CONTROL: widening must not lose what already worked.
 case "$line" in
-  *sub/deep/below.txt*) ok "the file below cwd is still recorded" ;;
+  *deep/below.txt*) ok "the file below cwd is still recorded" ;;
   *) no "coverage that worked before must not regress" "$line" ;;
 esac
 # The paths sent to the server are absolute; the LOG is repo-relative. Once the
@@ -79,8 +92,8 @@ esac
 # /var vs /private/var makes the same file two strings — found by an n=3 in a
 # two-file probe.
 case "$line" in
-  *"n=2 "*) ok "n= counts each file once across both roots" ;;
-  *) no "n= should be exactly 2 for a two-file probe" "$line" ;;
+  *"n=2 "*) ok "n= counts the in-scope files, not the one above cwd" ;;
+  *) no "n= should be 2: both files under cwd, neither above it" "$line" ;;
 esac
 
 # TRUNCATION IS NAMED, and cwd coverage survives it. On the monorepo above this
@@ -92,12 +105,13 @@ case "$line" in
   *TRUNCATED=cap*) ok "a capped walk says so" ;;
   *) no "a truncated walk must be distinguishable from a clean one" "$line" ;;
 esac
-# THE ORDERING GUARANTEE: under a cut budget the session's OWN directory is the
-# part that survives, because it is walked first. Without this the fix would
-# trade a known blind spot for an unpredictable one.
+# WITHDRAWN WITH THE WIDENING. This asserted the ordering guarantee that made a
+# two-root walk safe; with one root there is no ordering to guarantee. What
+# replaces it is the two-lane cell below, which pins the property the ordering
+# was only approximating: a session records its own work and not a peer's.
 case "$line" in
-  *sub/deep/below.txt*) ok "under truncation the surviving path is the cwd one" ;;
-  *) no "cwd must be walked FIRST so its coverage is never the part that is lost" "$line" ;;
+  *deep/*) ok "under truncation the surviving path is still under cwd" ;;
+  *) no "a truncated walk must still record something in scope" "$line" ;;
 esac
 
 # A CACHE WRITE IS NOT A LANE'S EDIT (mixpeek-cicd's specimen: n=3 in which two
@@ -130,8 +144,39 @@ case "$line" in
 esac
 # CONTROL: pruning caches must not lose the real file beside them.
 case "$line" in
-  *sub/real.txt*) ok "the real edit beside the caches is still recorded" ;;
+  *real.txt*) ok "the real edit beside the caches is still recorded" ;;
   *) no "pruning must not drop genuine edits" "$line" ;;
+esac
+
+# THE CELL THAT WOULD HAVE CAUGHT THE REGRESSION, and did not exist because
+# every probe here used ONE lane. Two lanes writing in the same window: the
+# session must claim its own file and NOT its neighbour's. mtime cannot tell them
+# apart, so the only bound is scope — which is why the root must stay at cwd
+# until something bounds it by IDENTITY instead.
+two_lane_probe() {
+  local tmp; tmp="$(mktemp -d)"
+  local R="$tmp/repo"
+  mkdir -p "$R/laneA" "$R/laneB"
+  git init -q "$R"
+  export AMUX_HOME="$tmp/home" AMUX_SESSION="laneA"
+  mkdir -p "$AMUX_HOME/hooks/state"
+  touch "$AMUX_HOME/hooks/state/observed-$AMUX_SESSION.t0"
+  sleep 1
+  echo mine  > "$R/laneA/mine.txt"
+  echo peers > "$R/laneB/peers.txt"
+  printf '{"cwd":"%s","tool_input":{"command":"cp src dst"}}' "$R/laneA" \
+    | AMUX_URL="http://127.0.0.1:9" python3 "$HOOK" >/dev/null 2>&1
+  tail -1 "$AMUX_HOME/hooks/state/observed-edits.log" 2>/dev/null || echo ""
+  rm -rf "$tmp"
+}
+line="$(two_lane_probe)"
+case "$line" in
+  *peers.txt*) no "a session must NEVER record a peer's file — the staged guard reads this" "$line" ;;
+  *) ok "a peer's file written in the same window is not claimed" ;;
+esac
+case "$line" in
+  *mine.txt*) ok "and the session's own file still is (bound, not blindness)" ;;
+  *) no "bounding must not stop the hook recording the session's own work" "$line" ;;
 esac
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

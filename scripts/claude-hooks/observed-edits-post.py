@@ -255,15 +255,33 @@ def main():
     # and every file under cwd is counted twice. Found by the n=3 in a two-file
     # control.
     _cwd_real = os.path.realpath(cwd)
+    # WITHDRAWN: THE REPO-ROOT WALK (AMUX-3920 / AMUX-3933, reverted 2026-08-30).
+    #
+    # Widening the root beyond cwd is UNSOUND, and the coverage it bought and the
+    # corruption it caused are the same operation. mtime says a file was written
+    # in this window; it does not say BY WHOM. cwd was the only thing bounding
+    # that smear, and removing it let every lane claim every other lane's
+    # uncommitted files.
+    #
+    # Live specimen, mixpeek-homepage-claude, with the git enumeration that made
+    # the widening complete:
+    #   byo-ray n=2 sent src=git paths=FRUSTRATIONS.md,research/shared-checkout/...md
+    # byo-ray's cwd is research/byo-ray/. The second path is another lane's file,
+    # written 22s earlier and never touched by byo-ray. The staged guard reads
+    # exactly these records to decide ownership, so this is worse than the blind
+    # spot it fixed — the module's own doctrine already says cross-linking is
+    # strictly worse than staying blind.
+    #
+    # Reverting the git enumeration alone was NOT enough; reproduced afterwards
+    # with a two-lane scratch repo, laneA claiming laneB/peers.txt through the
+    # os.walk widening. So the root goes back to cwd.
+    #
+    # WHAT SURVIVES from that work, because none of it depends on the wider root:
+    # the TRUNCATED marker, the tool-cache prune, realpath'd roots, repo-relative
+    # log paths. What does not survive is the coverage claim, and AMUX-3933 now
+    # owns the honest version of the problem: a bound that is about SESSION
+    # IDENTITY rather than about directory depth.
     walk_roots = [_cwd_real]
-    try:
-        top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
-                             capture_output=True, text=True, timeout=2).stdout.strip()
-        top = os.path.realpath(top) if top else ""
-        if top and os.path.isdir(top) and top != _cwd_real:
-            walk_roots.append(top)
-    except Exception:
-        pass
     walk_root = walk_roots[-1]
 
     deadline = time.monotonic() + FIND_BUDGET_S
@@ -307,6 +325,14 @@ def main():
                         # with its own clock.
                         hits.append({"path": p, "mtime": mt})
                         if len(hits) >= MAX_PATHS:
+                            # MARK IT HERE, not only at the top of the next
+                            # directory. Hitting the cap inside the LAST
+                            # directory used to break out with no marker, so a
+                            # capped run and a complete one printed the same
+                            # line — the exact ambiguity the marker exists to
+                            # remove, surviving in the one case where the cap
+                            # actually bit.
+                            truncated = " TRUNCATED=cap"
                             break
                 except OSError:
                     continue
