@@ -319,8 +319,109 @@ def main():
                 f"as another session's uncommitted work while clearing both real "
                 f"paths in the same message")
 
+    # ---- MR-101: a CONSUMED authorization implies the command was ALLOWED ----
+    #
+    # mixpeek-research saw one tool call produce BOTH "ALLOWED once" and
+    # "BLOCKED", the marker gone, the consumption in the audit log, and git never
+    # running. The discard branch is straight-line code evaluated once per
+    # process, so one process cannot print both: the hook ran TWICE for one tool
+    # call. The first run consumed the marker and allowed, the second found no
+    # marker and blocked, and the block is what the tool call returned.
+    #
+    # These run the guard as a SUBPROCESS twice with the same command, against a
+    # real HOME, so the marker/audit files are the shipped ones rather than a
+    # paraphrase of them.
+    import pathlib, time as _time
+    _home = tempfile.mkdtemp(prefix="guardhome-")
+    (pathlib.Path(_home) / ".amux" / "logs").mkdir(parents=True, exist_ok=True)
+    _marker = pathlib.Path(_home) / ".amux" / "guard-allow-once"
+    _audit = pathlib.Path(_home) / ".amux" / "logs" / "guard-overrides.jsonl"
+    # A command the guard blocks on its own: discarding another session's work.
+    # `git checkout HEAD -- f.txt` against a dirty f.txt is the discard shape.
+    open(os.path.join(work, "f.txt"), "w").write("dirty\n")
+    _discard = "git checkout HEAD -- f.txt"
+
+    def _hook(cmd, env=None):
+        # AMUX_URL points at a dead port on purpose. The discard branch fires
+        # either when a peer owns the path or when co-tenancy CANNOT BE VERIFIED
+        # ("REFUSING an unrecoverable discard rather than guessing"), and the
+        # second is reachable from a temp fixture where the first is not — a
+        # scratch repo has no peer edit records. It is also the exact shape the
+        # reporter saw beside their incident: byo-ray hit "the amux server is
+        # unreachable (TimeoutError)" from this guard minutes earlier.
+        e = dict(os.environ, AMUX_SHARED_CHECKOUTS=work, HOME=_home,
+                 AMUX_URL="https://127.0.0.1:9")
+        e.update(env or {})
+        p = subprocess.run(
+            [sys.executable, HOOK],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": work}),
+            capture_output=True, text=True, env=e, timeout=30)
+        return p.returncode, p.stderr
+
+    _marker.write_text(_discard)
+    rc1, err1 = _hook(_discard)
+    consumed = not _marker.exists()
+    rc2, err2 = _hook(_discard)
+
+    if consumed and rc1 != 0:
+        failures.append(
+            "MR-101/consumed-implies-allowed: the marker was CONSUMED but the run "
+            f"that consumed it returned {rc1}. A consumption that does not allow "
+            "spends the owner's one-off on nothing")
+    if consumed and rc2 != 0:
+        failures.append(
+            "MR-101/replay: second invocation of the SAME command returned "
+            f"{rc2} after the first consumed the marker. This is the reported "
+            f"bug: one tool call, both verdicts, git never ran. stderr: {err2[:200]}")
+    if consumed and rc2 == 0 and "REPLAYED" not in err2:
+        failures.append(
+            "MR-101/replay-is-loud: the replay was allowed but said nothing. "
+            "Allowing twice must be greppable, not silent")
+
+    # CONTROL 1 — a DIFFERENT destructive command inside the window gets nothing.
+    # Without this the replay could be 'any recent override allows anything'.
+    rc3, _ = _hook("git reset --hard HEAD~1")
+    if rc3 == 0:
+        failures.append(
+            "MR-101/control-different-command: an unrelated destructive command "
+            "was allowed inside the replay window — the window must key on the "
+            "AUTHORIZED TEXT, not on 'an override happened recently'")
+
+    # CONTROL 2 — the window EXPIRES. Backdate the audit record past the window
+    # and the same command must block again, or 'allow once' has become 'allow
+    # forever' for any command an owner ever sanctioned.
+    if not _audit.exists():
+        failures.append(
+            "MR-101/premise: the discard branch never fired, so none of these cells "
+            "measured anything. The fixture must reach a state where the guard "
+            "refuses a discard (a peer-owned path, or an unverifiable co-tenancy)")
+        _rows = []
+    else:
+        _rows = [json.loads(l) for l in _audit.read_text().splitlines() if l.strip()]
+    for _r in _rows:
+        _r["ts"] = _time.time() - 3600
+    if _rows:
+        _audit.write_text("".join(json.dumps(r) + "\n" for r in _rows))
+    rc4, _ = _hook(_discard)
+    if _rows and rc4 == 0:
+        failures.append(
+            "MR-101/control-window-expires: the same command was still allowed an "
+            "hour after its authorization was consumed — the replay window is not "
+            "bounded, so a one-off has become permanent")
+
+    # CONTROL 3 — the window can be switched OFF, restoring strict one-shot.
+    _audit.write_text("")
+    _marker.write_text(_discard)
+    _hook(_discard, {"AMUX_GUARD_ALLOW_REPLAY_S": "0"})
+    rc5, _ = _hook(_discard, {"AMUX_GUARD_ALLOW_REPLAY_S": "0"})
+    if rc5 == 0:
+        failures.append(
+            "MR-101/control-disable: AMUX_GUARD_ALLOW_REPLAY_S=0 must restore the "
+            "strict one-shot behaviour, and did not")
+    _mr101 = 6
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases))
+             + len(redir_cases) + _mr101)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

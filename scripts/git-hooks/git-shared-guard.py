@@ -191,28 +191,135 @@ def _scrub(cmd):
     s = re.sub(r'"[^"]*"', " ", s)
     return s
 
+# How long a CONSUMED authorization still answers for the SAME command string
+# (MR-101). Seconds. 0 disables the replay window and restores strict one-shot.
+#
+# SIZED FROM THE MEASURED GAP, not guessed. `_consume_override` has FOUR call
+# sites in this file, all straight-line in main(), and an unreachable amux server
+# sets `discard_why` at more than one of them — so one process reaches the
+# authorization check several times, separated by however long each co-tenancy
+# probe takes to give up. Measured here against a refused connection (the fast
+# failure): 4.4s between the first branch and the second. The reported incident
+# was a TimeoutError, which is much slower, and AC-287's retry loop sleeps up to
+# ~6s on top.
+#
+# 60 covers that with room and is still bounded: the expiry is a tested control,
+# so a one-off cannot become standing permission. The risk it accepts is narrow —
+# re-allowing THE SAME command string the owner already sanctioned, within a
+# minute, and every replay is audited with `replay_of`.
+_ALLOW_REPLAY_S = float(os.environ.get("AMUX_GUARD_ALLOW_REPLAY_S", "60") or 0)
+
+
+def _authorization_matches(want, cmd):
+    """Does the marker text `want` authorize `cmd`?
+
+    ONE predicate, used by both the marker path and the replay path below. Two
+    copies would let a command be authorized by the marker and then refused on
+    replay by a subtly different rule, which is the bug MR-101 reports wearing a
+    different cause.
+    """
+    if not want:
+        return False
+    return want in cmd or " ".join(want.split()) in " ".join(cmd.split())
+
+
+def _recently_authorized(cmd):
+    """Was this exact command authorized and consumed moments ago?
+
+    MR-101: mixpeek-research saw one tool call produce BOTH "ALLOWED once" and
+    "BLOCKED", with the marker gone and the consumption in the audit log, and
+    git never running. The discard branch is straight-line code evaluated once
+    per process, so one process cannot print both — the hook ran TWICE for one
+    tool call. The first run consumed the marker and allowed; the second found
+    no marker and blocked, and the block is what the tool call returned.
+
+    So a consumed authorization has to keep answering for a moment. The evidence
+    needed is already durable: every consumption is appended to the audit log
+    with its timestamp and the authorized text, which is the same record that
+    proved the double-invocation. Reading it back costs no new state and makes
+    that log load-bearing, so it cannot quietly stop being written.
+
+    Deliberately keyed on the AUTHORIZED TEXT rather than on "any recent
+    override": a different destructive command inside the window gets nothing.
+    """
+    if _ALLOW_REPLAY_S <= 0:
+        return None
+    try:
+        if not _AUDIT.exists():
+            return None
+        # Tail only — this file is append-only and grows forever.
+        with open(_AUDIT, "rb") as f:
+            try:
+                f.seek(-65536, os.SEEK_END)
+            except OSError:
+                f.seek(0)
+            tail = f.read().decode("utf-8", "replace")
+        now = time.time()
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except Exception:
+                continue
+            ts = rec.get("ts") or 0
+            if now - ts > _ALLOW_REPLAY_S:
+                # Records are append-only and time-ordered, so the first one
+                # outside the window ends the search.
+                return None
+            if _authorization_matches(rec.get("authorized") or "", cmd):
+                return rec
+    except Exception:
+        pass
+    return None
+
+
 def _consume_override(cmd):
     """If an owner-sanctioned marker matches this command, consume it (one-time),
     audit-log, and allow. Returns True to allow, False to keep blocking."""
     try:
-        if not _ALLOW_ONCE.exists():
-            return False
-        want = _ALLOW_ONCE.read_text().strip()
-        if not want:
-            return False
-        norm = " ".join(cmd.split())
-        if want in cmd or " ".join(want.split()) in norm:
-            _ALLOW_ONCE.unlink()  # one-time use
-            try:
-                _AUDIT.parent.mkdir(parents=True, exist_ok=True)
-                with open(_AUDIT, "a") as f:
-                    f.write(json.dumps({"ts": time.time(), "authorized": want, "command": cmd[:600]}) + "\n")
-            except Exception:
-                pass
-            return True
+        if _ALLOW_ONCE.exists():
+            want = _ALLOW_ONCE.read_text().strip()
+            if _authorization_matches(want, cmd):
+                _ALLOW_ONCE.unlink()  # one-time use
+                _audit_override({"ts": time.time(), "authorized": want, "command": cmd[:600]})
+                return True
     except Exception:
         pass
+    # The marker is gone or does not match. Before blocking, ask whether THIS
+    # command was authorized moments ago — a re-invocation of the same tool call
+    # must not be refused by the consumption its own first invocation performed.
+    prior = _recently_authorized(cmd)
+    if prior is not None:
+        _audit_override({
+            "ts": time.time(),
+            "authorized": prior.get("authorized"),
+            "command": cmd[:600],
+            # Distinct field, so "allowed twice" is greppable rather than
+            # indistinguishable from two separate owner authorizations.
+            "replay_of": prior.get("ts"),
+            "replay_window_s": _ALLOW_REPLAY_S,
+        })
+        sys.stderr.write(
+            "amux guard: allow-once REPLAYED (%.1fs after it was consumed) — same command "
+            "string, same authorization. The hook ran more than once for one tool call; "
+            "refusing the second run would block the command the owner sanctioned (MR-101).\n"
+            % (time.time() - (prior.get("ts") or time.time()))
+        )
+        return True
     return False
+
+
+def _audit_override(rec):
+    """Append one override record. Best-effort, like the original inline write:
+    an audit failure must not turn an ALLOW into a BLOCK."""
+    try:
+        _AUDIT.parent.mkdir(parents=True, exist_ok=True)
+        with open(_AUDIT, "a") as f:
+            f.write(json.dumps(rec) + "\n")
+    except Exception:
+        pass
 
 def _amend_verdict(cmd, scrubbed, run_dir):
     """Case 15/16 (2026-07-05 near-miss): `git commit --amend` rewrites shared
