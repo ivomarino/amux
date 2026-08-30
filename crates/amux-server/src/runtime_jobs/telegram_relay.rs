@@ -106,19 +106,33 @@ async fn check_and_relay(state: &AppState, mapping: &tg_db::TelegramMapping) -> 
         return Ok(());
     };
 
+    // DEDUP GATE (2026-08-30): a content hash of the extracted reply, not a
+    // line-number checkpoint. `last_relayed_line` looked like a checkpoint
+    // and was never one — it was write-only, nothing ever read it back, so
+    // this job resent the SAME reply every 30s tick for as long as it stayed
+    // the newest thing in the watched pane (found live, reported directly:
+    // "I get answers multiple times"). If this reply hashes the same as the
+    // last one actually sent to this chat, there is nothing new to say.
+    let reply_hash = content_hash(&reply_text);
+    if mapping.last_relayed_hash.as_deref() == Some(reply_hash.as_str()) {
+        return Ok(());
+    }
+
     // Convert markdown to Telegram HTML
     let html = markdown_to_html(&reply_text);
 
     // Try sending; fall back to plain text on format error
     match send_reply_to_telegram(mapping.chat_id, &html, Some("HTML")).await {
         Ok(_) => {
-            // Record success (line number of last relayed line)
+            // Record success (the dedup hash, plus the capture depth as an
+            // informational breadcrumb only — see mark_relayed's doc).
             let _ = state
                 .store
                 .write_async({
                     let chat_id = mapping.chat_id;
+                    let hash = reply_hash.clone();
                     move |conn| {
-                        tg_db::mark_relayed(conn, chat_id, last_line)?;
+                        tg_db::mark_relayed(conn, chat_id, last_line, &hash)?;
                         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                     }
                 })
@@ -151,13 +165,15 @@ async fn check_and_relay(state: &AppState, mapping: &tg_db::TelegramMapping) -> 
                 let plain = strip_html(&html);
                 match send_reply_to_telegram(mapping.chat_id, &plain, None).await {
                     Ok(_) => {
-                        // Update checkpoint even though we downgraded to plain text
+                        // Update the dedup gate even though we downgraded to plain text —
+                        // the underlying reply content, and thus its hash, is unchanged.
                         let _ = state
                             .store
                             .write_async({
                                 let chat_id = mapping.chat_id;
+                                let hash = reply_hash.clone();
                                 move |conn| {
-                                    tg_db::mark_relayed(conn, chat_id, last_line)?;
+                                    tg_db::mark_relayed(conn, chat_id, last_line, &hash)?;
                                     Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                                 }
                             })
@@ -171,6 +187,21 @@ async fn check_and_relay(state: &AppState, mapping: &tg_db::TelegramMapping) -> 
             Err(e)
         }
     }
+}
+
+/// Stable content hash for the dedup gate — deliberately SHA-256 (already a
+/// dependency, used the same way elsewhere in this crate), not
+/// `std::hash::Hash`/`DefaultHasher`: the stdlib hasher's algorithm is
+/// explicitly NOT guaranteed stable across compiler/std versions, and this
+/// hash is persisted to SQLite and compared across server restarts — which
+/// happen on every commit-triggered deploy via the auto-builder. A hasher
+/// that quietly changed algorithms would reset every chat's dedup state on
+/// the next deploy, at best causing one stray duplicate per chat rather than
+/// a hard bug, but there's no reason to accept even that when a stable hash
+/// is one dependency already in Cargo.toml away.
+fn content_hash(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(s.as_bytes()))
 }
 
 /// Send text to a Telegram chat. Reuses the existing send_message logic from telegram_poll.rs
@@ -193,19 +224,23 @@ fn bot_token() -> Result<String, String> {
 
 /// Markdown → Telegram HTML converter, subset matching what
 /// `send_message`'s doc comment says Telegram itself accepts: bold, italic,
-/// strikethrough, inline code, fenced code blocks (`<pre>`), links, and
-/// blockquotes. No native headings/lists/tables — those pass through as
-/// literal text, which is what Claude's own replies degrade to when a
-/// terminal can't render markdown either, so it's not a regression.
+/// strikethrough, inline code, fenced code blocks (`<pre>`), links,
+/// blockquotes, GFM tables (rendered as a monospace `<pre>` block — Telegram
+/// has no `<table>` entity, so column-aligned monospace is the closest
+/// available approximation), and ATX headings (`#`..`######`, rendered
+/// `<b>bold</b>` — Telegram has no `<h1>`..`<h6>` either). Native
+/// lists pass through as literal text unchanged, which already renders fine
+/// (Telegram doesn't need special markup for a leading "- " or "1. ").
 ///
-/// Fenced ```blocks``` are found on a LINE basis first (Telegram's own
-/// entity model is line-oriented for `<pre>`/`<blockquote>`), then each
-/// non-fenced, non-quote line runs through [`convert_inline`] for
-/// `**bold**`/`*italic*`/`~~strike~~`/`` `code` ``/`[text](url)`. This two-pass
-/// split is why triple backticks used to corrupt: the old single-pass
-/// char-walker toggled `<code>` three times per fence line (open/close/open),
-/// leaving an empty `<code></code>` pair and the language tag bleeding into
-/// the visible block instead of one clean `<pre>`.
+/// Fenced ```blocks``` and tables are found on a LINE basis first (Telegram's
+/// own entity model is line-oriented for `<pre>`/`<blockquote>`), then each
+/// remaining non-fenced, non-quote, non-table, non-heading line runs through
+/// [`convert_inline`] for `**bold**`/`*italic*`/`~~strike~~`/`` `code` ``/
+/// `[text](url)`. This two-pass split is why triple backticks used to
+/// corrupt: the old single-pass char-walker toggled `<code>` three times per
+/// fence line (open/close/open), leaving an empty `<code></code>` pair and
+/// the language tag bleeding into the visible block instead of one clean
+/// `<pre>`.
 fn markdown_to_html(md: &str) -> String {
     let mut result = String::with_capacity(md.len() * 2);
     let mut in_fence = false;
@@ -221,7 +256,14 @@ fn markdown_to_html(md: &str) -> String {
         buf.clear();
     };
 
-    for line in md.split('\n') {
+    // Indexed rather than `for line in md.split('\n')`: a table's shape
+    // (header row, then a separator row of `---`/`:--:`) can only be
+    // recognized by looking one line AHEAD, which an iterator-per-line loop
+    // can't do without re-buffering.
+    let lines: Vec<&str> = md.split('\n').collect();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
         let trimmed = line.trim_start();
         if trimmed.starts_with("```") {
             flush_quote(&mut quote_buf, &mut result);
@@ -231,21 +273,38 @@ fn markdown_to_html(md: &str) -> String {
                 result.push_str("<pre>");
             }
             in_fence = !in_fence;
+            i += 1;
             continue;
         }
         if in_fence {
             // Inside a fence: raw text, only HTML-escaped, no inline markdown.
             result.push_str(&escape_html(line));
             result.push('\n');
+            i += 1;
             continue;
         }
         if let Some(quoted) = line.strip_prefix("> ").or_else(|| line.strip_prefix(">")) {
             quote_buf.push(convert_inline(quoted));
+            i += 1;
             continue;
         }
         flush_quote(&mut quote_buf, &mut result);
+        if trimmed.contains('|') && i + 1 < lines.len() && is_table_separator(lines[i + 1]) {
+            let (table_html, consumed) = render_table(&lines[i..]);
+            result.push_str(&table_html);
+            i += consumed;
+            continue;
+        }
+        if let Some(heading) = parse_heading(trimmed) {
+            result.push_str("<b>");
+            result.push_str(&convert_inline(heading));
+            result.push_str("</b>\n");
+            i += 1;
+            continue;
+        }
         result.push_str(&convert_inline(line));
         result.push('\n');
+        i += 1;
     }
     flush_quote(&mut quote_buf, &mut result);
     if in_fence {
@@ -261,6 +320,123 @@ fn markdown_to_html(md: &str) -> String {
     }
 
     result
+}
+
+/// ATX heading (`# text` through `###### text`, standard markdown — a `#`
+/// followed by 1-6 hashes total and a space before the text). Deliberately
+/// requires the space: Claude's replies use bare `#123` (issue refs) and
+/// `#deploy`-style hashtag-looking text often enough that treating every
+/// leading `#` as a heading would be the more common false positive.
+fn parse_heading(trimmed: &str) -> Option<&str> {
+    let hashes = trimmed.chars().take_while(|&c| c == '#').count();
+    if hashes == 0 || hashes > 6 {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    rest.strip_prefix(' ').map(|s| s.trim_start())
+}
+
+/// Is `line` a GFM table separator row — cells of only `-` (optionally
+/// bracketed by `:` for alignment), e.g. `|---|:--:|--:|` or `---|---`? This
+/// is the ONE unambiguous signal that the line above it is a table header
+/// (plain text can contain `|` for all sorts of non-table reasons — a pipe
+/// used as a visual separator, shell output, etc. — so detection anchors on
+/// the separator row, never on `|` alone).
+fn is_table_separator(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let inner = t.trim_start_matches('|').trim_end_matches('|');
+    if inner.trim().is_empty() {
+        return false;
+    }
+    inner.split('|').all(|cell| {
+        let c = cell.trim();
+        if c.is_empty() {
+            return false;
+        }
+        let core = c.trim_start_matches(':').trim_end_matches(':');
+        !core.is_empty() && core.chars().all(|ch| ch == '-')
+    })
+}
+
+/// Splits one table row into its cells, tolerating an optional leading and
+/// trailing `|` (GFM allows `| a | b |` and bare `a | b` alike).
+fn parse_table_row(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let inner = t.trim_start_matches('|').trim_end_matches('|');
+    inner.split('|').map(|c| c.trim().to_string()).collect()
+}
+
+/// Renders a GFM table (`lines[0]` = header, `lines[1]` = separator,
+/// `lines[2..]` = data rows until a blank line or a line with no `|`) as a
+/// column-aligned monospace `<pre>` block — the closest Telegram gets to a
+/// real table, since it has no `<table>` entity at all. Returns the HTML and
+/// how many lines of `lines` were consumed, so the caller's index can skip
+/// past the whole block in one step.
+///
+/// Column widths come from the DATA (`chars().count()` on each cell, before
+/// escaping), not from the source separator row's dash count — Claude's own
+/// tables are rarely pre-aligned, and re-deriving the widths is what makes
+/// the monospace block actually line up instead of reproducing the source's
+/// misalignment verbatim.
+fn render_table(lines: &[&str]) -> (String, usize) {
+    let header = parse_table_row(lines[0]);
+    let ncols = header.len().max(1);
+    let mut rows: Vec<Vec<String>> = vec![header];
+    let mut consumed = 2; // header + separator row
+    let mut idx = 2;
+    while idx < lines.len() {
+        let t = lines[idx].trim();
+        if t.is_empty() || !t.contains('|') {
+            break;
+        }
+        rows.push(parse_table_row(lines[idx]));
+        consumed += 1;
+        idx += 1;
+    }
+
+    let mut widths = vec![1usize; ncols];
+    for row in &rows {
+        for (c, cell) in row.iter().enumerate().take(ncols) {
+            widths[c] = widths[c].max(cell.chars().count());
+        }
+    }
+
+    let render_row = |row: &[String], out: &mut String| {
+        for (c, &w) in widths.iter().enumerate() {
+            let cell = row.get(c).map(String::as_str).unwrap_or("");
+            let pad = w.saturating_sub(cell.chars().count());
+            out.push_str(&escape_html(cell));
+            out.push_str(&" ".repeat(pad));
+            if c + 1 < ncols {
+                out.push_str(" | ");
+            }
+        }
+    };
+
+    let mut out = String::from("<pre>");
+    for (ri, row) in rows.iter().enumerate() {
+        let mut line_out = String::new();
+        render_row(row, &mut line_out);
+        out.push_str(line_out.trim_end());
+        out.push('\n');
+        if ri == 0 {
+            // Separator, regenerated to the REAL widths above rather than
+            // copied from the source — the source's dash run only had to
+            // satisfy `is_table_separator`, not match the data's width.
+            for (c, &w) in widths.iter().enumerate() {
+                out.push_str(&"-".repeat(w));
+                if c + 1 < ncols {
+                    out.push_str("-+-");
+                }
+            }
+            out.push('\n');
+        }
+    }
+    out.push_str("</pre>\n");
+    (out, consumed)
 }
 
 fn escape_html(s: &str) -> String {
@@ -403,7 +579,7 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_reply, markdown_to_html};
+    use super::{content_hash, extract_reply, markdown_to_html};
 
     /// The bug this module used to have: a single-pass char walker toggled
     /// `<code>` on every backtick, so a fenced block's opening ``` produced
@@ -540,5 +716,92 @@ A shared Claude Code session on claude.ai/code";
         let (reply, _) = extract_reply(raw).expect("a reply was present");
         assert_eq!(reply, "second answer, this is the new one");
         assert!(!reply.contains("first answer"), "{reply:?}");
+    }
+
+    // ── Tables ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn gfm_table_becomes_a_column_aligned_pre_block() {
+        let md = "| Site | Status |\n\
+                   |------|--------|\n\
+                   | northstage.io | live |\n\
+                   | floads.io | live |";
+        let html = markdown_to_html(md);
+        assert_eq!(
+            html,
+            "<pre>Site          | Status\n\
+             --------------+-------\n\
+             northstage.io | live\n\
+             floads.io     | live\n\
+             </pre>"
+        );
+    }
+
+    #[test]
+    fn table_columns_widen_to_the_longest_cell_not_the_source_dash_count() {
+        // The source separator only had to satisfy is_table_separator (any
+        // run of dashes) — the rendered widths must come from the DATA, or a
+        // short `---` under a long header would misalign every row.
+        let md = "| a | b |\n|-|-|\n| short | a much longer cell |";
+        let html = markdown_to_html(md);
+        assert_eq!(html, "<pre>a     | b\n------+-------------------\nshort | a much longer cell\n</pre>");
+    }
+
+    #[test]
+    fn table_cell_content_is_html_escaped() {
+        let md = "| x |\n|---|\n| <b>&amp;</b> |";
+        let html = markdown_to_html(md);
+        assert!(html.contains("&lt;b&gt;&amp;amp;&lt;/b&gt;"), "{html:?}");
+    }
+
+    #[test]
+    fn a_pipe_with_no_separator_row_is_not_treated_as_a_table() {
+        // Plain text containing '|' (shell output, a visual separator) must
+        // not be mistaken for a table just because it has a pipe character —
+        // detection anchors on the separator ROW, not on '|' alone.
+        let md = "usage: foo | bar | baz";
+        assert_eq!(markdown_to_html(md), "usage: foo | bar | baz");
+    }
+
+    #[test]
+    fn table_stops_at_a_blank_line() {
+        let md = "| a |\n|---|\n| 1 |\n\nafter the table";
+        let html = markdown_to_html(md);
+        assert!(html.ends_with("</pre>\n\nafter the table"), "{html:?}");
+    }
+
+    // ── Headings ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn atx_headings_become_bold() {
+        assert_eq!(markdown_to_html("# Title"), "<b>Title</b>");
+        assert_eq!(markdown_to_html("### Sub-heading"), "<b>Sub-heading</b>");
+    }
+
+    #[test]
+    fn heading_text_still_gets_inline_formatting() {
+        assert_eq!(markdown_to_html("## **Frame** Phase 1"), "<b><b>Frame</b> Phase 1</b>");
+    }
+
+    #[test]
+    fn hash_with_no_space_is_not_a_heading() {
+        // Claude's replies say "#123" (issue refs) and "#deploy" often enough
+        // that guessing every leading '#' is a heading would be the more
+        // common false positive.
+        assert_eq!(markdown_to_html("see #123 for context"), "see #123 for context");
+        assert_eq!(markdown_to_html("#deploy"), "#deploy");
+    }
+
+    #[test]
+    fn seven_hashes_is_not_a_valid_heading_level() {
+        assert_eq!(markdown_to_html("####### too deep"), "####### too deep");
+    }
+
+    // ── Dedup hash ───────────────────────────────────────────────────────
+
+    #[test]
+    fn content_hash_is_deterministic_and_discriminates() {
+        assert_eq!(content_hash("same text"), content_hash("same text"));
+        assert_ne!(content_hash("text a"), content_hash("text b"));
     }
 }

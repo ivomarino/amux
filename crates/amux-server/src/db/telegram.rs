@@ -24,6 +24,20 @@ pub struct TelegramMapping {
     /// need "which pane is this chat's reply going to appear in" must read
     /// `routed_session()`, never `session` directly — see that method's doc.
     pub last_routed_session: Option<String>,
+    /// Content hash of the last reply text actually sent to Telegram
+    /// (migration 0038). The dedup gate: `telegram_relay::check_and_relay`
+    /// skips sending when the freshly-extracted reply hashes the same as
+    /// this. NOT a line-number/position checkpoint — `last_relayed_line`
+    /// was that, and was found live 2026-08-30 to be write-only (never read
+    /// back), so the relay resent the same reply every 30s tick for as long
+    /// as it stayed the newest thing in the pane. A raw position is also the
+    /// wrong shape for this: `tmux capture-pane -S -300` is a window sliding
+    /// off the CURRENT bottom, so once a pane has >300 lines of scrollback
+    /// its line count pins at 300 forever and a position-based comparison
+    /// would either never fire again or always fire — a content hash has
+    /// neither failure mode, since it only changes when the text to send
+    /// actually does.
+    pub last_relayed_hash: Option<String>,
 }
 
 impl TelegramMapping {
@@ -46,11 +60,12 @@ fn row_to_mapping(r: &rusqlite::Row<'_>) -> rusqlite::Result<TelegramMapping> {
         linked_at: r.get(3)?,
         last_message_at: r.get(4)?,
         last_routed_session: r.get(5)?,
+        last_relayed_hash: r.get(6)?,
     })
 }
 
-const COLS: &str =
-    "chat_id, session, telegram_username, linked_at, last_message_at, last_routed_session";
+const COLS: &str = "chat_id, session, telegram_username, linked_at, last_message_at, \
+                     last_routed_session, last_relayed_hash";
 
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<TelegramMapping>> {
     let mut stmt =
@@ -121,6 +136,10 @@ pub fn set_routed_session(conn: &Connection, chat_id: i64, session: &str) -> rus
                WHEN COALESCE(last_routed_session, session) != ?1 THEN 0
                ELSE last_relayed_line
              END,
+             last_relayed_hash = CASE
+               WHEN COALESCE(last_routed_session, session) != ?1 THEN NULL
+               ELSE last_relayed_hash
+             END,
              last_routed_session = ?1
          WHERE chat_id = ?2",
         params![session, chat_id],
@@ -153,13 +172,22 @@ pub fn set_last_update_id(conn: &Connection, id: i64) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Mark a message as successfully relayed back to Telegram. Clears any previous error.
-pub fn mark_relayed(conn: &Connection, chat_id: i64, line_number: i64) -> rusqlite::Result<()> {
+/// Mark a message as successfully relayed back to Telegram. Clears any
+/// previous error. `hash` is the dedup gate (see `TelegramMapping::
+/// last_relayed_hash`); `line_number` is kept only as an informational
+/// "how deep was the capture" breadcrumb — nothing reads it as a checkpoint.
+pub fn mark_relayed(
+    conn: &Connection,
+    chat_id: i64,
+    line_number: i64,
+    hash: &str,
+) -> rusqlite::Result<()> {
     conn.execute(
         "UPDATE telegram_mappings
-         SET last_relayed_line = ?1, last_relayed_at = datetime('now'), relay_error = NULL
-         WHERE chat_id = ?2",
-        params![line_number, chat_id],
+         SET last_relayed_line = ?1, last_relayed_hash = ?2,
+             last_relayed_at = datetime('now'), relay_error = NULL
+         WHERE chat_id = ?3",
+        params![line_number, hash, chat_id],
     )?;
     Ok(())
 }
