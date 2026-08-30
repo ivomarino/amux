@@ -44,6 +44,20 @@ pub fn reap_after_s() -> u64 {
         .unwrap_or(3600)
 }
 
+/// Activity-based TTL: kill any browser that has had no verb (navigate /
+/// screenshot / action / state) for this many seconds, even with pages open.
+/// `0` disables this arm. Default 300s (5 minutes).
+///
+/// This is the fastest arm. A session that opens a browser and walks away
+/// without closing it holds memory, GPU buffers, and a CDP socket for nothing.
+/// Five minutes of silence is a strong signal of abandonment.
+pub fn activity_reap_s() -> u64 {
+    std::env::var("AMUX_BROWSER_ACTIVITY_REAP_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
 /// Hard TTL: kill any browser older than this, even if it has pages open.
 /// `0` disables this arm entirely. Default 4 hours.
 ///
@@ -174,7 +188,26 @@ async fn tick(home: &std::path::Path) -> Vec<String> {
     let prior = read_idle(home);
     let mut next: HashMap<String, f64> = HashMap::new();
     let ttl = ttl_s();
-    for (profile, owner, started, _pid, port) in crate::integrations::browser::running_all() {
+    let activity_ttl = activity_reap_s();
+    for (profile, owner, started, _pid, port, last_verb) in crate::integrations::browser::running_all() {
+        // ACTIVITY ARM: no verb for N seconds = abandoned, release it. Checked
+        // before the page-presence arms because it fires fastest and the reason
+        // is the most actionable ("nobody is driving this") not just "it is old".
+        if activity_ttl > 0 {
+            let since_verb = now - last_verb as f64;
+            if since_verb >= activity_ttl as f64 {
+                tracing::info!(
+                    profile = %profile, owner = %owner,
+                    since_verb_s = since_verb as i64, activity_ttl,
+                    "browser: no activity for the whole window — releasing \
+                     (AMUX_BROWSER_ACTIVITY_REAP_S). Logins survive on disk."
+                );
+                crate::integrations::browser::stop_profile_as(home, &profile, "activity-reaper").await;
+                next.remove(&profile);
+                reaped.push(profile);
+                continue;
+            }
+        }
         // TTL ARM: hard ceiling regardless of page state. Checked first so a
         // browser that hit the TTL is not also logged as "idle" — one reason,
         // one log line (2026-08-30: 20+ Chrome instances in the dock, none
@@ -286,6 +319,21 @@ mod tests {
         // CONTROL: one real page among blanks keeps it alive. A predicate that
         // ignored the real one would reap a browser someone is using.
         assert!(has_real_page(&[page("about:blank"), page("https://x.com/")]));
+    }
+
+    /// Activity arm fires when no verb has been called for the whole window.
+    #[test]
+    fn activity_arm_fires_on_verb_silence() {
+        let five_min = 300u64;
+        let now = 10_000.0f64;
+        // Last verb 6 minutes ago -> reap.
+        assert!(should_reap_ttl(now as i64 - 360, now, five_min),
+            "360s silence with 300s window should reap");
+        // Last verb 4 minutes ago -> keep.
+        assert!(!should_reap_ttl(now as i64 - 240, now, five_min),
+            "240s silence with 300s window should keep");
+        // Disabled (0) -> never.
+        assert!(!should_reap_ttl(0, now, 0));
     }
 
     /// TTL arm fires on age, not emptiness — even a browser with open pages is

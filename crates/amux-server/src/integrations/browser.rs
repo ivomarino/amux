@@ -292,6 +292,10 @@ pub struct RunningBrowser {
     pub user_data_dir: PathBuf,
     pub cdp_port: u16,
     pub started_at: i64,
+    /// Unix timestamp of the last navigate/screenshot/action verb. Stamped by
+    /// `touch_verb` on every driver call so the reaper can detect stale browsers
+    /// that have pages open but nobody driving them (2026-08-30).
+    pub last_verb_at: i64,
     /// Always known. `child` is None for a browser ADOPTED after a server
     /// restart — we did not spawn it, so we have no handle, but we can still
     /// speak CDP to it and still kill it by pid.
@@ -325,15 +329,57 @@ pub fn running_snapshot_for(profile: &str) -> Option<(String, String, i64, u32, 
 
 /// Every running browser, newest first. The status verb renders all of them;
 /// nothing may assume a single one (AMUX-3828).
-pub fn running_all() -> Vec<(String, String, i64, u32, u16)> {
+/// Tuple: (profile, started_by, started_at, pid, cdp_port, last_verb_at)
+pub fn running_all() -> Vec<(String, String, i64, u32, u16, i64)> {
     let mut v: Vec<_> = RUNNING
         .lock()
         .expect("browser registry poisoned")
         .values()
-        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port))
+        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port, r.last_verb_at))
         .collect();
     v.sort_by_key(|r| std::cmp::Reverse(r.2));
     v
+}
+
+/// Stamp the current time as the last verb on a profile. Called by every
+/// driver verb (navigate, screenshot, action, state) so the reaper can tell
+/// "browser with open page but nobody driving it" from "browser in active use".
+pub fn touch_verb(profile: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if let Ok(mut g) = RUNNING.lock() {
+        if let Some(b) = g.get_mut(profile) {
+            b.last_verb_at = now;
+        }
+    }
+}
+
+/// Like `touch_verb` but looks up the browser by `started_by` == session.
+/// Mirrors the `port_for_session` fallback: if no owner matches but exactly
+/// one browser is running, that browser gets the stamp (it is the one being
+/// driven). Called from API verb handlers where we have the session name.
+pub fn touch_verb_for_session(session: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if let Ok(mut g) = RUNNING.lock() {
+        // Prefer the browser owned by this session.
+        if !session.is_empty() {
+            if let Some(b) = g.values_mut().find(|b| b.started_by == session) {
+                b.last_verb_at = now;
+                return;
+            }
+        }
+        // Single-browser fallback: mirrors port_for_session.
+        if g.len() == 1 {
+            if let Some(b) = g.values_mut().next() {
+                b.last_verb_at = now;
+            }
+        }
+    }
 }
 
 
@@ -397,7 +443,7 @@ fn spawn_exit_monitor() {
                 // The first ADOPTED browser (no child handle) whose pid is
                 // gone. Checked one per tick like the spawned case above; with
                 // several browsers the next tick takes the next (AMUX-3828).
-                let snap = running_all().into_iter().find(|(p, _, _, _, _)| {
+                let snap = running_all().into_iter().find(|(p, _, _, _, _, _)| {
                     RUNNING
                         .lock()
                         .expect("browser registry poisoned")
@@ -405,7 +451,7 @@ fn spawn_exit_monitor() {
                         .is_some_and(|r| r.child.is_none())
                 });
                 match snap {
-                    Some((profile, owner, _, pid, _)) => {
+                    Some((profile, owner, _, pid, _, _)) => {
                         let alive = tokio::process::Command::new("kill")
                             .args(["-0", &pid.to_string()])
                             .status()
@@ -468,6 +514,7 @@ pub fn test_seed_running_port(profile: &str, started_by: &str, pid: u32, port: u
         user_data_dir: PathBuf::new(),
         cdp_port: port,
         started_at: 0,
+        last_verb_at: 0,
         pid,
         started_by: started_by.into(),
         child: None,
@@ -641,6 +688,7 @@ async fn adopt_one(home: &Path, v: &serde_json::Value) -> bool {
         user_data_dir: dir,
         cdp_port: port,
         started_at: started,
+        last_verb_at: started,
         pid,
         started_by,
         child: None,
@@ -774,7 +822,7 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // own siblings — the exact "two Chromes on one dir" harm it exists to stop,
     // caused by the fix for it.
     let adopted: std::collections::HashSet<u32> =
-        running_all().into_iter().map(|(_, _, _, pid, _)| pid).collect();
+        running_all().into_iter().map(|(_, _, _, pid, _, _)| pid).collect();
     let strays: Vec<u32> = live_chromes_on_dir(home, target_dir)
         .into_iter()
         .filter(|p| !adopted.contains(p))
@@ -1336,6 +1384,7 @@ pub async fn start(
         user_data_dir: target.user_data_dir,
         cdp_port: port,
         started_at,
+        last_verb_at: started_at,
         pid: pid_num,
         // Ownership is the EXPLICIT attribution, never the tab-binding
         // default ("amux") — an anonymous start records "" so the guard can
@@ -1719,6 +1768,223 @@ pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<Dri
 pub static STALE_BINDING_RECOVERIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The registry row for a CDP port: (profile, started_by, pid).
+///
+/// READS THE STRUCT BY FIELD NAME, deliberately, rather than going through
+/// `running_all()`. That helper returns a positional tuple which peers widen as
+/// the reaper grows — it gained a sixth element on 2026-08-30, mid-edit, and
+/// every destructuring call site broke at once for a field none of them wanted.
+/// Naming the three fields this path actually needs makes the next widening a
+/// non-event here.
+fn registry_row_for_port(port: u16) -> Option<(String, String, u32)> {
+    RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .values()
+        .find(|r| r.cdp_port == port)
+        .map(|r| (r.profile.clone(), r.started_by.clone(), r.pid))
+}
+
+/// How many times a verb found the registry naming a browser whose PROCESS is
+/// gone (AMUX-3886). Read by `GET /api/browser/status`.
+pub static DEAD_BROWSER_RECOVERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Is `pid` a currently-live process? `kill(pid, 0)` sends no signal but
+/// performs the existence+permission check — Ok/EPERM means alive, ESRCH means
+/// gone.
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 is the canonical liveness probe; it touches
+    // no memory and cannot affect the target.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// What a `/json/list` failure on a registered port MEANS. Pure on purpose.
+///
+/// PURE FOR THE SAME REASON AS `choose_target`. The effectful version has to
+/// clear the registry, rewrite the running-file under `~/.amux` and record a
+/// corpse; a test that drove it would reach the REAL `~/.amux` and could clear
+/// a live lane's browser (AF-111 is exactly this hazard). Splitting the
+/// decision out is what makes the check runnable in CI at all, rather than an
+/// `#[ignore]`d live test that never fails because it never executes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CdpListVerdict {
+    /// The registry no longer names this port — a stop raced us. Nothing to
+    /// clear, no pid to judge; report the CDP fault with its cause.
+    Unregistered,
+    /// The process is ALIVE and its CDP port did not answer: wedged or
+    /// refusing, not gone. A real 502, and the pid is what makes it diagnosable.
+    Wedged { pid: u32, profile: String },
+    /// The process is GONE while the registry still named it. The caller's
+    /// fixable state, not amux failing.
+    Gone { pid: u32, profile: String, started_by: String },
+}
+
+/// The rule, separated from its side effects. `entry` is the registry row for
+/// the port (profile, started_by, pid), `alive` its `kill -0` result.
+pub(crate) fn classify_cdp_list_failure(
+    entry: Option<(String, String, u32)>,
+    alive: bool,
+) -> CdpListVerdict {
+    match entry {
+        None => CdpListVerdict::Unregistered,
+        Some((profile, _, pid)) if alive => CdpListVerdict::Wedged { pid, profile },
+        Some((profile, started_by, pid)) => CdpListVerdict::Gone { pid, profile, started_by },
+    }
+}
+
+/// `/json/list` failed on a port the registry says is ours. SAY WHICH FAULT
+/// THIS IS before handing it back.
+///
+/// AMUX-3886. Two 502s from `general-canvas-apps` on 2026-08-29 carried
+/// `error sending request for url (http://127.0.0.1:49731/json/list)` and
+/// nothing else, and the server log had NO line for either — the whole
+/// `cdp_list` failure path was silent. Three different faults reach this point
+/// and the old code could not tell them apart, because the one string it
+/// produced is identical for a refused connect, a DNS failure and a timeout.
+///
+/// A GONE process must not wear a 5xx: that is the caller's fixable state
+/// (start a browser), which is the card's own instruction — "if this is really
+/// a refusal, the fix is the STATUS CODE, not the caller". The corpse is
+/// recorded exactly as `adopt_one` records it, and the registry cleared, so the
+/// next verb says `NotRunning` instead of retrying a dead port.
+///
+/// The exit monitor polls every 5s and would eventually notice a dead pid; this
+/// runs on the REQUEST, so the caller that hits the gap gets the answer rather
+/// than a 502 that reads as a mystery.
+async fn cdp_list_failure(session: &str, port: u16, e: anyhow::Error) -> DriverError {
+    let entry = registry_row_for_port(port);
+    let alive = entry.as_ref().is_some_and(|(_, _, pid)| pid_alive(*pid));
+    match classify_cdp_list_failure(entry, alive) {
+        CdpListVerdict::Unregistered => {
+            tracing::warn!(
+                session, port, cause = %format!("{e:#}"),
+                "browser: /json/list failed on a port no longer in the registry (AMUX-3886)"
+            );
+            DriverError::Cdp(e)
+        }
+        CdpListVerdict::Wedged { pid, profile } => {
+            tracing::warn!(
+                session, port, pid, profile, cause = %format!("{e:#}"),
+                "browser: Chrome is ALIVE but its CDP port did not answer — wedged or refusing, \
+                 not gone; the registry is left intact (AMUX-3886)"
+            );
+            DriverError::Cdp(e.context(format!(
+                "Chrome pid {pid} (profile {profile:?}) is ALIVE but its CDP port {port} did not \
+                 answer /json/list, so the browser is wedged or refusing rather than gone. \
+                 POST /api/browser/stop then /api/browser/start to replace it"
+            )))
+        }
+        CdpListVerdict::Gone { pid, profile, started_by } => {
+            tracing::warn!(
+                session, port, pid, profile, started_by = %started_by, cause = %format!("{e:#}"),
+                "browser: the registry named a browser whose PROCESS IS GONE — recording \
+                 last_exit, clearing the registry, and answering the caller with the fixable \
+                 state instead of a 502 (AMUX-3886)"
+            );
+            *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
+                "ts": chrono::Utc::now().timestamp(),
+                "reason": "found dead on a verb (the registry still named it; CDP and the pid are both gone)",
+                "profile": profile,
+                "pid": pid,
+                "started_by": started_by,
+                "code": serde_json::Value::Null,
+                "signal": serde_json::Value::Null,
+            }));
+            RUNNING.lock().expect("browser registry poisoned").remove(&profile);
+            NATIVE_TARGETS.lock().expect("native targets poisoned").remove(session);
+            clear_running_for(&amux_home(), &profile);
+            DEAD_BROWSER_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DriverError::NotRunning
+        }
+    }
+}
+
+#[cfg(test)]
+mod cdp_list_failure_tests {
+    use super::*;
+
+    /// THE DEFECT AMUX-3886 IS ABOUT, pinned against a real socket.
+    ///
+    /// `to_string()` on the error `cdp_list` returns prints the outermost frame
+    /// only. That frame names the URL and NOTHING about the fault, so a refused
+    /// connect, a DNS failure and a timeout all render as the same bytes — which
+    /// is why two 502s on 2026-08-29 were undiagnosable four hours later.
+    ///
+    /// Asserts BOTH directions on purpose. Without the negative arm this test
+    /// would still pass if `{:#}` silently started behaving like `{}`, and the
+    /// whole fix would be gone with the check still green.
+    #[tokio::test]
+    async fn cdp_list_error_keeps_its_cause_only_in_the_alternate_form() {
+        // Bind then drop, so the port is certainly closed and the connect is
+        // REFUSED rather than timing out (the 2026-08-29 samples answered in
+        // ~1ms, which is a refusal, not the 3s timeout).
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        drop(l);
+
+        let e = cdp_list(port).await.expect_err("a closed port must fail");
+        let plain = e.to_string();
+        let with_cause = format!("{e:#}");
+
+        assert!(
+            !plain.to_lowercase().contains("refused"),
+            "the CONTROL has stopped holding: `to_string()` now carries the cause, so this test \
+             no longer proves anything. Got: {plain}"
+        );
+        assert!(
+            with_cause.to_lowercase().contains("refused"),
+            "the alternate form must carry the cause that separates a refusal from a timeout. \
+             Got: {with_cause}"
+        );
+        assert!(
+            with_cause.len() > plain.len(),
+            "cause chain must ADD to the message: plain={plain:?} alt={with_cause:?}"
+        );
+    }
+
+    /// A GONE process is the caller's fixable state, not amux failing.
+    #[test]
+    fn a_gone_process_is_not_running_and_a_live_one_is_wedged() {
+        let entry = || Some(("default".to_string(), "some-lane".to_string(), 4242u32));
+
+        assert_eq!(
+            classify_cdp_list_failure(entry(), false),
+            CdpListVerdict::Gone {
+                pid: 4242,
+                profile: "default".into(),
+                started_by: "some-lane".into()
+            },
+            "pid gone => the registry is stale; the caller can fix it by starting a browser"
+        );
+        // CONTROL: same registry row, live pid. A change that answered `Gone`
+        // for everything would pass the assertion above and clear a HEALTHY
+        // browser out from under its owner.
+        assert_eq!(
+            classify_cdp_list_failure(entry(), true),
+            CdpListVerdict::Wedged { pid: 4242, profile: "default".into() },
+            "a live pid must never be swept as a corpse"
+        );
+        // A stop that raced us leaves no row to judge.
+        assert_eq!(classify_cdp_list_failure(None, false), CdpListVerdict::Unregistered);
+        assert_eq!(classify_cdp_list_failure(None, true), CdpListVerdict::Unregistered);
+    }
+
+    /// `pid_alive` must actually discriminate, or the classifier above is fed a
+    /// constant and every arm of it is decoration.
+    #[test]
+    fn pid_alive_separates_this_process_from_a_reaped_one() {
+        assert!(pid_alive(std::process::id()), "this very process must read as alive");
+        // A child we spawn and reap: its pid is genuinely gone, and unlike a
+        // made-up number it cannot accidentally belong to something else.
+        let mut c = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = c.id();
+        c.wait().expect("wait");
+        assert!(!pid_alive(pid), "a reaped child (pid {pid}) must read as gone");
+    }
+}
+
 /// `resolve_page`, but refusing to hand back `avoid`.
 ///
 /// AMUX-3708. The bound-tab branch below already falls through when the tab is
@@ -1745,7 +2011,10 @@ pub async fn resolve_page_avoiding(
     let Some(port) = port_for_session(session) else {
         return Err(DriverError::NotRunning);
     };
-    let tabs_v = cdp_list(port).await.map_err(DriverError::Cdp)?;
+    let tabs_v = match cdp_list(port).await {
+        Ok(v) => v,
+        Err(e) => return Err(cdp_list_failure(session, port, e).await),
+    };
     let empty = vec![];
     let tabs = tabs_v.as_array().unwrap_or(&empty);
     let page_of = |t: &Value| -> Option<DriverPage> {

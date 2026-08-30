@@ -2255,3 +2255,31 @@ FIX: The firsthand-edit record is fed by Edit/Write tool calls, so a session fol
  Either record a firsthand claim when a Bash command writes a tracked file in the
  session's own cwd, or suppress the per-line list when EVERY unmatched line is in a
  file whose only recorded writer is you and no peer has a recorded write in the window.
+## A trustworthy test run on a contended file now requires a private worktree, and each one costs a full dependency rebuild
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-30
+SESSION: amux-frustrations
+CARD: AF-336
+SYMPTOM: Verifying the AF-342 fix, `cargo test -p amux-server --lib git_guard` failed to
+ compile for ~35 minutes on errors entirely inside a peer's in-flight
+ crates/amux-server/src/api/browser.rs (E0308 tuple arity, then an unterminated json!
+ macro) while three lanes edited the tree. `cargo test` builds the TREE, so a red result
+ said nothing about my change and a green one would have been equally uninformative.
+ Both amux and amux-frustrations independently reached for the same workaround in the
+ same hour, neither having proposed it to the other: `git worktree add --detach <tmp>
+ HEAD`, apply only your own diff, test there.
+COST: ~35 minutes of blocked verification on this pass, plus a full dependency rebuild
+ per worktree because CARGO_TARGET_DIR keys on the workspace path, so the shared build
+ cache does not carry over. The durable cost is that the sanctioned verification command
+ in VERIFY.md is now untrustworthy for any contended file, with nothing in its output
+ saying so: scripts/test-contended.sh reports whether a BUILD was running, which is a
+ different question from whether a peer's half-saved source is in your tree. Two lanes
+ converging on an unshared workaround in one hour is the signal that it is the norm.
+FIX: AF-336 (per-lane worktree) ends this class rather than detecting it, and this entry
+ is evidence for it rather than a new proposal. Until then the cheap half is honesty in
+ the instrument: have scripts/test-contended.sh report, beside its result, whether any
+ tracked source in the crate under test is dirty and attributed to another session. A
+ compile failure in a file you did not touch would then read as such instead of as your
+ own regression.

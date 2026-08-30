@@ -181,6 +181,17 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-friction-themes.sh
+      # AF-342. The staged-guard's SERVER decision has unit tests in
+      # git_guard.rs; what a lane actually experiences is what the hook prints,
+      # and that half had none. The defect was purely printing volume (93
+      # warning lines on a commit with no peer involved), so the behaviour worth
+      # pinning is "stays silent when it should" - which no Rust test can see,
+      # because the hook is a separate Python file that ships by install, not by
+      # build. Language-agnostic, so it belongs here rather than in rust.yml.
+      - name: staged-guard prints noise only when it has something to say (AF-342)
+        run: |
+          set -uo pipefail
+          ./scripts/test-staged-guard-render.sh
       # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
       # and they belong HERE rather than in rust.yml because rust.yml is
       # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to

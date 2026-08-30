@@ -939,7 +939,7 @@ async fn status() -> Response {
     let all = chrome::running_all();
     let snapshot = all
         .first()
-        .map(|(p, o, st, _pid, port)| (p.clone(), *port, *st, o.clone()));
+        .map(|(p, o, st, _pid, port, _lv)| (p.clone(), *port, *st, o.clone()));
     // AMUX-3414: why the LAST browser is gone. In-memory, so a server restart
     // clears it — absent means "no exit recorded by this process", not "no
     // exit happened"; the field's note says so rather than letting the two
@@ -973,15 +973,18 @@ async fn status() -> Response {
     let now_f = crate::config::now_f64();
     // Per-browser rows, so two workers can each see their own.
     let mut browsers: Vec<Value> = Vec::new();
-    for (p, o, st, pid, port) in &all {
+    for (p, o, st, pid, port, last_verb) in &all {
         let t = chrome::cdp_list(*port).await.ok();
         let age_s = now_f - *st as f64;
+        let since_verb_s = now_f - *last_verb as f64;
         let ttl_remaining_s = if ttl > 0 {
             let r = ttl as f64 - age_s;
             if r > 0.0 { Some(r.round()) } else { Some(0.0) }
         } else {
             None
         };
+        let activity_reap = crate::runtime_jobs::browser_reaper::activity_reap_s();
+        let activity_reap_val = if activity_reap == 0 { Value::Null } else { json!(activity_reap) };
         browsers.push(json!({
             "profile": p,
             "started_by": o,
@@ -1000,6 +1003,9 @@ async fn status() -> Response {
             // Null when AMUX_BROWSER_TTL_S=0 (TTL arm disabled).
             "ttl_remaining_s": ttl_remaining_s,
             "ttl_s": if ttl == 0 { Value::Null } else { json!(ttl) },
+            // How long since any verb (navigate/screenshot/action) was called.
+            "since_verb_s": since_verb_s.round(),
+            "activity_reap_s": activity_reap_val,
         }));
     }
     Json(json!({
@@ -1026,6 +1032,17 @@ async fn status() -> Response {
         "stale_binding_recoveries_note":
             "tabs Chrome still listed whose CDP socket would not open, so the session was \
              rebound. In-memory; a server restart resets it to 0.",
+        // AMUX-3886. The other half of the same blindness: a browser whose
+        // PROCESS is gone while the registry still names it. The exit monitor
+        // polls at 5s, so every verb in that gap used to 502 with a cause-free
+        // reqwest string; now the verb itself clears the corpse and counts it.
+        // Read it BESIDE `last_exit`: a non-zero count with a `found dead on a
+        // verb` reason means the monitor was not the thing that noticed.
+        "dead_browser_recoveries":
+            chrome::DEAD_BROWSER_RECOVERIES.load(std::sync::atomic::Ordering::Relaxed),
+        "dead_browser_recoveries_note":
+            "verbs that found the registry naming a browser whose process was gone, cleared it, \
+             and answered 409 rather than 502. In-memory; a server restart resets it to 0.",
     }))
     .into_response()
 }
@@ -1041,7 +1058,7 @@ async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     // by whoever notices) but LOUD: the log and the response both name owner
     // and actor, so an anonymous stop can no longer read as a mystery death
     // (AMUX-3063's other half — the 09:05 stop had no actor on record).
-    let owner = chrome::running_all().into_iter().next().map(|(_, o, _, _, _)| o);
+    let owner = chrome::running_all().into_iter().next().map(|(_, o, _, _, _, _)| o);
     if let Some(o) = owner.as_deref() {
         if attrib.as_deref() != Some(o) {
             tracing::warn!(
@@ -1201,6 +1218,7 @@ async fn navigate(headers: HeaderMap, body: Option<Json<NavigateBody>>) -> Respo
     };
     match chrome::navigate_and_settle(&mut cdp, &url).await {
         Ok(mut v) => {
+            crate::integrations::browser::touch_verb_for_session(&session);
             if let Some(o) = v.as_object_mut() {
                 o.insert("backend".into(), json!("native"));
                 o.insert("session".into(), json!(session));
@@ -1246,6 +1264,7 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
     }
     match chrome::screenshot_to_file(&mut cdp, &chrome::amux_home(), &session).await {
         Ok((path, size)) => {
+            crate::integrations::browser::touch_verb_for_session(&session);
             let url = cdp
                 .eval("location.href", 10)
                 .await
@@ -1344,6 +1363,7 @@ async fn state_verb(headers: HeaderMap, Query(q): Query<SessionQuery>) -> Respon
         Ok(x) => x,
         Err(r) => return r,
     };
+    crate::integrations::browser::touch_verb_for_session(&session);
     match state_payload(&mut cdp, &session).await {
         Ok(v) => Json(v).into_response(),
         Err(r) => r,
@@ -1492,6 +1512,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
         Ok(x) => x,
         Err(r) => return r,
     };
+    crate::integrations::browser::touch_verb_for_session(&session);
     let ten = Duration::from_secs(10);
 
     match action.as_str() {
@@ -2028,6 +2049,38 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v, proxied)
+    }
+
+    /// AMUX-3886. `with_cause` is the renderer every error body in this file
+    /// goes through, and the ONLY thing it has to do is not drop the chain.
+    ///
+    /// `tests/browser_errors_carry_cause.rs` proves the call sites USE it. This
+    /// proves it is worth using: without this, `with_cause` could be rewritten
+    /// to `format!("{e}")` and every check in the pair would stay green while
+    /// the 502 went back to being undiagnosable.
+    #[test]
+    fn with_cause_keeps_the_whole_chain_and_plain_display_does_not() {
+        let e = anyhow::anyhow!("tcp connect error: Connection refused (os error 61)")
+            .context("client error (Connect)")
+            .context("error sending request for url (http://127.0.0.1:49731/json/list)");
+
+        let rendered = with_cause(&e);
+        for frame in [
+            "error sending request for url",
+            "client error (Connect)",
+            "Connection refused (os error 61)",
+        ] {
+            assert!(rendered.contains(frame), "with_cause dropped {frame:?}: {rendered}");
+        }
+        // CONTROL: the thing this replaced keeps ONLY the outermost frame. If
+        // this stops holding, plain Display started carrying causes and the
+        // assertions above no longer distinguish the two renderers.
+        let plain = e.to_string();
+        assert!(
+            !plain.contains("Connection refused"),
+            "the control has stopped holding: plain Display now carries the cause ({plain})"
+        );
+        assert!(rendered.len() > plain.len(), "the chain must ADD to the message");
     }
 
     /// AMUX-3672. A wedged browser and a rejected call must not share a status,

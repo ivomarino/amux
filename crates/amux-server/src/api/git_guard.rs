@@ -1162,6 +1162,74 @@ pub(crate) fn unaccounted_added_lines(added: &[String], own_content: &str) -> Ve
         .collect()
 }
 
+/// What unaccounted-line accounting can do for one staged path (AF-342).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum LineAccounting {
+    /// No firsthand content at all: an entirely shell-edited file. Comparing
+    /// would flag every line, so nothing is reported and nothing is claimed.
+    /// This arm predates AF-342 and is the original AMUX-3446 behaviour.
+    Skip,
+    /// Firsthand content EXISTS, but the committer ALSO has a write here that
+    /// recorded no content. That is the general property, not "a shell edit"
+    /// (ts-gke's correction on AF-342): a heredoc is one way for a write to
+    /// carry no content record, and a codegen step, a `git checkout` and an
+    /// editor outside the harness are three more. Whatever produced it, a line
+    /// absent from the firsthand content is then equally consistent with "my
+    /// own unrecorded write put it there" and "a peer's hunk rode my git add".
+    /// The probe cannot separate them, and says so instead of guessing.
+    Undecidable,
+    /// Firsthand content, and no observed write of mine. A line the committer's
+    /// own content cannot account for is then a real anomaly: this is the
+    /// 7797e45 peer-hunk shape the check was built for.
+    Check,
+}
+
+/// AF-342, the pure half so the three-way decision is PINNED rather than held
+/// by a control-flow reading. The two `true` arms differ in what they mean and
+/// collapsing them is the bug: before this existed, a file with a PARTIAL
+/// content record (created with Write, then changed by something that records
+/// no content) took the `Check` arm, and every line from the unrecorded write
+/// came back as unaccounted. Measured on commit 40fa0ce0: 93 warning lines
+/// across three files written entirely by one session, no peer involved.
+///
+/// `mine_observed` is an mtime, so it is already the general property and not
+/// a shell-edit test: it fires for a heredoc, a codegen step or a `git
+/// checkout` alike. That generality is deliberate (ts-gke, AF-342) — scoping
+/// this to "shell edits" would require the harness and the guard to agree
+/// about how edits are made, which is a coupling neither should carry.
+///
+/// Why the noise matters more than the false positive: partial content records
+/// are the NORMAL shape here, and a warning that fires on the normal path is
+/// one people learn to scroll past. That is not hypothetical. Twenty minutes
+/// after this was filed, ts-gke's 78009d90 swept 87 lines of a peer's
+/// in-flight `with_cause` work into a commit about a browser-reaper TTL, past
+/// this very warning; `git log -S with_cause` now answers with the wrong
+/// commit. The protection is only as good as the odds the warning gets read.
+///
+/// `peer_claims` is why this takes three arguments rather than two. An observed
+/// record is an MTIME MY BASH WINDOW CAUGHT, and on a shared checkout that
+/// includes writes I did not make: measured live while building this fix, a
+/// peer's `integrations/browser.rs` write landed inside my window and entered
+/// MY observed set 59 seconds later (the `mine_observed_only` provenance
+/// AMUX-3662 exists for). Suppressing on my observed record ALONE would
+/// therefore also suppress the one case the check is most useful in. So when a
+/// peer also claims the path, the detail stays on: that is exactly when a
+/// reader needs to see which lines are not theirs.
+pub(crate) fn line_accounting_mode(
+    has_firsthand: bool,
+    mine_observed: bool,
+    peer_claims: bool,
+) -> LineAccounting {
+    match (has_firsthand, mine_observed, peer_claims) {
+        (false, _, _) => LineAccounting::Skip,
+        // My shell write, and nobody else is anywhere near this path.
+        (true, true, false) => LineAccounting::Undecidable,
+        // A peer claims it too: keep the line detail, noise and all.
+        (true, true, true) => LineAccounting::Check,
+        (true, false, _) => LineAccounting::Check,
+    }
+}
+
 /// AMUX-3128 surfacing half: every INFERRED edit record (a Bash command whose
 /// named path moved mtime within slack) is logged so the class stays countable.
 /// A future false co-authorship now leaves a trace naming the verb — and if a
@@ -1952,6 +2020,13 @@ struct Envelope {
     /// shell-edited file has no firsthand content and is skipped entirely,
     /// and a partial Edit+sed workflow can false-positive, so the hook WARNs.
     unaccounted: Vec<Value>,
+    /// AF-342: staged paths where unaccounted-line accounting COULD NOT RUN,
+    /// because the committer also wrote the file in the window through
+    /// something that records no content. Published beside
+    /// `unaccounted` so an empty list there is readable as "nothing found"
+    /// rather than "nothing looked" — the measured/n_considered contract
+    /// (AF-320) applied to this probe.
+    unaccounted_undecidable: Vec<Value>,
     /// A verdict WAS computed but may UNDER-report: a peer we could not see, a
     /// git call that failed, paths truncated.
     degraded: Vec<String>,
@@ -1981,6 +2056,7 @@ impl Envelope {
             // degradation for an advisory.
             "split_risk": self.verdict.split_risk,
             "unaccounted": self.unaccounted,
+            "unaccounted_undecidable": self.unaccounted_undecidable,
             "cotenants": self.cotenants,
             "window_secs": self.window as i64,
             "undecided": self.undecided.is_some(),
@@ -2488,9 +2564,14 @@ pub async fn staged_guard_inner(
     // the structural firsthand=0 penalty on Bash-editing lanes: their writes
     // become facts here regardless of how the command spelled the path.
     let mut inputs = inputs;
+    // Hoisted out of the block below because the per-line check further down
+    // needs it too (AF-342): "does my own content record for this path have a
+    // hole in it" is the question that decides whether the check can
+    // discriminate at all, and an observed mtime is how a hole shows up.
+    let mut mine_obs: HashMap<String, f64> = HashMap::new();
     if let Some(st) = state.as_ref() {
         if let Ok(conn) = st.store.read() {
-            let mine_obs = if session.is_empty() {
+            mine_obs = if session.is_empty() {
                 HashMap::new()
             } else {
                 load_observed(&conn, &session, window)
@@ -2511,6 +2592,7 @@ pub async fn staged_guard_inner(
     // every line), and never blocking — but a hit is the one signal that
     // survives peer-record expiry, which is the hole 7797e45 shipped through.
     let mut unaccounted_rows: Vec<Value> = Vec::new();
+    let mut unaccounted_undecidable: Vec<Value> = Vec::new();
     if !session.is_empty() {
         let own = tokio::task::spawn_blocking({
             let s = session.clone();
@@ -2520,6 +2602,49 @@ pub async fn staged_guard_inner(
         .await
         .unwrap_or_default();
         for (rel, ap) in &pairs {
+            // AF-342. The Skip arm handles the file with NO content record at
+            // all: no firsthand
+            // content, no comparison, no false positive. It does not handle the
+            // PARTIAL one, which is now the dominant shape: a file gets CREATED
+            // with Write, so `own` holds content for it, and is then changed by
+            // something that records none (a heredoc, a codegen step, a
+            // checkout), so every such line reads as unaccounted.
+            //
+            // Measured on commit 40fa0ce0: four files written entirely by one
+            // session, 93 lines of "matching nothing you edited firsthand"
+            // across three of them, zero peer involvement. The docstring on
+            // `Envelope::unaccounted` has named this false positive since
+            // AMUX-3446 ("a partial Edit+sed workflow can false-positive").
+            //
+            // An observed record (AF-123) is the missing half: the hook pair
+            // saw this file's mtime move during one of my own commands. Content
+            // for that write exists nowhere — no extractor can recover what a
+            // heredoc or a generator wrote — so the comparison's premise
+            // ("these lines match nothing you edited") is simply false here,
+            // and the honest answer is that the probe cannot decide.
+            //
+            // Reported, not dropped (ethos rule 4): a check that silently stops
+            // running is worse than the false positive it replaced, so the path
+            // moves to `unaccounted_undecidable` and travels in the same
+            // payload. The check stays FULLY LIVE for its real target, a file
+            // with firsthand content and NO observed write of mine — which is
+            // exactly the 7797e45 peer-hunk shape it was built for, since a
+            // peer's hunk riding my `git add` moves no mtime in MY window.
+            let observed = mine_obs.get(ap);
+            let peer_claims = inputs.theirs.contains_key(ap);
+            match line_accounting_mode(own.contains_key(ap), observed.is_some(), peer_claims) {
+                LineAccounting::Skip => continue,
+                LineAccounting::Undecidable => {
+                    let ts = observed.copied().unwrap_or(now);
+                    unaccounted_undecidable.push(json!({
+                        "path": rel,
+                        "observed_write_age_s": (now - ts).max(0.0) as i64,
+                        "why_undecidable": "you also wrote this file in the window through something that records no content (observed record, AF-123: a heredoc, a generator, a checkout). Your own content record is therefore incomplete here, so unaccounted-line accounting cannot tell your lines from a peer's hunk. Path-level ownership above is unaffected.",
+                    }));
+                    continue;
+                }
+                LineAccounting::Check => {}
+            }
             let Some(content) = own.get(ap) else { continue };
             let Some(diff) = git_out(&wd, &["diff", "--cached", "--unified=0", "--", rel]).await
             else {
@@ -2541,6 +2666,24 @@ pub async fn staged_guard_inner(
                 "note": "staged ADDED lines matching nothing you edited firsthand in the window — on a shared checkout these are likely a peer's in-flight hunks riding your git add (AMUX-3446; a per-file add stages whatever is in the file). If they are yours via shell edits, proceed; otherwise stage per-hunk (git add -p).",
             }));
         }
+    }
+
+    // AF-342, the surfacing half: this suppression must be COUNTABLE, or the
+    // next sweep cannot tell "the line check found nothing" from "the line
+    // check never ran". If this counter climbs while `unaccounted` stays at
+    // zero fleet-wide, the probe has quietly stopped covering the mixed-edit
+    // workflow entirely and needs a content record for shell writes, not a
+    // wider skip.
+    if !unaccounted_undecidable.is_empty() {
+        tracing::info!(
+            target: "staged_guard",
+            session = %session,
+            undecidable_paths = unaccounted_undecidable.len(),
+            unaccounted_paths = unaccounted_rows.len(),
+            "unaccounted-line accounting skipped on {} path(s): the committer also wrote them \
+             in the window through something that records no content (AF-342)",
+            unaccounted_undecidable.len()
+        );
     }
 
     if !v.foreign.is_empty() {
@@ -2764,7 +2907,7 @@ pub async fn staged_guard_inner(
     (
         StatusCode::OK,
         Json(
-            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, verdict_id, ..Default::default() }
+            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, unaccounted_undecidable, verdict_id, ..Default::default() }
                 .json(),
         ),
     )
@@ -4012,6 +4155,58 @@ mod tests {
         // Everything accounted -> silence (the check CAN pass).
         let all_mine = unaccounted_added_lines(&added[..1], my_edit_content);
         assert!(all_mine.is_empty(), "{all_mine:?}");
+    }
+
+    /// AF-342. The mixed-edit file is the one this decision exists for, and it
+    /// is the shape the harness PRODUCES: bypass-permissions sessions are told
+    /// to prefer Bash, but a file still gets created with Write, so `own` has
+    /// content for it and every later sed/heredoc line looks unaccounted.
+    /// Commit 40fa0ce0 printed 93 such lines across three files with no peer
+    /// anywhere near them.
+    ///
+    /// The two `true` arms must stay DISTINCT. Collapsing Undecidable into
+    /// Check is the bug being fixed; collapsing it into Skip would be worse,
+    /// because the payload would then be silent about a probe that did not
+    /// run, which is the measured/n_considered failure (AF-320) one layer up.
+    #[test]
+    fn mixed_edit_files_are_undecidable_not_unaccounted() {
+        // Content record PARTIAL (created with Write, then changed by
+        // something that records none), nobody else near it: the AF-342
+        // shape, and the only arm that got quieter.
+        assert_eq!(
+            line_accounting_mode(true, true, false),
+            LineAccounting::Undecidable,
+            "a file only this session wrote, with a partial content record, cannot be line-accounted"
+        );
+        // The check's REAL target must stay live: a peer's hunk riding my
+        // `git add` moves no mtime inside MY observed window, so firsthand
+        // content with no observed write of mine is still fully checked.
+        // If this arm ever stops being Check, 7797e45 can recur silently.
+        assert_eq!(
+            line_accounting_mode(true, false, false),
+            LineAccounting::Check,
+            "the peer-hunk shape must still be checked"
+        );
+        // THE ARM THAT KEEPS THE SUPPRESSION HONEST, and the one the
+        // 78009d90 sweep makes non-negotiable. An observed record is an mtime,
+        // not an authorship proof: a peer writing during my window enters MY
+        // observed set (seen live 2026-08-30, a peer's browser.rs write landed
+        // in this session's records 59s later). Suppressing on my observed
+        // record alone would hide the line detail in precisely the case it is
+        // most wanted — a contested path — which is the case where ts-gke
+        // swept 87 lines of a peer's work past this warning. So a path a peer
+        // also claims stays fully checked.
+        assert_eq!(
+            line_accounting_mode(true, true, true),
+            LineAccounting::Check,
+            "a path a peer also claims keeps its line detail, noise and all"
+        );
+        // Pre-existing AMUX-3446 behaviour, unchanged: an all-shell file has
+        // no content to compare against and is skipped without a claim.
+        for peer in [true, false] {
+            assert_eq!(line_accounting_mode(false, true, peer), LineAccounting::Skip);
+            assert_eq!(line_accounting_mode(false, false, peer), LineAccounting::Skip);
+        }
     }
 
     /// MG-1484: a restore writes bytes equal to a committed ref — an edit

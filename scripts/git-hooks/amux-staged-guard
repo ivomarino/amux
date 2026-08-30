@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# guard-features: AMUX-2946
+# guard-features: AMUX-2946 AF-342
 # (Drift token for install-hooks.sh — see append-only-push-guard's header for
 #  the mechanism. A vendored copy lacking a canonical token reads STALE.)
 # ============================================================================
@@ -42,7 +42,7 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
-GUARD_VERSION = 10
+GUARD_VERSION = 11
 
 
 def amux_base_url():
@@ -801,6 +801,18 @@ def main():
         w("  If these are yours via shell edits, proceed. If you do not recognize "
           "one, it is a peer's in-flight hunk riding your git add — stage "
           "per-hunk instead (git add -p %s).\n" % _ua.get("path", ""))
+    # AF-342. Only printed BESIDE a real list, never on its own. When the reader
+    # is being shown unaccounted lines, they need to know the list is partial —
+    # a path where the check could not run is not a path where it passed. When
+    # nothing at all is flagged, this stays silent, because a "could not check"
+    # line on every commit is the same noise this fix removed, wearing a
+    # different hat, and noise on the normal path is what let 78009d90 sweep 87
+    # lines of a peer's work past this warning.
+    _und = d.get("unaccounted_undecidable") or []
+    if _und and (d.get("unaccounted") or []):
+        w("  (line accounting could not run on %d other path(s) — you also wrote "
+          "them in the window through something that records no content: %s)\n"
+          % (len(_und), ", ".join(str(_u.get("path", "?")) for _u in _und[:4])))
     _render_split_risk(d, w)
     foreign = d.get("foreign") or []
     _m = _read_marker(sess, top)
