@@ -2602,3 +2602,49 @@ NOTE (2026-08-24, amux — author, superseding their own 2026-08-23 reading): ST
   Working where it applies: three of the five probes DID carry a co_signal (autofix.rs and
   session_verbs.rs with the AF-179 wording, app.js with the AMUX-3497 wording). The gap is
   specifically observed-vs-transcript where the transcript side is the real one.
+
+## `amux send` reported a DELIVERED message as FAILED on a gemini worker
+VALIDATED: amux | Fixed in d8a18687 (AMUX-3889), deployed and confirmed live: after the deploy,
+`amux send photo-analysis` returned plain `sent` and the message is visible in
+that lane's pane.
+
+The entry's SYMPTOM is closed and its diagnosis was right: the verdict scraper
+only knew Claude Code's composer. A verbatim `tmux capture-pane -e` of
+photo-analysis contains neither U+276F nor U+203A anywhere, so `composer_state`
+returned NotVisible, `read_frame` mapped that to NoUi, and after five looks the
+fall-through called `jsonl_user_msg_since` — which reads Claude Code's transcript
+directory and cannot succeed for a gemini lane — giving Submission::Stuck and the
+exact wording this entry recorded.
+
+TAKEN BY A DIFFERENT ROUTE THAN THE ENTRY'S FIX PROPOSED, deliberately. The entry
+said make the verdict provider-aware from CC_PROVIDER, or abstain. The fix
+teaches `composer_state` gemini's box chrome instead, so the READER is correct
+rather than one of its consumers: ghost-rescue, the composer-stuck badge and the
+send verdict all become right at once, with no provider plumbing threaded through
+them.
+
+A SECOND DEFECT WAS FOUND UNDERNEATH AND IS ALSO FIXED, worse than the one
+reported here. `dim_mask` read the `2` in `48;2;95;95;95` — the truecolor marker
+— as SGR 2 (dim), so on a gemini frame every TYPED message read as a placeholder,
+`read_frame` returned Cleared, and the send would report SUBMITTED while the text
+sat in the box. This entry's own COST line predicted the shape of that hazard
+("a retry driven by a provider-blind verdict will re-submit messages that already
+went through").
+
+STILL LIVE, and not claimed by this validation: the abstain half of the proposed
+fix. The next unrecognised UI reproduces this entry exactly, because there is
+still no honest "I cannot read this composer" verdict distinct from FAILED.
+Whether that wants its own entry is for the next lane that hits it.
+
+Tests: a_gemini_composer_is_read_rather_than_reported_as_no_ui and
+a_truecolor_parameter_is_not_the_dim_code, both proven able to fail by mutation.
+Full lib suite 1595 passed, 0 failed.
+AREA: cli
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-29
+SESSION: amux
+CARD: AMUX-3889
+SYMPTOM: Sending the post-reboot continue message to the 14 workers with `doing` cards, 13 returned `sent (queued while generating)` and `photo-analysis` returned rc=1 with `send to photo-analysis FAILED: not submitted — text is sitting in the input box (autocomplete popup ate the Enter?)`. The message had in fact been delivered and submitted: a peek showed the worker already generating, with "Resuming Landscape Photo Ranking Post-Reboot" and a plan referencing the cards. `photo-analysis` is a gemini-provider worker, whose composer chrome ("Type your message or @path/to/file", the YOLO/GEMINI.md status bar) looks nothing like Claude Code's, which is what the post-send verdict scraper matches against.
+COST: Two minutes and a nearly-wrong report. I was about to re-send, which would have double-queued the instruction into a worker already acting on it. In a sweep across many workers the failure mode is worse than the wasted retry: a verdict that reads FAILED on success is indistinguishable from one that reads FAILED on failure, so the only safe response to ANY red send becomes "go look", which is what the verdict existed to save you from. AMUX-3880 (`a stuck pasted message now gets its Enter retried, not just reported`) landed the same day and makes this sharper — a retry driven by a provider-blind verdict will re-submit messages that already went through.
+FIX: The verdict must be provider-aware, or it must abstain. The provider is already known at send time (`CC_PROVIDER`, and the server's `launch_base_binary` maps it), so the scraper can select the right composer signature — or, where it has no signature for a provider, report `unverified` rather than `FAILED`. Ethos rule 3: with only sent/failed available, the honest answer for an unrecognised UI cannot be expressed.
