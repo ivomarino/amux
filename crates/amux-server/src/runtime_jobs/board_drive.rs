@@ -102,7 +102,7 @@ const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
 /// starved card — and when it does exclude a todo, `select_pickup` now says so
 /// in the trace instead of the card silently vanishing from auto-pickup.
 const PICKUP_FRESHNESS_S_DEFAULT: i64 = 7 * 86400;
-fn pickup_freshness_s() -> i64 {
+pub(crate) fn pickup_freshness_s() -> i64 {
     std::env::var("AMUX_PICKUP_FRESHNESS_S")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())

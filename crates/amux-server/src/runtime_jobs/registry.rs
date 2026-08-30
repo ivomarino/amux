@@ -112,6 +112,7 @@ pub mod ids {
     pub const STORAGE: &str = "storage";
     pub const HEARTBEAT: &str = "heartbeat";
     pub const TAILNET_WATCH: &str = "tailnet-watch";
+    pub const QUEUE_DISPOSITION: &str = "queue-disposition";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -142,6 +143,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::STORAGE,
     ids::HEARTBEAT,
     ids::TAILNET_WATCH,
+    ids::QUEUE_DISPOSITION,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -270,6 +272,18 @@ pub const CATALOG: &[Doc] = &[
         ],
         pref: None,
         detail: Some("/api/debug/downtime"),
+    },
+    Doc {
+        id: ids::QUEUE_DISPOSITION,
+        name: "Queue disposition",
+        purpose: "Tells a lane which of its todo cards auto-pickup has already stopped offering, and asks for one of three dispositions. Files ONE card per lane and updates it; it never retires or retypes a card itself.",
+        env: &[EnvControl {
+            var: "AMUX_QUEUE_DISPOSITION_SECS",
+            effect: "sweep seconds; 0 stops the sweep",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: None,
     },
     Doc {
         id: ids::STORAGE,

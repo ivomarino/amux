@@ -190,6 +190,13 @@ async fn needsyou_queue(
     .into_response()
 }
 
+/// The creator name the queue-disposition job files under (AF-317).
+///
+/// Exempt from the todo WIP limit BY NAME. Its card is the one that has to
+/// arrive precisely when a lane's queue is too long, so refusing it for queue
+/// depth would make the mechanism suppress its own alarm.
+pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
+
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
 
@@ -2328,6 +2335,60 @@ pub async fn create_item(
         .cloned()
         .collect();
 
+    // AF-317: THE WIP LIMIT HAS TO COVER CREATION, or it is decorative.
+    //
+    // `amux board add` is how a lane files its own work and it creates directly
+    // in `todo`, so gating only the PATCH transition would leave the path that
+    // actually grew the queues untouched (ethos rule 7: a check pinning the
+    // wrong layer is exactly as green as one pinning the right layer).
+    //
+    // Two exemptions, both named rather than silent. Detector cards carry
+    // `session: None` and are outside the count by construction — a fault
+    // report is never dropped because a lane was full. And a card from the
+    // queue-disposition job is exempt BY NAME: it is the one card whose whole
+    // purpose is to arrive when the queue is too long, so refusing it for queue
+    // depth would be the mechanism suppressing its own alarm.
+    if status_raw == "todo" && owner_type == "agent" && !session.is_empty() && creator != QUEUE_DISPOSITION_CREATOR {
+        let limit = bs::todo_wip_limit(Some(&session));
+        if limit > 0 {
+            let held_and_stalest = state.store.read().ok().map(|c| {
+                (bs::todo_wip_count(&c, &session, ""), bs::stalest_todos(&c, &session, 5))
+            });
+            if let Some((held, stalest)) = held_and_stalest {
+                if held >= limit {
+                    tracing::warn!(
+                        "todo_wip_gate: refused a new todo for lane {} (holding {}, limit {})",
+                        session, held, limit
+                    );
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "error": "todo queue is at its limit for this lane",
+                            "code": "todo_wip_limit_reached",
+                            "ok": false,
+                            "blocked": true,
+                            "session": session,
+                            "holding": held,
+                            "limit": limit,
+                            "why": format!(
+                                "{session} already holds {held} todo card(s) and the limit is {limit}.                                  `todo` is the dispatch queue: filing here is a claim that the card is next."
+                            ),
+                            "close_these_first": stalest.iter().map(|(id, title, days)| json!({
+                                "id": id, "title": title, "days_since_touched": days,
+                                "already_undispatchable": *days >= 7,
+                            })).collect::<Vec<_>>(),
+                            "how_to_fix": {
+                                "file_it_anyway_but_not_as_next": "POST with {\"status\":\"backlog\"} — unbounded on purpose, and where a real card that is not NEXT belongs",
+                                "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let new = bs::NewIssue {
         title,
         desc: body_str(&map, "desc").unwrap_or_default(),
@@ -4145,6 +4206,130 @@ pub async fn patch_item(
                                             ],
                                             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
                                             "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-317 (a): A LANE'S `todo` IS A DISPATCH QUEUE, NOT A PILE.
+                    //
+                    // Measured 2026-08-29: 358 todo cards, median age 28.8 days,
+                    // 88% older than a week, against 48 done. Ethan the same
+                    // morning: "some workers have an infinite # of growing
+                    // backlogs and todo then they go idle."
+                    //
+                    // The refusal LISTS THE STALEST CARDS FIRST, and that is not
+                    // a nicety. `board_drive` already stops dealing any todo
+                    // nobody has touched in 7 days, and measured 2026-08-30, 55
+                    // of 125 agent todo cards were already past that edge at a
+                    // median 27.4 days untouched — counted in a pickup trace
+                    // that only prints when the queue is otherwise EMPTY, so a
+                    // lane with one live card never saw it. Those cards are the
+                    // answer to "what do I close first" because they are already
+                    // not being worked; the queue is long precisely because they
+                    // fell out of it silently.
+                    let wip_limit = if force || target != TaskStatus::Todo {
+                        0
+                    } else {
+                        bs::todo_wip_limit(next.session.as_deref())
+                    };
+                    // owner_type is checked here and not folded into the count:
+                    // a human-owned card is not the dispatcher's to deal, so
+                    // capping it would be capping the owner's own queue.
+                    let lane = next.session.clone().unwrap_or_default();
+                    if wip_limit > 0 && !lane.is_empty() && next.owner_type == "agent" {
+                        let held = bs::todo_wip_count(conn, &lane, &next.id);
+                        if held >= wip_limit {
+                            let stalest = bs::stalest_todos(conn, &lane, 5);
+                            tracing::warn!(
+                                "todo_wip_gate: blocked {} -> todo for lane {} (holding {}, limit {})",
+                                next.id,
+                                lane,
+                                held,
+                                wip_limit
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "todo queue is at its limit for this lane",
+                                        "code": "todo_wip_limit_reached",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "session": lane,
+                                        "holding": held,
+                                        "limit": wip_limit,
+                                        "why": format!(
+                                            "{lane} already holds {held} todo card(s) and the limit is {wip_limit}.                                              `todo` is the dispatch queue: a card here is a claim that it is next.                                              Fleet-wide the median todo card is 28.8 days old against 48 done, which                                              is what a queue nobody drains looks like."
+                                        ),
+                                        // NOT a generic "close something". These are the
+                                        // specific cards the dispatcher has already stopped
+                                        // dealing, newest-untouched last.
+                                        "close_these_first": stalest.iter().map(|(id, title, days)| json!({
+                                            "id": id,
+                                            "title": title,
+                                            "days_since_touched": days,
+                                            "already_undispatchable": *days >= 7,
+                                        })).collect::<Vec<_>>(),
+                                        "how_to_fix": {
+                                            "not_next": format!("amux board backlog <ID> --trigger \"<what re-arms it>\" — `backlog` is unbounded on purpose and is where a real card that is not NEXT belongs"),
+                                            "not_a_unit_of_work": "amux board discard <ID>",
+                                            "finish_one": "amux board done <ID> --evidence-stdin",
+                                            "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-317 (b): `blocked` MUST NAME WHAT IT IS WAITING ON.
+                    //
+                    // 95% of blocked cards were older than 7 days, and only 16 of
+                    // 70 carried a `depends_on`. A block with no named condition
+                    // has nobody watching for the unblock, so it is not blocked,
+                    // it is abandoned with a nicer status.
+                    let blocked_gate = !force
+                        && target == TaskStatus::Blocked
+                        && bs::blocked_needs_watch(next.session.as_deref());
+                    if blocked_gate {
+                        let has_dep = !next.depends_on.is_empty();
+                        // `--trigger` lands in source_ref (AMUX-3686); a trigger
+                        // there is a condition something re-checks.
+                        let has_trigger =
+                            next.source_ref.as_deref().is_some_and(|t| t.split_whitespace().count() >= 3);
+                        if !has_dep && !has_trigger {
+                            tracing::warn!(
+                                "blocked_watch_gate: blocked {} -> blocked for session {} (no depends_on, no trigger)",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-")
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "blocked must name what it is waiting on",
+                                        "code": "blocked_needs_a_watch",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "why": "A block with no named condition has nobody watching for the unblock. Measured 2026-08-29: 95% of blocked cards were older than 7 days and only 16 of 70 named a dependency — which is what a status with no exit looks like.",
+                                        "how_to_fix": {
+                                            "on_another_card": "PATCH {\"depends_on\": [\"<ID>\"]} — the card that has to land first",
+                                            "on_a_condition": "amux board backlog <ID> --trigger \"<the condition that re-arms it>\" — re-checked, so the card comes back on its own",
+                                            "on_a_person": "amux board needsyou <ID> --ask <type> --question \"...\" --unblocks \"...\" (AF-318)",
+                                            "override_for_this_worker": "set AMUX_BLOCKED_NEEDS_WATCH=0 in this worker's / group's / global scope env (Scope tab).",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),

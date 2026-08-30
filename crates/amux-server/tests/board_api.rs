@@ -1136,6 +1136,112 @@ async fn done_requires_evidence_a_plan_cannot_supply() {
     );
 }
 
+// ---- todo WIP limit + blocked needs a watch (AF-317) ----------------------
+
+/// A lane's `todo` is a dispatch queue with a ceiling, and the refusal names
+/// the cards to close FIRST rather than saying "close something".
+#[tokio::test]
+async fn the_todo_wip_limit_refuses_the_next_card_and_names_what_to_close() {
+    let (app, _tmp) = app();
+    std::env::set_var("AMUX_TODO_WIP_LIMIT", "3");
+
+    let mk = |app: &axum::Router, n: usize| {
+        let app = app.clone();
+        async move {
+            create(
+                &app,
+                json!({"title": format!("queued work {n}"), "session": "wippy",
+                       "owner_type": "agent", "status": "todo"}),
+            )
+            .await
+        }
+    };
+    for n in 0..3 {
+        let c = mk(&app, n).await;
+        assert!(c["id"].as_str().is_some(), "card {n} must be creatable: {c}");
+    }
+
+    // The FOURTH is refused, on the CREATE path — which is the path `amux board
+    // add` uses and therefore the one that actually grew the queues.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title": "one too many", "session": "wippy",
+                    "owner_type": "agent", "status": "todo"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("todo_wip_limit_reached"), "{v}");
+    assert_eq!(v["holding"], json!(3), "{v}");
+    assert_eq!(v["limit"], json!(3), "{v}");
+    // Not a generic "close something": the refusal carries specific cards.
+    let close = v["close_these_first"].as_array().expect("must name cards to close");
+    assert!(!close.is_empty(), "a limit with no list is an obstacle, not a fix: {v}");
+    assert!(close[0]["id"].as_str().is_some() && close[0]["days_since_touched"].is_number(), "{v}");
+
+    // `backlog` is the sanctioned exit and is NOT capped — the limit is a
+    // ceiling on QUEUEING, not on filing (ethos rule 3 wants a truthful path).
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title": "real but not next", "session": "wippy",
+                    "owner_type": "agent", "status": "backlog"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "backlog must stay unbounded: {v}");
+
+    // A DETECTOR's card is never refused for queue depth: it carries no
+    // session, so it is outside the count by construction rather than by an
+    // exemption someone has to remember.
+    let (st, _, v) = send(
+        &app,
+        "POST",
+        "/api/board",
+        Some(json!({"title": "disk is at 97%", "owner_type": "human", "status": "todo"})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CREATED, "a fault report must never be dropped for WIP: {v}");
+
+    std::env::remove_var("AMUX_TODO_WIP_LIMIT");
+}
+
+/// `blocked` has to name what would unblock it, or nobody is watching.
+#[tokio::test]
+async fn blocked_refuses_a_card_that_names_no_watch() {
+    let (app, _tmp) = app();
+    let c = create(&app, json!({"title": "waiting on something", "session": "w2"})).await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"status": "blocked", "gate_ack": true})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("blocked_needs_a_watch"), "{v}");
+    // All three honest exits are offered, including the AF-318 one.
+    let fix = &v["how_to_fix"];
+    assert!(fix["on_another_card"].as_str().unwrap().contains("depends_on"), "{v}");
+    assert!(fix["on_a_condition"].as_str().unwrap().contains("--trigger"), "{v}");
+    assert!(fix["on_a_person"].as_str().unwrap().contains("needsyou"), "{v}");
+
+    // A dependency satisfies it.
+    let other = create(&app, json!({"title": "the thing that must land first"})).await;
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({"status": "blocked", "gate_ack": true,
+                    "depends_on": [other["id"].as_str().unwrap()]})),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "a named dependency is a watch: {v}");
+}
+
 // ---- typed needsyou ask (AF-318): a park has to name the human act ---------
 
 /// THE PROPERTY. A card can be parked on a human only if it says which KIND of
@@ -3179,13 +3285,16 @@ async fn statuses_that_have_a_next_actor_are_not_stamped() {
     for status in ["doing", "review", "blocked"] {
         let c = create(&app, json!({ "title": format!("move to {status}") })).await;
         let id = c["id"].as_str().unwrap().to_string();
-        let (st, _, v) = send(
-            &app,
-            "PATCH",
-            &format!("/api/board/{id}"),
-            Some(json!({ "status": status, "gate_ack": true })),
-        )
-        .await;
+        // `blocked` carries a named watch, because this test is about the DUE
+        // STAMP and not the AF-317 watch gate — same reason these tests already
+        // carry an asset link, evidence and a typed ask. The gate has its own
+        // coverage in `blocked_refuses_a_card_that_names_no_watch`.
+        let mut body = json!({ "status": status, "gate_ack": true });
+        if status == "blocked" {
+            let dep = create(&app, json!({ "title": "the thing that must land first" })).await;
+            body["depends_on"] = json!([dep["id"].as_str().unwrap()]);
+        }
+        let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(body)).await;
         assert_eq!(st, StatusCode::OK, "{status}: {v}");
         let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
         let due = got["due"].as_str().unwrap_or("");

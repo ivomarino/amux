@@ -430,6 +430,116 @@ pub fn blast_radius(conn: &Connection, id: &str) -> i64 {
     .unwrap_or(0)
 }
 
+/// Scope key for the AF-317 per-lane WIP limit on `todo`.
+pub const TODO_WIP_LIMIT_KEY: &str = "AMUX_TODO_WIP_LIMIT";
+
+/// How many `todo` cards one lane may hold. 0 disables the limit for that scope.
+///
+/// Five, because `todo` is the DISPATCH QUEUE and a dispatch queue longer than a
+/// lane can work is not a queue, it is a pile. Measured 2026-08-29: 358 todo
+/// cards, median age 28.8 days, against 48 done. Ethan, the same morning: "some
+/// workers have an infinite # of growing backlogs and todo then they go idle."
+///
+/// The limit is a CEILING ON QUEUEING, not on working: `backlog` is unbounded on
+/// purpose and is where a card that is real but not next belongs.
+pub fn todo_wip_limit(session: Option<&str>) -> i64 {
+    let read = |v: String| v.trim().parse::<i64>().ok().filter(|n| *n >= 0);
+    if let Ok(v) = std::env::var(TODO_WIP_LIMIT_KEY) {
+        if let Some(n) = read(v) {
+            return n;
+        }
+    }
+    let lane = match session.filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return TODO_WIP_LIMIT_DEFAULT,
+    };
+    crate::api::session_verbs::scoped_setting_in(
+        &crate::api::session_verbs::home(),
+        lane,
+        TODO_WIP_LIMIT_KEY,
+    )
+    .and_then(read)
+    .unwrap_or(TODO_WIP_LIMIT_DEFAULT)
+}
+
+/// Default ceiling on a lane's `todo` queue.
+pub const TODO_WIP_LIMIT_DEFAULT: i64 = 5;
+
+/// The predicate the WIP limit counts over.
+///
+/// Deliberately the SAME shape `board_drive`'s dispatch selector uses
+/// (`owner_type='agent'`, real session, dormant types excluded): a limit that
+/// counted rows the dispatcher never deals would refuse work over a queue that
+/// does not exist. Detector-filed cards have `session IS NULL`, so they are
+/// outside this by construction rather than by an exemption someone has to
+/// remember — a fault report is never dropped because a lane was full.
+const TODO_WIP_WHERE: &str = "session=?1 AND status='todo' AND owner_type='agent' \
+     AND deleted IS NULL AND COALESCE(archived,0)=0 \
+     AND COALESCE(type,'') NOT IN ('tripwire','watch','epic')";
+
+/// How many `todo` cards this lane is holding, by the same predicate the
+/// dispatcher selects from.
+pub fn todo_wip_count(conn: &Connection, session: &str, excluding: &str) -> i64 {
+    conn.query_row(
+        &format!("SELECT COUNT(*) FROM issues WHERE {TODO_WIP_WHERE} AND id <> ?2"),
+        rusqlite::params![session, excluding],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// The lane's stalest `todo` cards: id, title, days since anyone touched it.
+///
+/// This is what the WIP refusal prints, and the choice of ORDER is the point.
+/// Sorting by `updated` puts the cards the dispatcher has ALREADY stopped
+/// dealing at the top — measured 2026-08-30, 55 of 125 agent todo cards were
+/// past the 7-day freshness edge with a median 27.4 days untouched, invisible
+/// to everyone. So the answer to "what do I close first" is the same list as
+/// "what is already not being worked", and the refusal hands over both.
+pub fn stalest_todos(conn: &Connection, session: &str, n: usize) -> Vec<(String, String, i64)> {
+    let now = crate::config::now_f64();
+    let mut out = Vec::new();
+    if let Ok(mut st) = conn.prepare(&format!(
+        "SELECT id, title, updated FROM issues WHERE {TODO_WIP_WHERE} \
+         ORDER BY updated ASC LIMIT ?2"
+    )) {
+        if let Ok(rows) = st.query_map(rusqlite::params![session, n as i64], |r| {
+            let updated: f64 = r.get(2)?;
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, ((now - updated) / 86_400.0) as i64))
+        }) {
+            out.extend(rows.flatten());
+        }
+    }
+    out
+}
+
+/// Scope key for the AF-317 requirement that `blocked` name what it waits on.
+pub const BLOCKED_NEEDS_WATCH_KEY: &str = "AMUX_BLOCKED_NEEDS_WATCH";
+
+/// Must a card entering `blocked` name what would unblock it?
+pub fn blocked_needs_watch(session: Option<&str>) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    }
+    if let Ok(v) = std::env::var(BLOCKED_NEEDS_WATCH_KEY) {
+        if !v.trim().is_empty() {
+            return !is_off(&v);
+        }
+    }
+    let lane = match session.filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return true,
+    };
+    match crate::api::session_verbs::scoped_setting_in(
+        &crate::api::session_verbs::home(),
+        lane,
+        BLOCKED_NEEDS_WATCH_KEY,
+    ) {
+        Some(v) => !is_off(&v),
+        None => true,
+    }
+}
+
 /// The env keys that tune (or disable) the automatic revisit date. `0` turns
 /// the default off for a scope; a positive integer is a number of days.
 pub const BACKLOG_REVISIT_DAYS_KEY: &str = "AMUX_BACKLOG_REVISIT_DAYS";
