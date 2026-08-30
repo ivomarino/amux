@@ -247,16 +247,87 @@ fi
   # DEBUG ARTIFACT CLEANUP (2026-08-29). This script ONLY builds --release, but
   # cargo check/test runs from fleet sessions land in debug/ using the same
   # CARGO_TARGET_DIR. Debug artifacts are never reused by this script and can
-  # accumulate without bound — 229 GB was observed on 2026-08-29. Unlike the
-  # release cache, debug/ has no value to this builder and is always safe to
-  # remove. The threshold is generous (10 GB) to avoid thrashing on a small
-  # accumulation; the floor is measured BEFORE clearing so the log line is honest.
+  # accumulate without bound — 229 GB was observed on 2026-08-29. The threshold
+  # is generous (10 GB) to avoid thrashing on a small accumulation; the floor is
+  # measured BEFORE clearing so the log line is honest.
+  #
+  # AF-303: THIS ARM USED TO SAY "always safe to remove", AND IT IS NOT. Two
+  # lines above, the same comment states that fleet sessions' cargo check/test
+  # land in debug/ — those artifacts are precisely what every lane's build is
+  # using while this runs. "No value to THIS BUILDER" is true; "safe to remove"
+  # does not follow from it, and the gap between those two sentences is ~50
+  # lanes' in-flight compilation. Deleting it mid-build is the vanished-rlib /
+  # ETXTBSY class already in the ledger (8 phantom failures in a module nobody
+  # touched, 15/15 green on an immediate re-run).
+  #
+  # Measured before the fix, from this log: 13 debug clears against 1 clear of
+  # the shared release cache. The DESTRUCTIVE arm ran 13x more often than the
+  # careful one, because the release cache is gated behind severe disk pressure
+  # (< 8 GB free) while this fired on SIZE alone, every 60s cycle. Six fired on
+  # 2026-08-30 alone.
+  #
+  # So gate it on what the clear is actually FOR. Unbounded growth is only
+  # harmful because it ends in ENOSPC, so while free disk is healthy there is no
+  # urgency worth a peer's build: defer to the next cycle, 60s away. When disk
+  # IS low the override is automatic and needs no counter, because ENOSPC breaks
+  # every lane including the ones being protected. That ties the exception to
+  # the harm rather than to a timeout someone would have to tune.
+  #
+  # Detecting a lane's build: any rustc/cargo process at THIS moment is a peer's.
+  # The builder holds the single-instance lock and has not started its own cargo
+  # yet — the guard runs before the build, deliberately (see the ordering note
+  # above), which is what makes this check unambiguous rather than a heuristic.
   DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
   if [ -d "$DEBUG_DIR" ]; then
     DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
     if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}" ]; then
-      echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR (> ${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}GB threshold). Clearing — release build is unaffected."
-      [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" = "1" ] || rm -rf "$DEBUG_DIR"
+      # WHY THIS IS AN if/else AND NOT `${VAR-$(...)}`, and why every pgrep
+      # carries `|| true`: this script runs under `set -euo pipefail`, `pgrep`
+      # exits 1 when nothing matches, and with pipefail a single failing element
+      # fails the whole pipeline. The one-line version therefore made the
+      # ASSIGNMENT return non-zero on an idle host and `set -e` killed the
+      # builder right here — before the build, on every cycle, for the whole
+      # fleet. Caught by running the real script against the real HOME rather
+      # than by any test; `bash -n` was clean and the unit cases were green,
+      # because they exercise the branch and not the shell's error discipline.
+      #
+      # `+set` rather than a value test: an explicitly EMPTY override means "no
+      # peers are building", a state the real detector reaches constantly and a
+      # test must be able to force. Treating empty as unset would fall through
+      # to pgrep and make the no-peer case host-dependent, green on an idle CI
+      # runner and red here whenever any lane compiles.
+      # `pgrep -x`, matching the EXECUTABLE NAME, never `pgrep -f` over the whole
+      # command line. Measured while writing this: `-f '(^|/)(rustc|cargo)( |$)'`
+      # matched the very shell that ran it, because that command line CONTAINED
+      # the word cargo inside the pattern. On this box, where lanes discuss and
+      # grep for cargo constantly, an `-f` detector would report a peer build
+      # almost every cycle, defer forever, and hand back the unbounded growth
+      # this clear exists to stop (229 GB, 2026-08-29). A guard that never fires
+      # is the same outcome as no guard, arrived at more expensively.
+      if [ -n "${AMUX_BUILD_PEER_PIDS_OVERRIDE+set}" ]; then
+        PEER_BUILDS="$AMUX_BUILD_PEER_PIDS_OVERRIDE"
+      else
+        PEER_BUILDS="$( { pgrep -x rustc || true; pgrep -x cargo || true; } 2>/dev/null \
+          | sort -un | tr '\n' ' ' | sed 's/ *$//' )"
+      fi
+      FREE_NOW_GB=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')
+      if [ -n "$PEER_BUILDS" ] && [ "${FREE_NOW_GB:-0}" -ge "${AMUX_BUILD_MIN_FREE_GB:-25}" ]; then
+        # DEFERRED, and said out loud: a skip with no trace is indistinguishable
+        # from a cycle that found nothing to clear, which is the same ambiguity
+        # the single-instance lock above had to learn to report (AMUX-2927).
+        # If this line runs every cycle for hours, debug/ is growing while the
+        # fleet never idles, and the answer is per-lane target dirs (AF-336),
+        # not a shorter fuse here.
+        echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR (> ${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}GB threshold), but DEFERRED — peer build(s) in flight (pid $PEER_BUILDS) and ${FREE_NOW_GB}GB free is above the ${AMUX_BUILD_MIN_FREE_GB:-25}GB fleet floor. Their artifacts live in debug/; clearing now is the vanished-rlib class (AF-303). Retrying next cycle."
+      else
+        if [ -n "$PEER_BUILDS" ]; then
+          why="disk at ${FREE_NOW_GB}GB free is BELOW the ${AMUX_BUILD_MIN_FREE_GB:-25}GB fleet floor, so ENOSPC outranks the peer build(s) in flight (pid $PEER_BUILDS)"
+        else
+          why="no peer build in flight"
+        fi
+        echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR (> ${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}GB threshold). Clearing — $why. Release build is unaffected."
+        [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" = "1" ] || rm -rf "$DEBUG_DIR"
+      fi
     fi
   fi
 
