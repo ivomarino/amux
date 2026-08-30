@@ -195,6 +195,7 @@ jobs:
           ./scripts/test-commit-stamp.sh
           ./scripts/test-mass-delete-gate.sh
           ./scripts/test-observed-edits-walk.sh
+          ./scripts/test-hook-drift-notice.sh
       # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
       # and they belong HERE rather than in rust.yml because rust.yml is
       # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to
