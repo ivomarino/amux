@@ -739,6 +739,20 @@ cmd_start() {
     fi
   else
     [[ "$cmd" == *"--model"* ]] || cmd="$cmd --model sonnet"
+    # Resume the most recent conversation in this directory by default, so a
+    # restart (crash recovery, a deploy that killed the tmux server, `amux
+    # start-all`) picks up where the worker left off instead of silently
+    # registering a brand-new, untitled Claude Code session every time this
+    # runs — the gap that turned one `stop-all`+`start-all` recovery pass
+    # into 8 fresh sessions with random names and zero prior context
+    # (2026-08-30, see frustrations.md / INIT-3). Verified safe on a
+    # directory with NO prior conversation: `claude --continue` there just
+    # starts fresh, exit 0, no error — so this is safe on a worker's very
+    # first-ever start too. Skipped if the caller already asked to
+    # resume/start a specific conversation another way.
+    if [[ ! "$cmd" =~ (^|[[:space:]])(-c|--continue|--resume|--session-id|--from-pr|--teleport)([[:space:]]|$) ]]; then
+      cmd="$cmd --continue"
+    fi
   fi
 
   # Create tmux session and attach
