@@ -19333,6 +19333,71 @@ mod tests {
             CONV3,
             "adoption must happen above the subagent early-return"
         );
+
+        // 7. AMUX-3897: A CLAIM EXPIRES WHEN ITS OWNER STOPS CONFIRMING IT, and
+        //    not before. Step 3 above already covered the first half — `sib`'s
+        //    claim had no confirmation stamp, so it was age-UNKNOWN and the
+        //    refusal stood. Here is the rest of the lifecycle, end to end through
+        //    the real endpoint and real meta files.
+        //
+        //    The live shape this comes from: `desktop` went idle on 2026-08-28
+        //    still holding a conversation that was actually `ts-gke`'s, and
+        //    ts-gke was refused 205 times and stayed blind to the staged guard
+        //    the whole time.
+
+        //    7a. THE OWNER RE-CONFIRMS, so its claim is fresh and still wins.
+        //    This is the control for the ping-pong the card was worried about: a
+        //    RESUMED lane reports the same id, which refreshes the stamp, so it
+        //    can never age out from under itself.
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/sib/report",
+            Some(json!({"state": "idle", "session_id": SIB_CONV})),
+        )
+        .await;
+        assert_eq!(v["conv_id"]["adopted"], json!(false), "owner re-reporting is not an adopt: {v}");
+        let stamped = meta_i64(&load_meta("sib"), "cc_conversation_confirmed_at");
+        assert!(stamped > 0, "an owner re-reporting its own id must stamp a confirmation");
+
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "session_id": SIB_CONV})),
+        )
+        .await;
+        assert_eq!(v["conv_id"]["conflict_with"], json!("sib"), "a FRESH claim must still win: {v}");
+
+        //    7b. THE OWNER GOES SILENT. Backdate the stamp past the window —
+        //    the same state `desktop` was in, two days without a report.
+        let mut sib_meta = load_meta("sib");
+        sib_meta.insert(
+            "cc_conversation_confirmed_at".into(),
+            json!(crate::config::now_f64() as i64 - conv_claim_stale_s() - 1),
+        );
+        std::fs::write(meta_path("sib"), Value::Object(sib_meta).to_string()).unwrap();
+
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "session_id": SIB_CONV})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["conv_id"]["adopted"],
+            json!(true),
+            "an owner that stopped confirming must lose the claim, or the blocked lane stays \
+             blind forever — which is the whole of AMUX-3897: {v}"
+        );
+        assert_eq!(meta_str(&load_meta("blindy"), "cc_conversation_id"), SIB_CONV);
+        assert_eq!(
+            meta_str(&load_meta("sib"), "cc_conversation_id"),
+            "",
+            "the stale claim must be RELEASED, not left behind to block the next lane too"
+        );
     }
 }
 
