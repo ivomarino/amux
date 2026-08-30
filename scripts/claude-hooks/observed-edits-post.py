@@ -198,33 +198,102 @@ def main():
         log_line(home, session, "n=0 pure-read")
         return
 
+    # WALK THE REPO, NOT ONLY THE SESSION'S CORNER OF IT (AMUX-3920, MHC-527).
+    #
+    # The harness reports the SESSION cwd. When that is a SUBDIRECTORY of a
+    # shared checkout, every edit above it produced no record at all — not a
+    # partial one, none. MHC-527's positive control, one Bash call writing two
+    # files in one repo: `homepage/scripts/.probe` recorded, `scripts/.probe`
+    # not, hook logged n=1.
+    #
+    # The cost is not friction. That session committed 16 paths, 13 above its
+    # cwd, so 81% of the work was structurally unobservable — and the staged
+    # guard, correctly reading "NO session has an edit record for this", asked
+    # for AMUX_VERIFIED_SOLO on three commits and AMUX_ALLOW_FOREIGN on two.
+    # Routinely overriding a guard that is right most of the time trains the
+    # fleet to wave it through, and the next time it correctly names a peer's
+    # work the muscle memory is already there.
+    #
+    # CWD FIRST, THEN THE REST OF THE REPO. Measured 2026-08-30 with this file's
+    # own PRUNE set: amux is 2,222 files in 0.03s, but ~/Dev/mixpeek — the
+    # monorepo this card is about — is 640,353 files in 2.54s against a 1.5s
+    # budget. A naive widening therefore TRUNCATES on the repo it exists to fix,
+    # and a truncated walk that starts at the repo root can run out of budget
+    # before it ever reaches the session's own directory. That would trade a
+    # known blind spot for an unpredictable one.
+    #
+    # Ordering the roots fixes it without touching the budget: cwd is walked
+    # first, so the coverage that worked before is never lost, and the rest of
+    # the repo is walked with whatever budget remains. Strictly more than before,
+    # never less, and the shortfall is named rather than silent.
+    # realpath BOTH roots. On macOS /var is a symlink to /private/var, so the
+    # cwd the harness reports and the toplevel git prints can name the same
+    # directory with different strings — and then the `seen` dedupe below misses
+    # and every file under cwd is counted twice. Found by the n=3 in a two-file
+    # control.
+    _cwd_real = os.path.realpath(cwd)
+    walk_roots = [_cwd_real]
+    try:
+        top = subprocess.run(["git", "-C", cwd, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True, timeout=2).stdout.strip()
+        top = os.path.realpath(top) if top else ""
+        if top and os.path.isdir(top) and top != _cwd_real:
+            walk_roots.append(top)
+    except Exception:
+        pass
+    walk_root = walk_roots[-1]
+
     deadline = time.monotonic() + FIND_BUDGET_S
     hits = []
-    for root, dirs, files in os.walk(cwd):
-        if time.monotonic() > deadline or len(hits) >= MAX_PATHS:
+    seen = set()
+    # A TRUNCATED WALK MUST NOT LOOK LIKE A CLEAN ONE (ethos rule 4). Widening
+    # the root makes the budget bite where it never did, and a walk that stops
+    # early reports fewer paths with no sign it stopped — the same blindness this
+    # card fixes, wearing a different hat. On the mixpeek measurement above this
+    # is the EXPECTED path, not a corner case, so it has to be legible: a reader
+    # must be able to tell "found 3" from "found 3 so far".
+    truncated = ""
+    for _wr in walk_roots:
+        if truncated:
             break
-        dirs[:] = [x for x in dirs if x not in PRUNE and not x.startswith(".cache")]
-        for f in files:
-            p = os.path.join(root, f)
-            try:
-                mt = os.stat(p).st_mtime
-                if mt >= t0:
-                    # AF-130: send the mtime we just read, not merely the path.
-                    # This hook fires after the WHOLE Bash command, so for
-                    # edit-and-commit in one compound call a hook-time stamp
-                    # postdates the commit and the guard's SettledByOwner can
-                    # never fire — the false at-risk notice on every such
-                    # commit. The server accepts bare strings too (older
-                    # installed copies), stamping those with its own clock.
-                    hits.append({"path": p, "mtime": mt})
-                    if len(hits) >= MAX_PATHS:
-                        break
-            except OSError:
-                continue
+        for root, dirs, files in os.walk(_wr):
+            if time.monotonic() > deadline:
+                truncated = " TRUNCATED=budget"
+                break
+            if len(hits) >= MAX_PATHS:
+                truncated = " TRUNCATED=cap"
+                break
+            dirs[:] = [x for x in dirs if x not in PRUNE and not x.startswith(".cache")]
+            for f in files:
+                p = os.path.join(root, f)
+                # The second root CONTAINS the first, so dedupe. Without this a
+                # file under cwd is reported twice and n= overcounts.
+                if p in seen:
+                    continue
+                seen.add(p)
+                try:
+                    mt = os.stat(p).st_mtime
+                    if mt >= t0:
+                        # AF-130: send the mtime we just read, not merely the
+                        # path. This hook fires after the WHOLE Bash command, so
+                        # for edit-and-commit in one compound call a hook-time
+                        # stamp postdates the commit and the guard's
+                        # SettledByOwner can never fire — the false at-risk
+                        # notice on every such commit. The server accepts bare
+                        # strings too (older installed copies), stamping those
+                        # with its own clock.
+                        hits.append({"path": p, "mtime": mt})
+                        if len(hits) >= MAX_PATHS:
+                            break
+                except OSError:
+                    continue
     if not hits:
         # AF-124's fourth case: "ran and found nothing" must be
         # distinguishable from "never ran" (AMUX-2538) — the quiet path logs.
-        log_line(home, session, "n=0 no-moved-mtimes")
+        # `truncated` matters MOST here: "walked the whole tree and nothing
+        # moved" and "ran out of budget before reaching anything" are opposite
+        # facts and both used to print n=0.
+        log_line(home, session, f"n=0 no-moved-mtimes{truncated}")
         return
 
     url = os.environ.get("AMUX_URL") or "https://localhost:8824"
@@ -260,10 +329,15 @@ def main():
     # to reconstruct it from file mtimes by hand. A count is not an audit trail.
     # Paths are repo-relative and capped so a wide walk cannot flood the log;
     # the count stays authoritative and the tail says how many were elided.
-    _rel = [os.path.relpath(h["path"], cwd) for h in hits]
+    # Relative to the WALK ROOT, not the session cwd (AMUX-3920). The paths SENT
+    # to the server are absolute and unaffected, but once the walk root moved
+    # above cwd this line rendered every hit as `../../../../..` — the record was
+    # correct and unreadable, which for an observability hook is most of the
+    # defect. Repo-relative also matches what `git status` prints.
+    _rel = [os.path.relpath(h["path"], walk_root) for h in hits]
     _shown = _rel[:LOG_PATHS]
     _more = "" if len(_rel) <= LOG_PATHS else f" +{len(_rel) - LOG_PATHS} more"
-    log_line(home, session, f"n={len(hits)} {outcome} paths={','.join(_shown)}{_more}")
+    log_line(home, session, f"n={len(hits)} {outcome}{truncated} paths={','.join(_shown)}{_more}")
 
 
 try:
