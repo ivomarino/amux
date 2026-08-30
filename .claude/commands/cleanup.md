@@ -1,5 +1,5 @@
 ---
-description: Repo/branch/file hygiene sweep — stray artifacts, doc drift, stale branches, worktrees, upstream sync, backup sprawl. Verifies before purging.
+description: Repo/branch/file hygiene sweep — stray artifacts, doc drift, stale branches, worktrees, upstream sync, backup sprawl, duplicate build caches. Verifies before purging.
 allowed-tools: Bash, Read, Edit, Write
 argument-hint: [dry-run|full] (default: full)
 ---
@@ -11,9 +11,13 @@ Built from a real cleanup session (2026-08-30) that found: a 37MB binary
 accidentally committed, a security-sensitive file (`CLAUDE.local.md`)
 pushed to a public fork, a live systemd script left untracked, a doc file
 independently drifting in **three** places, 6 stale branches, 2 worktrees
-for merged PRs, and 17 accumulated backup-file generations. None of that
-was hypothetical — every category below is something that actually
-happened here, not a theoretical checklist.
+for merged PRs, 17 accumulated backup-file generations, and — in a
+follow-up pass the same day — 5.9GB of pure disk waste: duplicate cargo
+`target/` dirs in every PR worktree (the shared-target config is
+gitignored, so worktrees never inherit it) plus stale manual binary
+backups nobody cleaned up. None of that was hypothetical — every category
+below is something that actually happened here, not a theoretical
+checklist.
 
 **Golden rule, stated explicitly because it was tested and mattered:**
 verify before you purge. "Looks like a duplicate" and "confirmed
@@ -55,6 +59,41 @@ add to `.gitignore` + commit stops it from being carried forward. That
 does **not** scrub it from history on a remote it already reached — flag
 that explicitly and let the human decide about a history rewrite
 (rewriting a shared/in-review branch is disruptive; not a unilateral call).
+
+**After adding a gitignore entry, verify the COMMIT, not the working
+tree.** `git show HEAD:.gitignore | tail` — not `tail .gitignore`. Editing
+the file and reporting "added to .gitignore" without an explicit `git add
+.gitignore` is a real, repeatable mistake (happened twice in the same
+session here): the commit only contains what got staged, and a later
+`git reset --hard` silently drops the uncommitted rest with no error at
+all. `git status`'s summary line does not catch this when the same pass
+also has a staged deletion — check the actual diff that's about to be
+committed (`git diff --cached --stat`), not just that *something* is
+staged.
+
+**If the human authorizes a history rewrite, scope it to exactly the
+affected commit range — do not process full history.** `git filter-repo`
+run without `--refs` restriction processes every reachable commit and can
+reassign NEW HASHES even to commits whose tree never changed (its default
+merge-simplification touches the whole graph) — this silently moves the
+branch's merge-base with `main`, and a locally-clean rewrite can still
+turn into spurious PR conflicts that have nothing to do with the actual
+fix. `git filter-branch --index-filter '...' -- <bad-commit>^..HEAD`
+(note the revision range after `--`) only touches commits in that range;
+everything before it, including the true shared ancestor with `main`,
+keeps its original hash. **Verify before pushing, every time:**
+```bash
+# merge-base must be IDENTICAL before and after the rewrite
+git merge-base <old-ref> origin/main
+git merge-base <rewritten-ref> origin/main
+# and a real merge test should show 0 conflicts against the SAME origin/main
+# snapshot the old branch was tested against (it may have moved since —
+# check git log <old-merge-base>..origin/main for genuinely new, unrelated
+# conflicts before blaming the rewrite for something upstream drift caused)
+git merge-tree $(git merge-base <rewritten-ref> origin/main) <rewritten-ref> origin/main | grep -c '^<<<<<<<'
+```
+Tag the pre-rewrite tip locally (never pushed) before starting, so a wrong
+rewrite has a clean recovery path.
 
 ## 2. Doc/skill drift
 
@@ -179,7 +218,64 @@ Archiving beats deleting for anything that might be someone's operational
 checkpoint — the cost of keeping 17 small files is negligible; the cost of
 deleting the one that mattered is not.
 
-## 8. Report, don't sweep
+## 8. Build-artifact & disk-cache hygiene
+
+A shared-build-cache setup (e.g. a gitignored `.cargo/config.toml` pinning
+`target-dir` to one shared path — see CLAUDE.md's `CARGO_TARGET_DIR` rule)
+only works where that gitignored file actually exists. **Worktrees don't
+inherit gitignored files from the main checkout** — each is a separate
+directory, so a build run inside one silently falls back to its own local
+`./target` unless the config is copied there too. Confirmed cost: 1.4GB
+across two PR worktrees, invisible until someone actually measured it.
+
+```bash
+# Does every worktree have the same build-cache pin as the main checkout?
+for wt in $(git worktree list --porcelain | grep ^worktree | cut -d' ' -f2); do
+  [ -f "$wt/.cargo/config.toml" ] || echo "$wt: MISSING shared build-cache config"
+done
+# fix (root cause, not just cleanup — do this before deleting the stray dir):
+cp .cargo/config.toml <worktree>/.cargo/config.toml
+
+# Find local target/ or node_modules/ dirs that duplicate a shared cache:
+find . <worktree-paths> -maxdepth 2 -type d \( -name target -o -name node_modules \) -exec du -sh {} \;
+# a target/ dir OLDER than the shared-cache config's own mtime is dead —
+# nothing has written to it since the config started redirecting builds:
+find <target-dir> -newer .cargo/config.toml | head -1   # empty = confirmed stale
+```
+
+**Manual build/deploy byproducts left in `~/.local/bin` (or wherever
+binaries get manually swapped) are the same "forgot to clean up" pattern
+as the `.new` file that ended up committed to git (category 1) — just
+outside the repo, so nothing catches it automatically:**
+
+```bash
+ls -la ~/.local/bin/*.backup-* ~/.local/bin/*.new 2>/dev/null
+# for each: is it the one actually running?
+readlink -f /proc/<server-pid>/exe   # compare against the candidate's path
+# not referenced anywhere and not the live binary -> safe to delete,
+# it's a build output, fully regenerable from source
+```
+
+**A disk-usage `du` sweep needs dotfiles included, or the biggest
+consumers hide entirely:** `du -sh ~/*` silently skips everything starting
+with `.` — `~/.cargo`, `~/.rustup`, `~/.npm`, `~/.amux` and similar can be
+the majority of usage and never show up. Use `du -sh ~/.[!.]* ~/*` (or
+`du -sha` at the parent and sort) so hidden top-level dirs are actually in
+the comparison, not silently absent from a "here's what's using space"
+report.
+
+**A health check's disk threshold can be correct in general and wrong for
+THIS host.** If `/health` or similar reports `critical`/`warn` on an
+absolute free-GB threshold, sanity-check the threshold against this
+specific disk's TOTAL size before treating the reading as a cleanup
+target: a threshold requiring e.g. 75GB free for "ok" is unreachable by
+construction on a 35GB disk, no matter how clean it is. That's a
+miscalibrated check for this host, not a disk problem — flag the
+threshold itself rather than chasing a number that can never move into
+the "ok" band; changing a shared health-check threshold that other hosts
+in the fleet may rely on isn't a unilateral cleanup call either.
+
+## 9. Report, don't sweep
 
 End every run with a clear before/after: what was deleted (with the
 verification that made it safe), what was flagged instead (with why it
@@ -194,7 +290,8 @@ else's data.
 `$ARGUMENTS`: `dry-run` reports every finding above without deleting,
 moving, or committing anything — use this for the first pass, or whenever
 asked to "check" rather than "clean up". `full` (default) executes the
-safe categories (1, 2 via symlink, 3–4 once verified, 6–7) and stops to
-ask before anything in category 5 or anything flagged as ambiguous in 3.
+safe categories (1, 2 via symlink, 3–4 once verified, 6–8) and stops to
+ask before anything in category 5, a history rewrite in category 1, or
+anything flagged as ambiguous in category 3.
 
-Always finish with the category-8 report, even on a dry run.
+Always finish with the category-9 report, even on a dry run.
