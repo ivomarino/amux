@@ -200,9 +200,19 @@ pub async fn tick(state: AppState) -> (usize, usize, usize) {
                 let _ = state
                     .store
                     .write_async(move |conn| {
+                        // INTEGER, not f64. `updated` is an INTEGER column and
+                        // every other writer stores it as one; SQLite is
+                        // dynamically typed, so a single f64 here silently
+                        // stores REAL in that row and `issue_from_row` then
+                        // fails the WHOLE list read with "Invalid column type
+                        // Real at index: 6". Three rows written by this job
+                        // took `GET /api/board` down fleet-wide for ~20 minutes
+                        // on 2026-08-30. The reader is hardened too (see
+                        // `issue_from_row`); this is the half that stops
+                        // producing the bad value in the first place.
                         conn.execute(
                             "UPDATE issues SET title=?1, \"desc\"=?2, updated=?3 WHERE id=?4",
-                            rusqlite::params![t, d, crate::config::now_f64(), id],
+                            rusqlite::params![t, d, crate::config::now_f64() as i64, id],
                         )?;
                         Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                     })

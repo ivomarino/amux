@@ -1505,6 +1505,29 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence, \
      i.ask_type, i.ask_question, i.ask_unblocks";
 
+/// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
+///
+/// `updated` is declared INTEGER and every writer is supposed to store one, so
+/// `r.get::<_, i64>()` reads it — and rusqlite's `FromSql` is strict per storage
+/// type, so ONE row holding a REAL fails the whole query. On 2026-08-30 three
+/// rows written by the queue-disposition job with an f64 timestamp took
+/// `GET /api/board` down fleet-wide with `Invalid column type Real at index: 6,
+/// name: updated`: 12,959 correct rows, 3 wrong ones, and the board served a
+/// 500 to every session.
+///
+/// The writer is fixed. This is the second half, and it is the one that matters:
+/// a list read over ~13,000 rows must not be all-or-nothing on the storage type
+/// of a single cell. Same shape `last_verified_at` already uses below for the
+/// Python-era TEXT case — that precedent existed and this column did not have it.
+fn ts_i64(r: &Row<'_>, idx: usize) -> rusqlite::Result<i64> {
+    Ok(match r.get::<_, rusqlite::types::Value>(idx)? {
+        rusqlite::types::Value::Integer(n) => n,
+        rusqlite::types::Value::Real(f) => f as i64,
+        rusqlite::types::Value::Text(t) => t.trim().parse::<f64>().unwrap_or(0.0) as i64,
+        _ => 0,
+    })
+}
+
 fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
     let depends_raw: Option<String> = r.get(19)?;
     let depends_on = depends_raw
@@ -1533,7 +1556,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         creator: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
         due: r.get(6)?,
         created: r.get(7)?,
-        updated: r.get(8)?,
+        updated: ts_i64(r, 8)?,
         owner_type: r.get::<_, Option<String>>(9)?.unwrap_or_else(|| "human".into()),
         due_time: r.get(10)?,
         pinned: r.get(11)?,
@@ -1778,7 +1801,7 @@ fn light_rows(
             archived: r.get(3)?,
             pinned: r.get(4)?,
             pos: r.get(5)?,
-            updated: r.get(6)?,
+            updated: ts_i64(r, 6)?,
         })
     })? {
         let row = row?;
@@ -2437,6 +2460,56 @@ mod tests {
         assert!(has_asset_link("closes #106"));
         // A short hex-ish word is not a sha, a bare year is too short.
         assert!(!has_asset_link("the cafe was open in 2026"));
+    }
+
+    /// ONE ROW WITH A REAL TIMESTAMP MUST NOT TAKE THE WHOLE LIST DOWN.
+    ///
+    /// The live incident, as a test. `updated` is declared INTEGER; the
+    /// queue-disposition job wrote three rows with an f64, and because
+    /// rusqlite's FromSql is strict per storage type, `GET /api/board` returned
+    /// `Invalid column type Real at index: 6, name: updated` for EVERY session
+    /// — 12,959 good rows made unreadable by 3 bad ones.
+    ///
+    /// The control is the point: the good row must still come back with its
+    /// exact value, or a reader that silently zeroed every timestamp would pass
+    /// this too.
+    #[test]
+    fn a_single_real_timestamp_does_not_fail_the_whole_list_read() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (id TEXT PRIMARY KEY, status TEXT, session TEXT,
+                archived INTEGER DEFAULT 0, pinned INTEGER DEFAULT 0, pos REAL DEFAULT 0,
+                updated INTEGER, deleted INTEGER);",
+        )
+        .unwrap();
+        // SQLite is dynamically typed, so this stores a REAL in an INTEGER column
+        // exactly as the job did.
+        conn.execute("INSERT INTO issues VALUES ('A-1','todo','x',0,0,0,?1,NULL)", [1788076327.487f64])
+            .unwrap();
+        conn.execute("INSERT INTO issues VALUES ('A-2','todo','x',0,0,0,?1,NULL)", [1788076327i64])
+            .unwrap();
+
+        let mut st = conn
+            .prepare("SELECT id, status, session, archived, pinned, pos, updated FROM issues ORDER BY id")
+            .unwrap();
+        let rows: Vec<(String, i64)> = st
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, ts_i64(r, 6)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .expect("a REAL in an INTEGER column must not fail the read");
+        assert_eq!(rows.len(), 2, "both rows must come back");
+        assert_eq!(rows[0].1, 1788076327, "the REAL row truncates to its second");
+        // CONTROL: the correct row is unchanged, so a reader that zeroed
+        // everything would fail here rather than pass.
+        assert_eq!(rows[1].1, 1788076327, "the INTEGER row must be exact");
+
+        // And the strict read is what USED to happen — pinned so the test is
+        // known to be exercising the real hazard and not a hypothetical one.
+        let mut st = conn.prepare("SELECT updated FROM issues WHERE id='A-1'").unwrap();
+        assert!(
+            st.query_row([], |r| r.get::<_, i64>(0)).is_err(),
+            "if a strict i64 read of this cell succeeds, the fixture no longer reproduces the bug"
+        );
     }
 
     /// THE GAP THIS CARD IS ABOUT, pinned so it cannot be argued away.

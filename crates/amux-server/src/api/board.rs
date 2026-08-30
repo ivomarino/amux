@@ -2371,7 +2371,9 @@ pub async fn create_item(
                             "holding": held,
                             "limit": limit,
                             "why": format!(
-                                "{session} already holds {held} todo card(s) and the limit is {limit}.                                  `todo` is the dispatch queue: filing here is a claim that the card is next."
+                                "{session} already holds {held} todo card(s) and the limit is {limit}. \
+                                 `todo` is the dispatch queue: filing here is a claim that \
+                                 the card is next."
                             ),
                             "close_these_first": stalest.iter().map(|(id, title, days)| json!({
                                 "id": id, "title": title, "days_since_touched": days,
@@ -4268,7 +4270,10 @@ pub async fn patch_item(
                                         "holding": held,
                                         "limit": wip_limit,
                                         "why": format!(
-                                            "{lane} already holds {held} todo card(s) and the limit is {wip_limit}.                                              `todo` is the dispatch queue: a card here is a claim that it is next.                                              Fleet-wide the median todo card is 28.8 days old against 48 done, which                                              is what a queue nobody drains looks like."
+                                            "{lane} already holds {held} todo card(s) and the limit is {wip_limit}. \
+                                             `todo` is the dispatch queue: a card here is a \
+                                             claim that it is next. `backlog` is unbounded and \
+                                             is where a real card that is not NEXT belongs."
                                         ),
                                         // NOT a generic "close something". These are the
                                         // specific cards the dispatcher has already stopped
