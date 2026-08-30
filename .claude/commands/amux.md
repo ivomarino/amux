@@ -213,8 +213,12 @@ that sends text before linking gets a one-line nudge back (`/link
 **Routing to a specific lane from Telegram** — start a message with `@lane_name` to
 route it to that lane instead of your default mapped session. Example: `@frontstage
 what's the status?` sends the message to the `frontstage` session. If the lane name
-is invalid, the message routes to your mapped session as usual (graceful fallback).
-Available lane names are shown in the link prompt if you don't know them yet.
+is unknown or misspelled, the message still routes to your mapped session (never
+silently dropped) but you get an inline reply back naming the bad mention and
+listing known lanes — e.g. `@fronstage` (typo for `frontstage`) replies with
+`Note: '@fronstage' isn't a known lane — delivered to 'amux' instead. Known lanes: ...`
+rather than silently landing in the wrong place with no signal (fixed 2026-08-30,
+found via a real typo'd message during testing).
 
 ```bash
 curl -sk $AMUX_URL/api/telegram/status                          # bot_token_set, mapping_count, last_poll_at, last_error, messages_routed/unlinked
