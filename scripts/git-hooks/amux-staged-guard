@@ -37,11 +37,19 @@ import json, os, ssl, subprocess, sys, time, urllib.error, urllib.request
 
 # Bump on ANY change to this file, not only on a request/response contract
 # change. It is what the installed-copy inventory greps
-# (`grep -L 'GUARD_VERSION = 8' */.git/hooks/amux-staged-guard`), so a tracked
+# (`V=$(grep -m1 -o '^GUARD_VERSION = [0-9]*' scripts/git-hooks/amux-staged-guard)
+#   grep -L "$V" */.git/hooks/amux-staged-guard`), so a tracked
 # file that changed without moving this number makes every stale installed copy
 # read as current — the two-components-disagreeing shape this hook exists to
 # report. `scripts/install-hooks.sh` still compares bytes; this is the cheap
 # read for "which checkouts are behind".
+# The inventory command above DERIVES this number rather than repeating it. The
+# comment used to name `= 8` as a literal while this said 11, so the documented
+# way to find stale copies would have listed every one of them as current: the
+# instruction for auditing the guard would itself have been the stale thing.
+# `^`-anchored, because an unanchored match now finds the comment line first
+# (checked: it returned empty, which would have made `grep -L` match nothing and
+# report a clean fleet).
 GUARD_VERSION = 11
 
 
