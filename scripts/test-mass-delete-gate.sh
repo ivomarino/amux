@@ -99,5 +99,20 @@ else
   no "files absent from origin are nobody else's loss and must not be gated" ""
 fi
 
+# 5. NO origin/main -> the gate cannot compare, and must SAY so rather than
+#    passing quietly. Without the notice a fetch-less checkout has no gate and
+#    nothing distinguishes that from a clean pass (mixpeek-homepage-claude's
+#    caution, taken; they hit the same silent-correct/silent-broken shape in
+#    their uptime canary the same morning).
+G update-ref -d refs/remotes/origin/main
+G rm -q pkg/f23.txt pkg/f24.txt pkg/f25.txt pkg/f26.txt pkg/f27.txt pkg/f28.txt \
+        pkg/f29.txt pkg/f30.txt pkg/f31.txt pkg/f32.txt pkg/f33.txt pkg/f34.txt \
+        pkg/f35.txt pkg/f36.txt pkg/f37.txt pkg/f38.txt pkg/f39.txt pkg/f40.txt
+out=$(G commit -qm "no origin" 2>&1)
+case "$out" in
+  *"not resolvable"*) ok "with no origin/main the gate says it is NOT protecting the commit" ;;
+  *) no "an unusable gate must announce itself, not pass silently" "$out" ;;
+esac
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

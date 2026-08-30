@@ -55,8 +55,26 @@ STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 # does separate them is SCALE — a deliberate removal names a handful of files, a
 # sweep takes everything the worktree happens to be missing. The threshold is
 # the override-free path for ordinary work.
+# THE THRESHOLD IS DERIVED FROM THIS REPO, not inherited (mixpeek-homepage-claude
+# made this point by measuring their own and I had not measured mine). Over the
+# last 400 commits on amux, FIVE deleted anything at all: 61, 17, 7, 6 and 4
+# files. So 15 gates two of four hundred — 792ce1f4 "the Python server was
+# deleted" and 88f797c5 "Remove Playwright entirely" — and both are exactly the
+# deliberate mass removal where an explicit confirmation is the right answer,
+# not a false positive. 0.5% is well short of the rate that would teach the
+# override by reflex.
 DEL_LIMIT="${AMUX_MAX_STAGED_DELETIONS:-15}"
 if [ -z "${AMUX_ALLOW_MASS_DELETE:-}" ]; then
+  # ORIGIN MUST BE RESOLVABLE, AND SAY SO WHEN IT IS NOT. Without this the
+  # `git cat-file -e origin/main:<path>` below returns non-zero for every path,
+  # ON_ORIGIN stays 0, and the gate passes — so a fetch-less or freshly-cloned
+  # checkout has NO gate and nothing says so. Silent-correct and silent-broken
+  # look identical, which is the class this whole file keeps running into.
+  if ! git rev-parse --verify -q origin/main >/dev/null 2>&1; then
+    echo "amux: NOTE — origin/main is not resolvable here, so the mass-deletion gate" >&2
+    echo "      cannot compare against it and is NOT protecting this commit." >&2
+    echo "      (git fetch origin, or ignore if this checkout has no remote.)" >&2
+  fi
   STAGED_DEL=$(git diff --cached --name-only --diff-filter=D 2>/dev/null || true)
   N_DEL=$(printf '%s' "$STAGED_DEL" | grep -c . || true)
   if [ "${N_DEL:-0}" -gt "$DEL_LIMIT" ]; then
