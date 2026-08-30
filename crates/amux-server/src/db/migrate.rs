@@ -211,6 +211,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0037_issues_typed_ask",
         sql: include_str!("../../migrations/0037_issues_typed_ask.sql"),
     },
+    Migration {
+        version: 38,
+        name: "0038_nudge_feedback",
+        sql: include_str!("../../migrations/0038_nudge_feedback.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

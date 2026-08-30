@@ -203,6 +203,212 @@ fn idle_backlog_drain_cooldown_s(drainable_backlog: i64) -> f64 {
     )
 }
 
+/// Per-lane nudge feedback state plus the cost the loop is actually charging.
+///
+/// `unheeded` is the count this tick would act on; `suppressed` is the set the
+/// cap has silenced. `chars_24h` is the number that made AF-319 a card rather
+/// than an opinion — drain nudges were 42% of all fleet messages over 34 hours,
+/// and nothing in amux could say so without reading cmd_history by hand.
+fn nudge_feedback_report(conn: &Connection) -> Value {
+    let mut lanes: Vec<Value> = Vec::new();
+    if let Ok(mut st) = conn.prepare(
+        "SELECT session, COALESCE(unheeded,0), COALESCE(escalated_card,''), \
+         COALESCE(last_nudge_at,0) FROM board_drive_nudge_state ORDER BY unheeded DESC, session",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| {
+            let card: String = r.get(2)?;
+            Ok(json!({
+                "session": r.get::<_, String>(0)?,
+                "unheeded": r.get::<_, i64>(1)?,
+                // Null, not "", so "never escalated" and "escalated to a card
+                // whose id we lost" are not the same value.
+                "escalated_card": if card.is_empty() { Value::Null } else { json!(card) },
+                "last_nudge_at": r.get::<_, f64>(3)?,
+            }))
+        }) {
+            lanes.extend(rows.flatten());
+        }
+    }
+    let cap = nudge_unheeded_cap();
+    let suppressed = lanes
+        .iter()
+        .filter(|l| l["unheeded"].as_i64().unwrap_or(0) >= cap)
+        .count();
+    // The cost, from the message ledger. `ts` there is MILLISECONDS — reading it
+    // as seconds silently matches all history and reports ~3x the real volume,
+    // which is exactly the mistake made while measuring this card.
+    let cutoff_ms = (crate::config::now_f64() - 24.0 * 3600.0) * 1000.0;
+    let (msgs, chars): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)),0) FROM cmd_history \
+             WHERE ts > ?1 AND (text LIKE '%[amux]%Idle with%' \
+                 OR text LIKE '%[amux auto-pickup]%' OR text LIKE '%[amux auto-continue]%')",
+            rusqlite::params![cutoff_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    let all_24h: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cmd_history WHERE ts > ?1", rusqlite::params![cutoff_ms], |r| r.get(0))
+        .unwrap_or(0);
+    crate::api::measured::measured(
+        json!({
+            "cap": cap,
+            "suppressed_lanes": suppressed,
+            "tracked_lanes": lanes.len(),
+            "nudges_24h": msgs,
+            "chars_24h": chars,
+            "share_of_fleet_messages_24h": if all_24h > 0 {
+                json!(((msgs as f64 / all_24h as f64) * 1000.0).round() / 10.0)
+            } else {
+                Value::Null
+            },
+            "lanes": lanes,
+            "note": "`unheeded` counts consecutive drain nudges after which NO card in the \
+                     lane changed. At `cap` the loop stops nudging and files one escalation \
+                     card instead; any card movement resets it to 0 and nudging resumes with \
+                     no action needed. Cadence doubles per unheeded repeat rather than \
+                     staying at the 20m floor (AF-319).",
+        }),
+        all_24h.max(0) as usize,
+    )
+}
+
+/// File the ONE card that replaces a nudge nobody is reading (AF-319).
+///
+/// Owner is the LANE, because the lane is who can dispose of its own backlog —
+/// but the card is `chore` and says plainly that the nudging has stopped, so a
+/// human reading the board sees a queue that has been declared stuck rather
+/// than a lane that has merely gone quiet.
+///
+/// Exactly one per stuck stretch: `escalated_card` gates it, and the counter
+/// resets to 0 the moment any card in the lane moves, which clears the gate.
+async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unheeded: i64) {
+    let title = format!("{lane}'s backlog has not moved across {unheeded} nudges — nudging stopped");
+    let desc = format!(
+        "board_drive nudged this lane {unheeded} times in a row about its {backlog}-card \
+         backlog and not one card changed in between. It has stopped nudging.\n\n\
+         That is deliberate. Measured fleet-wide over 34h to 2026-08-30, drain nudges were \
+         42% of all messages (419 of 988, ~143k tokens), and the hardest-nudged lanes moved \
+         ZERO cards while the two least-nudged lanes did all the work. More nudges was not \
+         the missing ingredient.\n\n\
+         Nudging resumes automatically the moment ANY card in this lane changes. Nothing \
+         here needs to be answered to restore it.\n\n\
+         If the backlog is real work, pull one card. If it is not, this is the moment to say \
+         so:\n\n\
+         \x20 amux board discard <ID>                       not a unit of work\n\
+         \x20 amux board backlog <ID> --trigger \"<cond>\"    real, waiting on something\n\
+         \x20 amux board doing <ID>                         you are picking it up\n"
+    );
+    let new = crate::db::board_store::NewIssue {
+        title,
+        desc,
+        status: "todo".into(),
+        session: Some(lane.to_string()),
+        // `chore`: nothing to implement or merge, so a code gate could not be
+        // satisfied honestly (ethos rule 3).
+        item_type: "chore".into(),
+        // Exempt from the AF-317 todo WIP limit by name, for the same reason the
+        // queue-disposition card is: this card exists BECAUSE the queue is too
+        // long, so refusing it for queue depth would suppress its own alarm.
+        creator: crate::api::board::QUEUE_DISPOSITION_CREATOR.into(),
+        owner_type: "agent".into(),
+        due: None,
+        due_time: None,
+        reviewer: None,
+        shepherd: None,
+        gate: vec![],
+        depends_on: vec![],
+        tags: vec!["nudge:escalated".to_string()],
+    };
+    let l = lane.to_string();
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            let row = crate::db::board_store::create_issue(conn, &new, crate::config::now_f64() as i64)?;
+            conn.execute(
+                "UPDATE board_drive_nudge_state SET escalated_card=?1 WHERE session=?2",
+                rusqlite::params![row.id, l],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+}
+
+/// After this many consecutive drain nudges that moved nothing, STOP nudging
+/// the lane and escalate once (AF-319).
+///
+/// Three, because the first repeat is a reasonable retry and the second is a
+/// reasonable doubt. Measured over 34h to 2026-08-30: mvs-infra took 80 nudges
+/// and moved 0 cards, backend 56 and 0, byo-ray 41 and 0 — every one of them
+/// running, not credit-limited, not waiting. A nudge that fired 80 times without
+/// moving a card is evidence about the queue, not a message to the worker.
+fn nudge_unheeded_cap() -> i64 {
+    env_f64("AMUX_NUDGE_UNHEEDED_CAP", 3.0) as i64
+}
+
+/// The lane's board watermark: the newest `updated` across the cards a drain
+/// nudge is asking it to work.
+///
+/// This is the FEEDBACK SIGNAL, and it is deliberately "did anything at all
+/// change" rather than "did a card change status". A lane that retitled, retyped
+/// or commented on one of its cards has engaged with the queue, and nudging it
+/// again on the same cadence would be punishing a response we asked for.
+fn lane_board_mark(conn: &Connection, lane: &str) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(updated),0) FROM issues WHERE session=?1 \
+         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+        rusqlite::params![lane],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// What the nudge loop knows about a lane between ticks.
+#[derive(Debug, Clone, Copy, Default)]
+struct NudgeState {
+    unheeded: i64,
+    board_mark: i64,
+    has_escalated: bool,
+}
+
+fn read_nudge_state(conn: &Connection, lane: &str) -> NudgeState {
+    conn.query_row(
+        "SELECT COALESCE(unheeded,0), COALESCE(board_mark,0), \
+         COALESCE(LENGTH(escalated_card),0) > 0 \
+         FROM board_drive_nudge_state WHERE session=?1",
+        rusqlite::params![lane],
+        |r| Ok(NudgeState { unheeded: r.get(0)?, board_mark: r.get(1)?, has_escalated: r.get(2)? }),
+    )
+    .unwrap_or_default()
+}
+
+/// Decide what this tick means, given the watermark then and now.
+///
+/// Split from the IO so the curve is testable without a store — the same reason
+/// `drain_cooldown_scaled` is split out just below.
+///
+/// Returns (unheeded_after, moved). A first sighting (`prev_mark == 0`) counts
+/// as movement so a lane is never escalated on the strength of a tick that had
+/// nothing to compare against — ethos rule 4, applied to this function's own
+/// first run.
+fn nudge_feedback(prev_mark: i64, mark_now: i64, unheeded_before: i64) -> (i64, bool) {
+    if prev_mark == 0 || mark_now > prev_mark {
+        (0, true)
+    } else {
+        (unheeded_before + 1, false)
+    }
+}
+
+/// Back off while the lane is not responding, instead of speeding up.
+///
+/// The bug this closes: cadence scaled with backlog SIZE and nothing scaled with
+/// the OUTCOME, so the largest backlogs pinned themselves to the 20-minute floor
+/// and stayed there. Doubling per unheeded repeat means an ignored lane goes
+/// 20m, 40m, 80m and then stops, rather than 20m forever.
+fn unheeded_backoff(cooldown_s: f64, unheeded: i64) -> f64 {
+    cooldown_s * 2f64.powi(unheeded.clamp(0, 8) as i32)
+}
+
 /// Pure scaling: gentle `base` for a small backlog, halving roughly every `per`
 /// cards, never below `floor`. Split out so the cadence curve is tested without
 /// touching process env (the env-race trap the ethos file records).
@@ -4143,10 +4349,31 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 if !idle_drain && !stale_enough {
                     break 'triage None;
                 }
-                let (event_type, cooldown_s) = if idle_drain {
+                let (event_type, base_cooldown_s) = if idle_drain {
                     ("backlog.drain_nudge", idle_backlog_drain_cooldown_s(drainable_backlog))
                 } else {
                     ("backlog.triage_nudge", BACKLOG_TRIAGE_COOLDOWN_S)
+                };
+                // AF-319: THE FEEDBACK TERM. Cadence used to be a function of
+                // backlog SIZE and of nothing else, so the biggest backlogs
+                // pinned themselves to the 20-minute floor and stayed there.
+                // Measured over 34h to 2026-08-30: mvs-infra 80 nudges / 0 cards
+                // moved, backend 56 / 0, byo-ray 41 / 0, all of them running and
+                // not rate-limited, while the two LEAST-nudged lanes did all the
+                // work. Frequency was anti-correlated with the outcome.
+                //
+                // Only the drain nudge is metered. The triage nudge already has
+                // a 72h cooldown and is not what the measurement found.
+                let mark_now = lane_board_mark(&conn, lane);
+                let nudge_state = read_nudge_state(&conn, lane);
+                let (unheeded_after, moved) =
+                    nudge_feedback(nudge_state.board_mark, mark_now, nudge_state.unheeded);
+                let cap = nudge_unheeded_cap();
+                let suppress = idle_drain && unheeded_after >= cap;
+                let cooldown_s = if idle_drain {
+                    unheeded_backoff(base_cooldown_s, unheeded_after)
+                } else {
+                    base_cooldown_s
                 };
                 let recent: bool = conn
                     .query_row(
@@ -4173,6 +4400,56 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     break 'triage None;
                 }
                 drop(conn);
+
+                // Persist the feedback state on EVERY drain decision, nudge or
+                // not — a counter that only advances when we act cannot detect
+                // the case it exists for.
+                if idle_drain {
+                    let (l, esc) = (lane.to_string(), nudge_state.has_escalated || suppress);
+                    let _ = state
+                        .store
+                        .write_async(move |c| {
+                            c.execute(
+                                "INSERT INTO board_drive_nudge_state \
+                                 (session, unheeded, last_nudge_at, board_mark) \
+                                 VALUES (?1, ?2, ?3, ?4) \
+                                 ON CONFLICT(session) DO UPDATE SET \
+                                   unheeded=excluded.unheeded, \
+                                   last_nudge_at=excluded.last_nudge_at, \
+                                   board_mark=excluded.board_mark",
+                                rusqlite::params![l, unheeded_after, now, mark_now],
+                            )?;
+                            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                        })
+                        .await;
+                    let _ = esc;
+                }
+
+                // THE CAP. Past it the lane is not told again; the QUEUE is
+                // reported once, to its owner, as a card. A nudge that fired 80
+                // times without moving anything is evidence about the queue, not
+                // a message to the worker (AF-319).
+                if suppress {
+                    if !nudge_state.has_escalated {
+                        file_nudge_escalation(state, lane, drainable_backlog, unheeded_after).await;
+                    }
+                    tracing::warn!(
+                        "nudge_unheeded_cap: {lane} ignored {unheeded_after} drain nudge(s) with \
+                         no card movement (cap {cap}); suppressed, backlog {drainable_backlog}"
+                    );
+                    break 'triage Some(format!(
+                        "drain nudge SUPPRESSED — {unheeded_after} consecutive nudges moved no \
+                         card (cap {cap}); escalated to the lane's owner instead"
+                    ));
+                }
+                if idle_drain && !moved && unheeded_after > 0 {
+                    tracing::info!(
+                        "nudge_backoff: {lane} unheeded={unheeded_after} cooldown now {:.0}m \
+                         (base {:.0}m)",
+                        cooldown_s / 60.0,
+                        base_cooldown_s / 60.0
+                    );
+                }
                 let text = if idle_drain {
                     backlog_drain_text(&cards, drainable_backlog)
                 } else {
@@ -4578,6 +4855,11 @@ pub async fn debug_board_drive(
         .collect();
     let capture_shells = state.store.read().ok().map(|c| capture_shell_cost(&c));
     let queue_shape = state.store.read().ok().map(|c| fleet_queue_shape(&c));
+    // AF-319: the nudge loop's own cost and its feedback state, on the endpoint
+    // that already answers "what is this loop doing". A throttle nobody can
+    // audit is the shape ethos rule 6 warns about, and the measurement that
+    // motivated this had to be reconstructed from cmd_history by hand.
+    let nudge_feedback = state.store.read().ok().map(|c| nudge_feedback_report(&c));
     let body = json!({
         "note": "per-lane trace of the board -> worker drive loop; `reason` says why a lane \
                  was passed over. A skip that leaves no trace is indistinguishable from a loop \
@@ -4595,6 +4877,7 @@ pub async fn debug_board_drive(
         "distinct_lanes_waiting": seen.len(),
         "capture_shells": capture_shells,
         "queue_shape": queue_shape,
+        "nudge_feedback": nudge_feedback,
     });
     let body = match lanes_considered {
         Some(n) => crate::api::measured::measured(body, n),
@@ -4950,6 +5233,77 @@ mod reviewer_renag_tests {
 
 #[cfg(test)]
 mod tests {
+    // ---- AF-319: the nudge loop's missing feedback term --------------------
+
+    /// The LOOP CLOSES: a lane that moves a card is forgiven, one that does not
+    /// accumulates, and the very first tick is never counted against it.
+    ///
+    /// That last case is the one worth pinning. On a lane's first drain nudge
+    /// there is no previous watermark to compare against, and treating an
+    /// absent measurement as "no movement" would escalate a lane on the
+    /// strength of a tick that could not have observed anything (ethos rule 4,
+    /// applied to this function's own first run).
+    #[test]
+    fn unheeded_counts_only_when_a_comparison_was_actually_possible() {
+        // First sighting: no prior mark. Counts as movement, never as silence.
+        assert_eq!(nudge_feedback(0, 1_700_000_000, 0), (0, true));
+        assert_eq!(nudge_feedback(0, 1_700_000_000, 7), (0, true), "and it CLEARS a stuck count");
+
+        // A card moved: the watermark advanced.
+        assert_eq!(nudge_feedback(1_700_000_000, 1_700_000_050, 2), (0, true));
+
+        // Nothing moved: accumulate.
+        assert_eq!(nudge_feedback(1_700_000_000, 1_700_000_000, 0), (1, false));
+        assert_eq!(nudge_feedback(1_700_000_000, 1_700_000_000, 2), (3, false));
+    }
+
+    /// The cadence now BACKS OFF while a lane is not responding.
+    ///
+    /// The defect this closes is that the old curve only ever went faster:
+    /// `idle_backlog_drain_cooldown_s` scales with backlog SIZE, so a big
+    /// backlog pinned itself to the 20-minute floor and stayed. Measured over
+    /// 34h to 2026-08-30, mvs-infra sat at a 22-minute gap for 80 nudges and
+    /// moved 0 cards.
+    #[test]
+    fn the_backoff_doubles_and_is_bounded() {
+        let floor = 20.0 * 60.0;
+        assert_eq!(unheeded_backoff(floor, 0), floor, "a responsive lane is untouched");
+        assert_eq!(unheeded_backoff(floor, 1), floor * 2.0);
+        assert_eq!(unheeded_backoff(floor, 2), floor * 4.0);
+        // Bounded, so a long-dead lane cannot overflow the multiplier into a
+        // cooldown that never expires.
+        assert!(unheeded_backoff(floor, 500) <= floor * 256.0);
+        // CONTROL: the OLD behaviour is what this replaces — the floor forever.
+        // If backoff ever became a no-op this equality would hold at every n.
+        assert_ne!(unheeded_backoff(floor, 3), floor);
+    }
+
+    /// The cap is reachable from the measured reality, not just in principle.
+    ///
+    /// mvs-infra took 80 unheeded nudges. With the cap at 3 it would have been
+    /// suppressed after the third, so this asserts the specimen crosses it.
+    #[test]
+    fn the_measured_specimen_crosses_the_cap() {
+        let cap = nudge_unheeded_cap();
+        assert!(cap >= 1, "a cap of 0 would suppress the first nudge, which is not the fix");
+        let mut unheeded = 0;
+        let mark = 1_700_000_000;
+        let mut fired = 0;
+        for _ in 0..80 {
+            let (next, _) = nudge_feedback(mark, mark, unheeded);
+            unheeded = next;
+            if unheeded >= cap {
+                break;
+            }
+            fired += 1;
+        }
+        assert!(
+            fired < 5,
+            "mvs-infra fired 80 nudges into silence; after this change it gets {fired} before \
+             the queue is escalated instead"
+        );
+    }
+
 
     /// amux's review question, made into a test rather than answered in prose:
     /// "can a card promoted by the revisit arm be distinguished, after the
