@@ -1,7 +1,0 @@
-FROM amux-base:ready
-SHELL ["/bin/bash", "-c"]
-WORKDIR /build
-COPY . .
-RUN rm -f .cargo/config.toml
-ENV CARGO_TARGET_DIR=/build/target
-RUN source /root/.cargo/env && cargo build --release --offline -p amux-server -p amux-cli

@@ -21,11 +21,6 @@
             "type": "command",
             "command": "$CLAUDE_PROJECT_DIR/.claude/auto-deploy.sh --on-stop",
             "timeout": 30
-          },
-          {
-            "type": "command",
-            "command": "python3 $CLAUDE_PROJECT_DIR/.claude/telegram-relay.py",
-            "timeout": 15
           }
         ]
       }

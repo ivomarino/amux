@@ -50,6 +50,10 @@ curl -sk $AMUX_URL/api/telegram/mappings
 
 ## Reference Implementation Details
 
-- `.claude/telegram-relay.py` — old Stop hook (kept as reference, amux uses it)
-- `crates/amux-server/src/runtime_jobs/telegram_relay.rs` — new server-side relay
+- `crates/amux-server/src/runtime_jobs/telegram_relay.rs` — server-side relay
 - `crates/amux-server/migrations/0036_telegram_relay.sql` — relay state tracking (DB)
+
+The old Stop-hook-based relay (`.claude/telegram-relay.py`) is gone — fully
+superseded by the server-side job above (works for every session with zero
+per-session hook config, unlike the hook it replaced) and removed from the
+repo per review (dev artifact, not meant to ship).
