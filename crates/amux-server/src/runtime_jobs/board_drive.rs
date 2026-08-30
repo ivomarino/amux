@@ -188,6 +188,83 @@ const SOURCE_REF_STALE_S: i64 = 24 * 3600;
 /// and in what order (the ethos line: amux surfaces the stall, the model drives);
 /// only the reminder frequency scales, never any server-side auto-promotion.
 /// A hard `AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S` override still wins for tuning.
+/// AF-334 follow-up, AF-333-adjacent: the lane-activity map, computed ONCE per
+/// tick instead of once per lane.
+///
+/// The first cut ran the activity query inside `drive_lane`, so it executed
+/// once for each of ~50 lanes. Measured on the live DB: 62ms per lane against
+/// 32,569 `task` rows, whether the lane was active or not, because the
+/// `(entity_type, entity_id)` index selects on entity_type and `at` is not
+/// indexed. That is ~3.1 SECONDS of DB work per tick, held under a read lock,
+/// on a box where `/api/board` p95 is already 4.5s and AF-333's leading
+/// hypothesis for that latency is "a cache or a lock". Adding three seconds of
+/// lock-held scanning while investigating a lock-shaped latency bug is the
+/// kind of thing that gets found later and attributed to something else.
+///
+/// One GROUP BY answers every lane in 68ms, so the cache exists to turn N
+/// queries into one. The TTL only has to outlive a single tick's pass over the
+/// lanes; 15s against a 30-minute window is a staleness of 0.8%, which cannot
+/// flip the `> 0` test that consumes it.
+static LANE_ACTIVITY: std::sync::Mutex<Option<(f64, std::collections::HashMap<String, i64>)>> =
+    std::sync::Mutex::new(None);
+
+const LANE_ACTIVITY_CACHE_TTL_S: f64 = 15.0;
+
+fn lane_card_activity(
+    conn: &rusqlite::Connection,
+    window_min: i64,
+) -> std::collections::HashMap<String, i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if let Ok(g) = LANE_ACTIVITY.lock() {
+        if let Some((at, map)) = g.as_ref() {
+            if now - at < LANE_ACTIVITY_CACHE_TTL_S {
+                return map.clone();
+            }
+        }
+    }
+    let mut map = std::collections::HashMap::new();
+    // datetime() on BOTH sides: `at` is RFC3339 with an explicit +00:00, and
+    // comparing it to a localtime string applies a silent 4-hour skew that
+    // reads every lane as inactive (see the AF-334 note at the call site).
+    let rows = conn
+        .prepare(
+            "SELECT i.session, COUNT(*) FROM _amux_state_events e \
+             JOIN issues i ON i.id = e.entity_id \
+             WHERE e.entity_type='task' AND datetime(e.at) > datetime('now', ?1) \
+             GROUP BY i.session",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![format!("-{window_min} minutes")], |r| {
+                Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    match rows {
+        Ok(v) => {
+            for (sess, n) in v {
+                map.insert(sess, n);
+            }
+            if let Ok(mut g) = LANE_ACTIVITY.lock() {
+                *g = Some((now, map.clone()));
+            }
+        }
+        // A failed probe must not read as "every lane is idle", which would
+        // restore the exact over-nudging this fixes. Return an empty map WITHOUT
+        // caching it, so the next tick retries rather than inheriting a blank.
+        Err(e) => {
+            tracing::warn!(
+                target: "board_drive",
+                "[drain-nudge AF-334] lane-activity probe failed: {e}. Lanes will \
+                 read as inactive this tick, so drain nudges may over-fire."
+            );
+        }
+    }
+    map
+}
+
 /// AF-334: does the drain nudge fire? Pure, and extracted for the reason
 /// AF-342 taught the hard way two hours earlier: a correct decision living as
 /// one line inside an async job is a decision no test can reach, and that is
@@ -4448,15 +4525,9 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     .ok()
                     .and_then(|v| v.trim().parse().ok())
                     .unwrap_or(30);
-                let recent_card_events: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(*) FROM _amux_state_events e \
-                         JOIN issues i ON i.id = e.entity_id \
-                         WHERE e.entity_type='task' AND i.session=?1 \
-                         AND datetime(e.at) > datetime('now', ?2)",
-                        rusqlite::params![lane, format!("-{lane_activity_window_min} minutes")],
-                        |r| r.get(0),
-                    )
+                let recent_card_events: i64 = lane_card_activity(&conn, lane_activity_window_min)
+                    .get(lane)
+                    .copied()
                     .unwrap_or(0);
                 let lane_working = recent_card_events > 0;
                 let idle_drain =
