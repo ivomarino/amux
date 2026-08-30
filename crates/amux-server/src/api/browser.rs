@@ -101,6 +101,25 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Render an error WITH ITS CAUSES, for any body or log line a human reads.
+///
+/// AMUX-3886. `with_cause(&e)` on an `anyhow::Error` prints the OUTERMOST frame
+/// and silently drops the source chain, and every CDP error in this file was
+/// built that way. For the `reqwest` errors underneath `cdp_list` that outer
+/// frame carries no diagnosis at all:
+///
+///   to_string(): error sending request for url (http://127.0.0.1:49731/json/list)
+///   {e:#}:       error sending request for url (http://127.0.0.1:49731/json/list): \
+///                client error (Connect): tcp connect error: Connection refused (os error 61)
+///
+/// The first string is what two 502s from `general-canvas-apps` left on record
+/// on 2026-08-29, and it is IDENTICAL for a refused connect, a DNS failure and
+/// a 3s timeout — three different faults with three different fixes. The cause
+/// that separates them was one format specifier away the whole time.
+fn with_cause(e: &impl std::fmt::Display) -> String {
+    format!("{e:#}")
+}
+
 /// The ATTRIBUTION resolution: explicit `session` (body/query) →
 /// `X-Amux-Session` header → None. No default constant — amux-cloud's
 /// validation of the takeover guard caught the harm: a header-less curl's
@@ -593,7 +612,7 @@ fn driver_err(e: chrome::DriverError) -> Response {
                          browser this server did not launch.",
             }),
         ),
-        chrome::DriverError::Cdp(e) => err(cdp_status(&e), json!({ "error": e.to_string() })),
+        chrome::DriverError::Cdp(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -658,7 +677,7 @@ async fn connect_session(session: &str, create_url: Option<&str>) -> Result<(chr
          did not recover: {first}",
         page.target_id
     );
-    Err(err(StatusCode::BAD_GATEWAY, json!({ "error": first.to_string() })))
+    Err(err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&first) })))
 }
 
 // ---------------------------------------------------------------------------
@@ -877,7 +896,7 @@ async fn start(
                                     .unwrap_or(Value::Null);
                                 v["viewport"] = json!({ "w": w, "h": h, "measured": seen });
                             }
-                            Err(e) => v["viewport_error"] = json!(e.to_string()),
+                            Err(e) => v["viewport_error"] = json!(with_cause(&e)),
                         }
                     }
                     Err(_) => {
@@ -898,7 +917,7 @@ async fn start(
             }
             Json(v).into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -939,7 +958,7 @@ async fn status() -> Response {
     // different fact from "no tabs" (ethos rule 4).
     let (tabs, tabs_error) = match chrome::cdp_list(cdp_port).await {
         Ok(t) => (t, Value::Null),
-        Err(e) => (Value::Null, json!(e.to_string())),
+        Err(e) => (Value::Null, json!(with_cause(&e))),
     };
     // THE REAP COUNTDOWN, VISIBLE (AMUX-3829, second pass). It used to live only
     // in the reaper's process memory, so a reaper about to fire and one that
@@ -950,14 +969,24 @@ async fn status() -> Response {
         crate::config::now_f64(),
     );
     let reap_after = crate::runtime_jobs::browser_reaper::reap_after_s();
+    let ttl = crate::runtime_jobs::browser_reaper::ttl_s();
+    let now_f = crate::config::now_f64();
     // Per-browser rows, so two workers can each see their own.
     let mut browsers: Vec<Value> = Vec::new();
     for (p, o, st, pid, port) in &all {
         let t = chrome::cdp_list(*port).await.ok();
+        let age_s = now_f - *st as f64;
+        let ttl_remaining_s = if ttl > 0 {
+            let r = ttl as f64 - age_s;
+            if r > 0.0 { Some(r.round()) } else { Some(0.0) }
+        } else {
+            None
+        };
         browsers.push(json!({
             "profile": p,
             "started_by": o,
             "started_at": st,
+            "age_s": age_s.round(),
             "pid": pid,
             "cdp_port": port,
             "tabs": t.clone().unwrap_or(Value::Null),
@@ -967,6 +996,10 @@ async fn status() -> Response {
             // needs: null here means nothing is counting down.
             "idle_s": idle.get(p).map(|v| v.round()),
             "reap_after_s": if reap_after == 0 { Value::Null } else { json!(reap_after) },
+            // TTL countdown: how many seconds until the hard TTL fires.
+            // Null when AMUX_BROWSER_TTL_S=0 (TTL arm disabled).
+            "ttl_remaining_s": ttl_remaining_s,
+            "ttl_s": if ttl == 0 { Value::Null } else { json!(ttl) },
         }));
     }
     Json(json!({
@@ -1040,7 +1073,7 @@ async fn profiles(Query(q): Query<ProfilesQuery>) -> Response {
     let list =
         match tokio::task::spawn_blocking(move || chrome::list_profiles(&home, with_sizes)).await {
             Ok(l) => l,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) })),
         };
     let chrome_profiles = chrome::list_chrome_profiles();
     Json(json!({ "profiles": list, "backends": ["native"], "chrome_profiles": chrome_profiles })).into_response()
@@ -1075,7 +1108,7 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
     // it here from now on because the dir exists.
     let dir = home.join("playwright-auth").join("profiles").join(&name);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }));
+        return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) }));
     }
     // A sign-in URL means "open a headed window on the new profile so a
     // human can log in" — same intent as the Python create flow.
@@ -1099,7 +1132,7 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
             .await
         {
             Ok(_) => launched = true,
-            Err(e) => launch_error = json!(e.to_string()),
+            Err(e) => launch_error = json!(with_cause(&e)),
         }
         launch_ms = launch_started.elapsed().as_millis();
     }
@@ -1183,7 +1216,7 @@ async fn navigate(headers: HeaderMap, body: Option<Json<NavigateBody>>) -> Respo
             }
             Json(v).into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -1208,7 +1241,7 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
             // so a log sweep / /api/logs catches "browser session X can't render"
             // without a human noticing the empty viewport first.
             tracing::warn!("[browser] navigate failed for session {session:?} → {u}: {e}");
-            return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }));
+            return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }));
         }
     }
     match chrome::screenshot_to_file(&mut cdp, &chrome::amux_home(), &session).await {
@@ -1248,7 +1281,7 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
             // 2026-08-13) — the tab wedged and the viewport went blank. WARN so
             // the failure is visible in the logs, not only as an empty view.
             tracing::warn!("[browser] screenshot capture failed for session {session:?}: {e}");
-            err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }))
+            err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }))
         }
     }
 }
@@ -1294,7 +1327,7 @@ async fn state_payload(cdp: &mut chrome::CdpClient, session: &str) -> Result<Val
     let mut v = cdp
         .eval(&chrome::state_js(), 20)
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })))?;
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })))?;
     let text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
     if let Some(o) = v.as_object_mut() {
         o.insert("text".into(), json!(chrome::obs_cap(&text, chrome::obs_state_cap())));
@@ -1477,7 +1510,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match out {
                 Ok(v) if v.get("error").is_some() => err(StatusCode::BAD_REQUEST, v),
                 Ok(v) => Json(v).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "type" => {
@@ -1485,7 +1518,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match cdp.call("Input.insertText", json!({ "text": text }), ten).await {
                 Ok(_) => Json(json!({ "ok": true, "typed": text.chars().count(), "backend": "native" }))
                     .into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "input" => {
@@ -1500,7 +1533,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             );
             let raw = match cdp.eval(&js, 20).await {
                 Ok(r) => r,
-                Err(e) => return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             };
             if raw.as_str() != Some("FOCUSED") {
                 let v = chrome::click_outcome(
@@ -1513,21 +1546,21 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match cdp.call("Input.insertText", json!({ "text": text }), ten).await {
                 Ok(_) => Json(json!({ "ok": true, "index": idx, "typed": text.chars().count() }))
                     .into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "key" => {
             let k = get_str("key").unwrap_or_default();
             match chrome::dispatch_key(&mut cdp, &k).await {
                 Ok(()) => Json(json!({ "ok": true, "key": k })).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "scroll" => {
             let dy = body.get("dy").and_then(Value::as_i64).unwrap_or(500);
             match cdp.eval(&format!("window.scrollBy(0,{dy})"), 10).await {
                 Ok(_) => Json(json!({ "ok": true, "dy": dy })).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "eval" => {
@@ -1573,7 +1606,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                 // with the description — Python's eval contract.
                 Err(e) => err(
                     StatusCode::BAD_REQUEST,
-                    json!({ "error": e.to_string(), "backend": "native" }),
+                    json!({ "error": with_cause(&e), "backend": "native" }),
                 ),
             }
         }
@@ -1600,12 +1633,12 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match chrome::set_input_files(&mut cdp, &selector, &files).await {
                 Ok(v) if v.get("error").is_some() => err(StatusCode::BAD_REQUEST, v),
                 Ok(v) => Json(v).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "back" => match cdp.eval("history.back()", 10).await {
             Ok(_) => Json(json!({ "ok": true })).into_response(),
-            Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+            Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
         },
         "extract" => match state_payload(&mut cdp, &session).await {
             Ok(v) => Json(v).into_response(),
@@ -1649,7 +1682,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }))
+                        return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }))
                     }
                 }
                 if std::time::Instant::now() >= deadline {
@@ -1687,7 +1720,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                     Json(json!({ "ok": true, "viewport": { "w": w, "h": h }, "measured": seen }))
                         .into_response()
                 }
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         _ => unreachable!("validated above"),
@@ -1745,7 +1778,7 @@ async fn inspect_payload(cdp: &mut chrome::CdpClient, clear: bool, limit: usize)
     let _ = cdp.eval(chrome::CAPTURE_JS, 15).await;
     cdp.eval(&chrome::inspect_js(limit, clear), 15)
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })))
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })))
 }
 
 async fn inspect_clear(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
@@ -1779,7 +1812,7 @@ async fn search(Query(sq): Query<SearchQuery>) -> Response {
         Err(r) => return r,
     };
     if let Err(e) = chrome::navigate_and_settle(&mut cdp, &url).await {
-        return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }));
+        return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }));
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     let scrape = r#"
@@ -1792,7 +1825,7 @@ async fn search(Query(sq): Query<SearchQuery>) -> Response {
     match cdp.eval(scrape, 30).await {
         Ok(v) if v.is_array() => Json(json!({ "results": v })).into_response(),
         Ok(v) => Json(json!({ "results": [], "raw": v, "note": "scrape matched nothing — google may be showing a consent/challenge page" })).into_response(),
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -1886,7 +1919,7 @@ async fn save_profile(headers: HeaderMap, body: Option<Json<SaveProfileBody>>) -
             "label": entry.get("label").cloned().unwrap_or_else(|| json!("")),
         }))
         .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) })),
     }
 }
 

@@ -31,7 +31,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 /// How long a profile must be CONTINUOUSLY empty before it is released.
-/// `0` disables the job entirely.
+/// `0` disables this arm entirely.
 ///
 /// One hour by default. The window is generous against the thing actually at
 /// risk, which is only a relaunch: with no pages open there is no in-memory
@@ -42,6 +42,27 @@ pub fn reap_after_s() -> u64 {
         .ok()
         .and_then(|v| v.trim().parse::<u64>().ok())
         .unwrap_or(3600)
+}
+
+/// Hard TTL: kill any browser older than this, even if it has pages open.
+/// `0` disables this arm entirely. Default 4 hours.
+///
+/// WHY THIS EXISTS (2026-08-30). The idle reaper only fires when there are NO
+/// real pages. Sessions that opened a page and never closed it — or that were
+/// abandoned mid-task — accumulated indefinitely: 20+ Chrome instances on the
+/// Mac dock, each holding memory, GPU buffers, and a CDP socket. The idle arm
+/// cannot reach them. A hard ceiling can.
+///
+/// WHAT IT WILL LOSE. An open page is lost. The profile's saved login is NOT
+/// lost (it is on disk). This is the same trade the idle reaper makes, with the
+/// explicit acknowledgement that a page may be present. Sessions that need a
+/// browser for longer than the TTL should increase it via the env var or stop
+/// and restart the browser themselves to reset the clock.
+pub fn ttl_s() -> u64 {
+    std::env::var("AMUX_BROWSER_TTL_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(4 * 3600)
 }
 
 fn tick_secs() -> u64 {
@@ -107,7 +128,7 @@ pub fn has_real_page(targets: &[serde_json::Value]) -> bool {
     })
 }
 
-/// Should this profile be released now?
+/// Should this profile be released now (idle arm)?
 ///
 /// Pure, so the whole decision has cells rather than only its plumbing. `None`
 /// for `first_empty` means "not empty at this check", which must reset rather
@@ -117,6 +138,17 @@ pub fn should_reap(first_empty: Option<f64>, now: f64, after_s: u64) -> bool {
         return false;
     }
     first_empty.is_some_and(|t| now - t >= after_s as f64)
+}
+
+/// Should this profile be released now (TTL arm)?
+///
+/// `started_at` is the Unix timestamp the browser was launched. Pure function
+/// so the boundary is testable without a live Chrome.
+pub fn should_reap_ttl(started_at: i64, now: f64, ttl: u64) -> bool {
+    if ttl == 0 {
+        return false;
+    }
+    now - started_at as f64 >= ttl as f64
 }
 
 fn now_f64() -> f64 {
@@ -141,7 +173,24 @@ async fn tick(home: &std::path::Path) -> Vec<String> {
     let boot = crate::runtime_jobs::heartbeat::boot_at();
     let prior = read_idle(home);
     let mut next: HashMap<String, f64> = HashMap::new();
-    for (profile, owner, _started, _pid, port) in crate::integrations::browser::running_all() {
+    let ttl = ttl_s();
+    for (profile, owner, started, _pid, port) in crate::integrations::browser::running_all() {
+        // TTL ARM: hard ceiling regardless of page state. Checked first so a
+        // browser that hit the TTL is not also logged as "idle" — one reason,
+        // one log line (2026-08-30: 20+ Chrome instances in the dock, none
+        // caught by the idle arm because they all had at least one open page).
+        if should_reap_ttl(started, now, ttl) {
+            let age_s = now - started as f64;
+            tracing::warn!(
+                profile = %profile, owner = %owner, age_s = age_s as i64, ttl,
+                "browser: TTL exceeded — releasing profile (AMUX_BROWSER_TTL_S). \
+                 Any open page is lost; saved login is on disk and survives."
+            );
+            crate::integrations::browser::stop_profile_as(home, &profile, "ttl-reaper").await;
+            next.remove(&profile);
+            reaped.push(profile);
+            continue;
+        }
         // CDP SILENCE IS NOT EMPTINESS. A browser that will not answer is left
         // alone: killing it would turn a transient wedge into a destroyed
         // session, and this job's whole safety argument rests on knowing there
@@ -237,6 +286,22 @@ mod tests {
         // CONTROL: one real page among blanks keeps it alive. A predicate that
         // ignored the real one would reap a browser someone is using.
         assert!(has_real_page(&[page("about:blank"), page("https://x.com/")]));
+    }
+
+    /// TTL arm fires on age, not emptiness — even a browser with open pages is
+    /// released once it passes the ceiling (2026-08-30: 20+ Chrome instances).
+    #[test]
+    fn ttl_reaps_old_browsers_regardless_of_pages() {
+        let four_h = 4 * 3600u64;
+        let now = 10_000.0f64;
+        // Started just over 4 hours ago -> release.
+        assert!(should_reap_ttl(now as i64 - four_h as i64 - 1, now, four_h));
+        // Started exactly at the boundary -> release (>= not >).
+        assert!(should_reap_ttl(now as i64 - four_h as i64, now, four_h));
+        // Started 1 second short of the TTL -> keep.
+        assert!(!should_reap_ttl(now as i64 - four_h as i64 + 1, now, four_h));
+        // TTL disabled (0) -> never reap, regardless of age.
+        assert!(!should_reap_ttl(0, now, 0));
     }
 
     /// AMUX-3829, second pass. The window must SURVIVE a restart, because the
