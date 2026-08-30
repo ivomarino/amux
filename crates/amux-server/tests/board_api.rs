@@ -206,8 +206,18 @@ async fn list_is_slim_by_default_and_serves_prose_only_on_request() {
     let item = &list.as_array().unwrap()[0];
     assert!(item.get("desc").is_none(), "default list must not carry desc");
     assert!(item.get("log").is_none(), "default list must not carry log");
-    assert!(item["desc_len"].as_u64().is_some());
-    assert!(item["log_n"].as_u64().is_some());
+    // `> 0`, not `is_some()` (AF-346). A blanked loader returns 0 for both, and
+    // `is_some()` is true of 0 — so the pair read as passing while every card on
+    // the board carried desc_len 0. The desc_head assertion below is what actually
+    // caught the 2026-08-30 regression; these two were present and could not have.
+    assert!(
+        item["desc_len"].as_u64().unwrap_or(0) > 0,
+        "a card created with a 300-char desc must report a non-zero desc_len"
+    );
+    assert!(
+        item["log_n"].as_u64().unwrap_or(0) > 0,
+        "the PATCH above appends a log line, so log_n must be non-zero"
+    );
     assert!(item["desc_head"].as_str().unwrap().starts_with("first line"));
     assert!(item.get("folded_n").is_some());
 

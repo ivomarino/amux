@@ -22,6 +22,15 @@ scripts/test-contended.sh -p amux-server
 
 Pass: clippy exits 0, and `test result: ok` with a non-zero pass count.
 
+**`--lib` IS A PARTIAL RUN THAT READS LIKE A FULL ONE.** `cargo test -p amux-server
+--lib` skips every `tests/*.rs` integration target — 1,625 tests pass and the
+number looks total. The wrapper runs all of them (1,831 on the same tree). On
+2026-08-30 a board change shipped a fleet-wide blank-preview regression on a
+`--lib` green; the guard that catches it, `list_is_slim_by_default_and_serves_
+prose_only_on_request`, lives in `tests/board_api.rs` and was never executed.
+Running it at that commit fails in 0.16s. The coverage existed; the command did
+not reach it.
+
 Use the wrapper, not bare `cargo test`. This box builds amux continuously, so
 the auto-builder can rewrite the shared binary while your tests spawn it and the
 ETXTBSY family surfaces as failures in modules you never touched. The wrapper
