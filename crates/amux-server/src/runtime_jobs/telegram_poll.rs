@@ -233,6 +233,24 @@ async fn handle_update(state: &AppState, update: &Value) {
         (mapping.session.clone(), text.to_string())
     };
 
+    // Stamp which session THIS message actually went to — default or @lane —
+    // BEFORE sending, so the relay job (which polls every 30s, independently
+    // of this handler) is never caught watching the previous message's pane.
+    // Without this, a reply typed by a lane reached only via @-mention sits
+    // in that lane's pane forever: the relay only ever watched the /link'd
+    // default (found 2026-08-30, `@frontstage status` producing no Telegram
+    // reply despite frontstage actually running the command).
+    {
+        let target_session = target_session.clone();
+        let _ = state
+            .store
+            .write_async(move |conn| {
+                tg_db::set_routed_session(conn, chat_id, &target_session)?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await;
+    }
+
     let stamped = format!("[from Telegram @{who}]: {message_text}");
     let (ok, msg) =
         session_verbs::send_text(state, &target_session, &stamped, true, session_verbs::SendOrigin::Automation)

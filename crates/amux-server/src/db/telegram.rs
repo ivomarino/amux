@@ -18,6 +18,24 @@ pub struct TelegramMapping {
     pub telegram_username: Option<String>,
     pub linked_at: String,
     pub last_message_at: Option<String>,
+    /// Where the MOST RECENT inbound message actually landed — the `/link`'d
+    /// `session` by default, or an `@lane` target when the last message used
+    /// one (migration 0040). NULL means "same as `session`"; callers that
+    /// need "which pane is this chat's reply going to appear in" must read
+    /// `routed_session()`, never `session` directly — see that method's doc.
+    pub last_routed_session: Option<String>,
+}
+
+impl TelegramMapping {
+    /// The session whose pane the auto-relay job should be watching for this
+    /// chat right now: the last `@lane` target if one is set, else the
+    /// `/link`'d default. Reading `session` directly here is the exact bug
+    /// fixed in migration 0040 — a reply typed by a lane reached only via
+    /// `@mention` sits in that lane's pane forever, unseen, if the relay
+    /// keeps watching the static `/link` target instead.
+    pub fn routed_session(&self) -> &str {
+        self.last_routed_session.as_deref().unwrap_or(&self.session)
+    }
 }
 
 fn row_to_mapping(r: &rusqlite::Row<'_>) -> rusqlite::Result<TelegramMapping> {
@@ -27,10 +45,12 @@ fn row_to_mapping(r: &rusqlite::Row<'_>) -> rusqlite::Result<TelegramMapping> {
         telegram_username: r.get(2)?,
         linked_at: r.get(3)?,
         last_message_at: r.get(4)?,
+        last_routed_session: r.get(5)?,
     })
 }
 
-const COLS: &str = "chat_id, session, telegram_username, linked_at, last_message_at";
+const COLS: &str =
+    "chat_id, session, telegram_username, linked_at, last_message_at, last_routed_session";
 
 pub fn list(conn: &Connection) -> rusqlite::Result<Vec<TelegramMapping>> {
     let mut stmt =
@@ -77,6 +97,33 @@ pub fn upsert(
            telegram_username = COALESCE(excluded.telegram_username, telegram_mappings.telegram_username),
            linked_at = datetime('now')",
         params![chat_id, session, telegram_username],
+    )?;
+    Ok(())
+}
+
+/// Stamp which session THIS inbound message actually routed into (migration
+/// 0040) — the default `session` or an `@lane` target. Always called, even
+/// when the target equals the default, so `routed_session()` never has to
+/// guess between "never set" and "explicitly the default".
+///
+/// When the target session CHANGES from what was routed last, `last_relayed_line`
+/// resets to 0: it is a line-number checkpoint into a specific pane's tmux
+/// capture, and a different session's pane has an unrelated line count. Carrying
+/// the old number over would make the relay either resend old output (number
+/// too low for the new pane) or skip real new output (number too high) —
+/// wrong in the direction that depends on which pane happens to be longer, so
+/// letting it ride is worse than a clean reset that watches the new pane from
+/// its own start.
+pub fn set_routed_session(conn: &Connection, chat_id: i64, session: &str) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE telegram_mappings
+         SET last_relayed_line = CASE
+               WHEN COALESCE(last_routed_session, session) != ?1 THEN 0
+               ELSE last_relayed_line
+             END,
+             last_routed_session = ?1
+         WHERE chat_id = ?2",
+        params![session, chat_id],
     )?;
     Ok(())
 }

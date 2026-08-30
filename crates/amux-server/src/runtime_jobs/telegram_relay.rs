@@ -42,8 +42,8 @@ async fn relay_cycle(state: &AppState) -> Result<(), String> {
         if let Err(e) = check_and_relay(state, mapping).await {
             // Log but continue — don't let one session's error block others
             tracing::debug!(
-                "telegram_relay: chat {} (session '{}'): {}",
-                mapping.chat_id, mapping.session, e
+                "telegram_relay: chat {} (watching '{}'): {}",
+                mapping.chat_id, mapping.routed_session(), e
             );
         }
     }
@@ -52,8 +52,15 @@ async fn relay_cycle(state: &AppState) -> Result<(), String> {
 }
 
 async fn check_and_relay(state: &AppState, mapping: &tg_db::TelegramMapping) -> Result<(), String> {
+    // Watch wherever the chat's LAST inbound message actually routed to — the
+    // `/link`'d default, or an `@lane` target (migration 0040). Reading
+    // `mapping.session` directly here is the exact bug found 2026-08-30:
+    // `@frontstage status` runs frontstage correctly, but a relay pinned to
+    // the static default never looks at frontstage's pane, so the reply is
+    // never seen and Telegram gets no feedback at all.
+    let watch_session = mapping.routed_session();
     // Capture the session's current terminal output (last 300 lines)
-    let output = tmux_capture(&mapping.session, 300).await;
+    let output = tmux_capture(watch_session, 300).await;
     let lines: Vec<String> = output.lines().map(|s| s.to_string()).collect();
 
     // Find the LAST `[from Telegram @...]` line
@@ -107,7 +114,7 @@ async fn check_and_relay(state: &AppState, mapping: &tg_db::TelegramMapping) -> 
             tracing::info!(
                 "telegram_relay: relayed {} bytes from '{}' to chat {}",
                 html.len(),
-                mapping.session,
+                watch_session,
                 mapping.chat_id
             );
             Ok(())
@@ -212,6 +219,12 @@ fn markdown_to_html(md: &str) -> String {
                     chars.next();
                     result.push_str("<b>");
                     let mut found_close = false;
+                    // clippy's `for c in chars.by_ref()` suggestion does NOT
+                    // compile here: the for-loop holds a mutable borrow of
+                    // `chars` for the whole body, which conflicts with the
+                    // `chars.peek()` call below (E0499). `peek()` inside the
+                    // loop is what makes `while let` the only form that works.
+                    #[allow(clippy::while_let_on_iterator)]
                     while let Some(c) = chars.next() {
                         if c == '*' && chars.peek() == Some(&'*') {
                             chars.next();
@@ -229,7 +242,7 @@ fn markdown_to_html(md: &str) -> String {
                     // *italic*
                     result.push_str("<i>");
                     let mut found_close = false;
-                    while let Some(c) = chars.next() {
+                    for c in chars.by_ref() {
                         if c == '*' {
                             result.push_str("</i>");
                             found_close = true;
