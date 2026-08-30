@@ -191,95 +191,189 @@ fn bot_token() -> Result<String, String> {
         .ok_or_else(|| "TELEGRAM_BOT_TOKEN not set".to_string())
 }
 
-/// Simple markdown → Telegram HTML converter (subset: bold, italic, code).
-/// Same logic as the relay hook's converter for consistency.
+/// Markdown → Telegram HTML converter, subset matching what
+/// `send_message`'s doc comment says Telegram itself accepts: bold, italic,
+/// strikethrough, inline code, fenced code blocks (`<pre>`), links, and
+/// blockquotes. No native headings/lists/tables — those pass through as
+/// literal text, which is what Claude's own replies degrade to when a
+/// terminal can't render markdown either, so it's not a regression.
+///
+/// Fenced ```blocks``` are found on a LINE basis first (Telegram's own
+/// entity model is line-oriented for `<pre>`/`<blockquote>`), then each
+/// non-fenced, non-quote line runs through [`convert_inline`] for
+/// `**bold**`/`*italic*`/`~~strike~~`/`` `code` ``/`[text](url)`. This two-pass
+/// split is why triple backticks used to corrupt: the old single-pass
+/// char-walker toggled `<code>` three times per fence line (open/close/open),
+/// leaving an empty `<code></code>` pair and the language tag bleeding into
+/// the visible block instead of one clean `<pre>`.
 fn markdown_to_html(md: &str) -> String {
     let mut result = String::with_capacity(md.len() * 2);
-    let mut in_code = false;
+    let mut in_fence = false;
+    let mut quote_buf: Vec<String> = Vec::new();
 
-    let mut chars = md.chars().peekable();
-    while let Some(ch) = chars.next() {
-        // Handle code blocks (backticks) with entity encoding inside
-        if ch == '`' {
-            if in_code {
-                result.push_str("</code>");
-                in_code = false;
+    let flush_quote = |buf: &mut Vec<String>, out: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        out.push_str("<blockquote>");
+        out.push_str(&buf.join("\n"));
+        out.push_str("</blockquote>\n");
+        buf.clear();
+    };
+
+    for line in md.split('\n') {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            flush_quote(&mut quote_buf, &mut result);
+            if in_fence {
+                result.push_str("</pre>\n");
             } else {
-                result.push_str("<code>");
-                in_code = true;
+                result.push_str("<pre>");
             }
+            in_fence = !in_fence;
             continue;
         }
-
-        if in_code {
-            // Inside code: escape HTML entities
-            match ch {
-                '&' => result.push_str("&amp;"),
-                '<' => result.push_str("&lt;"),
-                '>' => result.push_str("&gt;"),
-                _ => result.push(ch),
-            }
+        if in_fence {
+            // Inside a fence: raw text, only HTML-escaped, no inline markdown.
+            result.push_str(&escape_html(line));
+            result.push('\n');
             continue;
         }
-
-        // Outside code blocks: handle markdown formatting
-        match ch {
-            '*' => {
-                if chars.peek() == Some(&'*') {
-                    // **bold**
-                    chars.next();
-                    result.push_str("<b>");
-                    let mut found_close = false;
-                    // clippy's `for c in chars.by_ref()` suggestion does NOT
-                    // compile here: the for-loop holds a mutable borrow of
-                    // `chars` for the whole body, which conflicts with the
-                    // `chars.peek()` call below (E0499). `peek()` inside the
-                    // loop is what makes `while let` the only form that works.
-                    #[allow(clippy::while_let_on_iterator)]
-                    while let Some(c) = chars.next() {
-                        if c == '*' && chars.peek() == Some(&'*') {
-                            chars.next();
-                            result.push_str("</b>");
-                            found_close = true;
-                            break;
-                        } else {
-                            result.push(c);
-                        }
-                    }
-                    if !found_close {
-                        result.push_str("</b>");
-                    }
-                } else {
-                    // *italic*
-                    result.push_str("<i>");
-                    let mut found_close = false;
-                    for c in chars.by_ref() {
-                        if c == '*' {
-                            result.push_str("</i>");
-                            found_close = true;
-                            break;
-                        } else {
-                            result.push(c);
-                        }
-                    }
-                    if !found_close {
-                        result.push_str("</i>");
-                    }
-                }
-            }
-            '&' => result.push_str("&amp;"),
-            '<' => result.push_str("&lt;"),
-            '>' => result.push_str("&gt;"),
-            _ => result.push(ch),
+        if let Some(quoted) = line.strip_prefix("> ").or_else(|| line.strip_prefix(">")) {
+            quote_buf.push(convert_inline(quoted));
+            continue;
         }
+        flush_quote(&mut quote_buf, &mut result);
+        result.push_str(&convert_inline(line));
+        result.push('\n');
     }
-
-    // Ensure no unclosed code tags
-    if in_code {
-        result.push_str("</code>");
+    flush_quote(&mut quote_buf, &mut result);
+    if in_fence {
+        // Unclosed fence in the source: close it rather than leave a
+        // dangling `<pre>` that makes Telegram reject the whole message.
+        result.push_str("</pre>\n");
+    }
+    // The line-based loop adds a trailing '\n' that split('\n') didn't have
+    // when `md` itself had none — match the input's own trailing newline
+    // convention rather than always appending one.
+    if !md.ends_with('\n') && result.ends_with('\n') {
+        result.pop();
     }
 
     result
+}
+
+fn escape_html(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
+/// Inline formatting for one non-fenced, non-quote line.
+fn convert_inline(md: &str) -> String {
+    let mut result = String::with_capacity(md.len() * 2);
+    let mut chars = md.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '`' => {
+                // Inline `code`: escape entities inside, same as a fence.
+                // Unterminated still closes honestly (best-effort, matches
+                // the original converter's behavior) rather than leaving a
+                // dangling `<code>` that would make Telegram reject the
+                // whole message.
+                result.push_str("<code>");
+                for c in chars.by_ref() {
+                    if c == '`' {
+                        break;
+                    }
+                    result.push_str(&escape_html(&c.to_string()));
+                }
+                result.push_str("</code>");
+            }
+            '*' if chars.peek() == Some(&'*') => {
+                // **bold**
+                chars.next();
+                result.push_str("<b>");
+                #[allow(clippy::while_let_on_iterator)]
+                while let Some(c) = chars.next() {
+                    if c == '*' && chars.peek() == Some(&'*') {
+                        chars.next();
+                        break;
+                    }
+                    result.push_str(&escape_html(&c.to_string()));
+                }
+                result.push_str("</b>");
+            }
+            '*' => {
+                // *italic*
+                result.push_str("<i>");
+                for c in chars.by_ref() {
+                    if c == '*' {
+                        break;
+                    }
+                    result.push_str(&escape_html(&c.to_string()));
+                }
+                result.push_str("</i>");
+            }
+            '~' if chars.peek() == Some(&'~') => {
+                // ~~strikethrough~~
+                chars.next();
+                result.push_str("<s>");
+                #[allow(clippy::while_let_on_iterator)]
+                while let Some(c) = chars.next() {
+                    if c == '~' && chars.peek() == Some(&'~') {
+                        chars.next();
+                        break;
+                    }
+                    result.push_str(&escape_html(&c.to_string()));
+                }
+                result.push_str("</s>");
+            }
+            '[' => {
+                // [text](url) — only consumed as a link when the full
+                // pattern is present; otherwise the '[' is literal (Claude's
+                // replies use bare brackets often enough, e.g. "[done]",
+                // that guessing wrong here would be the more common bug).
+                let rest: String = chars.clone().collect();
+                if let Some((label, url, consumed)) = try_parse_link(&rest) {
+                    result.push_str("<a href=\"");
+                    result.push_str(&escape_html(&url).replace('"', "&quot;"));
+                    result.push_str("\">");
+                    result.push_str(&escape_html(&label));
+                    result.push_str("</a>");
+                    for _ in 0..consumed {
+                        chars.next();
+                    }
+                } else {
+                    result.push('[');
+                }
+            }
+            _ => result.push_str(&escape_html(&ch.to_string())),
+        }
+    }
+    result
+}
+
+/// Parses a `text](url)` tail (the `[` itself already consumed by the
+/// caller) into `(label, url, chars_consumed)`. Returns `None` if `rest`
+/// isn't actually a well-formed link — no nested `[`/`]`, matching a real
+/// markdown link but not e.g. `[note]` followed unrelatedly by `(parens)`
+/// later in the line.
+fn try_parse_link(rest: &str) -> Option<(String, String, usize)> {
+    let close_bracket = rest.find(']')?;
+    let label = &rest[..close_bracket];
+    if label.contains('[') {
+        return None;
+    }
+    let after = &rest[close_bracket + 1..];
+    let open_paren = after.strip_prefix('(')?;
+    let close_paren = open_paren.find(')')?;
+    let url = &open_paren[..close_paren];
+    if url.contains('(') || url.contains(')') {
+        return None;
+    }
+    // consumed = everything up to and including the ')', counted in chars
+    // of `rest` (the caller already consumed the leading '[').
+    let consumed = rest[..close_bracket + 1 + 1 + close_paren + 1].chars().count();
+    Some((label.to_string(), url.to_string(), consumed))
 }
 
 fn strip_html(html: &str) -> String {
@@ -309,7 +403,71 @@ pub fn spawn(state: AppState) -> tokio::task::JoinHandle<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_reply;
+    use super::{extract_reply, markdown_to_html};
+
+    /// The bug this module used to have: a single-pass char walker toggled
+    /// `<code>` on every backtick, so a fenced block's opening ``` produced
+    /// an empty `<code></code>` pair and the language tag ("rust") bled into
+    /// the visible text instead of becoming one clean `<pre>` block.
+    #[test]
+    fn fenced_code_block_becomes_one_pre_not_three_toggled_code_tags() {
+        let md = "before\n```rust\nfn main() {}\n```\nafter";
+        let html = markdown_to_html(md);
+        assert_eq!(html, "before\n<pre>fn main() {}\n</pre>\nafter");
+    }
+
+    #[test]
+    fn fenced_block_html_escapes_but_does_not_apply_inline_markdown() {
+        let md = "```\n*not italic* & <tag>\n```";
+        let html = markdown_to_html(md);
+        assert_eq!(html, "<pre>*not italic* &amp; &lt;tag&gt;\n</pre>");
+    }
+
+    #[test]
+    fn unclosed_fence_still_closes_the_pre_tag() {
+        let html = markdown_to_html("```\nno closing fence");
+        assert!(html.ends_with("</pre>\n") || html.ends_with("</pre>"), "{html:?}");
+        assert!(html.contains("no closing fence"), "{html:?}");
+    }
+
+    #[test]
+    fn bold_italic_and_inline_code_still_work() {
+        assert_eq!(markdown_to_html("**bold** and *italic* and `code`"), "<b>bold</b> and <i>italic</i> and <code>code</code>");
+    }
+
+    #[test]
+    fn strikethrough_converts_to_s_tag() {
+        assert_eq!(markdown_to_html("~~gone~~"), "<s>gone</s>");
+    }
+
+    #[test]
+    fn markdown_link_becomes_anchor() {
+        assert_eq!(
+            markdown_to_html("see [the PR](https://github.com/mixpeek/amux/pull/170) for details"),
+            "see <a href=\"https://github.com/mixpeek/amux/pull/170\">the PR</a> for details"
+        );
+    }
+
+    #[test]
+    fn bare_bracket_without_a_link_is_left_alone() {
+        // Claude's own replies say things like "[done]" or "status: [ok]"
+        // often enough that guessing these are broken links would be the
+        // more common failure.
+        assert_eq!(markdown_to_html("task [done]"), "task [done]");
+    }
+
+    #[test]
+    fn blockquote_lines_group_into_one_blockquote() {
+        assert_eq!(
+            markdown_to_html("> first\n> second\nafter"),
+            "<blockquote>first\nsecond</blockquote>\nafter"
+        );
+    }
+
+    #[test]
+    fn ampersand_and_angle_brackets_outside_any_span_are_escaped() {
+        assert_eq!(markdown_to_html("a < b && b > c"), "a &lt; b &amp;&amp; b &gt; c");
+    }
 
     /// Reproduces the incident's own artifact (ethos rule 7: test against
     /// what actually happened, not a convenient shape) — a capture built from
