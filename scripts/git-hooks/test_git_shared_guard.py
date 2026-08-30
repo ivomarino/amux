@@ -56,6 +56,24 @@ def main():
     # executable heredoc bodies must STILL be scanned
     A("bash heredoc real reset", "bash <<'EOF'\ngit reset --hard HEAD~1\nEOF", True),
     A("sh heredoc real clean", "sh <<EOF\ngit clean -fd\nEOF", True),
+    # AF-316 — the SHARED INDEX, staged half. `git commit -a` was already
+    # blocked; these reach the same hazard one step earlier.
+    A("add -A bare", "git add -A", True)
+    A("add . bare", "git add .", True)
+    A("add --all bare", "git add --all", True)
+    # `git add -- .` is the same command as `git add .` and is the obvious next
+    # thing to type after being refused once — it must not read as "scoped".
+    A("add -- . bypass", "git add -- .", True)
+    # BOUNDED forms must PASS, or the rule stops being a scoping rule and
+    # becomes a ban. Each of these is someone doing the right thing.
+    A("add -A bounded by pathspec", "git add -A -- crates/amux-server/src/lib.rs", False)
+    A("add named path", "git add crates/amux-server/src/lib.rs", False)
+    A("add relative named path", "git add ./crates/amux-server/src/lib.rs", False)
+    A("add interactive", "git add -p", False)
+    A("add -u scoped to a dir", "git add -u crates/", False)
+    # Mention, not invocation — the same class the heredoc pins above cover.
+    A("add -A mentioned in a commit message", 'git commit -m "never git add -A here" -- f.txt', False)
+
     # quoted mentions (existing behavior, regression pins)
     A("quoted commit-msg mention", 'git commit -m "never git reset --hard again" -- f.txt', False)
     A("echo quoted amend mention", 'echo "recipe: git commit --amend needs a pin"', False)

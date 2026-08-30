@@ -70,6 +70,37 @@ DANGER = [
     (r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
      'git commit -a/--all — commits EVERY modified tracked file in this SHARED tree, '
      'sweeping up other sessions\' edits; commit only your paths: `git commit -m "msg" -- <your files>`'),
+    # THE SHARED INDEX, staged half (AF-316). `git commit -a` is blocked above;
+    # `git add -A` / `git add .` reach the SAME hazard one step earlier and were
+    # not covered. They stage every modified file in the one shared tree, so a
+    # peer's in-flight edit becomes YOURS to commit — and it poisons the index
+    # for everyone else too, because the next lane's plain `git commit` takes
+    # whatever is staged.
+    #
+    # Largest open frustration class: 9 open `attribution` entries plus
+    # `shared-checkout`, all one structural fact. Live instances: a peer's
+    # `git add` sweeping an uncommitted migration into someone else's commit
+    # (AMUX-2647); a commit shipping another lane's staged work under its own
+    # message (DESKT-22); a graft from a stale index silently reverting two
+    # landed changes (backend 2026-08-29, MC-1441).
+    #
+    # TWO RULES, because one regex could not keep `-A -- <path>` legal.
+    # `git add -A -- src/foo.rs` is SCOPED and must pass: the flag is bounded by
+    # the pathspec. Only the unbounded forms are the hazard.
+    (r'\bgit\s+(?:-C\s+\S+\s+)?add\b(?![^;&|\n]*\s--\s+\S)[^\n;&|]*?'
+     r'(?:\s-A\b|\s--all\b|\s--no-ignore-removal\b)',
+     'git add -A/--all — stages EVERY modified file in this SHARED checkout, '
+     'including other sessions\' in-flight edits, and leaves them staged for the '
+     'next lane\'s commit too. Name your own paths: `git add <your files>`, or '
+     'bound the flag: `git add -A -- <your dir>` (AF-316; `git add -p` passes)'),
+    # A bare `.` pathspec, with or without `--`. `git add -- .` is the same
+    # command as `git add .` and would otherwise read as "scoped" to the rule
+    # above — the obvious next thing to type after being refused once.
+    # `git add ./src/foo.rs` is a real path and is NOT matched.
+    (r'\bgit\s+(?:-C\s+\S+\s+)?add\b[^\n;&|]*?\s(?:--\s+)?\.(?=[\s;&|]|$)',
+     'git add . — stages EVERY modified file under this directory in a SHARED '
+     'checkout, including other sessions\' in-flight edits. Name your own paths: '
+     '`git add <your files>` (AF-316)'),
     # HISTORY TRUNCATION (AMUX-3893, tuple supplied and pre-tested by mixpeek-cicd).
     #
     # 2026-08-29 20:19 ET: something ran a depth-limited fetch against the shared
