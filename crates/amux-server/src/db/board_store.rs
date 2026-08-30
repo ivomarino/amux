@@ -469,7 +469,26 @@ pub fn todo_wip_limit(session: Option<&str>) -> i64 {
 }
 
 /// Default ceiling on a lane's `todo` queue.
-pub const TODO_WIP_LIMIT_DEFAULT: i64 = 5;
+///
+/// RAISED FROM 5 TO 20 on 2026-08-30, hours after shipping, because the number
+/// that justified 5 did not survive. AF-317 asked for "start at 5" against a
+/// measured "todo median age 28.8 days" — and that figure counted ARCHIVED
+/// cards. Live it is 88 todo cards at a median of 0.8 DAYS. The queues are not
+/// stale, so a working limit was the wrong instrument.
+///
+/// At 5 it fired 16 times in two hours against five lanes, eight of them at
+/// `mvs-infra`, which is the single most active board user in the fleet (3,682
+/// card events in 34h). Refusing the most productive lane's next card, to
+/// enforce a ceiling derived from a statistic that turned out to be an artifact,
+/// is a cost with nothing on the other side of it.
+///
+/// 20 is above every lane's live depth today (max 11, ETHAN) so it does not
+/// interfere with normal work, and it still catches the pathology the card was
+/// actually filed about — Ethan, 2026-08-29: "some workers have an infinite #
+/// of growing backlogs and todo then they go idle." A ceiling is supposed to be
+/// unhit in normal operation; `the_todo_wip_limit_refuses_the_next_card_and_
+/// names_what_to_close` pins that it still fires, by setting the env override.
+pub const TODO_WIP_LIMIT_DEFAULT: i64 = 20;
 
 /// The predicate the WIP limit counts over.
 ///
