@@ -2075,6 +2075,159 @@ pub fn detect_dead_routes(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Sup
 /// Both checks read tables the SERVER owns, deliberately: a silent-subsystem
 /// detector that needed a worker to answer would go silent exactly when the
 /// fleet did.
+/// How many rate-limited lanes must qualify in one tick before their queues are
+/// filed as ONE card instead of one card each (AMUX-3900).
+///
+/// Mirrors `AMUX_INVARIANT_ROLLUP_AT` deliberately, including the floor of 2: a
+/// "rollup" of one is a card with worse wording. Default 3 rather than that
+/// one's 4 because the population is smaller and the cause is knowable — see
+/// [`steering_fan_out`] for why several rate-limited lanes at once is one fault.
+fn steering_rollup_at() -> usize {
+    std::env::var("AMUX_STEERING_ROLLUP_AT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 2)
+        .unwrap_or(3)
+}
+
+/// Decide whether the stalled steering queues are N faults or one.
+///
+/// # Several rate-limited lanes at once is ONE condition, and amux can prove it
+///
+/// amux UNSETS `ANTHROPIC_API_KEY` when it launches a lane
+/// (`session_verbs.rs`, the shell rc and the tmux env both), so every lane
+/// authenticates on the SAME Claude subscription. There is no per-lane key and
+/// no per-session env carries one. A cap is therefore account-level by
+/// construction, and lanes discover it one at a time as each makes its next
+/// request — a tight cluster with a rolling tail, which is exactly the shape
+/// mixpeek-general measured on MG-1536: 29 of 124 lanes credit-limited, the
+/// first 8 inside 131 seconds.
+///
+/// Filed per lane, that becomes N cards, each individually true, each naming a
+/// cause no sender can act on. The live specimen is this card's own family:
+/// AMUX-3898, 3899, 3900 and 3901, filed 00:45 to 01:17 against four different
+/// lanes, one cap. By the time anyone read them all four had cleared by
+/// themselves.
+///
+/// So the rate-limited rows fold into one card and the rest are untouched. A
+/// lane that is unreachable for any OTHER reason (no-env-file, not-running,
+/// archived) is a genuinely per-lane fault and still gets its own card, which is
+/// the discriminator this function exists to draw.
+///
+/// # Why the count comes from the qualifying set and not from the fleet
+///
+/// The tempting signal is "how many lanes are credit_limited fleet-wide", which
+/// would need another pass over every session. The number that matters is how
+/// many cards are about to be filed, and that is already in hand here. It also
+/// cannot drift from the thing it describes: if the rollup fires, N cards were
+/// genuinely about to exist.
+fn steering_fan_out(
+    rows: Vec<(Option<String>, String, i64, f64, Finding)>,
+    now: f64,
+    out: &mut Vec<Finding>,
+    suppressed: &mut Vec<Suppressed>,
+) {
+    let is_rl = |b: &Option<String>| b.as_deref() == Some("rate-limited");
+    let rl_count = rows.iter().filter(|(b, ..)| is_rl(b)).count();
+    if rl_count < steering_rollup_at() {
+        out.extend(rows.into_iter().map(|(.., f)| f));
+        return;
+    }
+    let (capped, rest): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(b, ..)| is_rl(b));
+    out.extend(rest.into_iter().map(|(.., f)| f));
+
+    let total: i64 = capped.iter().map(|(_, _, n, ..)| *n).sum();
+    let worst = capped.iter().map(|(_, _, _, age, _)| *age).fold(0.0_f64, f64::max);
+    let listing = capped
+        .iter()
+        .map(|(_, s, n, age, _)| format!("  {s} — {n} queued, oldest {:.0} min", age / 60.0))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let lanes: Vec<&str> = capped.iter().map(|(_, s, ..)| s.as_str()).collect();
+
+    // EVERY FOLDED LANE LEAVES A TRACE (ethos rule 4). A rollup that silently
+    // absorbed N per-lane cards is indistinguishable from a detector that never
+    // looked at those lanes, and the per-lane signature is what a reader greps
+    // when they wonder why `silent|steering|<lane>` stopped filing.
+    for (_, session, n, age, _) in &capped {
+        suppressed.push(sup(
+            DetectorKind::SilentSubsystem,
+            &format!("silent|steering|{session}"),
+            &format!(
+                "{n} message(s) queued {:.0} min for {session}, folded into the account-level \
+                 card: {rl_count} rate-limited lanes qualified on this tick and every amux lane \
+                 shares one Claude subscription, so this is one cap and not {rl_count} faults \
+                 (AMUX_STEERING_ROLLUP_AT={})",
+                age / 60.0,
+                steering_rollup_at()
+            ),
+        ));
+    }
+
+    out.push(Finding {
+        kind: DetectorKind::SilentSubsystem,
+        // Keyed on the CONDITION, not on any lane, so the card dedupes against
+        // itself as lanes join and leave the capped set rather than re-filing
+        // every time the membership changes by one.
+        signature: "silent|steering|account-rate-limit".into(),
+        title: format!(
+            "{rl_count} lanes' steering queues are held by ONE account rate limit, oldest {:.0} min",
+            worst / 60.0
+        ),
+        evidence: vec![
+            (
+                "verdict".into(),
+                format!(
+                    "{rl_count} lanes have a steering queue past its deadline and every one of \
+                     them is rate-limited. Filed as ONE card on purpose. amux unsets \
+                     ANTHROPIC_API_KEY when it launches a lane, so every lane authenticates on \
+                     the same Claude subscription and a cap is account-level by construction; \
+                     lanes discover it one at a time as each makes its next request, which is \
+                     why this looks like {rl_count} separate stalls. {total} message(s) are \
+                     waiting in total, and every one was reported to its sender as accepted."
+                ),
+            ),
+            ("lanes".into(), format!("\n{listing}")),
+            (
+                "rollup_threshold".into(),
+                format!("{} rate-limited lanes (AMUX_STEERING_ROLLUP_AT)", steering_rollup_at()),
+            ),
+            (
+                "what_to_do".into(),
+                "Nothing, if the cap has a reset time — the queues drain when it lifts and this \
+                 card closes itself. The work is only real if the queues are STILL full after \
+                 the reset, which points at the drain loop rather than at the limit. A credit \
+                 cap has no reset clock at all, and then the question is whether the fleet \
+                 should be running this many lanes on one subscription, which is Ethan's call \
+                 and not a per-sender fix."
+                    .to_string(),
+            ),
+            (
+                "why_not_one_card_per_lane".into(),
+                "Because each would carry the same cause and the same non-fix, and would be \
+                 addressed to senders who cannot act on it. The live specimen is this rule's own \
+                 family: AMUX-3898, 3899, 3900 and 3901, filed 00:45 to 01:17 on 2026-08-30 \
+                 against four different lanes, one cap, all four cleared by themselves before \
+                 anyone read them."
+                    .to_string(),
+            ),
+        ],
+        recheck: format!(
+            "curl -sk \"$AMUX_URL/api/debug/steering\" | python3 -c \"import json,sys; \
+             d=json.load(sys.stdin); \
+             print([(l['session'],l['queued'],l['blocked_reason'],l['rate_limit_resets_local']) \
+             for l in d['lanes'] if l['session'] in {lanes:?}])\""
+        ),
+        // Unassigned to a sender on purpose: an account-level cap has no sender
+        // who can act on it, and the routing rule that addresses these to the
+        // SENDER is correct only for a per-lane stall.
+        owner: None,
+        count: total as u64,
+        last_ts: now,
+        parked_until: None,
+    });
+}
+
 pub fn detect_silent(
     conn: &Connection,
     now: f64,
@@ -2200,6 +2353,13 @@ pub fn detect_silent(
                 r.get::<_, String>(3)?,
             ))
         });
+        // COLLECTED, NOT PUSHED (AMUX-3900). The per-lane findings are built
+        // first and the filing decision is taken after the loop, because one
+        // account-level credit cap makes every capped lane qualify at once and
+        // the rollup can only see that from the whole set. Inside the loop each
+        // row looks like an independent fault, which is exactly how four cards
+        // (AMUX-3898/3899/3900/3901) were filed against one condition.
+        let mut steer_rows: Vec<(Option<String>, String, i64, f64, Finding)> = Vec::new();
         if let Ok(rows) = rows {
             for (session, n, oldest, senders) in rows.flatten() {
                 let age = now - oldest;
@@ -2294,7 +2454,7 @@ pub fn detect_silent(
                     [one] => Some((*one).to_string()),
                     _ => None,
                 };
-                out.push(Finding {
+                steer_rows.push((block.clone(), session.clone(), n, age, Finding {
                     kind: DetectorKind::SilentSubsystem,
                     signature: format!("silent|steering|{session}"),
                     title: match &block {
@@ -2433,9 +2593,10 @@ pub fn detect_silent(
                     count: n as u64,
                     last_ts: now,
                     parked_until: None,
-                });
+                }));
             }
         }
+        steering_fan_out(steer_rows, now, &mut out, &mut suppressed);
     }
     (out, suppressed)
 }
@@ -6819,6 +6980,133 @@ mod tests {
         for off in ["0", "false", "off", "no", "OFF", " 0 ", "False"] {
             assert!(!parse_ops_health_cards(Some(off)), "{off:?} must disable filing");
         }
+    }
+
+    // ── AMUX-3900: one account cap must not become N cards ──────────────────
+    //
+    // amux unsets ANTHROPIC_API_KEY when it launches a lane, so every lane runs
+    // on one Claude subscription and a cap is account-level by construction.
+    // Lanes discover it one at a time, so it PRESENTS as N independent stalls.
+    // Filed per lane that produced AMUX-3898/3899/3900/3901 between 00:45 and
+    // 01:17 on 2026-08-30, four cards, one cap, all four self-cleared before
+    // anyone read them.
+
+    /// Seed `lanes` each with one message queued `queued_min` ago.
+    async fn seed_queues(st: &crate::api::AppState, now: f64, lanes: &[&str], queued_min: f64) {
+        let owned: Vec<String> = lanes.iter().map(|s| s.to_string()).collect();
+        st.store
+            .write_async(move |conn| {
+                crate::api::session_verbs::ensure_fleet_tables(conn)?;
+                for lane in &owned {
+                    conn.execute(
+                        "INSERT INTO steering_queue (id,session,text,queued_at,guard,sender) \
+                         VALUES (?1,?2,'hi',?3,'','')",
+                        rusqlite::params![format!("s-{lane}"), lane, now - queued_min * 60.0],
+                    )?;
+                }
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .expect("seed");
+    }
+
+    fn rate_limited(lanes: &[&str]) -> BTreeMap<String, Option<String>> {
+        lanes.iter().map(|l| (l.to_string(), Some("rate-limited".to_string()))).collect()
+    }
+
+    /// THE ROLLUP. Three capped lanes past their deadline file ONE card, and
+    /// every folded lane leaves a suppression behind — a rollup that absorbed
+    /// them silently would read exactly like a detector that never looked.
+    #[tokio::test]
+    async fn one_account_rate_limit_files_one_card_not_one_per_lane() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        let lanes = ["capped-a", "capped-b", "capped-c"];
+        seed_queues(&st, now, &lanes, 92.0).await;
+        let conn = st.store.read().unwrap();
+        // No reset clock anywhere: the credit-cap case, which is the one that files.
+        let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
+        let (f, sup) = detect_silent(&conn, now, &rate_limited(&lanes), &resets);
+        assert!(
+            !sup.iter().any(|x| x.signature.contains("<query failed>")),
+            "the steering query did not prepare, so this test measures nothing: {sup:?}"
+        );
+
+        let rollup: Vec<_> =
+            f.iter().filter(|x| x.signature == "silent|steering|account-rate-limit").collect();
+        assert_eq!(rollup.len(), 1, "one cap is one card: {f:?}");
+        for lane in lanes {
+            assert!(
+                !f.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                "{lane} must not also get its own card: {f:?}"
+            );
+            let s = sup
+                .iter()
+                .find(|x| x.signature == format!("silent|steering|{lane}"))
+                .expect("a folded lane must leave a trace, or the fold is invisible");
+            assert!(s.reason.contains("folded into the account-level card"), "{}", s.reason);
+        }
+        let ev: BTreeMap<_, _> = rollup[0].evidence.iter().cloned().collect();
+        assert!(ev["lanes"].contains("capped-b"), "the card must name the lanes: {ev:?}");
+        assert!(
+            ev["verdict"].contains("ANTHROPIC_API_KEY"),
+            "and say why several lanes at once is ONE fault: {ev:?}"
+        );
+        assert_eq!(rollup[0].owner, None, "an account cap has no sender who can act on it");
+    }
+
+    /// BELOW THE THRESHOLD, NOTHING CHANGES. Two capped lanes are still two
+    /// cards. A rollup that fired at any N would delete the per-lane card the
+    /// detector exists for, and would pass the test above just as green.
+    #[tokio::test]
+    async fn two_capped_lanes_are_still_two_cards() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        let lanes = ["pair-a", "pair-b"];
+        seed_queues(&st, now, &lanes, 92.0).await;
+        let conn = st.store.read().unwrap();
+        let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
+        let (f, _) = detect_silent(&conn, now, &rate_limited(&lanes), &resets);
+        assert!(
+            !f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
+            "two is a coincidence, not a pattern: {f:?}"
+        );
+        for lane in lanes {
+            assert!(
+                f.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                "{lane} keeps its own card below the threshold: {f:?}"
+            );
+        }
+    }
+
+    /// THE DISCRIMINATOR. Only a RATE LIMIT is shared. A lane that cannot be
+    /// reached for its own reason (no env file, not running, archived) is a
+    /// genuinely per-lane fault and must survive the fold — otherwise the
+    /// rollup quietly swallows the actionable cards along with the noise.
+    #[tokio::test]
+    async fn a_lane_blocked_for_its_own_reason_is_not_folded_into_the_cap() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        let lanes = ["cap-1", "cap-2", "cap-3", "no-env-lane"];
+        seed_queues(&st, now, &lanes, 92.0).await;
+        let conn = st.store.read().unwrap();
+        let mut blocked = rate_limited(&["cap-1", "cap-2", "cap-3"]);
+        blocked.insert("no-env-lane".into(), Some("no-env-file".into()));
+        let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
+        let (f, _) = detect_silent(&conn, now, &blocked, &resets);
+        assert!(
+            f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
+            "the three capped lanes still roll up: {f:?}"
+        );
+        let own = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|no-env-lane")
+            .expect("a lane with no env file is its own fault and its own card");
+        let ev: BTreeMap<_, _> = own.evidence.iter().cloned().collect();
+        assert!(ev["verdict"].contains("no-env-file"), "{ev:?}");
     }
 
     /// AMUX-3696: a queue that cannot drain and a queue waiting for a turn
