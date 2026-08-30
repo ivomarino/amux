@@ -1869,14 +1869,20 @@ pub async fn debug_context_health() -> Response {
         }));
     }
     lanes.sort_by_key(|l| std::cmp::Reverse(l.get("generations").and_then(Value::as_u64).unwrap_or(0)));
-    j200(json!({
+    let n_lanes = lanes.len();
+    j200(crate::api::measured::measured(
+        json!({
         "note": "compaction generations per lane: how many times this conversation has been \
                  summarized away. A raw `claude` in a terminal sits at 0; an amux lane resumes \
                  forever, so it answers from a summary of a summary. Measured 2026-08-26 across \
                  every transcript active since 08-05: amux median 8 / max 215, raw median 0 / \
                  max 32 — same models, same effort, same first-turn token baseline.",
         "sessions": lanes.len(),
-        "measured": measured,
+        // RENAMED for AF-320. This was `measured`, an integer, on the one
+        // endpoint that already had the right instinct — and the contract needs
+        // `measured` to be the boolean "did this probe run". Two meanings on one
+        // key is worse than either, so the count takes the specific name.
+        "lanes_measured": measured,
         "unmeasurable": unmeasurable,
         "over_warn_threshold": over,
         "warn_at": GENERATIONS_WARN_AT,
@@ -1884,7 +1890,9 @@ pub async fn debug_context_health() -> Response {
                    starts its conversation over. Never automatic: the conversation is the lane's \
                    accumulated work, so discarding it is the owner's call (ethos rule 8).",
         "lanes": lanes,
-    }))
+        }),
+        n_lanes,
+    ))
 }
 
 /// The display name a transcript CURRENTLY carries — the last `customTitle` /
@@ -3543,6 +3551,37 @@ fn mint_capture_card(
     Ok(Some(row))
 }
 
+/// The most recent row for (session, text) that was actually DELIVERED, newer
+/// than `since_ms`. `(id, ts)`, or None.
+///
+/// Extracted so the duplicate-delivery detector and its test run the SAME
+/// query. It was inline, and a test could only restate it — a restatement stays
+/// green when the shipped query changes, which is the "check pinning the wrong
+/// layer" shape (ethos rule 7).
+///
+/// # `stuck` rows are excluded, and that is the point
+///
+/// Failed sends became rows in AMUX-3903. A send that never left the composer
+/// is exactly what a caller SHOULD retry, so counting it as a prior delivery
+/// would flag the correct response as a double delivery and train people to
+/// ignore the one warning that exists for real duplicates. A QUEUED row carries
+/// no verdict and IS delivered at the next boundary, so it still counts.
+fn prior_delivered(
+    conn: &rusqlite::Connection,
+    session: &str,
+    text: &str,
+    since_ms: i64,
+) -> Option<(i64, i64)> {
+    conn.query_row(
+        "SELECT id, ts FROM cmd_history WHERE session=?1 AND text=?2 \
+         AND ts > ?3 AND COALESCE(submit_verdict,'') != 'stuck' \
+         ORDER BY ts DESC LIMIT 1",
+        rusqlite::params![session, text, since_ms],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
+}
+
 pub(crate) async fn cmd_hist_record_full(
     state: &AppState,
     session: &str,
@@ -3578,20 +3617,9 @@ pub(crate) async fn cmd_hist_record_full(
     // deliberate, and silently dropping one would turn a visible annoyance into
     // an invisible data-loss bug — strictly worse. It announces, and lets a
     // human or a sweep decide.
-    let dup_prior: Option<(i64, i64)> = {
-        let session_q = session.clone();
-        let text_q = text.clone();
-        match state.store.read() {
-            Ok(conn) => conn
-                .query_row(
-                    "SELECT id, ts FROM cmd_history WHERE session=?1 AND text=?2 \
-                     AND ts > ?3 ORDER BY ts DESC LIMIT 1",
-                    rusqlite::params![session_q, text_q, now_ms - DUP_DELIVERY_WINDOW_MS],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .ok(),
-            Err(_) => None,
-        }
+    let dup_prior: Option<(i64, i64)> = match state.store.read() {
+        Ok(conn) => prior_delivered(&conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS),
+        Err(_) => None,
     };
     if let Some((prior_id, prior_ts)) = dup_prior {
         let age_s = (now_ms - prior_ts) as f64 / 1000.0;
@@ -3649,8 +3677,16 @@ pub(crate) async fn cmd_hist_record_full(
     // separate `steering_history` table IS stamped at real delivery by the
     // deliverer — which is also where the timestamp for the eventual backfill
     // will come from.
+    // A STUCK ROW IS NOT A DELIVERY (AMUX-3903). `delivery` says which PATH was
+    // taken and `Direct` is true of a stuck send — amux typed straight into the
+    // pane — so the mode alone would stamp `delivered_at`, which is the exact
+    // AMUX-3541 defect (a column populated 100% of the time is believable, and
+    // wrong) reintroduced through a new door. The verdict is what says whether
+    // the text landed, so it decides this column too.
+    let landed = !matches!(submit_verdict.as_deref(), Some("stuck"));
     let delivered_at_ms = match meta.delivery {
         Some(Delivery::Queued) => None,
+        _ if !landed => None,
         _ => Some(now_ms),
     };
     let msg_row_id_w = msg_row_id.clone();
@@ -3688,7 +3724,13 @@ pub(crate) async fn cmd_hist_record_full(
     // not auto-captured as ledger cards. It has no session/URL to run `amux
     // board`, so a card minted here would name work nobody can drive, and the
     // accountability sweep is likewise told to skip it.
-    if is_user && !skip_board && !session_is_isolated(&cap_session) {
+    // AND NOT FOR A PROMPT THE LANE NEVER RECEIVED (AMUX-3903). A ledger card
+    // asserts "this lane was given this task", and a stuck send means it was
+    // not: the text is sitting in the composer. Minting one would hand the
+    // accountability sweep a lane to chase over work nobody delivered. The
+    // message ROW still goes in, because the delivery attempt is the fact worth
+    // keeping; the card is a consequence that did not happen.
+    if is_user && landed && !skip_board && !session_is_isolated(&cap_session) {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -7839,7 +7881,11 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
         }));
     }
 
-    j200(json!({
+    // AF-320. `healthy: true` over zero rows is the dangerous reading here: a
+    // sweep reads that one boolean, and an empty fleet and an unlistable one
+    // both produce it. n_considered is the lanes actually examined.
+    j200(crate::api::measured::measured(
+        json!({
         "checked_at": now,
         "stale_s": stale_s,
         // Panes named amux-* that amux does not manage (no session env file).
@@ -7858,7 +7904,9 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
         // The whole point of the endpoint: a sweep reads this one boolean.
         "healthy": stale == 0 && unpiped == 0,
         "sessions": rows,
-    }))
+        }),
+        rows.len(),
+    ))
 }
 
 fn mark_pending_log_reload(name: &str, reason: &str) {
@@ -10261,14 +10309,30 @@ async fn warn_on_stalled_lanes(state: &AppState) {
 /// every 5 seconds for four hours looked exactly like a lane with nothing to do.
 async fn steering_debug(State(state): State<AppState>) -> Response {
     let rows: Vec<(String, f64, i64, String)> = {
+        // Both arms carry the AF-320 contract: an error body with no `lanes`
+        // key renders as "nothing is queued" in any tolerant reader, and the
+        // steer-queue age is a number other jobs subtract from.
         let Ok(conn) = state.store.read() else {
-            return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "store unavailable"}));
+            return jresp(
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::api::measured::unmeasured(
+                    json!({"error": "store unavailable", "lanes": []}),
+                    "the store could not be opened, so the steering queue was never read",
+                ),
+            );
         };
         let Ok(mut stmt) = conn.prepare(
             "SELECT session, MIN(queued_at), COUNT(*), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
              FROM steering_queue GROUP BY session",
         ) else {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "query failed"}));
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::measured::unmeasured(
+                    json!({"error": "query failed", "lanes": []}),
+                    "steering_queue could not be queried — the schema is older than this \
+                     binary expects, so an empty `lanes` is unmeasured, not idle",
+                ),
+            );
         };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .map(|it| it.flatten().collect())
@@ -10316,13 +10380,19 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
             "last_skip_age_s": if at > 0.0 { json!((now - at) as i64) } else { Value::Null },
         }));
     }
-    j200(json!({
+    // AF-320: an empty `lanes` means either nothing is queued anywhere or the
+    // queue was never read, and the steer-queue age is exactly the number other
+    // jobs subtract from.
+    j200(crate::api::measured::measured(
+        json!({
         "lanes": lanes,
         "stall_warn_s": steer_stall_warn_s(),
         "max_age_s": steer_max_age_s(),
         "max_age_env": "AMUX_STEER_MAX_AGE_S",
         "note": "last_skip_* is in-memory and resets when the server restarts; queued/oldest_age_s are durable",
-    }))
+        }),
+        lanes.len(),
+    ))
 }
 
 /// Deliver the oldest queued steering message for ONE specific session.
@@ -11220,7 +11290,11 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
     for r in &rows {
         *by_session.entry(r["session"].as_str().unwrap_or("").to_string()).or_insert(0) += 1;
     }
-    j200(json!({
+    // AF-320. `total: 0` reads as "no duplicates" whether the query ran or
+    // silently returned nothing; `unwrap_or_default()` above makes that a real
+    // path rather than a hypothetical one.
+    j200(crate::api::measured::measured(
+        json!({
         "hours": hours,
         "window_ms": DUP_DELIVERY_WINDOW_MS,
         "total": rows.len(),
@@ -11229,7 +11303,9 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
         "note": "a duplicate is the SAME text recorded twice for one lane inside window_ms. \
                  Deliveries are never suppressed on this signal — two identical sends can be \
                  deliberate, and dropping one would turn a visible annoyance into silent loss.",
-    }))
+        }),
+        rows.len(),
+    ))
 }
 
 fn qs_first<'a>(qs: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {
@@ -12720,8 +12796,58 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         } else if !origin.is_empty() && origin != name {
             cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
         }
-    } else if !msg_id.is_empty() {
-        send_dedup_forget(state, name, &msg_id).await;
+    } else {
+        // A FAILED DELIVERY IS A DELIVERY EVENT (AMUX-3903).
+        //
+        // This whole record was inside `if ok`, so a send that typed the text
+        // and could not submit it wrote NO ROW AT ALL. Not a row marked failed:
+        // absent. The consequences compound, because every consumer of this
+        // table reads a population with the failures already removed —
+        // `submit_verdict` had never been `stuck` in 9,494 rows fleet-wide, the
+        // success rate computed from it is 100% by construction, and the
+        // duplicate-delivery detector, the sender-attribution trail and any
+        // sweep over "what was this lane told" all inherit the same blind spot.
+        // A wrong answer that is not wrong-looking is ethos rule 4's whole
+        // subject.
+        //
+        // A REFUSAL IS NOT A FAILED DELIVERY, and the distinction is the reason
+        // this is not simply `else`. "not running", archived, invalid name, the
+        // resume picker, an isolated lane, the background-conversation view:
+        // amux never typed anything, the caller got an error naming the next
+        // step, and recording them here would bury the real failures under
+        // thousands of rows about messages that were never attempted.
+        //
+        // `submit_verdict_of` is the discriminator and it already exists —
+        // reused rather than re-derived, so this cannot drift from the verdict
+        // the response reports (ethos rule 1). On the failure branch it returns
+        // Some only for "not submitted", which means the text IS in the lane's
+        // composer; every refusal maps to None.
+        if let Some(verdict) = submit_verdict_of(&msg) {
+            // LOUD, for the same reason ghost-rescue is: keystroke delivery
+            // failing is a defect, and until now it left the process without a
+            // trace anywhere durable.
+            tracing::warn!(
+                session = %name, verdict = %verdict,
+                preview = %chars_truncate(&text, 80),
+                "send FAILED to submit — recording it (AMUX-3903); the text is in the lane's \
+                 composer and was never delivered"
+            );
+            let meta = DeliveryMeta {
+                delivery: Some(Delivery::Direct),
+                queued_at_ms: None,
+                submit_verdict: Some(verdict),
+            };
+            if record_history {
+                let email =
+                    headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
+                cmd_hist_record_full(state, name, &orig_text, "user", email, skip_board, meta).await;
+            } else if !origin.is_empty() && origin != name {
+                cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
+            }
+        }
+        if !msg_id.is_empty() {
+            send_dedup_forget(state, name, &msg_id).await;
+        }
     }
     // A REFUSAL IS NOT A SERVER ERROR (AMUX-2681). This used to be
     // `if msg == "not running" { 409 } else { 500 }`, so every other honest
@@ -16998,6 +17124,128 @@ mod tests {
             del_d, Some(ts_d),
             "a DIRECT send really was delivered when it was recorded — blanking this too \
              would throw away true information instead of removing false information"
+        );
+    }
+
+    // ── AMUX-3903: a failed send is a fact worth keeping ────────────────────
+
+    /// THE DISCRIMINATOR THE NEW BRANCH RESTS ON. `send_post` records a failed
+    /// send only when `submit_verdict_of` claims it, so that predicate has to
+    /// separate "amux typed the text and it did not submit" from "amux declined
+    /// and typed nothing" across the WHOLE refusal vocabulary. Get it wrong in
+    /// one direction and the failures stay invisible; wrong in the other and
+    /// every unreachable lane files rows about messages never attempted.
+    #[test]
+    fn only_a_send_that_actually_typed_something_is_recorded_as_failed() {
+        // The one failure that put text in the lane.
+        assert_eq!(
+            submit_verdict_of(
+                "not submitted — text is sitting in the input box (autocomplete popup ate the Enter?)"
+            ),
+            Some("stuck"),
+            "this is the row the ledger was missing"
+        );
+
+        // REFUSALS. amux never typed; the caller got a next step. Every one of
+        // these is a real message from `send_text`/`send_failure_status`.
+        for refusal in [
+            "not running",
+            "session 'nope' not found",
+            "invalid session name",
+            "auto-wake failed: session is archived; wake it first",
+            "target is an isolated (raw-agent) worker",
+            "herdr-backed session start is not ported",
+            "iTerm2-backed sessions are not supported",
+            &bg_view_refusal(false),
+            &bg_view_refusal(true),
+        ] {
+            assert_eq!(
+                submit_verdict_of(refusal),
+                None,
+                "a refusal typed nothing and must not become a delivery-failure row: {refusal:?}"
+            );
+        }
+
+        // And the success wordings keep their own verdicts, so widening the
+        // failure branch cannot have quietly reclassified them.
+        assert_eq!(submit_verdict_of("sent"), Some("confirmed"));
+        assert_eq!(submit_verdict_of("sent (Enter was dropped; submitted on retry)"), Some("retried"));
+        assert_eq!(
+            submit_verdict_of(
+                "sent (keys delivered; submission could not be verified — no input box was drawn)"
+            ),
+            Some("unverified")
+        );
+    }
+
+    /// A STUCK ROW MUST NOT CLAIM A DELIVERY TIME. `delivery` says which path
+    /// was taken and Direct is true of a stuck send, so the mode alone stamps
+    /// `delivered_at` — which would re-create AMUX-3541's defect through a new
+    /// door: a column populated on every row reads as a working instrument.
+    #[tokio::test]
+    async fn a_stuck_row_records_the_attempt_and_not_a_delivery() {
+        let (st, _d) = state();
+        cmd_hist_record_full(
+            &st,
+            "lane-stuck",
+            "a message that never submitted",
+            "user",
+            "",
+            false,
+            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") },
+        )
+        .await;
+        let (ts, delivered) = last_row(&st);
+        assert!(ts > 0, "the ATTEMPT is the fact worth keeping — the row must exist");
+        assert_eq!(
+            delivered, None,
+            "the text is in the composer, not in the lane; a delivered_at here is a lie \
+             the same shape as AMUX-3541's"
+        );
+        let verdict: Option<String> = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT submit_verdict FROM cmd_history ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(verdict.as_deref(), Some("stuck"), "the value that had never once been written");
+    }
+
+    /// RETRYING AN UNDELIVERED MESSAGE IS NOT A DUPLICATE DELIVERY.
+    ///
+    /// Recording failures gives the duplicate detector rows it never saw. Its
+    /// query matches on (session, text) inside a window, so without this the
+    /// correct response to a failed send — send it again — would be warned
+    /// about as a double delivery, which trains people to ignore the one
+    /// warning that exists for real duplicates.
+    #[tokio::test]
+    async fn a_retry_after_a_failed_send_is_not_flagged_as_a_duplicate() {
+        let (st, _d) = state();
+        let text = "please look at the report";
+        // The failed attempt.
+        cmd_hist_record_full(
+            &st, "lane-dup", text, "user", "", false,
+            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") },
+        )
+        .await;
+        // The detector's own query, verbatim, against the seeded table.
+        // THE SHIPPED QUERY, not a restatement of it: a copy here would stay
+        // green if the detector's own SQL changed underneath it.
+        let prior = |st: &AppState| -> Option<(i64, i64)> {
+            prior_delivered(&st.store.read().unwrap(), "lane-dup", text, 0)
+        };
+        assert_eq!(
+            prior(&st),
+            None,
+            "a message that never left the composer is not a prior DELIVERY"
+        );
+
+        // CONTROL: a real delivery of the same text IS a prior, or the filter
+        // above has simply switched the detector off.
+        cmd_hist_record_full(&st, "lane-dup", text, "user", "", false, DeliveryMeta::direct()).await;
+        assert!(
+            prior(&st).is_some(),
+            "a genuine prior delivery must still be found, or the duplicate detector is dead"
         );
     }
 

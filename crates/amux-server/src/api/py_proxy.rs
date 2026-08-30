@@ -171,7 +171,12 @@ pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
 /// emptiness is STRUCTURAL (there is nothing left that could forward) rather
 /// than a table that merely happens to be clear today.
 pub async fn boundary() -> axum::Json<serde_json::Value> {
-    axum::Json(json!({
+    // AF-320. `proxied: []` is the whole claim this endpoint makes, and an empty
+    // list is exactly what a broken read would also produce. The population is
+    // both family tables, so a zero here is readable as structural rather than
+    // as unmeasured.
+    axum::Json(crate::api::measured::measured(
+        json!({
         "proxied": PROXIED_FAMILIES.iter().map(|f| json!({
             "family": f.family,
             "owner": "python",
@@ -186,5 +191,7 @@ pub async fn boundary() -> axum::Json<serde_json::Value> {
                             retired legacy bind, i.e. a self-proxy loop. `proxied` is empty \
                             STRUCTURALLY, not incidentally.",
         "doc": "docs/rust-migration/server-boundary.md",
-    }))
+        }),
+        PROXIED_FAMILIES.len() + NATIVE_FAMILIES.len(),
+    ))
 }

@@ -654,7 +654,10 @@ pub async fn debug_storage() -> axum::Json<Value> {
     let home = amux_home();
     let free = disk_free_bytes(&home);
     let r = last_report();
-    axum::Json(json!({
+    // AF-320: `free_bytes: null` is the interesting case — the disk could not be
+    // read, and every consumer of this endpoint is asking about disk pressure.
+    // `SPECS.len()` is the retention population the report describes.
+    let body = json!({
         "free_bytes": free,
         "free_gb": free.map(|b| (b as f64 / 1e9 * 10.0).round() / 10.0),
         "knobs": SPECS.iter().map(|s| json!({
@@ -668,7 +671,15 @@ pub async fn debug_storage() -> axum::Json<Value> {
             "files_removed": r.files_removed, "bytes_freed": r.bytes_freed,
             "took_ms": r.took_ms,
         })),
-    }))
+    });
+    axum::Json(match free {
+        Some(_) => crate::api::measured::measured(body, SPECS.len()),
+        None => crate::api::measured::unmeasured(
+            body,
+            "free space could not be read for the amux home, so no disk verdict here is \
+             founded (`df -Pk` failed or returned nothing parseable)",
+        ),
+    })
 }
 
 /// Typed `Router<AppState>` to match the app router it merges into — the

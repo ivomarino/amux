@@ -5969,7 +5969,18 @@ async fn debug_autofix(axum::extract::State(state): axum::extract::State<AppStat
         "note": "suppressed lists EVERY decision not to file, with its reason — a detector that \
                  silently declines is the failure this job exists to end",
     });
-    axum::Json::<Value>(body).into_response()
+    // AF-320. `last: null` means the loop has not ticked in this process, and
+    // every count under it is then absent rather than zero. n_considered is the
+    // detectors the last pass actually ran.
+    axum::Json::<Value>(match r.as_ref() {
+        Some(_) => crate::api::measured::measured(body, DetectorKind::all().len()),
+        None => crate::api::measured::unmeasured(
+            body,
+            "the autofix loop has not completed a pass in this process, so nothing under \
+             `last` was measured — this is not a quiet fleet",
+        ),
+    })
+    .into_response()
 }
 
 pub fn routes() -> axum::Router<AppState> {

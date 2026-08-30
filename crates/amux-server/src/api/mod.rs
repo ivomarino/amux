@@ -42,6 +42,7 @@ pub mod journal;
 pub mod layout_presets;
 pub mod log_search;
 pub mod map;
+pub mod measured;
 pub mod mdai;
 pub mod memories;
 pub mod metrics;
@@ -654,8 +655,14 @@ async fn debug_sse(
     // The client half: stale-reconnect beacons already ride /api/client-debug,
     // which is the existing primitive for "the browser wants to tell the server
     // something". No new endpoint, no new store.
-    let (stale, sample) = match CLIENT_DEBUG_RING.lock() {
+    // AF-320: the Err arm below returns `stale_reconnects: 0`, which is
+    // indistinguishable from a healthy backbone — the precise failure this
+    // endpoint's own note spends a paragraph warning about in the OTHER
+    // direction. `scanned` is the beacon population; None means the ring could
+    // not be read at all.
+    let (stale, sample, scanned) = match CLIENT_DEBUG_RING.lock() {
         Ok(ring) => {
+            let scanned = ring.len();
             let hits: Vec<&serde_json::Value> = ring
                 .iter()
                 .filter(|v| {
@@ -664,11 +671,11 @@ async fn debug_sse(
                 })
                 .collect();
             let n = hits.len();
-            (n, hits.into_iter().rev().take(5).cloned().collect::<Vec<_>>())
+            (n, hits.into_iter().rev().take(5).cloned().collect::<Vec<_>>(), Some(scanned))
         }
-        Err(_) => (0, Vec::new()),
+        Err(_) => (0, Vec::new(), None),
     };
-    axum::Json(serde_json::json!({
+    let body = serde_json::json!({
         "live_connections": live,
         "opened_total": opened,
         // opened >> live within one process is reconnect churn, which is the
@@ -699,7 +706,15 @@ async fn debug_sse(
                  clients running an app.js that HAS the beacon, so a 0 shortly after a \
                  deploy is a ramp-up, not a verdict. live_connections is the \
                  discriminator: those clients are on this build.",
-    }))
+    });
+    axum::Json(match scanned {
+        Some(n) => crate::api::measured::measured(body, n),
+        None => crate::api::measured::unmeasured(
+            body,
+            "the client-debug ring could not be locked, so stale_reconnects counted nothing \
+             — this zero is the absence of a measurement",
+        ),
+    })
 }
 
 static CLIENT_DEBUG_RING: std::sync::Mutex<Vec<serde_json::Value>> =

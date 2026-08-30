@@ -2913,7 +2913,10 @@ pub async fn guard_outcomes_debug(
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({"error": e.to_string()})),
+                axum::Json(crate::api::measured::unmeasured(
+                    json!({"error": e.to_string()}),
+                    "the store could not be opened, so no guard verdict was counted",
+                )),
             )
         }
     };
@@ -2948,9 +2951,7 @@ pub async fn guard_outcomes_debug(
             recent = rows.flatten().collect();
         }
     }
-    (
-        StatusCode::OK,
-        axum::Json(json!({
+    let body = json!({
             "since_h": since_h,
             "verdicts": {
                 "allow": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='allow'", &[c]),
@@ -2975,7 +2976,24 @@ pub async fn guard_outcomes_debug(
             },
             "recent_blocks": recent,
             "note": "proceeded cells are DECLARED (the committer's own override env var); trimmed/reallowed are hook-OBSERVED staged-set comparisons; aborted is inferred at read time and named so. -1 = query failed, never silently 0.",
-        })),
+        });
+    // AF-320 makes the `-1 = query failed` convention machine-readable. That
+    // sentinel is in a NOTE, so a reader has to know to look for it; a caller
+    // summing the cells gets a plausible number either way. `window_verdicts`
+    // is the population every cell above is drawn from, and a negative one
+    // means the count itself failed.
+    let window_verdicts = count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1", &[c]);
+    (
+        StatusCode::OK,
+        axum::Json(if window_verdicts < 0 {
+            crate::api::measured::unmeasured(
+                body,
+                "guard_verdicts could not be counted, so every cell in this report is -1 \
+                 or unfounded — the schema is older than this binary expects",
+            )
+        } else {
+            crate::api::measured::measured(body, window_verdicts as usize)
+        }),
     )
 }
 

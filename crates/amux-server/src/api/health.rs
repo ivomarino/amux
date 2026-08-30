@@ -486,8 +486,12 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
         .ok()
         .and_then(|l| l.clone())
         .map(|(lane, ts)| serde_json::json!({"lane": lane, "ts": ts}));
+    // AF-320: `stdout_lines: 0` is the exact reading this endpoint was built to
+    // explain, and on its own it cannot say whether tmux answered with nothing
+    // or was never reached. The contract puts that clause in the same payload.
     axum::Json(match out {
-        Ok(o) => serde_json::json!({
+        Ok(o) => crate::api::measured::measured(
+            serde_json::json!({
             "spawn": "ok",
             "pane_capture_timeouts": pane_timeouts,
             "pane_capture_last_timeout": pane_last,
@@ -505,8 +509,13 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
             "env_tmpdir": std::env::var("TMPDIR").ok(),
             "env_tmux": std::env::var("TMUX").ok(),
             "cwd": std::env::current_dir().ok().map(|p| p.display().to_string()),
-        }),
-        Err(e) => serde_json::json!({ "spawn": "failed", "error": e.to_string() }),
+            }),
+            String::from_utf8_lossy(&o.stdout).lines().count(),
+        ),
+        Err(e) => crate::api::measured::unmeasured(
+            serde_json::json!({ "spawn": "failed", "error": e.to_string() }),
+            "tmux could not be spawned from this process, so the fleet was never listed",
+        ),
     })
 }
 
@@ -524,7 +533,11 @@ pub async fn debug_tmux() -> axum::Json<serde_json::Value> {
 pub async fn debug_scan() -> axum::Json<serde_json::Value> {
     let now = crate::runtime_jobs::registry::unix_now();
     match crate::orchestrator::scan::last_scan_state() {
-        Some(s) => axum::Json(serde_json::json!({
+        // AF-320. Every list below can be legitimately empty, and "the loop found
+        // nothing to demote" and "the loop has never run" produce the same empty
+        // lists. n_considered is the number of lanes the pass actually looked at.
+        Some(s) => axum::Json(crate::api::measured::measured(
+            serde_json::json!({
             "note": "the terminal scan loop's last pass, the FALLBACK voice for hookless \
                      workers. A lane in demoted_structured spoke for itself (live protocol \
                      session); one in demoted_native was reported by its backend (herdr \
@@ -541,8 +554,13 @@ pub async fn debug_scan() -> axum::Json<serde_json::Value> {
             "capture_failures": s.report.capture_failures,
             "events_applied": s.report.events_applied,
             "deduped": s.deduped,
-        })),
-        None => axum::Json(serde_json::json!({
+            }),
+            s.report.scanned.len()
+                + s.report.demoted_structured.len()
+                + s.report.demoted_native.len(),
+        )),
+        None => axum::Json(crate::api::measured::unmeasured(
+            serde_json::json!({
             "note": "the terminal scan loop has not completed a pass yet, so no demotion \
                      decisions to report. If this persists past AMUX_RS_SCAN_SECS, check \
                      /api/system-jobs for the 'terminal-scan' job.",
@@ -555,7 +573,10 @@ pub async fn debug_scan() -> axum::Json<serde_json::Value> {
             "capture_failures": Vec::<String>::new(),
             "events_applied": 0,
             "deduped": serde_json::Map::new(),
-        })),
+            }),
+            "the terminal scan loop has not completed a pass yet — these empty lists are \
+             the absence of a measurement, not the absence of demotions",
+        )),
     }
 }
 
@@ -569,7 +590,10 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
     let conn = match state.store.read() {
         Ok(c) => c,
         Err(e) => {
-            return axum::Json(serde_json::json!({ "error": e.to_string() }));
+            return axum::Json(crate::api::measured::unmeasured(
+                serde_json::json!({ "error": e.to_string(), "outages": [] }),
+                "the store could not be opened, so no outage row was read",
+            ));
         }
     };
     let mut rows: Vec<serde_json::Value> = Vec::new();
@@ -620,7 +644,8 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
     let last_beat: Option<f64> = conn
         .query_row("SELECT beat_at FROM server_heartbeat WHERE id = 1", [], |r| r.get(0))
         .ok();
-    axum::Json(serde_json::json!({
+    let query_error_reason = query_error.clone();
+    let body = serde_json::json!({
         "note": "Gaps in the liveness heartbeat. `down_from` is the LAST CONFIRMED \
                  BEAT, so the true stop is within one beat interval after it — the \
                  number is deliberately the one that can be proved rather than a guess. \
@@ -640,7 +665,14 @@ pub async fn debug_downtime(State(state): State<AppState>) -> axum::Json<serde_j
         // Present ONLY when the read failed, so a consumer can tell an empty
         // history from an unreadable one.
         "error": query_error,
-    }))
+    });
+    // AF-320 makes that same distinction MACHINE-READABLE. `error` above is the
+    // prose half and predates the contract; a consumer had to know to look for
+    // it, which is what AF-99 shows nobody does.
+    axum::Json(match query_error_reason {
+        Some(w) => crate::api::measured::unmeasured(body, &w),
+        None => crate::api::measured::measured(body, rows.len()),
+    })
 }
 
 #[cfg(test)]

@@ -97,6 +97,14 @@ Use the server's diagnostic endpoints before writing a grep:
 | `GET /api/debug/sse?since_h=24` | Is the realtime backbone carrying the fleet, or has it dropped clients onto polling? `live_connections` + `opened_total` (per-PROCESS: the builder restarts this binary on every commit and all SSE connections die with it) joined with `stale_reconnects`, the client-side beacon fired at the 18s zombie trigger. Neither half answers alone — from the server a reconnect looks like a laptop lid; only the client knows it declared the stream stale. A 0 shortly after a deploy is a ramp-up, not a verdict; `live_connections` is the discriminator. |
 | `GET /api/debug/tmux` | Fleet discovery from inside the server |
 
+**Read `measured` before you read the number.** Every diagnostic endpoint
+answers with `measured` (did the probe run) and `n_considered` (how big the
+population was). `total_errors: 0, measured: true, n_considered: 4210` is a
+quiet window; `total_errors: 0, measured: false` is a probe that never ran, and
+`why_unmeasured` says what stopped it. Those two used to be the same payload,
+which is 41 of 83 frustration entries (AF-320). A new diagnostic route without
+both fields fails `tests/diagnostic_contract.rs`.
+
 Raw logs: `~/.amux/logs/server-rs.log`
 
 ## Deploy

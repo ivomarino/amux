@@ -57,7 +57,11 @@ async fn health(
     // while the monitor that produced it is dead.
     if let Some(want) = q.get("id").map(|s| s.trim()).filter(|s| !s.is_empty()) {
         let results = monitor::evaluate_all(&state).await;
-        return Json(filtered_body(&results, want)).into_response();
+        // AF-320: a filtered body that matches nothing and a pass that never ran
+        // both come back empty. n_considered is the invariants evaluated.
+        let n = results.len();
+        return Json(crate::api::measured::measured(filtered_body(&results, want), n))
+            .into_response();
     }
     let want_live = q
         .get("live")
@@ -65,7 +69,9 @@ async fn health(
         .unwrap_or(false);
     if want_live {
         let results = monitor::evaluate_all(&state).await;
-        return Json(live_body(&results, &state)).into_response();
+        let n = results.len();
+        return Json(crate::api::measured::measured(live_body(&results, &state), n))
+            .into_response();
     }
 
     // DEFAULT: stored + producer liveness.
@@ -90,7 +96,7 @@ async fn health(
     let live = store::live_incidents(&state.store).unwrap_or_default();
     let last_age = snap.as_ref().and_then(|s| s.last_tick_at).map(|t| ((now - t).max(0.0) * 10.0).round() / 10.0);
 
-    Json(json!({
+    let body = json!({
         "source": "stored",
         "confidence": confidence,
         // TOP-LEVEL, not a field a reader has to know to check (AMUX-3841): a
@@ -122,7 +128,21 @@ async fn health(
         "unknowns": latest.iter().filter(|l| l["status"] == "unknown").map(|l| json!({
             "invariant_id": l["invariant_id"], "why": l["observed"],
         })).collect::<Vec<_>>(),
-    }))
+    });
+    // AF-320. `failures: []` is THE reading a sweep takes from this endpoint,
+    // and "nothing is failing" and "the monitor has never completed a pass"
+    // produce the identical empty list. The prose note below already says so in
+    // the !has_stored arm; this is the same clause as a field, so a caller that
+    // does not read notes cannot miss it.
+    Json(if has_stored {
+        crate::api::measured::measured(body, latest.len())
+    } else {
+        crate::api::measured::unmeasured(
+            body,
+            "no invariant results are stored — the monitor has not completed a pass in \
+             this process, so an empty `failures` is the absence of a measurement",
+        )
+    })
     .into_response()
 }
 
@@ -277,7 +297,12 @@ async fn debug(State(state): State<AppState>) -> Response {
             "by_section_slowest_first": secs,
         })
     });
-    Json(json!({
+    // AF-320: `latest_per_invariant: []` reads as a quiet system, and is also
+    // what an unrun monitor produces. n_considered is the invariants with a
+    // stored verdict.
+    let n_latest = latest.len();
+    Json(crate::api::measured::measured(
+        json!({
         "live_incidents": incidents,
         "latest_per_invariant": latest,
         "stale_checks": stale,
@@ -297,7 +322,9 @@ async fn debug(State(state): State<AppState>) -> Response {
                                     /api/health/invariants pays on every call, and null means no \
                                     run has happened in this process, not that it is free.",
         }
-    }))
+        }),
+        n_latest,
+    ))
     .into_response()
 }
 

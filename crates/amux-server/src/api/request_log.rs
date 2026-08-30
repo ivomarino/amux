@@ -825,7 +825,11 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         }
         _ => 0.0,
     };
-    Json(json!({
+    // AF-320: `count: 0` is ambiguous on its own — no matching events, or a
+    // window nobody read. n_considered is the matched population, which is the
+    // number that disambiguates it.
+    Json(crate::api::measured::measured(
+        json!({
         "events": events,
         "count": events.len(),
         "total_matched": total,
@@ -840,7 +844,9 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
              Page backward with `until=<the oldest ts in this page>`, or read \
              `total_matched` for volume. Do not describe this page as the window."
         } else { "" },
-    }))
+        }),
+        total.max(0) as usize,
+    ))
     .into_response()
 }
 
@@ -924,8 +930,25 @@ async fn get_logs_raw(
         .clamp(1, 5000);
     let log_path = super::settings::amux_home().join("logs").join("server-rs.log");
     match raw_payload(&log_path, lines_n, &state) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => internal(e),
+        Ok(v) => {
+            // n_considered is the whole tailable population (log file lines +
+            // request-log rows), not the page returned — `lines: []` with a
+            // large population is a filter result, with a zero it is an empty
+            // log, and the page length cannot tell them apart (AF-320).
+            let n = v.get("total").and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
+            Json(crate::api::measured::measured(v, n)).into_response()
+        }
+        // A 500 here used to answer with no `lines` key at all, which any
+        // tolerant reader renders as "no log lines". Keep the status, and say
+        // in the body that nothing was read.
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(crate::api::measured::unmeasured(
+                json!({ "lines": [], "total": 0, "error": e.to_string() }),
+                "the log tail could not be built, so no line was read",
+            )),
+        )
+            .into_response(),
     }
 }
 
@@ -1963,7 +1986,11 @@ async fn analyze(
         })
         .collect();
 
-    Json(json!({
+    // AF-320. `total_errors: 0` is the reading this endpoint most often serves
+    // and the one it can least afford to serve ambiguously: no errors in the
+    // window, or a window that was never scanned. n_considered is rows scanned.
+    Json(crate::api::measured::measured(
+        json!({
         "since_h": since_h,
         "window_start": cutoff, "window_start_local": local_when(cutoff),
         "generated_at": unix_now(),
@@ -1977,7 +2004,9 @@ async fn analyze(
         "groups_total": groups_total,
         "verdicts": verdicts,
         "route_table_size": ROUTE_TABLE.len(),
-    }))
+        }),
+        scanned as usize,
+    ))
     .into_response()
 }
 
@@ -2308,7 +2337,11 @@ async fn stats(
 
     let now = unix_now();
     let actual_window_h = oldest_ts.map(|ots| (now - ots) / 3600.0);
-    Json(json!({
+    // AF-320. `window_rows` is the true pre-sample population, which is exactly
+    // the n_considered this contract asks for: a families list that comes back
+    // empty over 0 rows and over 40,000 rows are different answers.
+    Json(crate::api::measured::measured(
+        json!({
         "since_h": since_h,
         "actual_window_h": actual_window_h.map(round2),
         "oldest_row_ts": oldest_ts,
@@ -2351,7 +2384,9 @@ async fn stats(
             "restart_spanning_excluded": spanned,
         },
         "slow_outliers": outliers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
-    }))
+        }),
+        window_rows as usize,
+    ))
     .into_response()
 }
 
@@ -2418,7 +2453,11 @@ pub async fn debug_routes() -> axum::Json<Value> {
             path == f.family || (path.starts_with(f.family) && path[f.family.len()..].starts_with('/'))
         })
     };
-    axum::Json(json!({
+    // AF-320: the population here is the route table itself, so a truncated or
+    // empty listing is readable as such rather than as "the server mounts
+    // nothing".
+    axum::Json(crate::api::measured::measured(
+        json!({
         "count": ROUTE_TABLE.len(),
         "routes": ROUTE_TABLE.iter().map(|e| json!({
             "family": family_of(e.path),
@@ -2438,7 +2477,9 @@ pub async fn debug_routes() -> axum::Json<Value> {
                        honest both directions by tests/route_table.rs against the real \
                        router composition",
         },
-    }))
+        }),
+        ROUTE_TABLE.len(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

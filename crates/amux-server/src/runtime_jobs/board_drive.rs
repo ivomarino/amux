@@ -4558,8 +4558,13 @@ pub async fn debug_board_drive(
     // now. This is the number that says how much work the loop is responsible
     // for, independent of what the last tick happened to do.
     let mut waiting: Vec<Value> = Vec::new();
+    // AF-320: `backlog: []` means either no lane is waiting or the store was
+    // never opened, and the `if let Ok` below makes the second a silent path.
+    // `lanes_considered` is None exactly when nothing was examined.
+    let mut lanes_considered: Option<usize> = None;
     if let Ok(conn) = state.store.read() {
         let lanes = crate::api::session_verbs::all_lane_names();
+        lanes_considered = Some(lanes.len());
         for lane in lanes {
             let n = eligible_todo_count(&conn, &lane, crate::config::now_f64());
             if n > 0 {
@@ -4591,6 +4596,14 @@ pub async fn debug_board_drive(
         "capture_shells": capture_shells,
         "queue_shape": queue_shape,
     });
+    let body = match lanes_considered {
+        Some(n) => crate::api::measured::measured(body, n),
+        None => crate::api::measured::unmeasured(
+            body,
+            "the store could not be opened, so no lane's eligible-card count was read — \
+             an empty backlog here is the absence of a measurement",
+        ),
+    };
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
 }
 
