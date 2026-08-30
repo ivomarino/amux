@@ -372,42 +372,86 @@ def _content_is_committed(top, rel, base=None):
         return False
 
 
-def _discard_verdict(cmd, scrubbed, run_dir):
-    """AC-212 (2026-08-04): block a PATH-SCOPED discard that would destroy ANOTHER
-    session's uncommitted work.
+# A REDIRECT IS NOT A PATHSPEC (AMUX-3890, filed by mixpeek-docs 2026-08-29).
+#
+# The operand scan splits on `--` and treats everything after it as a path. Shell
+# redirection survives that split, so a redirect token becomes a phantom pathspec
+# and vetoes the whole Bash call. The reported specimen:
+#
+#   git -C ~/Dev/mixpeek checkout origin/main -- docs/platform/syncs.mdx \
+#       docs/retrieval/cookbook.mdx 2>&1 | head -30
+#
+#   -> "2 path(s) NOT blocked ... syncs.mdx, cookbook.mdx"
+#      "BLOCKED ... another session -- 2> (recently edited ...)"
+#
+# The blocked path is the literal string `2>`, in the same message that explicitly
+# cleared both real paths. Dropping `2>&1 | head -30` let the identical command
+# through. The `&` inside `2>&1` truncates the tail regex mid-token, which is what
+# leaves a bare `2>` behind; a fused `2>/dev/null` survives whole and is just as
+# wrong.
+#
+# Two costs, and the second is the one that makes this worth a helper. The guard
+# stops the entire Bash call, so one phantom token vetoes a command whose every
+# real path the guard already cleared. And the refusal names a nonexistent file as
+# another session's work, which reads as a genuine ownership conflict and invites a
+# guard-allow-once that was never needed — a false positive that actively teaches
+# people to bypass the guard is worse than one that merely annoys them.
+#
+# FAIL-OPEN BY CONSTRUCTION, matching the rest of this file: this only ever REMOVES
+# candidate paths. A pathological filename that genuinely looks like a redirect goes
+# unchecked rather than being falsely blocked, which is the same direction every
+# other fallback here takes.
+_REDIR_DUP = re.compile(r'^[0-9]*[<>]&[0-9]*-?$')                    # 2>&1  >&2  2>&-
+_REDIR_OP = r'(?:[0-9]*(?:>>|>|<<<|<<|<)|&>>|&>)'
+_REDIR_BARE = re.compile(r'^' + _REDIR_OP + r'$')                    # >  2>  >>  <  &>
+_REDIR_FUSED = re.compile(r'^' + _REDIR_OP + r'\S+$')                # 2>/dev/null  >out.txt
 
-    The guard above covers only TREE-WIDE destroys and its own docstring says
-    path-scoped ops "pass". That exemption was written for multi-directory repos,
-    where naming a path really does narrow the blast radius to your own work. It is
-    exactly inverted in a SINGLE-FILE repo: `git checkout -- amux-server.py` names
-    one path, and that one path holds every session's edits. I destroyed a peer's
-    uncommitted fix that way while reverting my own ~20 lines; `git diff --stat`
-    had said 63 insertions and I never asked whose the other 43 were.
 
-    Why this direction deserves a guard MORE than the two that already have one:
-    committing or pushing a peer's work is RECOVERABLE — the content is in the
-    object store, revertable, and the PASSENGER convention names it. Destroying
-    unstaged work leaves no object and no reflog entry. amux guarded both
-    recoverable directions and left the unrecoverable one open.
+def _strip_redirections(toks):
+    """Drop shell redirection tokens (and their targets) from an operand list.
 
-    Detection is deliberately narrow, because a false block on `git checkout <branch>`
-    would be worse than the gap:
-      - checkout: only with an explicit `--` separator (a branch switch has none)
-      - restore:  skipped when --staged/-S is present WITHOUT --worktree/-W, since
-                  that only unstages and the worktree content survives
-      - `.` is left to the tree-wide patterns above
-    Attribution is not guessed here: it reuses POST /api/git/staged-guard, which is
-    already generic ({session,dir,paths} -> foreign) rather than commit-specific, and
-    derives ownership from each session's own JSONL transcript.
+    The three tests are ORDERED, and both orderings that look fine are wrong:
 
-    Fail-open on anything unexpected, same posture as the rest of this guard.
-    Returns a block-reason string, or None to allow."""
-    import shlex, urllib.request, ssl, subprocess
-    if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore)\b', scrubbed):
-        return None
-    # Detect on `scrubbed` (so prose/docs that merely mention the command never
-    # match), but extract the operands from the ORIGINAL cmd — scrubbing removes
-    # quoted strings, which is where a filename with a space would live.
+      DUP before BARE   — `2>&1` is self-contained. Let BARE see it first and it
+                          matches the `2>` prefix, sets skip, and eats the NEXT
+                          token, which is a real pathspec.
+      BARE before FUSED — `>>` is two operator characters. FUSED reads that as
+                          operator `>` plus target `>`, drops it as self-contained,
+                          and orphans the `log` in `>> log` back into the path list.
+                          Caught by the table below, which is why it is a table."""
+    out, skip = [], False
+    for t in toks:
+        if skip:
+            skip = False          # this token is the previous operator's target
+            continue
+        if _REDIR_DUP.match(t):
+            continue              # `2>&1` — self-contained, nothing follows
+        if _REDIR_BARE.match(t):
+            skip = True           # `> out.txt` — drop the operator AND its target
+            continue
+        if _REDIR_FUSED.match(t):
+            continue              # `2>/dev/null` — operator and target in one token
+        out.append(t)
+    return out
+
+
+
+
+def _discard_operands(cmd):
+    """Extract (paths, src_refs) from every checkout/restore invocation in `cmd`.
+
+    LIFTED OUT OF `_discard_verdict` SO A TEST CAN REACH IT (AMUX-3890). The
+    verdict function POSTs to /api/git/staged-guard and fails open when the server
+    is unreachable, so nothing that goes through it can pin operand parsing: the
+    "not blocked" assertion is green with the parser broken. This is the layer the
+    bug lives at, so this is the layer the test has to call.
+
+    That distinction is not hypothetical here. The first version of the AMUX-3890
+    test called `_strip_redirections` directly and passed a mutation that deleted
+    its only call site — pinning the helper while leaving the wiring untested,
+    which is exactly the failure ethos rule 7 names: a check on the wrong layer is
+    exactly as green as one on the right layer."""
+    import shlex
     paths = []
     src_refs = set()
     for m in re.finditer(r'\bgit\s+(?:-C\s+\S+\s+)?(checkout|restore)\b([^\n;&|]*)', cmd):
@@ -416,6 +460,7 @@ def _discard_verdict(cmd, scrubbed, run_dir):
             toks = shlex.split(tail)
         except ValueError:
             continue
+        toks = _strip_redirections(toks)
         if sub == "checkout":
             if "--" not in toks:
                 # `git checkout <tree-ish> <paths>...` WITHOUT `--` IS A PATH
@@ -454,6 +499,46 @@ def _discard_verdict(cmd, scrubbed, run_dir):
             cand = (toks[toks.index("--") + 1:] if "--" in toks
                     else [t for t in toks if not t.startswith("-")])
         paths += [p for p in cand if p != "." and not p.startswith("-")]
+    return paths, src_refs
+
+
+def _discard_verdict(cmd, scrubbed, run_dir):
+    """AC-212 (2026-08-04): block a PATH-SCOPED discard that would destroy ANOTHER
+    session's uncommitted work.
+
+    The guard above covers only TREE-WIDE destroys and its own docstring says
+    path-scoped ops "pass". That exemption was written for multi-directory repos,
+    where naming a path really does narrow the blast radius to your own work. It is
+    exactly inverted in a SINGLE-FILE repo: `git checkout -- amux-server.py` names
+    one path, and that one path holds every session's edits. I destroyed a peer's
+    uncommitted fix that way while reverting my own ~20 lines; `git diff --stat`
+    had said 63 insertions and I never asked whose the other 43 were.
+
+    Why this direction deserves a guard MORE than the two that already have one:
+    committing or pushing a peer's work is RECOVERABLE — the content is in the
+    object store, revertable, and the PASSENGER convention names it. Destroying
+    unstaged work leaves no object and no reflog entry. amux guarded both
+    recoverable directions and left the unrecoverable one open.
+
+    Detection is deliberately narrow, because a false block on `git checkout <branch>`
+    would be worse than the gap:
+      - checkout: only with an explicit `--` separator (a branch switch has none)
+      - restore:  skipped when --staged/-S is present WITHOUT --worktree/-W, since
+                  that only unstages and the worktree content survives
+      - `.` is left to the tree-wide patterns above
+    Attribution is not guessed here: it reuses POST /api/git/staged-guard, which is
+    already generic ({session,dir,paths} -> foreign) rather than commit-specific, and
+    derives ownership from each session's own JSONL transcript.
+
+    Fail-open on anything unexpected, same posture as the rest of this guard.
+    Returns a block-reason string, or None to allow."""
+    import urllib.request, ssl, subprocess
+    if not re.search(r'\bgit\s+(?:-C\s+\S+\s+)?(?:checkout|restore)\b', scrubbed):
+        return None
+    # Detect on `scrubbed` (so prose/docs that merely mention the command never
+    # match), but extract the operands from the ORIGINAL cmd — scrubbing removes
+    # quoted strings, which is where a filename with a space would live.
+    paths, src_refs = _discard_operands(cmd)
     if not paths:
         return None
     top = subprocess.run(["git", "-C", run_dir, "rev-parse", "--show-toplevel"],

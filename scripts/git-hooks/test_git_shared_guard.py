@@ -231,7 +231,68 @@ def main():
             f"found only {_bodies} staged-guard POST bodies — the AST walk is not "
             f"reaching them, so the `op` check above is vacuous")
 
-    total = len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
+    # ── AMUX-3890: a redirect is not a pathspec ────────────────────────────
+    #
+    # Tested at the helper rather than end-to-end ON PURPOSE. `_discard_verdict`
+    # POSTs to /api/git/staged-guard and FAILS OPEN when the server is
+    # unreachable, so an end-to-end "this command is not blocked" case passes
+    # just as green with the bug present as with it fixed. It would pin nothing.
+    # `_strip_redirections` is the seam where the defect actually lives and the
+    # only place a check here can genuinely fail (ethos rule 7).
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_gsg", HOOK)
+    _gsg = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_gsg)
+    _operands = _gsg._discard_operands
+
+    # Called through `_discard_operands`, the WIRED path, not `_strip_redirections`
+    # directly. The first version of this test called the helper and passed a
+    # mutation that deleted its only call site, which is ethos rule 7 exactly: a
+    # check pinning the wrong layer is as green as one pinning the right layer.
+    # Inputs are raw command strings, so the operand regex, shlex, the `--` split
+    # and the redirection strip are all under test together.
+    D = "/Users/ethan/Dev/mixpeek"
+    redir_cases = [
+        # The reported specimen. `2>&1` is truncated to a bare `2>` by the operand
+        # regex (it stops at `&`), and that `2>` was reaching the path list and
+        # being reported as another session's uncommitted file.
+        ("reported specimen",
+         f"git -C {D} checkout origin/main -- docs/platform/syncs.mdx docs/retrieval/cookbook.mdx 2>&1 | head -30",
+         ["docs/platform/syncs.mdx", "docs/retrieval/cookbook.mdx"]),
+        ("fused 2>/dev/null",
+         "git checkout origin/main -- a.mdx 2>/dev/null", ["a.mdx"]),
+        ("stdout to file",
+         "git checkout origin/main -- a.mdx > out.txt", ["a.mdx"]),
+        ("append to file",
+         "git checkout origin/main -- a.mdx >> log", ["a.mdx"]),
+        ("fused >out",
+         "git checkout origin/main -- a.mdx >out.txt", ["a.mdx"]),
+        ("both streams",
+         "git checkout origin/main -- a.mdx &> log", ["a.mdx"]),
+        ("stdin redirect",
+         "git checkout origin/main -- a.mdx < in.txt", ["a.mdx"]),
+        ("restore with redirect",
+         "git restore --worktree --source=origin/main -- a.mdx 2>&1", ["a.mdx"]),
+        ("no-dashdash form with redirect",
+         "git checkout origin/main a.mdx 2>/dev/null", ["a.mdx"]),
+        # Must NOT over-strip: real pathspecs still arrive, redirect or not.
+        ("plain, no redirect",
+         "git checkout origin/main -- a.mdx b.mdx", ["a.mdx", "b.mdx"]),
+        ("path containing >",
+         "git checkout origin/main -- 'weird>name.txt'", ["weird>name.txt"]),
+    ]
+    for _name, _cmd, _want in redir_cases:
+        _paths, _ = _operands(_cmd)
+        if _paths != _want:
+            failures.append(
+                f"_discard_operands/{_name}: paths {_paths} != expected {_want} "
+                f"(from {_cmd!r}) — a redirection token reaching the path list is "
+                f"AMUX-3890, where the guard reported a file literally named `2>` "
+                f"as another session's uncommitted work while clearing both real "
+                f"paths in the same message")
+
+    total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
+             + len(redir_cases))
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:
