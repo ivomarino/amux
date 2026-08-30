@@ -356,7 +356,7 @@ async fn get_contract(
         // reason: a gate you can only learn by tripping it teaches nobody.
         "needsyou_requires_typed_ask": {
             "rule": "a card entering needsyou must carry `ask_type`, `ask_question` and `ask_unblocks`",
-            "why": "445 cards were parked here at a median age of 15 days and 51% of them were not blocked on a human at all — `needsyou` was the only status that cost a worker nothing and stopped the nudge, so the ~20 real asks became unfindable",
+            "why": "389 live cards were parked here at a median age of 15 days and 51% of them were not blocked on a human at all — `needsyou` was the only status that cost a worker nothing and stopped the nudge, so the ~20 real asks became unfindable",
             "ask_types": bs::ASK_TYPE_HELP.iter().map(|(k, v)| json!({"type": k, "means": v})).collect::<Vec<_>>(),
             "fields": "`ask_question` is what you are asking, `ask_unblocks` is what ends the block — both a sentence (3+ words). All three writable on their own, so a refused transition cannot discard them",
             "enforced": "server-validated on any transition to needsyou; force bypasses it (logged); gate_ack cannot",
@@ -4217,21 +4217,22 @@ pub async fn patch_item(
 
                     // AF-317 (a): A LANE'S `todo` IS A DISPATCH QUEUE, NOT A PILE.
                     //
-                    // Measured 2026-08-29: 358 todo cards, median age 28.8 days,
-                    // 88% older than a week, against 48 done. Ethan the same
-                    // morning: "some workers have an infinite # of growing
-                    // backlogs and todo then they go idle."
+                    // Ethan, 2026-08-29: "some workers have an infinite # of
+                    // growing backlogs and todo then they go idle."
+                    //
+                    // AF-317's "median age 28.8 days" counted ARCHIVED cards and
+                    // does not hold: live it is 88 todo cards at a median of 0.8
+                    // days. What justifies a ceiling is DEPTH on a few lanes —
+                    // 22 lanes hold a live todo, 4 are over 5 (11, 9, 8, 6).
                     //
                     // The refusal LISTS THE STALEST CARDS FIRST, and that is not
                     // a nicety. `board_drive` already stops dealing any todo
-                    // nobody has touched in 7 days, and measured 2026-08-30, 55
-                    // of 125 agent todo cards were already past that edge at a
-                    // median 27.4 days untouched — counted in a pickup trace
-                    // that only prints when the queue is otherwise EMPTY, so a
-                    // lane with one live card never saw it. Those cards are the
-                    // answer to "what do I close first" because they are already
-                    // not being worked; the queue is long precisely because they
-                    // fell out of it silently.
+                    // nobody has touched in 7 days, and measured 2026-08-30, 4
+                    // of the 72 live agent todo cards were already past that
+                    // edge — counted in a pickup trace that only prints when the
+                    // queue is otherwise EMPTY, so a lane with one live card
+                    // never saw it. Those cards are the answer to "what do I
+                    // close first" because they are already not being worked.
                     let wip_limit = if force || target != TaskStatus::Todo {
                         0
                     } else {
@@ -4294,10 +4295,13 @@ pub async fn patch_item(
 
                     // AF-317 (b): `blocked` MUST NAME WHAT IT IS WAITING ON.
                     //
-                    // 95% of blocked cards were older than 7 days, and only 16 of
-                    // 70 carried a `depends_on`. A block with no named condition
-                    // has nobody watching for the unblock, so it is not blocked,
-                    // it is abandoned with a nicer status.
+                    // Measured 2026-08-30 over LIVE cards (AF-317's 70 counted
+                    // archived rows; live it is 32): 31 of the 32 open blocked
+                    // cards are older than a week, 16 name a `depends_on` and 19
+                    // carry a trigger. A block with no named condition has
+                    // nobody watching for the unblock, so it is not blocked, it
+                    // is abandoned with a nicer status. This is the one AF-317
+                    // statistic that survived re-measurement.
                     let blocked_gate = !force
                         && target == TaskStatus::Blocked
                         && bs::blocked_needs_watch(next.session.as_deref());
@@ -4324,7 +4328,7 @@ pub async fn patch_item(
                                         "blocked": true,
                                         "item": next.id,
                                         "attempted_status": target_raw,
-                                        "why": "A block with no named condition has nobody watching for the unblock. Measured 2026-08-29: 95% of blocked cards were older than 7 days and only 16 of 70 named a dependency — which is what a status with no exit looks like.",
+                                        "why": "A block with no named condition has nobody watching for the unblock. Measured 2026-08-30 over live cards: 31 of the 32 open blocked cards are older than a week — which is what a status with no exit looks like.",
                                         "how_to_fix": {
                                             "on_another_card": "PATCH {\"depends_on\": [\"<ID>\"]} — the card that has to land first",
                                             "on_a_condition": "amux board backlog <ID> --trigger \"<the condition that re-arms it>\" — re-checked, so the card comes back on its own",
@@ -4366,7 +4370,7 @@ pub async fn patch_item(
                         if verdict != bs::AskVerdict::Ok {
                             let (why, code) = match verdict {
                                 bs::AskVerdict::NoType => (
-                                    "This card does not say what KIND of human act it is waiting on. 51% of the 445 cards already parked here (median age 15 days) are not blocked on a human at all — they are work someone stopped doing, and they are why the real asks go unanswered.",
+                                    "This card does not say what KIND of human act it is waiting on. 51% of the cards already parked here are not blocked on a human at all (389 of them, live, median age 15 days) — they are work someone stopped doing, and they are why the real asks go unanswered.",
                                     "needsyou_requires_ask_type",
                                 ),
                                 bs::AskVerdict::UnknownType => (

@@ -1249,9 +1249,13 @@ async fn blocked_refuses_a_card_that_names_no_watch() {
 ///
 /// The specimen is not an empty card — the old gates already caught those. It
 /// is a card whose title and desc are perfectly ordinary engineering work, the
-/// shape 227 of the 445 live `needsyou` cards actually have ("Compute
+/// shape roughly half the live `needsyou` cards actually have ("Compute
 /// Utilization Audit", "Fix Namespace Pollution"). Those pass every other gate
 /// on the board and are exactly what makes the ~20 real asks unfindable.
+///
+/// The population is 389 live, not the 445 the filing card quoted: that query
+/// counted archived rows. The 51% share is unaffected, and the shape is what
+/// this test pins.
 #[tokio::test]
 async fn needsyou_refuses_a_park_that_names_no_human_act() {
     let (app, _tmp) = app();

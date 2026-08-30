@@ -1,9 +1,15 @@
 //! A card that fell out of the dispatch queue has to say so (AF-317).
 //!
-//! MEASURED 2026-08-29 from `/api/board` (1,978 cards): `todo` holds 321 cards
-//! at a median age of 28.8 days, 88% of them older than a week, against 48
-//! `done`. Ethan the same morning: "some workers have an infinite # of growing
-//! backlogs and todo then they go idle."
+//! Ethan, 2026-08-29: "some workers have an infinite # of growing backlogs and
+//! todo then they go idle."
+//!
+//! THE FILING CARD'S HEADLINE NUMBER DID NOT SURVIVE VERIFICATION, and this
+//! note is here because the wrong version shipped first (dfa7187c). AF-317
+//! measured "todo: 321 cards, median age 28.8 days" from `/api/board`, and that
+//! query counted ARCHIVED cards. Re-measured against the DB on 2026-08-30 with
+//! `COALESCE(archived,0)=0`: 88 live todo cards, median age 0.8 DAYS. The
+//! month-old population is real and it is entirely archived, which every
+//! dispatch mechanism already excludes. So `todo` is not a graveyard.
 //!
 //! THE OBVIOUS READING OF THAT IS WRONG, and getting it wrong would have
 //! produced a weaker fix than the one already in the tree. The card that filed
@@ -13,10 +19,15 @@
 //! would have loosened an existing rule while reading like a new constraint.
 //!
 //! The real gap is what happens at that edge, which is nothing. Measured
-//! 2026-08-30: 55 of 125 agent-owned todo cards were ALREADY past the freshness
-//! edge, median 27.4 days untouched. They still read `todo` on the board and in
-//! every list, so their status says dispatchable while the mechanism has
-//! excluded them — ethos rule 4, in the board's own state field. The exclusion
+//! 2026-08-30 over LIVE cards: 4 of the 72 agent-owned todo cards in the
+//! dispatch pool are past the freshness edge, median 9.9 days untouched. (The
+//! first version of this comment said 55 of 125 at a median of 27.4 days, from
+//! the same archived-inclusive query as above; 67 of those 55 were archived.
+//! Correcting it rather than deleting it, because the mechanism below is
+//! justified at 4 cards and a reader deserves the real order of magnitude.)
+//! Those 4 still read `todo` on the board and in every list, so their status
+//! says dispatchable while the mechanism has excluded them — ethos rule 4, in
+//! the board's own state field. The exclusion
 //! IS counted, by `stale_gate_excluded_todos`, and surfaced in the pickup trace;
 //! but only when the queue is otherwise EMPTY, so a lane holding one live card
 //! and eight dead ones never sees it, and the trace reaches no owner anyway.

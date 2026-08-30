@@ -436,9 +436,15 @@ pub const TODO_WIP_LIMIT_KEY: &str = "AMUX_TODO_WIP_LIMIT";
 /// How many `todo` cards one lane may hold. 0 disables the limit for that scope.
 ///
 /// Five, because `todo` is the DISPATCH QUEUE and a dispatch queue longer than a
-/// lane can work is not a queue, it is a pile. Measured 2026-08-29: 358 todo
-/// cards, median age 28.8 days, against 48 done. Ethan, the same morning: "some
-/// workers have an infinite # of growing backlogs and todo then they go idle."
+/// lane can work is not a queue, it is a pile.
+///
+/// THE JUSTIFICATION IS NARROWER THAN AF-317 CLAIMED, corrected here after the
+/// first version shipped. That card's "358 todo cards, median age 28.8 days"
+/// counted ARCHIVED rows; live it is 88 cards at a median of 0.8 days, so the
+/// queue is not old. What survives is depth on a few lanes and Ethan's own
+/// report: measured 2026-08-30, 22 lanes hold a live todo and 4 are over 5
+/// (11, 9, 8, 6). Ethan, 2026-08-29: "some workers have an infinite # of
+/// growing backlogs and todo then they go idle."
 ///
 /// The limit is a CEILING ON QUEUEING, not on working: `backlog` is unbounded on
 /// purpose and is where a card that is real but not next belongs.
@@ -492,9 +498,9 @@ pub fn todo_wip_count(conn: &Connection, session: &str, excluding: &str) -> i64 
 ///
 /// This is what the WIP refusal prints, and the choice of ORDER is the point.
 /// Sorting by `updated` puts the cards the dispatcher has ALREADY stopped
-/// dealing at the top — measured 2026-08-30, 55 of 125 agent todo cards were
-/// past the 7-day freshness edge with a median 27.4 days untouched, invisible
-/// to everyone. So the answer to "what do I close first" is the same list as
+/// dealing at the top — measured 2026-08-30 over live cards, 4 of the 72 in the
+/// dispatch pool are past the 7-day freshness edge, median 9.9 days untouched,
+/// and invisible to everyone. So the answer to "what do I close first" is the same list as
 /// "what is already not being worked", and the refusal hands over both.
 pub fn stalest_todos(conn: &Connection, session: &str, n: usize) -> Vec<(String, String, i64)> {
     let now = crate::config::now_f64();
