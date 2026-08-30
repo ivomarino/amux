@@ -1427,6 +1427,30 @@ fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
         .collect()
 }
 
+/// For a set of blocking dep ids, return the subset that are `backlog` cards
+/// owned by `session`. These are self-resolvable: the lane can promote them
+/// to `todo` itself without any human or cross-lane action.
+fn self_owned_backlog_blockers(conn: &Connection, dep_ids: &[String], session: &str) -> Vec<String> {
+    dep_ids
+        .iter()
+        .filter(|d| {
+            let row: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT status, session FROM issues WHERE id=?1 AND deleted IS NULL",
+                    rusqlite::params![d],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            matches!(row, Some((ref st, Some(ref sess)))
+                if sess == session
+                    && matches!(bs::parse_status(st), Some(TaskStatus::Backlog)))
+        })
+        .cloned()
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Drive to verified — re-activate a card parked on a dependency once it clears
 // ---------------------------------------------------------------------------
@@ -2007,6 +2031,7 @@ fn reviewer_has_responded(conn: &Connection, card: &str, reviewer: &str) -> Opti
 // ---------------------------------------------------------------------------
 
 /// A pickup decision: either a claim to make, or the reason there is none.
+#[derive(Debug)]
 pub enum Pickup {
     /// Claim this card and send this prompt.
     Claim { card: String, prompt: String },
@@ -2015,6 +2040,12 @@ pub enum Pickup {
     /// not a unit of work; the fix is the session SPLITTING it, which is
     /// judgment a model does well, not the card rotting.
     Decompose { ids: Vec<String>, text: String },
+    /// Every candidate is blocked, but all blockers are this session's own
+    /// `backlog` cards — self-resolvable without human or cross-lane action.
+    /// board_drive promotes them to `todo` automatically and re-runs pickup.
+    /// `blocked_card` is the todo that was waiting; `promoted` are the backlog
+    /// ids that were promoted. The lane receives no nudge — it just gets work.
+    PromoteDeps { blocked_card: String, promoted: Vec<String> },
     /// Nothing to do, with the reason and the detail for the trace.
     None { reason: &'static str, detail: String },
 }
@@ -2313,6 +2344,16 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
 
         let blocking = deps_blocking(conn, &row);
         if !blocking.is_empty() {
+            // Self-resolvable: all blockers are this session's own backlog cards.
+            // Promote them immediately so pickup can succeed on the next pass —
+            // the lane gets work without a nudge, and the log says why.
+            let self_owned = self_owned_backlog_blockers(conn, &blocking, session);
+            if !self_owned.is_empty() && self_owned.len() == blocking.len() {
+                return Pickup::PromoteDeps {
+                    blocked_card: id.clone(),
+                    promoted: self_owned,
+                };
+            }
             skipped.push(format!("{id} blocked by {}", blocking.join(",")));
             continue;
         }
@@ -4326,6 +4367,67 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     format!("{card} left 'todo' before the claim landed — not dispatched"),
                 )
                 .with_counts(eligible, open)
+            }
+        }
+        Pickup::PromoteDeps { blocked_card, promoted } => {
+            // The blocked todo's only blockers are this session's own backlog
+            // cards. Promote them to todo now so the next select_pickup pass
+            // can claim the unblocked card. No nudge — the lane gets work
+            // silently. Log so the trace is auditable.
+            let to_promote = promoted.clone();
+            let promote_now = now;
+            let result = state
+                .store
+                .write_async(move |conn| {
+                    let mut promoted_ids: Vec<String> = Vec::new();
+                    for dep_id in &to_promote {
+                        let n = conn.execute(
+                            "UPDATE issues SET status='todo', updated=?1 \
+                             WHERE id=?2 AND status='backlog' AND deleted IS NULL",
+                            rusqlite::params![promote_now as i64, dep_id],
+                        )?;
+                        if n == 1 {
+                            promoted_ids.push(dep_id.clone());
+                        }
+                    }
+                    Ok(crate::db::WriteOutcome {
+                        applied: !promoted_ids.is_empty(),
+                        events: vec![],
+                    })
+                })
+                .await;
+            match result {
+                Ok(reply) if reply.applied => {
+                    tracing::info!(
+                        session = lane, blocked = %blocked_card,
+                        deps = ?promoted,
+                        "board_drive: auto-promoted own backlog dep(s) → todo \
+                         (self_owned_backlog_blocker); will dispatch next tick"
+                    );
+                    LaneTrace::acted(
+                        lane,
+                        "promote-deps",
+                        &blocked_card,
+                        format!(
+                            "auto-promoted own backlog dep(s) {} → todo; \
+                             {blocked_card} dispatched next tick",
+                            promoted.join(", ")
+                        ),
+                    )
+                    .with_counts(eligible, open)
+                }
+                Ok(_) => LaneTrace::skip(
+                    lane,
+                    "promote-deps-raced",
+                    format!("deps of {blocked_card} moved before promotion landed"),
+                )
+                .with_counts(eligible, open),
+                Err(e) => LaneTrace::skip(
+                    lane,
+                    "promote-deps-err",
+                    format!("write failed promoting deps of {blocked_card}: {e}"),
+                )
+                .with_counts(eligible, open),
             }
         }
         Pickup::Decompose { ids, text } => {
@@ -7409,6 +7511,45 @@ mod tests {
         assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
         conn.execute("UPDATE issues SET status='verified' WHERE id='B-1'", []).expect("close");
         assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+    }
+
+    /// When a todo card is blocked only by the same session's own backlog cards,
+    /// select_pickup returns PromoteDeps so drive_lane can promote them and
+    /// dispatch the todo on the next tick — no human or cross-lane action needed.
+    /// Mirrors the live byo-ray incident (2026-08-30): BR-10 blocked by BR-9
+    /// (own backlog), budget spent, lane idle indefinitely.
+    #[test]
+    fn own_backlog_dep_returns_promote_deps() {
+        let conn = board_db();
+        // Same session owns both cards: the backlog dep and the todo that needs it.
+        add_card(&conn, "D-1", "lane", "backlog", "prerequisite work", "SCOPE: x");
+        add_card(&conn, "D-2", "lane", "todo", "downstream work", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on='[\"D-1\"]' WHERE id='D-2'", [])
+            .expect("dep");
+        match select_pickup(&conn, "lane", now_f64()) {
+            Pickup::PromoteDeps { blocked_card, promoted } => {
+                assert_eq!(blocked_card, "D-2");
+                assert_eq!(promoted, vec!["D-1"]);
+            }
+            other => panic!("expected PromoteDeps, got {other:?}"),
+        }
+    }
+
+    /// If the dep is another session's card (even if backlog), it is NOT
+    /// self-resolvable — select_pickup must leave it as all-candidates-refused.
+    #[test]
+    fn other_session_backlog_dep_does_not_promote() {
+        let conn = board_db();
+        add_card(&conn, "X-1", "other-lane", "backlog", "other session dep", "SCOPE: x");
+        add_card(&conn, "X-2", "lane", "todo", "blocked card", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on='[\"X-1\"]' WHERE id='X-2'", [])
+            .expect("dep");
+        match select_pickup(&conn, "lane", now_f64()) {
+            Pickup::None { reason, .. } => {
+                assert_eq!(reason, "all-candidates-refused");
+            }
+            other => panic!("expected None/all-candidates-refused, got {other:?}"),
+        }
     }
 
     /// Invariant 20: silence is the correct output for an empty board, and the
