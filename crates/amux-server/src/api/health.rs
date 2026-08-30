@@ -11,9 +11,40 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Serialize;
 
+/// AF-332 + AF-320. `ok: false` and "the probe never ran" are different facts
+/// and must not render identically, so `measured` travels beside the verdict
+/// and `rows_mapped` beside the count. An empty board and an unreadable board
+/// both yield zero rows; only `measured` separates them.
+#[derive(Serialize)]
+pub struct BoardProbe {
+    /// Did the probe run to completion? False means `ok` is meaningless.
+    pub measured: bool,
+    /// Did the real row mapper accept a row?
+    pub ok: bool,
+    /// Rows actually deserialized (0 or 1 — the probe is LIMIT 1). Zero with
+    /// measured:true and ok:true means the board is genuinely empty.
+    pub rows_mapped: usize,
+    /// Present only on failure, and it is the sentence a sweep will grep for.
+    pub error: Option<String>,
+}
+
 #[derive(Serialize)]
 pub struct Health {
     pub status: &'static str,
+    /// AF-332: the result of an ACTUAL bounded board read, not a liveness ping.
+    ///
+    /// On 2026-08-30 `GET /api/board` returned 500 to every session in the
+    /// fleet for ~20 minutes and NOTHING alarmed. /health was 200 with
+    /// store:"ok" throughout, no invariant covered a board read, autofix filed
+    /// nothing, and the dashboard rendered an empty board that is
+    /// indistinguishable from a quiet one. A human found it by noticing a
+    /// number looked wrong while verifying something unrelated.
+    ///
+    /// `store` could not have caught it and still cannot: it reports whether
+    /// the connection answers `current_rev()`, and the failure was in ROW
+    /// MAPPING. This field goes through the real `issue_from_row`, so the class
+    /// fails here the way it fails in `list_issues`.
+    pub board: BoardProbe,
     pub build: String,
     /// The commit the binary was built from (AMUX-3454), stamped by build.rs.
     /// `build` discriminates BINARIES but cannot answer "does this build
@@ -415,6 +446,45 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
         Ok(rev) => (Some(rev.0), "ok", StatusCode::OK),
         Err(_) => (None, "hung", StatusCode::SERVICE_UNAVAILABLE),
     };
+    // AF-332: exercise the REAL board read. This is the one probe here that
+    // deserializes a row, because the outage it exists to catch was a row-
+    // mapping failure that `current_rev()` above answered "ok" straight
+    // through. Bounded to one row: /health is polled constantly and
+    // `list_issues` is unbounded.
+    let board = match state.store.read() {
+        Ok(conn) => match crate::db::board_store::probe_board_read(&conn) {
+            Ok(n) => BoardProbe { measured: true, ok: true, rows_mapped: n, error: None },
+            Err(e) => {
+                // The two-fix rule: the fix, plus a signal that makes the next
+                // occurrence self-announce. This WARN is what a log sweep
+                // greps; without it the field is only visible to whoever
+                // happens to curl /health during the window, which is exactly
+                // how the 20-minute outage went unnoticed.
+                tracing::warn!(
+                    target: "health",
+                    "[health/board-probe AF-332] the board row mapper FAILED: {e}. \
+                     GET /api/board is very likely 5xx for the whole fleet right now; \
+                     `store` cannot see this class because it only checks current_rev()."
+                );
+                BoardProbe {
+                    measured: true,
+                    ok: false,
+                    rows_mapped: 0,
+                    error: Some(e.to_string()),
+                }
+            }
+        },
+        // Could not even take the connection. `measured:false` because the
+        // probe did not run, which is NOT the same claim as "the board is
+        // broken" and must not render as one.
+        Err(_) => BoardProbe {
+            measured: false,
+            ok: false,
+            rows_mapped: 0,
+            error: Some("store lock unavailable; probe did not run".into()),
+        },
+    };
+    let board_bad = board.measured && !board.ok;
     let fds = fd_health();
     // Descriptor pressure degrades `status` but does NOT fail the request: the
     // server is still serving, and returning 503 here would take the fleet down
@@ -428,13 +498,26 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
     (
         code,
         Json(Health {
+            // `degraded-board` ranks ABOVE fd pressure and below a hung
+            // store: an unreadable board means the surface the whole fleet
+            // coordinates through is down, which is worse than descriptor
+            // pressure and is the thing that went unreported for 20 minutes.
+            //
+            // It does NOT fail the request, same reasoning the fd branch
+            // records: a 503 here invites a watchdog restart, and a restart
+            // does not fix a schema drift or a serializer panic. `status` is
+            // the field that carries the alarm; `store` is the one that gates
+            // the code.
             status: if store != "ok" {
                 "degraded"
+            } else if board_bad {
+                "degraded-board"
             } else if fd_tight {
                 "degraded-fds"
             } else {
                 "ok"
             },
+            board,
             build: state.build_hash.clone(),
             commit: env!("AMUX_BUILD_COMMIT"),
             uptime_s: state.started.elapsed().as_secs(),

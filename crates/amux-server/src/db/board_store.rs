@@ -1673,6 +1673,35 @@ pub enum ArchivedFilter {
 /// drawn from) — [`cap_terminal`] is a separate step the API applies after.
 /// Status filter values are canonicalized on both sides so `needs_you`
 /// matches a `needsyou` row.
+/// AF-332: a BOUNDED board read through the REAL row mapper, for /health.
+///
+/// WHY NOT `SELECT 1`. On 2026-08-30 `GET /api/board` returned 500 to every
+/// session in the fleet for ~20 minutes and nothing alarmed. The failure was in
+/// ROW MAPPING, not in the query or the connection, so `current_rev()` answered
+/// fine and `/health` stayed green throughout. A liveness probe that does not
+/// deserialize a row cannot see that class at all, and this one exists
+/// specifically to see it: same `COLS`, same `issue_from_row`, so a schema
+/// drift or a serializer panic fails HERE the way it fails in `list_issues`.
+///
+/// `LIMIT 1` because the point is to exercise the path, not to measure the
+/// board. /health is polled often and `list_issues` is unbounded.
+///
+/// Returns the number of rows actually mapped, so the caller can distinguish
+/// "mapped a row" from "the table is empty" - which are the same `ok` to a
+/// probe that only reports success, and different facts (AF-320).
+pub fn probe_board_read(conn: &Connection) -> rusqlite::Result<usize> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
+         WHERE i.deleted IS NULL GROUP BY i.id LIMIT 1"
+    ))?;
+    let mut mapped = 0usize;
+    for row in stmt.query_map([], issue_from_row)? {
+        row?;
+        mapped += 1;
+    }
+    Ok(mapped)
+}
+
 pub fn list_issues(
     conn: &Connection,
     status_filter: &[String],
@@ -2329,6 +2358,57 @@ pub fn depends_on_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AF-332. The probe must catch what `current_rev()` cannot.
+    ///
+    /// The outage this exists for: `GET /api/board` 500'd for the whole fleet
+    /// for ~20 minutes while /health reported store:"ok" the entire time,
+    /// because the failure was in ROW MAPPING and the store check only asks
+    /// whether the connection answers a revision query. Nothing else amux has
+    /// covered it either - no invariant, no autofix detector, and a dashboard
+    /// showing an empty board that reads identically to a quiet one.
+    ///
+    /// So the cell that matters is not "the probe returns Ok on a good DB".
+    /// It is "the probe FAILS on a row the mapper cannot decode, in a database
+    /// whose connection is perfectly healthy". A `SELECT 1` liveness check
+    /// passes that case, which is precisely why it would not have helped.
+    #[test]
+    fn board_probe_fails_on_a_row_the_mapper_cannot_decode() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,created,updated) VALUES ('AF-1','t','todo',1,1)",
+            [],
+        )
+        .unwrap();
+
+        // Healthy baseline: the mapper decodes the row.
+        assert_eq!(probe_board_read(&conn).unwrap(), 1, "a good row must map");
+
+        // The CONTROL that makes the cell mean something: the connection is
+        // fine and a revision-style query still succeeds. This is the state
+        // /health reported as "ok" for 20 minutes.
+        assert!(
+            conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).is_ok(),
+            "the connection must be healthy, or this cell proves nothing"
+        );
+
+        // Now corrupt a column's TYPE, not the connection. SQLite is
+        // dynamically typed, so this is exactly how a schema drift or a bad
+        // write reaches the mapper in production.
+        conn.execute("UPDATE issues SET created = 'not-an-integer'", []).unwrap();
+
+        assert!(
+            probe_board_read(&conn).is_err(),
+            "the probe must FAIL on an undecodable row - if it passes here it \
+             is a liveness ping wearing a board read's name, and the AF-332 \
+             outage recurs invisibly"
+        );
+        // And the connection is STILL healthy, which is the whole point.
+        assert!(
+            conn.query_row("SELECT 1", [], |r| r.get::<_, i64>(0)).is_ok(),
+            "the store check would still say ok here - that is the gap"
+        );
+    }
 
     /// `last_verified_at` must read back from BOTH storage shapes.
     ///
