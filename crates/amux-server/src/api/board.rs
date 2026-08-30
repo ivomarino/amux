@@ -4103,8 +4103,37 @@ pub async fn patch_item(
                         && target == TaskStatus::Done
                         && bs::done_link_required(next.session.as_deref());
                     if link_required {
+                        // EVIDENCE COUNTS AS THE LINK, because it is one
+                        // (AMUX-3914). This gate scanned desc and log only,
+                        // while `--evidence` — which AF-321 SEPARATELY REQUIRES
+                        // on the same call — writes its own column. So the two
+                        // verbs a lane reaches for first, `status-update` and
+                        // `--evidence`, both wrote where this gate could not
+                        // look, and it refused cards whose artifact was already
+                        // recorded in the sanctioned place. Measured three times
+                        // on 2026-08-30: mixpeek-general on MG-1538 (outcome in
+                        // log, desc_len 0), and twice by amux, the second with a
+                        // real commit sha sitting in --evidence.
+                        //
+                        // Reuses `evidence_verdict` rather than testing the text
+                        // again here. That function already decides what counts
+                        // as an artifact — URL, path, sha, #N, a command, or
+                        // `none: <reason>` — and a second opinion in this file
+                        // would be the drift its own doc warns about. It also
+                        // means the DOCUMENTED escape finally works: CLAUDE.md
+                        // says `none: <reason>` "is stored and counted, not a
+                        // bypass", and until now this gate refused it, so an
+                        // honest close had to go through `--force` and was
+                        // logged as an override. That corrupted the override
+                        // signal itself — an audit of forced closes found two
+                        // that were the correct path.
+                        let evidence_names_artifact = next
+                            .evidence
+                            .as_deref()
+                            .is_some_and(|e| bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok);
                         let has_link = bs::has_asset_link(&next.desc)
-                            || next.log.as_deref().is_some_and(bs::has_asset_link);
+                            || next.log.as_deref().is_some_and(bs::has_asset_link)
+                            || evidence_names_artifact;
                         if !has_link {
                             // Surfaces so a sweep catches the next one without a
                             // human noticing (two-fixes rule): grep
@@ -4130,6 +4159,8 @@ pub async fn patch_item(
                                         "why": "A card cannot be marked done without pointing at the artifact it produced: a URL, a repo file path, a commit sha, or a #PR/issue. This is a global constraint and gate_ack cannot satisfy it.",
                                         "how_to_fix": {
                                             "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
+                                            "or_evidence": "--evidence naming the artifact satisfies this gate too (a command, path, URL, sha or #PR). This card's evidence is empty or has nothing checkable in it.",
+                                            "no_artifact": "If the work genuinely produced none, say so: evidence starting `none: <reason>` (three words or more) is accepted and counted, not a bypass.",
                                             "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
                                             "force": "true (explicit bypass; logged)"
                                         }

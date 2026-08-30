@@ -1498,7 +1498,12 @@ async fn none_needs_a_reason_and_then_it_is_accepted_and_stored() {
 #[tokio::test]
 async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
     let (app, _dir) = app();
-    // No link in the desc: no session, so the global default applies.
+    // No link anywhere: prose desc, and evidence that is prose too. Both of the
+    // places this gate reads are empty of anything checkable, so it refuses.
+    // `PROSE_EV` rather than `EV` since AMUX-3914 — `EV` is a backticked command,
+    // which now legitimately satisfies the gate, and a refusal case that supplies
+    // a valid artifact tests nothing.
+    const PROSE_EV: &str = "implemented it and it works";
     let card = create(
         &app,
         json!({ "title": "linkless", "status": "doing", "type": "chore", "desc": "just prose, nothing produced" }),
@@ -1509,17 +1514,75 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
+        Some(json!({ "status": "done", "evidence": PROSE_EV, "gate_ack": true })),
     )
     .await;
     assert_eq!(st, StatusCode::CONFLICT, "{v}");
     assert_eq!(v["code"], json!("done_requires_asset_link"));
 
-    // Add a real artifact link; the same ack now reaches done.
-    let (st, _, _) = send(
+    // AMUX-3914: EVIDENCE NAMING AN ARTIFACT SATISFIES THIS GATE, with the desc
+    // still prose. Before this, the two verbs a lane reaches for first —
+    // `status-update` (writes log) and `--evidence` (writes its own column, and
+    // is SEPARATELY REQUIRED on done by AF-321) — both wrote where this gate
+    // could not look. Measured three times on 2026-08-30, the last with a real
+    // commit sha sitting in --evidence while the gate refused.
+    let (st, _, v) = send(
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "evidence naming an artifact IS the link: {v}");
+    assert_eq!(v["status"], json!("done"));
+
+    // THE DOCUMENTED ESCAPE ACTUALLY WORKS NOW. CLAUDE.md says `none: <reason>`
+    // "is stored and counted, not a bypass"; this gate used to refuse it, so an
+    // honest close of a card that genuinely produced nothing had to go through
+    // `--force` and was logged as an override. Two such closes are on record.
+    let noart = create(
+        &app,
+        json!({ "title": "self-cleared", "status": "doing", "type": "chore", "desc": "a report that resolved itself" }),
+    )
+    .await;
+    let nid = noart["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{nid}"),
+        Some(json!({
+            "status": "done",
+            "evidence": "none: the rate limit reset on its own and no artifact was produced",
+            "gate_ack": true
+        })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "`none: <reason>` must close without --force: {v}");
+
+    // CONTROL: a bare `none:` is still refused. The escape is a reason, not a
+    // shrug, and an unexplained one is exactly what it exists to prevent — so
+    // the arm above must not have opened a hole.
+    let shrug = create(
+        &app,
+        json!({ "title": "shrug", "status": "doing", "type": "chore", "desc": "prose only" }),
+    )
+    .await;
+    let sid = shrug["id"].as_str().unwrap().to_string();
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{sid}"),
+        Some(json!({ "status": "done", "evidence": "none:", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "an unexplained `none:` must not pass: {v}");
+
+    // And the original path still works: an artifact link in the DESC, which is
+    // what this gate has always read.
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{sid}"),
         Some(json!({ "desc": "shipped in crates/amux-server/src/api/board.rs" })),
     )
     .await;
@@ -1527,7 +1590,7 @@ async fn done_requires_an_asset_link_and_gate_ack_cannot_fake_it() {
     let (st, _, v) = send(
         &app,
         "PATCH",
-        &format!("/api/board/{id}"),
+        &format!("/api/board/{sid}"),
         Some(json!({ "status": "done", "evidence": EV, "gate_ack": true })),
     )
     .await;
