@@ -1394,6 +1394,61 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                 return err(StatusCode::BAD_REQUEST, json!({ "error": "wait needs selector or text" }));
             }
         }
+        // TUBES-2343. Validated here with the rest, so a bad request is a 400
+        // whether or not a browser happens to be running and the schema stays
+        // testable without Chrome.
+        "files" => {
+            if get_str("selector").map(|s| s.trim().is_empty()).unwrap_or(true) {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "files needs a selector for the <input type=file>" }),
+                );
+            }
+            let paths = body.get("files").and_then(Value::as_array);
+            let Some(paths) = paths.filter(|a| !a.is_empty()) else {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "files needs a non-empty `files` array of absolute paths" }),
+                );
+            };
+            for p in paths {
+                let Some(p) = p.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "every entry in `files` must be a non-empty string path" }),
+                    );
+                };
+                // ABSOLUTE ONLY. CDP resolves a relative path against the
+                // BROWSER's working directory, not the caller's, so a relative
+                // path does not fail — it attaches the wrong file or nothing,
+                // and the upload under test then "passes" against a file the
+                // author never chose.
+                if !std::path::Path::new(p).is_absolute() {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": format!(
+                            "file path must be absolute, got {p:?} — CDP resolves a relative \
+                             path against the browser's working directory, not yours, so it \
+                             would silently attach the wrong file"
+                        ) }),
+                    );
+                }
+                // EXISTENCE, checked before the round trip. `DOM.setFileInputFiles`
+                // accepts a missing path and reports success; the page then sees
+                // an input with a file that has no bytes, which reads as a broken
+                // upload rather than as a bad request.
+                if !std::path::Path::new(p).exists() {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": format!(
+                            "no such file: {p:?} (resolved on the machine running Chrome). \
+                             setFileInputFiles reports success for a missing path, so this is \
+                             refused here rather than surfacing later as a broken upload"
+                        ) }),
+                    );
+                }
+            }
+        }
         "type" | "scroll" | "back" | "extract" => {}
         other => {
             return err(StatusCode::BAD_REQUEST, json!({ "error": format!("unknown action: {other}") }))
@@ -1520,6 +1575,32 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                     StatusCode::BAD_REQUEST,
                     json!({ "error": e.to_string(), "backend": "native" }),
                 ),
+            }
+        }
+        // TUBES-2343: attach local files to an <input type=file>.
+        //
+        // Every other action here drives the page through `Runtime.evaluate`,
+        // and this one CANNOT: `input.files` is not assignable from page script
+        // by design — that restriction is the browser's file-upload security
+        // model, not an oversight to work around. So the only route is the one
+        // the debugger protocol reserves for a driver,
+        // `DOM.setFileInputFiles`, which is also what page.setInputFiles is
+        // built on in Playwright.
+        //
+        // Consequence for the reader: this is the one action whose paths are
+        // resolved on the machine running CHROME, not by the page. Both
+        // validations above (absolute, exists) are about that seam.
+        "files" => {
+            let selector = get_str("selector").unwrap_or_default();
+            let files: Vec<String> = body
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            match chrome::set_input_files(&mut cdp, &selector, &files).await {
+                Ok(v) if v.get("error").is_some() => err(StatusCode::BAD_REQUEST, v),
+                Ok(v) => Json(v).into_response(),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
             }
         }
         "back" => match cdp.eval("history.back()", 10).await {
@@ -1861,7 +1942,8 @@ fn catalog_body(path: &str) -> Response {
             ],
             "actions": ["click (selector|index|x,y)", "type", "input", "key",
                         "scroll", "eval", "wait", "extract", "back",
-                        "viewport (width+height, or device=iphone|iphone-se|ipad|desktop)"],
+                        "viewport (width+height, or device=iphone|iphone-se|ipad|desktop)",
+                        "files (selector + files[]: absolute paths, sets an <input type=file>)"],
             "eval_contract": "script must be a bare EXPRESSION; a `return` statement yields null",
         })),
     )
@@ -2288,6 +2370,16 @@ mod tests {
             (r#"{"action":"viewport"}"#, "viewport needs width+height, or device"),
             (r#"{"action":"wait"}"#, "wait needs selector or text"),
             (r#"{"action":"dance"}"#, "unknown action: dance"),
+            // TUBES-2343.
+            (r#"{"action":"files","files":["/tmp/x"]}"#, "files needs a selector"),
+            (r##"{"action":"files","selector":"#f"}"##, "non-empty `files` array"),
+            (r##"{"action":"files","selector":"#f","files":[]}"##, "non-empty `files` array"),
+            (r##"{"action":"files","selector":"#f","files":[""]}"##, "must be a non-empty string"),
+            // RELATIVE PATHS ARE REFUSED, and the message says why: CDP
+            // resolves them against the BROWSER's cwd, so the attach would
+            // silently succeed against the wrong file.
+            (r##"{"action":"files","selector":"#f","files":["fixture.png"]}"##, "must be absolute"),
+            (r##"{"action":"files","selector":"#f","files":["./fixture.png"]}"##, "must be absolute"),
         ] {
             let (status, v, proxied) = send(&app, "POST", "/api/browser/action", Some(body)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
@@ -2297,6 +2389,45 @@ mod tests {
                 "{body}: {v}"
             );
         }
+        // A MISSING FILE IS A BAD REQUEST, NOT A BROKEN UPLOAD (TUBES-2343).
+        // `DOM.setFileInputFiles` accepts a path that is not there and reports
+        // SUCCESS, leaving the page with an input whose file has no bytes — so
+        // the fault surfaces later, inside whatever upload was under test,
+        // wearing the shape of a product bug. Refused here instead.
+        let missing = std::env::temp_dir().join("tubes-2343-does-not-exist.png");
+        let _ = std::fs::remove_file(&missing);
+        let body = format!(
+            r##"{{"action":"files","selector":"#f","files":[{}]}}"##,
+            json!(missing.to_string_lossy())
+        );
+        let (status, v, _) = send(&app, "POST", "/api/browser/action", Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap_or("").contains("no such file"), "{v}");
+
+        // CONTROL: an existing absolute path passes the SCHEMA and is refused
+        // only for want of a browser. Without this cell the assertions above
+        // would all pass against a handler that rejected every `files` request,
+        // which is a working schema and a dead action.
+        let present = std::env::temp_dir().join("tubes-2343-present.png");
+        std::fs::write(&present, b"x").expect("write fixture");
+        let body = format!(
+            r##"{{"action":"files","selector":"#f","files":[{}]}}"##,
+            json!(present.to_string_lossy())
+        );
+        let (status, v, _) = send(&app, "POST", "/api/browser/action", Some(&body)).await;
+        let _ = std::fs::remove_file(&present);
+        assert_ne!(status, StatusCode::BAD_REQUEST, "a valid files request must clear the schema: {v}");
+
+        // AND THE ACTION IS DISCOVERABLE. An action the contract does not list
+        // reaches nobody, which is the gap this card was filed about — the
+        // reporter read GET /api/browser, found no file verb, and concluded the
+        // upload path could not be driven (ethos rule 1).
+        let (_, v, _) = send(&app, "GET", "/api/browser", None).await;
+        assert!(
+            v["actions"].as_array().map(|a| a.iter().any(|x| x.as_str().unwrap_or("").starts_with("files"))).unwrap_or(false),
+            "the contract must list `files`: {v}"
+        );
+
         // start's viewport validation runs BEFORE any Chrome launch (AMUX-3403),
         // so a bad request is hermetic too.
         for (body, needle) in [

@@ -2356,6 +2356,129 @@ pub fn click_outcome(raw: &Value, what: &str, hint: &str) -> Value {
 }
 
 /// Click by CSS selector (Python `_bu_click_selector`).
+/// Attach local files to an `<input type=file>` (TUBES-2343).
+///
+/// # Why this is not an `eval`
+///
+/// Every other verb in this module drives the page with `Runtime.evaluate`.
+/// This one cannot: `input.files` is not assignable from page script, and that
+/// is the browser's file-upload security model rather than a gap to route
+/// around. `DOM.setFileInputFiles` is the seam the debugger protocol reserves
+/// for a driver, and it is what Playwright's `page.setInputFiles` is built on.
+///
+/// # The element is checked BEFORE the protocol call
+///
+/// `DOM.setFileInputFiles` against a non-file element fails with a protocol
+/// error that names neither the selector nor what was wrong with it, and
+/// against a MISSING path it reports SUCCESS — the page then holds an input
+/// whose file has no bytes, which reads as a broken upload rather than a bad
+/// request. The caller's paths are validated by the handler; the element is
+/// validated here, in one round trip, so both failures name themselves.
+///
+/// Returns `{"error": ...}` for a caller mistake (no such element, wrong
+/// element type) and `Err` only for a transport fault, matching
+/// [`click_selector`]'s split.
+pub async fn set_input_files(
+    c: &mut CdpClient,
+    selector: &str,
+    files: &[String],
+) -> anyhow::Result<Value> {
+    let ten = std::time::Duration::from_secs(10);
+    // One probe, returning a verdict rather than a bare boolean, so a wrong
+    // element type can say WHAT it found instead of "not found".
+    let probe = format!(
+        "(()=>{{const el=document.querySelector({sel});if(!el)return 'NOELEMENT';\
+         if(el.tagName!=='INPUT'||(el.type||'').toLowerCase()!=='file')\
+         return 'NOTFILE:'+el.tagName+'/'+(el.type||'');\
+         return el.multiple?'OK:multiple':'OK:single';}})()",
+        sel = json!(selector)
+    );
+    let verdict = c.eval(&probe, 20).await?;
+    let verdict = verdict.as_str().unwrap_or("");
+    if verdict == "NOELEMENT" {
+        return Ok(json!({
+            "error": format!("no element matches {selector:?}"),
+            "fix": "check the selector against GET /api/browser/state",
+        }));
+    }
+    if let Some(found) = verdict.strip_prefix("NOTFILE:") {
+        return Ok(json!({
+            "error": format!(
+                "{selector:?} matched a <{found}>, which is not an <input type=file>"
+            ),
+            "fix": "point the selector at the file input itself — a label or a styled \
+                    wrapper is a common miss, and the real input is often visually hidden",
+        }));
+    }
+    // MULTIPLE FILES NEED `multiple`. Chrome silently keeps only the first
+    // otherwise, so the test would attach one file and report N.
+    if files.len() > 1 && verdict == "OK:single" {
+        return Ok(json!({
+            "error": format!(
+                "{} files given but {selector:?} is a single-file input (no `multiple` \
+                 attribute) — Chrome would keep only the first and report success",
+                files.len()
+            ),
+            "fix": "send one file, or point at an input that has `multiple`",
+        }));
+    }
+    // Now the objectId, which is what setFileInputFiles needs and what an eval
+    // result cannot give us.
+    let resolved = c
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("document.querySelector({})", json!(selector)),
+                "returnByValue": false,
+            }),
+            ten,
+        )
+        .await?;
+    let Some(object_id) = resolved
+        .get("result")
+        .and_then(|r| r.get("objectId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        // The probe just saw the element, so losing it here is a page that
+        // navigated or re-rendered underneath us, not a caller mistake.
+        return Ok(json!({
+            "error": format!("{selector:?} resolved to no remote object — the page changed between the probe and the attach"),
+            "fix": "retry; if it repeats, the element is being re-rendered and needs a `wait` first",
+        }));
+    };
+    // DOM domain must be enabled before setFileInputFiles; idempotent.
+    let _ = c.call("DOM.enable", json!({}), ten).await;
+    c.call(
+        "DOM.setFileInputFiles",
+        json!({ "files": files, "objectId": object_id }),
+        ten,
+    )
+    .await?;
+    // READ THE INPUT BACK. setFileInputFiles returns an empty result and
+    // reports success for a path the browser could not use, so the only honest
+    // confirmation is what the page now holds — and that is also what the
+    // upload under test will read.
+    let attached = c
+        .eval(
+            &format!(
+                "(()=>{{const el=document.querySelector({sel});\
+                 return el&&el.files?Array.from(el.files).map(f=>f.name+':'+f.size):[];}})()",
+                sel = json!(selector)
+            ),
+            20,
+        )
+        .await?;
+    Ok(json!({
+        "ok": true,
+        "selector": selector,
+        "requested": files,
+        // name:size per file, straight off the input. A zero size is the shape
+        // a missing or unreadable path leaves behind.
+        "attached": attached,
+    }))
+}
+
 pub async fn click_selector(c: &mut CdpClient, selector: &str) -> anyhow::Result<Value> {
     let raw = c.eval(&selector_click_js(selector), 20).await?;
     let mut v = click_outcome(
