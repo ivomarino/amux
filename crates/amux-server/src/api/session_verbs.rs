@@ -3197,7 +3197,7 @@ pub(crate) async fn emit_event_store(store: &crate::db::SharedStore, session: &s
 /// The secret-redaction pass Python applies before any chat text lands in a
 /// DB row (py:8676 _cmd_hist_record / py:8655 steer history — AMUX-2525).
 /// Same pattern family as the pipe-pane redactor (py:21478).
-fn redact_secrets(text: &str) -> String {
+pub(crate) fn redact_secrets(text: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {

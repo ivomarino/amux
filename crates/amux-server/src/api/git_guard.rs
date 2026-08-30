@@ -1373,6 +1373,25 @@ fn first_blocking_verb(cmd: &str) -> Option<String> {
     None
 }
 
+/// The three UNTRUSTED fields of the inferred-edit WARN, redacted (AF-343).
+///
+/// Pure, and extracted for exactly one reason: the leak was never that the
+/// redactor was missing. `redact_secrets` already existed and already matched
+/// this key family. What was missing was anything that tested whether the log
+/// site CALLED it, and a call site inside a `tracing::warn!` is not reachable
+/// from a test without a capture harness this crate does not have. That is the
+/// same shape as AF-342, where a correct pure function had four passing cells
+/// and a one-line untestable derivation shipped inert. So the decision moves
+/// into a function a test can call.
+pub(crate) fn inferred_warn_fields(
+    base: &str,
+    verb: &str,
+    blocked_by: &str,
+) -> (String, String, String) {
+    let r = crate::api::session_verbs::redact_secrets;
+    (r(base), r(verb), r(blocked_by))
+}
+
 fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
     // Same stripper as `first_blocking_verb` (AMUX-3822): this extractor had
     // the identical defect and produced `verb=persona_tick.json`, a filename.
@@ -1420,15 +1439,29 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
         "NOT a known read verb, and not classifiable from this token alone — treat as \
          unmeasured rather than as a write (AMUX-3822)"
     };
+    // AF-343: `verb`, `blocked_by` and `base` are TOKENS LIFTED OUT OF A BASH
+    // COMMAND, so anything a lane typed can reach this line, and this line goes
+    // to a file. Measured before the fix: 192 live-looking `mxp_sk_` secrets in
+    // server-rs.log and 454 in its rotation, because a command beginning with
+    // `MXPKEY="..."` makes the whole assignment the first token, and the first
+    // token is what gets logged as the "verb" (96 WARN lines carried one key).
+    //
+    // The redactor already existed and already covered this key family; it was
+    // simply never applied on this path, and it was private to session_verbs so
+    // it could not be. Redacting at the LOG SITE rather than at the extractor is
+    // deliberate: it covers every shape a token can take, including the ones
+    // nobody has thought of, and it keeps working if the extractor changes.
+    let (safe_base, safe_verb, safe_blocked_by) =
+        inferred_warn_fields(base, verb, &blocked_by);
     tracing::warn!(
         target: "staged_guard",
         "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} blocked_by={} \
          verdict={} — ownership INFERRED from a bash command, not a firsthand Edit/Write. \
          (AF-126: the first segment's verb is usually `cd` and says nothing.)",
         if session.is_empty() { "(none)" } else { session },
-        base,
-        verb,
-        blocked_by,
+        safe_base,
+        safe_verb,
+        safe_blocked_by,
         verdict,
     );
 }
@@ -4247,6 +4280,35 @@ mod tests {
             assert_eq!(line_accounting_mode(false, true, peer), LineAccounting::Skip);
             assert_eq!(line_accounting_mode(false, false, peer), LineAccounting::Skip);
         }
+    }
+
+    /// AF-343. The staged-guard writes tokens lifted out of a bash command to a
+    /// LOG FILE, so anything a lane typed can land there. Measured on the live
+    /// box before the fix: 192 `mxp_sk_` secrets in server-rs.log and 454 in its
+    /// rotation, 96 of them on WARN lines, because a command starting with
+    /// `KEY="..."` makes the whole assignment the first token and the first
+    /// token is logged as the "verb".
+    ///
+    /// The token shape here is the one that actually appeared, not an invented
+    /// one. The key body is synthetic.
+    #[test]
+    fn inferred_warn_fields_redact_a_secret_lifted_from_a_command() {
+        let leaky = "MXPKEY=\"mxp_sk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"";
+        let (base, verb, blocked) = inferred_warn_fields("notes.md", leaky, leaky);
+        for (name, got) in [("verb", &verb), ("blocked_by", &blocked)] {
+            assert!(
+                !got.contains("mxp_sk_AAAA"),
+                "{name} still carries the key body: {got}"
+            );
+        }
+        // And the field must still SAY something: a redactor that blanked the
+        // line would pass the assertion above while destroying the diagnostic
+        // this WARN exists to provide.
+        assert!(verb.contains("MXPKEY"), "the non-secret part must survive: {verb}");
+        // An ordinary token is untouched, or every WARN becomes unreadable.
+        assert_eq!(base, "notes.md");
+        let (_, plain, _) = inferred_warn_fields("a", "sed", "sed");
+        assert_eq!(plain, "sed");
     }
 
     /// AF-342 second iteration, THE CELL THAT CAN ACTUALLY FAIL ON THE BUG.
