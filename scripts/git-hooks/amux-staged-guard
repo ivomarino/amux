@@ -809,13 +809,25 @@ def main():
         w("  If these are yours via shell edits, proceed. If you do not recognize "
           "one, it is a peer's in-flight hunk riding your git add — stage "
           "per-hunk instead (git add -p %s).\n" % _ua.get("path", ""))
-    # AF-342. Only printed BESIDE a real list, never on its own. When the reader
-    # is being shown unaccounted lines, they need to know the list is partial —
-    # a path where the check could not run is not a path where it passed. When
-    # nothing at all is flagged, this stays silent, because a "could not check"
-    # line on every commit is the same noise this fix removed, wearing a
-    # different hat, and noise on the normal path is what let 78009d90 sweep 87
-    # lines of a peer's work past this warning.
+    # AF-342. Only printed BESIDE a real list, never on its own.
+    #
+    # WHY THAT IS ALLOWED, and it is NOT the noise argument (amux, reviewing
+    # AF-342). On noise grounds alone this would fail ethos rule 4: a check that
+    # can read empty must publish whether it ran, and "no finding" and "could
+    # not check" would render identically here. What makes the suppression legal
+    # is that `degraded` and `unaccounted_undecidable` are in the API payload
+    # UNCONDITIONALLY, confirmed on a clean response carrying ok:true, no
+    # finding, and a populated `degraded`. The MEASUREMENT publishes its own
+    # partiality; this hook is only choosing presentation on top of it.
+    #
+    # So if you ever move either field behind a condition, this suppression
+    # becomes a rule-4 violation in the same edit, and nothing here will tell
+    # you. That coupling is the reason this paragraph exists.
+    #
+    # The noise argument is still true and still secondary: a "could not check"
+    # line on every commit is the same noise this fix removed wearing a
+    # different hat, and noise on the normal path is what let a sweep of 87
+    # lines of a peer's work go past this warning on 2026-08-30.
     _und = d.get("unaccounted_undecidable") or []
     if _und and (d.get("unaccounted") or []):
         w("  (line accounting could not run on %d other path(s) — you also wrote "

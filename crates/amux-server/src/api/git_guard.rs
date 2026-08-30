@@ -1168,6 +1168,17 @@ pub(crate) enum LineAccounting {
     /// No firsthand content at all: an entirely shell-edited file. Comparing
     /// would flag every line, so nothing is reported and nothing is claimed.
     /// This arm predates AF-342 and is the original AMUX-3446 behaviour.
+    ///
+    /// NOTE THE ASYMMETRY, and do not read this arm as "checked and clean"
+    /// (amux, reviewing AF-342). `Skip` ignores `peer_claims` entirely, while
+    /// `(true, true, true)` exists precisely BECAUSE a peer's claim is when
+    /// line detail matters most. That is correct rather than inconsistent:
+    /// with no firsthand content there is nothing to compare against, so a
+    /// contested path here would return every line as unaccounted and say
+    /// nothing true. But this is the arm covering a file written entirely
+    /// through the shell, which is the exact shape swept twice on 2026-08-30,
+    /// so "we did not look" is the honest reading and "we looked and it was
+    /// fine" is not.
     Skip,
     /// Firsthand content EXISTS, but the committer ALSO has a write here that
     /// recorded no content. That is the general property, not "a shell edit"
@@ -1226,6 +1237,23 @@ pub(crate) fn peer_authored_content(inputs: &GuardInputs, ap: &str) -> bool {
     inputs.theirs_transcript.contains(ap)
 }
 
+/// HOW TO VERIFY THIS BY HAND, and the trap in the obvious recipe (AF-342).
+///
+///   1. Create a mixed path: an Edit/Write, THEN a shell append.
+///   2. `git add` it.
+///   3. Query POST /api/git/staged-guard for that path.
+///
+/// RUN STEP 1 AND STEP 3 AS SEPARATE COMMANDS. `mine_observed` is read from the
+/// session's own transcript, and a write issued in the SAME tool call as the
+/// query is not in the transcript yet when the guard reads it. The mode then
+/// falls to `(true, false, _) => Check`, the line comes back unaccounted, and
+/// the arm looks inert. A reviewer hit exactly this and came within one report
+/// of filing the fix as broken; 20 seconds later, nothing else changed, the
+/// same query returned `unaccounted: []` and the undecidable path.
+///
+/// It has no effect on the real path, where a pre-commit hook runs long after
+/// the writes. It only bites a hand-verification that is too fast, which is the
+/// most likely way anyone will check this.
 pub(crate) fn line_accounting_mode(
     has_firsthand: bool,
     mine_observed: bool,
