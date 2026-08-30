@@ -653,10 +653,23 @@ cmd_start() {
   # collapses the two launch constructions into one (D6), so the server-side fixes
   # cannot be skipped by whichever door a worker is started through. The server
   # creates the session as amux-<name> (same name tmux_name produces) — we attach.
+  # gemini belongs in this list for the same reason codex and ollama do, and it
+  # was missing until 2026-08-29 (AMUX-3888). The server maps provider->binary in
+  # ONE place (`launch_base_binary`, session_verbs.rs: "gemini" => "gemini") and
+  # builds a real gemini command. This bash path did not: it fell through to the
+  # `claude` branch below and launched a gemini worker as
+  # `claude --model gemini-2.5-flash --yolo`. claude rejects that model, the
+  # process exits, and the tmux session dies with it — so the worker read as
+  # "started" and was gone seconds later. Both of the fleet's gemini lanes
+  # (photo-analysis, gtm-researcher-gemini) failed exactly this way while being
+  # brought back up after a machine restart.
+  #
+  # This is D6 (two launch constructions) leaking through the door the server
+  # does not own. Delegating means the provider->binary map has one home.
   local _provider="${CC_PROVIDER:-claude}"
-  if [[ "$_provider" == "codex" || "$_provider" == "ollama" ]]; then
+  if [[ "$_provider" == "codex" || "$_provider" == "ollama" || "$_provider" == "gemini" ]]; then
     if $dry_run; then
-      echo "${BOLD}$name${RESET} ($_provider — started via server API: POST /api/sessions/$name/start; the server builds the codex command, seeds ~/.codex trust, and forces model_reasoning_effort=low)"
+      echo "${BOLD}$name${RESET} ($_provider — started via server API: POST /api/sessions/$name/start; the server owns the provider→binary map and the provider-specific setup)"
       return
     fi
     if [[ $# -gt 0 ]]; then
@@ -783,9 +796,38 @@ cmd_start() {
   tmux new-session -d -s "$tname" -n "$name" -c "$dir" \
     -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" -e "AMUX_URL=$AMUX_API" \
     "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
-  # Lock the window name so Claude can't overwrite it with escape sequences
-  tmux set-option -t "=$tname" allow-rename off 2>/dev/null
-  tmux set-window-option -t "=$tname" automatic-rename off 2>/dev/null
+  # Lock the window name so Claude can't overwrite it with escape sequences.
+  #
+  # Both of these are `set-window-option`, and both end in `|| true`, because
+  # this pair silently broke EVERY real start for as long as tmux has treated
+  # allow-rename as a window option (3.6a here). It read
+  # `set-option -t "=$tname" allow-rename off`, which targets a SESSION with a
+  # window-only option: tmux answers "no such window", exits 1, `2>/dev/null`
+  # eats the message, and `set -euo pipefail` (line 19) kills the script right
+  # here — before the "started" echo, before automatic-rename is ever applied,
+  # and before the `--detach` return.
+  #
+  # So a start that fully SUCCEEDED (the tmux session exists and the worker is
+  # running) reported failure with no output at all. That is worse than a loud
+  # break, because the three callers each mis-read it differently:
+  #   * a human saw no confirmation and assumed nothing happened;
+  #   * `cmd_start_all` calls this in a loop, so set -e aborted the WHOLE loop
+  #     after the first worker — the fleet could never be brought up in bulk;
+  #   * any boot/CI script checking the exit code of `amux start --detach`,
+  #     which the comment below advertises as the script-friendly path, saw a
+  #     failure on every worker it started correctly.
+  # Found 2026-08-29 after a machine restart left 56 workers down (AMUX-3887).
+  #
+  # A cosmetic window-title option must never decide whether a start succeeded:
+  # that is what `|| true` is for. The failure is now reported (below) instead
+  # of being swallowed, so a future tmux rename of these options surfaces as a
+  # WARN line rather than as another silent fleet-wide outage.
+  local _rename_lock_failed=""
+  tmux set-window-option -t "=$tname" allow-rename off 2>/dev/null || _rename_lock_failed="allow-rename"
+  tmux set-window-option -t "=$tname" automatic-rename off 2>/dev/null || _rename_lock_failed="${_rename_lock_failed:+$_rename_lock_failed,}automatic-rename"
+  if [[ -n "$_rename_lock_failed" ]]; then
+    echo "${YELLOW}warn:${RESET} $name started, but tmux rejected the window-name lock ($_rename_lock_failed) — the worker is fine; its tmux window title may drift. tmux $(tmux -V 2>/dev/null)" >&2
+  fi
   echo "${GREEN}started${RESET} ${BOLD}$name${RESET} in $dir"
   echo "  ${DIM}$cmd${RESET}"
   # The session is already created detached (new-session -d). Only attach when
@@ -1382,15 +1424,75 @@ cmd_stop_all() {
   done
 }
 
+# Start every registered, NON-ARCHIVED worker that is not already running.
+#
+# This is the fleet's cold-start path (a machine reboot, `amux stop-all`, a
+# launchd boot agent), and on 2026-08-29 it could not do the job in three
+# independent ways at once — none of which announced itself, because the only
+# caller was a human who read the first worker's output and assumed the rest
+# followed (AMUX-3887):
+#
+#   1. NO ARCHIVE FILTER. It iterated every *.env, and 66 of the 124 registered
+#      workers are archived. Archiving a worker is how you retire it; bulk-start
+#      resurrecting all 66 would have been the loudest possible bug, and it never
+#      fired only because of (2).
+#   2. IT ABORTED AFTER THE FIRST WORKER. `cmd_start` exited 1 on every real
+#      start (the tmux allow-rename bug, see cmd_start), and under
+#      `set -euo pipefail` a non-zero return from a function called bare in a
+#      loop body kills the whole script. So this started exactly ONE worker and
+#      exited — silently, with the shell's status, having printed nothing.
+#   3. IT TRIED TO ATTACH. `cmd_start` without --detach ends in
+#      `tmux attach-session`, which cannot work from launchd or any other
+#      non-TTY caller.
+#
+# Each fix below is paired with the reporting that would have caught it: the
+# per-worker verdict, and the started/skipped/failed/archived summary. A bulk
+# operation that cannot say how many of N it actually did is indistinguishable
+# from one that did nothing, which is ethos rule 4 — the count beside the zero.
 cmd_start_all() {
-  for f in "$CC_SESSIONS"/*.env; do
+  local started=0 already=0 failed=0 archived=0
+  local failures=()
+  shopt -s nullglob
+  local files=("$CC_SESSIONS"/*.env)
+  shopt -u nullglob
+  local f name
+  for f in "${files[@]}"; do
     [[ -f "$f" ]] || continue
-    local name
     name=$(basename "$f" .env)
-    if ! is_running "$name" 2>/dev/null; then
-      cmd_start "$name"
+    # Archived workers are retired on purpose. Read the flag from the env file
+    # rather than the server so cold start does not depend on the server being
+    # up yet — at boot it frequently is not.
+    if grep -q '^CC_ARCHIVED="\?1' "$f" 2>/dev/null; then
+      archived=$((archived + 1))
+      continue
+    fi
+    if is_running "$name" 2>/dev/null; then
+      already=$((already + 1))
+      continue
+    fi
+    # --detach is mandatory here (see (3) above). `|| true`-style capture keeps
+    # one bad worker from taking down the other 55 (see (2) above).
+    if cmd_start "$name" --detach; then
+      started=$((started + 1))
+      # Stagger. `tmux new-session -d` returns immediately, so with no delay all
+      # 56 agent processes begin their startup work in the same instant — and the
+      # moment this matters most is a cold boot, when the machine is already
+      # contending with everything else launchd is bringing up. Tunable via
+      # AMUX_START_ALL_STAGGER (0 disables).
+      local _stagger="${AMUX_START_ALL_STAGGER:-1}"
+      [[ "$_stagger" != "0" ]] && sleep "$_stagger"
+    else
+      failed=$((failed + 1))
+      failures+=("$name")
     fi
   done
+  echo
+  echo "${BOLD}start-all:${RESET} ${GREEN}${started} started${RESET} · ${already} already running · ${failed} failed · ${archived} archived (skipped)"
+  if (( failed > 0 )); then
+    echo "${YELLOW}failed:${RESET} ${failures[*]}" >&2
+    return 1
+  fi
+  return 0
 }
 
 # Build and send a status transition, INCLUDING the gate-satisfying fields.
