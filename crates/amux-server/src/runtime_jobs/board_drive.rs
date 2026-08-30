@@ -188,6 +188,22 @@ const SOURCE_REF_STALE_S: i64 = 24 * 3600;
 /// and in what order (the ethos line: amux surfaces the stall, the model drives);
 /// only the reminder frequency scales, never any server-side auto-promotion.
 /// A hard `AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S` override still wins for tuning.
+/// AF-334: does the drain nudge fire? Pure, and extracted for the reason
+/// AF-342 taught the hard way two hours earlier: a correct decision living as
+/// one line inside an async job is a decision no test can reach, and that is
+/// exactly where a fix ships inert with a green suite.
+///
+/// The fourth term is the new one. The first three are the original predicate
+/// and they conflate "no card is in `doing`" with "the lane is doing nothing".
+pub(crate) fn should_drain_nudge(
+    doing_count: i64,
+    eligible: i64,
+    drainable_backlog: i64,
+    recent_card_events: i64,
+) -> bool {
+    doing_count == 0 && eligible == 0 && drainable_backlog > 0 && recent_card_events == 0
+}
+
 fn idle_backlog_drain_cooldown_s(drainable_backlog: i64) -> f64 {
     if let Some(v) = std::env::var("AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S")
         .ok()
@@ -866,6 +882,53 @@ pub fn prose_dependency(blob: &str) -> Option<String> {
         return None;
     }
     Some(id.to_string())
+}
+
+#[cfg(test)]
+mod drain_trigger_tests {
+    use super::should_drain_nudge;
+
+    /// AF-334, with the MEASURED numbers rather than invented ones.
+    ///
+    /// The defect: the trigger read `doing_count == 0 && eligible == 0 &&
+    /// drainable_backlog > 0`, which a lane that works fast and keeps `todo`
+    /// drained satisfies continuously. Measured 2026-08-30 at the 30-minute
+    /// resolution the trigger actually runs at: mvs-infra's last six drain
+    /// nudges each landed with 63-79 card events in the preceding half hour.
+    /// Told it was idle every 16 minutes while mutating a card every ~25s.
+    ///
+    /// THE CONTROL IS THE HALF THAT MATTERS. A term that simply silenced the
+    /// nudge would pass a test that only checks the busy case, and would
+    /// re-open the bug this nudge exists for (tubescience: 51 backlog / 0 todo
+    /// / 0 doing, idle forever because board-drive dispatches only `todo`).
+    /// Both cells below are real observations from the same window.
+    #[test]
+    fn a_demonstrably_working_lane_is_not_told_it_is_idle() {
+        // mvs-infra, nudge at 19:07:49Z: 79 card events in the prior 30 min.
+        assert!(
+            !should_drain_nudge(0, 0, 40, 79),
+            "a lane mutating a card every ~25s must not be told it is idle"
+        );
+        // This session, 2 of its 4 nudges in the same window: 25-27 events.
+        assert!(!should_drain_nudge(0, 0, 10, 27));
+
+        // CONTROL 1 — the genuinely stalled lane the nudge was built for.
+        // Same three original terms, zero activity: it MUST still fire.
+        assert!(
+            should_drain_nudge(0, 0, 51, 0),
+            "tubescience's 51-backlog/0-todo/0-doing case must still be nudged"
+        );
+        // CONTROL 2 — this session's OTHER 2 nudges, which were correct: the
+        // lane had 0 card events because it was waiting on a build. Those are
+        // not false positives and must survive the fix.
+        assert!(should_drain_nudge(0, 0, 10, 0));
+
+        // The original three terms still gate: nothing to drain, or already
+        // working a card, or a dispatchable todo exists.
+        assert!(!should_drain_nudge(0, 0, 0, 0), "no drainable backlog");
+        assert!(!should_drain_nudge(1, 0, 10, 0), "already has a card in doing");
+        assert!(!should_drain_nudge(0, 1, 10, 0), "has a dispatchable todo");
+    }
 }
 
 #[cfg(test)]
@@ -4350,7 +4413,65 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 //    `backlog`, so a lane handed only backlog sits idle forever
                 //    (tubescience: 51 backlog / 0 todo / 0 doing). Short cooldown
                 //    so a lane that stays idle keeps getting nudged until it drains.
-                let idle_drain = doing_count == 0 && eligible == 0 && drainable_backlog > 0;
+                // AF-334. `doing_count == 0` means "no card is in `doing`",
+                // NOT "the lane is doing nothing", and the comment above
+                // conflates them. A lane that works fast, keeps `todo` drained
+                // and holds backlog satisfies all three terms CONTINUOUSLY
+                // while being the most productive lane in the fleet.
+                //
+                // Measured 2026-08-30, at the 30-minute resolution the trigger
+                // actually operates at rather than in aggregate: mvs-infra's
+                // last six drain nudges each landed with 63-79 card events in
+                // the preceding half hour. It was told it was idle every 16
+                // minutes while mutating a card every ~25 seconds. Fleet-wide
+                // the drain nudge was 42% of all messages.
+                //
+                // So the trigger gets a term for whether the lane is DEMONSTRABLY
+                // WORKING. This does not weaken the case it was built for: a
+                // genuinely stalled lane produces no card events and is still
+                // nudged. Checked against this session's own nudges in the same
+                // window - 2 of 4 had 25-27 events (suppressed by this term, and
+                // they were the wrong nudges) and 2 had exactly 0 (still fire,
+                // and they were correct: the lane was waiting on a build).
+                //
+                // A rotting backlog is NOT hidden by this. `stale_enough` below
+                // is an independent path and still fires at 10+ cards over 14
+                // days, which is the case where a busy lane's backlog needs
+                // attention regardless of how active the lane is.
+                //
+                // datetime(e.at) on BOTH sides: `_amux_state_events.at` is
+                // RFC3339 with an explicit +00:00 offset. Comparing it against a
+                // localtime string silently applies a 4-hour skew, which while
+                // writing this made every lane read as 0 events and nearly
+                // produced a false "the fix does not work" conclusion.
+                let lane_activity_window_min: i64 = std::env::var("AMUX_DRAIN_ACTIVITY_WINDOW_MIN")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(30);
+                let recent_card_events: i64 = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM _amux_state_events e \
+                         JOIN issues i ON i.id = e.entity_id \
+                         WHERE e.entity_type='task' AND i.session=?1 \
+                         AND datetime(e.at) > datetime('now', ?2)",
+                        rusqlite::params![lane, format!("-{lane_activity_window_min} minutes")],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+                let lane_working = recent_card_events > 0;
+                let idle_drain =
+                    should_drain_nudge(doing_count, eligible, drainable_backlog, recent_card_events);
+                if doing_count == 0 && eligible == 0 && drainable_backlog > 0 && lane_working {
+                    // Countable, so the suppression cannot become invisible.
+                    // If this fires constantly for a lane whose backlog never
+                    // moves, the term is too generous and the number says so.
+                    tracing::info!(
+                        target: "board_drive",
+                        "[drain-nudge/suppressed AF-334] lane={lane} backlog={drainable_backlog} \
+                         card_events_last_{lane_activity_window_min}min={recent_card_events} \
+                         — the lane is demonstrably working; drain nudge withheld"
+                    );
+                }
                 let stale_enough = (stale_count as usize) >= BACKLOG_TRIAGE_THRESHOLD;
                 if !idle_drain && !stale_enough {
                     break 'triage None;
