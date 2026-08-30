@@ -1,7 +1,7 @@
 ---
 description: Use when you need to interact with the amux system — manage board tasks, check sessions, send emails, message via Telegram, automate browsers, or work with CRM contacts
 allowed-tools: Bash, Read, Edit, Write
-argument-hint: [board|memory|sessions|schedule|notes|email|telegram|browser|crm|help] [args...]
+argument-hint: [board|memory|sessions|schedule|notes|email|gmail|telegram|browser|crm|help] [args...]
 ---
 
 # /amux — amux Session Integration
@@ -187,6 +187,36 @@ curl -sk $AMUX_URL/api/email/events
 
 ---
 
+## Gmail (OAuth — distinct from the Email/Mail.app section above)
+
+This talks to the Gmail API directly via OAuth, not Mail.app — a separate,
+per-account credential path. Use this when you specifically need Gmail
+(labels, thread view) rather than whatever's in Mail.app. Live on this
+server (`crates/amux-server/src/api/gmail.rs` + `gmail_auth.rs`); undocumented
+here until 2026-08-30 despite being real — verify against `GET
+/api/debug/routes` before trusting any *other* connector section below, since
+several (Calendar, Secrets, GitHub, Mattermost) describe features that exist
+only on still-open PR branches and are NOT live on this checkout.
+
+```bash
+# Connected accounts / start OAuth flow (returns a URL to open) / disconnect
+curl -sk $AMUX_URL/api/gmail/accounts
+curl -sk $AMUX_URL/api/gmail/auth
+curl -sk -X DELETE $AMUX_URL/api/gmail/account
+
+# Inbox / labels / a specific thread
+curl -sk $AMUX_URL/api/gmail/inbox
+curl -sk $AMUX_URL/api/gmail/labels
+curl -sk $AMUX_URL/api/gmail/thread/THREAD_ID
+
+# Send
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"to":"x@example.com","subject":"Hi","body":"..."}' \
+  $AMUX_URL/api/gmail/send
+```
+
+---
+
 ## Telegram
 
 Bot connector — **inbound** via long-polling
@@ -355,6 +385,7 @@ amux crm fu
 - Task / action item → `/api/board`
 - Recurring automation → `/api/schedules`
 - Telegram chat <-> session link, or a message out to Telegram → `/api/telegram/*`
+- Gmail specifically (not Mail.app) → `/api/gmail/*`
 
 ---
 
@@ -381,6 +412,7 @@ Parse the arguments to determine what the user wants:
 - **`schedule add <title>`** → create a new schedule interactively
 - **`notes`** → list notes
 - **`email send`** → compose and send an email
+- **`gmail`** → Gmail OAuth account status / inbox / send
 - **`telegram`** → Telegram bot status / link a chat to a session / send a message via `/api/telegram`
 - **`browser`** → browser automation help
 - **`crm`** → CRM operations
