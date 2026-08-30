@@ -2578,6 +2578,39 @@ pub fn detect_silent(
                                     }
                                 }
                             ),
+                            // NOT-RUNNING IS A SNAPSHOT, NOT A TERMINAL STATE
+                            // (AMUX-3918). This branch used to assert "will not
+                            // drain on its own" for every non-rate-limit reason,
+                            // and for `not-running` that is measurably false: a
+                            // stopped worker gets started again, this fleet
+                            // auto-starts them at boot (com.amux.fleet-start),
+                            // and the queue then drains untouched.
+                            //
+                            // Measured over 7 days, every message that passed the
+                            // deadline: 45 of 45 left the queue, waits 92.6 to
+                            // 492.2 minutes, and not one was still stuck. The
+                            // message AMUX-3913 was filed about drained by itself
+                            // 210 minutes in. Four cards asserted this sentence
+                            // about one 63-second release window.
+                            //
+                            // `archived` and `no-env-file` ARE terminal without a
+                            // human, so they keep the claim. Collapsing the three
+                            // is what produced a verdict of "cannot drain" about
+                            // a queue that drains.
+                            Some(r) if r.as_str() == "not-running" => format!(
+                                "{n} message(s) queued for {session}; the oldest has waited \
+                                 {:.0} min (deadline {deadline_min:.0} min). The lane is not \
+                                 running RIGHT NOW, which is a snapshot and not a verdict: the \
+                                 queue drains by itself when the lane next starts, and this \
+                                 fleet auto-starts workers at boot. Over the 7 days before this \
+                                 wording changed, 45 of 45 messages that passed the deadline \
+                                 left the queue with no intervention (waits 92-492 min). Worth \
+                                 acting on only if the lane is one that should be running and \
+                                 is not — start it, or archive it if it is finished. Senders \
+                                 were told 'accepted', which remains true and remains \
+                                 not-yet-delivered.",
+                                age / 60.0
+                            ),
                             Some(r) => format!(
                                 "{n} message(s) queued for {session}; the oldest has waited \
                                  {:.0} min (deadline {deadline_min:.0} min). The lane is NOT \
@@ -7250,6 +7283,66 @@ mod tests {
                 "{lane} keeps its own card below the threshold: {f:?}"
             );
         }
+    }
+
+    /// AMUX-3918. "This queue will not drain on its own" was asserted for every
+    /// non-rate-limit block reason, and for `not-running` it is measurably
+    /// false.
+    ///
+    /// Over the 7 days before this changed, every steering message that passed
+    /// the deadline left the queue: 45 of 45, waits 92.6 to 492.2 minutes, none
+    /// still stuck. The message AMUX-3913 was filed about drained by itself
+    /// after 210 minutes. Four cards asserted the sentence about a single
+    /// 63-second release window in which nine messages across six lanes were
+    /// freed at once.
+    ///
+    /// `archived` is the control and it is the whole point: it IS terminal
+    /// without a human, so it must keep the claim. A change that deleted the
+    /// sentence outright would pass the first assertion and remove the warning
+    /// from the one state that earns it.
+    #[tokio::test]
+    async fn not_running_does_not_claim_the_queue_will_never_drain_but_archived_does() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        seed_queues(&st, now, &["stopped-lane", "gone-lane"], 92.0).await;
+        let mut blocked = BTreeMap::new();
+        blocked.insert("stopped-lane".to_string(), Some("not-running".to_string()));
+        blocked.insert("gone-lane".to_string(), Some("archived".to_string()));
+        let resets: BTreeMap<String, i64> =
+            ["stopped-lane", "gone-lane"].iter().map(|l| (l.to_string(), 0)).collect();
+        let conn = st.store.read().unwrap();
+        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+
+        let verdict = |sig: &str| -> String {
+            f.iter()
+                .find(|x| x.signature == sig)
+                .unwrap_or_else(|| panic!("no card for {sig}: {f:?}"))
+                .evidence
+                .iter()
+                .find(|(k, _)| k == "verdict")
+                .map(|(_, v)| v.clone())
+                .expect("a steering card carries a verdict")
+        };
+
+        let stopped = verdict("silent|steering|stopped-lane");
+        assert!(
+            !stopped.contains("will not drain on its own"),
+            "a stopped lane gets started again and its queue drains untouched; asserting \
+             otherwise sent four cards to say the opposite of what the ledger records: {stopped}"
+        );
+        assert!(
+            stopped.contains("snapshot"),
+            "and it should say WHY it is not a verdict, not merely omit the claim: {stopped}"
+        );
+
+        // CONTROL. Archived is terminal without a human, so the warning stays.
+        let gone = verdict("silent|steering|gone-lane");
+        assert!(
+            gone.contains("will not drain on its own"),
+            "an archived lane really cannot drain — removing the sentence everywhere would \
+             delete the warning from the one state that earns it: {gone}"
+        );
     }
 
     /// AMUX-3915, gtm-engine. A capped lane below the rollup threshold still
