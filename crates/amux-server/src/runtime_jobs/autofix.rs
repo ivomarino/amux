@@ -2237,6 +2237,12 @@ pub fn detect_silent(
     // `&'static str` on purpose — one shared predicate, no per-lane text — so
     // the WHEN rides alongside the WHETHER instead of inside it.
     resets: &BTreeMap<String, i64>,
+    // `kinds`: per-lane limit KIND — "menu" (a session limit, which carries a
+    // reset time), "credit-banner" (a cap, which has none), "" (unknown).
+    // Separate from `resets` because a zero reset cannot say which, and telling
+    // a reader "the banner wording changed and parse_rate_limit_reset needs it"
+    // about a credit cap is a false lead pointed at real code (MC-1458).
+    kinds: &BTreeMap<String, String>,
 ) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
@@ -2406,6 +2412,7 @@ pub fn detect_silent(
                 // A reset time of 0 means the banner named none (a credit cap
                 // has no clock), and that case still files.
                 let reset = resets.get(&session).copied().unwrap_or(0);
+                let kind = kinds.get(&session).map(String::as_str).unwrap_or("");
                 let reset_pending = block.as_deref() == Some("rate-limited")
                     && reset > 0
                     && (reset as f64) > now;
@@ -2507,13 +2514,35 @@ pub fn detect_silent(
                                         rl::local_when(reset as f64)
                                     )
                                 } else {
-                                    "amux could not read a reset time from its banner \
-                                     (`rate_limited_until` is 0), so it cannot say whether this \
-                                     drains on its own. A credit cap genuinely has no reset \
-                                     clock; a session limit does, and a missing one there means \
-                                     the banner wording changed and \
-                                     `parse_rate_limit_reset` needs it."
-                                        .to_string()
+                                    // MC-1458. This used to offer the reader BOTH
+                                    // explanations for a zero and then name
+                                    // `parse_rate_limit_reset` as the likely fix,
+                                    // on evidence that cannot distinguish them —
+                                    // sending people to debug a parser that was
+                                    // working. The sweep knows which kind of limit
+                                    // it matched; say only what is true of that one.
+                                    match kind {
+                                        "credit-banner" => "This is a CREDIT CAP: the sweep \
+                                             matched the credit banner, which carries no reset \
+                                             time, so `rate_limited_until` is 0 because there is \
+                                             no clock to read. Nothing is broken and there is \
+                                             nothing to parse. It lifts when credits refresh."
+                                            .to_string(),
+                                        "menu" => "The sweep matched the usage-limit MENU, which \
+                                             DOES carry a reset time, and `rate_limited_until` is \
+                                             still 0 — so the parse failed. This is the one case \
+                                             where `parse_rate_limit_reset` is the thing to fix: \
+                                             capture the lane's footer and add the wording."
+                                            .to_string(),
+                                        _ => "amux has no record of WHICH limit this is \
+                                             (`rate_limited_by` is empty — a lane stamped before \
+                                             that field existed), so it cannot say whether a \
+                                             reset clock should exist. Check the lane's footer: a \
+                                             credit banner means there is nothing to fix, the \
+                                             usage-limit menu means the reset parse needs its \
+                                             wording."
+                                            .to_string(),
+                                    }
                                 }
                             ),
                             Some(r) => format!(
@@ -2539,6 +2568,10 @@ pub fn detect_silent(
                         ("lane_reachable".into(), match &block {
                             Some(r) => format!("NO — {r}"),
                             None => "yes — no block reason from lane_block_reason".into(),
+                        }),
+                        ("limit_kind".into(), match kind {
+                            "" => "unknown (rate_limited_by not stamped)".to_string(),
+                            k => k.to_string(),
                         }),
                         ("queued".into(), n.to_string()),
                         ("oldest_queued_at".into(), rl::local_when(oldest)),
@@ -4906,6 +4939,13 @@ pub async fn autofix_tick_with_ci(
         .keys()
         .map(|s| (s.clone(), crate::api::session_verbs::lane_rate_limit_reset(s)))
         .collect();
+    // WHICH KIND of limit, from the same meta the sweep stamps (MC-1458). A zero
+    // reset cannot say whether a clock should exist, and the two answers want
+    // opposite responses from whoever reads the card.
+    let steer_kinds: BTreeMap<String, String> = steer_blocked
+        .keys()
+        .map(|s| (s.clone(), crate::api::session_verbs::lane_rate_limit_kind(s)))
+        .collect();
 
     // DISK DETECTION RUNS OFF THE RUNTIME, AND OUTSIDE THE STORE LOCK (AF-97 —
     // the deeper exit AMUX-35 named and did not take).
@@ -4976,7 +5016,7 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::Latency => detect_latency(&conn, now),
                 DetectorKind::DeadRoute => detect_dead_routes(&conn, now),
                 DetectorKind::SilentSubsystem => {
-                    detect_silent(&conn, now, &steer_blocked, &steer_resets)
+                    detect_silent(&conn, now, &steer_blocked, &steer_resets, &steer_kinds)
                 }
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
@@ -7025,6 +7065,93 @@ mod tests {
         lanes.iter().map(|l| (l.to_string(), Some("rate-limited".to_string()))).collect()
     }
 
+    // ── MC-1458: a zero reset time is two different facts ───────────────────
+    //
+    // Reported by mixpeek-cicd against a card filed on their own lane. The card
+    // said "amux could not read a reset time from its banner
+    // (`rate_limited_until` is 0) ... a missing one there means the banner
+    // wording changed and `parse_rate_limit_reset` needs it", offering both
+    // explanations and then naming the fix for one of them. A credit cap has no
+    // clock at all, so that zero is correct and there is nothing to parse; a
+    // usage-limit MENU does carry one, so a zero there is a real parse gap. The
+    // card could not tell which and pointed at real code either way.
+    //
+    // The sweep in session_verbs already knows — it matches `menu` or the credit
+    // banner and put the answer only in an event payload. It is stamped to meta
+    // now, and these three cells are the three sentences it buys.
+
+    fn silent_verdict(f: &[super::Finding], lane: &str) -> String {
+        let hit = f
+            .iter()
+            .find(|x| x.signature == format!("silent|steering|{lane}"))
+            .unwrap_or_else(|| panic!("no card for {lane}: {f:?}"));
+        hit.evidence.iter().find(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).unwrap_or_default()
+    }
+
+    /// A CREDIT CAP MUST NOT SEND ANYONE TO THE PARSER. This is the common case
+    /// and the one the report was filed about.
+    #[tokio::test]
+    async fn a_credit_cap_says_there_is_no_clock_rather_than_blaming_the_parser() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        seed_queues(&st, now, &["capped"], 92.0).await;
+        let conn = st.store.read().unwrap();
+        let resets: BTreeMap<String, i64> = [("capped".to_string(), 0)].into();
+        let kinds: BTreeMap<String, String> = [("capped".to_string(), "credit-banner".to_string())].into();
+        let (f, _) = detect_silent(&conn, now, &rate_limited(&["capped"]), &resets, &kinds);
+        let v = silent_verdict(&f, "capped");
+        assert!(v.contains("CREDIT CAP"), "{v}");
+        assert!(v.contains("no clock to read"), "{v}");
+        assert!(
+            !v.contains("parse_rate_limit_reset"),
+            "naming the parser here is the false lead this card is about: {v}"
+        );
+    }
+
+    /// THE MENU IS THE ONE CASE WHERE THE PARSER *IS* THE FIX. Without this
+    /// cell the change above could be "never mention the parser", which would
+    /// delete a true signal instead of removing a false one.
+    #[tokio::test]
+    async fn a_usage_limit_menu_with_no_reset_time_is_a_real_parse_gap() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        seed_queues(&st, now, &["menu-lane"], 92.0).await;
+        let conn = st.store.read().unwrap();
+        let resets: BTreeMap<String, i64> = [("menu-lane".to_string(), 0)].into();
+        let kinds: BTreeMap<String, String> = [("menu-lane".to_string(), "menu".to_string())].into();
+        let (f, _) = detect_silent(&conn, now, &rate_limited(&["menu-lane"]), &resets, &kinds);
+        let v = silent_verdict(&f, "menu-lane");
+        assert!(v.contains("parse_rate_limit_reset"), "{v}");
+        assert!(v.contains("MENU"), "{v}");
+    }
+
+    /// UNKNOWN IS ITS OWN ANSWER. A lane stamped before `rate_limited_by`
+    /// existed has no kind, and defaulting it to either one manufactures the
+    /// certainty this whole change removes (ethos rule 4: absence is not
+    /// evidence).
+    #[tokio::test]
+    async fn an_unstamped_limit_kind_is_reported_as_unknown_not_guessed() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        seed_queues(&st, now, &["old-lane"], 92.0).await;
+        let conn = st.store.read().unwrap();
+        let resets: BTreeMap<String, i64> = [("old-lane".to_string(), 0)].into();
+        let (f, _) =
+            detect_silent(&conn, now, &rate_limited(&["old-lane"]), &resets, &BTreeMap::new());
+        let v = silent_verdict(&f, "old-lane");
+        assert!(v.contains("no record of WHICH limit"), "{v}");
+        assert!(
+            !v.contains("CREDIT CAP") && !v.contains("the parse failed"),
+            "unknown must not be answered as either kind: {v}"
+        );
+        let hit = f.iter().find(|x| x.signature == "silent|steering|old-lane").unwrap();
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        assert!(ev["limit_kind"].contains("unknown"), "{ev:?}");
+    }
+
     /// THE ROLLUP. Three capped lanes past their deadline file ONE card, and
     /// every folded lane leaves a suppression behind — a rollup that absorbed
     /// them silently would read exactly like a detector that never looked.
@@ -7038,7 +7165,7 @@ mod tests {
         let conn = st.store.read().unwrap();
         // No reset clock anywhere: the credit-cap case, which is the one that files.
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, sup) = detect_silent(&conn, now, &rate_limited(&lanes), &resets);
+        let (f, sup) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new());
         assert!(
             !sup.iter().any(|x| x.signature.contains("<query failed>")),
             "the steering query did not prepare, so this test measures nothing: {sup:?}"
@@ -7079,7 +7206,7 @@ mod tests {
         seed_queues(&st, now, &lanes, 92.0).await;
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, _) = detect_silent(&conn, now, &rate_limited(&lanes), &resets);
+        let (f, _) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new());
         assert!(
             !f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
             "two is a coincidence, not a pattern: {f:?}"
@@ -7107,7 +7234,7 @@ mod tests {
         let mut blocked = rate_limited(&["cap-1", "cap-2", "cap-3"]);
         blocked.insert("no-env-lane".into(), Some("no-env-file".into()));
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, _) = detect_silent(&conn, now, &blocked, &resets);
+        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
         assert!(
             f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
             "the three capped lanes still roll up: {f:?}"
@@ -7167,7 +7294,7 @@ mod tests {
         let mut blocked = BTreeMap::new();
         blocked.insert("busy-lane".to_string(), None);
         blocked.insert("dead-lane".to_string(), Some("no-env-file".to_string()));
-        let (f, sup) = detect_silent(&conn, now, &blocked, &BTreeMap::new());
+        let (f, sup) = detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new());
 
         // THE PREMISE, asserted rather than assumed: the query must have RUN.
         // If it did not prepare, the detector records a suppression saying so,
@@ -7198,7 +7325,7 @@ mod tests {
         // CELL 3 — reachable but far past the LARGER deadline: still reported,
         // as the different thing it is. A lane that has not reached a turn
         // boundary in 7h is worth a card; calling it a stuck queue is not.
-        let (f2, _) = detect_silent(&conn, now + 7.0 * 3600.0, &blocked, &BTreeMap::new());
+        let (f2, _) = detect_silent(&conn, now + 7.0 * 3600.0, &blocked, &BTreeMap::new(), &BTreeMap::new());
         let late = f2
             .iter()
             .find(|x| x.signature == "silent|steering|busy-lane")
@@ -7280,7 +7407,7 @@ mod tests {
             ("no-clock".to_string(), 0),
         ]
         .into();
-        let (f, sup) = detect_silent(&conn, now, &blocked, &resets);
+        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
         assert!(
             !sup.iter().any(|x| x.signature.contains("<query failed>")),
             "the steering query did not prepare, so this test measures nothing: {sup:?}"
@@ -7312,17 +7439,39 @@ mod tests {
             "and must send the reader somewhere: {ev:?}"
         );
 
-        // CELL 4 (CONTROL) — no reset time known. Still files, and says amux
-        // could not read one rather than asserting the queue is doomed.
+        // CELL 4 (CONTROL) — no reset time known. Still files, and does not
+        // assert the queue is doomed.
+        //
+        // This cell used to also require the literal "could not read a reset
+        // time", and MC-1458 replaced that sentence: it offered BOTH
+        // explanations for a zero and then named `parse_rate_limit_reset` as the
+        // fix, which is true of a usage-limit menu and wrong about a credit cap,
+        // so it sent readers to debug a working parser. This lane has no `kinds`
+        // entry, so it exercises the UNKNOWN arm.
+        //
+        // The assertions are now the PROPERTIES rather than the phrasing —
+        // it files, it claims no doom, and it does not name the parser on
+        // evidence that cannot implicate it. Pinning a sentence made this cell
+        // go red on a change that improved exactly what the cell is for.
+        // The three arms' own wording is pinned by the MC-1458 tests below,
+        // where changing one is supposed to be a decision.
         let hit = f
             .iter()
             .find(|x| x.signature == "silent|steering|no-clock")
             .expect("an unreadable reset time must not silence the card");
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
-        assert!(ev["verdict"].contains("could not read a reset time"), "{ev:?}");
         assert!(
             !ev["verdict"].contains("will not drain on its own"),
             "amux cannot support that claim about a temporary limit: {ev:?}"
+        );
+        assert!(
+            !ev["verdict"].contains("parse_rate_limit_reset"),
+            "the kind is unknown here, so the parser cannot be named as the fix (MC-1458): {ev:?}"
+        );
+        assert!(
+            ev["limit_kind"].contains("unknown"),
+            "and the card must SAY the kind is unknown rather than leaving the reader to \
+             infer it from a zero: {ev:?}"
         );
     }
 

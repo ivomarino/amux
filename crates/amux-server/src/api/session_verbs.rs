@@ -8978,6 +8978,28 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
 /// 0 means "no reset time known", never "resets at the epoch". A credit cap has
 /// no clock at all, so a caller that reads 0 as a past time would treat every
 /// capped lane as overdue.
+/// WHICH kind of limit this lane is under: `"menu"` (the usage-limit selector,
+/// which carries a reset time), `"credit-banner"` (a credit cap, which has none),
+/// or `""` when unknown (MC-1458).
+///
+/// [`lane_rate_limit_reset`] returning 0 cannot answer this and never could. A
+/// zero there means "no reset time known", and the two ways to arrive at it want
+/// OPPOSITE responses: a cap has no clock to read and there is nothing to fix,
+/// while a menu does have one and a zero means the parse failed. The steering
+/// detector was asserting the second about every instance of the first, which is
+/// a false lead pointed at real code (`parse_rate_limit_reset`).
+///
+/// EMPTY IS "UNKNOWN", NOT "CAP". A lane stamped before this field existed, or
+/// one whose meta predates the current sweep, has no value here, and a reader
+/// that defaults it to either kind manufactures the certainty this exists to
+/// remove.
+pub(crate) fn lane_rate_limit_kind(name: &str) -> String {
+    if !env_path(name).exists() {
+        return String::new();
+    }
+    meta_str(&load_meta(name), "rate_limited_by")
+}
+
 pub(crate) fn lane_rate_limit_reset(name: &str) -> i64 {
     if !env_path(name).exists() {
         return 0;
@@ -10815,7 +10837,11 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
                 // reads as "limited until 8:30pm" while it is already working.
                 update_meta(
                     name,
-                    &[("rate_limited_since", json!(0)), ("rate_limited_until", json!(0))],
+                    &[
+                        ("rate_limited_since", json!(0)),
+                        ("rate_limited_until", json!(0)),
+                        ("rate_limited_by", json!("")),
+                    ],
                 );
             }
             continue;
@@ -10830,6 +10856,25 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
         let reset = parse_rate_limit_reset(&footer).unwrap_or(0);
         if meta_i64(&load_meta(name), "rate_limited_until") != reset {
             update_meta(name, &[("rate_limited_until", json!(reset))]);
+        }
+        // WHICH KIND OF LIMIT, PERSISTED (MC-1458). This loop already knows:
+        // `menu` is the usage-limit selector, which CARRIES a reset time, and
+        // the credit banner is a cap that has none. Until now that fact went
+        // only into the `session.rate_limited` event payload as `detected_by`
+        // and was dropped, so every downstream reader saw the same
+        // `rate_limited_until = 0` for both and could not tell "no clock exists"
+        // from "a clock exists and amux failed to read it".
+        //
+        // The cost was a card that pointed at real code on evidence that cannot
+        // indicate the fault: the steering silent-detector told readers a zero
+        // meant "the banner wording changed and `parse_rate_limit_reset` needs
+        // it", which is true only in the menu case and wrong in the far more
+        // common cap case. Written on EVERY tick, not only on first detection,
+        // because a lane can move from a cap to a session limit without the
+        // stamp clearing in between.
+        let kind = if menu { "menu" } else { "credit-banner" };
+        if meta_str(&load_meta(name), "rate_limited_by") != kind {
+            update_meta(name, &[("rate_limited_by", json!(kind))]);
         }
         if meta_i64(&load_meta(name), "rate_limited_since") == 0 {
             update_meta(
