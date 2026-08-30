@@ -376,6 +376,26 @@ fn pane_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
 /// landing, a human's pasted line); 3+ inside a minute is something REDRAWING.
 const CHURN_MIN_DISTINCT: usize = 3;
 
+/// Distinct content-frames required inside a window that STARTS AT A LANE'S OWN
+/// `idle` CLAIM (AMUX-3896). Two, not three, and the difference is the window.
+///
+/// [`CHURN_MIN_DISTINCT`]'s 3 buys margin over a fixed 60s window where a
+/// legitimate single repaint (a notification, a pasted line) is common. Here the
+/// window is bounded by the age of the claim and the frames are the only ones
+/// recorded AFTER it, so the thing being excluded is different: a stale
+/// post-Stop frame, which is FROZEN and therefore contributes exactly one
+/// content hash however many times it is sampled. Two distinct contents means
+/// the pane changed after the lane said it was done, which a frozen frame cannot
+/// do — and the gate additionally requires a spinner in the same frame.
+///
+/// It also carries a floor for free. Captures sit behind a 2s response cache, so
+/// N distinct frames cannot exist in less than ~2*(N-1) seconds; 2 means the
+/// claim is at least a couple of seconds old, which is the repaint lag the
+/// contradiction window was written for. Raising this to 3 would push the
+/// earliest possible correction to ~4-8s at real sampling rates and miss the
+/// shorter live specimens (4.4s, 8.1s) outright.
+const CHURN_MIN_SINCE_CLAIM: usize = 2;
+
 /// lane -> recent (ts, content-hash) observations.
 type ChurnMap = BTreeMap<String, Vec<(f64, u64)>>;
 
@@ -1185,6 +1205,24 @@ impl FleetSignals {
         pane_churn_distinct(name, self.now, self.contradiction_window()) >= CHURN_MIN_DISTINCT
     }
 
+    /// Distinct content-frames observed in the last `age_s` seconds — i.e.
+    /// SINCE a claim made that long ago (AMUX-3896).
+    ///
+    /// [`Self::pane_churning`] asks "is this lane redrawing?" over the fixed
+    /// contradiction window. This asks the narrower question the fresh-idle
+    /// gate needs: "has it redrawn since it told us it was DONE?" The window
+    /// has to start at the claim, or the count includes frames from the turn
+    /// the lane just finished and every stop-hook would look like live work.
+    ///
+    /// Zero when the pane is inadmissible, same as `pane_churning` — no
+    /// captured frames means no evidence, never "therefore idle".
+    pub(crate) fn pane_churn_since(&self, name: &str, age_s: f64) -> usize {
+        if self.pane_of(name).is_none() {
+            return 0;
+        }
+        pane_churn_distinct(name, self.now, age_s.max(0.0))
+    }
+
     /// Capture the panes that could contradict a report.
     ///
     /// Only lanes that painted inside the contradiction window — typically a
@@ -1427,14 +1465,65 @@ impl FleetSignals {
         // costs a late correction, never a false "busy".
         let idle_gate_open =
             idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true);
+        // ...AND A FRESH ONE IS FALSIFIABLE TOO, BY EVIDENCE THE RACE CANNOT
+        // MANUFACTURE (AMUX-3896). The window above is one number doing two
+        // jobs, and its own doc says so: "one number for both halves because it
+        // is one question". They are two questions. How recent must a frame be
+        // to be admissible wants 60s. How long does a lane's own word survive
+        // contrary evidence wants ~1s — the repaint lag after a Stop hook is
+        // the entire race the window was written for.
+        //
+        // Conflating them costs the normal amux flow: a lane ends a turn
+        // (stop-hook -> idle) and immediately starts another (auto-continue,
+        // standing orders, input queued at the boundary), then reads IDLE until
+        // 60s pass or its first tool call fires a tool-hook. Ethan, 22:54
+        // 2026-08-29: "tubescience worker says idle but its not". The specimen
+        // is in that lane's own status-explain history — status=idle,
+        // decided_by=report, report age 8.8s, over pane detect=active with 20
+        // distinct content frames. It sat that way for 49s. Sampling every
+        // running lane found the same shape on 8 of 57, all stop-hook, ages
+        // 0.6s to 34s.
+        //
+        // So: keep the window for weak evidence (a bar phrase, a single
+        // spinner-shaped frame — a stale frame can show either), and add one
+        // narrow gate for evidence a frozen frame cannot produce. The pane must
+        // show a spinner AND have REDRAWN since the claim: `CHURN_MIN_DISTINCT`
+        // distinct content-frames inside a window that starts at the report's
+        // own timestamp. A stale frame is by definition one frame and stops
+        // there; a lane really working repaints ~6x/s. That flips the 8.8s,
+        // 16.3s and 34.0s specimens and leaves the 0.6s and 0.7s ones — which
+        // ARE the repaint race — exactly as they are.
+        //
+        // Measured in the same window as the claim, never a fixed one: at age
+        // 3s only the last 3s of frames may vote, so the evidence can never
+        // include the turn the lane just finished.
+        let churn_since_claim = idle_report_age.map(|a| self.pane_churn_since(name, a)).unwrap_or(0);
+        let fresh_idle_contradicted = !idle_gate_open
+            && churn_since_claim >= CHURN_MIN_SINCE_CLAIM
+            && self
+                .pane_of(name)
+                .map(crate::api::session_verbs::detect_claude_status)
+                .as_deref()
+                == Some("active");
         ex.insert(
             "idle_report_age_s".into(),
             idle_report_age.map(|a| json!(a)).unwrap_or(serde_json::Value::Null),
         );
         ex.insert("idle_contradiction_gate_open".into(), json!(idle_gate_open));
-        if status == "idle" && idle_gate_open && self.pane_says_working(name) {
+        ex.insert("churn_since_claim".into(), json!(churn_since_claim));
+        ex.insert("churn_since_claim_threshold".into(), json!(CHURN_MIN_SINCE_CLAIM));
+        ex.insert("fresh_idle_contradicted".into(), json!(fresh_idle_contradicted));
+        if status == "idle" && (idle_gate_open || fresh_idle_contradicted) && self.pane_says_working(name)
+        {
             status = "active".into();
-            decided = "contradiction_pane_generating";
+            // NAMED APART from the aged path, because the two rest on different
+            // evidence and a sweep that cannot tell them apart cannot tell
+            // whether this gate is earning its keep or firing on the race.
+            decided = if idle_gate_open {
+                "contradiction_pane_generating"
+            } else {
+                "contradiction_pane_redrew_since_claim"
+            };
         }
         // A PICKER CONTRADICTS IDLE TOO (AMUX-2952's status half). The rule
         // above only ever flips idle -> active on a GENERATING pane, so a lane
@@ -3965,6 +4054,115 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(ex["decided_by"], json!("not_running"));
     }
 
+    // ── AMUX-3896: a FRESH idle claim is falsifiable too ────────────────────
+    //
+    // Ethan, 2026-08-29 22:54: "tubescience worker says idle but its not". That
+    // lane's own status-explain history holds the derivation: status=idle,
+    // decided_by=report, a stop-hook `idle` 8.8s old, over a pane with a spinner
+    // and 20 distinct content frames. It read idle for 49s while generating,
+    // because the contradiction window (60s) refuses the pane's evidence until
+    // the claim is a minute old — and the normal amux flow (turn ends, next turn
+    // starts at once from queued input or standing orders) lives entirely inside
+    // that minute. 8 of 57 running lanes carried the same shape when sampled.
+    //
+    // These three cases are the whole discriminator: work redraws AFTER the
+    // claim, a stale post-Stop frame does not, and frames from BEFORE the claim
+    // are the finished turn's and may never vote.
+
+    /// One planted frame per element, spaced 1s apart, ending `newest_age_s`
+    /// ago. Distinct `body` values are what make a frame count as a redraw —
+    /// `pane_content_hash` ignores the bottom bar, so the varying line has to be
+    /// above it.
+    fn plant_frames(lane: &str, now: f64, bodies: &[&str], newest_age_s: f64) {
+        for (i, b) in bodies.iter().rev().enumerate() {
+            let frame = format!(
+                "{b}\n\u{273b} Doing\u{2026} (3m 56s \u{b7} \u{2193} 6.8k tokens)\n\
+                 \u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                 \u{23f5}\u{23f5} bypass permissions on \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents"
+            );
+            super::note_pane_frame(lane, &frame, now - newest_age_s - i as f64, 600.0);
+        }
+    }
+
+    fn fresh_idle_lane(lane: &str, claim_age_s: f64) -> FleetSignals {
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {"state": "idle", "ts": s.now - claim_age_s, "source": "stop-hook"}});
+        s.panes.insert(lane.into(), WORKING_BAR.into());
+        s
+    }
+
+    /// THE FIX. A spinner plus two distinct frames recorded since the claim is
+    /// evidence a frozen frame cannot manufacture, so the lane reads working —
+    /// and the verdict names the narrow rule, not the aged one.
+    #[test]
+    fn a_fresh_idle_claim_loses_to_a_pane_that_redrew_since_the_claim() {
+        let lane = "t3896-redrew";
+        let s = fresh_idle_lane(lane, 9.0);
+        plant_frames(lane, s.now, &["frame one", "frame two"], 1.0);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "active", "a generating lane must not read idle: {ex}");
+        assert_eq!(ex["decided_by"], json!("contradiction_pane_redrew_since_claim"), "{ex}");
+        assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "the 60s gate is still shut: {ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(true), "{ex}");
+        assert!(ex["churn_since_claim"].as_u64().unwrap() >= 2, "{ex}");
+    }
+
+    /// THE RACE THE WINDOW EXISTS FOR, WHICH MUST KEEP WINNING. The live
+    /// specimens at 0.6s and 0.7s are a stop-hook landing while the just-drawn
+    /// frame is still on screen. A frozen frame hashes the same however often it
+    /// is sampled, so it can never reach two distinct contents.
+    #[test]
+    fn a_frozen_post_stop_frame_does_not_falsify_a_fresh_idle_claim() {
+        let lane = "t3896-frozen";
+        let s = fresh_idle_lane(lane, 0.7);
+        // Sampled four times, same content every time — which is what "stale"
+        // means. Planting one distinct body four times is the point.
+        plant_frames(lane, s.now, &["same", "same", "same", "same"], 0.1);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "a stale frame must not read as work: {ex}");
+        assert_eq!(ex["decided_by"], json!("report"), "{ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(false), "{ex}");
+        assert_eq!(ex["churn_since_claim"], json!(1), "{ex}");
+    }
+
+    /// THE WINDOW HAS TO START AT THE CLAIM. Frames from before it belong to the
+    /// turn the lane just finished; counting them would make every stop-hook
+    /// look like live work and turn the fix into "no idle status at all".
+    #[test]
+    fn frames_from_before_the_claim_do_not_count_as_redrawing_since_it() {
+        let lane = "t3896-before";
+        let s = fresh_idle_lane(lane, 5.0);
+        // Four distinct frames, all older than the 5s-old claim.
+        plant_frames(lane, s.now, &["a", "b", "c", "d"], 8.0);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "the finished turn's own frames are not evidence: {ex}");
+        assert_eq!(ex["churn_since_claim"], json!(0), "{ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(false), "{ex}");
+    }
+
+    /// A REDRAWING PANE IS NOT ENOUGH ON ITS OWN. Churn is content-only and a
+    /// human typing at the composer also changes content; the gate requires a
+    /// SPINNER in the same frame, so a genuinely idle lane whose pane is
+    /// changing stays idle. Without this the fix would flip lanes that just
+    /// finished and are being typed into.
+    #[test]
+    fn churn_without_a_spinner_does_not_falsify_a_fresh_idle_claim() {
+        let lane = "t3896-nospinner";
+        let mut s = fresh_idle_lane(lane, 9.0);
+        s.panes.insert(lane.into(), IDLE_WITH_AGENTS.into());
+        plant_frames(lane, s.now, &["frame one", "frame two", "frame three"], 1.0);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(
+            crate::api::session_verbs::detect_claude_status(IDLE_WITH_AGENTS),
+            "idle",
+            "fixture guard: this pane must not detect as active, or the test proves nothing"
+        );
+        assert_eq!(status, "idle", "content churn alone is not a generating turn: {ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(false), "{ex}");
+    }
+
     /// AMUX-3756. The status badge and the turn-boundary gate must reach the
     /// same verdict about the same stored report.
     ///
@@ -4340,6 +4538,19 @@ Claude usage limit reached. Your limit will reset at 3pm.
                                 };
                                 let got = run(&c);
                                 checked += 1;
+                                // THE NAME OVER-CLAIMS, AND THIS LINE IS WHERE
+                                // (AMUX-3896). A totalizing title with a
+                                // carve-out reads as a total guarantee to
+                                // everyone who greps it, and the carve-out was
+                                // the bug: a lane starting its next turn read
+                                // idle for up to 60s. The window is now
+                                // falsifiable by a pane that REDREW since the
+                                // claim, which this table cannot express — it
+                                // plants no frames, so churn_since_claim is 0
+                                // in every row here. The discriminator is
+                                // pinned by the four `*_since_the_claim` tests
+                                // above; grace stays permissive so both
+                                // outcomes are legal here.
                                 let grace = st == "idle" && age <= 60.0;
                                 assert!(
                                     got != "idle" || grace,
