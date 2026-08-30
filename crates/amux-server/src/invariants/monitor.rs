@@ -267,6 +267,7 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     // halves reporting success for 11 days).
     out.extend(autofix_dispatchable_check(state));
     out.extend(card_type_vocabulary_check(state));
+    out.extend(board_list_read_check(state));
 
     tm.mark(&out, "6d. are auto-filed cards DISPATCHABLE?");
     // -- 6f. does the frustrations LEDGER agree with the board? (AF-191).
@@ -1074,6 +1075,61 @@ fn result_log_bounded_check(state: &AppState) -> Vec<InvariantResult> {
     }
 }
 
+/// The board must be readable THROUGH THE READER THE API USES.
+///
+/// 2026-08-30, ~20 minutes, every session: `GET /api/board` answered
+/// `{"error":"Invalid column type Real at index: 6, name: updated"}`. A runtime
+/// job wrote `updated` with an f64; SQLite is dynamically typed so that row
+/// stored REAL, and rusqlite's `FromSql` is strict per storage type, so
+/// `issue_from_row` failed and took the WHOLE list read with it. 12,959 correct
+/// rows made unreadable by 3 wrong ones.
+///
+/// NOTHING ALARMED. `/health` does not read the board. And this file already had
+/// two board invariants which both stayed green, because each runs its OWN
+/// `SELECT id, type ...` and never touches `updated` or `issue_from_row`. So 537
+/// invariants were evaluated and not one of them asked the question the fleet
+/// actually cared about: can the board be read?
+///
+/// That is ethos rule 1 — a view must share the predicate of the mechanism it
+/// describes. "The issues table is queryable" and "the board is readable" are
+/// different claims, and only the second is what a session loses.
+///
+/// So this check deliberately calls `list_issues`, the same function the handler
+/// calls, rather than a SELECT of its own. A cheaper query would be a third
+/// predicate that can pass while the API is down, which is precisely the failure
+/// being closed. It is the one board check that must never be "optimised" into
+/// its own SQL.
+fn board_list_read_check(state: &AppState) -> Vec<InvariantResult> {
+    const ID: &str = "board.list_read_succeeds";
+    let Ok(conn) = state.store.read() else {
+        return vec![InvariantResult::unknown(ID, "store unreadable")];
+    };
+    match crate::db::board_store::list_issues(
+        &conn,
+        &[],
+        &[],
+        crate::db::board_store::ArchivedFilter::All,
+    ) {
+        // A pass carries no count here (InvariantResult::pass takes only an id);
+        // the point of this check is binary — the reader either works for the
+        // whole table or it works for none of it.
+        Ok(_rows) => vec![InvariantResult::pass(ID)],
+        // The MESSAGE is the diagnosis. rusqlite names the column and the storage
+        // class it refused ("Invalid column type Real at index: 6, name: updated"),
+        // which is enough to find the offending writer without reproducing the
+        // outage — so it is carried through verbatim rather than summarised.
+        Err(e) => vec![InvariantResult::fail(
+            ID,
+            "list_issues returns rows for every non-deleted card",
+            format!(
+                "GET /api/board is DOWN for every session: {e}. One bad cell fails the \
+                 whole list read. Find the row (e.g. SELECT id, typeof(updated) FROM issues \
+                 WHERE typeof(updated) != 'integer') and the job that wrote it."
+            ),
+        )],
+    }
+}
+
 fn card_type_vocabulary_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "board.card_types_are_in_vocabulary";
     let Ok(conn) = state.store.read() else {
@@ -1741,6 +1797,93 @@ pub async fn run(state: AppState) {
 
 #[cfg(test)]
 mod tests {
+    // ── AF-317 fallout: the board's own readability had no invariant ────────
+    //
+    // 2026-08-30, ~20 minutes, every session: GET /api/board answered
+    // {"error":"Invalid column type Real at index: 6, name: updated"}. A runtime
+    // job wrote an f64 into an INTEGER column, rusqlite's FromSql is strict per
+    // storage type, and `issue_from_row` took the whole 12,959-row list read down
+    // over 3 cells.
+    //
+    // 537 invariants were being evaluated and none of them noticed, because both
+    // existing board checks run their own `SELECT id, type ...` and never touch
+    // the handler's reader. `/health` does not read the board either. So the
+    // fleet lost its primary surface with every instrument green.
+    //
+    // These two pin the wiring rather than the incident. The incident itself is
+    // now unreproducible here on purpose — 66a9e6ed hardened `updated` behind
+    // `ts_i64`, so a REAL no longer breaks the read — which means a test that
+    // planted a REAL would assert nothing about this check. What must stay true
+    // is narrower and outlives that fix: when the handler's reader FAILS, this
+    // check FAILS, whatever made it fail.
+
+    /// A broken reader must produce a FAILING invariant, not an absent one.
+    #[test]
+    fn a_board_read_that_errors_is_reported_as_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        // Replace `issues` with a table that has none of the columns the
+        // handler's SELECT names, so `list_issues` fails at prepare. The CAUSE
+        // does not matter; that a reader failure surfaces as a failed invariant
+        // does.
+        store
+            .write(|conn| {
+                conn.execute_batch("DROP TABLE IF EXISTS issues; CREATE TABLE issues (nope TEXT);")?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .expect("break the table");
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let rs = super::board_list_read_check(&state);
+        let r = rs
+            .iter()
+            .find(|r| r.invariant_id == "board.list_read_succeeds")
+            .expect("the check must reach a verdict, not vanish");
+        assert_eq!(
+            r.status,
+            crate::invariants::Status::Fail,
+            "a board the API cannot read must FAIL this invariant; observed: {}",
+            r.observed
+        );
+        assert!(
+            r.observed.contains("DOWN for every session"),
+            "the message must say what the fleet loses, not just quote rusqlite: {}",
+            r.observed
+        );
+        assert!(
+            r.observed.contains("typeof(updated)"),
+            "and must carry the recovery query, which is how the 3 offending rows \
+             were found without reproducing the outage: {}",
+            r.observed
+        );
+    }
+
+    /// CONTROL: a healthy board passes. Without this the check could be
+    /// hard-failing and the test above would still be green.
+    #[test]
+    fn a_readable_board_passes_the_same_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::db::Store::open(&dir.path().join("t.db")).unwrap();
+        let state = AppState {
+            store: std::sync::Arc::new(store),
+            started: std::time::Instant::now(),
+            build_hash: "test".into(),
+            auth_token: None,
+        };
+        let rs = super::board_list_read_check(&state);
+        let r = rs.iter().find(|r| r.invariant_id == "board.list_read_succeeds").unwrap();
+        assert_eq!(
+            r.status,
+            crate::invariants::Status::Pass,
+            "a migrated, empty board is readable: {}",
+            r.observed
+        );
+    }
+
     use super::*;
 
     /// The BINDING for the provider-launch invariant (RR-0043 / AMUX-3153):
