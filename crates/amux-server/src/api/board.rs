@@ -6385,25 +6385,7 @@ mod slim_tests {
     // ---- AMUX-3391: auto-fold the silent capture card into the worker's own ----
 
     fn fold_db() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
-                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
-                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
-                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
-                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
-                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, closed_at INTEGER, evidence TEXT,
-                ask_type TEXT, ask_question TEXT, ask_unblocks TEXT, deleted INTEGER);
-             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
-                PRIMARY KEY (issue_id, tag));
-             CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
-        )
-        .unwrap();
-        conn
+        crate::db::migrate::test_memdb()
     }
 
     fn fold_card(creator: &str, status: &str, desc: &str, session: &str) -> bs::NewIssue {

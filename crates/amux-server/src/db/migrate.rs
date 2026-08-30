@@ -397,6 +397,31 @@ pub fn apply_all_guarded(conn: &mut Connection, db_path: &std::path::Path) -> an
     apply_all(conn)
 }
 
+/// An in-memory DB carrying the REAL schema, for tests (AF-328).
+///
+/// Four test fixtures used to hand-write `CREATE TABLE issues (...)` mirroring
+/// this crate's migrations, and nothing kept them in step. Adding a column meant
+/// finding all four, and the failure when you missed one was badly misleading:
+/// `COLS` selects the new column, `prepare` fails, an `unwrap_or_default()`
+/// swallows the error, the query returns None, and the test reports its OWN
+/// assertion. Migration 0037 produced 38 failures across `board_drive` and not
+/// one of them mentioned a schema or named a column — the top one read
+/// "the 3-day-old card must be worked before the fresh one, left: None", which
+/// sends you to read the scoring logic. The same tax was paid on 0036.
+///
+/// Building the fixture FROM the migrations removes the class rather than
+/// detecting it: there is one schema, so drift is not possible. A new column is
+/// present in every fixture the moment its migration is registered.
+///
+/// The two deliberately NARROW fixtures are left alone on purpose — they declare
+/// only the columns their test uses, so they mirror nothing and cannot drift.
+#[cfg(test)]
+pub(crate) fn test_memdb() -> Connection {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_all(&mut conn).expect("migrations must apply cleanly to a fresh db");
+    conn
+}
+
 pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS _amux_migrations (

@@ -5447,8 +5447,8 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str, status: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
-                 VALUES (?1,?2,?3,'me','agent',0,'code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created) \
+                 VALUES (?1,?2,?3,'me','agent',0,'code',100,100)",
                 rusqlite::params![id, format!("card {id}"), status],
             )
             .expect("insert");
@@ -5575,8 +5575,8 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str, status: &str, dep: Option<&str>| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,depends_on) \
-                 VALUES (?1,?2,?3,'me','agent',0,'code',100,?4)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,depends_on,created) \
+                 VALUES (?1,?2,?3,'me','agent',0,'code',100,?4,100)",
                 rusqlite::params![
                     id,
                     format!("card {id}"),
@@ -5778,8 +5778,8 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str, typ: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
-                 VALUES (?1,?2,'done','me','agent',0,?3,100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created) \
+                 VALUES (?1,?2,'done','me','agent',0,?3,100,100)",
                 rusqlite::params![id, format!("card {id}"), typ],
             )
             .expect("insert");
@@ -5819,7 +5819,7 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str, session: &str, status: &str, owner: &str, arch: i64, del: Option<i64>| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,deleted,type,updated)                  VALUES (?1,?2,?3,?4,?5,?6,?7,'code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,deleted,type,updated,created)                  VALUES (?1,?2,?3,?4,?5,?6,?7,'code',100,100)",
                 rusqlite::params![id, format!("card {id}"), status, session, owner, arch, del],
             )
             .expect("insert");
@@ -5854,8 +5854,8 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
-                 VALUES (?1,?2,'done','me','agent',0,'code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created) \
+                 VALUES (?1,?2,'done','me','agent',0,'code',100,100)",
                 rusqlite::params![id, format!("card {id}")],
             )
             .expect("insert");
@@ -5901,7 +5901,7 @@ mod tests {
         let conn = board_db();
         for i in 0..11 {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated)                  VALUES (?1,?2,'done','me','agent',0,'code',?3)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created)                  VALUES (?1,?2,'done','me','agent',0,'code',?3,?3)",
                 rusqlite::params![format!("A-{i}"), format!("card {i}"), i],
             )
             .expect("insert");
@@ -5948,36 +5948,7 @@ mod tests {
 
     /// The live board schema, trimmed to the columns these predicates read.
     fn board_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("memdb");
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
-                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
-                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
-                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
-                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
-                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, closed_at INTEGER, evidence TEXT,
-                ask_type TEXT, ask_question TEXT, ask_unblocks TEXT, deleted INTEGER);
-             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
-                PRIMARY KEY (issue_id, tag));
-             CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
-                session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT, idem TEXT,
-                source TEXT NOT NULL DEFAULT '');
-             CREATE TABLE cmd_history (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
-                type TEXT NOT NULL DEFAULT 'direct', session TEXT NOT NULL DEFAULT '',
-                ts INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT '');
-             CREATE TABLE interaction_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER,
-                kind TEXT, actor TEXT, target TEXT, action TEXT, url TEXT, detail TEXT,
-                before TEXT, result TEXT, ok INTEGER, ms INTEGER, seq INTEGER);
-             CREATE TABLE statuses (id TEXT PRIMARY KEY, label TEXT, position INTEGER,
-                is_builtin INTEGER DEFAULT 1, gate TEXT, mode TEXT DEFAULT 'implicit');
-             CREATE TABLE status_scope (status TEXT, scope_type TEXT, scope_value TEXT);",
-        )
-        .expect("schema");
-        conn
+        crate::db::migrate::test_memdb()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -6271,8 +6242,8 @@ mod tests {
         // Dependencies in the states that matter.
         let dep = |id: &str, status: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
-                 VALUES (?1,?1,?2,'me','agent','code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,type,updated,created) \
+                 VALUES (?1,?1,?2,'me','agent','code',100,100)",
                 rusqlite::params![id, status],
             )
             .expect("dep");
@@ -6284,8 +6255,8 @@ mod tests {
         // Parked backlog cards of every shape (owner_type='agent').
         let parked = |id: &str, typ: &str, deps: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
-                 VALUES (?1,?1,'backlog','me','agent',?2,?3,100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated,created) \
+                 VALUES (?1,?1,'backlog','me','agent',?2,?3,100,100)",
                 rusqlite::params![id, typ, deps],
             )
             .expect("parked");
@@ -6297,15 +6268,15 @@ mod tests {
         parked("E-epic", "epic", r#"["A-verified"]"#); // NOT: container type
         // A triggers-only park: NULL depends_on, terminal-deps irrelevant.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
-             VALUES ('P-nodeps','P-nodeps','backlog','me','agent','code',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,updated,created) \
+             VALUES ('P-nodeps','P-nodeps','backlog','me','agent','code',100,100)",
             [],
         )
         .unwrap();
         // A human's card with a completed dep — ethos rule 8, never swept.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
-             VALUES ('H-1','H-1','backlog','me','human','code','[\"A-done\"]',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated,created) \
+             VALUES ('H-1','H-1','backlog','me','human','code','[\"A-done\"]',100,100)",
             [],
         )
         .unwrap();
@@ -6337,30 +6308,30 @@ mod tests {
     fn a_live_trigger_holds_a_card_even_when_its_deps_are_terminal() {
         let conn = board_db();
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
-             VALUES ('A-done','A-done','done','me','agent','code',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,updated,created) \
+             VALUES ('A-done','A-done','done','me','agent','code',100,100)",
             [],
         )
         .unwrap();
         // The MG-1388 shape: a terminal dep AND a live source_ref trigger.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated) \
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated,created) \
              VALUES ('T-armed','T-armed','backlog','me','agent','investigation','[\"A-done\"]',\
-                     'some namespace holds both an archive- and a competitor-shaped collection',100)",
+                     'some namespace holds both an archive- and a competitor-shaped collection',100,100)",
             [],
         )
         .unwrap();
         // Control: same terminal dep, NO trigger -> still promotes.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
-             VALUES ('T-plain','T-plain','backlog','me','agent','code','[\"A-done\"]',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated,created) \
+             VALUES ('T-plain','T-plain','backlog','me','agent','code','[\"A-done\"]',100,100)",
             [],
         )
         .unwrap();
         // A whitespace-only source_ref is NOT a live trigger -> promotes.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated) \
-             VALUES ('T-blank','T-blank','backlog','me','agent','code','[\"A-done\"]','   ',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated,created) \
+             VALUES ('T-blank','T-blank','backlog','me','agent','code','[\"A-done\"]','   ',100,100)",
             [],
         )
         .unwrap();
@@ -7738,7 +7709,12 @@ mod tests {
     fn verified_is_only_named_for_lanes_it_applies_to() {
         let conn = board_db();
         conn.execute(
-            "INSERT INTO statuses (id,label,position,gate,mode) VALUES ('verified','Verified',6,NULL,'explicit')",
+            // OR REPLACE: the fixture now carries the REAL migrated schema, which
+            // SEEDS the builtin statuses. The hand-rolled one created `statuses`
+            // empty, so this plain INSERT used to be the only row — another way
+            // the old fixture differed from production without saying so (AF-328).
+            "INSERT OR REPLACE INTO statuses (id,label,position,gate,mode) \
+             VALUES ('verified','Verified',6,NULL,'explicit')",
             [],
         )
         .expect("status");

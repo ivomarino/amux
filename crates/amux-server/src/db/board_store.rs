@@ -2341,23 +2341,7 @@ mod tests {
     /// are here and why the integer cell is not decoration.
     #[test]
     fn last_verified_at_reads_back_from_both_integer_and_legacy_text_storage() {
-        let conn = Connection::open_in_memory().expect("memdb");
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
-                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
-                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
-                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
-                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
-                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0, evidence TEXT,
-                ask_type TEXT, ask_question TEXT, ask_unblocks TEXT,
-                epic TEXT, closed_at INTEGER, deleted INTEGER);
-             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
-                PRIMARY KEY (issue_id, tag));",
-        )
-        .expect("schema");
+        let conn = crate::db::migrate::test_memdb();
 
         // SQLite is dynamically typed: binding an i64 stores INTEGER, binding a
         // &str stores TEXT, in the same column. That is how the legacy rows
@@ -2367,16 +2351,28 @@ mod tests {
             ("TXT-1", &"1787840686" as &dyn rusqlite::ToSql),
             ("TXT-2", &" 1787840686 " as &dyn rusqlite::ToSql), // whitespace, trimmed
         ] {
+            // title/created/updated are NOT NULL with NO default in the real
+            // schema. The hand-rolled fixture this test used to carry declared
+            // `title TEXT NOT NULL DEFAULT ''`, so these inserts were valid
+            // against a schema that does not exist — the fixture was more
+            // PERMISSIVE than production, which is the sharper half of AF-328:
+            // drift does not only hide columns, it can hide constraints.
             conn.execute(
-                "INSERT INTO issues (id, last_verified_at) VALUES (?1, ?2)",
+                "INSERT INTO issues (id, title, created, updated, last_verified_at) \
+                 VALUES (?1, ?1, 0, 0, ?2)",
                 params![id, bind],
             )
             .expect("insert");
         }
         // Genuine absence, and the unreadable case that must not be mistaken for it.
-        conn.execute("INSERT INTO issues (id) VALUES ('NUL-1')", []).expect("insert");
         conn.execute(
-            "INSERT INTO issues (id, last_verified_at) VALUES ('BAD-1', 'yesterday')",
+            "INSERT INTO issues (id, title, created, updated) VALUES ('NUL-1','NUL-1',0,0)",
+            [],
+        )
+        .expect("insert");
+        conn.execute(
+            "INSERT INTO issues (id, title, created, updated, last_verified_at) \
+             VALUES ('BAD-1','BAD-1',0,0,'yesterday')",
             [],
         )
         .expect("insert");
@@ -2397,11 +2393,40 @@ mod tests {
         );
 
         let at = |id: &str| get_issue(&conn, id).expect("read").expect("row").last_verified_at;
+        // PER-ROW STORAGE, not just "the set holds both shapes" (AF-328).
+        //
+        // The guard above is satisfied as long as SOME row is text and SOME row
+        // is integer, and BAD-1 supplies the text on its own. That let two
+        // assertions below claim to exercise the legacy-TEXT arm while their
+        // rows were stored as INTEGER: SQLite applies INTEGER affinity on write,
+        // so a numeric STRING is converted before it is ever stored, whitespace
+        // and all. Asserting each row's own typeof is what makes the label and
+        // the fact agree.
+        let kind = |id: &str| -> String {
+            conn.query_row("SELECT typeof(last_verified_at) FROM issues WHERE id=?1", [id], |r| {
+                r.get(0)
+            })
+            .expect("typeof")
+        };
+        assert_eq!(kind("INT-1"), "integer");
+        assert_eq!(kind("TXT-1"), "integer", "a numeric string is coerced by INTEGER affinity");
+        assert_eq!(kind("TXT-2"), "integer", "whitespace does not defeat affinity either");
+        assert_eq!(kind("BAD-1"), "text", "only a NON-numeric string survives as text");
+
         assert_eq!(at("INT-1"), Some(1787840686), "the normal INTEGER case");
-        assert_eq!(at("TXT-1"), Some(1787840686), "legacy TEXT must not crash or drop");
-        assert_eq!(at("TXT-2"), Some(1787840686), "legacy TEXT is trimmed");
+        assert_eq!(at("TXT-1"), Some(1787840686), "a numeric string, coerced to INTEGER on write");
+        assert_eq!(at("TXT-2"), Some(1787840686), "same, with surrounding whitespace");
         assert_eq!(at("NUL-1"), None, "NULL is genuine absence");
         assert_eq!(at("BAD-1"), None, "unreadable text degrades to None (and warns)");
+
+        // WHAT THIS TEST CANNOT REACH, said out loud rather than left implied.
+        // The reader's `Value::Text(s) => s.trim().parse::<i64>()` SUCCESS arm is
+        // not reachable through SQL: any text that parses as an integer is
+        // converted to one on write, and any text that survives as text does not
+        // parse. It guards rows written by something that bypassed affinity.
+        // Measured on the live DB 2026-08-30: 1,423 integer, 11,572 null, ZERO
+        // text — so the condition is currently hypothetical, and this test
+        // covers the failure branch only.
     }
 
     #[test]
@@ -2667,25 +2692,7 @@ mod tests {
     }
 
     fn create_db() -> Connection {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
-                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
-                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
-                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
-                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
-                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0, evidence TEXT,
-                ask_type TEXT, ask_question TEXT, ask_unblocks TEXT,
-                epic TEXT, closed_at INTEGER, deleted INTEGER);
-             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
-                PRIMARY KEY (issue_id, tag));
-             CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
-        )
-        .unwrap();
-        conn
+        crate::db::migrate::test_memdb()
     }
 
     /// AMUX-3609. The write rule lives in `save_patched`, so these drive the
@@ -2894,9 +2901,12 @@ mod tests {
         for i in 0..40 {
             let id = format!("C-{i:02}");
             conn.execute(
-                "INSERT INTO issues (id, title, desc, status, session, updated, pos, pinned, \
+                // `created` mirrors `updated` (?6): the real schema has it NOT NULL
+                // with no default, which the old hand-rolled fixture hid behind
+                // `created INTEGER NOT NULL DEFAULT 0` (AF-328).
+                "INSERT INTO issues (id, title, desc, status, session, updated, created, pos, pinned, \
                                      archived, log, deleted) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?7, ?8, ?9, ?10, ?11)",
                 params![
                     id,
                     format!("card {i}"),
