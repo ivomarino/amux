@@ -2121,13 +2121,29 @@ fn steering_rollup_at() -> usize {
 /// many cards are about to be filed, and that is already in hand here. It also
 /// cannot drift from the thing it describes: if the rollup fires, N cards were
 /// genuinely about to exist.
+/// Is this lane blocked by an ACCOUNT-LEVEL rate limit?
+///
+/// One definition, two consumers, on purpose (AMUX-3915). `steering_fan_out`
+/// used a local closure to decide whether to roll several capped lanes into one
+/// card, and `detect_silent` decided a card's OWNER without consulting the
+/// reason at all. Same cause, two judgements, and they disagreed: the rollup's
+/// own test asserts `owner == None` because "an account cap has no sender who
+/// can act on it", while the per-lane path assigned an owner whenever exactly
+/// one named sender existed.
+///
+/// A rate limit is not a per-lane fault and has no per-lane lever. `not-running`,
+/// `no-env-file` and `archived` are, and keep their owner.
+pub(crate) fn blocked_by_rate_limit(b: &Option<String>) -> bool {
+    b.as_deref() == Some("rate-limited")
+}
+
 fn steering_fan_out(
     rows: Vec<(Option<String>, String, i64, f64, Finding)>,
     now: f64,
     out: &mut Vec<Finding>,
     suppressed: &mut Vec<Suppressed>,
 ) {
-    let is_rl = |b: &Option<String>| b.as_deref() == Some("rate-limited");
+    let is_rl = |b: &Option<String>| blocked_by_rate_limit(b);
     let rl_count = rows.iter().filter(|(b, ..)| is_rl(b)).count();
     if rl_count < steering_rollup_at() {
         out.extend(rows.into_iter().map(|(.., f)| f));
@@ -2457,7 +2473,24 @@ pub fn detect_silent(
                     .map(str::trim)
                     .filter(|x| !x.is_empty() && *x != session)
                     .collect();
+                // OWNER IS GATED ON WHETHER THE SENDER HAS A LEVER, NOT ON HOW
+                // MANY SENDERS THERE HAPPEN TO BE (AMUX-3915, gtm-engine).
+                //
+                // GE-741 was addressed to gtm-engine as the sender, on the
+                // ground that "the sender holds the false belief ('I sent it')
+                // and is the only party who can act". Under a credit cap neither
+                // half is true: the belief was correct — steer-1788077483062 was
+                // delivered 412 minutes later with outcome "sent (queued while
+                // generating)", and its neighbour at 409 minutes — and resending
+                // would only have queued a duplicate behind the same cap.
+                //
+                // The same cause already produces an UNOWNED card once three
+                // lanes are capped in one sweep, so ownership was decided by how
+                // many OTHER lanes happened to be capped alongside you. Here it
+                // collapsed to `[one]` only because the queue's second row had a
+                // blank sender and was filtered out.
                 let owner = match senders.as_slice() {
+                    _ if blocked_by_rate_limit(&block) => None,
                     [one] => Some((*one).to_string()),
                     _ => None,
                 };
@@ -7217,6 +7250,74 @@ mod tests {
                 "{lane} keeps its own card below the threshold: {f:?}"
             );
         }
+    }
+
+    /// AMUX-3915, gtm-engine. A capped lane below the rollup threshold still
+    /// gets its own card — and that card has NO OWNER, because a credit cap has
+    /// no sender who can act on it.
+    ///
+    /// GE-741 was addressed to gtm-engine as the sender on the ground that the
+    /// sender "holds the false belief ('I sent it') and is the only party who
+    /// can act". Under a cap neither half holds: steer-1788077483062 was
+    /// delivered 412 minutes later, outcome "sent (queued while generating)",
+    /// with no sender action, and resending would only have queued a duplicate
+    /// behind the same cap.
+    ///
+    /// The rollup path already asserts exactly this (`an account cap has no
+    /// sender who can act on it`), so before this fix ownership depended on how
+    /// many OTHER lanes happened to be capped in the same sweep.
+    ///
+    /// The `not-running` arm is the control, and it is the one that matters: a
+    /// fix that simply stopped assigning owners would pass the first assertion
+    /// and quietly unassign every card that DOES have a lever.
+    #[tokio::test]
+    async fn a_capped_lane_with_one_named_sender_gets_a_card_with_no_owner() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        seed_queues(&st, now, &["capped-lane", "dead-lane"], 92.0).await;
+        // Exactly ONE named sender on each, which is what used to collapse the
+        // match to `[one]` and mint an owner.
+        st.store
+            .write_async(move |conn| {
+                conn.execute(
+                    "UPDATE steering_queue SET sender='some-sender' WHERE session IN                      ('capped-lane','dead-lane')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+            })
+            .await
+            .expect("stamp senders");
+
+        let mut blocked = rate_limited(&["capped-lane"]);
+        blocked.insert("dead-lane".into(), Some("not-running".into()));
+        let resets: BTreeMap<String, i64> =
+            ["capped-lane", "dead-lane"].iter().map(|l| (l.to_string(), 0)).collect();
+        let conn = st.store.read().unwrap();
+        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+
+        let capped = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|capped-lane")
+            .expect("a capped lane below the threshold keeps its own card");
+        assert_eq!(
+            capped.owner, None,
+            "a credit cap has no sender who can act on it — the sender's belief was correct \
+             and resending only queues a duplicate behind the same cap"
+        );
+
+        // CONTROL: a per-lane fault keeps its owner. `not-running` has a real
+        // lever (start the lane), and the sender is the party who can pull it.
+        let dead = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|dead-lane")
+            .expect("a not-running lane still gets its own card");
+        assert_eq!(
+            dead.owner,
+            Some("some-sender".to_string()),
+            "not-running is a per-lane fault with a lever; unassigning it too would trade one \
+             misrouted card for a pile of unowned ones"
+        );
     }
 
     /// THE DISCRIMINATOR. Only a RATE LIMIT is shared. A lane that cannot be
