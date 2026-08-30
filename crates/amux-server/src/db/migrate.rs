@@ -211,10 +211,25 @@ const MIGRATIONS: &[Migration] = &[
         name: "0037_telegram_routed_session",
         sql: include_str!("../../migrations/0037_telegram_routed_session.sql"),
     },
+    // NOTE: version 38 is permanently unusable on this box's live DB — it was
+    // consumed 2026-08-29 by an unrelated migration ("0038_telegram") built
+    // from a DIFFERENT, un-merged branch that happened to be live at the
+    // time (this dev box's single shared amux.db gets migrations from
+    // whatever OFF-MAIN branch the auto-builder last installed, per the
+    // freshness hook's own warning — see frustrations.md 2026-08-30). Migration
+    // application is matched by VERSION NUMBER ALONE (`db/migrate.rs`'s
+    // `apply_all`: `SELECT 1 FROM _amux_migrations WHERE version = ?1`), so a
+    // second, unrelated migration also claiming 38 is silently skipped
+    // forever regardless of its actual SQL content — no error, just a column
+    // that never arrives. This is the SAME class of incident 324116fb fixed
+    // once already ("renumber relay migrations to close the gap CI's
+    // dense-ordering guard enforces"); CI's dense-ordering check only sees
+    // ONE branch's migrations/ directory, never this box's actual applied
+    // history, so it cannot catch a cross-branch collision like this one.
     Migration {
-        version: 38,
-        name: "0038_telegram_relay_dedup",
-        sql: include_str!("../../migrations/0038_telegram_relay_dedup.sql"),
+        version: 39,
+        name: "0039_telegram_relay_dedup",
+        sql: include_str!("../../migrations/0039_telegram_relay_dedup.sql"),
     },
 ];
 
