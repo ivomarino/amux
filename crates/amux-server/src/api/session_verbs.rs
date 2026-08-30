@@ -3801,8 +3801,48 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
     .unwrap_or((None, None))
 }
 
+/// Guards whose messages CARRY CONTENT instead of asserting a re-evaluated
+/// state. These never coalesce: a second one is a SECOND MESSAGE, not a fresher
+/// version of the first.
+///
+/// The guard field does three jobs at once — it is the isolation discriminator,
+/// the producer label, and the coalescing key — and only the third is wrong for
+/// a note. Coalescing is right for a nudge: auto-compact re-evaluates the same
+/// condition 300 times and the reader wants one pending answer with current
+/// content (AMUX-3557). It is wrong for a peer's note, which is a message with
+/// a body that nobody else will ever send again.
+///
+/// MEASURED (AMUX-3938). Every board note enqueues under `board-progress`, and
+/// the lookup below is `WHERE session=? AND guard=?` — no card, no text. So
+/// while one note sat pending for a lane's next turn boundary, the NEXT board
+/// note to that lane overwrote its text, from any sender, about any card. Live
+/// specimen: three notes posted to AMUX-3935 within one second produced exactly
+/// one steer, and it carried note 1's `queued_at` with note 2's text, which is
+/// the signature of the in-place UPDATE. The lane read one of two distinct notes
+/// and had no way to know a first one existed.
+///
+/// This is the SAME defect as AMUX-3935 one layer down, and strictly wider: that
+/// one needed the same card and the same author, this one needs neither. Fixing
+/// the dedupe key alone left it in place, which is why the reporter's live test
+/// passed while a note still went missing.
+///
+/// Membership is by producer, not by heuristic, so adding a content-bearing
+/// producer is a deliberate edit here rather than something that has to be
+/// noticed later.
+const NON_COALESCING_GUARDS: &[&str] = &["board-progress"];
+
+/// Whether `guard` names a content-bearing producer (see
+/// [`NON_COALESCING_GUARDS`]). Guards stay non-empty for these, so the isolation
+/// gate above still refuses them into a raw-agent lane — the coalescing is what
+/// is switched off, not the producer identity.
+fn non_coalescing(guard: &str) -> bool {
+    NON_COALESCING_GUARDS.contains(&guard)
+}
+
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
-/// Dedup-on-enqueue: identical text (or same guard) replaces, never stacks.
+/// Dedup-on-enqueue: identical text replaces, never stacks. A shared `guard`
+/// ALSO replaces, except for the content-bearing producers in
+/// [`NON_COALESCING_GUARDS`].
 ///
 /// `sender` is the origin lane (the server-verified `X-Amux-Session` stamp) or
 /// "" for an automated producer, which the `guard` already identifies. It is
@@ -3984,7 +4024,7 @@ pub(crate) async fn steer_enqueue_precond(
             // been waiting since it was first queued. The newest TEXT wins
             // because that is the guard's purpose (one pending answer, current
             // content); the age is not part of the content.
-            let existing: Option<String> = if guard_s.is_empty() {
+            let existing: Option<String> = if guard_s.is_empty() || non_coalescing(&guard_s) {
                 None
             } else {
                 conn.query_row(
@@ -21528,6 +21568,107 @@ mod delivery_mode_tests {
         // The two pre-existing reasons to paste still hold on an idle lane.
         assert!(must_paste(false, 401, false), "long text still pastes");
         assert!(must_paste(false, 12, true), "picker-shaped text still pastes");
+    }
+}
+
+#[cfg(test)]
+mod steer_coalescing_tests {
+    use super::*;
+    use crate::db::Store;
+    use std::sync::Arc;
+
+    /// A store with lane "lane" REGISTERED. The chokepoint refuses a target it
+    /// cannot resolve ("no-env-file"), which is correct and is why the first
+    /// version of this fixture failed: a lane that does not exist is not a lane
+    /// whose coalescing you can test. `_amux_workers` is the resolution path for
+    /// a rust-managed worker with no env file on disk.
+    async fn store() -> (crate::db::SharedStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(&dir.path().join("steer-test.db")).unwrap());
+        s.write_async(|conn| {
+            conn.execute(
+                "INSERT INTO _amux_workers (id, display_name, created_at, updated_at)
+                 VALUES ('wrk_test_lane', 'lane', 0, 0)",
+                [],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        })
+        .await
+        .unwrap();
+        (s, dir)
+    }
+
+    fn pending(st: &crate::db::SharedStore, session: &str) -> Vec<String> {
+        let conn = st.read().unwrap();
+        let mut q = conn
+            .prepare("SELECT text FROM steering_queue WHERE session=?1 ORDER BY queued_at")
+            .unwrap();
+        let rows: Vec<String> =
+            q.query_map([session], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        rows
+    }
+
+    /// THE CELL THAT WOULD HAVE CAUGHT AMUX-3938. Two DIFFERENT board notes,
+    /// both pending for a lane that has not hit its turn boundary yet.
+    ///
+    /// The coalescing lookup is `WHERE session=? AND guard=?` — no card, no
+    /// text — and every board note enqueues under `board-progress`, so the
+    /// second note overwrote the first IN PLACE. The lane then read one of two
+    /// distinct messages with nothing saying a first had existed. Live
+    /// specimen: three notes to AMUX-3935 inside one second produced one steer
+    /// carrying note 1's `queued_at` and note 2's text.
+    #[tokio::test]
+    async fn two_different_board_notes_both_survive_until_delivery() {
+        let (st, _d) = store().await;
+        steer_enqueue_store(&st, "lane", "note one: context", "board-progress", "peer")
+            .await
+            .unwrap();
+        steer_enqueue_store(&st, "lane", "note two: the verdict", "board-progress", "peer")
+            .await
+            .unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 2, "both notes must be pending, got {got:?}");
+        assert!(got.contains(&"note one: context".to_string()), "the FIRST note survived");
+        assert!(got.contains(&"note two: the verdict".to_string()), "and so did the second");
+    }
+
+    /// CONTROL 1, and the reason this is an allowlist rather than a deletion:
+    /// coalescing is CORRECT for a nudge. auto-compact re-evaluates one
+    /// condition hundreds of times and the reader wants one pending answer with
+    /// current content (AMUX-3557). If this arm ever goes green with two rows,
+    /// the fix has removed coalescing instead of scoping it.
+    #[tokio::test]
+    async fn a_re_evaluated_nudge_still_coalesces_to_one_row() {
+        let (st, _d) = store().await;
+        steer_enqueue_store(&st, "lane", "context is at 12%", "auto-compact", "").await.unwrap();
+        steer_enqueue_store(&st, "lane", "context is at 7%", "auto-compact", "").await.unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 1, "a guarded nudge must collapse, got {got:?}");
+        assert_eq!(got[0], "context is at 7%", "and the NEWEST text wins");
+    }
+
+    /// CONTROL 2: flood protection at THIS layer is text-based and still works.
+    /// Two byte-identical notes are one message however they are guarded, so
+    /// making board notes non-coalescing must not let a repeat stack.
+    #[tokio::test]
+    async fn an_identical_board_note_still_does_not_stack() {
+        let (st, _d) = store().await;
+        steer_enqueue_store(&st, "lane", "same text", "board-progress", "peer").await.unwrap();
+        steer_enqueue_store(&st, "lane", "same text", "board-progress", "peer").await.unwrap();
+        assert_eq!(pending(&st, "lane").len(), 1, "an identical repeat must not stack");
+    }
+
+    /// CONTROL 3: the guard stays NON-EMPTY for board notes, so the isolation
+    /// gate still refuses them into a raw-agent lane. Switching off coalescing
+    /// by passing an empty guard would have looked identical here and would
+    /// have broken "isolated = zero amux harness" (Ethan, 2026-08-26).
+    #[test]
+    fn a_non_coalescing_guard_is_still_a_guard() {
+        assert!(non_coalescing("board-progress"));
+        assert!(!NON_COALESCING_GUARDS.iter().any(|g| g.is_empty()),
+                "an empty guard would bypass the isolation gate at the chokepoint");
+        assert!(!non_coalescing("auto-compact"), "nudges must keep coalescing");
+        assert!(!non_coalescing(""), "the owner's own send is not a producer");
     }
 }
 

@@ -5461,17 +5461,47 @@ pub async fn patch_item(
                          is delivery of a peer's note, not a status request.)",
                         title.chars().take(60).collect::<String>()
                     );
-                    let _ = crate::api::session_verbs::steer_enqueue(
+                    // REPORT WHAT THE ENQUEUE ACTUALLY DID (AMUX-3938). This
+                    // was `let _ =` followed by an unconditional
+                    // `owner_notified: true`, so the sender was told the owner
+                    // had been notified even when the chokepoint REFUSED — an
+                    // isolated lane, an archived lane, a permanently blocked
+                    // target. That is the same sender/recipient disagreement
+                    // this card family is about: from the sender it looked
+                    // delivered, from the owner it never arrived, and neither
+                    // side could see the mismatch. `steer_enqueue` is
+                    // `#[must_use]` precisely so this is a decision, not an
+                    // oversight; the honest handling is to pass the refusal on.
+                    match crate::api::session_verbs::steer_enqueue(
                         &state,
                         &owner,
                         &prompt,
                         "board-progress",
                         &caller_for_notify,
                     )
-                    .await;
-                    body["owner_notified"] = json!(true);
-                    body["owner_notify_note"] =
-                        json!(format!("{owner} will see the note at their next turn boundary"));
+                    .await
+                    {
+                        Ok(_) => {
+                            body["owner_notified"] = json!(true);
+                            body["owner_notify_note"] = json!(format!(
+                                "{owner} will see the note at their next turn boundary"
+                            ));
+                        }
+                        Err(reason) => {
+                            body["owner_notified"] = json!(false);
+                            body["owner_notify_reason"] = json!(format!(
+                                "the note is saved on the card, but {owner} could NOT be \
+                                 notified: {reason}"
+                            ));
+                            tracing::warn!(
+                                board_note_undelivered = %owner,
+                                card = %id,
+                                sender = %caller_for_notify,
+                                reason = reason,
+                                "board note saved but owner not notified"
+                            );
+                        }
+                    }
                 }
             }
             // REACTIVE PICKUP: when a card transitions to a terminal state,
