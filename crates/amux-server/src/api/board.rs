@@ -2771,9 +2771,15 @@ const PATCH_CONTROL: [&str; 9] = [
     "desc_shrink_ack",
 ];
 
-/// One owner-notice per (owner, card, author) per 10 minutes (AVE-36): a burst
-/// of appends collapses to one turn-boundary message; the notes themselves all
-/// land on the card regardless.
+/// One owner-notice per (owner, card, author, NOTE TEXT) per 10 minutes: a burst
+/// of IDENTICAL appends collapses to one turn-boundary message; the notes
+/// themselves all land on the card regardless.
+///
+/// AVE-36 set the window. AMUX-3935 added the note text, because without it the
+/// key could not tell a repeat from a follow-up, and a review conversation is
+/// always a follow-up: context, then the verdict that rests on it. Two measured
+/// instances dropped a blocking review condition and a verification result, both
+/// times the later and higher-value message.
 fn progress_notify_once(key: &str) -> bool {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::HashMap<String, f64>>> = Mutex::new(None);
@@ -2788,6 +2794,51 @@ fn progress_notify_once(key: &str) -> bool {
     }
     m.insert(key.to_string(), now);
     true
+}
+
+#[cfg(test)]
+mod progress_notify_dedupe_tests {
+    use super::progress_notify_once;
+
+    /// AMUX-3935. The dedupe key was (owner, card, author) over a 10-minute
+    /// window, which cannot tell "the same note twice" from "a second, DIFFERENT
+    /// note about the same card".
+    ///
+    /// A review conversation is always the second kind — context, then the
+    /// verdict that rests on it — so the LATER message is systematically the
+    /// higher-value one and it was the one dropped. Two measured instances on
+    /// 2026-08-30, both from the same peer, both with that ordering: a review
+    /// verdict carrying a blocking condition, and a verification result. The
+    /// second suppressed note was their close-out on this very defect.
+    ///
+    /// Both directions asserted. Without the collapse arm this is
+    /// indistinguishable from deleting the dedupe, which would restore the
+    /// notification flood AVE-36 added the window for.
+    #[test]
+    fn a_different_note_delivers_and_an_identical_one_still_collapses() {
+        let k = |note: &str| format!("owner|CARD-1|peer|{note}");
+
+        assert!(progress_notify_once(&k("context: here is what I measured")),
+                "the first note delivers");
+        assert!(
+            progress_notify_once(&k("verdict: ACCEPT with one blocking condition")),
+            "a DIFFERENT note from the same author on the same card must deliver — this is \
+             the verdict that was dropped twice"
+        );
+        // CONTROL: the flood protection still works. A burst of identical
+        // appends is what the window exists for.
+        assert!(
+            !progress_notify_once(&k("context: here is what I measured")),
+            "an IDENTICAL repeat inside the window must still collapse, or the fix has \
+             removed flood protection rather than narrowing it"
+        );
+        // CONTROL: the key still separates cards and owners, so the content hash
+        // has not swallowed the rest of the key.
+        assert!(progress_notify_once("owner|CARD-2|peer|context: here is what I measured"),
+                "the same text on a DIFFERENT card is a different notice");
+        assert!(progress_notify_once("other|CARD-1|peer|context: here is what I measured"),
+                "the same text to a DIFFERENT owner is a different notice");
+    }
 }
 
 enum PatchOut {
@@ -5361,11 +5412,40 @@ pub async fn patch_item(
                          nobody was told; re-run `amux board ask {id}` when they are up if it \
                          needs their attention"
                     ));
-                } else if !progress_notify_once(&format!("{owner}|{id}|{caller_for_notify}")) {
+                // THE NOTE'S CONTENT IS PART OF THE KEY (AMUX-3935).
+            //
+            // The key was (owner, card, author) with a 10-minute window, which
+            // collapses "the same note twice" and "a second, DIFFERENT note
+            // about the same card" into one case. A review conversation is
+            // necessarily the second kind: context first, then the verdict that
+            // rests on it — so the later message is systematically the
+            // higher-value one, and it is the one that was dropped.
+            //
+            // Two instances on 2026-08-30, both from mixpeek-homepage-claude,
+            // both with that ordering. The first dropped a review verdict
+            // carrying a BLOCKING condition on how AMUX-3920 should close; it
+            // reached me only because they appended a pointer to a third card.
+            // The second dropped a verification result on AMUX-3933 — and the
+            // note it suppressed was their close-out on THIS defect, which is
+            // as self-demonstrating as it gets.
+            //
+            // Flood protection is preserved exactly: a burst of IDENTICAL
+            // appends still collapses to one notice. What no longer collapses is
+            // a note that says something new.
+            } else if !progress_notify_once(&format!(
+                "{owner}|{id}|{caller_for_notify}|{:x}",
+                {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    note.hash(&mut h);
+                    h.finish()
+                }
+            )) {
                     body["owner_notified"] = json!(false);
                     body["owner_notify_reason"] = json!(
-                        "owner was already notified about your notes on this card in the last \
-                         10 minutes (deduped); the note itself is saved"
+                        "an IDENTICAL note from you on this card was already delivered in the \
+                         last 10 minutes (deduped); the note itself is saved. A note with \
+                         different text always delivers (AMUX-3935)."
                     );
                 } else {
                     let prompt = format!(
