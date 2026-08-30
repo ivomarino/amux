@@ -1542,8 +1542,38 @@ fn ts_i64(r: &Row<'_>, idx: usize) -> rusqlite::Result<i64> {
     Ok(match r.get::<_, rusqlite::types::Value>(idx)? {
         rusqlite::types::Value::Integer(n) => n,
         rusqlite::types::Value::Real(f) => f as i64,
-        rusqlite::types::Value::Text(t) => t.trim().parse::<f64>().unwrap_or(0.0) as i64,
-        _ => 0,
+        // A NUMBER IN A DIFFERENT STORAGE CLASS IS THE SAME TIMESTAMP.
+        // TEXT THAT IS NOT A NUMBER IS NOT A TIMESTAMP AT ALL (AMUX-3906).
+        //
+        // The point of this helper is that one row written as f64 must not fail
+        // a 13,000-row list read, because the VALUE is right and only its
+        // storage class is wrong. `'not-an-integer'` is a different situation:
+        // there is no timestamp in the cell, and substituting 0 invents one —
+        // the card then renders as 1970 and the corruption is never seen.
+        //
+        // It also silently disarmed a probe. `board_probe_fails_on_a_row_the_
+        // mapper_cannot_decode` (AF-332) corrupts `created` to exactly that
+        // string to prove /health's board read is not a liveness ping; with
+        // `unwrap_or(0.0)` the row decoded fine and the probe went green on a
+        // database it was meant to call broken.
+        rusqlite::types::Value::Text(t) => {
+            let t = t.trim();
+            t.parse::<f64>().map(|f| f as i64).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    idx,
+                    rusqlite::types::Type::Text,
+                    format!("timestamp column holds non-numeric text {t:?}").into(),
+                )
+            })?
+        }
+        rusqlite::types::Value::Null => 0,
+        other => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                idx,
+                other.data_type(),
+                "timestamp column holds a value that is not a number".into(),
+            ))
+        }
     })
 }
 
@@ -1574,7 +1604,15 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         session: r.get(4)?,
         creator: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
         due: r.get(6)?,
-        created: r.get(7)?,
+        // `created` IS THE SAME SHAPE AS `updated` AND WAS LEFT STRICT
+        // (AMUX-3906). AF-317's fix made `updated` tolerant because that is the
+        // column three queue-disposition rows had written as f64, taking
+        // GET /api/board down fleet-wide over 3 bad cells in ~13,000 rows. The
+        // column NEXT TO IT is declared INTEGER, read strictly, and carries the
+        // identical all-or-nothing failure — a fix to the instance rather than
+        // to the class. Nothing had written a REAL there yet, which is the only
+        // reason it had not fired.
+        created: ts_i64(r, 7)?,
         updated: ts_i64(r, 8)?,
         owner_type: r.get::<_, Option<String>>(9)?.unwrap_or_else(|| "human".into()),
         due_time: r.get(10)?,
@@ -2597,6 +2635,38 @@ mod tests {
     /// The control is the point: the good row must still come back with its
     /// exact value, or a reader that silently zeroed every timestamp would pass
     /// this too.
+    /// AMUX-3906. Both INTEGER timestamp columns in the row mapper must go
+    /// through the tolerant reader, not just the one that happened to break.
+    ///
+    /// AF-317 made `updated` tolerant because three queue-disposition rows had
+    /// written it as f64, failing GET /api/board fleet-wide on 3 bad cells in
+    /// ~13,000 rows. `created` sits at the next index, is declared INTEGER, and
+    /// was still read strictly — the identical all-or-nothing hazard, unfired
+    /// only because nothing had written a REAL there yet. That is a fix to the
+    /// instance rather than to the class.
+    ///
+    /// Source-level because the failure is a column being ADDED or REVERTED to a
+    /// strict read, which no behavioural test over today's data can see: the
+    /// hazard needs a REAL in the cell, and a correct database never has one.
+    #[test]
+    fn every_integer_timestamp_in_the_row_mapper_is_read_tolerantly() {
+        let src = include_str!("board_store.rs");
+        let start = src.find("fn issue_from_row").expect("the row mapper exists");
+        let body = &src[start..start + 4000];
+        for field in ["created", "updated"] {
+            let line = body
+                .lines()
+                .find(|l| l.trim_start().starts_with(&format!("{field}:")))
+                .unwrap_or_else(|| panic!("`{field}` is read in issue_from_row"));
+            assert!(
+                line.contains("ts_i64("),
+                "`{field}` is an INTEGER-declared timestamp and must use ts_i64, or one row \
+                 holding a REAL fails the entire list read for every session (AF-317 took the \
+                 board down fleet-wide over 3 such cells). Got: {line}"
+            );
+        }
+    }
+
     #[test]
     fn a_single_real_timestamp_does_not_fail_the_whole_list_read() {
         let conn = Connection::open_in_memory().unwrap();
