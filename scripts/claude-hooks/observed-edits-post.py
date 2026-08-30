@@ -178,60 +178,6 @@ def log_line(home, session, text):
         pass
 
 
-def _git_candidates(root, t0):
-    """Paths git thinks MIGHT have changed, or None if git cannot answer.
-
-    AMUX-3933. The walk is O(tree) and the tree is not the subject: measured on
-    ~/Dev/mixpeek, `os.walk` visits 640,353 files while `git ls-files` counts
-    44,932 tracked — roughly 93% of the walk is untracked build output. Timed on
-    that repo, best of three:
-
-        git status --porcelain -uall   0.38s     819 candidates
-        os.walk (this hook's PRUNE)    1.0-2.9s  640,353 files
-
-    So git answers the same question an order of magnitude cheaper, and it
-    respects .gitignore for free, which is what the PRUNE list was approximating
-    by hand.
-
-    TWO SOURCES, UNIONED, because `git status` alone loses the case the current
-    design exists to handle. This hook fires after the WHOLE Bash command, so an
-    edit-and-commit in one compound call is already committed by the time we
-    look and `git status` no longer lists it (AF-130). Commits made inside the
-    window supply those paths.
-
-    Returns absolute paths. `None` means git could not answer and the caller
-    must fall back to walking — an empty set means git answered "nothing", which
-    is a different fact.
-    """
-    paths = set()
-    try:
-        # Uncommitted: modified, added, deleted, untracked-but-not-ignored.
-        # -z because a path may contain a space, and porcelain v1 quotes such
-        # names in a shell-ish escaping that is easy to mis-parse.
-        out = subprocess.run(["git", "-C", root, "status", "--porcelain", "-uall", "-z"],
-                             capture_output=True, text=True, timeout=5)
-        if out.returncode != 0:
-            return None
-        for rec in out.stdout.split("\0"):
-            if len(rec) > 3:
-                paths.add(os.path.join(root, rec[3:]))
-        # Committed INSIDE the window (AF-130). `--since` takes a unix stamp
-        # with @; a couple of seconds of slack costs nothing and a missed commit
-        # costs an attribution.
-        log = subprocess.run(
-            ["git", "-C", root, "log", "--since", f"@{int(t0) - 2}", "--name-only",
-             "--format=", "--no-renames"],
-            capture_output=True, text=True, timeout=5)
-        if log.returncode == 0:
-            for line in log.stdout.splitlines():
-                line = line.strip()
-                if line:
-                    paths.add(os.path.join(root, line))
-    except Exception:
-        return None
-    return paths
-
-
 def main():
     session = (os.environ.get("AMUX_SESSION") or "").strip()
     derived = not session
@@ -323,51 +269,14 @@ def main():
     deadline = time.monotonic() + FIND_BUDGET_S
     hits = []
     seen = set()
-    truncated = ""
-
-    # ASK GIT FIRST (AMUX-3933). Same question, an order of magnitude cheaper,
-    # and it reaches the WHOLE repo rather than as far as the budget allows —
-    # which is the coverage AMUX-3920 shipped the ordering fix for and could not
-    # close. Falls back to the walk when git cannot answer (no repo, git slow,
-    # timeout), so a non-repo cwd behaves exactly as before.
-    _git_paths = _git_candidates(walk_root, t0)
-    if _git_paths is not None:
-        for gp in sorted(_git_paths):
-            if time.monotonic() > deadline:
-                truncated = " TRUNCATED=budget"
-                break
-            if len(hits) >= MAX_PATHS:
-                truncated = " TRUNCATED=cap"
-                break
-            if gp in seen:
-                continue
-            seen.add(gp)
-            # PRUNE APPLIES TO THE GIT SET TOO. In a repo that gitignores its
-            # caches git never offers them, but PRUNE encodes "this is never a
-            # lane's edit" independent of whether a given repo remembered to
-            # ignore it — and an untracked `.pytest_cache` write is exactly the
-            # attribution mixpeek-cicd's n=3 was minting. Belt and braces, and
-            # the cell that caught this was a scratch repo with no .gitignore.
-            _parts = os.path.relpath(gp, walk_root).split(os.sep)
-            if any(x in PRUNE or x.startswith(".cache") for x in _parts[:-1]):
-                continue
-            try:
-                mt = os.stat(gp).st_mtime
-            except OSError:
-                continue
-            if mt >= t0:
-                hits.append({"path": gp, "mtime": mt})
-        _shown_src = "git"
-    else:
-        _shown_src = "walk"
-
     # A TRUNCATED WALK MUST NOT LOOK LIKE A CLEAN ONE (ethos rule 4). Widening
     # the root makes the budget bite where it never did, and a walk that stops
     # early reports fewer paths with no sign it stopped — the same blindness this
     # card fixes, wearing a different hat. On the mixpeek measurement above this
     # is the EXPECTED path, not a corner case, so it has to be legible: a reader
     # must be able to tell "found 3" from "found 3 so far".
-    for _wr in (walk_roots if _shown_src == "walk" else []):
+    truncated = ""
+    for _wr in walk_roots:
         if truncated:
             break
         for root, dirs, files in os.walk(_wr):
@@ -407,7 +316,7 @@ def main():
         # `truncated` matters MOST here: "walked the whole tree and nothing
         # moved" and "ran out of budget before reaching anything" are opposite
         # facts and both used to print n=0.
-        log_line(home, session, f"n=0 no-moved-mtimes{truncated} src={_shown_src}")
+        log_line(home, session, f"n=0 no-moved-mtimes{truncated}")
         return
 
     url = os.environ.get("AMUX_URL") or "https://localhost:8824"
@@ -451,13 +360,7 @@ def main():
     _rel = [os.path.relpath(h["path"], walk_root) for h in hits]
     _shown = _rel[:LOG_PATHS]
     _more = "" if len(_rel) <= LOG_PATHS else f" +{len(_rel) - LOG_PATHS} more"
-    # WHICH ENUMERATION ANSWERED, in the same line as the answer (AMUX-3933).
-    # Without it a git-path run and a walk-path run are indistinguishable in the
-    # log, and a change that silently disabled the git path would look identical
-    # to one that did not — my own mutation proved that, passing all nine cells
-    # while falling back to the walk.
-    log_line(home, session,
-             f"n={len(hits)} {outcome}{truncated} src={_shown_src} paths={','.join(_shown)}{_more}")
+    log_line(home, session, f"n={len(hits)} {outcome}{truncated} paths={','.join(_shown)}{_more}")
 
 
 try:
