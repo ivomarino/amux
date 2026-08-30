@@ -9716,10 +9716,18 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                                 ensure_fleet_tables(conn)?;
                                 let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                                // OUTCOME IS NOT OPTIONAL ON A VOID PATH (AMUX-3919).
+                                // This row is a message that was deliberately NOT
+                                // delivered, and it used to write no outcome at all —
+                                // so the one row where the column carries the most
+                                // information was the row that left it NULL, reading
+                                // identically to a delivered message whose outcome
+                                // simply went unrecorded. Every NULL written by the
+                                // live code path on 2026-08-30 was one of these.
                                 conn.execute(
-                                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                                     VALUES(?,?,?,?,?,?,?)",
-                                    rusqlite::params![id2, sess2, hist_text, queued_at, now, src_guard, src_sender],
+                                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                                     VALUES(?,?,?,?,?,?,?,?)",
+                                    rusqlite::params![id2, sess2, hist_text, queued_at, now, "void:pickup-stale", src_guard, src_sender],
                                 )?;
                                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                             })
@@ -9896,15 +9904,20 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                         ensure_fleet_tables(conn)?;
                         let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                        // Same as the pickup-stale void above (AMUX-3919): a
+                        // deliberately undelivered message must say so in the
+                        // column, not only in the text prefix. `[VOIDED: ...]` in
+                        // the body is prose; `outcome` is what a query can group by.
                         conn.execute(
-                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                             VALUES(?,?,?,?,?,?,?)",
+                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                             VALUES(?,?,?,?,?,?,?,?)",
                             rusqlite::params![
                                 id2,
                                 sess2,
                                 format!("[VOIDED: picker gone] {}", redact_secrets(&text2)),
                                 queued_at,
                                 now_f64(),
+                                "void:picker-gone",
                                 src_guard,
                                 src_sender
                             ],
@@ -12151,12 +12164,20 @@ pub(crate) async fn steer_mutate(
                 }
                 if let Some((text, queued_at)) = sent_row.filter(|_| sent) {
                     let hid = id2.clone();
+                    // AMUX-3919: the sixth writer, and the last one that left
+                    // `outcome` NULL. This row IS a delivery — the caller asked
+                    // for the queued row to be sent as it was dequeued — so it
+                    // must not be indistinguishable from a void or from a
+                    // delivery whose outcome went unrecorded. Named for the path
+                    // rather than a bare "sent", because the turn-boundary
+                    // drain and an operator sending a row by hand are different
+                    // facts and a reader grouping by outcome should see both.
                     conn.execute(
-                        "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                         VALUES(?,?,?,?,?,?,?)",
+                        "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                         VALUES(?,?,?,?,?,?,?,?)",
                         rusqlite::params![
                             hid, session, redact_secrets(&text), queued_at, now_f64(),
-                            sent_src.0, sent_src.1
+                            "sent (dequeued by request)", sent_src.0, sent_src.1
                         ],
                     )?;
                 }
@@ -17802,6 +17823,48 @@ mod tests {
         }
         // Without this the assertion above is vacuous the day someone renames
         // the statement: zero matches, zero failures, green.
+        assert!(seen >= 6, "expected to inspect at least 6 history inserts, saw {seen}");
+    }
+
+    /// AMUX-3919. Every one of those six inserts must also name an OUTCOME.
+    ///
+    /// Two of them did not, and both were VOID paths — a message deliberately
+    /// NOT delivered. So the rows where the column carries the most information
+    /// were exactly the rows that left it NULL, and a void became
+    /// indistinguishable from a delivery whose outcome went unrecorded. Every
+    /// NULL written by the live code path on 2026-08-30 was one of these: 9 of
+    /// 9, all `[VOIDED: card X left 'doing' -> Y]`.
+    ///
+    /// The information was never missing, only unqueryable: it sat in an
+    /// `[VOIDED: ...]` prefix inside the message TEXT, where no `group by` can
+    /// reach it. Prose in a body is not a field.
+    ///
+    /// Source-level for the same reason as the producer check above: a
+    /// behavioural test proves one path writes an outcome and says nothing
+    /// about the other five, and "five stay right and one silently stops" is
+    /// how this happened in the first place.
+    #[test]
+    fn every_steering_history_insert_names_an_outcome() {
+        let src = include_str!("session_verbs.rs");
+        let mut seen = 0;
+        for (i, _) in src.match_indices("INSERT OR REPLACE INTO steering_history(") {
+            let rest = &src[i..];
+            let end = rest.find(')').expect("an INSERT names its columns");
+            let cols = &rest[..end];
+            // Skip this test's own search literal (see the note above).
+            if !cols.contains("id, session") {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                cols.contains("outcome"),
+                "a steering_history INSERT omits `outcome`, so the row it writes cannot say \
+                 whether the message was delivered, voided or dropped — and a NULL there reads \
+                 identically to all three (AMUX-3919). Columns: {cols}"
+            );
+        }
+        // Same anti-vacuity guard as the producer check: zero matches would be
+        // zero failures and a green run.
         assert!(seen >= 6, "expected to inspect at least 6 history inserts, saw {seen}");
     }
 
