@@ -149,6 +149,28 @@ its own failure. Re-measured 2026-08-30 across both repos: 99 open entries in
 this class, 19 amux / 80 Mixpeek. The contract is enforced for new amux
 diagnostic routes only, which is why this stays open on the Mixpeek side.
 
+## A fix ships, its tests pass, and it does nothing in production
+SCOPE: amux
+STATUS: open
+FIRST_SEEN: 2026-08-30
+LAST_SEEN: 2026-08-30
+OCCURRENCES: 1
+SIGNALS: ledger-cluster:instruments, rule-restatement:verification
+FIX_SITE: the seam between a tested pure function and its untested call site
+NOTE: this block was finished by a shell write on top of Edit-tool content, which is the
+mixed-edit shape AF-342 is about, and it was staged to verify the fix against the live
+server rather than only against tests.
+CARDS: AF-342
+EVIDENCE: AF-342 shipped with four passing cells over a correct pure decision and a
+one-line derivation inside an async handler that nobody could test. The derivation read
+a field any mtime satisfies, so the fix was inert on every path in the fleet. Every
+instrument said pass: unit tests, mutation cells, and the deployed payload carrying the
+new key. Only a live call against the running server showed the arm never firing.
+Re-introducing the exact production bug by mutation then passed all 44 tests, which is
+the measurement that names the gap: the tests pinned the decision and not the input to
+it. The general shape is that extraction for testability stops at the function boundary,
+and the bug moves one line up into the argument.
+
 ## One checkout, N lanes, and git has one index
 SCOPE: amux
 STATUS: open
