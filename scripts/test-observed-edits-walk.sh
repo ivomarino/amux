@@ -134,5 +134,43 @@ case "$line" in
   *) no "pruning must not drop genuine edits" "$line" ;;
 esac
 
+# NON-REPO cwd MUST STILL WORK (AMUX-3933). The git path is an optimisation, not
+# a requirement: when `git status` cannot answer — no repo, git missing, timeout —
+# the hook falls back to walking and behaves exactly as it did before. Claimed in
+# the commit, so it needs a cell, otherwise the fallback is an untested branch
+# that only fires in the situations nobody is watching.
+norepo_probe() {
+  local tmp; tmp="$(mktemp -d)"
+  mkdir -p "$tmp/plain/sub"
+  export AMUX_HOME="$tmp/home" AMUX_SESSION="probe-norepo"
+  mkdir -p "$AMUX_HOME/hooks/state"
+  touch "$AMUX_HOME/hooks/state/observed-$AMUX_SESSION.t0"
+  sleep 1
+  echo x > "$tmp/plain/sub/loose.txt"
+  printf '{"cwd":"%s","tool_input":{"command":"cp src dst"}}' "$tmp/plain/sub" \
+    | AMUX_URL="http://127.0.0.1:9" python3 "$HOOK" >/dev/null 2>&1
+  tail -1 "$AMUX_HOME/hooks/state/observed-edits.log" 2>/dev/null || echo ""
+  rm -rf "$tmp"
+}
+line="$(norepo_probe)"
+case "$line" in
+  *loose.txt*) ok "a cwd outside any git repo falls back to walking and still records" ;;
+  *) no "the git path must be an optimisation, not a requirement" "$line" ;;
+esac
+case "$line" in
+  *src=walk*) ok "and says src=walk, so the fallback is visible rather than inferred" ;;
+  *) no "the log must name WHICH enumeration answered" "$line" ;;
+esac
+
+# WHICH PATH RAN MUST BE OBSERVABLE. Without this, disabling the git path passes
+# every other cell in this file — the scratch repos are small enough that the
+# walk covers them — so a silent regression to walking would look identical to a
+# working fix. Proved by mutation before adding it.
+line="$(run_probe "$HOOK")"
+case "$line" in
+  *src=git*) ok "inside a git repo the git enumeration is what answered" ;;
+  *) no "a repo cwd must use the git path, not fall back to walking" "$line" ;;
+esac
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
