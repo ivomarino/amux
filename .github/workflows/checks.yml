@@ -165,6 +165,22 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-frustration-scan.sh
+      # The THEME scanner's cells (AF-341). Wired in the same commit that adds the
+      # scanner, because the step above records what happens otherwise: that
+      # harness existed unwired and its 6 cells ran for nobody.
+      #
+      # This one reads TWO repos, and its worst failure is silent in a way the
+      # single-repo scanner's is not. The Mixpeek ledger is a checkbox format and
+      # the amux one is field-per-line, so they need separate parsers; if the
+      # Mixpeek parser stops matching, it returns [] and every cross-repo cluster
+      # quietly becomes amux-only. The report still prints, still says `measured`,
+      # and Mixpeek reads as clean, which is the precise failure the
+      # measured/n_considered contract exists to prevent, reappearing one layer
+      # up in the tool that measures it. Cells B and C are that gate.
+      - name: friction theme scanner reads BOTH repos, or says it could not (AF-341)
+        run: |
+          set -uo pipefail
+          ./scripts/test-friction-themes.sh
       # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
       # and they belong HERE rather than in rust.yml because rust.yml is
       # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to
