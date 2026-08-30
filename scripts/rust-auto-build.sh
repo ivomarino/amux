@@ -244,6 +244,22 @@ fi
   #
   # Between the two, reclaim the idle caches and let the build stay warm. Below
   # the lower one, the shared cache genuinely is worth a cold build.
+  # DEBUG ARTIFACT CLEANUP (2026-08-29). This script ONLY builds --release, but
+  # cargo check/test runs from fleet sessions land in debug/ using the same
+  # CARGO_TARGET_DIR. Debug artifacts are never reused by this script and can
+  # accumulate without bound — 229 GB was observed on 2026-08-29. Unlike the
+  # release cache, debug/ has no value to this builder and is always safe to
+  # remove. The threshold is generous (10 GB) to avoid thrashing on a small
+  # accumulation; the floor is measured BEFORE clearing so the log line is honest.
+  DEBUG_DIR="$HOME/.amux/rust-build-target/debug"
+  if [ -d "$DEBUG_DIR" ]; then
+    DEBUG_GB=$(du -sk "$DEBUG_DIR" 2>/dev/null | awk '{print int($1/1048576)}')
+    if [ "${DEBUG_GB:-0}" -gt "${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}" ]; then
+      echo "== DEBUG ARTIFACTS: ${DEBUG_GB:-?}GB in $DEBUG_DIR (> ${AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB:-10}GB threshold). Clearing — release build is unaffected."
+      [ "${AMUX_RS_DISK_CLEAR_DRYRUN:-}" = "1" ] || rm -rf "$DEBUG_DIR"
+    fi
+  fi
+
   FREE_GB=$(df -Pk "$HOME" | awk 'NR==2{print int($4/1048576)}')
   if [ "${FREE_GB:-999}" -lt "${AMUX_BUILD_MIN_FREE_GB:-25}" ]; then
     for cand in "$HOME/.amux/rust-build-target-e2e-head" "$HOME/.amux/rust-build-target"; do
