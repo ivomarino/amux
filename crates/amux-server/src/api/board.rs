@@ -1940,13 +1940,6 @@ pub async fn list_board(
     };
 
     let quota = qp_truthy(p.quota.as_deref());
-    // AF-346: the hydrate only reads desc+log when the RESPONSE will carry
-    // them. `slim` already decides that for the body (list_body -> snapshot_slim
-    // drops both), and it defaults to TRUE, so the fleet's every-few-seconds
-    // poll was paying 8.4 MB of prose per call to have it discarded one layer
-    // up. Same flag on both sides, so the two cannot disagree about whether the
-    // prose is wanted.
-    let with_prose = !slim;
     let store = state.store.clone();
     let joined = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
         let conn = store.read()?;
@@ -1966,13 +1959,12 @@ pub async fn list_board(
                     &session_f,
                     archived,
                     done_limit.max(0) as usize,
-                    with_prose,
                 )?,
                 0,
                 0,
             )
         } else {
-            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit, with_prose)?
+            bs::list_issues_capped(&conn, &status_f, &session_f, archived, done_limit)?
         };
         // The `stale` flag needs the active-session set only when an
         // in-progress card is present (Python computes it in `_load_board`).
