@@ -157,11 +157,25 @@ def log_line(home, session, text):
 
 def main():
     session = (os.environ.get("AMUX_SESSION") or "").strip()
+    derived = not session
     if not session:
         session = _derive_session_from_tmux()
     if not session:
         return
     home = os.environ.get("AMUX_HOME") or os.path.expanduser("~/.amux")
+    # ISOLATED WORKERS (AMUX-3232): if the session was derived (not injected),
+    # check the session env file. Isolated workers have CC_ISOLATED=1 and must
+    # not emit edit records — their file edits are not attributable to a fleet
+    # lane and the staged-guard must not see them as such.
+    if derived:
+        sf = os.path.join(home, "sessions", f"{session}.env")
+        try:
+            with open(sf) as _f:
+                if any("CC_ISOLATED" in ln and '"1"' in ln or "CC_ISOLATED=1" in ln
+                       for ln in _f):
+                    return
+        except OSError:
+            pass
     marker = os.path.join(home, "hooks", "state", f"observed-{session}.t0")
     try:
         t0 = os.stat(marker).st_mtime

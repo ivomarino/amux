@@ -25,6 +25,18 @@ if [ -z "$AMUX_SESSION" ]; then
   esac
 fi
 [ -n "$AMUX_SESSION" ] || exit 0
+# ISOLATED WORKERS (AMUX-3232). An isolated worker has AMUX_SESSION stripped at
+# spawn, so DERIVED=1 is the discriminator. But "derived" also covers a real lane
+# that lost its env var mid-run (the original MR-43 case). The two are separated
+# by CC_ISOLATED in the session file: an isolated worker set it intentionally, a
+# real lane that lost its var did not. Skip reporting for isolated workers only —
+# a real lane that derived its session still gets a liveness report.
+if [ "$DERIVED" = "1" ]; then
+  _SF="$HOME/.amux/sessions/$AMUX_SESSION.env"
+  if grep -qE '^CC_ISOLATED="?1"?' "$_SF" 2>/dev/null; then
+    exit 0
+  fi
+fi
 IN=$(cat 2>/dev/null)
 E="$HOME/.amux/endpoint.json"
 C=$(sed -n 's/.*"canonical_url":"\([^"]*\)".*/\1/p' "$E" 2>/dev/null)
