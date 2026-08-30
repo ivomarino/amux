@@ -2363,3 +2363,32 @@ FIX: AF-336 (per-lane worktree) ends this class rather than detecting it, and th
  tracked source in the crate under test is dirty and attributed to another session. A
  compile failure in a file you did not touch would then read as such instead of as your
  own regression.
+
+## A "slim" payload that omits a column can still SHIP DERIVATIONS of it, and the loader layer cannot see that
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-30
+SESSION: amux-frustrations
+CARD: AF-346
+SYMPTOM: I made `/api/board`'s slim path stop SELECTing desc+log, having verified the slim
+ response carries neither key. It shipped (a99955f7) and blanked every card preview on the
+ fleet dashboard: desc_len>0 = 0, desc_head!="" = 0, log_n>0 = 0, folded_n>0 = 0 across
+ 2,047 cards, and needsyou_note gone, so cards waiting on a human stopped showing their
+ question. `list_body` derives five values from `row.desc`/`row.log` BY REFERENCE and ships
+ those instead of the prose. Reverted at b1227af0, restored and verified.
+COST: A live user-visible regression on the owner's own dashboard, caught by a peer
+ measuring the deployed build rather than by any test. Roughly 20 minutes of blank previews
+ fleet-wide, plus a near-miss on a double revert that would have re-applied it. My full test
+ suite was green: the cell I wrote asserted the slim hydrate returns empty prose and the full
+ one returns it (both true), and the two PRE-EXISTING equivalence tests key on desc+log,
+ which the slim body omits by design, so they compared two payloads that both correctly
+ omitted the fields and asserted nothing about the derived ones.
+FIX: The structural half is a naming problem the code cannot express: "slim" describes the
+ PAYLOAD, and every reader takes it as a claim about the LOADER. AMUX-2840 was this same bug
+ one layer up ("silently blanked both in the dashboard"), its warning is three lines above
+ the line I changed, and I read past it - so a comment is demonstrably not sufficient here.
+ What would have caught it is a consumer-side invariant rather than a mechanism-side one: a
+ slim row's desc_len must equal the real desc length, and its desc_head the real first line.
+ amux is adding that cell with the revert. Generally: when a payload drops a column, the test
+ that matters asserts on what the payload DERIVES from it, not on the column's absence.
