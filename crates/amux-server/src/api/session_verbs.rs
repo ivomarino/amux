@@ -12004,6 +12004,63 @@ impl ConvAdopt {
 /// So the cross-link refusal is kept, and it is LOUD. A reported id that another
 /// lane's meta already claims is the one shape that cannot be a benign restart,
 /// and silently dropping it would leave the lane blind with no trace of why.
+/// How long a conversation claim survives without its OWNER re-confirming it.
+///
+/// A live lane's hooks report their conversation id every few seconds, so this
+/// window is hundreds of missed reports, not a couple.
+fn conv_claim_stale_s() -> i64 {
+    std::env::var("AMUX_CONV_CLAIM_STALE_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(1800)
+}
+
+/// What to do about a claim another lane holds on the id we were just handed.
+///
+/// PURE ON PURPOSE (AMUX-3897). The effectful version reads and writes meta
+/// files under the real `~/.amux`, and the property under test is the DECISION.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConvClaim {
+    /// The owner confirmed recently. Their claim stands; stay blind.
+    Refuse,
+    /// The claim predates confirmation tracking, so its age is unknown. Start
+    /// the clock and refuse THIS time. A live owner re-confirms within seconds
+    /// and never ages out; a dead one ages out exactly once.
+    StampAndRefuse,
+    /// The owner has not re-confirmed for a full window. Take it.
+    Takeover,
+}
+
+/// `confirmed_at` is the last time the OWNER itself reported this id.
+///
+/// AMUX-3897. The refusal this gates is correct and had no expiry: a lane that
+/// restarts onto a different conversation keeps holding the old id, and the
+/// lane actually running that conversation can never take it. Measured live on
+/// 2026-08-30: `desktop` went idle on 08-28 still holding
+/// 15819f9b-aaf6-46fb-889d-175a8e134a4d, and `ts-gke` — whose hooks report that
+/// id every ~5s because it is genuinely ts-gke's conversation — was refused 205
+/// times and stayed blind to the staged guard throughout.
+///
+/// The card proposed keying staleness on "the claimant STARTED after the claim
+/// was stamped", and correctly declined to ship it: a RESUMED lane keeps its id
+/// across a restart, so that test cannot tell an abandoned claim from a resumed
+/// one, and two live lanes could ping-pong an id against a mechanism whose own
+/// doc says cross-linking is worse than blindness.
+///
+/// Confirmation time does not have that failure. A resumed lane reports the id
+/// it still holds, which refreshes the stamp, so it never goes stale and the
+/// ping-pong cannot start. Only a lane that has STOPPED reporting an id ages
+/// out of it, which is the actual condition being detected.
+pub(crate) fn conv_claim_verdict(confirmed_at: i64, now: i64, window_s: i64) -> ConvClaim {
+    if confirmed_at <= 0 {
+        return ConvClaim::StampAndRefuse;
+    }
+    if now - confirmed_at >= window_s {
+        return ConvClaim::Takeover;
+    }
+    ConvClaim::Refuse
+}
+
 pub(crate) fn adopt_reported_conv_id(name: &str, reported: &str) -> ConvAdopt {
     let reported = reported.trim();
     // A transcript stem is a UUID. Anything else is a caller mistake, not an id;
@@ -12015,23 +12072,75 @@ pub(crate) fn adopt_reported_conv_id(name: &str, reported: &str) -> ConvAdopt {
     if !plausible {
         return ConvAdopt::Unchanged;
     }
-    let was = meta_str(&load_meta(name), "cc_conversation_id");
+    let meta = load_meta(name);
+    let was = meta_str(&meta, "cc_conversation_id");
     if was == reported {
+        // THE OWNER RE-CONFIRMING ITS OWN CLAIM (AMUX-3897). This path used to
+        // write nothing, which is why a claim had no age and therefore no way
+        // to expire. Throttled: a lane reports every few seconds and this is a
+        // file write, so refresh only once a minute. The staleness window is
+        // measured in tens of minutes, so a stamp up to 60s behind changes no
+        // verdict.
+        let now = crate::config::now_f64() as i64;
+        if now - meta_i64(&meta, "cc_conversation_confirmed_at") >= 60 {
+            update_meta(name, &[("cc_conversation_confirmed_at", json!(now))]);
+        }
         return ConvAdopt::Unchanged;
     }
     let owner = conversation_owned_by_other(reported, name);
     if !owner.is_empty() {
-        tracing::warn!(
-            target: "staged_guard",
-            "[conv-adopt/AMUX-2936] session={} reported conv_id={} but lane '{}' already claims \
-             it — REFUSED. Two lanes pointing at one conversation both resume it, and the \
-             staged guard would attribute one lane's edits to the other. '{}' stays blind \
-             until the conflict is resolved.",
-            name, reported, owner, name,
-        );
-        return ConvAdopt::Conflict { owner: owner.clone() };
+        let now = crate::config::now_f64() as i64;
+        let confirmed_at = meta_i64(&load_meta(&owner), "cc_conversation_confirmed_at");
+        match conv_claim_verdict(confirmed_at, now, conv_claim_stale_s()) {
+            ConvClaim::StampAndRefuse => {
+                // A claim from before confirmation tracking. Its age is unknown,
+                // and "unknown" must not read as "stale" — that would hand a
+                // live lane's conversation away on the first report after a
+                // deploy. Start the clock and refuse; a live owner refreshes it
+                // within seconds, a dead one ages out once.
+                update_meta(&owner, &[("cc_conversation_confirmed_at", json!(now))]);
+                tracing::warn!(
+                    target: "staged_guard",
+                    "[conv-adopt/AMUX-3897] session={} reported conv_id={} claimed by '{}', whose \
+                     claim predates confirmation tracking — clock started, REFUSED for now. If \
+                     '{}' is not really on that conversation this clears itself in {}s.",
+                    name, reported, owner, owner, conv_claim_stale_s(),
+                );
+                return ConvAdopt::Conflict { owner: owner.clone() };
+            }
+            ConvClaim::Takeover => {
+                tracing::warn!(
+                    target: "staged_guard",
+                    "[conv-adopt/AMUX-3897] TAKEOVER: session={} adopted conv_id={} from lane \
+                     '{}', which had not re-confirmed it for {}s (window {}s). A live lane \
+                     reports its id every few seconds, so '{}' is no longer on this \
+                     conversation. '{}' was blind to the staged guard until now.",
+                    name, reported, owner, now - confirmed_at, conv_claim_stale_s(), owner, name,
+                );
+                update_meta(&owner, &[("cc_conversation_id", json!(""))]);
+            }
+            ConvClaim::Refuse => {
+                tracing::warn!(
+                    target: "staged_guard",
+                    "[conv-adopt/AMUX-2936] session={} reported conv_id={} but lane '{}' already \
+                     claims it and re-confirmed {}s ago — REFUSED. Two lanes pointing at one \
+                     conversation both resume it, and the staged guard would attribute one \
+                     lane's edits to the other. '{}' stays blind until the conflict is resolved.",
+                    name, reported, owner, now - confirmed_at, name,
+                );
+                return ConvAdopt::Conflict { owner: owner.clone() };
+            }
+        }
     }
-    update_meta(name, &[("cc_conversation_id", json!(reported))]);
+    update_meta(
+        name,
+        &[
+            ("cc_conversation_id", json!(reported)),
+            // Adoption IS a confirmation, and without this the freshly adopted
+            // claim would read as age-unknown to the next lane that reports it.
+            ("cc_conversation_confirmed_at", json!(crate::config::now_f64() as i64)),
+        ],
+    );
     // Countable, because "how many lanes healed and how many are still blind" is
     // the question AMUX-2936 could not answer for want of a trace. `was.empty()`
     // is the discriminator that matters: it means a lane the guard could not see
@@ -16394,6 +16503,59 @@ mod tests {
     /// after install, panicked, and the server stopped answering entirely —
     /// TCP still accepted from the kernel backlog while nothing serviced the
     /// TLS hello, which is why it presented as a hang rather than a crash.
+    /// AMUX-3897. The refusal was right and had no expiry, so a claim outlived
+    /// the life that made it and blocked the lane actually on that conversation
+    /// forever.
+    ///
+    /// Every arm carries the control it must not produce, because each is only
+    /// meaningful against the wrong answer next to it. `Refuse` on a fresh claim
+    /// is the load-bearing one: the mechanism's own doc says cross-linking two
+    /// live lanes is strictly WORSE than one lane staying blind, so a change
+    /// that took over eagerly would fix this card by causing the harm the card
+    /// is careful about.
+    #[test]
+    fn a_conversation_claim_expires_only_when_its_owner_stops_confirming_it() {
+        const W: i64 = 1800;
+        let now = 1_000_000i64;
+
+        // The live desktop/ts-gke shape: owner last confirmed two days ago.
+        assert_eq!(
+            conv_claim_verdict(now - 2 * 86_400, now, W),
+            ConvClaim::Takeover,
+            "an owner silent for two days is not on this conversation; a live lane reports \
+             its id every few seconds"
+        );
+        // CONTROL, and the one that matters most: an owner that confirmed a
+        // moment ago keeps its claim. A resumed lane refreshes the stamp on
+        // every report, so this is also what stops two live lanes ping-ponging
+        // an id, which is why the card declined to ship the start-time test.
+        assert_eq!(
+            conv_claim_verdict(now - 5, now, W),
+            ConvClaim::Refuse,
+            "a lane still reporting its own id must keep it — taking it would cross-link two \
+             live lanes, which is worse than the blindness being fixed"
+        );
+        // Exactly at the window: stale. Named so the boundary is a decision
+        // rather than an accident of `>` versus `>=`.
+        assert_eq!(conv_claim_verdict(now - W, now, W), ConvClaim::Takeover);
+        assert_eq!(conv_claim_verdict(now - W + 1, now, W), ConvClaim::Refuse);
+
+        // A claim from before this tracking existed. Its age is UNKNOWN, and
+        // unknown must not read as stale: that would hand a live lane's
+        // conversation away on the first report after a deploy. Start the clock,
+        // refuse once.
+        assert_eq!(
+            conv_claim_verdict(0, now, W),
+            ConvClaim::StampAndRefuse,
+            "an unconfirmed claim is age-unknown, not stale"
+        );
+        assert_eq!(
+            conv_claim_verdict(-1, now, W),
+            ConvClaim::StampAndRefuse,
+            "a junk stamp is treated as unknown, not as infinitely old"
+        );
+    }
+
     #[test]
     fn meta_i64_absent_key_is_zero_not_a_panic() {
         assert_eq!(meta_i64(&pre_cutover_map(), "rate_limited_since"), 0);
