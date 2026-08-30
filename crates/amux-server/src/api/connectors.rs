@@ -518,42 +518,32 @@ fn write_store_file(path: &std::path::Path, body: &Value) -> std::io::Result<()>
     Ok(())
 }
 
-/// `POST {base}/api/v4/users/login` — Mattermost's login endpoint. Uses raw
-/// reqwest rather than the shared `HttpTransport` trait: the session token
-/// comes back in the `Token` RESPONSE HEADER, not the JSON body, which
-/// `HttpTransport`'s `(status, body)`-shaped methods cannot carry (the same
-/// reason `test_connection` below already bypasses it for its generic bearer
-/// probe). A personal access token works as `password` too — Mattermost
-/// accepts either through the same endpoint.
+/// `POST {base}/api/v4/users/login` — Mattermost's login endpoint. Goes
+/// through the shared `HttpTransport` trait's `post_json_with_header` (added
+/// alongside this fix): the session token comes back in the `Token` RESPONSE
+/// HEADER, not the JSON body, which the trait's plain `(status, body)`-shaped
+/// methods cannot carry — `post_json_with_header` exists for exactly that
+/// shape. Going through the trait (rather than a private `reqwest::Client`,
+/// as this function used to) is what makes this branch of `begin_auth`
+/// reachable by the existing `MockHttp`/`app_with` test harness; see the
+/// `login_password_...` tests below. A personal access token works as
+/// `password` too — Mattermost accepts either through the same endpoint.
 ///
 /// Returns `(session_token, user_id)` on success.
-async fn mattermost_login(base_url: &str, login_id: &str, password: &str) -> Result<(String, String), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("client build failed: {e}"))?;
-    let resp = client
-        .post(format!("{base_url}/api/v4/users/login"))
-        .json(&json!({ "login_id": login_id, "password": password }))
-        .send()
-        .await
-        .map_err(|e| {
-            if e.is_timeout() {
-                "timed out after 10s".to_string()
-            } else if e.is_connect() {
-                format!("could not reach {base_url}")
-            } else {
-                format!("request failed: {e}")
-            }
-        })?;
-    let status = resp.status();
-    let token = resp
-        .headers()
-        .get("Token")
-        .and_then(|h| h.to_str().ok())
-        .map(str::to_string);
-    let body: Value = resp.json().await.unwrap_or(Value::Null);
-    if !status.is_success() {
+async fn mattermost_login(
+    http: &Arc<dyn HttpTransport>,
+    base_url: &str,
+    login_id: &str,
+    password: &str,
+) -> Result<(String, String), String> {
+    let (status, body, token) = http
+        .post_json_with_header(
+            &format!("{base_url}/api/v4/users/login"),
+            &json!({ "login_id": login_id, "password": password }),
+            "Token",
+        )
+        .await?;
+    if !(200..300).contains(&status) {
         let detail = body.get("message").and_then(Value::as_str).unwrap_or("login failed");
         return Err(format!("HTTP {status}: {detail}"));
     }
@@ -822,7 +812,7 @@ async fn begin_auth(
             };
             let base_url = base_url.trim_end_matches('/').to_string();
             let account = if account.is_empty() { username.clone() } else { account };
-            match mattermost_login(&base_url, &username, &password).await {
+            match mattermost_login(&ctx.http, &base_url, &username, &password).await {
                 Ok((token, user_id)) => {
                     let store = json!({
                         "token": token,
@@ -2185,6 +2175,13 @@ mod tests {
     struct MockHttp {
         calls: Mutex<Vec<RecordedCall>>,
         script: Mutex<Vec<(String, String, u16, Value)>>,
+        // (url_substring, header_name, header_value) — scripted for
+        // `post_json_with_header` only (Mattermost login), kept separate from
+        // `script` above rather than widening its tuple, so every existing
+        // `MockHttp::new(vec![("GET", ...), ...])` call site keeps compiling
+        // unchanged. Pushed via `with_header` AFTER construction (the Mutex
+        // gives interior mutability through the `Arc<Self>` `new` returns).
+        headers: Mutex<Vec<(String, String, String)>>,
     }
 
     impl MockHttp {
@@ -2194,7 +2191,17 @@ mod tests {
                 script: Mutex::new(
                     script.into_iter().map(|(m, u, s, v)| (m.into(), u.into(), s, v)).collect(),
                 ),
+                headers: Mutex::new(Vec::new()),
             })
+        }
+        /// Scripts a response header for the next `post_json_with_header`
+        /// call whose URL contains `url_substring`.
+        fn with_header(&self, url_substring: &str, header_name: &str, header_value: &str) {
+            self.headers.lock().unwrap().push((
+                url_substring.into(),
+                header_name.into(),
+                header_value.into(),
+            ));
         }
         fn answer(
             &self,
@@ -2243,6 +2250,22 @@ mod tests {
         ) -> Result<(u16, Value), String> {
             let v = Value::Object(form.iter().map(|(k, val)| (k.clone(), json!(val))).collect());
             self.answer("FORM", url, None, Some(&v))
+        }
+        async fn post_json_with_header(
+            &self,
+            url: &str,
+            body: &Value,
+            header_name: &str,
+        ) -> Result<(u16, Value, Option<String>), String> {
+            let (status, resp_body) = self.answer("POST", url, None, Some(body))?;
+            let header = self
+                .headers
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|(sub, name, _)| url.contains(sub.as_str()) && name == header_name)
+                .map(|(_, _, val)| val.clone());
+            Ok((status, resp_body, header))
         }
     }
 
@@ -2763,5 +2786,86 @@ mod tests {
         .unwrap();
         assert_eq!(persisted["accounts"][ACCT]["calendar"]["status"], json!("api_error"));
         assert!(persisted["checked_at"].as_f64().unwrap() > 0.0);
+    }
+
+    /// Review finding (esteininger, PR #164, 2026-08-30): `Auth::LoginPassword`
+    /// had zero coverage despite the harness for exactly this existing
+    /// (`MockHttp`/`app_with`). Exercises `begin_auth`'s LoginPassword branch
+    /// end to end: credentials in server.env, a scripted login response WITH
+    /// the `Token` header (via `post_json_with_header`, added alongside this
+    /// test — the prior raw-`reqwest` `mattermost_login` sat outside the one
+    /// seam `MockHttp` can intercept), and the resulting store file.
+    #[tokio::test]
+    async fn login_password_success_stores_token_and_user_id() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("server.env"),
+            "MATTERMOST_URL=https://chat.example.com\n\
+             MATTERMOST_LOGIN=alice\n\
+             MATTERMOST_PASSWORD=PLACEHOLDER_PW\n",
+        )
+        .unwrap();
+        let http = MockHttp::new(vec![(
+            "POST",
+            "chat.example.com/api/v4/users/login",
+            200,
+            json!({ "id": "USER123", "username": "alice" }),
+        )]);
+        http.with_header("chat.example.com/api/v4/users/login", "Token", "PLACEHOLDER_SESSION_TOKEN");
+        let (app, _d) = app_with(http.clone(), home.path());
+
+        let (st, v) = send_json(&app, "POST", "/api/connectors/mattermost/auth?account=alice").await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["ok"], json!(true), "{v}");
+        assert_eq!(v["account"], json!("alice"), "{v}");
+
+        // The call actually went through the transport (proves the branch is
+        // reachable via MockHttp, not just that begin_auth returned 200).
+        let calls = http.calls();
+        assert_eq!(calls.len(), 1, "{calls:?}");
+        assert!(calls[0].1.contains("/api/v4/users/login"), "{calls:?}");
+        assert_eq!(calls[0].3, Some(json!({ "login_id": "alice", "password": "PLACEHOLDER_PW" })));
+
+        let stored: Value = serde_json::from_str(
+            &std::fs::read_to_string(store_path(home.path(), "mattermost", "alice")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stored["token"], json!("PLACEHOLDER_SESSION_TOKEN"));
+        assert_eq!(stored["user_id"], json!("USER123"));
+        assert_eq!(stored["base_url"], json!("https://chat.example.com"));
+    }
+
+    /// The failure half of the same branch: a rejected login must surface the
+    /// server's own message and must NOT write a store file (a partial/absent
+    /// token on disk would read as "connected" on the next status check).
+    #[tokio::test]
+    async fn login_password_failure_surfaces_error_and_stores_nothing() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("server.env"),
+            "MATTERMOST_URL=https://chat.example.com\n\
+             MATTERMOST_LOGIN=alice\n\
+             MATTERMOST_PASSWORD=PLACEHOLDER_WRONG\n",
+        )
+        .unwrap();
+        let http = MockHttp::new(vec![(
+            "POST",
+            "chat.example.com/api/v4/users/login",
+            401,
+            json!({ "message": "Invalid or expired session, please login again." }),
+        )]);
+        let (app, _d) = app_with(http, home.path());
+
+        let (st, v) = send_json(&app, "POST", "/api/connectors/mattermost/auth?account=alice").await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED, "{v}");
+        assert_eq!(v["ok"], json!(false), "{v}");
+        assert!(
+            v["error"].as_str().unwrap().contains("Invalid or expired session"),
+            "{v}"
+        );
+        assert!(
+            !store_path(home.path(), "mattermost", "alice").exists(),
+            "a failed login must not leave a store file behind"
+        );
     }
 }
