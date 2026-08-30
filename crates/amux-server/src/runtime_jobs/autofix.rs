@@ -1855,6 +1855,35 @@ pub(crate) fn detect_latency_at(
                 ("sample_request".into(), sample),
                 ("threshold_ms".into(), format!("{:.0}", outlier_ms())),
                 ("last_seen".into(), rl::local_when(last_ts)),
+                // THE COUNT BESIDE THE COUNT (AMUX-3907). `n` above is what
+                // SURVIVED two filters, and until now the card published only
+                // the survivor. Both exclusions are individually right and
+                // together they can shrink a sustained incident to a rounding
+                // error — restart-spanning rows are dropped because wall time
+                // across a boot is not service time (AF-175), and the box
+                // rebuilds this binary many times an hour, so the filter is
+                // BUSIEST exactly when latency is worst.
+                //
+                // The specimen is this card's own ancestor. AMUX-3907 reported
+                // "3 requests exceeded 10s in the last 6.0h; worst 20.0s". Its
+                // window actually held 1,055 GET /api/board rows over 10s, in a
+                // six-hour incident whose peak hour averaged 10.3s and topped
+                // out at 97.9s. A reader who takes 3 as the incident size — and
+                // one did — sizes it a thousandfold wrong, and nothing in the
+                // payload contradicts them.
+                //
+                // Published unconditionally, including as zeros: "3 slow, 0
+                // excluded" and "3 slow, 1052 excluded" are different facts and
+                // must not render identically (ethos rule 4).
+                ("outliers_excluded".into(), format!(
+                    "{outliers_considered} row(s) matched the threshold in this window; \
+                     {outliers_spanned} dropped as spanning a server restart (AF-175: wall time \
+                     across a boot is not service time) and {outliers_failed} dropped as failed \
+                     requests (AMUX-3709: a timeout's duration is the timeout, not a \
+                     measurement). `n` and `worst_ms` above describe only what survived. If \
+                     `excluded` dwarfs the survivors, size the incident from the re-check query \
+                     below, not from this card."
+                )),
                 // AMUX-3647. Until 2026-08-24 a row that arrived within
                 // `latency` seconds of a boot was DROPPED here, so this card
                 // did not exist for that request and nobody could weigh it.
@@ -8974,6 +9003,53 @@ mod tests {
     ///
     /// The behaviour under test is unchanged: the card still fires, still on its
     /// own, still with the number in the title.
+    /// AMUX-3907. The card publishes what SURVIVED its filters, so it must also
+    /// publish what they removed.
+    ///
+    /// The specimen is that card itself: it reported "3 request(s) to
+    /// GET /api/board exceeded 10s in the last 6.0h; worst 20.0s". Its window
+    /// actually held 1,055 such rows, in a six-hour incident whose peak hour
+    /// averaged 10.3s and topped out at 97.9s. Both filters are individually
+    /// correct — restart-spanning rows are not service time (AF-175), failed
+    /// requests are not measurements (AMUX-3709) — and the restart one is
+    /// BUSIEST exactly when latency is worst, because the builder rewrites this
+    /// binary many times an hour. So a sustained incident can arrive as a
+    /// rounding error with nothing in the payload to say so.
+    ///
+    /// Asserts the counts are PRESENT and NUMERIC rather than pinning a
+    /// sentence, and asserts them in the zero case too: "3 slow, 0 excluded" and
+    /// "3 slow, 1052 excluded" must not render identically, which is the whole
+    /// requirement (ethos rule 4).
+    #[tokio::test]
+    async fn a_latency_card_says_how_many_rows_its_filters_removed() {
+        let (st, _d) = state();
+        let now = unix_now();
+        log_row(&st, Row { ts: now - 50.0, method: "GET", path: "/api/board", family: "/api/board", status: 200, body: "", worker: "", ua: "curl/8", ms: 21_000.0 });
+        let (f, _) = detect_latency(&st.store.read().unwrap(), now);
+        let hit = f
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|GET"))
+            .expect("a 21s request files on its own");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+        let excluded = ev
+            .get("outliers_excluded")
+            .expect("the card must say what its filters removed, not only what survived");
+        assert!(
+            excluded.contains("1 row(s) matched"),
+            "it must name how many rows the threshold matched before filtering: {excluded}"
+        );
+        // The zero case is published, not omitted. An absent field and a zero
+        // read the same to a reader, and that equivalence is the defect.
+        assert!(
+            excluded.contains("0 dropped as spanning a server restart"),
+            "a clean window must SAY zero were excluded rather than stay silent: {excluded}"
+        );
+        assert!(
+            excluded.contains("0 dropped as failed"),
+            "same for the failed-request filter: {excluded}"
+        );
+    }
+
     #[tokio::test]
     async fn absurd_single_requests_file_on_their_own() {
         let (st, _d) = state();
