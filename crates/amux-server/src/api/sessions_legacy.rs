@@ -831,35 +831,96 @@ impl FleetSignals {
             // dropped here is simply not proven live by its children, which
             // reads as shell-only — so the count has to be visible or the fleet
             // quietly looks idler than it is.
-            let probe_start = std::time::Instant::now();
-            let loop_budget = probe_budget();
+            // ONE `ps`, NOT N `pgrep`s (AMUX-3894, 2026-08-29).
+            //
+            // The loop deadline above did its job and then BECAME the defect. Every
+            // amux lane is launched as `bash -c "... ; claude ..."`, so its pane's
+            // `#{pane_current_command}` is `bash` and essentially EVERY lane needs
+            // this child rescue — the rescue is the common path, not the rare one.
+            // At 57 lanes the cumulative 5s budget ran out partway through, and the
+            // remainder were counted as unproven, which reads as shell-only, which
+            // reads as `running: false`.
+            //
+            // Measured 2026-08-29 21:00, load 25, 57 tmux sessions and 122 live
+            // claude processes: `skipped=22 budget_s=5.0`, and three consecutive
+            // GETs of /api/sessions returned 40, 37 and 32 running out of 58, with a
+            // DIFFERENT set each time. Nothing had died. The set flapped because
+            // which lanes fell past the deadline depended on scheduling.
+            //
+            // That is not cosmetic. `steering skipped session=<x> reason=not-running`
+            // appeared 143 times in the same window, so queued steering was being
+            // dropped for lanes that were alive and idle — which is exactly the
+            // `queue.has_live_consumer` invariant firing on AMUX-3883 ("a live
+            // consumer sitting IDLE with an old item in front of it"). One bad
+            // liveness read produced a false fleet view, silent message loss, and a
+            // failing invariant that read as a delivery bug.
+            //
+            // The budget was the right instinct against a wedge and the wrong shape
+            // for the load: N sequential subprocesses cannot be made safe by timing
+            // them, only by not being N. `pgrep -P <pid>` asks "does this pid have a
+            // child"; `ps -eo ppid=` answers that for EVERY pid in one call, so the
+            // whole question costs one subprocess regardless of fleet size. That is
+            // the same move already made directly above for the per-session tmux
+            // calls ("One tmux call, not one per session").
+            //
+            // FAILS DISCLOSED, not silent (ethos rule 4). If the single probe fails
+            // there is no partial answer to misread: nothing is proven live by
+            // children, the WARN says so once, and the count it reports is the whole
+            // shell-pane set rather than a scheduling-dependent slice of it.
+            let mut ppids_with_children: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let ps_probe = {
+                let mut c = std::process::Command::new("ps");
+                c.args(["-eo", "ppid="])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null());
+                run_bounded(c, probe_budget(), "ps/ppid")
+            };
+            match &ps_probe {
+                Some(out) => {
+                    for line in out.lines() {
+                        let t = line.trim();
+                        if !t.is_empty() {
+                            ppids_with_children.insert(t.to_string());
+                        }
+                    }
+                }
+                None => tracing::warn!(
+                    target: "amux::sessions",
+                    budget_s = probe_budget().as_secs_f64(),
+                    "child-process liveness probe (ps -eo ppid=) did not answer — no lane can be \
+                     proven live by its children this pass, so shell-foreground lanes will read \
+                     as shell-only (AMUX-3894)"
+                ),
+            }
             let mut pgrep_skipped = 0usize;
             for (sess, pid) in shell_panes {
                 if any_live.contains(&sess) || pid.is_empty() {
                     continue;
                 }
-                if probe_start.elapsed() >= loop_budget {
+                if ps_probe.is_none() {
                     pgrep_skipped += 1;
                     continue;
                 }
-                let mut pg = std::process::Command::new("pgrep");
-                pg.args(["-P", &pid])
-                    .stdout(std::process::Stdio::piped())
-                    .stderr(std::process::Stdio::null());
-                if let Some(out) = run_bounded(pg, loop_budget, "pgrep") {
-                    if !out.is_empty() {
-                        any_live.insert(sess.clone());
-                    }
+                if ppids_with_children.contains(&pid) {
+                    any_live.insert(sess.clone());
                 }
             }
+            // Reached only when the single `ps` probe itself failed, so the count is
+            // now the WHOLE shell-pane set rather than a scheduling-dependent slice
+            // of it. That distinction is the point of AMUX-3894: this number used to
+            // vary run to run on a healthy machine, which made it unreadable as a
+            // signal. A non-zero count here now means one thing — `ps` did not
+            // answer — and the advice is no longer "raise the timeout", because
+            // there is no longer a per-lane cost for a timeout to be too small for.
             if pgrep_skipped > 0 {
                 tracing::warn!(
                     target: "amux::sessions",
-                    skipped = pgrep_skipped,
-                    budget_s = loop_budget.as_secs_f64(),
-                    "child-process liveness probe hit its TOTAL budget — these lanes were not \
-                     checked for a live child and will read as shell-only. Raise \
-                     AMUX_SESSIONS_PROBE_TIMEOUT_S if this is routine rather than a wedge."
+                    unproven = pgrep_skipped,
+                    "child-process liveness could not be established for these shell-foreground \
+                     lanes because `ps -eo ppid=` did not answer; they will read as shell-only \
+                     (and therefore not-running) this pass. This is a wedged/absent ps, NOT a \
+                     budget that needs raising (AMUX-3894)."
                 );
             }
             for s in seen {
