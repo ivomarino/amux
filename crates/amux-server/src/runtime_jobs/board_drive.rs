@@ -338,10 +338,16 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
 /// the lane and escalate once (AF-319).
 ///
 /// Three, because the first repeat is a reasonable retry and the second is a
-/// reasonable doubt. Measured over 34h to 2026-08-30: mvs-infra took 80 nudges
-/// and moved 0 cards, backend 56 and 0, byo-ray 41 and 0 — every one of them
-/// running, not credit-limited, not waiting. A nudge that fired 80 times without
-/// moving a card is evidence about the queue, not a message to the worker.
+/// reasonable doubt.
+///
+/// SCOPE, corrected 2026-08-30: this catches a genuinely DEAD lane, and it is
+/// NOT what drives the measured nudge volume. The claim it originally cited —
+/// "mvs-infra took 80 nudges and moved 0 cards" — came from joining
+/// `_amux_state_events` on entity_type='issue' (87 rows fleet-wide) when card
+/// events are entity_type='task' (6,777). Corrected, mvs-infra logged 3,682
+/// card events against 72 nudges and is the busiest board user in the fleet.
+/// The hardest-nudged lanes are the most ACTIVE ones, so this cap will rarely
+/// fire on them — by design, not by accident.
 fn nudge_unheeded_cap() -> i64 {
     env_f64("AMUX_NUDGE_UNHEEDED_CAP", 3.0) as i64
 }
@@ -4354,13 +4360,17 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 } else {
                     ("backlog.triage_nudge", BACKLOG_TRIAGE_COOLDOWN_S)
                 };
-                // AF-319: THE FEEDBACK TERM. Cadence used to be a function of
-                // backlog SIZE and of nothing else, so the biggest backlogs
-                // pinned themselves to the 20-minute floor and stayed there.
-                // Measured over 34h to 2026-08-30: mvs-infra 80 nudges / 0 cards
-                // moved, backend 56 / 0, byo-ray 41 / 0, all of them running and
-                // not rate-limited, while the two LEAST-nudged lanes did all the
-                // work. Frequency was anti-correlated with the outcome.
+                // AF-319: THE FEEDBACK TERM. Cadence was a function of backlog
+                // SIZE and of nothing else, so the biggest backlogs pinned
+                // themselves to the 20-minute floor and stayed there.
+                //
+                // What this does NOT fix, said here so the next reader does not
+                // over-credit it: the lanes carrying the measured volume are all
+                // ACTIVE (mvs-infra: 72 nudges against 3,682 card events over
+                // 34h), so their watermark moves every tick and they are never
+                // suppressed. That is the correct outcome — they are not stuck —
+                // but it means the 42%-of-fleet-messages cost is a TRIGGER
+                // problem, not a feedback one. Git note on 9d77177e.
                 //
                 // Only the drain nudge is metered. The triage nudge already has
                 // a 72h cooldown and is not what the measurement found.
@@ -5278,12 +5288,15 @@ mod tests {
         assert_ne!(unheeded_backoff(floor, 3), floor);
     }
 
-    /// The cap is reachable from the measured reality, not just in principle.
+    /// A lane that never moves is escalated in a few ticks, not eighty.
     ///
-    /// mvs-infra took 80 unheeded nudges. With the cap at 3 it would have been
-    /// suppressed after the third, so this asserts the specimen crosses it.
+    /// The doc here used to cite mvs-infra as an 80-nudge specimen; that was a
+    /// bad join and mvs-infra is in fact the busiest board user in the fleet
+    /// (corrected 2026-08-30). The BOUND is what matters and it stands on its
+    /// own: whatever the lane, silence is answered in `cap` ticks rather than
+    /// indefinitely.
     #[test]
-    fn the_measured_specimen_crosses_the_cap() {
+    fn a_silent_lane_is_escalated_within_a_few_ticks_not_eighty() {
         let cap = nudge_unheeded_cap();
         assert!(cap >= 1, "a cap of 0 would suppress the first nudge, which is not the fix");
         let mut unheeded = 0;
@@ -5299,8 +5312,8 @@ mod tests {
         }
         assert!(
             fired < 5,
-            "mvs-infra fired 80 nudges into silence; after this change it gets {fired} before \
-             the queue is escalated instead"
+            "a lane that never moves used to be nudged indefinitely; it now gets {fired} \
+             before the queue is escalated instead"
         );
     }
 

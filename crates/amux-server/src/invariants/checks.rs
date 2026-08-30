@@ -486,6 +486,12 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // exclude or admit the wrong rows. Verified against 174 live rows: 0 with
     // boot_at > ts, and the magnitude is 1.78e9 (seconds), not 1.78e12.
     ("_amux_request_log", "boot_at", false),
+    // AF-319's nudge feedback state. SECONDS: written from `now_f64()` in
+    // `drive_lane`, the same clock every other board_drive timestamp uses.
+    // Declared the hour it shipped, because this invariant caught it — the
+    // migration landed at 04:1x and the check was red by the next sweep, which
+    // is the check doing exactly what it exists for.
+    ("board_drive_nudge_state", "last_nudge_at", false),
     ("cmd_history", "delivered_at", true),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),

@@ -2,21 +2,38 @@
 --
 -- MEASURED over 34 hours to 2026-08-30: 419 of 988 fleet messages (42%) are
 -- board_drive nudges, 12.3/hour, 574k characters (~143k tokens) pushed into
--- worker contexts. Per lane, against card movements in the SAME window:
+-- worker contexts.
 --
---   mvs-infra     80 nudges (22 min apart)  ->  0 cards moved
---   backend       56 nudges (36 min)        ->  0
---   byo-ray       41 nudges (46 min)        ->  0
---   mixpeek-cicd  38 nudges (54 min)        ->  0
---   ts-gke        25 nudges (84 min)        ->  0
---   amux          18 nudges                 -> 82
---   amux-frustr.  24 nudges                 -> 40
+-- CORRECTED 2026-08-30. Only this COMMENT changed; the DDL below is untouched.
+-- Per lane over the same 34h:
 --
--- Every one of those lanes was running, not credit-limited and not waiting. So
--- 240 nudges to the five hardest-nudged lanes moved nothing, while the two
--- LEAST-nudged lanes did all the work. Nudge frequency is anti-correlated with
--- the outcome it exists to produce.
+--   lane          nudges   card events
+--   mvs-infra         72        3,682
+--   backend           55          357
+--   byo-ray           42          295
+--   mixpeek-cicd      40          298
+--   ts-gke            22           96
+--   amux              18          257
 --
+-- The correlation is POSITIVE: the hardest-nudged lanes are the MOST active,
+-- and no lane is ignoring its board.
+--
+-- THE FIRST VERSION OF THIS COMMENT SAID "0 cards moved" for the top five. It
+-- came from joining _amux_state_events on entity_type='issue', which holds 87
+-- rows fleet-wide; card events are entity_type='task' (6,777). A predicate that
+-- did not match what I believed, producing a confident and exactly inverted
+-- conclusion. Kept here so the method is not re-derived.
+--
+-- What survives, measured independently: drain nudges are 419 of 988 fleet
+-- messages (42%) over 34h, 12.3/hour, 574k characters.
+--
+-- So this table is a backstop for a genuinely DEAD lane, and NOT the fix for
+-- the measured volume: an active lane's watermark moves every tick, so it is
+-- never suppressed. The volume comes from the TRIGGER
+-- (doing_count == 0 && eligible == 0 && drainable_backlog > 0), which cannot
+-- tell "working fast with a drained todo queue" from "stuck" — mvs-infra keeps
+-- its todo empty and holds backlog, so it looks identical to a stalled lane
+-- while being the busiest board user in the fleet.
 -- The cause is a missing feedback term, not a wrong constant.
 -- `idle_backlog_drain_cooldown_s` scales cadence UP with backlog SIZE (base 2h,
 -- halving every ~25 cards, 20m floor). Frequency is therefore a function of

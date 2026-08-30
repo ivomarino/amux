@@ -373,6 +373,17 @@ pub fn router(state: AppState) -> Router {
     let app = Router::new()
         // Public: the PWA shell + health must load before auth happens.
         .route("/health", axum::routing::get(health::health))
+        // ALIAS. `/health` is the only diagnostic NOT under `/api/`, and every
+        // sibling — /api/health/invariants, /api/debug/*, /api/logs/* — is, so
+        // lanes guess `/api/health` and get a 404. Measured in the 2026-08-30
+        // sweep: 20 of them in 24h from loopback curl, in irregular bursts of
+        // 3-5, which is the signature of an agent typing it by hand rather than
+        // a poller. Nothing was broken and nothing was learned; each lane just
+        // paid a round trip and moved on.
+        //
+        // The honest path should be the easy path (ethos rule 6), and one route
+        // is cheaper than 20 lanes each remembering an exception.
+        .route("/api/health", axum::routing::get(health::health))
         .route("/api/debug/tmux", axum::routing::get(health::debug_tmux))
         // The terminal-scan loop's last pass (AF-80): which lanes were demoted
         // off pane-scraping and on what basis, so a skip leaves a trace instead

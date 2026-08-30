@@ -1081,6 +1081,7 @@ const ANY: &[&str] = &["*"];
 pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- public (outside require_bearer)
     RouteEntry { path: "/health", methods: &["GET"] },
+    RouteEntry { path: "/api/health", methods: &["GET"] },
     RouteEntry { path: "/manifest.json", methods: &["GET"] },
     RouteEntry { path: "/api/calendar.ics", methods: &["GET"] },
     RouteEntry { path: "/api/debug/tmux", methods: &["GET"] },

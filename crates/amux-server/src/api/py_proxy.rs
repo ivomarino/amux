@@ -66,6 +66,10 @@ pub const PROXIED_FAMILIES: &[ProxiedFamily] = &[];
 /// predicate of the mechanism it describes — ethos rule 1).
 pub const NATIVE_FAMILIES: &[(&str, &str)] = &[
     ("/health", "health + build discriminator"),
+    // The /api-prefixed alias for the same handler. Lanes guess this path
+    // because every sibling diagnostic is under /api/ (2026-08-30 sweep: 20
+    // 404s in 24h, hand-typed).
+    ("/api/health", "alias of /health; also the /api/health/invariants prefix"),
     ("/manifest.json", "PWA manifest from branding prefs"),
     ("/api/calendar.ics", "iCal feed"),
     ("/api/sync", "delta sync"),
