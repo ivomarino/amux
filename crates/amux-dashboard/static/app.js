@@ -693,12 +693,19 @@ let _connState = null;   // 'live' | 'polling' | 'offline' — null until first 
 let _connEvents = [];
 try { _connEvents = JSON.parse(localStorage.getItem('amux_conn_events') || '[]'); } catch(e) { _connEvents = []; }
 const _CONN_SESSION_START = Date.now();
+// AMUX-3917. `hid` records whether the PAGE WAS HIDDEN at the transition.
+// Without it a backgrounded phone and a server outage are the same row: Ethan's
+// panel showed "Disconnected (offline) 4h 16m, 9:38 PM → 1:55 AM", which was an
+// iPhone asleep overnight, rendered as the largest incident on the screen. The
+// browser fires the same offline transition for both, so no amount of reading
+// the transitions can separate them; the discriminator has to be recorded AT the
+// transition or it does not exist.
 function _recordConnState(s) {
   if (s === _connState) return;
   const prev = _connState;
   _connState = s;
   if (prev === null) return;   // first observation — not a transition, don't log
-  _connEvents.push({ ts: Date.now(), from: prev, to: s });
+  _connEvents.push({ ts: Date.now(), from: prev, to: s, hid: document.hidden ? 1 : 0 });
   if (_connEvents.length > 300) _connEvents = _connEvents.slice(-300);
   try { localStorage.setItem('amux_conn_events', JSON.stringify(_connEvents)); } catch(e) {}
 }
@@ -709,7 +716,12 @@ function _connEpisodes() {
   let cur = null;
   for (const e of _connEvents) {
     if (e.to !== 'live') {
-      if (!cur) cur = { start: e.ts, worst: e.to };
+      // `hid` is absent on events stored before AMUX-3917. Undefined is carried
+      // through as UNKNOWN rather than coerced to false: "we did not look" and
+      // "we looked and the page was visible" are different facts, and reading
+      // the first as the second is what would let an old sleep keep posing as
+      // an outage with a confident new label on it.
+      if (!cur) cur = { start: e.ts, worst: e.to, hid: ('hid' in e) ? !!e.hid : null };
       else if (e.to === 'offline') cur.worst = 'offline';
     } else if (cur) {
       cur.end = e.ts; eps.push(cur); cur = null;
@@ -717,6 +729,24 @@ function _connEpisodes() {
   }
   if (cur) eps.push(cur);   // still degraded (ongoing)
   return eps.reverse();     // most recent first
+}
+
+// A momentary fallback to polling that recovered on its own is the reconnect
+// logic WORKING. Ten of them listed as incidents is what made the panel read as
+// a wall of outages; six of the ten rows on Ethan's screen were 0s or 1s.
+const _CONN_BLIP_MS = 5000;
+
+// What a row IS, separated from how it renders so it can be reasoned about (and
+// tested) without a DOM.
+//   'sleep'  — offline that began while the page was hidden: the device slept or
+//              the app was backgrounded. Not an amux outage.
+//   'blip'   — under 5s and never offline: recovered automatically.
+//   'outage' — everything else, including any offline episode we cannot attribute.
+function _connEpisodeKind(ep, now) {
+  const dur = (ep.end || now) - ep.start;
+  if (ep.worst === 'offline' && ep.hid === true) return 'sleep';
+  if (ep.worst !== 'offline' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
+  return 'outage';
 }
 // _fmtDur lives once, further down. A second copy was declared here; the last
 // declaration wins in a classic script, so this one was already dead — the
@@ -791,24 +821,52 @@ function showConnHistory() {
   const eps = _connEpisodes();
   const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline' }[_connState] || '● —';
   const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149' }[_connState] || 'var(--dim)';
+  const _now = Date.now();
+  const kinds = eps.map(ep => _connEpisodeKind(ep, _now));
+  const blips = eps.filter((_, i) => kinds[i] === 'blip');
+  const shown = eps.filter((_, i) => kinds[i] !== 'blip');
   let rows = '';
   if (!eps.length) {
-    rows = '<div style="color:var(--dim);font-size:0.85rem;padding:10px 2px;">No disconnections recorded on this device since ' + _fmtClock(_CONN_SESSION_START) + '. Solid connection. 🟢</div>';
+    rows = '<div style="color:var(--dim);font-size:0.85rem;padding:10px 2px;">No interruptions recorded on this device since ' + _fmtClock(_CONN_SESSION_START) + '. Solid connection. 🟢</div>';
+  } else if (!shown.length) {
+    rows = '<div style="color:var(--dim);font-size:0.85rem;padding:10px 2px;">No outages on this device since ' + _fmtClock(_CONN_SESSION_START) + '. Solid connection. 🟢</div>';
   } else {
-    rows = eps.map(ep => {
+    rows = shown.map(ep => {
+      const kind = _connEpisodeKind(ep, _now);
       const ongoing = !ep.end;
-      const dur = _fmtDur((ep.end || Date.now()) - ep.start);
+      const dur = _fmtDur((ep.end || _now) - ep.start);
       const isOff = ep.worst === 'offline';
-      const ico = isOff ? '🔴' : '🟡';
-      const label = isOff ? 'Disconnected (offline)' : 'Degraded to polling';
+      const sleep = kind === 'sleep';
+      const ico = sleep ? '🌙' : isOff ? '🔴' : '🟡';
+      const label = sleep ? 'Device asleep or app backgrounded'
+                  : isOff ? 'Disconnected (offline)'
+                  : 'Degraded to polling';
       const when = _fmtClock(ep.start) + ' → ' + (ongoing ? '<span style="color:' + (isOff ? '#f85149' : '#facc15') + '">ongoing</span>' : _fmtClock(ep.end));
+      // WHAT THE RECORD CANNOT SAY, said in the row rather than left to the
+      // reader (AMUX-3917). An offline episode stored before this build carries
+      // no visibility flag, so a sleeping phone and a real outage are the same
+      // bytes. Claiming either would be a guess; naming the gap is not.
+      const note = sleep
+        ? '<div style="color:var(--dim);font-size:0.72rem;">Not an amux outage: the browser reports offline while the page is hidden. Data resumed on wake.</div>'
+        : (isOff && ep.hid === null
+            ? '<div style="color:var(--dim);font-size:0.72rem;">Cause not recorded on this build — a sleeping or backgrounded device looks identical to an outage here.</div>'
+            : '');
       return '<div style="display:flex;gap:8px;align-items:baseline;padding:7px 2px;border-top:1px solid var(--border);font-size:0.82rem;">'
         + '<span style="flex-shrink:0;">' + ico + '</span>'
         + '<div style="flex:1;min-width:0;"><div style="font-weight:600;">' + label + '</div>'
-        + '<div style="color:var(--dim);font-size:0.76rem;">' + when + '</div></div>'
+        + '<div style="color:var(--dim);font-size:0.76rem;">' + when + '</div>' + note + '</div>'
         + '<span style="color:var(--dim);flex-shrink:0;font-variant-numeric:tabular-nums;">' + dur + '</span></div>';
     }).join('');
   }
+  // THE COUNT BESIDE THE ZERO. Folded blips are summarised, never silently
+  // dropped: "no outages" and "no data" must not render the same, and a client
+  // that starts flapping should show it as a rising number here.
+  const blipHtml = blips.length
+    ? '<div style="display:flex;gap:8px;align-items:baseline;padding:7px 2px;border-top:1px solid var(--border);font-size:0.82rem;color:var(--dim);">'
+      + '<span style="flex-shrink:0;">✅</span><div style="flex:1;min-width:0;">'
+      + blips.length + ' momentary fallback' + (blips.length === 1 ? '' : 's') + ' to polling, under '
+      + Math.round(_CONN_BLIP_MS / 1000) + 's each, recovered automatically. Not listed above.</div></div>'
+    : '';
   const pending = offlineQueue.length + drafts.length;
   const pendingHtml = pending
     ? '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:0.8rem;color:var(--dim);">' + pending + ' operation' + (pending === 1 ? '' : 's') + ' queued while offline. <a href="#" onclick="event.preventDefault();document.getElementById(\'conn-hist-modal\').remove();showQueueModal();" style="color:var(--accent);">View queue</a></div>'
@@ -823,8 +881,8 @@ function showConnHistory() {
   modal.innerHTML = '<div onclick="event.stopPropagation()" style="background:var(--bg);border:1px solid var(--border);border-radius:12px;max-width:440px;width:100%;max-height:80dvh;overflow:auto;padding:1.2rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);">'
     + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;"><b style="font-size:1rem;flex:1;">Connection</b>'
     + '<span style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span></div>'
-    + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Disconnections from this device (this browser)</div>'
-    + _pingWidgetHtml() + rows + pendingHtml + clearHtml + '</div>';
+    + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Connection interruptions on this device (this browser)</div>'
+    + _pingWidgetHtml() + rows + blipHtml + pendingHtml + clearHtml + '</div>';
   document.body.appendChild(modal);
 }
 
@@ -8045,7 +8103,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.754';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.755';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
