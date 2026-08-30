@@ -739,6 +739,20 @@ cmd_start() {
     fi
   else
     [[ "$cmd" == *"--model"* ]] || cmd="$cmd --model sonnet"
+    # Resume the most recent conversation in this directory by default, so a
+    # restart (crash recovery, a deploy that killed the tmux server, `amux
+    # start-all`) picks up where the worker left off instead of silently
+    # registering a brand-new, untitled Claude Code session every time this
+    # runs — the gap that turned one `stop-all`+`start-all` recovery pass
+    # into 8 fresh sessions with random names and zero prior context
+    # (2026-08-30, see frustrations.md / INIT-3). Verified safe on a
+    # directory with NO prior conversation: `claude --continue` there just
+    # starts fresh, exit 0, no error — so this is safe on a worker's very
+    # first-ever start too. Skipped if the caller already asked to
+    # resume/start a specific conversation another way.
+    if [[ ! "$cmd" =~ (^|[[:space:]])(-c|--continue|--resume|--session-id|--from-pr|--teleport)([[:space:]]|$) ]]; then
+      cmd="$cmd --continue"
+    fi
   fi
 
   # Create tmux session and attach
@@ -783,9 +797,19 @@ cmd_start() {
   tmux new-session -d -s "$tname" -n "$name" -c "$dir" \
     -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" -e "AMUX_URL=$AMUX_API" \
     "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
-  # Lock the window name so Claude can't overwrite it with escape sequences
-  tmux set-option -t "=$tname" allow-rename off 2>/dev/null
-  tmux set-window-option -t "=$tname" automatic-rename off 2>/dev/null
+  # Lock the window name so Claude can't overwrite it with escape sequences.
+  # Trailing `:` is load-bearing: allow-rename/automatic-rename are WINDOW
+  # options, and a bare `=$tname` session-exact-match target makes tmux look
+  # for a WINDOW literally named "=amux-<name>" instead of the current window
+  # of that session — "no such window", exit 1, and under `set -euo pipefail`
+  # (line 19) that silently kills the rest of cmd_start: no "started" echo,
+  # no attach, no error shown (stderr was already routed to /dev/null on the
+  # very line that fails). Reproduced 2026-08-30: any non-interactive fresh
+  # `amux start <name>` (no --detach, e.g. from `amux start-all`) died right
+  # here with empty output and exit 1, while the tmux session it had just
+  # created was left running and unlocked. See frustrations.md / INIT-2.
+  tmux set-option -t "=$tname:" allow-rename off 2>/dev/null
+  tmux set-window-option -t "=$tname:" automatic-rename off 2>/dev/null
   echo "${GREEN}started${RESET} ${BOLD}$name${RESET} in $dir"
   echo "  ${DIM}$cmd${RESET}"
   # The session is already created detached (new-session -d). Only attach when
@@ -1378,12 +1402,22 @@ cmd_stop_all() {
 }
 
 cmd_start_all() {
+  # --detach, always: this starts every stopped worker in one pass, and a
+  # terminal can only attach to one of them anyway. Without it, cmd_start's
+  # own end-of-function `tmux attach-session` runs for the FIRST session
+  # started, fails "open terminal failed: not a terminal" in any
+  # non-interactive context (cron, a hook, this very script's own callers),
+  # and under `set -euo pipefail` that aborts the whole loop — every session
+  # after the first stays down with no indication why. Reproduced 2026-08-30
+  # alongside INIT-2's tmux target-syntax fix (same symptom, different cause:
+  # that one killed the FIRST session's start too; this one silently
+  # truncates the loop to just the first once that bug is fixed).
   for f in "$CC_SESSIONS"/*.env; do
     [[ -f "$f" ]] || continue
     local name
     name=$(basename "$f" .env)
     if ! is_running "$name" 2>/dev/null; then
-      cmd_start "$name"
+      cmd_start "$name" --detach
     fi
   done
 }
