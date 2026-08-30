@@ -2392,3 +2392,33 @@ FIX: The structural half is a naming problem the code cannot express: "slim" des
  slim row's desc_len must equal the real desc length, and its desc_head the real first line.
  amux is adding that cell with the revert. Generally: when a payload drops a column, the test
  that matters asserts on what the payload DERIVES from it, not on the column's absence.
+
+## SUPERSEDES the entry above: the consumer guard EXISTED and was correct — `--lib` never ran it
+AREA: instruments
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-30
+SESSION: amux-frustrations
+CARD: AF-346
+SYMPTOM: My entry above says the a99955f7 dashboard regression happened because no
+ consumer-side invariant existed and that amux was adding one. Both halves are wrong, and
+ amux established it by checking rather than agreeing with me.
+ `tests/board_api.rs :: list_is_slim_by_default_and_serves_prose_only_on_request` already
+ existed, drives the real HTTP list path, and asserts desc_head starts with the card's
+ first line. Run against a99955f7 in a scratch worktree it fails in 0.16s. The guard was
+ written before either of us got here, was right, and would have blocked the commit.
+ It did not run because I verified with `cargo test -p amux-server --lib`, which reports
+ "1625 passed" and SKIPS every `tests/*.rs` target: 47 integration files, ~339 tests.
+COST: The regression itself is costed in the entry above. The cost of THIS entry is the
+ wrong lesson I nearly left in the ledger: "add consumer-side tests" is useless advice
+ when the consumer-side test is already written, and it would have sent the next reader
+ to write a duplicate of a passing test instead of fixing the command that skipped it.
+ A false mechanism filed as history is the thing archiving rules exist to prevent, and I
+ was ten minutes from it.
+FIX: amux put it in VERIFY.md by name — `--lib` is a partial run whose number reads like a
+ total — and strengthened two assertions in that same test that were weaker than they
+ looked: `desc_len.as_u64().is_some()` is TRUE of 0, so it and the log_n line beside it
+ would BOTH have gone green against the blanked loader. Only desc_head had teeth. Now
+ they assert `> 0`, mutation-checked, at cc3b4221. What remains open is the general shape:
+ a suite-shaped command that silently covers a subset is the same instrument failure as a
+ probe reporting zero when it never ran, and `--lib` is not the only such flag.
