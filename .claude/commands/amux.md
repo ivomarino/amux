@@ -1,7 +1,7 @@
 ---
-description: Use when you need to interact with the amux system — manage board tasks, check sessions, send emails, message via Telegram, automate browsers, or work with CRM contacts
+description: Use when you need to interact with the amux system — manage board tasks, check sessions/workers, send emails, message via Telegram, automate browsers, work with CRM contacts, or use journal/files/org/torrents/graph/SQL/dictation
 allowed-tools: Bash, Read, Edit, Write
-argument-hint: [board|memory|sessions|schedule|notes|email|gmail|calendar|telegram|browser|crm|help] [args...]
+argument-hint: [board|memory|sessions|workers|schedule|notes|email|gmail|calendar|telegram|journal|files|org|groups|torrents|graph|map|sql|dictation|tts|habits|review|connectors|browser|crm|help] [args...]
 ---
 
 # /amux — amux Session Integration
@@ -51,6 +51,25 @@ curl -sk -X POST -H 'Content-Type: application/json' \
 
 # Peek at a session's terminal output
 curl -sk "$AMUX_URL/api/sessions/SESSION_NAME/peek?lines=100"
+```
+
+**Modern equivalent:** `/api/workers/*` is the canonical, still-growing
+replacement for parts of this API — `send` in particular is "the canonical
+spelling... promoted out of the catch-all" per its own source comment.
+Prefer it for new code; `/api/sessions/*` still works (legacy alias) and
+isn't going anywhere yet.
+
+```bash
+curl -sk $AMUX_URL/api/workers | python3 -m json.tool          # list
+curl -sk $AMUX_URL/api/workers/WORKER_ID                       # get one
+curl -sk -X PATCH -H 'Content-Type: application/json' \
+  -d '{"desc":"..."}' $AMUX_URL/api/workers/WORKER_ID           # update
+curl -sk -X POST $AMUX_URL/api/workers/WORKER_ID/start          # start
+curl -sk -X POST $AMUX_URL/api/workers/WORKER_ID/stop           # stop
+curl -sk $AMUX_URL/api/workers/WORKER_ID/peek                   # peek
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"text":"your message"}' $AMUX_URL/api/workers/WORKER_ID/send
+curl -sk $AMUX_URL/api/workers/WORKER_ID/dead-letters            # undelivered sends
 ```
 
 ---
@@ -450,6 +469,212 @@ amux crm fu
 - Gmail specifically (not Mail.app) → `/api/gmail/*`
 - Standalone calendar event (not a board/schedule item) → `/api/cal-events/*`
 - Mattermost, secrets, or full two-way Google Calendar sync → not live yet, see "Not yet deployed" above
+- Journal entry, org/team, files, torrents, graph/map, SQL, dictation/TTS, habits/review/local-models → see the sections below
+
+---
+
+## Journal
+
+`/api/journal` over the live `journal_entries`/`journal_media` tables —
+distinct from Notes (`/api/memories`, reference documents) and from CRM
+interaction logs (`amux crm log`). Entry ids are `JRN-N`.
+
+```bash
+curl -sk $AMUX_URL/api/journal                          # list
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"title":"...","body":"..."}' $AMUX_URL/api/journal
+curl -sk $AMUX_URL/api/journal/JRN_ID                    # get one
+curl -sk -X PATCH -H 'Content-Type: application/json' \
+  -d '{"body":"..."}' $AMUX_URL/api/journal/JRN_ID
+curl -sk -X DELETE $AMUX_URL/api/journal/JRN_ID           # soft delete
+curl -sk $AMUX_URL/api/journal/tags                       # tag counts
+```
+
+**Media upload is JSON + base64, NOT multipart** (a different shape from
+the Files section below — this matches what the dashboard's journal tab
+actually sends):
+
+```bash
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"data":"data:image/png;base64,iVBORw0K...","name":"photo.jpg"}' \
+  $AMUX_URL/api/journal/JRN_ID/media
+curl -sk $AMUX_URL/api/journal/media/MEDIA_ID              # serve
+curl -sk -X DELETE $AMUX_URL/api/journal/media/MEDIA_ID     # hard delete (file + row)
+```
+
+---
+
+## Files — two DIFFERENT contracts, both intentionally mounted
+
+`/api/fs/*` and `/api/files/*` are NOT duplicates — different roots,
+different upload shapes, kept side by side on purpose
+(`docs/rust-migration/server-boundary.md`). Pick by shape, not habit.
+
+```bash
+# /api/fs — Python-parity, path-containment-checked, MULTIPART upload
+curl -sk "$AMUX_URL/api/fs/list?path=."
+curl -sk -X POST -H 'Content-Type: application/json' -d '{"path":"..."}' $AMUX_URL/api/fs/mkdir
+curl -sk -X POST -F "file=@local.txt" -F "dir=/some/dir" $AMUX_URL/api/fs/upload
+curl -sk -X POST -H 'Content-Type: application/json' -d '{"path":"..."}' $AMUX_URL/api/fs/open
+curl -sk -X POST -H 'Content-Type: application/json' -d '{"from":"a","to":"b"}' $AMUX_URL/api/fs/rename
+
+# /api/files — rooted at $HOME (override AMUX_FILES_ROOT), RAW BODY upload,
+# 50MB cap both ways (413 beyond)
+curl -sk "$AMUX_URL/api/files?path=some/dir"                       # listing
+curl -sk "$AMUX_URL/api/files/download?path=some/file" -o out      # raw bytes
+curl -sk -X POST --data-binary @local.txt "$AMUX_URL/api/files/upload?path=dir/file"
+```
+
+---
+
+## Org / Team
+
+`/api/org` — a single-workspace org model (multi-workspace is not a thing
+here, one org per install). `GET` lazily creates the singleton row on
+first call. Invites expire in 7 days.
+
+```bash
+curl -sk $AMUX_URL/api/org                               # gets or creates
+curl -sk -X PATCH -H 'Content-Type: application/json' -d '{"name":"..."}' $AMUX_URL/api/org
+curl -sk $AMUX_URL/api/org/members
+curl -sk -X DELETE $AMUX_URL/api/org/members/MEMBER_ID
+curl -sk $AMUX_URL/api/org/invites                        # excludes used/expired
+curl -sk -X POST -H 'Content-Type: application/json' -d '{"email":"..."}' $AMUX_URL/api/org/invites
+curl -sk -X DELETE $AMUX_URL/api/org/invites/TOKEN
+```
+
+## Groups
+
+Fleet groups — **derived live from each session's `CC_TAGS` env var, never
+a stored list** (a second table would drift the moment someone edited one
+side and not the other). A session caller (`X-Amux-Worker` header) only
+sees same-tag sessions; the dashboard (no header) sees everything.
+
+```bash
+curl -sk $AMUX_URL/api/groups                              # list + config-usage hint
+curl -sk $AMUX_URL/api/groups/GROUP_NAME/config
+curl -sk -X PATCH -H 'Content-Type: application/json' \
+  -d '{"goal":"...","department":"sales","kpis":[...],"human_cost":300000}' \
+  $AMUX_URL/api/groups/GROUP_NAME/config
+```
+
+---
+
+## Torrents
+
+`/api/torrents` drives a local aria2c JSON-RPC daemon. **Every route
+honestly 503s with the exact start command if aria2c isn't running** —
+that's the "how do I use this" answer on a fresh box, not an error to work
+around.
+
+```bash
+curl -sk $AMUX_URL/api/torrents                            # list
+curl -sk -X POST -H 'Content-Type: application/json' -d '{"uri":"magnet:..."}' $AMUX_URL/api/torrents
+curl -sk $AMUX_URL/api/torrents/config                      # download dir etc
+curl -sk -X DELETE $AMUX_URL/api/torrents/GID
+curl -sk "$AMUX_URL/api/torrents/GID/file" -o out            # range-request streaming
+curl -sk -X POST $AMUX_URL/api/torrents/GID/pause            # or resume, etc (action)
+```
+
+---
+
+## Graph (mind-map) / Map (location)
+
+Two unrelated "map" concepts sharing naming — `/api/graph` is a node/edge
+mind-map (Obsidian-vault-importable); `/api/map` is a location-pin map
+backed by a plain JSON file, not a table.
+
+```bash
+# Graph: /api/graph/fleet is PROJECTED live from sessions, never stored
+curl -sk $AMUX_URL/api/graph/fleet
+curl -sk $AMUX_URL/api/graph/GRAPH_ID                       # {"nodes":[...],"edges":[...]}
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"path":"/path/to/vault"}' $AMUX_URL/api/graph/GRAPH_ID/import-vault  # REPLACES the graph
+
+# Map: whole-document GET/POST, additive pin POST, place search
+curl -sk $AMUX_URL/api/map
+curl -sk -X POST -H 'Content-Type: application/json' -d '{"pins":[...],...}' $AMUX_URL/api/map
+curl -sk -X POST -H 'Content-Type: application/json' -d '{"lat":0,"lng":0,"label":"..."}' $AMUX_URL/api/map/pins
+curl -sk "$AMUX_URL/api/map/search?q=coffee+near+me"          # Google Places, falls back to Nominatim
+```
+
+---
+
+## SQL browser — raw access to the live database, use with care
+
+`/api/sql` runs against the SAME SQLite database backing board/sessions/
+everything else in this file. **The read/write split is enforced by
+SQLite itself, not by inspecting your query text**: a non-`write` request
+runs on a connection opened `SQLITE_OPEN_READ_ONLY`, so the engine refuses
+any write outright — there's no keyword blocklist to route around, but
+also no correctness guarantee beyond "did you set `write` honestly."
+
+```bash
+curl -sk $AMUX_URL/api/sql/schema                          # table+column list
+curl -sk "$AMUX_URL/api/sql/rows?table=board"                # browse one table
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT * FROM board LIMIT 5","write":false}' $AMUX_URL/api/sql
+```
+
+Prefer the purpose-built API (`/api/board`, `/api/cal-events`, etc.) for
+anything that has one — this is for the cases nothing else covers.
+
+---
+
+## Dictation / Text-to-speech
+
+Both are **honest-503 if their engine isn't configured** — audio/text is
+never fabricated. Dictation: Whisper (local, warm subprocess) preferred,
+Gemini as fallback/AI-edit engine. TTS: `AMUX_TTS_ENGINE` (`say`|`piper`|
+`auto`) — macOS `say` by default where present, Piper elsewhere.
+
+```bash
+curl -sk -X POST --data-binary @audio.wav $AMUX_URL/api/dictate    # one-shot transcribe
+curl -sk $AMUX_URL/api/dictation/history
+curl -sk $AMUX_URL/api/dictation/dict                        # custom-word dictionary
+curl -sk $AMUX_URL/api/dictation/config
+
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"text":"Hello","voice_id":"..."}' $AMUX_URL/api/tts    # -> {url,size,engine,voice}
+curl -sk $AMUX_URL/api/tts/voices
+```
+
+---
+
+## Small utility APIs
+
+Thin, single-purpose — one JSON blob or a couple of routes each.
+
+```bash
+# Habits — one JSON array, whole-document replace (PUT overwrites everything)
+curl -sk $AMUX_URL/api/habits
+curl -sk -X PUT -H 'Content-Type: application/json' -d '[{"name":"...","...":"..."}]' $AMUX_URL/api/habits
+
+# Weekly review — trend data + a markdown digest
+curl -sk "$AMUX_URL/api/review/week?days=7"
+curl -sk "$AMUX_URL/api/review/digest?file=..."
+
+# Locally installed Ollama models — empty array (never an error) if the
+# daemon/binary isn't present
+curl -sk $AMUX_URL/api/ollama/models
+```
+
+---
+
+## Connectors (generic OAuth/credential framework)
+
+The framework Mattermost/Gmail-adjacent auth sits on top of — see "Not yet
+deployed" above for which providers are actually live. `GET
+/api/connectors` shows every registered provider's connection status and
+which env vars it needs (masked, never the value).
+
+```bash
+curl -sk $AMUX_URL/api/connectors                          # every provider + status
+curl -sk $AMUX_URL/api/connectors/accounts                  # connected accounts, all providers
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"key":"..."}' $AMUX_URL/api/connectors/PROVIDER_ID/credentials
+curl -sk -X POST $AMUX_URL/api/connectors/PROVIDER_ID/test
+```
 
 ---
 
@@ -472,6 +697,7 @@ Parse the arguments to determine what the user wants:
 - **`memory`** or **`memory show`** → show current session's memory content
 - **`memory update`** → read the current MEMORY.md, extract useful facts from recent context, update via API
 - **`sessions`** → list all amux sessions with their status
+- **`workers`** → list/get/update workers via the modern `/api/workers` API
 - **`schedule list`** → list all schedules
 - **`schedule add <title>`** → create a new schedule interactively
 - **`notes`** → list notes
@@ -479,6 +705,16 @@ Parse the arguments to determine what the user wants:
 - **`gmail`** → Gmail OAuth account status / inbox / send
 - **`calendar`** or **`cal`** → list/create/update/delete a standalone event via `/api/cal-events`
 - **`telegram`** → Telegram bot status / link a chat to a session / send a message via `/api/telegram`
+- **`journal`** → journal entries via `/api/journal`
+- **`files`** → browse/upload/download via `/api/fs` or `/api/files` (see Files section for which)
+- **`org`** → org/team/members/invites via `/api/org`
+- **`groups`** → fleet group list/config via `/api/groups`
+- **`torrents`** → torrent status/add/control via `/api/torrents` (needs aria2c running)
+- **`graph`** or **`map`** → mind-map (`/api/graph`) or location map (`/api/map`)
+- **`sql`** → browse schema/rows or run a query via `/api/sql`
+- **`dictation`** or **`tts`** → transcribe audio or synthesize speech
+- **`habits`** or **`review`** → habit tracking / weekly review data
+- **`connectors`** → generic connector framework status via `/api/connectors`
 - **`browser`** → browser automation help
 - **`crm`** → CRM operations
 - **`help`** or empty → show a brief summary of available /amux commands and APIs
