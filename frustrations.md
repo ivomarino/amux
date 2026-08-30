@@ -2255,6 +2255,65 @@ FIX: The firsthand-edit record is fed by Edit/Write tool calls, so a session fol
  Either record a firsthand claim when a Bash command writes a tracked file in the
  session's own cwd, or suppress the per-line list when EVERY unmatched line is in a
  file whose only recorded writer is you and no peer has a recorded write in the window.
+
+---
+## `git commit -a` in a shared checkout swept three lanes' in-flight work into one lane's commit, twice in four hours
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-30
+SESSION: amux
+CARD: AF-342
+SYMPTOM: Mid-task on AMUX-3886 I had ~87 uncommitted lines in
+ crates/amux-server/src/api/browser.rs (a `with_cause` helper plus 28 call sites).
+ ts-gke committed 78009d90, "browser-reaper: add hard TTL to kill old browsers
+ regardless of page state", touching the same file for an unrelated reason. All 87 of my
+ lines went in with it. `git log -S with_cause --oneline` now answers with a commit about
+ a TTL arm. I found out only because `git diff` on my own file came back a single hunk
+ when I had made two, which is a coincidence of what I happened to check next.
+COST: About 25 minutes: reconstructing what had moved, proving the sweep from
+ `git log -S`, and then rebuilding a mine-only tree in a scratch worktree because the
+ shared checkout by then held three lanes' in-flight edits and would not compile. The
+ durable cost is the record: the fix for a browser 502 is filed under a browser-reaper
+ TTL commit, and the next person to run `git log -S` or `git blame` on it gets a wrong
+ answer with nothing marking it wrong. Not rewriting history over it — 172 unpushed
+ commits with live lanes — so this entry and the follow-up commit body are the record.
+SEVERITY-NOTE (appended same day, after the recurrence): raising this from `slows`.
+ It happened AGAIN four hours later, same lane. 8a990ebd, "browser-reaper: activity arm",
+ carries THREE lanes' work: my remaining AMUX-3886 change (+281 integrations/browser.rs,
+ +59 api/browser.rs), amux-frustrations' entire AF-342 fix (+199 git_guard.rs, +100
+ test-staged-guard-render.sh, the hook, checks.yml, their ledger entry), and ts-gke's own
+ reaper arm. The second sweep landed AFTER ts-gke had read the diagnosis of the first,
+ agreed with it in writing, and said they were adopting the explicit-paths guard. So this
+ class does not require a careless session; it requires a lane that intends the right
+ thing and reaches for a familiar verb.
+ AND THE FIX FOR THIS WAS ONE OF THE THINGS SWEPT. amux-frustrations had AF-342 STAGED,
+ holding the commit on a full-suite result, when someone else's commit took the index. A
+ lane that stages early and verifies before committing is MORE exposed, not less, because
+ its work sits in the shared index longer. That is the argument against every advisory
+ guard on this path.
+ MECHANISM, narrower than the first entry had it. My untracked test file was NOT taken
+ while every modified TRACKED file was: that is `git commit -a`, not `git add -A`. `-a`
+ stages every modified tracked file at commit time — exactly the set a shared checkout
+ fills with peers' work — and it never touches the index beforehand, so it walks straight
+ past AF-316's staging refusal. The guard to state is "never pass -a", not "prefer
+ explicit paths".
+FIX: This is AF-342 (filed by amux-frustrations ~20 minutes before 78009d90 landed)
+ seen from the other end, and it CORRECTS one clause of that entry. AF-342's COST says
+ "The guard correctly kept the peer's two dirty browser.rs files OUT of the commit, so
+ its load-bearing half worked." On the very next commit, on one of those same two files,
+ it did not: the load-bearing half is exactly what failed here. Both observations are
+ real — amux-frustrations was warned and stopped, ts-gke was not — which means the
+ guard's protection is not a property of the guard, it is a property of whether the
+ committing session happens to read 93 lines of warning it has learned to scroll past.
+ That is the argument AF-342's own SYMPTOM makes ("warnings that fire on the normal path
+ are the ones people learn to scroll past, which is how the peer-hunk case gets missed"),
+ now with the case attached. ts-gke's diagnosis, unprompted and worth keeping: the
+ property the guard needs is "this path has no edit record from the COMMITTING session",
+ not "this path was edited via shell" — heredocs are one way to be invisible, and a
+ codegen step, a `git checkout` and a peer's editor are three more. Scope AF-342's fix to
+ the general property.
+
 ## A trustworthy test run on a contended file now requires a private worktree, and each one costs a full dependency rebuild
 AREA: instruments
 SEVERITY: slows
