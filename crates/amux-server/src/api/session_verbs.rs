@@ -4261,11 +4261,48 @@ fn dim_mask(line: &str) -> (String, String) {
                 for c2 in chars.by_ref() {
                     if c2.is_ascii_alphabetic() {
                         if c2 == 'm' {
-                            for code in body.split(';') {
-                                match code.trim() {
-                                    "2" => is_dim = true,
-                                    "0" | "" | "22" => is_dim = false,
-                                    _ => {}
+                            // AN EXTENDED COLOUR'S PARAMETERS ARE NOT SGR CODES
+                            // (AMUX-3889). This was a flat scan over every
+                            // semicolon-separated field, which reads the `2` in
+                            // `48;2;95;95;95` — the marker that says "truecolor
+                            // follows" — as SGR 2, DIM. One such sequence turns
+                            // the rest of the line dim, and `composer_state`
+                            // reports dim text as a PLACEHOLDER rather than as
+                            // pending input.
+                            //
+                            // It survived because Claude Code paints in 256
+                            // colour (`38;5;N`), where the second field is 5 and
+                            // the bug cannot fire. Gemini paints in truecolor,
+                            // so on a gemini lane EVERY typed message read as a
+                            // placeholder — and `read_frame` turns "no pending
+                            // input" into `Cleared`, i.e. SUBMITTED. The sender
+                            // is told a message landed while it sits in the box,
+                            // which is the AMUX-3876 failure with a different
+                            // cause.
+                            //
+                            // So the parameters are CONSUMED, walking the list
+                            // rather than scanning it: `38;5;n` takes one,
+                            // `38;2;r;g;b` takes three.
+                            let codes: Vec<&str> = body.split(';').collect();
+                            let mut i = 0;
+                            while i < codes.len() {
+                                match codes[i].trim() {
+                                    "38" | "48" | "58" => {
+                                        i += match codes.get(i + 1).map(|c| c.trim()) {
+                                            Some("5") => 3,
+                                            Some("2") => 5,
+                                            _ => 1,
+                                        }
+                                    }
+                                    "2" => {
+                                        is_dim = true;
+                                        i += 1;
+                                    }
+                                    "0" | "" | "22" => {
+                                        is_dim = false;
+                                        i += 1;
+                                    }
+                                    _ => i += 1,
                                 }
                             }
                         }
@@ -4290,6 +4327,77 @@ fn dim_mask(line: &str) -> (String, String) {
         }
     }
     (plain, dim)
+}
+
+/// Gemini CLI's composer, or `None` when this frame is not one.
+///
+/// # Why this is its own reader rather than another glyph in the scan
+///
+/// The obvious patch is to add `*` to the prompt-glyph set beside the two the
+/// scan already knows. That would be a disaster on Claude Code panes, where a
+/// line beginning `*` is an ordinary prose bullet and would read as pending
+/// input in any lane that happened to be writing markdown.
+///
+/// So the anchor is the CHROME, matched positively: gemini draws its input box
+/// as a half-block sandwich, a run of U+2584 above and a run of U+2580 below,
+/// and nothing else in any supported TUI draws those. Text between them is the
+/// composer by construction, and prose cannot fake a border.
+///
+/// # The placeholder is COLOURED, not dim
+///
+/// Claude Code's suggestion is SGR-2, which is why [`dim_mask`] exists and why
+/// `Placeholder` can be told from `Typed` without reading the words. Gemini
+/// paints its hint in grey (38;2;175;175;175), an ordinary foreground colour
+/// indistinguishable from real text by attribute alone, so this one case has to
+/// match the words.
+///
+/// IT FAILS TOWARD `Typed`, deliberately, and the asymmetry is the reason to
+/// say so here. Reading a placeholder as typed costs a send that reports
+/// not-confirmed when the lane is actually clear: annoying, and self-correcting
+/// on the next frame. Reading typed text as a placeholder makes `read_frame`
+/// return `Cleared`, which means SUBMITTED — the sender is told the message
+/// landed while it sits in the box, which is the AMUX-3876 defect this module
+/// already carries a variant for. So only gemini's own hint sentence is a
+/// placeholder; anything else is somebody's message.
+fn gemini_composer_state(raw_lines: &[&str], stripped: &[String]) -> Option<ComposerState> {
+    /// Gemini's own hint text. Matched on the stable head of the sentence
+    /// rather than the whole of it, because the `@path/to/file` tail is the
+    /// part most likely to be reworded, and a hint that stops matching fails
+    /// toward `Typed` (see above) rather than toward a false confirmation.
+    const HINT: &str = "type your message";
+    let is_run = |l: &str, ch: char| {
+        let t = l.trim();
+        t.chars().filter(|c| *c == ch).count() >= 4 && t.chars().all(|c| c == ch)
+    };
+    // The LAST box in the frame: scrollback can hold an older one.
+    let top = stripped.iter().rposition(|l| is_run(l, '\u{2584}'))?;
+    let bottom = stripped.iter().skip(top + 1).position(|l| is_run(l, '\u{2580}'))? + top + 1;
+    if bottom <= top + 1 {
+        // A drawn box with no body line: painted, and empty.
+        return Some(ComposerState::Empty);
+    }
+    let mut plain = String::new();
+    for (n, raw) in raw_lines[top + 1..bottom].iter().enumerate() {
+        let (mut p, _) = dim_mask(raw);
+        if n == 0 {
+            // Drop the prompt glyph and the reverse-video cursor cell: chrome,
+            // never content.
+            p = p.trim_start().trim_start_matches(['*', ' ', '\u{a0}', '\t']).to_string();
+        }
+        plain.extend(p.split_whitespace());
+    }
+    if plain.is_empty() {
+        return Some(ComposerState::Empty);
+    }
+    // Compared against the SPACE-STRIPPED hint, because `plain` is built with
+    // `split_whitespace` and concatenated — the same shape that makes
+    // `is_collapsed_paste` match `[Pastedtext#137+44lines]` rather than the
+    // spaced form a human reads off the pane.
+    let hint_squashed: String = HINT.split_whitespace().collect();
+    if plain.to_lowercase().starts_with(&hint_squashed) {
+        return Some(ComposerState::Placeholder(plain));
+    }
+    Some(ComposerState::Typed(plain))
 }
 
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
@@ -4326,6 +4434,16 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     // form so the ❯ scan is unchanged from python.
     let raw_lines: Vec<&str> = raw_frame.lines().filter(|l| !strip_ansi(l).trim().is_empty()).collect();
     let stripped: Vec<String> = raw_lines.iter().map(|l| strip_ansi(l)).collect();
+    // GEMINI DRAWS A DIFFERENT BOX, AND IT IS NOT A PROMPT GLYPH (AMUX-3889).
+    // Tried before the scan below because gemini's frame contains neither
+    // glyph at all, so that scan returned `NotVisible` for a composer that is
+    // plainly drawn — and `read_frame` maps `NotVisible` to `NoUi`, which
+    // `final_frame_confirms` refuses by design. Every send to a gemini lane
+    // therefore spun its twelve no-ui looks and reported `Unverified` while the
+    // message sat delivered in the lane.
+    if let Some(state) = gemini_composer_state(&raw_lines, &stripped) {
+        return state;
+    }
     let Some(idx) = stripped
         .iter()
         .rposition(|l| matches!(l.trim().chars().next(), Some('\u{276f}') | Some('\u{203a}')))
@@ -19693,6 +19811,132 @@ mod composer_state_tests {
     /// NOT the lane's: the placeholder literally says "describe a task for a
     /// new session", and its status bar replaces the normal one.
     const LIVE_BG_MANAGER: &str = "Your conversation moved to the background \u{2014} enter opens it \u{b7} esc returns to it \u{b7} ctrl+c twice quits\n\nNeeds input\n \u{273b} current session     send a prompt to start\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[39m\u{276f}\u{a0}\u{1b}[2mdescribe a task for a new session\u{1b}[0m\n\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} bypass permissions \u{b7} enter to collapse \u{b7} ctrl+x to delete all \u{b7} ? for shortcuts\n";
+
+    /// `photo-analysis`, a live GEMINI lane, captured 2026-08-30. Verbatim
+    /// `tmux capture-pane -e`, with the border runs shortened and nothing else
+    /// touched.
+    ///
+    /// GEMINI DRAWS A COMPLETELY DIFFERENT COMPOSER and this fixture is the
+    /// whole of AMUX-3889. There is no `\u{276f}` and no `\u{203a}` anywhere in
+    /// the frame: the prompt glyph is `*`, the box is a half-block sandwich
+    /// (`\u{2584}` above, `\u{2580}` below) rather than `\u{2500}` rules, and the
+    /// placeholder is COLOURED grey (38;2;175;175;175) rather than SGR-2 dim,
+    /// so the dim discriminator cannot see it either.
+    const LIVE_GEMINI_PLACEHOLDER: &str = "                                                                                                                                                                                                            \u{1b}[38;2;175;175;175m? for shortcuts\u{1b}[39m\n\u{1b}[2m\u{1b}[38;2;135;135;135m\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[0m \u{1b}[38;2;255;135;175mYOLO\u{1b}[38;2;175;175;175m Ctrl+Y\u{1b}[39m                                                                                                                                                                                               \u{1b}[38;2;175;175;175m1 GEMINI.md file\u{1b}[39m\n\u{1b}[38;2;95;95;95m\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\n\u{1b}[39m\u{1b}[48;2;95;95;95m \u{1b}[38;2;255;135;175m* \u{1b}[7m\u{1b}[39m \u{1b}[0m\u{1b}[38;2;175;175;175m\u{1b}[48;2;95;95;95m Type your message or @path/to/file\u{1b}[39m\n\u{1b}[38;2;95;95;95m\u{1b}[49m\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\u{1b}[39m \u{1b}[38;2;175;175;175mworkspace (/directory)\u{1b}[39m                                                       \u{1b}[38;2;175;175;175mbranch\u{1b}[39m                                                       \u{1b}[38;2;175;175;175msandbox\u{1b}[39m                                                                   \u{1b}[38;2;175;175;175m/model\u{1b}[39m\n \u{1b}[38;2;255;255;255m~/Dev/ethan.dev-minimal\u{1b}[39m                                                      \u{1b}[38;2;255;255;255mmain\u{1b}[39m                                                         \u{1b}[38;2;255;135;175mno sandbox\u{1b}[39m                                                      \u{1b}[38;2;255;255;255mgemini-2.5-flash\u{1b}[39m\n";
+
+    /// The same lane with a message actually typed in. Built from the frame
+    /// above by the one substitution the TUI makes: the grey placeholder is
+    /// replaced by the user's text in the normal foreground colour.
+    fn gemini_typed(text: &str) -> String {
+        LIVE_GEMINI_PLACEHOLDER.replace(
+            "\u{1b}[38;2;175;175;175m\u{1b}[48;2;95;95;95m Type your message or @path/to/file",
+            &format!("\u{1b}[48;2;95;95;95m {text}"),
+        )
+    }
+
+    /// AMUX-3889: `amux send` reported a DELIVERED message as FAILED on every
+    /// gemini lane, because the verdict scraper only knew Claude Code's box.
+    ///
+    /// `composer_state` finds the composer by `rposition`-ing a line whose
+    /// first character is `\u{276f}` or `\u{203a}`. Gemini has neither, so every
+    /// gemini frame returned `NotVisible`, `read_frame` mapped that to `NoUi`,
+    /// `final_frame_confirms(NoUi)` is false by design, and the retry loop
+    /// spun its twelve looks before returning `Unverified`. The message was in
+    /// the lane the whole time.
+    ///
+    /// The four cells are the ones that behave differently downstream.
+    /// AMUX-3889, the defect UNDER the reported one and the more dangerous of
+    /// the two.
+    ///
+    /// `dim_mask` scanned every semicolon-separated field of an SGR sequence
+    /// and treated a `2` as DIM. In `48;2;95;95;95` that `2` is the marker
+    /// saying "a truecolor triple follows", not SGR 2 — so one background-colour
+    /// sequence turned the rest of the line dim, and `composer_state` reports
+    /// dim text as a placeholder rather than as pending input.
+    ///
+    /// The direction is what makes it worse than the headline bug. A placeholder
+    /// means "nothing pending", `read_frame` turns that into `Cleared`, and
+    /// `Cleared` means SUBMITTED. The sender is told the message landed while it
+    /// is sitting in the box.
+    ///
+    /// It hid because Claude Code paints in 256 colour (`38;5;N`), where the
+    /// second field is 5 and the bug cannot fire. Every fixture in this module
+    /// was 256-colour, so the whole file agreed with itself.
+    #[test]
+    fn a_truecolor_parameter_is_not_the_dim_code() {
+        // The live specimen: gemini's composer background, then ordinary text.
+        let (plain, dim) = dim_mask("\u{1b}[48;2;95;95;95m hello\u{1b}[39m");
+        assert_eq!(plain.trim(), "hello", "truecolor must not dim the line");
+        assert!(dim.is_empty(), "nothing here is dim, got {dim:?}");
+
+        // Foreground truecolor, same shape.
+        let (plain, dim) = dim_mask("\u{1b}[38;2;175;175;175mgrey text\u{1b}[39m");
+        assert_eq!(plain, "grey text");
+        assert!(dim.is_empty(), "got {dim:?}");
+
+        // 256-colour still parses (the form every Claude Code fixture uses),
+        // including the `5` that must be consumed rather than read as a code.
+        let (plain, dim) = dim_mask("\u{1b}[38;5;153m/compact\u{1b}[39m");
+        assert_eq!(plain, "/compact");
+        assert!(dim.is_empty(), "got {dim:?}");
+
+        // THE CONTROL. Real SGR 2 must STILL dim, or this "fix" deletes the
+        // discriminator that separates Claude Code's suggestion from a typed
+        // message — the whole point of `dim_mask`.
+        let (plain, dim) = dim_mask("\u{1b}[2mcontinue with the queue\u{1b}[0m");
+        assert!(plain.is_empty(), "SGR 2 must still mean dim, got plain {plain:?}");
+        assert_eq!(dim, "continue with the queue");
+
+        // And real dim must survive a truecolor sequence in the same run, which
+        // is the combination a naive consume-everything fix would break.
+        let (plain, dim) = dim_mask("\u{1b}[38;2;1;2;3m\u{1b}[2mhint\u{1b}[0m done");
+        assert_eq!(dim, "hint");
+        assert_eq!(plain.trim(), "done");
+    }
+
+    #[test]
+    fn a_gemini_composer_is_read_rather_than_reported_as_no_ui() {
+        // 1. THE BUG. An empty gemini composer is a composer, not an absence.
+        assert_ne!(
+            composer_state(LIVE_GEMINI_PLACEHOLDER),
+            ComposerState::NotVisible,
+            "gemini's box is a drawn composer; NotVisible routes the send to NoUi \
+             and a delivered message is reported as failed"
+        );
+        assert_eq!(
+            composer_state(LIVE_GEMINI_PLACEHOLDER).typed(),
+            None,
+            "the grey `Type your message` hint is a placeholder, and reporting it as \
+             pending input would make every send read as still-in-the-box"
+        );
+
+        // 2. THE CONSEQUENCE, at the site the card is about. An empty composer
+        // after a send means it went in.
+        assert_eq!(
+            read_frame(LIVE_GEMINI_PLACEHOLDER, "somemessagetail"),
+            FrameRead::Cleared,
+            "this is the verdict that was reporting NoUi"
+        );
+        assert!(final_frame_confirms(read_frame(LIVE_GEMINI_PLACEHOLDER, "somemessagetail")));
+
+        // 3. THE CONTROL, and it is the one that must not regress. Real typed
+        // text must still read as real, or the fix trades a false FAILED for a
+        // false CONFIRMED — which is strictly worse (AMUX-3876: the sender is
+        // told it landed and it is sitting in the box).
+        let typed = gemini_typed("[10:24AM] please look at the ranking report");
+        assert_eq!(
+            composer_state(&typed).typed(),
+            Some("[10:24AM]pleaselookattherankingreport"),
+            "frame was: {typed:?}"
+        );
+        assert_eq!(read_frame(&typed, "rankingreport"), FrameRead::StillThereIdle);
+        assert!(!final_frame_confirms(read_frame(&typed, "rankingreport")));
+
+        // 4. A frame with no composer at all is still NotVisible. Without this
+        // the gemini branch could satisfy cell 1 by returning Empty for
+        // everything, which would confirm sends into a pane that never painted.
+        assert_eq!(composer_state("just some scrollback\nand more\n"), ComposerState::NotVisible);
+    }
 
     #[test]
     fn a_dim_suggestion_is_not_pending_input() {
