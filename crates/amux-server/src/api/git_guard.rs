@@ -83,6 +83,39 @@
 //! - `unclaimed` — staged, and NO session has an edit record inside the
 //!   window: warned. Not blockable (no owner to defer to) but silence here is
 //!   what let 762e06e sweep a peer's staged work.
+//!
+//! # A CLAIM DOES NOT EXIST UNTIL THE COMMAND THAT MADE IT FINISHES
+//!
+//! Measured 2026-08-30, and worth stating here because it cost two wrong
+//! diagnoses (AMUX-3904, AMUX-3905) before anyone tested it. Claude Code writes
+//! a Bash `tool_use` block to the transcript when the command COMPLETES, not
+//! when it starts. Every claim this module derives from Bash is read out of that
+//! transcript, so a session that writes a file and then asks the guard about it
+//! INSIDE THE SAME COMMAND is asking about a write whose record does not exist
+//! yet, and correctly gets `unclaimed`.
+//!
+//! The probe that shows it, and the reason a reader will otherwise blame the
+//! 30-second `EDIT_CACHE_TTL`:
+//!
+//! ```text
+//! cmd A: write + stage + staged-guard -> unclaimed;  transcript -> 0 records
+//! cmd B: transcript -> 1 record   AND   staged-guard -> claimed   (same instant)
+//! ```
+//!
+//! Cache staleness would have shown the record PRESENT while the verdict still
+//! said unclaimed. It does not; the verdict flips exactly when the record lands.
+//!
+//! THIS IS FAIL-SAFE IN THE FLOW THAT MATTERS, which is why it is documented
+//! rather than fixed. A peer commits in THEIR command, after your writing
+//! command ended, so your record is there by then. The only party whose record
+//! can be missing is the COMMITTER, about their own in-flight command — and a
+//! missing committer record makes `committer_fresher` false, which routes the
+//! path to `foreign` and BLOCKS. The lag errs toward refusing a commit, never
+//! toward sweeping one.
+//!
+//! What it DOES break is a self-query used as a probe. If you are testing this
+//! module by hand, put the write and the question in separate commands, or you
+//! will measure the command boundary and think you found a bug.
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
