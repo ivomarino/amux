@@ -1,7 +1,7 @@
 ---
 description: Use when you need to interact with the amux system — manage board tasks, check sessions, send emails, message via Telegram, automate browsers, or work with CRM contacts
 allowed-tools: Bash, Read, Edit, Write
-argument-hint: [board|memory|sessions|schedule|notes|email|gmail|telegram|browser|crm|help] [args...]
+argument-hint: [board|memory|sessions|schedule|notes|email|gmail|calendar|telegram|browser|crm|help] [args...]
 ---
 
 # /amux — amux Session Integration
@@ -217,6 +217,68 @@ curl -sk -X POST -H 'Content-Type: application/json' \
 
 ---
 
+## Calendar (plain events store)
+
+A CRUD store for calendar events (`crates/amux-server/src/api/calendar.rs`),
+independent of any external calendar account — not to be confused with
+the email-sync-extracted events under `/api/email/events` above, or with
+a **full two-way Google Calendar sync**, which does not exist on this
+server yet (see "Not yet deployed" below). This one just holds events you
+create directly and publishes them as a read-only `.ics` feed real
+calendars (Google, Apple) can subscribe to — one-way out, nothing syncs
+back in.
+
+```bash
+# List / create / update / delete
+curl -sk $AMUX_URL/api/cal-events
+curl -sk -X POST -H 'Content-Type: application/json' \
+  -d '{"title":"Standup","start":"2026-09-01T09:00:00Z","end":"2026-09-01T09:15:00Z","location":"...","description":"...","rrule":"...","all_day":false}' \
+  $AMUX_URL/api/cal-events
+curl -sk -X PATCH -H 'Content-Type: application/json' \
+  -d '{"location":"Room 2"}' $AMUX_URL/api/cal-events/EVT_ID
+curl -sk -X DELETE $AMUX_URL/api/cal-events/EVT_ID
+```
+
+`title` and `start` are the only required fields on create; everything
+else (`end`, `location`, `description`, `rrule`, `all_day`) is optional.
+`PATCH` accepts any subset of the same fields.
+
+**The `.ics` feed:** `GET /api/calendar.ics` — see CLAUDE.md's "iCal sync"
+section. Events only (not schedules/board), and its real subscription URL
+(S3-hosted, random key) lives only in `server.env` — never commit the
+actual URL, the repo is public.
+
+---
+
+## Not yet deployed (exists in code, not live on this server)
+
+Three connectors have real, merged-or-in-review code but **are not
+reachable on the currently running server** — verify against `GET
+/api/debug/routes` before trusting any of this, and don't assume "merged
+to `main`" means "live": this checkout's build source only advances when
+someone explicitly moves it there (CLAUDE.md's Deploy section) — a PR
+merging to `main` does not redeploy the running binary.
+
+- **Mattermost** (`/api/connectors/mattermost/*`) — login/password auth
+  against a self-hosted server, via the generic `/api/connectors/*`
+  family (also used for Google/Slack-shaped auth). Code merged to `main`
+  as of PR #164 (2026-08-30) but not yet built into the running server.
+- **Encrypted secrets store** (`/api/secrets/*`) — age/X25519 at rest,
+  decrypted once at startup. Still an open PR (#163) as of 2026-08-30.
+- **Full two-way Google Calendar sync** (`/api/gcal/*`) — distinct from
+  the plain `/api/cal-events` store above; syncs read/write against the
+  real Google Calendar API, multi-account. Still an open PR (#160) as of
+  2026-08-30, and also an open product question (amux already has a
+  one-way `.ics` feed — whether it should also own two-way write access
+  to a real calendar is not yet decided).
+
+Once any of these actually lands on the running server, give it its own
+section above (following the Gmail/Telegram pattern) rather than just
+deleting this note — the next person needs to know it changed, not just
+that it now works.
+
+---
+
 ## Telegram
 
 Bot connector — **inbound** via long-polling
@@ -386,6 +448,8 @@ amux crm fu
 - Recurring automation → `/api/schedules`
 - Telegram chat <-> session link, or a message out to Telegram → `/api/telegram/*`
 - Gmail specifically (not Mail.app) → `/api/gmail/*`
+- Standalone calendar event (not a board/schedule item) → `/api/cal-events/*`
+- Mattermost, secrets, or full two-way Google Calendar sync → not live yet, see "Not yet deployed" above
 
 ---
 
@@ -413,6 +477,7 @@ Parse the arguments to determine what the user wants:
 - **`notes`** → list notes
 - **`email send`** → compose and send an email
 - **`gmail`** → Gmail OAuth account status / inbox / send
+- **`calendar`** or **`cal`** → list/create/update/delete a standalone event via `/api/cal-events`
 - **`telegram`** → Telegram bot status / link a chat to a session / send a message via `/api/telegram`
 - **`browser`** → browser automation help
 - **`crm`** → CRM operations
