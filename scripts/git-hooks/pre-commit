@@ -24,6 +24,72 @@ set -e
 ROOT="$(git rev-parse --show-toplevel)"
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 
+# ── MASS DELETION OF FILES THAT STILL EXIST ON ORIGIN (AMUX-3921) ────────────
+#
+# Handed over from MHC-531. `git ls-files -d` on the shared ~/Dev/mixpeek
+# returned 233 tracked files absent from disk, all 233 still on origin/main,
+# zero legitimate deletions — 200 under packages/, 7 server tests, 6 MVS files,
+# 2 security baselines. Nothing was staged, so nothing was armed. ONE
+# `git add -A` or `git commit -a` by any lane would have staged all 233 and
+# pushed them.
+#
+# WHY THIS LIVES HERE AND NOT IN git-shared-guard.py. That guard already refuses
+# `git add -A`, `git add .` and `git commit -a` UNCONDITIONALLY (AF-316), which
+# is stronger than the conditional leg the handoff asked for. But it is wired as
+# a Claude Code PreToolUse Bash hook in ~/.claude/settings.json, so it only sees
+# commands a harness session runs. Anything else — a script, a lane whose hook
+# config did not load, a session that wandered into this checkout — walks past
+# it. That is not hypothetical: on 2026-08-30 two `git commit -a` invocations
+# swept three lanes' in-flight work into unrelated commits and the guard did not
+# fire, and MHC-531's own postscript records a third that ran while the guard
+# logged NOT ENFORCED.
+#
+# A pre-commit hook runs for EVERY invoker. So the gate belongs on the OUTCOME
+# (deletions are staged) rather than on the SYNTAX (`-a` was typed), which is
+# also the more honest test: `-a` is one way to produce this and not the only
+# one.
+#
+# WHY origin-presence AND A THRESHOLD, rather than either alone. An intentional
+# `git rm` also deletes paths that exist on origin, so presence cannot separate
+# them; and a lane legitimately removing one dead module must not be gated. What
+# does separate them is SCALE — a deliberate removal names a handful of files, a
+# sweep takes everything the worktree happens to be missing. The threshold is
+# the override-free path for ordinary work.
+DEL_LIMIT="${AMUX_MAX_STAGED_DELETIONS:-15}"
+if [ -z "${AMUX_ALLOW_MASS_DELETE:-}" ]; then
+  STAGED_DEL=$(git diff --cached --name-only --diff-filter=D 2>/dev/null || true)
+  N_DEL=$(printf '%s' "$STAGED_DEL" | grep -c . || true)
+  if [ "${N_DEL:-0}" -gt "$DEL_LIMIT" ]; then
+    # Only count deletions of paths ORIGIN STILL HAS. Removing files that were
+    # never pushed is a local cleanup and is nobody else's loss.
+    ON_ORIGIN=0
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      if git cat-file -e "origin/main:$f" 2>/dev/null; then
+        ON_ORIGIN=$((ON_ORIGIN + 1))
+      fi
+    done <<EOF
+$STAGED_DEL
+EOF
+    if [ "$ON_ORIGIN" -gt "$DEL_LIMIT" ]; then
+      echo "amux: REFUSING — this commit deletes $ON_ORIGIN file(s) that still exist on origin/main" >&2
+      echo "      (limit $DEL_LIMIT, AMUX_MAX_STAGED_DELETIONS). On a shared checkout this is the" >&2
+      echo "      shape of a sweep, not a removal: tracked files go missing from disk and one" >&2
+      echo "      \`git add -A\` or \`git commit -a\` stages every one of them." >&2
+      echo "" >&2
+      echo "      What to check first:" >&2
+      echo "        git diff --cached --name-only --diff-filter=D | head" >&2
+      echo "        git ls-files -d | wc -l      # tracked files missing from disk RIGHT NOW" >&2
+      echo "      Restore rather than commit the loss:" >&2
+      echo "        git checkout origin/main -- <path>" >&2
+      echo "" >&2
+      echo "      If the removal is deliberate, say so: AMUX_ALLOW_MASS_DELETE=1 git commit ..." >&2
+      echo "      (logged like every other override; prefer naming the paths explicitly)" >&2
+      exit 1
+    fi
+  fi
+fi
+
 # THE staged-guard CALL IS AT THE TOP OF THIS FILE AGAIN (2026-08-09), and the
 # history below is why that is not a re-run of a mistake.
 #
