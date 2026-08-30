@@ -2172,105 +2172,190 @@ fn steering_fan_out(
     out: &mut Vec<Finding>,
     suppressed: &mut Vec<Suppressed>,
 ) {
-    let is_rl = |b: &Option<String>| blocked_by_rate_limit(b);
-    let rl_count = rows.iter().filter(|(b, ..)| is_rl(b)).count();
-    if rl_count < steering_rollup_at() {
-        out.extend(rows.into_iter().map(|(.., f)| f));
-        return;
+    // ROLL UP ON THE SHARED CONDITION, NOT ON THE RATE-LIMIT FLAG (AMUX-3928).
+    //
+    // This used to fold ONLY rate-limited lanes, so an identical multi-lane
+    // event on any other reason took the per-lane route. Measured 2026-08-30:
+    // nine messages across six lanes released inside a 63-second window after
+    // being queued over the previous 3.5 hours, one cause and one recovery, and
+    // the detector had filed FOUR cards for it (AMUX-3911, 3912, 3913, GE-741),
+    // each asserting the queue would not drain. All four drained together
+    // before anyone read one.
+    //
+    // Grouping by REASON is what keeps the discriminator this function exists to
+    // draw. Lanes blocked for DIFFERENT reasons never merge, so a `no-env-file`
+    // lane is still its own card next to a cap — that is
+    // `a_lane_blocked_for_its_own_reason_is_not_folded_into_the_cap`, unchanged.
+    // What changes is that N lanes sharing ONE reason now share one card.
+    //
+    // WHAT THIS DELIBERATELY CANNOT TELL, said rather than hidden: N lanes that
+    // stopped at the same instant and N that stopped independently over a week
+    // both read as N `not-running` rows in one tick. The rollup treats them
+    // alike because the READER'S ACTION is the same either way — start them, or
+    // archive the ones that are finished — and because a card naming nine lanes
+    // is strictly more informative than nine cards naming one each. It is not a
+    // claim that the nine share a root cause.
+    let mut by_reason: std::collections::BTreeMap<String, Vec<_>> =
+        std::collections::BTreeMap::new();
+    let mut ungrouped: Vec<_> = Vec::new();
+    for row in rows {
+        match &row.0 {
+            Some(r) => by_reason.entry(r.clone()).or_default().push(row),
+            None => ungrouped.push(row),
+        }
     }
-    let (capped, rest): (Vec<_>, Vec<_>) = rows.into_iter().partition(|(b, ..)| is_rl(b));
-    out.extend(rest.into_iter().map(|(.., f)| f));
+    out.extend(ungrouped.into_iter().map(|(.., f)| f));
 
-    let total: i64 = capped.iter().map(|(_, _, n, ..)| *n).sum();
-    let worst = capped.iter().map(|(_, _, _, age, _)| *age).fold(0.0_f64, f64::max);
-    let listing = capped
-        .iter()
-        .map(|(_, s, n, age, _)| format!("  {s} — {n} queued, oldest {:.0} min", age / 60.0))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let lanes: Vec<&str> = capped.iter().map(|(_, s, ..)| s.as_str()).collect();
+    for (reason, group) in by_reason {
+        if group.len() < steering_rollup_at() {
+            out.extend(group.into_iter().map(|(.., f)| f));
+            continue;
+        }
+        let n_lanes = group.len();
+        let total: i64 = group.iter().map(|(_, _, n, ..)| *n).sum();
+        let worst = group.iter().map(|(_, _, _, age, _)| *age).fold(0.0_f64, f64::max);
+        let listing = group
+            .iter()
+            .map(|(_, s, n, age, _)| format!("  {s} — {n} queued, oldest {:.0} min", age / 60.0))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let lanes: Vec<&str> = group.iter().map(|(_, s, ..)| s.as_str()).collect();
+        let is_cap = blocked_by_rate_limit(&Some(reason.clone()));
 
-    // EVERY FOLDED LANE LEAVES A TRACE (ethos rule 4). A rollup that silently
-    // absorbed N per-lane cards is indistinguishable from a detector that never
-    // looked at those lanes, and the per-lane signature is what a reader greps
-    // when they wonder why `silent|steering|<lane>` stopped filing.
-    for (_, session, n, age, _) in &capped {
-        suppressed.push(sup(
-            DetectorKind::SilentSubsystem,
-            &format!("silent|steering|{session}"),
-            &format!(
-                "{n} message(s) queued {:.0} min for {session}, folded into the account-level \
-                 card: {rl_count} rate-limited lanes qualified on this tick and every amux lane \
-                 shares one Claude subscription, so this is one cap and not {rl_count} faults \
-                 (AMUX_STEERING_ROLLUP_AT={})",
-                age / 60.0,
-                steering_rollup_at()
-            ),
-        ));
-    }
-
-    out.push(Finding {
-        kind: DetectorKind::SilentSubsystem,
-        // Keyed on the CONDITION, not on any lane, so the card dedupes against
-        // itself as lanes join and leave the capped set rather than re-filing
-        // every time the membership changes by one.
-        signature: "silent|steering|account-rate-limit".into(),
-        title: format!(
-            "{rl_count} lanes' steering queues are held by ONE account rate limit, oldest {:.0} min",
-            worst / 60.0
-        ),
-        evidence: vec![
-            (
-                "verdict".into(),
-                format!(
-                    "{rl_count} lanes have a steering queue past its deadline and every one of \
-                     them is rate-limited. Filed as ONE card on purpose. amux unsets \
-                     ANTHROPIC_API_KEY when it launches a lane, so every lane authenticates on \
-                     the same Claude subscription and a cap is account-level by construction; \
-                     lanes discover it one at a time as each makes its next request, which is \
-                     why this looks like {rl_count} separate stalls. {total} message(s) are \
-                     waiting in total, and every one was reported to its sender as accepted."
+        // EVERY FOLDED LANE LEAVES A TRACE (ethos rule 4). A rollup that
+        // silently absorbed N per-lane cards is indistinguishable from a
+        // detector that never looked at those lanes, and the per-lane signature
+        // is what a reader greps when they wonder why `silent|steering|<lane>`
+        // stopped filing.
+        // "account-level" for a cap, not the generic "shared". Every amux lane
+        // authenticates on ONE subscription, so a cap really is account-level —
+        // a strictly stronger statement than "these lanes happen to match", and
+        // the one a reader needs. `one_account_rate_limit_files_one_card_not_one_
+        // per_lane` pins that word for exactly that reason.
+        let folded_into = if is_cap {
+            "the account-level card".to_string()
+        } else {
+            format!("the shared `{reason}` card")
+        };
+        for (_, session, n, age, _) in &group {
+            suppressed.push(sup(
+                DetectorKind::SilentSubsystem,
+                &format!("silent|steering|{session}"),
+                &format!(
+                    "{n} message(s) queued {:.0} min for {session}, folded into {folded_into}: \
+                     {n_lanes} lanes qualified on this tick with the same block reason, so this \
+                     is one report and not {n_lanes} (AMUX_STEERING_ROLLUP_AT={})",
+                    age / 60.0,
+                    steering_rollup_at()
                 ),
+            ));
+        }
+
+        let verdict = if is_cap {
+            format!(
+                "{n_lanes} lanes have a steering queue past its deadline and every one of \
+                 them is rate-limited. Filed as ONE card on purpose. amux unsets \
+                 ANTHROPIC_API_KEY when it launches a lane, so every lane authenticates on \
+                 the same Claude subscription and a cap is account-level by construction; \
+                 lanes discover it one at a time as each makes its next request, which is \
+                 why this looks like {n_lanes} separate stalls. {total} message(s) are \
+                 waiting in total, and every one was reported to its sender as accepted."
+            )
+        } else {
+            format!(
+                "{n_lanes} lanes have a steering queue past its deadline and every one of them \
+                 is blocked for the same reason: {reason}. Filed as ONE card on purpose — see \
+                 why_not_one_card_per_lane. {total} message(s) are waiting in total, and every \
+                 one was reported to its sender as accepted. This is NOT a claim that the \
+                 {n_lanes} lanes share a root cause: the detector cannot tell lanes that \
+                 stopped together from lanes that stopped independently, and says so rather \
+                 than implying the stronger fact."
+            )
+        };
+        let what_to_do = if is_cap {
+            "Nothing, if the cap has a reset time — the queues drain when it lifts and this \
+             card closes itself. The work is only real if the queues are STILL full after \
+             the reset, which points at the drain loop rather than at the limit. A credit \
+             cap has no reset clock at all, and then the question is whether the fleet \
+             should be running this many lanes on one subscription, which is Ethan's call \
+             and not a per-sender fix."
+                .to_string()
+        } else if reason == "not-running" {
+            "Start the lanes that should be running; archive the ones that are finished. \
+             Neither is urgent on its own: a stopped lane's queue drains by itself when the \
+             lane next starts, and this fleet auto-starts workers at boot. Over the 7 days \
+             before this card existed, 45 of 45 messages that passed the deadline left the \
+             queue with no intervention."
+                .to_string()
+        } else {
+            format!(
+                "Clear the shared `{reason}` condition once rather than per lane. The listing \
+                 below names every lane it currently covers."
+            )
+        };
+
+        out.push(Finding {
+            kind: DetectorKind::SilentSubsystem,
+            // Keyed on the CONDITION, not on any lane, so the card dedupes
+            // against itself as lanes join and leave the set rather than
+            // re-filing every time the membership changes by one. The
+            // rate-limit signature is spelled exactly as before so the existing
+            // card's history is continuous.
+            signature: if is_cap {
+                "silent|steering|account-rate-limit".to_string()
+            } else {
+                format!("silent|steering|shared|{reason}")
+            },
+            title: if is_cap {
+                format!(
+                    "{n_lanes} lanes' steering queues are held by ONE account rate limit, \
+                     oldest {:.0} min",
+                    worst / 60.0
+                )
+            } else {
+                format!(
+                    "{n_lanes} lanes' steering queues are all blocked by {reason}, oldest \
+                     {:.0} min",
+                    worst / 60.0
+                )
+            },
+            evidence: vec![
+                ("verdict".into(), verdict),
+                ("lanes".into(), format!("\n{listing}")),
+                (
+                    "rollup_threshold".into(),
+                    format!(
+                        "{} lanes sharing one block reason (AMUX_STEERING_ROLLUP_AT)",
+                        steering_rollup_at()
+                    ),
+                ),
+                ("what_to_do".into(), what_to_do),
+                (
+                    "why_not_one_card_per_lane".into(),
+                    "Because each would carry the same cause and the same non-fix, and would be \
+                     addressed to senders who cannot act on it. Two live specimens: AMUX-3898, \
+                     3899, 3900 and 3901, filed 00:45 to 01:17 on 2026-08-30 against four \
+                     different lanes for one cap, all four cleared by themselves before anyone \
+                     read them; and AMUX-3911, 3912, 3913 and GE-741, filed for one 63-second \
+                     release window in which nine messages across six lanes drained together."
+                        .to_string(),
+                ),
+            ],
+            recheck: format!(
+                "curl -sk \"$AMUX_URL/api/debug/steering\" | python3 -c \"import json,sys; \
+                 d=json.load(sys.stdin); \
+                 print([(l['session'],l['queued'],l['blocked_reason'],l['rate_limit_resets_local']) \
+                 for l in d['lanes'] if l['session'] in {lanes:?}])\""
             ),
-            ("lanes".into(), format!("\n{listing}")),
-            (
-                "rollup_threshold".into(),
-                format!("{} rate-limited lanes (AMUX_STEERING_ROLLUP_AT)", steering_rollup_at()),
-            ),
-            (
-                "what_to_do".into(),
-                "Nothing, if the cap has a reset time — the queues drain when it lifts and this \
-                 card closes itself. The work is only real if the queues are STILL full after \
-                 the reset, which points at the drain loop rather than at the limit. A credit \
-                 cap has no reset clock at all, and then the question is whether the fleet \
-                 should be running this many lanes on one subscription, which is Ethan's call \
-                 and not a per-sender fix."
-                    .to_string(),
-            ),
-            (
-                "why_not_one_card_per_lane".into(),
-                "Because each would carry the same cause and the same non-fix, and would be \
-                 addressed to senders who cannot act on it. The live specimen is this rule's own \
-                 family: AMUX-3898, 3899, 3900 and 3901, filed 00:45 to 01:17 on 2026-08-30 \
-                 against four different lanes, one cap, all four cleared by themselves before \
-                 anyone read them."
-                    .to_string(),
-            ),
-        ],
-        recheck: format!(
-            "curl -sk \"$AMUX_URL/api/debug/steering\" | python3 -c \"import json,sys; \
-             d=json.load(sys.stdin); \
-             print([(l['session'],l['queued'],l['blocked_reason'],l['rate_limit_resets_local']) \
-             for l in d['lanes'] if l['session'] in {lanes:?}])\""
-        ),
-        // Unassigned to a sender on purpose: an account-level cap has no sender
-        // who can act on it, and the routing rule that addresses these to the
-        // SENDER is correct only for a per-lane stall.
-        owner: None,
-        count: total as u64,
-        last_ts: now,
-        parked_until: None,
-    });
+            // Unassigned on purpose: a condition several lanes share has no one
+            // sender who can act on it, and the routing rule that addresses
+            // these to the SENDER is correct only for a per-lane stall.
+            owner: None,
+            count: total as u64,
+            last_ts: now,
+            parked_until: None,
+        });
+    }
 }
 
 pub fn detect_silent(
@@ -7439,6 +7524,80 @@ mod tests {
             Some("some-sender".to_string()),
             "not-running is a per-lane fault with a lever; unassigning it too would trade one \
              misrouted card for a pile of unowned ones"
+        );
+    }
+
+    /// AMUX-3928. N lanes sharing ONE block reason is one report, whatever the
+    /// reason — the rollup used to key on `rate-limited` alone.
+    ///
+    /// The specimen: nine messages across six lanes released inside a 63-second
+    /// window on 2026-08-30, queued over the previous 3.5 hours. One cause, one
+    /// recovery, and the detector had filed FOUR cards for it (AMUX-3911, 3912,
+    /// 3913, GE-741), each asserting the queue would not drain. All four
+    /// drained together before anyone read one.
+    ///
+    /// THE CONTROL IS THE HALF THAT MATTERS. Lanes blocked for DIFFERENT reasons
+    /// must never merge, or the rollup becomes a way to hide independent
+    /// failures behind one card — strictly worse than the N cards it replaced.
+    /// The existing `a_lane_blocked_for_its_own_reason_is_not_folded_into_the_cap`
+    /// covers that for one lane beside a cap; this covers two full groups.
+    #[tokio::test]
+    async fn lanes_sharing_one_block_reason_roll_up_and_different_reasons_do_not() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        let stopped = ["stop-1", "stop-2", "stop-3"];
+        let envless = ["env-1", "env-2", "env-3"];
+        let all: Vec<&str> = stopped.iter().chain(envless.iter()).copied().collect();
+        seed_queues(&st, now, &all, 92.0).await;
+        let mut blocked = BTreeMap::new();
+        for l in stopped {
+            blocked.insert(l.to_string(), Some("not-running".to_string()));
+        }
+        for l in envless {
+            blocked.insert(l.to_string(), Some("no-env-file".to_string()));
+        }
+        let resets: BTreeMap<String, i64> = all.iter().map(|l| (l.to_string(), 0)).collect();
+        let conn = st.store.read().unwrap();
+        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+
+        // Three stopped lanes become ONE card, and no lane keeps its own.
+        let rolled = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|shared|not-running")
+            .expect("three lanes sharing not-running must roll up into one card");
+        assert!(rolled.title.contains("3 lanes"), "the count belongs in the title: {}", rolled.title);
+        for lane in stopped {
+            assert!(
+                !f.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                "{lane} must not ALSO get its own card"
+            );
+            // Every folded lane leaves a trace, or the fold is invisible to
+            // anyone grepping the per-lane signature.
+            assert!(
+                sup.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                "{lane} must leave a suppression trace"
+            );
+        }
+
+        // CONTROL: a DIFFERENT reason is its own group, not absorbed. Merging
+        // these would hide two independent conditions behind one card.
+        let other = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|shared|no-env-file")
+            .expect("no-env-file lanes form their OWN group, not part of the not-running one");
+        let ev: BTreeMap<_, _> = other.evidence.iter().cloned().collect();
+        assert!(
+            ev["lanes"].contains("env-1") && !ev["lanes"].contains("stop-1"),
+            "the two groups must not bleed into each other: {ev:?}"
+        );
+
+        // And the not-running card must not inherit the cap's account-level
+        // claim, which is true of a subscription and not of stopped lanes.
+        let rev: BTreeMap<_, _> = rolled.evidence.iter().cloned().collect();
+        assert!(
+            !rev["verdict"].contains("ANTHROPIC_API_KEY"),
+            "a not-running rollup is not an account cap: {rev:?}"
         );
     }
 
