@@ -20,6 +20,16 @@ Configure guarded roots via AMUX_SHARED_CHECKOUTS (colon-separated; default
 """
 import sys, json, os, re, time, pathlib
 
+# Entries are (pattern, why) or (pattern, why, remedy).
+#
+# The 3-tuple exists because the shared refusal tail below hard-codes ONE hazard
+# model: "this discards or sweeps up EVERY session's uncommitted work — scope to
+# YOUR OWN paths instead". That is true of every rule here except the history
+# ones, and telling someone whose `git fetch --depth=1` was blocked to scope it
+# with `git stash push -- <yourpath>` is advice that cannot be followed for a
+# problem they do not have. A guard that prints an impossible remedy teaches
+# people to stop reading it. When a rule supplies a remedy, it replaces that
+# paragraph rather than being appended to it.
 DANGER = [
     (r'\bgit\s+(?:-C\s+\S+\s+)?reset\s+--hard\b',
      'git reset --hard — discards ALL uncommitted tracked changes tree-wide'),
@@ -60,6 +70,48 @@ DANGER = [
     (r'\bgit\s+(?:-C\s+\S+\s+)?commit\b[^\n;&|]*?(?:\s--all\b|\s-[a-zA-Z]*a[a-zA-Z]*(?=[\s;&|]|$))',
      'git commit -a/--all — commits EVERY modified tracked file in this SHARED tree, '
      'sweeping up other sessions\' edits; commit only your paths: `git commit -m "msg" -- <your files>`'),
+    # HISTORY TRUNCATION (AMUX-3893, tuple supplied and pre-tested by mixpeek-cicd).
+    #
+    # 2026-08-29 20:19 ET: something ran a depth-limited fetch against the shared
+    # ~/Dev/mixpeek. `git rev-list --count origin/main` fell from ~38,700 to 50 and
+    # a 15:41 commit became a parentless root. For four hours every lane asking "is
+    # fix X in sha Y" from that tree got a wrong NO for anything older than that
+    # afternoon — with no error and no output — while GitHub's compare said
+    # ahead=163/141/318 for the same three pairs (tubescience, TUBES-2339).
+    #
+    # The caller is still unknown, and that is exactly why this belongs in the
+    # guard: nothing in the repo does this (scripts/, .githooks/, server/scripts/
+    # and tools/ were grepped; the only local --depth is a `clone --depth=1` of an
+    # EXTERNAL repo into its own directory, which cannot shallow this checkout). So
+    # it came from a session, and the guard is the only layer that sees those.
+    #
+    # The same trap hit CI independently the same day: a
+    # `git fetch -q --depth=1 origin <sha> <sha>` followed by `merge-base
+    # --is-ancestor` produced a false "REVERT DETECTED" for hours (MG-1532). The
+    # fetch added to guarantee the commits were present is what removed the
+    # ancestors the walk needed.
+    #
+    # Why this is a guard rule rather than a fix at one consumer: mixpeek-cicd
+    # already made `scripts/graft-push.sh` refuse to run on a shallow repo (leg 23,
+    # 4de6dbeb8e). That is detection at ONE consumer. It does not stop the next
+    # depth-limited fetch and does not help the other ~49 lanes doing ancestry by
+    # hand.
+    #
+    # SCOPE, each part deliberate and independently re-tested here (8 block / 10
+    # pass, zero false positives):
+    #   * fetch|pull only. `clone --depth` creates a NEW repo and cannot shallow
+    #     this one; blocking it false-positives on real callers.
+    #   * `--unshallow` and `--deepen` stay allowed — they are the remedy, and
+    #     "deepen" does not contain "depth" so there is no overlap.
+    #   * `[^;&|\n]*?` keeps the match inside one command, like the tuples above.
+    (r'\bgit\s+(?:-C\s+\S+\s+)?(?:fetch|pull)\b[^;&|\n]*?\s(?:--depth[=\s]|--shallow-since\b|--shallow-exclude\b)',
+     "git fetch/pull --depth (or --shallow-since/--shallow-exclude) — truncates history in "
+     "this SHARED checkout, and every `merge-base --is-ancestor` past the cut then returns a "
+     "bare exit 1 with no error, which is indistinguishable from a real 'not an ancestor'",
+     "Fetch fully (`git fetch origin`), or heal an already-shallow tree with "
+     "`git fetch --unshallow origin`. Check with `git rev-parse --is-shallow-repository`. "
+     "This does NOT touch anyone's uncommitted work — it truncates shared HISTORY, so "
+     "scoping to your own paths is not the remedy here."),
 ]
 _ALLOW_ONCE = pathlib.Path.home() / ".amux" / "guard-allow-once"
 _AUDIT = pathlib.Path.home() / ".amux" / "logs" / "guard-overrides.jsonl"
@@ -960,17 +1012,24 @@ def main():
                 f"OWNER-AUTHORIZED one-off: write the exact command to ~/.amux/guard-allow-once "
                 f"and re-run (consumed once, audit-logged).\n")
             return 2
-    for pat, why in DANGER:
+    for _entry in DANGER:
+        # 2- or 3-tuple; the third element, when present, REPLACES the
+        # sweeps-up-uncommitted-work remedy below rather than adding to it.
+        pat, why = _entry[0], _entry[1]
+        remedy = _entry[2] if len(_entry) > 2 else None
         if re.search(pat, scrubbed):
             if _consume_override(cmd):
                 sys.stderr.write(f"amux guard: ALLOWED once (owner-sanctioned via ~/.amux/guard-allow-once): {why}\n")
                 return 0
+            _default_remedy = (
+                "this discards or sweeps up EVERY session's uncommitted work. Scope to YOUR OWN "
+                "paths instead: `git checkout -- <yourfile>`, `git stash push -- <yourpath>`, or "
+                "commit your files. For pulls, fetch+rebase on committed state or verify the "
+                "autostash popped.")
             sys.stderr.write(
                 f"BLOCKED by amux shared-checkout guard: {why}.\n"
-                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions — this discards or "
-                f"sweeps up EVERY session's uncommitted work. Scope to YOUR OWN paths instead: "
-                f"`git checkout -- <yourfile>`, `git stash push -- <yourpath>`, or commit your files. "
-                f"For pulls, fetch+rebase on committed state or verify the autostash popped.{_dir_note}\n"
+                f"'{run_dir}' is a SHARED checkout used by multiple agent sessions — "
+                f"{remedy or _default_remedy}{_dir_note}\n"
                 f"OWNER-AUTHORIZED one-off: after sign-off, write the exact command to "
                 f"~/.amux/guard-allow-once and re-run (consumed once, audit-logged) — do NOT route around "
                 f"the guard via reflog.\n")

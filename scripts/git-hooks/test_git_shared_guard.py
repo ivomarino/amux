@@ -111,6 +111,34 @@ def main():
     os.makedirs(scratch, exist_ok=True)
     A("literal -C escape still works from shared cwd", f"git -C {scratch} reset --hard", False)
 
+    # AMUX-3893 (tuple from mixpeek-cicd): a depth-limited fetch truncates the
+    # SHARED history, and every `merge-base --is-ancestor` past the cut then
+    # returns a bare exit 1 that is indistinguishable from a real "not an
+    # ancestor". 2026-08-29: rev-list --count on ~/Dev/mixpeek fell ~38,700 -> 50
+    # and four hours of "is fix X in sha Y" answered wrongly, silently
+    # (TUBES-2339); the same trap produced a false "REVERT DETECTED" in CI the
+    # same day (MG-1532).
+    A("fetch --depth=", "git fetch --depth=1 origin", True)
+    A("fetch --depth space", "git fetch --depth 50 origin", True)
+    A("pull --depth=", "git pull --depth=1 origin main", True)
+    A("fetch --depth after operands", "git fetch origin main --depth=1", True)
+    A("fetch -q --depth with shas", "git fetch -q --depth=1 origin abc123 def456", True)
+    A("fetch --shallow-since", "git fetch --shallow-since=2026-01-01 origin", True)
+    A("fetch --shallow-exclude", "git fetch --shallow-exclude=v1.0 origin", True)
+    A("fetch --depth with -C", f"git -C {work} fetch --depth=1", True)
+    # The REMEDY must never be blocked, or the refusal names an action the guard
+    # itself refuses — the shape ethos rule 3 is about.
+    A("fetch --unshallow is the remedy", "git fetch --unshallow origin", False)
+    A("fetch --deepen is the remedy", "git fetch --deepen=100 origin", False)
+    A("fetch --deepen space", "git fetch --deepen 100 origin", False)
+    A("plain fetch", "git fetch origin", False)
+    A("fetch --all --prune", "git fetch --all --prune", False)
+    A("pull --rebase", "git pull --rebase origin main", False)
+    # `clone --depth` makes a NEW repo and cannot shallow this one. Blocking it
+    # would false-positive on real callers that shallow-clone EXTERNAL repos.
+    A("clone --depth= is not fetch", "git clone --depth=1 https://github.com/x/y /tmp/y", False)
+    A("clone --depth space", "git clone --depth 1 https://github.com/x/y", False)
+
     failures = []
     for name, cmd, cwd, expect_block in cases:
         code, err = run_hook(cmd, cwd, work)
