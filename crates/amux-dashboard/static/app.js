@@ -7358,7 +7358,7 @@ function exportPeekBoard(fmt) {
   const scoped = !_peekIssuesAllSessions && peekSession;
   const qs = new URLSearchParams({ format: fmt });
   if (scoped) qs.set('worker', peekSession);
-  const url = '/api/board/export?' + qs.toString();
+  const url = _authUrl('/api/board/export?' + qs.toString());
   const a = document.createElement('a');
   a.href = url;
   // The server sets Content-Disposition with the filename; this attribute only
@@ -8045,7 +8045,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.753';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.754';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
