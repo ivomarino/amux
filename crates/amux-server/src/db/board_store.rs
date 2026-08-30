@@ -1516,6 +1516,30 @@ fn ts(secs: i64) -> DateTime<Utc> {
 /// Shared column list so row indices cannot drift from the query text.
 /// `desc` is quoted — it is an SQL keyword. `deleted` is never selected;
 /// it is filtered in every WHERE instead (soft delete, Python semantics).
+/// AF-346: [`COLS`] with the two prose columns replaced by empty literals.
+///
+/// SAME SHAPE, SAME ORDER, SAME `issue_from_row` — deliberately. A second
+/// mapper for slim rows is the drift this file already warns about in
+/// `light_rows` ("ONE loader on purpose — two spellings of the filter canon or
+/// the sort would drift"), and the win here is not fewer columns, it is that
+/// SQLite never reads the TEXT off disk.
+///
+/// WHY IT IS WORTH THE TRICK. Measured on the live DB 2026-08-30: the default
+/// `/api/board` is slim, its response carried 0.0 MB of desc+log across 2,049
+/// cards, and `hydrate_light` was still selecting 8.4 MB of prose per call to
+/// throw away — ~6.3 GB read-and-discarded per two hours at 752 calls.
+/// AMUX-3491 stopped hydrating non-SURVIVORS; this stops hydrating the
+/// survivors' prose, which the slim serializer drops anyway.
+///
+/// `''` rather than `NULL` because `issue_from_row` reads both as `String`.
+const COLS_SLIM: &str = "i.id, i.title, '' AS \"desc\", i.status, i.session, i.creator, i.due, \
+     i.created, i.updated, i.owner_type, i.due_time, COALESCE(i.pinned,0), \
+     i.gcal_event_id, COALESCE(i.pos,0), COALESCE(i.notified,0), i.gate, i.shepherd, \
+     i.type, COALESCE(i.archived,0), i.depends_on, i.reviewer, '' AS log, \
+     COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
+     i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence, \
+     i.ask_type, i.ask_question, i.ask_unblocks";
+
 const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i.due, \
      i.created, i.updated, i.owner_type, i.due_time, COALESCE(i.pinned,0), \
      i.gcal_event_id, COALESCE(i.pos,0), COALESCE(i.notified,0), i.gate, i.shepherd, \
@@ -1793,11 +1817,12 @@ pub fn list_issues_capped(
     session_filter: &[String],
     archived: ArchivedFilter,
     done_limit: i64,
+    with_prose: bool,
 ) -> rusqlite::Result<(Vec<IssueRow>, usize, usize)> {
     let light = light_rows(conn, status_filter, session_filter, archived)?;
     let (kept_light, term_total, term_kept) =
         cap_terminal_by(light, done_limit, |r| &r.status, |r| r.updated);
-    Ok((hydrate_light(conn, &kept_light)?, term_total, term_kept))
+    Ok((hydrate_light(conn, &kept_light, with_prose)?, term_total, term_kept))
 }
 
 /// [`list_issues_capped`]'s sibling with [`sse_terminal_quota`] semantics
@@ -1811,10 +1836,11 @@ pub fn list_issues_quota(
     session_filter: &[String],
     archived: ArchivedFilter,
     done_limit: usize,
+    with_prose: bool,
 ) -> rusqlite::Result<Vec<IssueRow>> {
     let light = light_rows(conn, status_filter, session_filter, archived)?;
     let kept_light = terminal_quota_by(light, done_limit, |r| &r.status, |r| r.updated);
-    hydrate_light(conn, &kept_light)
+    hydrate_light(conn, &kept_light, with_prose)
 }
 
 /// Pass 1 shared by the capped and quota lists: filter + sort over the
@@ -1874,12 +1900,17 @@ fn light_rows(
 
 /// Pass 2: hydrate survivors only, preserving pass-1 order. Chunked well
 /// under SQLITE_MAX_VARIABLE_NUMBER's historical floor of 999.
-fn hydrate_light(conn: &Connection, kept_light: &[LightRow]) -> rusqlite::Result<Vec<IssueRow>> {
+fn hydrate_light(
+    conn: &Connection,
+    kept_light: &[LightRow],
+    with_prose: bool,
+) -> rusqlite::Result<Vec<IssueRow>> {
+    let cols = if with_prose { COLS } else { COLS_SLIM };
     let mut by_id: std::collections::HashMap<String, IssueRow> = std::collections::HashMap::new();
     for chunk in kept_light.chunks(500) {
         let marks = vec!["?"; chunk.len()].join(",");
         let mut stmt = conn.prepare(&format!(
-            "SELECT {COLS} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
+            "SELECT {cols} FROM issues i LEFT JOIN issue_tags t ON t.issue_id = i.id \
              WHERE i.deleted IS NULL AND i.id IN ({marks}) GROUP BY i.id"
         ))?;
         let params: Vec<&dyn rusqlite::types::ToSql> =
@@ -2358,6 +2389,56 @@ pub fn depends_on_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AF-346. The slim hydrate must skip prose AND the full one must keep it.
+    ///
+    /// BOTH HALVES OR NEITHER, which is the card's own specification: a change
+    /// that simply dropped desc+log everywhere passes any test that only checks
+    /// the slim response, and silently breaks `?full=1`. That is the shape this
+    /// file keeps producing — AMUX-3491 stopped hydrating non-survivors and did
+    /// not notice the survivors' prose was unused, AF-161 found the drop
+    /// happening one layer up from where the test looked. Three occurrences.
+    ///
+    /// Measured before the fix: the default (slim) `/api/board` response
+    /// carried 0.0 MB of desc+log across 2,049 cards while the hydrate read
+    /// 8.4 MB of it per call, ~6.3 GB discarded per two hours at 752 calls.
+    #[test]
+    fn slim_hydrate_skips_prose_and_full_hydrate_keeps_it() {
+        let conn = crate::db::migrate::test_memdb();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,session,\"desc\",log,created,updated) \
+             VALUES ('AF-1','t','todo','me','THE-DESC','THE-LOG',1,1)",
+            [],
+        )
+        .unwrap();
+
+        // FULL: prose present, or `?full=1` has silently become `?slim=1`.
+        let (full, _, _) =
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 100, true).unwrap();
+        assert_eq!(full.len(), 1);
+        assert_eq!(full[0].desc, "THE-DESC", "full hydrate must return desc");
+        assert_eq!(full[0].log.as_deref(), Some("THE-LOG"), "and log");
+
+        // SLIM: prose absent, and every OTHER field still present — the point
+        // is to skip two columns, not to return a stub.
+        let (slim, _, _) =
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 100, false).unwrap();
+        assert_eq!(slim.len(), 1);
+        assert_eq!(slim[0].desc, "", "slim hydrate must NOT read desc");
+        assert!(
+            slim[0].log.as_deref().unwrap_or("").is_empty(),
+            "slim hydrate must NOT read log"
+        );
+        assert_eq!(slim[0].id, "AF-1", "identity must survive the slim read");
+        assert_eq!(slim[0].title, "t", "and title, which the response needs");
+        assert_eq!(slim[0].session.as_deref(), Some("me"), "and session");
+
+        // The quota sibling shares the hydrate and must obey the same flag.
+        let q = list_issues_quota(&conn, &[], &[], ArchivedFilter::All, 100, false).unwrap();
+        assert_eq!(q[0].desc, "", "quota path must honour the slim flag too");
+        let qf = list_issues_quota(&conn, &[], &[], ArchivedFilter::All, 100, true).unwrap();
+        assert_eq!(qf[0].desc, "THE-DESC", "and still return prose when asked");
+    }
 
     /// AF-332. The probe must catch what `current_rev()` cannot.
     ///
@@ -3024,7 +3105,9 @@ mod tests {
             let (single, st, sk) =
                 cap_terminal(list_issues(&conn, &status_f, &session_f, archived).unwrap(), limit);
             let (fused, ft, fk) =
-                list_issues_capped(&conn, &status_f, &session_f, archived, limit).unwrap();
+                // `true`: this case compares against the single-pass loader and its
+                // key includes desc+log, so it must ask for prose (AF-346).
+                list_issues_capped(&conn, &status_f, &session_f, archived, limit, true).unwrap();
             let key =
                 |r: &IssueRow| (r.id.clone(), r.desc.clone(), r.tags.clone(), r.log.clone());
             assert_eq!(
@@ -3048,7 +3131,7 @@ mod tests {
             list_issues(&conn, &[], &[], ArchivedFilter::All).unwrap(),
             2,
         );
-        let fused_q = list_issues_quota(&conn, &[], &[], ArchivedFilter::All, 2).unwrap();
+        let fused_q = list_issues_quota(&conn, &[], &[], ArchivedFilter::All, 2, true).unwrap();
         let key = |r: &IssueRow| (r.id.clone(), r.desc.clone(), r.tags.clone(), r.log.clone());
         assert_eq!(
             single_q.iter().map(key).collect::<Vec<_>>(),
@@ -3062,7 +3145,7 @@ mod tests {
         assert!(verified_kept > 2, "verified must ride its own floor, not the done quota");
         // Nor if the deleted row leaked into either path.
         let (all, _, _) =
-            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 0).unwrap();
+            list_issues_capped(&conn, &[], &[], ArchivedFilter::All, 0, true).unwrap();
         assert!(all.iter().all(|r| r.id != "C-39"), "deleted row must stay invisible");
         assert!(!all.is_empty());
     }
