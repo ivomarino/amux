@@ -2891,3 +2891,88 @@ FIX: Either (a) change `amux-worker-start.service` to have `Restart=always` so i
   systemd timer that verifies worker is up on server start. The root cause is that
   system-startup and service-restart are different events (both need the worker up),
   and the current unit only handles the first.
+
+## amux.service's KillMode=mixed cgroup-kills the whole fleet on every ordinary deploy
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-30
+SESSION: amux (this session, catching up on the 2026-08-29 reboot-verification memory)
+CARD: INIT-1
+SYMPTOM: Continuing the prior session's "verify everything comes back after reboot"
+  checklist, `GET /api/sessions` showed ALL 9 registered worker sessions with
+  running:false — not just after the physical reboot, but again after the routine
+  08:31:39 auto-builder restart that followed (commit 251cf15b, an ordinary
+  feature-branch deploy). `tmux list-sessions` had nothing but a freshly-recreated
+  `amux-init`; the real tmux server that held every worker's session had been killed
+  outright. Root cause: `amux.service` has `KillMode=mixed` + `SendSIGKILL=yes`, and
+  the tmux server lives in that unit's cgroup (spawned by ExecStartPre, never leaves
+  it — cgroup membership is sticky across reparenting to PID 1 even though tmux
+  daemonizes). Every restart of amux.service — reboot OR ordinary deploy — SIGKILLs
+  the whole cgroup, tmux server included. `amux-worker-start.service` only fires once
+  at boot (`WantedBy=default.target`), so nothing brought sessions back afterward.
+  This generalizes the narrower 2026-08-29 entry ("worker session does not auto-
+  restart when server restarts", CARD: none, still open) — that one suspected a
+  single worker and a single restart path; this is the whole fleet, and it fires on
+  every commit-triggered deploy, which happens many times a day on an active branch.
+COST: The entire fleet (9 lanes) silently down for ~1h25m (08:31 restart to 09:56
+  discovery+fix) with no alert anywhere — `/health` reported "ok" the whole time,
+  because the server process itself was fine; only the sessions it was supposed to
+  be managing were gone. Inbound Telegram messages during that window had nowhere to
+  land. A separate near-miss found along the way: `amux start <name>` (no --detach)
+  silently returns exit 1 with ZERO output when it can't attach to a non-existent
+  TTY, even though the start itself succeeded — first read as "start is broken",
+  cost a few minutes of confusion before `--detach` runs revealed it was already
+  running.
+FIX: `~/.config/systemd/user/amux.service`: `KillMode=mixed` -> `KillMode=process`
+  (config-only; `daemon-reload` applied without disrupting the running process —
+  confirmed same PID/start-time before and after the reload). `process` mode signals
+  only the unit's main PID, leaving the tmux server (and its sessions) alone —
+  matching what ExecStartPre's own idempotent `has-session || new-session` check
+  already assumed. VERIFIED live: `systemctl --user restart amux.service` (09:59
+  UTC) — PID changed, uptime_s reset, and all 8 real worker sessions (excluding the
+  separately-broken `synthesia`, wrong macOS path) kept their original tmux
+  `created` timestamps and came back running:true with no manual restart needed.
+  NOT YET DONE (the log-signal half, tracked on INIT-1): an `invariants/checks.rs`
+  check for "session expected running (standing_orders / no recorded stop event)
+  but `tmux has-session` says no" — today nothing in `runtime_jobs` would have
+  caught this without a human reading the dashboard; `backend::bootstrap::Bootstrap`
+  only reacts to explicit Starting/ended DB transitions, and an out-of-band cgroup
+  SIGKILL produces neither.
+
+## `amux start`/`start-all` silently die under `set -e` on a tmux target-syntax bug
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-30
+SESSION: amux (recovering from the KillMode incident above)
+CARD: INIT-2
+SYMPTOM: While recovering the fleet from the KillMode=mixed incident (previous entry),
+  `amux start-all` created exactly ONE tmux session then exited 1 with NO output at
+  all. `amux start <name>` on any not-yet-running session behaved the same: silent
+  exit 1, session left running-but-unlocked in tmux, nothing printed. Root cause:
+  `cmd_start`'s window-name lock, `tmux set-option -t "=$tname" allow-rename off
+  2>/dev/null`, targets a WINDOW-scoped option with a bare session-exact-match
+  target — tmux looks for a window literally named "=amux-<name>", finds none,
+  exits 1 — and `set -euo pipefail` (line 19) kills the function right there, with
+  the only evidence routed to `2>/dev/null` on that exact line. A second, separate
+  bug compounded it: `cmd_start_all` called `cmd_start "$name"` with no `--detach`,
+  so even after fixing the first bug, the first session started still hit
+  `cmd_start`'s own terminal-attach step, correctly failed "open terminal failed:
+  not a terminal" in this non-interactive context, and `set -e` aborted the rest of
+  the loop — every session after the first silently stayed down.
+COST: `amux start-all` — the obvious, documented recovery command for "the whole
+  fleet is down" (INIT-1) — was silently non-functional for that exact use case.
+  Cost ~15 minutes of manual per-session `amux start <name> --detach` calls to
+  actually recover the fleet before this was root-caused, and would cost the same
+  to the next session (or the next reboot) that reaches for `start-all` expecting
+  it to work.
+FIX: `/home/syseng/src/amux/amux` (ships on save, already live): `-t "=$tname"` ->
+  `-t "=$tname:"` on both the `set-option`/`set-window-option` lines (explicit
+  window target); `cmd_start_all`'s `cmd_start "$name"` -> `cmd_start "$name"
+  --detach`. Verified live: a fresh non-TTY `amux start <name>` now starts the
+  session and prints the honest attach-failure message instead of silent exit 1;
+  `amux start-all` against 8 fully-stopped sessions now starts all 8 in one pass
+  (the 9th, `synthesia`, fails for a pre-existing unrelated reason — a macOS path
+  baked into its config on this Linux box — and now says so clearly instead of the
+  whole batch dying silently after the first session).
