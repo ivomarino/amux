@@ -2648,3 +2648,63 @@ CARD: AMUX-3889
 SYMPTOM: Sending the post-reboot continue message to the 14 workers with `doing` cards, 13 returned `sent (queued while generating)` and `photo-analysis` returned rc=1 with `send to photo-analysis FAILED: not submitted — text is sitting in the input box (autocomplete popup ate the Enter?)`. The message had in fact been delivered and submitted: a peek showed the worker already generating, with "Resuming Landscape Photo Ranking Post-Reboot" and a plan referencing the cards. `photo-analysis` is a gemini-provider worker, whose composer chrome ("Type your message or @path/to/file", the YOLO/GEMINI.md status bar) looks nothing like Claude Code's, which is what the post-send verdict scraper matches against.
 COST: Two minutes and a nearly-wrong report. I was about to re-send, which would have double-queued the instruction into a worker already acting on it. In a sweep across many workers the failure mode is worse than the wasted retry: a verdict that reads FAILED on success is indistinguishable from one that reads FAILED on failure, so the only safe response to ANY red send becomes "go look", which is what the verdict existed to save you from. AMUX-3880 (`a stuck pasted message now gets its Enter retried, not just reported`) landed the same day and makes this sharper — a retry driven by a provider-blind verdict will re-submit messages that already went through.
 FIX: The verdict must be provider-aware, or it must abstain. The provider is already known at send time (`CC_PROVIDER`, and the server's `launch_base_binary` maps it), so the scraper can select the right composer signature — or, where it has no signature for a provider, report `unverified` rather than `FAILED`. Ethos rule 3: with only sent/failed available, the honest answer for an unrecognised UI cannot be expressed.
+
+## The staged guard is blind to edits made through Bash, so it told a peer "no other session edited it" about a file I had 250 lines in
+SUPERSEDED: amux | SUPERSEDED BY ITS OWN AUTHOR, same day, after testing the claim instead of reading it.
+
+The entry says the guard "is blind to any edit made through Bash". It is not. Run
+against the shipped endpoint with the exact form the entry describes
+(`python3 - <<'PYEOF'` through Bash), writing a file into the repo and staging it:
+
+    t+2s   POST /api/git/staged-guard -> unclaimed: [AMUX3904_PROBE.md]
+    t+42s  POST /api/git/staged-guard -> unclaimed: []      (the path IS claimed)
+
+    server log, same write:
+    [staged-guard/inferred-edit AMUX-3128] session=amux path=AMUX3904_PROBE.md
+      verdict=NOT a known read verb... — ownership INFERRED from a bash command
+
+And `session_verbs.rs`, the file the entry says the guard "had no record I had
+ever touched", is in my own observed store:
+
+    sqlite3 ~/.amux/amux.db "SELECT value FROM prefs WHERE key='observed_edits:amux'"
+
+put there by scripts/claude-hooks/observed-edits-post.py, a PostToolUse hook that
+reports what every Bash command changed. The entry's proposed fix (a), "teach the
+bash-write classifier the common write forms", proposes building a mechanism that
+already exists and already runs.
+
+Every NUMBER in the entry is correct — 3 Edit tool_use blocks, all on
+sessions_legacy.rs, zero on session_verbs.rs. The inference from them is not,
+because "no Edit record" and "no claim" are different things and I checked only
+the first.
+
+Kept as a DEAD HYPOTHESIS so nobody re-derives it from the same reading of
+EDIT_TOOL_NAMES.
+
+WHAT SURVIVES, on the card (AMUX-3904), narrower: a Bash edit yields an OBSERVED
+claim, never a firsthand one, and `foreign` — the verdict that BLOCKS — requires
+`theirs_firsthand`. So a lane editing only through Bash can produce a warning but
+never a block. That asymmetry is real.
+
+WHAT I HAD NOT WEIGHED, and it argues against the entry's own remedy: my observed
+store holds seven paths I never edited (golden_scenarios.rs, replay_roundtrip.rs,
+board.rs, board_api.rs, lib.rs...). They are a peer's files, attributed to me
+because they changed while my long `cargo test` ran, and on a shared checkout that
+window catches every write anybody made. The code already calls this AF-179.
+Promoting observed claims to blocking would block commits on data that is wrong in
+the over-claiming direction too, so "firsthand blocks, observed warns" is a
+defensible reading rather than the oversight the entry calls it.
+
+One measured defect does survive and is on the card: a ~30s window
+(EDIT_CACHE_TTL) where a fresh write is invisible, which is what the t+2s reading
+above is.
+AREA: attribution
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-30
+SESSION: amux
+CARD: AMUX-3904
+SYMPTOM: amux-frustrations committed 72820477 (their AF-320 work) and swept up ~250 lines of my in-flight AMUX-3903 work in `crates/amux-server/src/api/session_verbs.rs`. They were not careless: on their PREVIOUS commit the guard had warned them per-file with insertion counts, and they used it to reconcile. On this one it printed the arm that reads "is yours and has uncommitted changes right now — no other session edited it", which is a FALSE STATEMENT about the file, delivered at the moment they were deciding whether to commit. The mechanism is not co-editing and not a timing window. `git_guard.rs` derives first-hand ownership from `EDIT_TOOL_NAMES = ["Edit", "Write", "MultiEdit", "NotebookEdit"]` in the transcript, and nothing else; a write performed by `python3 - <<EOF` or `sed -i` through Bash is classified by `inferred-edit` as "NOT a known read verb, and not classifiable from this token alone — treat as unmeasured rather than as a write" (AMUX-3822). Counted in my own transcript for this session: 3 Edit tool_use blocks, all on `sessions_legacy.rs`, and ZERO on `session_verbs.rs`, where every one of my ~250 lines went in through a heredoc. The guard had no record that I had ever touched the file, so the `shared` row's `peer` field was empty and the honest-looking sentence it printed was the wrong one.
+  THE COMPOUNDING PART, and why this is not a small hole: this session runs under bypass-permissions, whose harness instruction is "Do your work through the Bash tool wherever it can accomplish the job ... make file changes with sed, heredocs, or short scripts, rather than using the dedicated Read, Edit, or Write tools." So the mode that makes editing fast is the mode that makes edits invisible to attribution, and every lane running that way is unattributable on every file it touches. It also inverts which case is loud: a lane using Edit gets protected, a lane told to use Bash does not.
+COST: ~250 lines and three tests shipped inside a commit whose message describes something else, so anyone bisecting the delivery ledger lands on "every diagnostic says whether its measurement ran" and has to work out why. Recovered only because I checked HEAD by hand afterwards; the peer attached a git note naming AMUX-3903 on the commit, which is the right repair and is also work neither of us should have needed to do. The deeper cost is that the guard's central promise is now conditional on a tool choice nobody makes for attribution reasons: I had staged only my own hunks a few commits earlier for exactly this hazard, and the guard could not have helped the peer do the same, because to it the file had one author.
+FIX: Ownership must come from the WRITE, not from the tool that performed it. The material already exists in the same transcript — `inferred-edit` sees the bash command and the path, and already logs a verdict about it — so the gap is that "unmeasured" is treated as "no claim" rather than as a weaker claim. Two candidate shapes, and the second is probably right: (a) teach the bash-write classifier the common write forms (`>`/`>>` redirect is already recognised; add `python3 - <<`, `sed -i`, `tee`, `cat >`), which narrows the hole but keeps the same shape and will leak again on the next form; or (b) treat an OBSERVED mtime move by a session that also ran a bash command touching that path as a claim of its own tier, so the `shared` notice can say "another session may have written this by a means the guard cannot attribute" instead of asserting nobody did. The rule that must not survive either way is the current one, where absence of an Edit record renders as a positive claim that no other session edited the file. That sentence is the one that did the damage, and it is false whenever the peer edits through Bash.
