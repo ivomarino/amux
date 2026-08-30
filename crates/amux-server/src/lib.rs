@@ -168,9 +168,14 @@ async fn async_main() {
     let cfg = config::ServerConfig::from_process_env();
 
     // Initialize secrets store (Phase 3: wire encrypted secrets into startup).
-    // Secrets file lives at checkout root (parent of AMUX_HOME), encrypted with age.
-    let checkout_root = cfg.amux_home.parent().unwrap_or(cfg.amux_home.as_path());
-    let secrets_file = checkout_root.join("secrets/amux-secrets.yaml");
+    // `amux_home` resolves to `~/.amux`, so its PARENT is the user's HOME
+    // directory — not the checkout root, despite this variable's name. That
+    // is deliberate: the repo is public, and a checkout-root path would put
+    // an encrypted secrets file inside the tree an accidental `git add -A`
+    // could catch. Keeping it in `~/secrets/` instead keeps it out of any
+    // repo entirely, checkout-root or not.
+    let secrets_dir = cfg.amux_home.parent().unwrap_or(cfg.amux_home.as_path());
+    let secrets_file = secrets_dir.join("secrets/amux-secrets.yaml");
     // Age key path from AMUX_AGE_KEY_PATH env var, or default to ~/.config/sops/age/keys.txt
     let age_key_path = std::env::var("AMUX_AGE_KEY_PATH")
         .ok()
@@ -668,7 +673,7 @@ async fn async_main() {
     // AEAB-52: self-adoption is right in PRODUCTION and wrong in a TEST HARNESS.
     //
     // `e2e/serve-head.sh` exists to pin a SPECIFIC build, and playwright.config.ts
-    // starts three servers from it (desktop 18824, mobile 18833, ios 18843). Each
+    // starts three servers from it (desktop 18823, mobile 18833, ios 18843). Each
     // one builds, and every build rewrites the shared binary — so each server
     // already running sees its own mtime move and exec's, refusing connections
     // for ~1s. Whichever specs are mid-`page.goto` at that instant fail with
@@ -678,7 +683,7 @@ async fn async_main() {
     //
     // The signature is why this is structural rather than random. Execs per port
     // in run 32645871348, against server start order:
-    //     18824 desktop, started 1st -> 2 execs
+    //     18823 desktop, started 1st -> 2 execs
     //     18833 mobile,  started 2nd -> 1 exec
     //     18843 ios,     started 3rd -> 0 execs
     // Each server exec's once per server that starts AFTER it; the last never
