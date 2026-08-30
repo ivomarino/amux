@@ -113,6 +113,7 @@ pub mod ids {
     pub const HEARTBEAT: &str = "heartbeat";
     pub const TAILNET_WATCH: &str = "tailnet-watch";
     pub const QUEUE_DISPOSITION: &str = "queue-disposition";
+    pub const MAC_HEALTH: &str = "mac-health";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -144,6 +145,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::HEARTBEAT,
     ids::TAILNET_WATCH,
     ids::QUEUE_DISPOSITION,
+    ids::MAC_HEALTH,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -460,6 +462,30 @@ pub const CATALOG: &[Doc] = &[
         name: "Tailnet watch",
         purpose: "Samples `tailscale status` for node-key expiry and reachability, and caches the verdict for /health — so the tailnet going away is visible before the day it takes remote access with it.",
         env: NO_ENV,
+        pref: None,
+        detail: None,
+    },
+    Doc {
+        id: ids::MAC_HEALTH,
+        name: "Mac process health",
+        purpose: "Reaps orphaned Ray workers (ray:: processes with no live raylet), and warns when the claude process count exceeds the ceiling. Runs every 30 minutes.",
+        env: &[
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_TICK_S",
+                effect: "sweep interval in seconds (default 1800 = 30 min)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_MAX_CLAUDE",
+                effect: "claude process count that triggers a WARN (default 60)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_RAY_GRACE_S",
+                effect: "minimum age (seconds) before an orphaned ray:: worker is killed (default 120)",
+                off: None,
+            },
+        ],
         pref: None,
         detail: None,
     },
