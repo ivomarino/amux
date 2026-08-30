@@ -189,6 +189,19 @@ jobs:
           set -uo pipefail
           ./scripts/test-board-add-flags.sh
           ./scripts/test-amux-url.sh
+      # AMUX-3891. The CLI is symlinked straight into the working tree and ~50
+      # lanes invoke it while it is being edited, so it MUST be parseable in one
+      # read: bash holds a byte offset, and a rewrite mid-invocation resumes it
+      # in the middle of different bytes. The observed cost was a `board retitle`
+      # whose write SUCCEEDED and which then exited 2 with a syntax error, which
+      # a caller checking exit codes retries — and retitle is not idempotent for
+      # a reader. This asserts the `{ ... }` wrapper and the trailing `exit`+`}`
+      # are still the file's shape. A race test cannot hold this line: a green
+      # race run is equally consistent with "the shape is gone and we got lucky".
+      - name: CLI is offset-safe under in-place rewrite (AMUX-3891)
+        run: |
+          set -uo pipefail
+          ./scripts/test-cli-offset-safe.sh
       # AEAB-22. Lives here, not in rust.yml, for the same reason as the other
       # CLI/asset gates: rust.yml is path-filtered to `crates/**` + `Cargo.*` +
       # `e2e/**`, and while app.js IS under crates/, this test also guards

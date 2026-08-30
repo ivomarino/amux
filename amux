@@ -18,6 +18,53 @@
 
 set -euo pipefail
 
+# ── READ THE WHOLE SCRIPT BEFORE RUNNING ANY OF IT (AMUX-3891) ──────────────
+#
+# Everything below lives inside one `{ ... }` compound command, and the script
+# ends with `exit` INSIDE it. That is not style. bash does not slurp a script:
+# it reads and executes incrementally, holding an open fd and a BYTE OFFSET.
+# Rewrite the file in place under a running interpreter and bash resumes at an
+# offset that now points into different bytes.
+#
+# This file is the one place in the fleet where that is a routine event rather
+# than a freak one. `~/.local/bin/amux` is a symlink straight into the working
+# tree (see the header above — that liveness is deliberate and worth keeping),
+# ~50 lanes invoke it constantly, and the file is edited constantly. Every
+# editor write, `git checkout`, `git stash` and branch switch rewrites it in
+# place while somebody is mid-invocation.
+#
+# Observed 2026-08-29 20:28 by mixpeek-homepage-claude: a `board retitle` whose
+# write SUCCEEDED (card read back, 3095 chars, title intact) then died with
+#
+#   /Users/ethan/.local/bin/amux: line 3784: syntax error near unexpected token `;'
+#   exit=2
+#
+# Line 3784 is the `version|--version|-v)` arm of the dispatch, and `bash -n`
+# on the same path passed immediately after. The file was fine; the PARSE was
+# not. The worktree file's mtime was inside the second that invocation ran.
+#
+# The spurious exit 2 is the BENIGN outcome, and that is the reason this is
+# worth a wrapper rather than a shrug. A caller that checks exit codes reads 2
+# as a failed write and retries — and `board retitle` / `status-update` are not
+# idempotent for a reader, so a double write is how a desc gets clobbered by a
+# stale copy. Worse, a shifted offset can land MID-FUNCTION and execute a
+# fragment of a command. That failure is unbounded and will not look like an
+# update problem when it happens.
+#
+# Atomic temp+rename in the UPDATER is the standard fix and does not apply here:
+# there is no installer to fix. The writers are each lane's editor and git
+# itself, which is exactly what CLAUDE.md means by "live on save, and so also
+# live on `git checkout`, `stash`, or a branch switch". So the reader is
+# hardened instead. Wrapped this way bash must parse to the closing brace before
+# executing anything, and the trailing `exit` means it never seeks back to the
+# file afterwards — a rewrite mid-run cannot be observed by a process that has
+# already read everything it will ever read.
+#
+# KEEP THE CLOSING BRACE AND `exit` AS THE LAST TWO STATEMENTS. Appending a new
+# top-level command after them re-opens exactly this hole for whatever you
+# append. `scripts/test-cli-offset-safe.sh` fails if the shape is broken.
+{
+
 CC_VERSION="0.3.0"
 
 # ── Migration from cc/cmux → amux ───────────────────────────────────────────
@@ -3726,3 +3773,6 @@ if [[ "${BASH_SOURCE[0]:-$0}" == "${0}" ]]; then
       ;;
   esac
 fi
+
+exit "$?"
+}
