@@ -411,6 +411,16 @@ fn load_meta(name: &str) -> Map<String, Value> {
         .unwrap_or_default()
 }
 
+/// Epoch seconds since this lane's composer has held unsubmitted text, or 0.
+///
+/// Stamped by `rate_limit_sweep`, and read here by `autofix`'s stuck-composer
+/// detector, which needs the AGE: `ghost_rescue` can say a lane holds a
+/// collapsed paste right now but not for how long, and "held for six days" is
+/// the whole difference between noise and a card (AMUX-3885).
+pub(crate) fn composer_stuck_since(name: &str) -> i64 {
+    meta_i64(&load_meta(name), "composer_stuck_since")
+}
+
 fn save_meta(name: &str, meta: &Map<String, Value>) {
     let _ = std::fs::create_dir_all(sessions_dir());
     let _ = std::fs::write(meta_path(name), Value::Object(meta.clone()).to_string());

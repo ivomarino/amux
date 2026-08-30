@@ -481,6 +481,19 @@ pub enum DetectorKind {
     /// nobody watches, which is why token rot gets a card instead of waiting
     /// for the Nth lane to rediscover it (AMUX-3353).
     ConnectorAuth,
+    /// A lane's composer has held an UNSUBMITTED COLLAPSED PASTE past the
+    /// threshold. `ghost_rescue` rescues any composer it can prove is amux's
+    /// (every message carries a `[H:MM AM]` prefix) but a collapsed paste hides
+    /// its own content behind `[Pasted text #N +M lines]`, so ownership is
+    /// unprovable and the sweep correctly refuses to submit on a guess.
+    ///
+    /// That refusal was the end of the line: `report.chips` was counted, one WARN
+    /// fired, a badge appeared, and NOTHING filed. The escalation the sweep's own
+    /// comment asks for — "make it loud and let a person or the sender decide" —
+    /// went as far as a log. Ethan's 2026-08-29 screenshot is what that looks
+    /// like after a while: eight lanes carrying UNSUBMITTED TEXT at 1d, 1d, 1d,
+    /// 2d, 3d, 5d and 6d. Six days is a notice reaching nobody (AMUX-3885).
+    StuckComposer,
 }
 
 impl DetectorKind {
@@ -496,6 +509,7 @@ impl DetectorKind {
             DetectorKind::CiFailure => "ci",
             DetectorKind::FdPressure => "fd",
             DetectorKind::ConnectorAuth => "connector-auth",
+            DetectorKind::StuckComposer => "stuck-composer",
         }
     }
 
@@ -512,12 +526,13 @@ impl DetectorKind {
             | DetectorKind::DiskPressure
             | DetectorKind::CiFailure
             | DetectorKind::FdPressure
-            | DetectorKind::ConnectorAuth => "blocker",
+            | DetectorKind::ConnectorAuth
+            | DetectorKind::StuckComposer => "blocker",
             _ => "investigation",
         }
     }
 
-    pub fn all() -> [DetectorKind; 10] {
+    pub fn all() -> [DetectorKind; 11] {
         [
             DetectorKind::Http5xx,
             DetectorKind::Latency,
@@ -529,6 +544,7 @@ impl DetectorKind {
             DetectorKind::CiFailure,
             DetectorKind::FdPressure,
             DetectorKind::ConnectorAuth,
+            DetectorKind::StuckComposer,
         ]
     }
 }
@@ -3602,6 +3618,166 @@ fn fd_trigger(
     None
 }
 
+/// How long a collapsed paste may sit before it earns a card. Minutes.
+///
+/// Not zero, and not a day. `ghost_rescue` sweeps every 15s and rescues anything
+/// it can prove is amux's, so a chip that is still there an hour later is one the
+/// sweep has already declined ~240 times on purpose. A day would reproduce the
+/// bug: the specimens that motivated this sat for 1 to 6 DAYS behind a badge.
+fn stuck_composer_card_after_s() -> f64 {
+    env_f64("AMUX_STUCK_COMPOSER_CARD_MIN", 60.0).clamp(1.0, 60.0 * 24.0) * 60.0
+}
+
+/// A composer holding an UNSUBMITTED COLLAPSED PASTE past the threshold.
+///
+/// The narrow, real gap left by `ghost_rescue` (AMUX-3885). That sweep rescues
+/// any pending text it can PROVE is amux's — every message amux sends carries a
+/// client-side `[H:MM AM]` prefix — takes the send lock, re-checks the frame, and
+/// submits. What it cannot claim is a collapsed paste: Claude Code renders a large
+/// paste as `[Pasted text #N +M lines]` and keeps the content off screen, so the
+/// prefix is unreadable and ownership is unprovable. It refuses, correctly, and
+/// says so: submitting on a guess could send a human's half-typed text, and
+/// choosing for them is ethos rule 8.
+///
+/// THIS DETECTOR DOES NOT OVERTURN THAT REFUSAL. It files a card so a person
+/// decides, which is exactly what the sweep's own comment asks for ("make it loud
+/// and let a person or the sender decide"). Before this, "loud" ended at one WARN
+/// and a dashboard badge, and nothing filed — `autofix` had no composer path at
+/// all. That is how eight lanes came to be holding unsubmitted text at 1d, 1d, 1d,
+/// 2d, 3d, 5d, 5d and 6d when Ethan screenshotted the dashboard on 2026-08-29. Six
+/// days is not an alert that was insufficiently urgent; it is one that reached
+/// nobody.
+///
+/// The AGE comes from `composer_stuck_since` rather than from the sweep, because
+/// the sweep is stateless across passes: it can say a lane holds a chip NOW and
+/// not for how long, and the duration is the entire difference between a card and
+/// noise.
+pub fn detect_stuck_composer(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
+    // ABSENCE IS NOT EVIDENCE (ethos rule 4). No completed sweep means "we have
+    // not looked", which must not read as "no lane is stuck" — the same shape as
+    // a zero `composer_stuck_since` right after a reboot, which means the tmux
+    // sessions were recreated rather than that the composers are clear.
+    let Some(report) = crate::runtime_jobs::ghost_rescue::last_report() else {
+        return (
+            vec![],
+            vec![sup(
+                DetectorKind::StuckComposer,
+                "stuck-composer|no-sweep",
+                "ghost-rescue has not published a sweep yet — nothing has looked at any composer, \
+                 so filing nothing here is 'unmeasured', not 'none stuck'",
+            )],
+        );
+    };
+    let aged: Vec<(String, i64)> = report
+        .chips
+        .iter()
+        .map(|l| (l.clone(), crate::api::session_verbs::composer_stuck_since(l)))
+        .collect();
+    stuck_composer_findings(&aged, now)
+}
+
+/// The decision, separated from the two live sources it reads (ghost-rescue's
+/// published sweep and each lane's `composer_stuck_since` stamp).
+///
+/// Split out so the SHIPPED path can be driven by a test. Judging the threshold,
+/// the unstamped-lane disagreement and the owner needs planted `(lane, since)`
+/// pairs, and with those readings buried inside the caller the only testable
+/// surface was arithmetic — which is to say the interesting decisions were the
+/// untested ones (ethos rule 7).
+fn stuck_composer_findings(lanes: &[(String, i64)], now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
+    let mut out = Vec::new();
+    let mut suppressed = Vec::new();
+    let after = stuck_composer_card_after_s();
+    for (lane, since) in lanes {
+        let (lane, since) = (lane.as_str(), *since);
+        if since <= 0 {
+            // The two instruments disagree: the sweep sees a chip on screen and
+            // rate_limit_sweep never stamped it. Report rather than guess an age.
+            suppressed.push(sup(
+                DetectorKind::StuckComposer,
+                &format!("stuck-composer|{lane}|unstamped"),
+                "ghost-rescue reports a collapsed paste in this lane but composer_stuck_since \
+                 is 0, so it cannot be aged — rate_limit_sweep stamps that field and the two \
+                 instruments disagree about the same lane",
+            ));
+            continue;
+        }
+        let held_s = now - since as f64;
+        if held_s < after {
+            continue;
+        }
+        let held_h = held_s / 3600.0;
+        out.push(Finding {
+            kind: DetectorKind::StuckComposer,
+            // Per LANE, not per text: the chip string carries a paste NUMBER that
+            // changes between Claude Code restarts, so keying on it would file a
+            // fresh card for the same stuck message.
+            signature: format!("stuck-composer|{lane}"),
+            title: format!(
+                "{lane}: an unsubmitted pasted message has sat in the composer for {held_h:.0}h"
+            ),
+            evidence: vec![
+                (
+                    "verdict".into(),
+                    format!(
+                        "This lane's composer has held an UNSUBMITTED collapsed paste for \
+                         {held_h:.1}h. amux delivered a message and it was never submitted, so \
+                         whoever sent it believes it landed. ghost-rescue examined this lane and \
+                         declined it on purpose: Claude Code renders a large paste as `[Pasted \
+                         text #N +M lines]` and hides the content, so the `[H:MM AM]` prefix that \
+                         would prove the text is amux's cannot be read, and submitting on a guess \
+                         could send someone's half-typed message."
+                    ),
+                ),
+                ("lane".into(), lane.to_string()),
+                ("held_hours".into(), format!("{held_h:.1}")),
+                (
+                    "threshold_min".into(),
+                    format!("{:.0} (AMUX_STUCK_COMPOSER_CARD_MIN)", after / 60.0),
+                ),
+                (
+                    "what_to_do".into(),
+                    "Look at the lane and decide, which is the call this card exists to put in \
+                     front of a person. If the text is amux's, submit it (`amux attach <lane>`, \
+                     then Enter) or clear it. If it is yours, finish or clear it. Clearing is \
+                     also available from the peek overflow menu."
+                        .to_string(),
+                ),
+                (
+                    "why_amux_will_not_do_it_for_you".into(),
+                    "Whether amux may press Enter on content it cannot read is an open decision \
+                     on AMUX-3885, not an oversight. It is doable — amux knows what it delivered \
+                     (cmd_history holds the text and the delivery verdict), so an unconfirmed \
+                     recent delivery plus an idle lane holding a chip is strong provenance \
+                     without reading the chip — but the failure mode is sending a human's \
+                     unfinished text in any of ~57 lanes."
+                        .to_string(),
+                ),
+            ],
+            recheck: "curl -sk \"$AMUX_URL/api/sessions\" | python3 -c \"import json,sys,time; \
+                 d=json.load(sys.stdin); [print(x['name'], round((time.time()-x['composer_stuck_since'])/3600,1), \
+                 'h', repr(x.get('composer_preview'))) for x in d if x.get('composer_stuck_since')]\"; \
+                 curl -sk \"$AMUX_URL/api/debug/jobs\" | grep -i ghost"
+                .to_string(),
+            // NOT the stuck lane, and that is load-bearing rather than
+            // stylistic. `board_drive` nudges the owner of a queued card, a
+            // nudge is a send, and `send_text_inner` answers a CollapsedPaste
+            // frame with Escape+Enter (AMUX-3880) — so owning this card with
+            // the stuck lane would make the escalation SUBMIT the very content
+            // ghost-rescue refused to submit, by side effect. Whether amux may
+            // press Enter on content it cannot read is the open half of
+            // AMUX-3885 and Ethan's call; arriving there through a nudge is
+            // taking it without asking. `None` routes to AMUX_AUTOFIX_SESSION,
+            // which is a lane that can look at the pane and escalate to a human.
+            owner: None,
+            count: 1,
+            last_ts: now,
+            parked_until: None,
+        });
+    }
+    (out, suppressed)
+}
+
 pub fn detect_fd(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
@@ -4653,6 +4829,7 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::ConnectorAuth => {
                     (std::mem::take(&mut connector_f), std::mem::take(&mut connector_s))
                 }
+                DetectorKind::StuckComposer => detect_stuck_composer(now),
             };
             findings.extend(f);
             suppressed.extend(s);
@@ -5675,6 +5852,148 @@ fn parse_ts(s: &str) -> Option<f64> {
 
 #[cfg(test)]
 mod tests {
+
+    // ── AMUX-3885: the stuck-composer detector ──────────────────────────────
+    //
+    // These drive `detect_stuck_composer` through its real decision points. The
+    // detector reads two live sources (ghost_rescue's published report and each
+    // lane's `composer_stuck_since` stamp), so what CAN be pinned here without a
+    // fleet is the threshold arithmetic and the unmeasured-vs-none distinction —
+    // which is exactly where the bug would be. A detector that files at 0h is
+    // noise; one that never files is the six-day badge this replaced.
+
+    /// ABSENCE IS NOT EVIDENCE. With no published sweep the detector must file
+    /// nothing AND say why, rather than returning a clean empty result that reads
+    /// as "no lane is stuck". A wrong implementation returns `(vec![], vec![])`
+    /// here and looks identical to a healthy fleet.
+    #[test]
+    fn no_published_sweep_is_reported_as_unmeasured_not_as_none_stuck() {
+        // ghost_rescue has published nothing in a bare test process.
+        let (findings, suppressed) = super::detect_stuck_composer(1_788_000_000.0);
+        assert!(findings.is_empty(), "must not file a card from an unmeasured state");
+        assert!(
+            suppressed.iter().any(|s| s.signature == "stuck-composer|no-sweep"),
+            "the unmeasured state must be DISCLOSED, not returned as an empty success: {suppressed:?}"
+        );
+    }
+
+    /// The threshold must be a real gate in both directions and must be the
+    /// documented default. A detector whose threshold is 0 files on every sweep;
+    /// one whose threshold is a day reproduces the bug it was written for.
+    #[test]
+    fn the_card_threshold_is_an_hour_and_is_clamped_to_something_sane() {
+        std::env::remove_var("AMUX_STUCK_COMPOSER_CARD_MIN");
+        assert_eq!(
+            super::stuck_composer_card_after_s(),
+            3600.0,
+            "default must be 60 minutes — long enough that ghost-rescue has already \
+             declined the chip ~240 times, short enough that nothing sits for days"
+        );
+        // Clamped at both ends: 0 would file instantly, a week would re-create the
+        // silence. Both bounds are load-bearing, so both are asserted.
+        std::env::set_var("AMUX_STUCK_COMPOSER_CARD_MIN", "0");
+        assert_eq!(super::stuck_composer_card_after_s(), 60.0, "must clamp up to 1 min");
+        std::env::set_var("AMUX_STUCK_COMPOSER_CARD_MIN", "99999");
+        assert_eq!(
+            super::stuck_composer_card_after_s(),
+            24.0 * 3600.0,
+            "must clamp down to 24h"
+        );
+        std::env::remove_var("AMUX_STUCK_COMPOSER_CARD_MIN");
+    }
+
+    /// The threshold is a REAL GATE in both directions, driven through the
+    /// shipped decision rather than through the arithmetic beside it. A lane
+    /// stuck for minutes must not file; one stuck for hours must.
+    #[test]
+    fn the_threshold_decides_which_stuck_lanes_earn_a_card() {
+        std::env::remove_var("AMUX_STUCK_COMPOSER_CARD_MIN");
+        let now = 1_788_000_000.0;
+        let lanes = vec![
+            ("just-stuck".to_string(), (now - 5.0 * 60.0) as i64),
+            ("stuck-for-hours".to_string(), (now - 6.0 * 3600.0) as i64),
+        ];
+        let (findings, _) = super::stuck_composer_findings(&lanes, now);
+        let names: Vec<&str> = findings.iter().map(|f| f.signature.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["stuck-composer|stuck-for-hours"],
+            "5 minutes is inside ghost-rescue's own retry territory; 6 hours is the bug"
+        );
+        let f = &findings[0];
+        assert!(f.title.contains("6h"), "the age is the whole argument for the card: {}", f.title);
+        assert!(
+            f.evidence.iter().any(|(k, v)| k == "lane" && v == "stuck-for-hours"),
+            "the card has to NAME the lane: {:?}",
+            f.evidence
+        );
+    }
+
+    /// THE CARD MUST NOT BE OWNED BY THE STUCK LANE. `board_drive` nudges a
+    /// queued card's owner, a nudge is a send, and a send into a collapsed paste
+    /// answers with Escape+Enter (AMUX-3880) — so owning it with the stuck lane
+    /// makes the escalation submit the unreadable content by side effect, which
+    /// is the half of AMUX-3885 that is Ethan's call, taken without asking.
+    #[test]
+    fn the_card_is_not_routed_back_into_the_lane_it_would_press_enter_in() {
+        std::env::remove_var("AMUX_STUCK_COMPOSER_CARD_MIN");
+        let now = 1_788_000_000.0;
+        let lanes = vec![("wedged-lane".to_string(), (now - 4.0 * 3600.0) as i64)];
+        let (findings, _) = super::stuck_composer_findings(&lanes, now);
+        assert_eq!(findings.len(), 1);
+        assert_ne!(
+            findings[0].owner.as_deref(),
+            Some("wedged-lane"),
+            "a nudge to this lane would submit the paste nobody has read"
+        );
+        assert_eq!(findings[0].owner, None, "None routes to AMUX_AUTOFIX_SESSION");
+    }
+
+    /// TWO INSTRUMENTS DISAGREEING IS NOT AN AGE OF ZERO. ghost-rescue sees the
+    /// chip on screen; `composer_stuck_since` is stamped elsewhere and can be 0
+    /// (a reboot recreates every tmux session and zeroes it fleet-wide). Filing
+    /// on a guessed age would put "stuck for 55 years" on the board; filing
+    /// nothing silently would hide the disagreement. It is disclosed instead.
+    #[test]
+    fn a_chip_with_no_age_stamp_is_disclosed_rather_than_aged_or_dropped() {
+        let now = 1_788_000_000.0;
+        let lanes = vec![("unstamped-lane".to_string(), 0)];
+        let (findings, suppressed) = super::stuck_composer_findings(&lanes, now);
+        assert!(findings.is_empty(), "an unmeasurable age cannot become a card: {findings:?}");
+        assert!(
+            suppressed.iter().any(|s| s.signature == "stuck-composer|unstamped-lane|unstamped"),
+            "the disagreement must be visible: {suppressed:?}"
+        );
+    }
+
+    /// The signature is per LANE, so a lane stuck across two ticks refreshes one
+    /// card. Keying on the chip text would file a new card every time Claude
+    /// Code restarts, because the paste NUMBER changes.
+    #[test]
+    fn the_same_stuck_lane_produces_one_stable_signature() {
+        std::env::remove_var("AMUX_STUCK_COMPOSER_CARD_MIN");
+        let now = 1_788_000_000.0;
+        let a = super::stuck_composer_findings(&[("l".to_string(), (now - 7200.0) as i64)], now).0;
+        let b =
+            super::stuck_composer_findings(&[("l".to_string(), (now - 7200.0) as i64)], now + 900.0).0;
+        assert_eq!(a[0].signature, b[0].signature, "one lane, one card");
+    }
+
+    /// The detector must be REGISTERED, not merely written. `DetectorKind::all()`
+    /// is what the tick iterates; a variant missing from it is a detector that
+    /// runs never, which is the ethos rule 1 failure this whole card is about
+    /// (a capability that exists and reaches no one).
+    #[test]
+    fn the_stuck_composer_detector_is_actually_wired_into_the_tick() {
+        assert!(
+            super::DetectorKind::all().contains(&super::DetectorKind::StuckComposer),
+            "StuckComposer must be in DetectorKind::all() or the tick never calls it"
+        );
+        assert_eq!(super::DetectorKind::StuckComposer.slug(), "stuck-composer");
+        // Not `code`: an auto-filed fault has no merged commit to claim, so a
+        // `code` card could only be closed by acking a gate that is not true.
+        assert_ne!(super::DetectorKind::StuckComposer.item_type(), "code");
+    }
 
     // ── AEAB-59: a standing card must re-measure, and must not become a journal ──
     //
