@@ -2981,9 +2981,9 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                    so a refused transition cannot discard it
     --outcome-stdin                read the outcome from stdin ${GREEN}(preferred)${RESET}
     --evidence "what was run"      WHAT WAS ACTUALLY RUN OR PRODUCED. Required by
-                                   the server on `done` (AF-321): a command, a
+                                   the server on \`done\` (AF-321): a command, a
                                    repo path, a URL, a commit sha, a #PR — or
-                                   `none: <reason>` when the card genuinely made
+                                   \`none: <reason>\` when the card genuinely made
                                    no artifact. An --outcome that already names
                                    an artifact is used as evidence, so a lane
                                    already passing a substantive --outcome needs
