@@ -53,6 +53,8 @@ pub fn routes() -> Router<AppState> {
             get(list_session_gates).patch(patch_session_gates),
         )
         .route("/contract", get(get_contract))
+        // Static /needsyou outranks /{id}. The one owner view (AF-318).
+        .route("/needsyou", get(needsyou_queue))
         // DELETE was never registered, so the SPA's own Delete button on a
         // card 405'd — and `deleteBoardItem` removes the card optimistically
         // BEFORE the request, so the card vanished, the server kept it, and it
@@ -73,6 +75,123 @@ pub fn routes() -> Router<AppState> {
         // untouched — AMUX-2140 one layer down. Same mechanism auto-pickup uses.
         .route("/{id}/claim", post(claim_item))
 }
+
+/// GET /api/board/needsyou — THE owner view, capped (AF-318).
+///
+/// One view, ten rows, and the rest hidden until those clear. A queue no human
+/// can drain is the same as no queue: 445 cards at a median age of 15 days is
+/// not a backlog anybody triages, it is a place cards go. Ten is a number a
+/// person finishes in a sitting, which is the only property that makes the
+/// eleventh card reachable at all.
+///
+/// Ranked by `age_days * blast_radius`, not by age alone. Age alone re-creates
+/// the same list in a different order and puts the 58-day card nobody is
+/// waiting on above the two-day card three lanes are blocked behind. Blast
+/// radius is a count of open cards depending on this one, so the ranking is by
+/// what CLEARING it releases — the only importance signal the board actually
+/// holds rather than infers.
+///
+/// `?all=1` returns the hidden remainder, for the sweep that wants the whole
+/// backlog. The cap is a default, not a wall: hiding rows with no way to ask
+/// for them would be the instrument lying about its own population, which is
+/// exactly the AF-320 shape.
+async fn needsyou_queue(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let want_all = q.get("all").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let cap: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(NEEDSYOU_VIEW_CAP)
+        .clamp(1, 500);
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(crate::api::measured::unmeasured(
+                    json!({"error": e.to_string(), "queue": []}),
+                    "the store could not be opened, so no needsyou card was read",
+                )),
+            )
+                .into_response()
+        }
+    };
+    let rows = match bs::list_issues(
+        &conn,
+        &["needsyou".to_string()],
+        &[],
+        ArchivedFilter::ActiveOnly,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::api::measured::unmeasured(
+                    json!({"error": e.to_string(), "queue": []}),
+                    "the needsyou query failed, so an empty queue here is unmeasured",
+                )),
+            )
+                .into_response()
+        }
+    };
+    let now = crate::config::now_f64();
+    let mut scored: Vec<(f64, Value)> = rows
+        .iter()
+        .map(|r| {
+            let age_days = ((now - r.created as f64) / 86_400.0).max(0.0);
+            let radius = bs::blast_radius(&conn, &r.id);
+            // radius + 1, so a card nobody depends on still ranks by age
+            // instead of scoring zero and sinking below every card forever.
+            let score = age_days * (radius + 1) as f64;
+            let mut v = list_body(r, true, false);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("age_days".into(), json!((age_days * 10.0).round() / 10.0));
+                o.insert("blast_radius".into(), json!(radius));
+                o.insert("score".into(), json!((score * 10.0).round() / 10.0));
+                // The ask, or the fact that there is not one. A card that
+                // predates AF-318 is NULL here, which is a different thing from
+                // a card that answered the gate — and the owner triaging this
+                // list is exactly who needs to tell them apart.
+                o.insert("has_typed_ask".into(), json!(r.ask_type.is_some()));
+            }
+            (score, v)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total = scored.len();
+    let shown: Vec<Value> = if want_all {
+        scored.into_iter().map(|(_, v)| v).collect()
+    } else {
+        scored.into_iter().take(cap).map(|(_, v)| v).collect()
+    };
+    let hidden = total.saturating_sub(shown.len());
+    let untyped = rows.iter().filter(|r| r.ask_type.is_none()).count();
+    Json(crate::api::measured::measured(
+        json!({
+            "queue": shown,
+            "total": total,
+            "shown": shown.len(),
+            "hidden": hidden,
+            "cap": if want_all { Value::Null } else { json!(cap) },
+            "untyped_legacy": untyped,
+            "ranked_by": "age_days * (blast_radius + 1), highest first",
+            "note": "THE owner view: the cards a human is actually blocking, capped so the \
+                     list can be finished. `hidden` is the remainder, reachable with ?all=1 \
+                     — the cap is a default, not a hiding place. `untyped_legacy` counts \
+                     cards that predate the typed-ask gate (AF-318); they were never \
+                     required to name a human act, so a NULL ask_type there means \
+                     unrecorded, not junk.",
+        }),
+        total,
+    ))
+    .into_response()
+}
+
+/// How many needsyou cards the owner view shows before hiding the rest.
+const NEEDSYOU_VIEW_CAP: usize = 10;
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.
 /// Every gate-blocked 409 tells the caller to `GET /api/board/contract`
@@ -225,6 +344,18 @@ async fn get_contract(
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
             "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
+        },
+        // Global `needsyou` constraint (AF-318). Published for the AF-112
+        // reason: a gate you can only learn by tripping it teaches nobody.
+        "needsyou_requires_typed_ask": {
+            "rule": "a card entering needsyou must carry `ask_type`, `ask_question` and `ask_unblocks`",
+            "why": "445 cards were parked here at a median age of 15 days and 51% of them were not blocked on a human at all — `needsyou` was the only status that cost a worker nothing and stopped the nudge, so the ~20 real asks became unfindable",
+            "ask_types": bs::ASK_TYPE_HELP.iter().map(|(k, v)| json!({"type": k, "means": v})).collect::<Vec<_>>(),
+            "fields": "`ask_question` is what you are asking, `ask_unblocks` is what ends the block — both a sentence (3+ words). All three writable on their own, so a refused transition cannot discard them",
+            "enforced": "server-validated on any transition to needsyou; force bypasses it (logged); gate_ack cannot",
+            "override": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "not_retroactive": "the 445 existing cards are untouched — the gate is on the transition. They drain by being re-asked, not by a sweep guessing on their behalf",
+            "owner_view": "GET /api/board/needsyou — ranked by age x blast radius, capped at 10, ?all=1 for the remainder",
         },
         // Global `verified` constraint (Ethan, 2026-08-29). Published HERE and
         // not only in the 409, because a gate you can only learn by tripping it
@@ -2443,7 +2574,7 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 20] = [
+const PATCH_WRITABLE: [&str; 23] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -2460,6 +2591,13 @@ const PATCH_WRITABLE: [&str; 20] = [
     // `--outcome` already uses, so a refused `done` cannot discard the very
     // text the retry needs).
     "evidence",
+    // AF-318: the typed ask. Writable on their own for the same reason as
+    // `evidence` — a refused `needsyou` must not discard the ask the retry
+    // needs, and a lane that writes the ask first can then move the card in a
+    // second call that cannot fail on content.
+    "ask_type",
+    "ask_question",
+    "ask_unblocks",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -3247,6 +3385,9 @@ pub async fn patch_item(
             set_opt("due", &mut next.due, &mut changed);
             set_opt("due_time", &mut next.due_time, &mut changed);
             set_opt("evidence", &mut next.evidence, &mut changed);
+            set_opt("ask_type", &mut next.ask_type, &mut changed);
+            set_opt("ask_question", &mut next.ask_question, &mut changed);
+            set_opt("ask_unblocks", &mut next.ask_unblocks, &mut changed);
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -4004,6 +4145,93 @@ pub async fn patch_item(
                                             ],
                                             "what_to_run": "the repo's VERIFY.md names the proof for each surface",
                                             "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-318: `needsyou` MUST NAME THE HUMAN ACT IT IS WAITING ON.
+                    //
+                    // Measured 2026-08-29: 445 cards parked here, median 15 days,
+                    // oldest 58 — and 227 of them (51%) are not human-blocked at
+                    // all. Their titles are plain engineering work ("Compute
+                    // Utilization Audit", "Fix Namespace Pollution"). The cause is
+                    // that `needsyou` is the only status which costs a worker
+                    // nothing and stops the idle nudge, so it collects everything a
+                    // worker decided to stop doing, and the ~20 real asks become
+                    // unfindable inside the rest.
+                    //
+                    // The gate is on the TRANSITION, never on the 445 already
+                    // there: a retroactive sweep would be this same guess made
+                    // once more, at scale, by the party least able to check it
+                    // (ethos rule 8). They drain by being re-asked.
+                    let ask_required = !force
+                        && target == TaskStatus::NeedsYou
+                        && bs::needsyou_ask_required(next.session.as_deref());
+                    if ask_required {
+                        let verdict = bs::ask_verdict(
+                            next.ask_type.as_deref().unwrap_or(""),
+                            next.ask_question.as_deref().unwrap_or(""),
+                            next.ask_unblocks.as_deref().unwrap_or(""),
+                        );
+                        if verdict != bs::AskVerdict::Ok {
+                            let (why, code) = match verdict {
+                                bs::AskVerdict::NoType => (
+                                    "This card does not say what KIND of human act it is waiting on. 51% of the 445 cards already parked here (median age 15 days) are not blocked on a human at all — they are work someone stopped doing, and they are why the real asks go unanswered.",
+                                    "needsyou_requires_ask_type",
+                                ),
+                                bs::AskVerdict::UnknownType => (
+                                    "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
+                                    "needsyou_ask_type_unknown",
+                                ),
+                                bs::AskVerdict::NoQuestion => (
+                                    "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
+                                    "needsyou_ask_has_no_question",
+                                ),
+                                bs::AskVerdict::NoUnblocks => (
+                                    "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
+                                    "needsyou_ask_has_no_exit",
+                                ),
+                                bs::AskVerdict::Ok => unreachable!(),
+                            };
+                            // Two-fixes rule: grep `needsyou_ask_gate` in
+                            // server-rs.log; the structured `code` splits these
+                            // from other 409s in /api/logs/analyze.
+                            tracing::warn!(
+                                "needsyou_ask_gate: blocked {} -> needsyou for session {} (verdict {:?})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-"),
+                                verdict
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "needsyou requires a typed ask",
+                                        "code": code,
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "why": why,
+                                        "recorded_ask": {
+                                            "ask_type": next.ask_type,
+                                            "ask_question": next.ask_question,
+                                            "ask_unblocks": next.ask_unblocks,
+                                        },
+                                        "ask_types": bs::ASK_TYPE_HELP.iter()
+                                            .map(|(k, v)| json!({"type": k, "means": v}))
+                                            .collect::<Vec<_>>(),
+                                        "how_to_fix": {
+                                            "cli": format!("amux board needsyou {} --ask <type> --question-stdin --unblocks \"...\"", next.id),
+                                            "api": "PATCH /api/board/<id> with {\"ask_type\":\"...\",\"ask_question\":\"...\",\"ask_unblocks\":\"...\"} — all three writable on their own, so record them first and the transition cannot discard them",
+                                            "if_it_is_not_human_blocked": "then it is not `needsyou`. Use `backlog --trigger \"<condition>\"` for an external wait that re-arms itself, or leave it in `doing` and work the blocker.",
+                                            "override_for_this_worker": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -5974,7 +6202,8 @@ mod slim_tests {
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
                 source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, closed_at INTEGER, evidence TEXT, deleted INTEGER);
+                epic TEXT, closed_at INTEGER, evidence TEXT,
+                ask_type TEXT, ask_question TEXT, ask_unblocks TEXT, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));
              CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",

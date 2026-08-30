@@ -1136,6 +1136,196 @@ async fn done_requires_evidence_a_plan_cannot_supply() {
     );
 }
 
+// ---- typed needsyou ask (AF-318): a park has to name the human act ---------
+
+/// THE PROPERTY. A card can be parked on a human only if it says which KIND of
+/// human act, what is being asked, and what ends the block.
+///
+/// The specimen is not an empty card — the old gates already caught those. It
+/// is a card whose title and desc are perfectly ordinary engineering work, the
+/// shape 227 of the 445 live `needsyou` cards actually have ("Compute
+/// Utilization Audit", "Fix Namespace Pollution"). Those pass every other gate
+/// on the board and are exactly what makes the ~20 real asks unfindable.
+#[tokio::test]
+async fn needsyou_refuses_a_park_that_names_no_human_act() {
+    let (app, _tmp) = app();
+    let c = create(
+        &app,
+        json!({
+            "title": "Compute Utilization Audit",
+            "desc": "Audit idle GPU hours across the fleet. See docs/compute.md.",
+        }),
+    )
+    .await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    // Untyped: refused, and the five types are IN the refusal so the reader
+    // does not have to go and find them (AF-112).
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "needsyou", "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "{v}");
+    assert_eq!(v["code"], json!("needsyou_requires_ask_type"), "{v}");
+    let types: Vec<&str> =
+        v["ask_types"].as_array().unwrap().iter().map(|t| t["type"].as_str().unwrap()).collect();
+    assert_eq!(types, vec!["decision", "access", "credential", "external", "judgment"], "{v}");
+
+    // A type outside the closed vocabulary is refused too, or the vocabulary
+    // is decorative.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "blocked",
+                     "ask_question": "can someone look at this",
+                     "ask_unblocks": "someone looks at it" })),
+    )
+    .await;
+    assert_eq!(v["code"], json!("needsyou_ask_type_unknown"), "{v}");
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // "Blocked on Ethan" with no question: the exact phrasing the rules call
+    // out as not-an-ask.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
+                     "ask_question": "blocked", "ask_unblocks": "Ethan answers this question" })),
+    )
+    .await;
+    assert_eq!(v["code"], json!("needsyou_ask_has_no_question"), "{v}");
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // A question with no exit condition. This is the half that makes an ask
+    // falsifiable, so it is refused separately rather than folded in.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
+                     "ask_question": "should idle GPU hours be reclaimed automatically",
+                     "ask_unblocks": "yes" })),
+    )
+    .await;
+    assert_eq!(v["code"], json!("needsyou_ask_has_no_exit"), "{v}");
+    assert_eq!(st, StatusCode::CONFLICT);
+
+    // All three, and it parks.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
+                     "ask_question": "should idle GPU hours be reclaimed automatically",
+                     "ask_unblocks": "a yes or no from the owner on auto-reclaim" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+
+    // And the ask is READABLE afterwards — a gate whose input is not stored is
+    // a gate nobody can audit (ethos rule 6), and the owner view ranks on it.
+    let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(got["ask_type"], json!("decision"));
+    assert!(got["ask_unblocks"].as_str().unwrap().contains("auto-reclaim"), "{got}");
+}
+
+/// The ask survives a transition that a DIFFERENT gate refuses.
+///
+/// Same two-write property as `evidence`: a PATCH is atomic, so sending the ask
+/// together with the status means a 409 rolls the ask back and the retry has
+/// nothing to satisfy the gate that just refused it.
+#[tokio::test]
+async fn a_refused_park_does_not_discard_the_ask_it_asked_for() {
+    let (app, _tmp) = app();
+    let c = create(&app, json!({ "title": "park me", "type": "code" })).await;
+    let id = c["id"].as_str().unwrap().to_string();
+
+    // Written on its own, with no status change at all.
+    let (st, _, _) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "ask_type": "access", "ask_question": "who owns the staging console",
+                     "ask_unblocks": "a name, or an invite to the console" })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+
+    let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(got["ask_type"], json!("access"), "the ask must persist without a transition");
+    assert_eq!(got["status"], json!("todo"), "writing an ask must not move the card");
+}
+
+/// THE OWNER VIEW: capped, ranked by what clearing it releases, and honest
+/// about the remainder.
+#[tokio::test]
+async fn the_needsyou_view_is_capped_and_ranks_by_blast_radius_not_age_alone() {
+    let (app, _tmp) = app();
+    let park = |app: &axum::Router, id: String| {
+        let app = app.clone();
+        async move {
+            send(
+                &app,
+                "PATCH",
+                &format!("/api/board/{id}"),
+                Some(json!({ "status": "needsyou", "gate_ack": true, "ask_type": "decision",
+                             "ask_question": "which way should this go",
+                             "ask_unblocks": "a direction from the owner" })),
+            )
+            .await
+        }
+    };
+
+    // Two parked cards. `blocker` has an open card depending on it; `lonely`
+    // has none. Both are the same age, so age alone cannot separate them and
+    // any ordering difference is the blast radius doing the work.
+    let blocker = create(&app, json!({"title": "three lanes wait on this"})).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let lonely = create(&app, json!({"title": "nobody waits on this"})).await["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    create(&app, json!({"title": "waiting behind the blocker", "depends_on": [blocker.clone()]}))
+        .await;
+    assert_eq!(park(&app, blocker.clone()).await.0, StatusCode::OK);
+    assert_eq!(park(&app, lonely.clone()).await.0, StatusCode::OK);
+
+    let (st, _, v) = send(&app, "GET", "/api/board/needsyou", None).await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    let ids: Vec<&str> =
+        v["queue"].as_array().unwrap().iter().map(|c| c["id"].as_str().unwrap()).collect();
+    assert_eq!(
+        ids.first(),
+        Some(&blocker.as_str()),
+        "the card others are blocked behind must outrank the one nobody waits on, at equal \
+         age — otherwise this is the same list sorted by age: {v}"
+    );
+    assert_eq!(v["queue"][0]["blast_radius"], json!(1), "{v}");
+    assert_eq!(v["queue"][1]["blast_radius"], json!(0), "{v}");
+
+    // AF-320 contract, since this is a diagnostic-shaped read.
+    assert_eq!(v["measured"], json!(true), "{v}");
+    assert_eq!(v["n_considered"], json!(2), "{v}");
+
+    // THE CAP, and the honesty about what it hides. A view that hid rows with
+    // no way to ask for them would be an instrument lying about its own
+    // population.
+    let (_, _, capped) = send(&app, "GET", "/api/board/needsyou?limit=1", None).await;
+    assert_eq!(capped["shown"], json!(1), "{capped}");
+    assert_eq!(capped["hidden"], json!(1), "{capped}");
+    assert_eq!(capped["total"], json!(2), "{capped}");
+    let (_, _, all) = send(&app, "GET", "/api/board/needsyou?limit=1&all=1", None).await;
+    assert_eq!(all["shown"], json!(2), "?all=1 must reach the remainder: {all}");
+    assert_eq!(all["hidden"], json!(0), "{all}");
+}
+
 /// The no-artifact escape is real, and it is not a shrug. Both halves matter:
 /// without the first, an escalation that closed because the owner decided has
 /// no truthful path to done (ethos rule 3); without the second, `none:` is a
@@ -2928,13 +3118,16 @@ async fn entering_an_undrained_status_stamps_a_revisit_date() {
     for (status, days) in [("backlog", 14i64), ("needsyou", 3)] {
         let c = create(&app, json!({ "title": format!("park me to {status}") })).await;
         let id = c["id"].as_str().unwrap().to_string();
-        let (st, _, v) = send(
-            &app,
-            "PATCH",
-            &format!("/api/board/{id}"),
-            Some(json!({ "status": status, "gate_ack": true })),
-        )
-        .await;
+        // A typed ask, because this test is about the REVISIT DATE and not the
+        // AF-318 ask gate — the same reason these tests already carry an asset
+        // link and evidence. The gate has its own coverage below.
+        let mut body = json!({ "status": status, "gate_ack": true });
+        if status == "needsyou" {
+            body["ask_type"] = json!("decision");
+            body["ask_question"] = json!("which retention window should this use");
+            body["ask_unblocks"] = json!("a number of days from the owner");
+        }
+        let (st, _, v) = send(&app, "PATCH", &format!("/api/board/{id}"), Some(body)).await;
         assert_eq!(st, StatusCode::OK, "{status} transition refused: {v}");
 
         let (_, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;

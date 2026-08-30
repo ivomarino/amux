@@ -1579,6 +1579,40 @@ _board_id_guard() {
 }
 
 
+# AF-318: the five kinds of human act, printed on an untyped park.
+#
+# Refused HERE and not only server-side, because the point of the refusal is
+# that the reader sees the vocabulary. A 409 teaches it too, but only after a
+# round trip, and the round trip is what makes people reach for a raw PATCH.
+_needsyou_types_or_die() {
+  local t="$1" id="$2"
+  case "$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')" in
+    decision|access|credential|external|judgment) return 0 ;;
+  esac
+  local head="amux board needsyou: --ask is required."
+  [[ -n "$t" ]] && head="amux board needsyou: '$t' is not one of the five kinds of human act."
+  die "$head
+
+  decision    a choice only the owner can make: direction, priority, a trade-off
+              with no right answer
+  access      you cannot reach something: a repo, a console, an environment, a person
+  credential  a secret, token, key or sign-in only the owner can supply
+  external    waiting on a third party: a vendor, a support ticket, another
+              company's deploy
+  judgment    a call only the owner's taste settles: is this good enough, does
+              this read right
+
+The vocabulary is closed on purpose. 445 cards were parked in needsyou at a median
+age of 15 days and 51% of them were not blocked on a human at all — this status was
+the only one that cost nothing and stopped the idle nudge. If your block fits none
+of the five, it is not a block on a person:
+
+  amux board backlog $id --trigger \"<the condition that re-arms it>\"   external wait
+  amux board doing $id                                                work the blocker
+
+  amux board needsyou $id --ask decision --question \"...\" --unblocks \"...\""
+}
+
 _board_transition() {
   local id="$1" status="$2"; shift 2
   local ack="" newtype="" override="" rev="" outcome="" trigger="" force_reason=""
@@ -2104,10 +2138,43 @@ cmd_board() {
       # Mark a card as blocked-on-human and RECORD THE ASK (AMUX-2167/2171):
       # additive tag (no clobber) + the question into the History, so Focus
       # mode and the card both show WHAT is needed, not just that it's stuck.
-      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID> [\"the question / decision needed\"]"
+      local id="${1:-}"; [[ -n "$id" ]] || die "Usage: amux board needsyou <ISSUE-ID> --ask <type> --question \"...\" --unblocks \"...\""
       _board_id_guard "needsyou" "$id"
       shift 2>/dev/null || true
-      local ask="$*"
+      # AF-318: the ask is TYPED now. 445 cards were parked here at a median age
+      # of 15 days and 51% of them were not blocked on a human at all — this verb
+      # cost nothing and stopped the idle nudge, so it collected everything a
+      # worker decided to stop doing. Three fields, refused server-side without
+      # them; the CLI refuses first so the five types are printed rather than
+      # discovered by tripping a 409.
+      local ask_type="" ask_q="" ask_unblocks="" want_q_stdin=""
+      local -a _rest=()
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --ask) ask_type="${2:-}"; [[ -n "$ask_type" ]] || die "--ask needs a type"; shift 2 ;;
+          --question) ask_q="${2:-}"; [[ -n "$ask_q" ]] || die "--question needs text"; shift 2 ;;
+          --question-stdin) want_q_stdin=1; shift ;;
+          --question-file) [[ -r "${2:-}" ]] || die "--question-file needs a readable path"
+                           ask_q="$(cat "$2")"; shift 2 ;;
+          --unblocks) ask_unblocks="${2:-}"; [[ -n "$ask_unblocks" ]] || die "--unblocks needs text"; shift 2 ;;
+          --unblocks-file) [[ -r "${2:-}" ]] || die "--unblocks-file needs a readable path"
+                           ask_unblocks="$(cat "$2")"; shift 2 ;;
+          *) _rest+=("$1"); shift ;;
+        esac
+      done
+      set -- "${_rest[@]+"${_rest[@]}"}"
+      [[ -n "$want_q_stdin" ]] && { ask_q="$(cat)"; [[ -n "$ask_q" ]] || die "--question-stdin got empty input"; }
+      # Positional prose still works and becomes the QUESTION, so a lane that
+      # already writes a real sentence here keeps working and only owes the type
+      # and the exit.
+      local ask="${ask_q:-$*}"
+      _needsyou_types_or_die "$ask_type" "$id"
+      [[ -n "$ask" ]] || die "amux board needsyou: --question is required — one sentence, what you are asking.
+  amux board needsyou $id --ask $ask_type --question \"...\" --unblocks \"...\""
+      [[ -n "$ask_unblocks" ]] || die "amux board needsyou: --unblocks is required — one sentence, what ENDS the block.
+Without it nobody but you can tell whether an answer landed, so the card can only
+leave this queue by you noticing. That is how 445 cards reached a median age of 15 days.
+  amux board needsyou $id --ask $ask_type --question \"$ask\" --unblocks \"...\""
       # A FLAG IS NOT AN ASK. This verb takes free prose, so an unrecognised
       # `--flag` was silently adopted AS the question: `amux board needsyou <id>
       # --stdin < file` printed "tagged needs:you", discarded the file entirely,
@@ -2163,6 +2230,31 @@ For long text use:                amux board progress $id \"\$(cat file)\"" ;;
       # ASK, status carries the QUEUE. If the transition bounces (gate), say
       # so loudly — a tagged-but-unmoved card is exactly the half-action this
       # verb used to hide.
+      # THE TYPED ASK IS ITS OWN WRITE, BEFORE THE TRANSITION. Same AC-323 shape
+      # the outcome and evidence paths already carry: a PATCH is atomic, so
+      # sending the ask together with the status means a refusal rolls the ask
+      # back and the retry has nothing to satisfy the gate that refused it.
+      local _askresp _askcurl=0
+      _askresp=$(_curl -sk -X PATCH -H 'Content-Type: application/json' \
+        -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" \
+        -d "$(T="$ask_type" Q="$ask" U="$ask_unblocks" python3 -c 'import json,os;print(json.dumps({"ask_type":os.environ["T"],"ask_question":os.environ["Q"],"ask_unblocks":os.environ["U"]}))')" \
+        "${AMUX_API:-https://localhost:8824}/api/board/$id" 2>/dev/null) || _askcurl=$?
+      if [[ "$_askcurl" -ne 0 ]]; then
+        die "cannot reach the board at ${AMUX_API:-https://localhost:8824} (curl exit $_askcurl).
+The tag was applied; the typed ask and the status move were NOT."
+      fi
+      printf '%s' "$_askresp" | python3 -c '
+import sys, json
+try: d = json.load(sys.stdin)
+except Exception:
+    sys.stderr.write("warning: the typed ask may not have been recorded — server sent no JSON. "
+                     "The transition below was still attempted; check its result.\n"); sys.exit(0)
+ign = [f for f in (d.get("ignored_fields") or []) if f]
+if "ask_type" in ign:
+    sys.stderr.write("note: the ask_type/ask_question/ask_unblocks fields were not stored — "
+                     "this server predates AF-318. Your NEEDS-YOU note still persisted to the "
+                     "card in full; only the typed columns were dropped.\n")
+'
       local tresult
       tresult=$(_board_transition "$id" "needsyou")
       echo "$tresult" | _board_outcome "$id" "needsyou" || {
@@ -2948,7 +3040,14 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
                                     REFUSED, not folded into the title — AEAB-17.)
   amux board claim <ID>            Atomically claim a todo/backlog card for this worker
   amux board assign <ID> <worker>  Reassign a card to a worker (the claim 409's sanctioned exit)
-  amux board needsyou <ID> [ask]   Mark a card as blocked on the human (surfaces in Needs-you).
+  amux board needsyou <ID> --ask <type> --question "..." --unblocks "..."
+                                   Park a card on the human. The ask is TYPED:
+                                   decision | access | credential | external | judgment
+                                   --question  one sentence, what you are asking
+                                   --unblocks  one sentence, what ENDS the block
+                                   Also --question-stdin / --question-file /
+                                   --unblocks-file. An untyped park is refused and
+                                   prints the five types (AF-318).
                                    A sign-in/login ask auto-gets a clickable resume link into
                                    this session's live browser view (Ethan clicks to sign in).
   amux board ask <ID> [question]   Ask the owning worker to post a status update

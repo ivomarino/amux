@@ -317,6 +317,119 @@ pub fn evidence_verdict(text: &str) -> EvidenceVerdict {
     EvidenceVerdict::NoArtifact
 }
 
+/// Scope key for the AF-318 typed-ask requirement on `needsyou`.
+pub const NEEDSYOU_ASK_REQUIRED_KEY: &str = "AMUX_NEEDSYOU_ASK_REQUIRED";
+
+/// The five kinds of human act a card can be waiting on.
+///
+/// Five, and closed. An open vocabulary would re-admit the 227 cards this gate
+/// exists to keep out: every one of them could be described in free text, and
+/// none of them fits any of these without saying something untrue. That is the
+/// point — a card whose block does not name a human ACT is not blocked on a
+/// human, it is a card someone stopped working on.
+///
+/// `judgment` is the deliberate soft one and it is still not a catch-all: it
+/// means a call only the owner's taste can settle, which is a real category
+/// (ethos rule 3 wants a truthful path for it) and NOT "I would like a second
+/// opinion".
+pub const ASK_TYPES: [&str; 5] = ["decision", "access", "credential", "external", "judgment"];
+
+/// What each type means, printed in the refusal so the reader picks correctly
+/// on the first try rather than by guessing at five bare words.
+pub const ASK_TYPE_HELP: [(&str, &str); 5] = [
+    ("decision", "a choice only the owner can make — direction, priority, or a trade-off with no right answer"),
+    ("access", "you cannot reach something: a repo, a console, an environment, a person"),
+    ("credential", "a secret, token, key or sign-in only the owner can supply"),
+    ("external", "waiting on a third party — a vendor, a support ticket, another company's deploy"),
+    ("judgment", "a call only the owner's taste settles: is this good enough, does this read right"),
+];
+
+/// Is the AF-318 typed-ask requirement enforced for `session`?
+///
+/// Same resolver as [`done_link_required`] and [`done_evidence_required`]:
+/// process env wins, then worker > group > global scope. Default ON.
+pub fn needsyou_ask_required(session: Option<&str>) -> bool {
+    fn is_off(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no")
+    }
+    if let Ok(v) = std::env::var(NEEDSYOU_ASK_REQUIRED_KEY) {
+        if !v.trim().is_empty() {
+            return !is_off(&v);
+        }
+    }
+    let lane = match session.filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return true,
+    };
+    match crate::api::session_verbs::scoped_setting_in(
+        &crate::api::session_verbs::home(),
+        lane,
+        NEEDSYOU_ASK_REQUIRED_KEY,
+    ) {
+        Some(v) => !is_off(&v),
+        None => true,
+    }
+}
+
+/// Why a typed ask was refused, or that it was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AskVerdict {
+    /// Names a type, a question and what ends the block.
+    Ok,
+    /// No `ask_type` at all — the untyped move this gate exists to refuse.
+    NoType,
+    /// An `ask_type` outside the closed vocabulary.
+    UnknownType,
+    /// No question, or too short to be one.
+    NoQuestion,
+    /// No statement of what ends the block.
+    NoUnblocks,
+}
+
+/// A sentence, not a shrug. Three words is the floor at which someone has had
+/// to think about the reader; "n/a", "blocked", "ask Ethan" all fall under it,
+/// and all three are real specimens from the 445.
+fn is_a_sentence(s: &str) -> bool {
+    s.split_whitespace().count() >= 3
+}
+
+/// Does this card say who is being asked what, and what ends the block?
+pub fn ask_verdict(ask_type: &str, question: &str, unblocks: &str) -> AskVerdict {
+    let t = ask_type.trim().to_ascii_lowercase();
+    if t.is_empty() {
+        return AskVerdict::NoType;
+    }
+    if !ASK_TYPES.contains(&t.as_str()) {
+        return AskVerdict::UnknownType;
+    }
+    if !is_a_sentence(question) {
+        return AskVerdict::NoQuestion;
+    }
+    if !is_a_sentence(unblocks) {
+        return AskVerdict::NoUnblocks;
+    }
+    AskVerdict::Ok
+}
+
+/// How much else is waiting behind this card (AF-318's owner view).
+///
+/// Deliberately a COUNT OF DEPENDENTS and not a guess at importance. A card
+/// nobody is waiting on can sit for 58 days and cost nothing; a card three
+/// lanes are blocked behind costs three lanes a day. The owner's scarce
+/// resource is attention, so the ranking has to be by what clearing it
+/// RELEASES, which is the one thing the board actually knows.
+pub fn blast_radius(conn: &Connection, id: &str) -> i64 {
+    let like = format!("%{id}%");
+    conn.query_row(
+        "SELECT COUNT(*) FROM issues WHERE deleted IS NULL AND archived = 0 \
+         AND status NOT IN ('done','verified','discarded') \
+         AND depends_on IS NOT NULL AND depends_on LIKE ?1",
+        [&like],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
 /// The env keys that tune (or disable) the automatic revisit date. `0` turns
 /// the default off for a scope; a positive integer is a number of days.
 pub const BACKLOG_REVISIT_DAYS_KEY: &str = "AMUX_BACKLOG_REVISIT_DAYS";
@@ -1083,6 +1196,20 @@ pub struct IssueRow {
     /// text `none: <reason>`, which is stored, countable, and deliberately NOT
     /// the same as NULL.
     pub evidence: Option<String>,
+    /// Which of [`ASK_TYPES`] this card is waiting on (AF-318).
+    ///
+    /// NULL means NOT RECORDED, never "no ask exists" — the 445 cards that
+    /// predate the column are all NULL, and a sweep that reads NULL as
+    /// "untyped, therefore junk" would discard real asks along with the rest.
+    /// The gate applies to the TRANSITION, so history is left as it is and the
+    /// backlog is drained by re-asking, not by a migration guessing.
+    pub ask_type: Option<String>,
+    /// One sentence: what is being asked.
+    pub ask_question: Option<String>,
+    /// One sentence: what ends the block. The half that makes an ask
+    /// falsifiable — without it nobody but the author can tell whether an
+    /// answer landed.
+    pub ask_unblocks: Option<String>,
     pub last_verified_at: Option<i64>,
     /// Rust per-row version (migration 0002). Bumped alongside `rev`.
     pub version: i64,
@@ -1154,6 +1281,11 @@ impl IssueRow {
             // the list body would ship the column and hide it from its only
             // caller.
             "evidence": self.evidence,
+            // In BOTH snapshots for the same reason: "which needsyou cards
+            // carry a real ask" is a LIST query, and the owner view ranks on it.
+            "ask_type": self.ask_type,
+            "ask_question": self.ask_question,
+            "ask_unblocks": self.ask_unblocks,
             // In BOTH snapshots deliberately, i.e. NOT in `slim_omits`. The
             // motivating question ("which cards closed in this window") is a
             // LIST query, so omitting it from the list body would ship the
@@ -1254,7 +1386,8 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.gcal_event_id, COALESCE(i.pos,0), COALESCE(i.notified,0), i.gate, i.shepherd, \
      i.type, COALESCE(i.archived,0), i.depends_on, i.reviewer, i.log, \
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
-     i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence";
+     i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence, \
+     i.ask_type, i.ask_question, i.ask_unblocks";
 
 fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
     let depends_raw: Option<String> = r.get(19)?;
@@ -1301,6 +1434,9 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         rev: r.get(22)?,
         source_ref: r.get(23)?,
         evidence: r.get(29)?,
+        ask_type: r.get(30)?,
+        ask_question: r.get(31)?,
+        ask_unblocks: r.get(32)?,
         // Some Python-era databases stored this column as TEXT despite the
         // schema saying INTEGER (legacy-data mismatch, not a live schema
         // bug) — rusqlite's FromSql is strict per storage type, so EITHER
@@ -1852,8 +1988,9 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
              rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
-             epic = ?22, closed_at = ?23, evidence = ?24 \
-         WHERE id = ?25 AND deleted IS NULL",
+             epic = ?22, closed_at = ?23, evidence = ?24, ask_type = ?25, \
+             ask_question = ?26, ask_unblocks = ?27 \
+         WHERE id = ?28 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -1879,6 +2016,9 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.epic,
             row.closed_at,
             row.evidence,
+            row.ask_type,
+            row.ask_question,
+            row.ask_unblocks,
             row.id,
         ],
     )
@@ -2054,6 +2194,7 @@ mod tests {
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
                 source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0, evidence TEXT,
+                ask_type TEXT, ask_question TEXT, ask_unblocks TEXT,
                 epic TEXT, closed_at INTEGER, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));",
@@ -2329,6 +2470,7 @@ mod tests {
                 shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
                 depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
                 source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0, evidence TEXT,
+                ask_type TEXT, ask_question TEXT, ask_unblocks TEXT,
                 epic TEXT, closed_at INTEGER, deleted INTEGER);
              CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
                 PRIMARY KEY (issue_id, tag));
@@ -2714,6 +2856,9 @@ mod tests {
             rev: 0,
             source_ref: None,
             evidence: None,
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
             last_verified_at: None,
             closed_at: None,
             version: 0,
@@ -2817,7 +2962,8 @@ mod configured_gate_tests {
             due_time: None, pinned: 0, gcal_event_id: None, pos: 0.0, notified: 0,
             gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
             archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
-            source_ref: None, evidence: None, last_verified_at: None, closed_at: None,
+            source_ref: None, evidence: None, ask_type: None, ask_question: None,
+            ask_unblocks: None, last_verified_at: None, closed_at: None,
             version: 0, tags: vec![],
         }
     }
