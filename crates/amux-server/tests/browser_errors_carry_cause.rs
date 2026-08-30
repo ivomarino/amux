@@ -131,3 +131,28 @@ fn the_guard_is_actually_looking_at_something() {
         "`with_cause` is the sanctioned renderer and must exist in this file"
     );
 }
+
+/// AMUX-3886 follow-up. Both recovery counters must appear in BOTH arms of
+/// `status`, because they vanished in exactly the state they describe.
+///
+/// A browser that died leaves `running: false`, and "how many times did a verb
+/// find a corpse" is the question asked AFTER that, not during. The live
+/// endpoint returned three keys — running, last_exit, last_exit_note — while the
+/// counter this card added sat in the other branch, unreachable. A zero you
+/// cannot read and a field that is absent are the same thing to a caller.
+///
+/// Pinned as a source check rather than a request test because reaching the
+/// not-running arm for real means stopping whatever browser a peer is holding.
+#[test]
+fn both_status_arms_publish_the_recovery_counters() {
+    let src = std::fs::read_to_string(workspace_root().join(FILE)).expect("read api/browser.rs");
+    for counter in ["stale_binding_recoveries", "dead_browser_recoveries"] {
+        let n = src.matches(&format!("\"{counter}\":")).count();
+        assert!(
+            n >= 2,
+            "`{counter}` is emitted {n} time(s) in {FILE}; it must appear in the running arm \
+             AND the `running: false` arm. A counter absent from the not-running payload is \
+             invisible in the state it exists to report (AMUX-3886)."
+        );
+    }
+}

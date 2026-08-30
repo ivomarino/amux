@@ -950,6 +950,19 @@ async fn status() -> Response {
             "running": false,
             "last_exit": last_exit,
             "last_exit_note": "in-memory: a server restart clears it; null means no exit recorded by THIS server process",
+            // THE COUNTERS BELONG HERE TOO (AMUX-3886 follow-up). Both used to
+            // appear only in the running branch, so they vanished in exactly
+            // the state they describe: a browser that died leaves `running:
+            // false`, and "how many times did a verb find a corpse" is the
+            // question you ask AFTER that, not during. Found by reading the
+            // live endpoint for the evidence on this card's own close and
+            // getting three keys back.
+            "stale_binding_recoveries":
+                chrome::STALE_BINDING_RECOVERIES.load(std::sync::atomic::Ordering::Relaxed),
+            "dead_browser_recoveries":
+                chrome::DEAD_BROWSER_RECOVERIES.load(std::sync::atomic::Ordering::Relaxed),
+            "recoveries_note": "in-memory; a server restart resets both to 0, so 0 means \
+                                \"none since this process started\", not \"never\"",
         }))
         .into_response();
     };
