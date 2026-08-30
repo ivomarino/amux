@@ -52,4 +52,4 @@ curl -sk $AMUX_URL/api/telegram/mappings
 
 - `.claude/telegram-relay.py` — old Stop hook (kept as reference, amux uses it)
 - `crates/amux-server/src/runtime_jobs/telegram_relay.rs` — new server-side relay
-- `crates/amux-server/migrations/0039_telegram_relay.sql` — relay state tracking (DB)
+- `crates/amux-server/migrations/0036_telegram_relay.sql` — relay state tracking (DB)

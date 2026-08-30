@@ -3,7 +3,7 @@
 --
 -- Bug (found 2026-08-30): the @lane feature (migration-free, telegram_poll.rs)
 -- lets a message route to ANY lane ("@frontstage status" -> frontstage's pane),
--- but the auto-relay job (0039_telegram_relay.sql) only ever watches
+-- but the auto-relay job (0036_telegram_relay.sql) only ever watches
 -- `telegram_mappings.session` — the one /link'd default. A reply typed by a lane
 -- reached only via @-mention was never observed by the relay, so it never made
 -- it back to Telegram. `last_routed_session` closes that gap: telegram_poll.rs

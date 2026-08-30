@@ -202,14 +202,14 @@ const MIGRATIONS: &[Migration] = &[
         sql: include_str!("../../migrations/0035_telegram.sql"),
     },
     Migration {
-        version: 39,
-        name: "0039_telegram_relay",
-        sql: include_str!("../../migrations/0039_telegram_relay.sql"),
+        version: 36,
+        name: "0036_telegram_relay",
+        sql: include_str!("../../migrations/0036_telegram_relay.sql"),
     },
     Migration {
-        version: 40,
-        name: "0040_telegram_routed_session",
-        sql: include_str!("../../migrations/0040_telegram_routed_session.sql"),
+        version: 37,
+        name: "0037_telegram_routed_session",
+        sql: include_str!("../../migrations/0037_telegram_routed_session.sql"),
     },
 ];
 
