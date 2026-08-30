@@ -2292,6 +2292,27 @@ SEVERITY-NOTE (appended same day, after the recurrence): raising this from `slow
  lane that stages early and verifies before committing is MORE exposed, not less, because
  its work sits in the shared index longer. That is the argument against every advisory
  guard on this path.
+ ATTRIBUTION CORRECTION (same day, after ts-gke checked my evidence). I claimed above
+ that both sweeps were the SAME LANE and leaned on "same Amux-Session AND same
+ Amux-Conversation" as two agreeing signals. They are ONE signal. Read
+ .git/hooks/prepare-commit-msg: `stamp="$AMUX_SESSION"`, then `conv` is a lookup of
+ `~/.amux/sessions/$stamp.meta.json` for `cc_conversation_id`. The conversation field is
+ DERIVED FROM the session field, so a wrong stamp produces a wrong conversation id
+ identically and the commit reads as doubly confirmed. Everything reduces to one
+ env var in whatever process ran `git commit`, and AMUX_SESSION is inherited by any
+ child of a lane.
+ So "two sweeps by one lane, the second after that lane agreed in writing" is NOT
+ established, and I withdraw it. What survives: two sweeps happened, and the mechanism
+ is `git commit -a` (established independently — my UNTRACKED test file was not taken
+ while every modified TRACKED file was, which `git add -A` would not produce). The class
+ argument does not need the actor to be identified, which is the useful part.
+ Contrary evidence worth keeping: all three ts-gke-stamped commits carry
+ `Co-Authored-By: Claude Sonnet 4.6` while that lane runs opus-5, and `Claude-Session:
+ session_01Gg7LPMY45VdVgrq29tHv2A` is on 78009d90 and 2a914717 but ABSENT from 8a990ebd
+ — a field no amux hook writes. None of that is conclusive (the hook's own comment
+ measures Claude-Session on ~30% of commits, so absence proves nothing), and that is the
+ point: the record cannot answer who committed, in either direction.
+ CARDED as AMUX-3916: the stamp needs one field the committing process cannot inherit.
  MECHANISM, narrower than the first entry had it. My untracked test file was NOT taken
  while every modified TRACKED file was: that is `git commit -a`, not `git add -A`. `-a`
  stages every modified tracked file at commit time — exactly the set a shared checkout

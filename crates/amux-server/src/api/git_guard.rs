@@ -1215,6 +1215,17 @@ pub(crate) enum LineAccounting {
 /// therefore also suppress the one case the check is most useful in. So when a
 /// peer also claims the path, the detail stays on: that is exactly when a
 /// reader needs to see which lines are not theirs.
+/// Does a cotenant have AUTHORED CONTENT at this path, as opposed to merely a
+/// record of it? This one line is the whole of AF-342's second iteration, and
+/// it lives here rather than inline because inline it was untestable and wrong
+/// for a full release: v1 read `inputs.theirs`, any mtime satisfied that, and
+/// on a 52-lane shared checkout the noisy arm therefore stayed on everywhere
+/// while all four unit cells passed. A mutation putting `theirs` back is the
+/// specific regression `peer_content_is_not_peer_mtime` refuses.
+pub(crate) fn peer_authored_content(inputs: &GuardInputs, ap: &str) -> bool {
+    inputs.theirs_transcript.contains(ap)
+}
+
 pub(crate) fn line_accounting_mode(
     has_firsthand: bool,
     mine_observed: bool,
@@ -1569,7 +1580,28 @@ pub(crate) struct GuardInputs {
     /// abs realpath -> (owner session, newest ts), all cotenants.
     pub theirs: HashMap<String, (String, f64)>,
     /// abs realpath, any cotenant, first-hand only.
+    ///
+    /// NB `apply_observed` INSERTS INTO THIS at firsthand rank (AF-123, and
+    /// deliberately: an mtime is a fact about the disk). So after that call it
+    /// means "a peer has a record here", NOT "a peer authored content here".
+    /// If you need the second question, use `theirs_transcript`.
     pub theirs_firsthand: HashSet<String>,
+    /// abs realpath where a cotenant has a TRANSCRIPT (Edit/Write) record, so
+    /// their authored CONTENT for it exists somewhere. Snapshotted before
+    /// `apply_observed` runs and never written by it, which is the whole
+    /// point: `theirs_firsthand` answers "is there a peer record here" and
+    /// this answers "did a peer author content here".
+    ///
+    /// AF-342 shipped once without this and was inert in production. It gated
+    /// on `theirs`, which any mtime satisfies, and on a 52-lane shared
+    /// checkout a peer's Bash window catches nearly every actively-edited
+    /// path. The live response said it out loud in its own `co_signal`:
+    /// "observed mtime coinciding with your own edit - possibly one write seen
+    /// through two sessions' Bash windows, not a real co-editor (AMUX-3497)".
+    /// A phantom co-editor was therefore enough to keep the noisy arm on
+    /// everywhere, which is authorship inferred from an mtime, the exact move
+    /// `line_accounting_mode` exists to refuse.
+    pub theirs_transcript: HashSet<String>,
     /// abs realpath whose WINNING peer claim came from an OBSERVED (mtime)
     /// row rather than a transcript record (AMUX-3497). An observed row is a
     /// fact about the disk, but on a shared checkout its attribution to the
@@ -2548,6 +2580,9 @@ pub async fn staged_guard_inner(
         // Filled by apply_observed, same as theirs_observed_only below.
         mine_observed_only: HashSet::new(),
         theirs,
+        // Same source, two fields on purpose: `apply_observed` will merge
+        // mtime rows into `theirs_firsthand` and must never touch this one.
+        theirs_transcript: theirs_fh.clone(),
         theirs_firsthand: theirs_fh,
         theirs_observed_only: HashSet::new(), // filled by apply_observed
         theirs_restore,
@@ -2631,7 +2666,12 @@ pub async fn staged_guard_inner(
             // exactly the 7797e45 peer-hunk shape it was built for, since a
             // peer's hunk riding my `git add` moves no mtime in MY window.
             let observed = mine_obs.get(ap);
-            let peer_claims = inputs.theirs.contains_key(ap);
+            // A peer claim gates the line check only when that peer has
+            // CONTENT behind it, because content is the only thing the
+            // comparison can attribute. `theirs` alone is satisfied by an
+            // mtime, which made this arm inert in production (see the field
+            // doc on `theirs_transcript`).
+            let peer_claims = peer_authored_content(&inputs, ap);
             match line_accounting_mode(own.contains_key(ap), observed.is_some(), peer_claims) {
                 LineAccounting::Skip => continue,
                 LineAccounting::Undecidable => {
@@ -4207,6 +4247,84 @@ mod tests {
             assert_eq!(line_accounting_mode(false, true, peer), LineAccounting::Skip);
             assert_eq!(line_accounting_mode(false, false, peer), LineAccounting::Skip);
         }
+    }
+
+    /// AF-342 second iteration, THE CELL THAT CAN ACTUALLY FAIL ON THE BUG.
+    /// The sibling below pins the ordering property of the SET; this pins the
+    /// DERIVATION, and only this one turns red when `peer_authored_content`
+    /// goes back to reading `theirs`. That distinction is the entire lesson of
+    /// v1: four green cells over a correct pure function, a one-line call site
+    /// nobody could test, and a fix that did nothing in production.
+    #[test]
+    fn peer_content_is_not_peer_mtime() {
+        let path = "/repo/shared.rs".to_string();
+        let mut inputs = GuardInputs::default();
+        // Phantom co-editor: a peer's Bash window caught a write, no transcript.
+        apply_observed(
+            &mut inputs,
+            &HashMap::new(),
+            &[("peer".to_string(), HashMap::from([(path.clone(), 100.0)]))],
+        );
+        assert!(
+            !peer_authored_content(&inputs, &path),
+            "an observed mtime must NOT count as a peer authoring content, or the \
+             Undecidable arm goes inert on every actively-edited path in the fleet"
+        );
+        // And the real thing still counts: a peer with a transcript record.
+        let mut real = GuardInputs::default();
+        real.theirs_transcript.insert(path.clone());
+        real.theirs.insert(path.clone(), ("peer".into(), 100.0));
+        assert!(
+            peer_authored_content(&real, &path),
+            "a peer transcript record MUST still gate the check on, or the \
+             7797e45 peer-hunk case loses its line detail"
+        );
+    }
+
+    /// AF-342, second iteration, and the cell that would have caught the first
+    /// one being INERT. The pure decision above was correct and fully tested;
+    /// what was wrong was the DERIVATION of `peer_claims` at the call site,
+    /// which read `theirs` and so counted a bare mtime as a peer authoring
+    /// content. On a 52-lane shared checkout a peer's Bash window catches
+    /// nearly every actively-edited path, so that arm stayed on everywhere and
+    /// the fix did nothing in production while every unit test passed.
+    ///
+    /// The property that makes the derivation safe is an ORDERING one:
+    /// `apply_observed` merges mtime rows into `theirs_firsthand` at firsthand
+    /// rank, on purpose, so only a set it never writes can answer "did a peer
+    /// author content here". This pins that `theirs_transcript` is that set.
+    /// If a future change starts maintaining it inside `apply_observed`, the
+    /// arm silently goes inert again and no other test in this file notices.
+    #[test]
+    fn apply_observed_never_writes_the_peer_transcript_set() {
+        let path = "/repo/shared.rs".to_string();
+        let mut inputs = GuardInputs::default();
+        // A peer with NO transcript record, whose only signal is an mtime that
+        // coincides with my own write: the AMUX-3497 phantom co-editor, and
+        // the exact shape the live response reported.
+        let theirs_obs = vec![("peer".to_string(), HashMap::from([(path.clone(), 100.0)]))];
+        apply_observed(&mut inputs, &HashMap::new(), &theirs_obs);
+
+        assert!(
+            inputs.theirs_firsthand.contains(&path),
+            "apply_observed must still rank observed rows WITH firsthand (AF-123)"
+        );
+        assert!(
+            inputs.theirs.contains_key(&path),
+            "and the observed row must still win the path-level claim"
+        );
+        assert!(
+            !inputs.theirs_transcript.contains(&path),
+            "an mtime is not authorship: theirs_transcript must stay empty, or \
+             a phantom co-editor re-inerts the Undecidable arm"
+        );
+        // The two questions must be answerable apart. If these ever agree for
+        // an observed-only row, the derivation has nothing left to key on.
+        assert_ne!(
+            inputs.theirs_firsthand.contains(&path),
+            inputs.theirs_transcript.contains(&path),
+            "the 'has a record' and 'authored content' questions must differ here"
+        );
     }
 
     /// MG-1484: a restore writes bytes equal to a committed ref — an edit
