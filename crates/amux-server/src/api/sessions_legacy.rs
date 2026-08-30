@@ -1470,6 +1470,55 @@ fn chars_truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
+/// True when a line — already ANSI-stripped and trimmed — is TUI CHROME
+/// rather than real content: a status-bar hint ("bypass permissions",
+/// "plan mode"), a box-drawing/separator row, or too little alphanumeric
+/// content to be a genuine line of text. Extracted from `preview_of`'s
+/// "intelligible" pass (2026-08-30) so `telegram_relay`'s reply-extraction
+/// can share the SAME answer to "is this real content or terminal
+/// furniture" instead of drifting its own copy — both read the identical
+/// raw pane capture (`tmux capture-pane -e`) and hit the identical noise:
+/// the bottom status bar, box-drawing dividers, and the like are exactly
+/// what leaked into a Telegram relay before this existed (found live,
+/// `@frontstage status` producing "[38;5;231m...bypass permissions on..."
+/// and walls of "─" instead of the model's actual reply).
+pub(crate) fn is_chrome_line(cl: &str) -> bool {
+    if cl.is_empty() {
+        return true;
+    }
+    let lower = cl.to_lowercase();
+    if cl.contains("⏵⏵") || lower.contains("bypass permissions") || lower.contains("plan mode") {
+        return true;
+    }
+    // Claude Code's own "shared session" footer card: a fixed boilerplate
+    // block CC prints under an OSC-8 hyperlink. The escape FRAMING gets
+    // stripped upstream, but the URL and label text inside it are genuine
+    // visible characters, not escape-sequence payload — ANSI stripping alone
+    // cannot remove them (found live 2026-08-30, alongside the ANSI leak:
+    // this card survived stripping and reached Telegram as a raw link plus
+    // "Claude Code" / "A shared Claude Code session on claude.ai/code").
+    if cl.contains("claude.ai/code/session_") || lower.contains("a shared claude code session") {
+        return true;
+    }
+    // The card's own EXACT heading line. An exact match (not `contains`) on
+    // purpose — prose that genuinely mentions "Claude Code" mid-sentence must
+    // still survive; only the standalone title line, printed verbatim by
+    // every instance of this card, is chrome.
+    if cl == "Claude Code" {
+        return true;
+    }
+    let n_chars = cl.chars().count();
+    if n_chars <= 2 {
+        return true;
+    }
+    let alnum = cl.chars().filter(|c| c.is_alphanumeric() || *c == ' ').count();
+    if n_chars > 3 && (alnum as f64) / (n_chars as f64) < 0.3 {
+        return true;
+    }
+    let distinct: BTreeSet<char> = cl.chars().filter(|c| *c != ' ').collect();
+    distinct.len() <= 2
+}
+
 /// Python's preview pair (amux-server.py:20224-20316): the scalar is the
 /// last non-blank RAW line, sliced to 120 chars THEN stripped (that order is
 /// Python's); `preview_lines` is an ARRAY of up to 5 intelligible lines —
@@ -1500,24 +1549,7 @@ fn preview_of(raw: &str) -> (String, Vec<String>) {
     let mut intelligible: Vec<String> = Vec::new();
     for l in &lines {
         let cl = strip_ansi(l).trim().to_string();
-        if cl.is_empty() {
-            continue;
-        }
-        let lower = cl.to_lowercase();
-        if cl.contains("⏵⏵") || lower.contains("bypass permissions") || lower.contains("plan mode")
-        {
-            continue;
-        }
-        let n_chars = cl.chars().count();
-        let alnum = cl.chars().filter(|c| c.is_alphanumeric() || *c == ' ').count();
-        if n_chars > 3 && (alnum as f64) / (n_chars as f64) < 0.3 {
-            continue;
-        }
-        if n_chars <= 2 {
-            continue;
-        }
-        let distinct: BTreeSet<char> = cl.chars().filter(|c| *c != ' ').collect();
-        if distinct.len() <= 2 {
+        if is_chrome_line(&cl) {
             continue;
         }
         intelligible.push(strip_elapsed_suffix(&chars_truncate(&cl, 200)));
