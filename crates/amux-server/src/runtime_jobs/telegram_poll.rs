@@ -226,7 +226,27 @@ async fn handle_update(state: &AppState, update: &Value) {
             let remaining = if parts.len() > 1 { parts[1] } else { "" };
             (mention.to_string(), remaining.to_string())
         } else {
-            // Invalid mention, treat whole thing as text to default session
+            // Invalid mention: still deliver the whole text to the default
+            // session (never silently dropped — ethos rule 3), but a typo'd
+            // or unknown lane name was otherwise INVISIBLE — the message
+            // lands wherever the /link default happens to be, indistinguishable
+            // from a message that never intended to address a lane at all.
+            // Found 2026-08-30: `@fronstage ...` (typo for `frontstage`) sat
+            // silently in the default session; the sender had no signal that
+            // routing missed, so "frontstage doesn't start from Telegram"
+            // read as an auto-wake bug when the message never reached
+            // send_text for that lane at all. WARN (sweep-catchable) + tell
+            // the sender inline, same as the unlinked-chat nudge below.
+            tracing::warn!(
+                "telegram_poll: unknown lane mention '@{}' from chat {}, falling back to default session '{}'",
+                mention, chat_id, mapping.session
+            );
+            let reply = format!(
+                "Note: '@{mention}' isn't a known lane — delivered to '{}' instead. Known lanes: {}",
+                mapping.session,
+                known.join(", ")
+            );
+            send_reply(chat_id, &reply).await;
             (mapping.session.clone(), text.to_string())
         }
     } else {
