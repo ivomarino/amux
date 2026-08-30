@@ -11,10 +11,15 @@
 # and ALLOW_FOREIGN on two. Overriding a guard that is right most of the time is
 # how a fleet learns to wave it through.
 #
-# THE CONSTRAINT THAT SHAPES THE FIX. Measured 2026-08-30 with this hook's own
-# PRUNE set: amux is 2,222 files in 0.03s, ~/Dev/mixpeek is 640,353 in 2.54s
-# against a 1.5s budget. So a naive widening truncates on the repo it exists to
-# fix, and a walk starting at the repo root can exhaust the budget before ever
+# THE CONSTRAINT THAT SHAPES THE FIX. amux is 2,222 files and walks in 0.03s;
+# ~/Dev/mixpeek is ~640,000 and sits right on the 1.5s budget — 2.5-2.9s COLD,
+# ~1.0s once the filesystem cache is warm. (My first figure was 2.54s and I
+# reported it without noting it was a cold walk; alternating the arms three times
+# is what separated the two.) On a box that compiles continuously the cold case
+# is not rare, and mixpeek-homepage-claude confirms every recent run on their
+# lane carries TRUNCATED=budget.
+#
+# So a walk that starts at the repo root can exhaust the budget before ever
 # reaching the session's own directory — trading a known blind spot for an
 # unpredictable one.
 #
@@ -93,6 +98,40 @@ esac
 case "$line" in
   *sub/deep/below.txt*) ok "under truncation the surviving path is the cwd one" ;;
   *) no "cwd must be walked FIRST so its coverage is never the part that is lost" "$line" ;;
+esac
+
+# A CACHE WRITE IS NOT A LANE'S EDIT (mixpeek-cicd's specimen: n=3 in which two
+# of the three recorded paths were .pytest_cache and .ruff_cache entries). Those
+# become edit records, and an edit record is what the staged guard reads to
+# decide who touched a file — so a test run minted attribution for files no
+# guard should care about. `.cache`-prefixed names were already excluded;
+# `.pytest_cache` is not `.cache`-prefixed, which is how it slipped through.
+cache_probe() {
+  local tmp; tmp="$(mktemp -d)"
+  local R="$tmp/repo"
+  mkdir -p "$R/sub" "$R/.pytest_cache/v" "$R/.ruff_cache/x"
+  git init -q "$R"
+  export AMUX_HOME="$tmp/home" AMUX_SESSION="probe-cache"
+  mkdir -p "$AMUX_HOME/hooks/state"
+  touch "$AMUX_HOME/hooks/state/observed-$AMUX_SESSION.t0"
+  sleep 1
+  echo real > "$R/sub/real.txt"
+  echo junk > "$R/.pytest_cache/v/cache.json"
+  echo junk > "$R/.ruff_cache/x/entry"
+  printf '{"cwd":"%s","tool_input":{"command":"cp src dst"}}' "$R/sub" \
+    | AMUX_URL="http://127.0.0.1:9" python3 "$HOOK" >/dev/null 2>&1
+  tail -1 "$AMUX_HOME/hooks/state/observed-edits.log" 2>/dev/null || echo ""
+  rm -rf "$tmp"
+}
+line="$(cache_probe)"
+case "$line" in
+  *pytest_cache*|*ruff_cache*) no "a tool cache write must not become an edit record" "$line" ;;
+  *) ok "tool-cache writes are pruned, not attributed" ;;
+esac
+# CONTROL: pruning caches must not lose the real file beside them.
+case "$line" in
+  *sub/real.txt*) ok "the real edit beside the caches is still recorded" ;;
+  *) no "pruning must not drop genuine edits" "$line" ;;
 esac
 
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"

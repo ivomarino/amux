@@ -21,7 +21,30 @@ import sys
 import time
 import urllib.request
 
-PRUNE = {".git", "node_modules", "target", ".venv", "__pycache__", ".next", "dist"}
+# Pruned for CORRECTNESS, not for speed (AMUX-3920, mixpeek-cicd's specimen).
+#
+# The speed argument does not survive measurement and I am recording that rather
+# than quietly acting on it: broadening this set drops ~/Dev/mixpeek from 640,355
+# files to 589,713, only 7.9%, and once the filesystem cache is warm the walk
+# takes ~1.0s either way. My earlier 2.54s figure was a COLD walk; alternating
+# the two arms three times gives 0.94/1.01s broadened against 1.04/1.08s current,
+# i.e. noise.
+#
+# The reason to prune these is that a cache write is not a lane's edit. On
+# 2026-08-30 mixpeek-cicd logged `n=3` in which TWO of the three recorded paths
+# were `.pytest_cache` and `.ruff_cache` entries. Those become edit records, and
+# an edit record is what the staged guard reads to decide who touched a file — so
+# a test run mints attribution for files no guard should care about. `.cache`-
+# prefixed names were already excluded; `.pytest_cache` and `.ruff_cache` are not
+# `.cache`-prefixed, which is why they slipped through.
+PRUNE = {
+    ".git", "node_modules", "target", ".venv", "__pycache__", ".next", "dist",
+    # Tool caches whose writes are churn, not authorship.
+    ".pytest_cache", ".ruff_cache", ".mypy_cache", ".tox", ".turbo",
+    ".parcel-cache", ".nyc_output", ".ipynb_checkpoints", ".gradle",
+    # Vendored/derived trees.
+    "site-packages", ".terraform", ".pnpm-store", ".yarn", ".worktrees",
+}
 
 
 def _derive_session_from_tmux():
