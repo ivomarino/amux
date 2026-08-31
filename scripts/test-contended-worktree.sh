@@ -88,6 +88,38 @@ else bad "(d) the no-owner disclaimer must travel with the file list"; fi
 [ $? -eq 0 ] && ok "(e) a passing stub still exits 0 through the wrapper" \
               || bad "(e) the wrapper altered the exit status"
 
+# (f) THE SNAPSHOT RE-EXEC IS PRESENT, AND IS THE FIRST THING THAT RUNS (AF-368).
+#
+# bash reads a script by BYTE OFFSET, incrementally, so a peer committing to this
+# file mid-run shifts the offsets and bash resumes mid-token. Measured live: 1888
+# passed, 0 failed, no verdict printed, `syntax error near unexpected token` on a
+# line that was a bare `#`, exit 2. The fix is that the wrapper re-execs from a
+# snapshot of itself before doing anything else.
+#
+# WHAT THIS CELL DOES AND DOES NOT PROVE, because the first version of it lied.
+# I originally wrote a behavioural cell: start the wrapper, truncate the file to
+# garbage mid-run, assert it still exits 0. It passed. It ALSO passed with the
+# re-exec mutated away, because bash buffers a file this small in one read, so
+# truncation never reached the running shell. A control that cannot fail is worse
+# than none, so it is gone rather than relabelled.
+#
+# This is a SOURCE assertion instead: the preamble exists, and no executable
+# statement precedes it. Position is the property that matters — a snapshot taken
+# after any other work is a snapshot of a file that could already have moved. It
+# cannot pass against a paraphrase, since it reads the shipped file, and it fails
+# if the preamble is removed or demoted.
+pre_line=$(grep -n '_TC_SNAPSHOT' "$WRAP" | head -1 | cut -d: -f1)
+if [ -n "$pre_line" ]; then ok "(f) the snapshot re-exec preamble is present"
+else bad "(f) the snapshot re-exec preamble is gone; a peer's edit can reach a run in flight"; fi
+if grep -q 'exec bash "\$_snap" "\$@"' "$WRAP"; then ok "(f2) and it re-execs the snapshot, passing the arguments through"
+else bad "(f2) the preamble no longer execs the snapshot copy"; fi
+# Nothing executable may run before it. Comments, `set`, and blank lines are fine;
+# anything else means the script did work against the file it is about to replace.
+before=$(awk -v n="$pre_line" 'NR<n' "$WRAP" \
+         | grep -vE '^[[:space:]]*(#|$)' | grep -vE '^set ' | grep -c . || true)
+if [ "$before" -eq 0 ]; then ok "(f3) and nothing executable runs before the snapshot is taken"
+else bad "(f3) $before statement(s) run before the snapshot; the file could move under them"; fi
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ]

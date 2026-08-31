@@ -2157,3 +2157,47 @@ FIX: Fixed. The create success path now emits `board card created` at INFO with
   instead of one site growing a silent blank. Not claimed as fixed: nothing verifies
   the header, and this does not change that. It makes a wrong stamp VISIBLE, which
   is the part that was missing.
+
+---
+## Editing a running .sh corrupts it mid-run, and the instrument cannot report its own death
+AREA: instruments
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux (hit it and diagnosed it), amux-frustrations (owns the file, took the fix)
+CARD: AF-368
+SYMPTOM: `amux` ran `scripts/test-contended.sh -p amux-server` and got:
+    1888 passed, 0 failed, and NO `test result: FAILED` line anywhere
+    no contention verdict printed at all
+    ./scripts/test-contended.sh: line 53: syntax error near unexpected token `('
+    exit 2
+  Line 53 was a bare `#`, and the file was `bash -n` clean throughout. Two of my
+  commits to that file landed inside their run. bash reads a script INCREMENTALLY,
+  by byte offset, so the file growing underneath the running shell shifted the
+  offsets and bash resumed mid-token, then failed on whatever byte now sat at its
+  saved position — nowhere near either edit.
+COST: Near-miss on a false red. Exit 2 with zero failures reads as a broken suite,
+  and amux nearly reported it as one; what stopped them was noticing that "0 failed"
+  and "exit 2" cannot both be a test result. They also correctly refused to report
+  their own AMUX-3718 work green off that run, because its exit status described my
+  edit rather than their code. This is the THIRD cause of a red suite after the
+  builder and the dirty worktree, and it is the one this script structurally cannot
+  report: it dies before reaching any echo, so its verdict is not wrong, it is
+  ABSENT. The instrument's blind spot is the instrument.
+FIX: Fixed. The wrapper now copies itself to a temp file and `exec`s that before
+  doing anything else, so an edit cannot reach a run in flight. `exec` means one
+  shell and the exit status still belongs to cargo. Snapshotting is the only fix at
+  the right layer, because a report cannot describe a run that stopped existing.
+  GENERALISES, and this is the part worth keeping: every .sh in this repo is
+  exposed, and the bash CLI ships on SAVE, so `amux` itself is the largest instance
+  — a long `amux` invocation running while any lane saves that file is this exact
+  hazard. Not fixed here; that is a separate card.
+  A NOTE ON THE TEST, because the first one lied. I wrote a behavioural cell that
+  started the wrapper, truncated the file to garbage mid-run, and asserted it still
+  exited 0. It passed. It also passed with the re-exec MUTATED AWAY, because bash
+  buffers a file this small in a single read and the truncation never reached the
+  running shell. A control that cannot fail is worse than none, so it was deleted
+  rather than relabelled. The shipped cells assert the preamble exists, execs the
+  snapshot, and has NO executable statement before it — position being the property
+  that matters, since a snapshot taken after other work is a snapshot of a file that
+  could already have moved. Both mutations now redden exactly one cell each.

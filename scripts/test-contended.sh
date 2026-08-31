@@ -23,6 +23,42 @@
 # Exit status is the test command's, untouched — this reports, it never decides.
 set -uo pipefail
 
+# RUN FROM A SNAPSHOT OF THIS FILE (AF-368, found by `amux`).
+#
+# bash reads a script INCREMENTALLY, by byte offset, not into memory up front. On
+# a shared checkout that makes every long-running .sh a moving target: a peer
+# commits to it, the file grows underneath the running shell, the offsets shift,
+# and bash resumes mid-token. It then fails on whatever byte now sits at its saved
+# position, which is usually not where the edit was.
+#
+# Measured live 2026-08-31, and the surface is maximally misleading:
+#
+#   1888 passed, 0 failed, no `test result: FAILED` line anywhere
+#   no contention verdict printed at all
+#   ./scripts/test-contended.sh: line 53: syntax error near unexpected token `('
+#   exit 2
+#
+# Line 53 was a bare `#`, and the file was `bash -n` clean the whole time. Two
+# commits of mine landed inside that run. Every test had already passed. Anyone
+# reading exit 2 reports a red suite; what caught it was that "0 failed" and
+# "exit 2" cannot both be a test result.
+#
+# THIS IS THE THIRD CAUSE, after the builder and the dirty worktree, and it is the
+# one this script structurally CANNOT report: it dies before reaching any echo, so
+# its verdict is not wrong, it is absent. The instrument's blind spot is the
+# instrument. Snapshotting is the only fix at the right layer — a report cannot
+# describe a run that stopped existing.
+#
+# `exec` replaces this process, so there is exactly one shell and the exit status
+# still belongs to cargo. The snapshot is removed by the EXIT trap below, which the
+# re-executed copy installs.
+if [ -z "${_TC_SNAPSHOT:-}" ]; then
+  _snap=$(mktemp) || exit 1
+  cat "$0" > "$_snap" || { rm -f "$_snap"; exit 1; }
+  export _TC_SNAPSHOT="$_snap"
+  exec bash "$_snap" "$@"
+fi
+
 LOCK="${AMUX_RS_BUILD_LOCK:-$HOME/.amux/rust-build.lock}"
 : "${CARGO_TARGET_DIR:=$HOME/.amux/rust-build-target}"
 export CARGO_TARGET_DIR
@@ -45,7 +81,7 @@ sample() {
 }
 
 FLAG=$(mktemp)
-trap 'kill "$SAMPLER" 2>/dev/null; rm -f "$FLAG"' EXIT INT TERM
+trap 'kill "$SAMPLER" 2>/dev/null; rm -f "$FLAG" "${_TC_SNAPSHOT:-}"' EXIT INT TERM
 
 sample & SAMPLER=$!
 
