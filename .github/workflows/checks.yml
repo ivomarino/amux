@@ -181,6 +181,17 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-friction-themes.sh
+      # AF-360. The dashboard stamps every outgoing message with the send time
+      # and had no guard against text that already carried one, so re-sending
+      # produced a nested stamp. Measured live on MSG-35221. The reader strips a
+      # SINGLE leading stamp, so the survivor is a stale timestamp that reaches
+      # the model looking exactly like a real one. Client-side and node-only, so
+      # it belongs here rather than in rust.yml; the cells drive the shipped
+      # functions extracted from app.js rather than a copy.
+      - name: the send-time stamp is applied exactly once (AF-360)
+        run: |
+          set -uo pipefail
+          ./scripts/test-send-time-stamp.sh
       # AF-342. The staged-guard's SERVER decision has unit tests in
       # git_guard.rs; what a lane actually experiences is what the hook prints,
       # and that half had none. The defect was purely printing volume (93

@@ -5567,6 +5567,43 @@ function hidePeekLoading() {
   if (ind) ind.style.display = 'none';
 }
 
+/// Does `text` already open with a send-time stamp this client wrote?
+///
+/// The stamp shape is `[<clock time>[ <author>]] `, so the discriminator is a
+/// CLOCK TIME immediately inside the leading bracket. Deliberately not "starts
+/// with a bracket": `[urgent] ship this` is an ordinary message and must still
+/// get stamped. AM/PM is optional because `toLocaleTimeString` drops it in a
+/// 24-hour locale, and the stamp has to be recognised in the same locale that
+/// wrote it.
+function _hasSendTimeStamp(text) {
+  return /^\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]\.?M\.?)?[^\]]*\]\s/i.test(text || '');
+}
+
+/// Prefix `text` with the send time, ONCE.
+///
+/// Idempotent on purpose. Re-sending a message that already carries a stamp is
+/// ordinary: Ethan re-asks by pasting the text back out of the transcript, and
+/// the offline queue replays a payload that was already built. Both used to
+/// produce a nested stamp, measured live on MSG-35221, whose stored text is
+///
+///   "[10:00 AM] [11:32 PM] where are we at with all of the items ..."
+///
+/// The inner one is 10.5 hours stale and reaches the model as message CONTENT,
+/// because the reader strips a SINGLE leading stamp (`strip_context_wrapper`,
+/// opencode/events.rs) and the survivor looks exactly like a real one. So the
+/// lane is told a time that is not when the message was sent, and cannot tell
+/// which of the two is now.
+///
+/// Returning the text unchanged rather than restamping it is the deliberate
+/// choice: the FIRST stamp is the one that was true when a human typed it, and
+/// a replay from the offline queue should not claim to have been sent at replay
+/// time.
+function _stampSendTime(text, now, author) {
+  if (_hasSendTimeStamp(text)) return text;
+  const ts = (now || new Date()).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: true});
+  return `[${ts}${author ? ` ${author}` : ''}] ${text}`;
+}
+
 async function doSend(name, text) {
   showSendingIndicator();
   // OPTIMISTIC STATUS (Ethan, 2026-08-16: "very snappy"). Flip to working the
@@ -5585,13 +5622,7 @@ async function doSend(name, text) {
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
   const isSlashCmd = /^\/[a-z]/.test(text.trim());
   amuxTrack('message_sent', { session: name, is_slash: isSlashCmd, cmd: isSlashCmd ? text.trim().split(/\s+/)[0] : null, length: text.length });
-  let payload = text;
-  if (!isSlashCmd) {
-    const now = new Date();
-    const ts = now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: true});
-    const author = _cloudEmail ? ` ${_cloudEmail}` : '';
-    payload = `[${ts}${author}] ${text}`;
-  }
+  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail);
   // One msg_id per logical send, reused verbatim by the offline-queue replay:
   // the server dedups on it, so a retry after a lost response (e.g. the
   // server restarted mid-request AFTER the keys landed) can't deliver twice.
@@ -8214,7 +8245,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.757';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.758';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
