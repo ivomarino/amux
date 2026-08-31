@@ -3212,3 +3212,61 @@ NOTE: This is the SECOND defect in this cell in four days and they point opposit
   a proxy for it. Also worth recording: the fix logs the downgrade, because STALE-because-
   downgraded and STALE-outright were otherwise byte-identical in the log, which is the one-output-
   two-states shape on the arm that prescribes the destructive remedy.
+
+## Nothing owned the WORKERS at boot — a reboot left 56 of 58 down, holding 69 `doing` cards
+VALIDATED: amux | VALIDATED by the ORIGINATING session (amux, 2026-08-31), EXERCISED rather than believed, at my request: this was one of the three I named from the four they had flagged as having no traceable card id. Is anything scheduled: YES, `com.amux.fleet-start`, RunAtLoad=true, runs=1, last exit 0, running scripts/fleet-boot.sh which calls `$AMUX_BIN start-all`. Does start_all get past the first worker: YES, and established from a REAL boot rather than by reading the loop, the 2026-08-30 run logging `55 started, 2 already running, 0 failed, 66 archived`, i.e. it walked all 112 entries. THEIR OWN FIRST PROBE WAS A FALSE NEGATIVE AND THEY SAID SO: grepping every LaunchAgent plist for `start-all` found nothing, because the plist runs a wrapper and the string lives one level down; the measured negative was wrong and looked exactly like a measured negative. RESIDUAL, deliberately NOT counted against this entry and filed as its own card AMUX-3965: the same boot's independent verdict three lines later reads `51/58 non-archived running, still down: opencode-test-1, refresh-house, self, social-media, studio-plg, ts-gke, tubescience`, and six of those seven appear in start-all's OWN `started` list. `tmux new-session -d` returns immediately, so `started` is a claim about the call and the verdict is a claim about the world. fleet-boot.sh already PUBLISHES that discriminator and its comment says so; what nothing does is act on it, and the boot exits rc=0 over the divergence.
+AREA: cli
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-29
+SESSION: amux
+CARD: AMUX-3887
+SYMPTOM: The machine restarted at ~19:55 ET. launchd brought back all four amux SERVICES (server-rs, its builder, watchdog, cert-renew) and `/health` was green within seconds. Every WORKER stayed down. `GET /api/sessions` read 2 running out of 58 non-archived, and the dashboard showed all 56 others registered, described, and stopped. Three separate defects stacked underneath, none of which announced itself: (1) `cmd_start` ran `tmux set-option -t "=$tname" allow-rename off` — a WINDOW option aimed at a SESSION, so tmux 3.6a answers "no such window" and exits 1, `2>/dev/null` eats it, and `set -euo pipefail` kills the script THERE, before the "started" echo and before the `--detach` return. A fully successful start reported rc=1 with zero output. (2) Because of (1), `cmd_start_all` — which calls `cmd_start` bare in a loop — aborted after the FIRST worker. Bulk start could never have worked. (3) `cmd_start_all` had no archive filter and would have tried to resurrect all 66 archived workers had it ever gotten past the first one, and it called `cmd_start` without `--detach`, ending in a `tmux attach-session` no boot-time caller can satisfy.
+COST: The fleet was down for roughly an hour of wall-clock until a human noticed and asked why. Recovering it took a hand-rolled staggered start loop because the sanctioned verb could not do it. The deeper cost is that this was silent in both directions: the three defects made `amux start` return failure on every success, so the exit code carried no information at all, and `start-all` was a verb that had apparently never once done what its help text says ("Start all registered workers"). Nobody could have learned this from a log, because the failing path printed nothing.
+FIX: `cmd_start` uses `set-window-option` for both rename locks, `|| true`s them so a cosmetic window-title option cannot decide whether a start succeeded, and prints a WARN naming the option and the tmux version if either is rejected — so the next tmux rename surfaces as a line instead of a fleet outage. `cmd_start_all` skips `CC_ARCHIVED=1` (read from the env file, so cold start does not depend on the server being up), passes `--detach`, keeps going past a failure, staggers via `AMUX_START_ALL_STAGGER`, and ends with a `started/already/failed/archived` summary — the count beside the zero that would have exposed (2) immediately. New `scripts/fleet-boot.sh` + `com.amux.fleet-start` launchd agent (RunAtLoad, no KeepAlive — a cold start, not a supervisor; a worker a human stopped stays stopped) waits for `/health` and brings the fleet up at login, logging an independent `N/M running` verdict from `/api/sessions` rather than trusting start-all's own count. Installed by `install.sh`; skip with `AMUX_NO_FLEET_START=1`.
+
+---
+---
+
+## `force` claimed to log the judgment and logged an empty string, 41 times out of 41
+VALIDATED: amux | VALIDATED by the ORIGINATING session (amux, 2026-08-31), EXERCISED live and in BOTH ARMS, at my request: this was one of the three I named from the four they had flagged as having no traceable card id. On a throwaway card of their own (AMUX-3964, since discarded): an empty reason was REFUSED with "force requires a reason" and the card STAYED todo; a force carrying a reason was accepted and the ledger line reads `force by amux: todo->done reason=<the actual text>`. Both arms is the claim, and they said why unprompted: the refusal arm alone proves nothing, because a gate that refuses everything passes it. That is the exact control this entry's own subject matter demanded, since the original defect was a force that logged an EMPTY judgment 41 times out of 41 while reporting success.
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-26
+SESSION: amux
+CARD: AMUX-3723
+SYMPTOM: Every force audit line on this board reads `force by <who>: a->b reason=` with nothing after the `=`. 41 lines, 41 blank — never once populated. The board contract advertises force as "bypass (judgment stays with you; logged)", and ts-gke's 2026-08-03 fix made attribution mandatory precisely so the ledger would name the party holding the judgment. It named them and recorded no judgment.
+COST: Found while auditing how the autofix backlog was actually closed, and it made that audit undecidable for 25 cards: bulk-discarded in one minute, attributed, with nothing recorded about why. Reconstructing intent meant reading desc diffs card by card. The one escape hatch from the entire gate system was the one action whose trace could not answer the only question anyone asks of it.
+FIX: f013ba5b. Neither obvious suspect was guilty, which is why it survived: `amux board --force` has always REFUSED to run without a reason, and the server has always written a supplied reason to the log (an existing test asserts it, and passed throughout). The CLI validated the reason and then sent it as `desc_append` instead of `reason` — 9 of the 41 cards carry a good "[FORCED] <why>" in their desc beside a ledger line that says nothing. A test on either side of the seam and none ON it. Now: the CLI sends both, the server refuses a blank reason from any caller with a 400 that names the sanctioned command, and a `force_without_reason` tracing marker makes the next off-path caller visible (a bare 400 here groups with every other board-PATCH 400 in /api/logs/analyze).
+
+---
+
+## session-freshness reported a stale shadowing CLI and prescribed the `cp` that rebuilds it
+VALIDATED: amux | VALIDATED by the ORIGINATING session (amux, 2026-08-31), EXERCISED rather than believed, at my request: this was one of the three I named from the four they had flagged as having no traceable card id. `.claude/session-freshness.sh:226` now prescribes a SYMLINK, and its own comment names the copy it replaced; no `cp` anywhere in the file's 453 lines. RESIDUAL THEY VOLUNTEERED AND I AGREE IS SMALLER THAN THE ENTRY, so not counted against it: the hook does not mention scripts/mutate.sh either, so it no longer teaches the wrong thing and does not yet teach the right one. Worth noting because ethos rule 7 now names mutate.sh explicitly as the alternative to `cp file bak`, and the session-freshness hook is the surface every lane reads at session start.
+AREA: instrumentation
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: amux
+CARD: AMUX-3687
+SYMPTOM: The freshness hook's Axis-2 shadow detector fired correctly on
+  /usr/local/bin/amux and then offered `cp "$REPO/amux" "$cand"` as the remedy. A copy
+  silences the warning and leaves a copy, which is stale again the next time anyone edits
+  ./amux — so the prescribed fix reconstructs the exact condition being reported. It is
+  also how the specimen got there: ~/.local/bin/amux has been a SYMLINK since install.sh
+  created it, and /usr/local/bin/amux was the copy, so the one file that could drift was
+  the one the remedy would recreate. What was actually sitting there was an Aug-6
+  227-line stub knowing two verbs (send, board) and defaulting AMUX_URL to
+  https://localhost:8822, the retired port (AMUX-3046). A lane resolving it gets
+  connection-refused on every call, and help-and-exit-0 on `url` or `alert`.
+COST: 18 days undetected, and the detection that finally landed pointed at a remedy that
+  would have reset the clock. Not measurable in minutes for me (the hook named the file
+  and I checked it), but any lane whose PATH ordered /usr/local/bin first was talking to
+  a dead port for those 18 days with no error a session would recognise as a stale CLI.
+FIX: `ln -sfn`, in both branches of the axis, with the reason stated inline so it does not
+  get "simplified" back to a cp. b0a0c6b7. Live shadow reconciled the same way; both PATH
+  entries now resolve to the checkout and the axis is silent.
+  The generalisable half: a detector that names a remedy owes the same scrutiny to the
+  REMEDY as to the check. This one could fail, fired correctly, and still closed the loop
+  back onto itself.

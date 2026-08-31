@@ -1617,34 +1617,6 @@ FIX: two separate fixes. (1) Upgrade mixpeek/.githooks/amux-staged-guard and
   numerically in addition to/instead of grepping tokens. Otherwise the next
   stale copy hides the same way. Neither started; MR-44.
 
-## session-freshness reported a stale shadowing CLI and prescribed the `cp` that rebuilds it
-AREA: instrumentation
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-24
-SESSION: amux
-CARD: AMUX-3687
-SYMPTOM: The freshness hook's Axis-2 shadow detector fired correctly on
-  /usr/local/bin/amux and then offered `cp "$REPO/amux" "$cand"` as the remedy. A copy
-  silences the warning and leaves a copy, which is stale again the next time anyone edits
-  ./amux — so the prescribed fix reconstructs the exact condition being reported. It is
-  also how the specimen got there: ~/.local/bin/amux has been a SYMLINK since install.sh
-  created it, and /usr/local/bin/amux was the copy, so the one file that could drift was
-  the one the remedy would recreate. What was actually sitting there was an Aug-6
-  227-line stub knowing two verbs (send, board) and defaulting AMUX_URL to
-  https://localhost:8822, the retired port (AMUX-3046). A lane resolving it gets
-  connection-refused on every call, and help-and-exit-0 on `url` or `alert`.
-COST: 18 days undetected, and the detection that finally landed pointed at a remedy that
-  would have reset the clock. Not measurable in minutes for me (the hook named the file
-  and I checked it), but any lane whose PATH ordered /usr/local/bin first was talking to
-  a dead port for those 18 days with no error a session would recognise as a stale CLI.
-FIX: `ln -sfn`, in both branches of the axis, with the reason stated inline so it does not
-  get "simplified" back to a cp. b0a0c6b7. Live shadow reconciled the same way; both PATH
-  entries now resolve to the checkout and the axis is silent.
-  The generalisable half: a detector that names a remedy owes the same scrutiny to the
-  REMEDY as to the check. This one could fail, fired correctly, and still closed the loop
-  back onto itself.
-
 ## An AF-66-style guard existed for this and had been green the whole time
 AREA: instruments
 SEVERITY: slows
@@ -1716,18 +1688,6 @@ SYMPTOM: `amux send <peer> --stdin` -> `/Users/ethan/.local/bin/amux: line 1906:
 COST: The whole fleet lost the CLI until a peer noticed and reported it over the HTTP API. Unquantifiable session-minutes across ~50 lanes, and the reporter spent time chasing an mtime that could never have explained it. Worse than the outage: a CLI that cannot parse cannot print its own help, so the tool could not tell anyone how to work around the tool — a session that had only ever used `amux send` had no path left to discover POST /api/sessions/<n>/send exists, and would read it as "amux is down" rather than "the CLI is down".
 FIX: 5ecec79c. Two gates at the two boundaries. `.claude/check-and-commit.sh` runs `bash -n` on any edit to `amux` — that is the one that fires in TIME, because ~/.local/bin/amux is a symlink into the working tree and for the bash CLI the deploy boundary is the SAVE, not the commit: no install, no builder cycle, no CI in between. `tests/cli_syntax_guard.rs` is the backstop for an edit made without the hook. Both mutation-verified against the real specimen. The repo already ran `node --check` on dashboard JS on every save; the CLI, which ships faster and breaks wider, had nothing.
 
-## `force` claimed to log the judgment and logged an empty string, 41 times out of 41
-AREA: attribution
-SEVERITY: slows
-STATUS: fixed
-DATE: 2026-08-26
-SESSION: amux
-CARD: AMUX-3723
-SYMPTOM: Every force audit line on this board reads `force by <who>: a->b reason=` with nothing after the `=`. 41 lines, 41 blank — never once populated. The board contract advertises force as "bypass (judgment stays with you; logged)", and ts-gke's 2026-08-03 fix made attribution mandatory precisely so the ledger would name the party holding the judgment. It named them and recorded no judgment.
-COST: Found while auditing how the autofix backlog was actually closed, and it made that audit undecidable for 25 cards: bulk-discarded in one minute, attributed, with nothing recorded about why. Reconstructing intent meant reading desc diffs card by card. The one escape hatch from the entire gate system was the one action whose trace could not answer the only question anyone asks of it.
-FIX: f013ba5b. Neither obvious suspect was guilty, which is why it survived: `amux board --force` has always REFUSED to run without a reason, and the server has always written a supplied reason to the log (an existing test asserts it, and passed throughout). The CLI validated the reason and then sent it as `desc_append` instead of `reason` — 9 of the 41 cards carry a good "[FORCED] <why>" in their desc beside a ledger line that says nothing. A test on either side of the seam and none ON it. Now: the CLI sends both, the server refuses a blank reason from any caller with a 400 that names the sanctioned command, and a `force_without_reason` tracing marker makes the next off-path caller visible (a bare 400 here groups with every other board-PATCH 400 in /api/logs/analyze).
-
----
 ## Typing at a lane disabled that lane's auto-pickup
 AREA: board
 SEVERITY: blocks
@@ -1772,19 +1732,6 @@ SYMPTOM: A full `cargo test -p amux-server --lib` run showed 8 failures, all in 
 COST: I nearly reported 8 failures as a regression in a peer's area, and spent a cycle proving they were not. The larger cost is retrospective: every "1530 pass, 0 failed" I wrote on a card today rested on a run that happened not to contend, and I could not have told the difference at the time. A green suite here means "green, and nothing was building" — the second clause is invisible and nobody states it. That is the same shape as the 706ms latency number from the same day: a measurement taken on a machine whose load is the dominant variable, reported as if the load were not there.
 FIX: none yet. The cheap instrument, not the cure: have the test run record whether a build was in flight (the builder's lock is already on disk at `~/.amux/rust-build.lock`) and print it beside the result, so a red suite says whether it was contended. The cure is either per-lane target dirs (rejected before, for disk) or serialising the spawn-a-binary tests behind the same lock the builder takes. Naming the instrument first because the wrong lesson from this entry is "ignore red suites", and a contention flag is what separates the two honestly.
 
----
-## Nothing owned the WORKERS at boot — a reboot left 56 of 58 down, holding 69 `doing` cards
-AREA: cli
-SEVERITY: blocks
-STATUS: fixed
-DATE: 2026-08-29
-SESSION: amux
-CARD: AMUX-3887
-SYMPTOM: The machine restarted at ~19:55 ET. launchd brought back all four amux SERVICES (server-rs, its builder, watchdog, cert-renew) and `/health` was green within seconds. Every WORKER stayed down. `GET /api/sessions` read 2 running out of 58 non-archived, and the dashboard showed all 56 others registered, described, and stopped. Three separate defects stacked underneath, none of which announced itself: (1) `cmd_start` ran `tmux set-option -t "=$tname" allow-rename off` — a WINDOW option aimed at a SESSION, so tmux 3.6a answers "no such window" and exits 1, `2>/dev/null` eats it, and `set -euo pipefail` kills the script THERE, before the "started" echo and before the `--detach` return. A fully successful start reported rc=1 with zero output. (2) Because of (1), `cmd_start_all` — which calls `cmd_start` bare in a loop — aborted after the FIRST worker. Bulk start could never have worked. (3) `cmd_start_all` had no archive filter and would have tried to resurrect all 66 archived workers had it ever gotten past the first one, and it called `cmd_start` without `--detach`, ending in a `tmux attach-session` no boot-time caller can satisfy.
-COST: The fleet was down for roughly an hour of wall-clock until a human noticed and asked why. Recovering it took a hand-rolled staggered start loop because the sanctioned verb could not do it. The deeper cost is that this was silent in both directions: the three defects made `amux start` return failure on every success, so the exit code carried no information at all, and `start-all` was a verb that had apparently never once done what its help text says ("Start all registered workers"). Nobody could have learned this from a log, because the failing path printed nothing.
-FIX: `cmd_start` uses `set-window-option` for both rename locks, `|| true`s them so a cosmetic window-title option cannot decide whether a start succeeded, and prints a WARN naming the option and the tmux version if either is rejected — so the next tmux rename surfaces as a line instead of a fleet outage. `cmd_start_all` skips `CC_ARCHIVED=1` (read from the env file, so cold start does not depend on the server being up), passes `--detach`, keeps going past a failure, staggers via `AMUX_START_ALL_STAGGER`, and ends with a `started/already/failed/archived` summary — the count beside the zero that would have exposed (2) immediately. New `scripts/fleet-boot.sh` + `com.amux.fleet-start` launchd agent (RunAtLoad, no KeepAlive — a cold start, not a supervisor; a worker a human stopped stays stopped) waits for `/health` and brings the fleet up at login, logging an independent `N/M running` verdict from `/api/sessions` rather than trusting start-all's own count. Installed by `install.sh`; skip with `AMUX_NO_FLEET_START=1`.
-
----
 ---
 ## `git commit -a` in a shared checkout swept three lanes' in-flight work into one lane's commit, twice in four hours
 AREA: attribution
@@ -2122,3 +2069,38 @@ FIX: Fixed for this instance by splitting it: AF-98 is narrowed to the isolated-
   have the typed `--ask` gate (AF-318) refuse an ask whose own body names a remedy the
   ASKER can apply. That is detectable — this refusal literally contained an imperative
   addressed to the sender.
+
+---
+## Retiring an entry is two writes, and only the second one can fail
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux-frustrations
+CARD: AF-362
+SYMPTOM: `scripts/frustrations-archive.py` does two things per entry: it MOVES the
+  text from frustrations.md into frustrations-archive.md (a local file write, which
+  always succeeds) and it CARRIES the SYMPTOM and COST onto the entry's card over
+  HTTP. Only the second can fail, and it did, twice in one batch:
+    AMUX-3887: NOT carried (curl exit 7, 0 bytes)
+    AMUX-3723: NOT carried (curl exit 7, 0 bytes)
+  `/api/health` answered normally moments later with `uptime_s: 11`. The server was
+  not down, it was MID-RESTART: this box rebuilds and swaps the binary on every
+  commit, and I had just committed twice.
+COST: Two half-retired entries. The text was gone from frustrations.md and the cards
+  it pointed at never received the symptom or cost, which is the whole reason AF-38's
+  rule carries them: the card is where someone hitting the friction again looks. The
+  archive move is NOT rolled back on a failed carry, so nothing self-heals and nothing
+  re-attempts. I only caught it because the tool prints `NOT carried` honestly, which
+  is AF-150's lesson working; a version that inferred success from an empty stdout
+  would have reported two clean retirements. The exposure scales with batch size and
+  I archived 20 entries in one run tonight, so this was luck rather than a near miss.
+FIX: Fixed. The carry now retries three times with 2s between attempts, which covers
+  a binary swap, and still reports `NOT carried` when the server is genuinely down
+  rather than blocking the archive (a retry that ended in a false success would be
+  worse than none). Cell (r) in scripts/test-frustrations-archive.sh pins it on
+  elapsed time against a closed port, a floor and never a ceiling; cell (r2) is the
+  control that the failure is still reported. Removing the sleep makes (r) fail.
+  The general shape is worth keeping: an operation that is one verb to the user but
+  two writes underneath needs to say which half it completed, and this one did, which
+  is the only reason there was anything to fix rather than to discover later.
