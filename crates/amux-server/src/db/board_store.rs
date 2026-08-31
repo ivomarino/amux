@@ -411,6 +411,104 @@ pub fn ask_verdict(ask_type: &str, question: &str, unblocks: &str) -> AskVerdict
     AskVerdict::Ok
 }
 
+// ---------------------------------------------------------------------------
+// The continuation contract (AMUX-3946)
+// ---------------------------------------------------------------------------
+
+pub const CONTINUATION_REQUIRED_KEY: &str = "AMUX_CONTINUATION_REQUIRED";
+
+/// Is the continuation gate on for this lane?
+///
+/// OPT-IN, which is the one place this deliberately departs from ethos rule 1's
+/// "prefer opt-out". The rule's question is who receives a capability by
+/// default; this is a COST, and it lands on 52 lanes at once. amux opts in
+/// first and eats it, per the dogfooding rule, and the default flips once there
+/// is a measurement rather than a guess about what it costs.
+///
+/// Structured exactly like `needsyou_ask_required` so the two cannot drift:
+/// env var wins, then the per-lane scoped setting. Only the DEFAULT differs,
+/// and it differs on purpose.
+pub fn continuation_required(session: Option<&str>) -> bool {
+    fn is_on(v: &str) -> bool {
+        matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes")
+    }
+    if let Ok(v) = std::env::var(CONTINUATION_REQUIRED_KEY) {
+        if !v.trim().is_empty() {
+            return is_on(&v);
+        }
+    }
+    let lane = match session.filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return false,
+    };
+    match crate::api::session_verbs::scoped_setting_in(
+        &crate::api::session_verbs::home(),
+        lane,
+        CONTINUATION_REQUIRED_KEY,
+    ) {
+        Some(v) => is_on(&v),
+        None => false,
+    }
+}
+
+/// Why a claim was refused for want of a continuation, or that it was accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationVerdict {
+    /// Carries a next action a stranger could act on.
+    Ok,
+    /// Nothing at all in `next_action`.
+    Missing,
+    /// Present but not a sentence: "wip", "continue", "n/a".
+    NotASentence,
+}
+
+/// Does this card say what the next actor should DO?
+///
+/// NO AUTO-SEED, and this is a correction to the plan as first written. Seeding
+/// `next_action` from the card's own `desc` would make the gate satisfiable
+/// without anyone thinking about the reader, which converts an enforcing gate
+/// into a warn-only one with extra steps. AMUX-3854 is the proof: its desc is
+/// "make it so this is all automatic", so a desc-seed would have produced
+/// exactly the useless next action this gate exists to refuse, and it would
+/// have looked like content.
+///
+/// AF-241 is a live card about dashboard toggles that control nothing. A gate
+/// that anything can satisfy becomes one of those.
+///
+/// The floor is three words, borrowed from `is_a_sentence` above rather than
+/// re-spelled, because the specimens are the same shape ("wip", "continue",
+/// "still working on it" is four and passes, which is the honest edge: this
+/// gate can force a sentence, not sincerity).
+///
+/// Deliberately NO upper bound. A length ceiling would be enforced by
+/// truncation, and truncating the one field whose job is to survive the
+/// author's context is the opposite of the point. The 300-800 token budget is
+/// documented guidance in the migration, not a check.
+pub fn continuation_verdict(next_action: &str) -> ContinuationVerdict {
+    if next_action.trim().is_empty() {
+        return ContinuationVerdict::Missing;
+    }
+    if !is_a_sentence(next_action) {
+        return ContinuationVerdict::NotASentence;
+    }
+    ContinuationVerdict::Ok
+}
+
+/// Does entering `status` require a continuation?
+///
+/// SCOPED TO `doing` FOR NOW, and the narrowness is deliberate. `doing` is the
+/// state where the gap actually bites: a lane claims a card, works, stops, and
+/// the next reader has nothing. `review` already carries a reviewer and a diff,
+/// `needsyou` is covered by the typed ask (0037), `backlog` is parked on an
+/// external trigger, and terminal states have an outcome instead.
+///
+/// Widening this is a one-line change and a new cell. Starting wide would have
+/// meant refusing transitions in four states on day one for a field nobody has
+/// written yet.
+pub fn continuation_applies(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Doing)
+}
+
 /// How much else is waiting behind this card (AF-318's owner view).
 ///
 /// Deliberately a COUNT OF DEPENDENTS and not a guess at importance. A card
@@ -1345,6 +1443,16 @@ pub struct IssueRow {
     /// falsifiable — without it nobody but the author can tell whether an
     /// answer landed.
     pub ask_unblocks: Option<String>,
+    /// The continuation contract (AMUX-3946). `next_action` is what the next
+    /// actor should DO and is the only one gated; `last_result` is what the
+    /// previous attempt produced; `unresolved` is what is still open.
+    ///
+    /// `unresolved` is deliberately ungated: requiring it would make every card
+    /// invent an open question to be claimable, and a manufactured question is
+    /// worse than none because it reads as a real one.
+    pub next_action: Option<String>,
+    pub last_result: Option<String>,
+    pub unresolved: Option<String>,
     pub last_verified_at: Option<i64>,
     /// Rust per-row version (migration 0002). Bumped alongside `rev`.
     pub version: i64,
@@ -1421,6 +1529,9 @@ impl IssueRow {
             "ask_type": self.ask_type,
             "ask_question": self.ask_question,
             "ask_unblocks": self.ask_unblocks,
+            "next_action": self.next_action,
+            "last_result": self.last_result,
+            "unresolved": self.unresolved,
             // In BOTH snapshots deliberately, i.e. NOT in `slim_omits`. The
             // motivating question ("which cards closed in this window") is a
             // LIST query, so omitting it from the list body would ship the
@@ -1522,7 +1633,8 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.type, COALESCE(i.archived,0), i.depends_on, i.reviewer, i.log, \
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
      i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence, \
-     i.ask_type, i.ask_question, i.ask_unblocks";
+     i.ask_type, i.ask_question, i.ask_unblocks, \
+     i.next_action, i.last_result, i.unresolved";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -1633,6 +1745,9 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         ask_type: r.get(30)?,
         ask_question: r.get(31)?,
         ask_unblocks: r.get(32)?,
+        next_action: r.get(33)?,
+        last_result: r.get(34)?,
+        unresolved: r.get(35)?,
         // Some Python-era databases stored this column as TEXT despite the
         // schema saying INTEGER (legacy-data mismatch, not a live schema
         // bug) — rusqlite's FromSql is strict per storage type, so EITHER
@@ -2228,8 +2343,9 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              type = ?12, archived = ?13, depends_on = ?14, reviewer = ?15, log = ?16, \
              rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
              epic = ?22, closed_at = ?23, evidence = ?24, ask_type = ?25, \
-             ask_question = ?26, ask_unblocks = ?27 \
-         WHERE id = ?28 AND deleted IS NULL",
+             ask_question = ?26, ask_unblocks = ?27, next_action = ?28, \
+             last_result = ?29, unresolved = ?30 \
+         WHERE id = ?31 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -2258,6 +2374,9 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.ask_type,
             row.ask_question,
             row.ask_unblocks,
+            row.next_action,
+            row.last_result,
+            row.unresolved,
             row.id,
         ],
     )
@@ -2859,6 +2978,101 @@ mod tests {
         crate::db::migrate::test_memdb()
     }
 
+    /// AMUX-3946. The continuation gate's predicate, both arms.
+    ///
+    /// The refusal is the headline; the ACCEPTANCE is what stops the fix from
+    /// being a blanket refusal that lanes route around with --force.
+    #[test]
+    fn a_claim_needs_a_next_action_a_stranger_could_act_on() {
+        assert_eq!(continuation_verdict(""), ContinuationVerdict::Missing);
+        assert_eq!(continuation_verdict("   "), ContinuationVerdict::Missing);
+        // Real specimens of the shrug this exists to refuse.
+        assert_eq!(continuation_verdict("wip"), ContinuationVerdict::NotASentence);
+        assert_eq!(continuation_verdict("continue"), ContinuationVerdict::NotASentence);
+        // ACCEPTED, and it has to be, or the gate is unsatisfiable.
+        assert_eq!(
+            continuation_verdict("Rerun compatibility test 07 against KubeRay 1.4"),
+            ContinuationVerdict::Ok
+        );
+        // THE HONEST EDGE, stated rather than hidden: this gate can force a
+        // sentence, not sincerity. "still working on it" is four words and
+        // passes. Three words is the floor at which somebody has had to think
+        // about the reader, and no predicate here can do better than that.
+        assert_eq!(continuation_verdict("still working on it"), ContinuationVerdict::Ok);
+    }
+
+    /// SCOPE. The gate is on `doing` and nowhere else, and the other states are
+    /// asserted rather than assumed: a gate that quietly applied to `review`
+    /// too would refuse transitions nobody was warned about.
+    #[test]
+    fn the_continuation_gate_applies_to_doing_and_nothing_else() {
+        assert!(continuation_applies(TaskStatus::Doing));
+        for st in [
+            TaskStatus::Todo,
+            TaskStatus::Review,
+            TaskStatus::NeedsYou,
+            TaskStatus::Done,
+            TaskStatus::Verified,
+            TaskStatus::Discarded,
+        ] {
+            assert!(!continuation_applies(st), "{st:?} must not be gated by Phase 1");
+        }
+    }
+
+    /// OPT-IN, and OFF by default. Decision 3 on AMUX-3945: this is a cost, and
+    /// it lands on 52 lanes at once, so amux eats it first.
+    ///
+    /// The env override is asserted in both directions because a flag that can
+    /// only be turned ON is not a flag, and this one has to be switchable off
+    /// by a lane it is hurting without a deploy.
+    #[test]
+    fn the_continuation_gate_is_off_until_a_lane_opts_in() {
+        // A guard so this cannot leak into other tests in the binary.
+        struct Restore(Option<String>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(v) => std::env::set_var(CONTINUATION_REQUIRED_KEY, v),
+                    None => std::env::remove_var(CONTINUATION_REQUIRED_KEY),
+                }
+            }
+        }
+        let _r = Restore(std::env::var(CONTINUATION_REQUIRED_KEY).ok());
+
+        std::env::remove_var(CONTINUATION_REQUIRED_KEY);
+        assert!(!continuation_required(Some("some-lane")), "default is OFF");
+        assert!(!continuation_required(None), "an unattributed caller is not gated");
+
+        std::env::set_var(CONTINUATION_REQUIRED_KEY, "1");
+        assert!(continuation_required(Some("some-lane")), "env can turn it on");
+        std::env::set_var(CONTINUATION_REQUIRED_KEY, "0");
+        assert!(!continuation_required(Some("some-lane")), "and off again");
+    }
+
+    /// THE WRITE MUST SURVIVE THE ROUND TRIP.
+    ///
+    /// Adding a column to a struct and to a SELECT while forgetting the UPDATE
+    /// is the exact shape of the silent-drop bugs this file already records
+    /// (AC-323: a field that lands in `ignored_fields` and does nothing). The
+    /// gate would then refuse a card whose `next_action` had been written and
+    /// discarded, which is worse than having no gate.
+    #[test]
+    fn the_continuation_fields_survive_save_and_reload() {
+        let conn = create_db();
+        let mut row = create_issue(&conn, &new_card("todo"), 1000).expect("create");
+        assert_eq!(row.next_action, None, "a fresh card carries no continuation");
+
+        row.next_action = Some("Rerun compatibility test 07 against KubeRay 1.4".into());
+        row.last_result = Some("E2E 07 failed on namespace-scoped discovery".into());
+        row.unresolved = Some("Do multiple namespaces need support?".into());
+        save_patched(&conn, &mut row).expect("save");
+
+        let back = get_issue(&conn, &row.id).expect("read").expect("row");
+        assert_eq!(back.next_action.as_deref(), Some("Rerun compatibility test 07 against KubeRay 1.4"));
+        assert_eq!(back.last_result.as_deref(), Some("E2E 07 failed on namespace-scoped discovery"));
+        assert_eq!(back.unresolved.as_deref(), Some("Do multiple namespaces need support?"));
+    }
+
     /// AMUX-3609. The write rule lives in `save_patched`, so these drive the
     /// real function rather than a paraphrase of it.
     ///
@@ -3244,6 +3458,9 @@ mod tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            next_action: None,
+            last_result: None,
+            unresolved: None,
             last_verified_at: None,
             closed_at: None,
             version: 0,
@@ -3348,7 +3565,10 @@ mod configured_gate_tests {
             gate: gate.map(String::from), shepherd: None, item_type: item_type.into(),
             archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
             source_ref: None, evidence: None, ask_type: None, ask_question: None,
-            ask_unblocks: None, last_verified_at: None, closed_at: None,
+            ask_unblocks: None,
+            next_action: None,
+            last_result: None,
+            unresolved: None, last_verified_at: None, closed_at: None,
             version: 0, tags: vec![],
         }
     }

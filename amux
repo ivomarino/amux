@@ -2531,6 +2531,51 @@ print(json.dumps(b))' \
       echo "$result" | _board_outcome "$id" "" "$_what"
       return $?
       ;;
+    next)
+      # AMUX-3946. The continuation contract needs an attributed setter, or the
+      # gate's own remedy line ("amux board next <ID> ...") would point at a raw
+      # PATCH with no X-Amux-Session — the exact defect AMUX-2325 recorded for
+      # `type`/`reviewer`, where a nudge manufactured the unattributed writes it
+      # then complained about.
+      #
+      # --stdin is the preferred form for the same reason as retitle: an inline
+      # argument is evaluated by YOUR shell first, so backticks and $(...) in it
+      # are EXECUTED (AMUX-1888), and a next action very often quotes a command.
+      local id="${1:-}"
+      _board_id_guard "next" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board next <ISSUE-ID> <what to do next> | --stdin | --file <path>
+       amux board next <ISSUE-ID> --result <text>       (what the last attempt produced)
+       amux board next <ISSUE-ID> --unresolved <text>   (what is still open)
+Writes the continuation contract so a reader arriving with no conversation
+history can act on the card. Only next_action is gated, and only on 'doing'."
+      shift
+      local na="" lr="" un="" _mode=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --stdin)      na="$(cat)"; _mode=1; shift ;;
+          --file)       [[ -f "${2:-}" ]] || die "--file needs a readable path"; na="$(cat "$2")"; _mode=1; shift 2 ;;
+          --result)     lr="${2:-}"; [[ -n "$lr" ]] || die "--result needs text"; _mode=1; shift 2 ;;
+          --result-stdin) lr="$(cat)"; _mode=1; shift ;;
+          --unresolved) un="${2:-}"; [[ -n "$un" ]] || die "--unresolved needs text"; _mode=1; shift 2 ;;
+          --help|-h)    die "amux board next <ISSUE-ID> <text> | --stdin | --file <p> | --result <t> | --unresolved <t>" ;;
+          -*)           die "amux board next: unknown flag '$1'" ;;
+          *)            na="$1"; _mode=1; shift ;;
+        esac
+      done
+      [[ -n "$_mode" ]] || die "nothing to write: pass a next action, --stdin, --file, --result or --unresolved"
+      local result
+      result=$(N="$na" R="$lr" U="$un" python3 -c 'import json,os
+b={}
+for env,field in (("N","next_action"),("R","last_result"),("U","unresolved")):
+    v=os.environ.get(env,"")
+    if v.strip(): b[field]=v.strip()
+print(json.dumps(b))'         | _curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      local _what="continuation set"
+      [[ -n "$na" ]] || _what="continuation updated"
+      echo "$result" | _board_outcome "$id" "" "$_what"
+      return $?
+      ;;
     add|create)
       # Title via --stdin/--file keeps it out of a shell-evaluated string
       # (AMUX-1888); the JSON body is built with json.dumps, not string
@@ -3064,6 +3109,13 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board type <ID> <type>      Correct a card's type (the gate is DERIVED from it)
   amux board epic <ID> <EPIC-ID>   Roll a card up under an epic ('none' detaches)
   amux board reviewer <ID> <W>     Name the peer a card in review is handed to
+  amux board next <ID> <text>      Continuation: what the next actor should DO.
+                                   --stdin/--file preferred (a next action often
+                                   quotes a command, and an inline arg is shell-
+                                   evaluated first). Also --result <what the last
+                                   attempt produced> and --unresolved <what is
+                                   still open>. Required to enter 'doing' on lanes
+                                   that have opted in (AMUX_CONTINUATION_REQUIRED).
   amux board archive <ID>          Hide a card from every view AND every autonomy loop
   amux board unarchive <ID>        Bring an archived card back (the un-do, AMUX-2492)
   amux board retitle <ID> <title>  Rewrite a title/desc so the card stands alone

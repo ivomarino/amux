@@ -2726,7 +2726,7 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 23] = [
+const PATCH_WRITABLE: [&str; 26] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -2750,6 +2750,13 @@ const PATCH_WRITABLE: [&str; 23] = [
     "ask_type",
     "ask_question",
     "ask_unblocks",
+    // The continuation contract (AMUX-3946). Writable on their own for the same
+    // reason the ask fields are: a lane can write the continuation first and
+    // then move the card in a second call that cannot fail on content, so a
+    // refused transition never discards what the author just wrote.
+    "next_action",
+    "last_result",
+    "unresolved",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -3591,6 +3598,9 @@ pub async fn patch_item(
             set_opt("ask_type", &mut next.ask_type, &mut changed);
             set_opt("ask_question", &mut next.ask_question, &mut changed);
             set_opt("ask_unblocks", &mut next.ask_unblocks, &mut changed);
+            set_opt("next_action", &mut next.next_action, &mut changed);
+            set_opt("last_result", &mut next.last_result, &mut changed);
+            set_opt("unresolved", &mut next.unresolved, &mut changed);
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -4534,6 +4544,72 @@ pub async fn patch_item(
                     // there: a retroactive sweep would be this same guess made
                     // once more, at scale, by the party least able to check it
                     // (ethos rule 8). They drain by being re-asked.
+                    // THE CONTINUATION GATE, on the same door and by the same
+                    // shape (AMUX-3946). A card entering `doing` must say what
+                    // the next actor should DO, so that a reader arriving with
+                    // no conversation history can act on it.
+                    //
+                    // Measured in one session, eight cards claimed cold: the two
+                    // carrying a reproduction and a stated next step closed in a
+                    // single pass; AMUX-3854 reads "make it so this is all
+                    // automatic" against a deleted screenshot and cannot be
+                    // worked by anyone, including its author.
+                    //
+                    // `force` bypasses it, exactly as it bypasses the ask gate.
+                    // A gate with no truthful escape is one people route around
+                    // (ethos rule 3), and every force is already audited.
+                    //
+                    // ON THE TRANSITION, never retroactively on cards already in
+                    // `doing`. Same reasoning AF-318 recorded for the 445: a
+                    // retroactive sweep is a guess made at scale by the party
+                    // least able to check it.
+                    let continuation_required = !force
+                        && bs::continuation_applies(target)
+                        && bs::continuation_required(next.session.as_deref());
+                    if continuation_required {
+                        let verdict =
+                            bs::continuation_verdict(next.next_action.as_deref().unwrap_or(""));
+                        if verdict != bs::ContinuationVerdict::Ok {
+                            let (why, code) = match verdict {
+                                bs::ContinuationVerdict::Missing => (
+                                    "This card does not say what to DO next. Claiming it means someone will arrive here later, possibly you after a compaction, with no conversation history — and `desc` describes the problem, not the next move. One sentence.",
+                                    "doing_requires_next_action",
+                                ),
+                                bs::ContinuationVerdict::NotASentence => (
+                                    "`next_action` has to be a sentence a stranger could act on. \"wip\" and \"continue\" name no action; three words is the floor at which somebody has had to think about the reader.",
+                                    "doing_next_action_not_a_sentence",
+                                ),
+                                bs::ContinuationVerdict::Ok => unreachable!(),
+                            };
+                            // Two-fix rule, same shape as `needsyou_ask_gate`
+                            // below: grep `continuation_gate` in server-rs.log,
+                            // and the structured `code` splits these out in
+                            // /api/logs/analyze. A gate whose refusals are
+                            // invisible cannot tell you it is too strict.
+                            tracing::warn!(
+                                "continuation_gate: blocked {} -> doing for session {} (verdict {:?})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-"),
+                                verdict
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::BAD_REQUEST,
+                                    json!({
+                                        "error": code,
+                                        "why": why,
+                                        "how": "amux board next <ID> \"<what the next actor should do>\"",
+                                        "fields": "next_action is what to do next; last_result is what the previous attempt produced; unresolved is what is still open. Only next_action is gated — a card should not have to invent an open question to be claimable.",
+                                        "escape": "amux board doing <ID> --force  (audited, and it is the honest move when the next action genuinely is not knowable yet)",
+                                        "scope": "This gate is on `doing` only, and only for lanes that have opted in.",
+                                        "override_for_this_worker": "set AMUX_CONTINUATION_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
                     let ask_required = !force
                         && target == TaskStatus::NeedsYou
                         && bs::needsyou_ask_required(next.session.as_deref());
