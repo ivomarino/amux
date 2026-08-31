@@ -376,8 +376,22 @@ pub fn build(
              `git checkout origin/main -- <path>` reverts YOUR landed commits — and the \
              find-object restore-safety check PASSES while it does, because locally-committed \
              content is reachable-from-a-commit too (that is how the mixpeek MG-1483 push guard \
-             was silently disarmed, 2026-08-20). MERGE the two versions, or hand the path to its owner. Do \
-             not clear these with any single-arm command."
+             was silently disarmed, 2026-08-20). Do not clear these with any single-arm command.\n\n\
+             THREE-WAY MERGE, per path, non-destructive (AMUX-3718 — this arm used to say \
+             \"MERGE the two versions, or hand the path to its owner\" and stop, while every \
+             other arm here carries something runnable; of 16 paths one lane was told to merge, \
+             they merged none):\n\
+             \x20 B=$(git merge-base HEAD origin/main)\n\
+             \x20 git show $B:<path>          > /tmp/base\n\
+             \x20 git show origin/main:<path> > /tmp/theirs\n\
+             \x20 git merge-file -p <path> /tmp/base /tmp/theirs > /tmp/merged; echo \"conflicts=$?\"\n\
+             `-p` writes the merge to STDOUT and leaves <path> untouched, which matters on a \
+             shared checkout where an in-place merge is a whole-file write over a peer's live \
+             edit. The exit status is the conflict COUNT: 0 means git merged it cleanly and you \
+             can move /tmp/merged into place; non-zero means real judgment is needed and the \
+             markers show exactly where. Handing it to the owner stays the right answer when the \
+             conflicts are not yours to resolve — but now you know how many there are before you \
+             decide that."
         ));
     }
 
@@ -857,8 +871,14 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          `git log --oneline origin/main..HEAD -- <path>` prints NOTHING.\n\
          \u{2022} if BOTH directions print commits, the path has DIVERGED — novel AND stale at \
          once — and commit and restore each destroy one side's landed work while every test \
-         above passes as prescribed. MERGE the two versions (or hand the path to its owner); \
-         neither single-arm remedy is safe. Live specimen 2026-08-20: mixpeek \
+         above passes as prescribed. Neither single-arm remedy is safe; three-way merge it, \
+         non-destructively (AMUX-3718 — this line used to stop at 'MERGE the two versions' with \
+         no procedure): `B=$(git merge-base HEAD origin/main); git show $B:<path> >/tmp/base; \
+         git show origin/main:<path> >/tmp/theirs; git merge-file -p <path> /tmp/base \
+         /tmp/theirs >/tmp/merged; echo conflicts=$?` — `-p` leaves <path> untouched (an \
+         in-place merge is a whole-file write over a peer's live edit) and the exit status is \
+         the conflict COUNT, so you know whether it is yours to resolve before you hand it to \
+         the owner. Live specimen 2026-08-20: mixpeek \
          .githooks/pre-push, origin carrying 96ea161803 and HEAD carrying the MG-1483 guard \
          chain — the one-direction protocol read it STALE and the prescribed restore silently \
          disarmed a data-loss push guard.\n\
@@ -2249,10 +2269,63 @@ mod tests {
             m.contains("reachable-from-a-commit too"),
             "must say WHY the restore-safety check cannot catch this: {m}"
         );
-        assert!(m.contains("MERGE the two versions"), "the only safe exit must be named: {m}");
+        // AMUX-3718. This used to assert the phrase "MERGE the two versions", and a
+        // directive is not a procedure: mixpeek-frustrations was told to merge 16
+        // paths and merged none, because every other arm of this nudge carries
+        // something runnable and this one carried a sentence.
+        //
+        // The phrase assertion could not even see the change that fixed it. The
+        // replacement text QUOTES the old directive while describing it as former
+        // behaviour, so `contains("MERGE the two versions")` stayed green across a
+        // rewrite that removed the prescription entirely. A check that a quotation
+        // satisfies is pinning the words, not the property (ethos rule 7).
+        assert!(
+            m.contains("git merge-file -p"),
+            "the merge must be RUNNABLE, not just prescribed: {m}"
+        );
+        assert!(
+            m.contains("merge-base HEAD origin/main"),
+            "a three-way merge needs its base named or the recipe cannot be run: {m}"
+        );
+        assert!(
+            m.contains("conflicts=$?"),
+            "the reader must learn the conflict COUNT — that is what decides whether \
+             this is theirs to resolve or the owner's: {m}"
+        );
         assert!(
             !m.contains("STALE:"),
             "a diverged path must not also render the STALE restore recipe: {m}"
+        );
+    }
+
+    /// THE SAME BARE DIRECTIVE EXISTED TWICE, and fixing one arm would have left
+    /// the other (AMUX-3718, mixpeek-frustrations 2026-08-31).
+    ///
+    /// `commit_worthy_body`'s decision protocol walks the reader through both
+    /// direction tests and then, on the DIVERGED branch, used to stop at "MERGE
+    /// the two versions (or hand the path to its owner)" — a verdict with no
+    /// procedure, in a block whose every other bullet ends in a runnable command.
+    /// The DIVERGED section and this protocol are rendered by different functions,
+    /// so the section's cell could not see this one.
+    #[test]
+    fn the_protocols_diverged_bullet_carries_the_merge_it_prescribes() {
+        let dirty = vec!["src/thing.rs".to_string()];
+        // Commit-worthy: in `dirty` and in none of the other buckets, which is
+        // what makes `commit_worthy_body` render at all.
+        let fresh = Freshness::default();
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("a commit-worthy path must render the protocol");
+        assert!(
+            m.contains("if BOTH directions print commits"),
+            "premise: the decision protocol must be the block under test: {m}"
+        );
+        assert!(
+            m.contains("git merge-file -p"),
+            "the protocol's DIVERGED branch must carry the merge, not just name it: {m}"
+        );
+        assert!(
+            m.contains("conflicts=$?"),
+            "and the conflict count, which is what decides whose problem it is: {m}"
         );
     }
 
