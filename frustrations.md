@@ -2110,3 +2110,40 @@ FIX: Fixed. `git commit <your paths>` is now offered FIRST, labelled as the exit
   The cell reads the SHIPPED hook rather than executing the branch (that text is
   inline in main() and reaching it needs a multi-session git fixture), and it says
   so rather than implying parity with the cells above it.
+
+---
+## A card create records the claimed creator and nothing about the request
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux-frustrations
+CARD: AF-366
+SYMPTOM: Auto-pickup handed this lane `AF-364 [ts-gke] tenant-deploy engine skipped
+  on 75ad074eab7c` to work, alongside `AF-363 Test card from tubescience`. Both are
+  stamped `creator: amux-frustrations` and `session: amux-frustrations`, created 8
+  seconds apart with empty descs. I did not create either. Nothing anywhere can say
+  who did:
+    - a successful POST /api/board logs NOTHING (`grep -c 'POST /api/board'` over
+      today's server-rs.log returns 0), while the board READ path logs `caller_ua`
+      and `caller_session` on its truncation WARN;
+    - the `_amux_state_events` payload for the create stores the resulting
+      `creator` field, which is the value in question, not the request's origin.
+  The `X-Amux-Session` header is caller-supplied and unverified, which is fine for a
+  local fleet, so the stamp is only ever as good as the caller's honesty or config.
+  Verified by control: a create with NO session header leaves `creator` empty and
+  takes the `AMUX-` prefix, so these two DID carry this lane's header.
+COST: A lane was handed another team's deploy card by an automated loop, and the
+  misrouting is unfixable at the root because the origin is unrecoverable. I could
+  route AF-364 to ts-gke and discard the probe, but I cannot tell whoever did it,
+  and neither can anyone auditing later. The read path being instrumented while the
+  write path is not is backwards: a read is recoverable by reading again, a write is
+  not.
+FIX: Fixed. The create success path now emits `board card created` at INFO with
+  `card`, `caller_session`, `caller_ua`, `stamped_creator` and `owner_session`, so a
+  header that disagrees with the caller, or a create from an unexpected user-agent,
+  is greppable. It reuses `truncation_caller` rather than re-deriving the pair, so
+  the honest fallbacks ("(none)", "(unattributed)") stay identical to the read path
+  instead of one site growing a silent blank. Not claimed as fixed: nothing verifies
+  the header, and this does not change that. It makes a wrong stamp VISIBLE, which
+  is the part that was missing.

@@ -2832,6 +2832,40 @@ pub async fn create_item(
             if let Some(cap_id) = folded.lock().expect("folded slot poisoned").take() {
                 v["folded_capture"] = json!(cap_id);
             }
+            // AF-366: RECORD WHO CALLED, not only what the row now says.
+            //
+            // A card's `creator` is derived from a header the CALLER supplies, and
+            // until now nothing anywhere recorded the request itself: a successful
+            // create logged NOTHING, and the state-event payload stores the
+            // resulting `creator` field, which is the very value in question. So a
+            // card attributed to the wrong lane was unforensicable by anyone,
+            // including the lane wearing the attribution.
+            //
+            // Found live: AF-363 "Test card from tubescience" and AF-364 "[ts-gke]
+            // tenant-deploy engine skipped" were both stamped
+            // creator=amux-frustrations, and auto-pickup then handed a lane another
+            // team's deploy card to work. Neither their origin nor their intent can
+            // be recovered from any record that exists.
+            //
+            // The board's READ path already logs `caller_ua` and `caller_session`
+            // on its truncation WARN. The WRITE path logged nothing, which is
+            // backwards: the read is recoverable by reading again, the write is not.
+            // Reuses `truncation_caller` rather than re-deriving the pair, so the
+            // honest fallbacks ("(none)", "(unattributed)") stay identical across
+            // both sites instead of one growing a silent blank.
+            //
+            // INFO, not WARN: creating a card is the normal path and this is a
+            // ledger line, not a complaint. `grep 'board card created'` is the
+            // forensic index that did not exist.
+            let (cua, csess) = truncation_caller(&headers);
+            tracing::info!(
+                card = %row.id,
+                caller_session = %csess,
+                caller_ua = %cua,
+                stamped_creator = %(if row.creator.is_empty() { "(none)" } else { row.creator.as_str() }),
+                owner_session = %row.session.as_deref().unwrap_or("(none)"),
+                "board card created"
+            );
             (StatusCode::CREATED, Json(v)).into_response()
         }
     }
