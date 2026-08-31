@@ -2358,6 +2358,20 @@ fn steering_fan_out(
     }
 }
 
+/// How long the drain loop may go WITHOUT evaluating a lane before that counts
+/// as a hang (AMUX-3927).
+///
+/// This is a liveness bound on the LOOP, not a patience bound on the message,
+/// which is the distinction the old 90-minute deadline collapsed. The loop ticks
+/// far more often than this, so the value only has to be safely above one tick;
+/// it is not a judgement about how long a lane may reasonably stay busy.
+fn drain_loop_quiet_s() -> f64 {
+    std::env::var("AMUX_DRAIN_LOOP_QUIET_S")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(900.0)
+}
+
 pub fn detect_silent(
     conn: &Connection,
     now: f64,
@@ -2373,6 +2387,11 @@ pub fn detect_silent(
     // a reader "the banner wording changed and parse_rate_limit_reset needs it"
     // about a credit cap is a false lead pointed at real code (MC-1458).
     kinds: &BTreeMap<String, String>,
+    // `skips`: per-lane `(last_skip_reason, seconds_since)` from the drain
+    // loop. THE field that separates a hung loop from a lane mid-turn, computed
+    // and published on /api/debug/steering since AMUX-3696 and read by nothing
+    // until AMUX-3927. A missing entry is UNMEASURED, never healthy.
+    skips: &BTreeMap<String, (String, f64)>,
 ) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
@@ -2523,8 +2542,103 @@ pub fn detect_silent(
                     Some(_) => steering_stale_min(),
                     None => steering_stale_deliverable_min(),
                 };
-                if age < deadline_min * 60.0 {
-                    continue;
+
+                // AGE IS THE WRONG AXIS FOR THIS WHOLE FAMILY (AMUX-3927,
+                // gtm-engine's framing). The abnormal thing is a STATE, not a
+                // duration, and the threshold sat BELOW the normal tail of what
+                // it measured. Distribution of all 11,752 deliveries with a
+                // `queued_at`: 10,330 under 10m, 1,111 at 10-30m, 166 at 30-90m,
+                // 82 at 90-240m, 63 past 240m. That >90 tail is ordinary
+                // traffic, because steering waits for a TURN BOUNDARY and a lane
+                // deep in a long task has none for hours. Every message that
+                // crossed the deadline in 7 days drained: 45 of 45.
+                //
+                // The number was also not measuring what it claimed. It is 90
+                // minutes while `AMUX_STEER_MAX_AGE_S` is 600 seconds, so during
+                // a cap the force-delivery branch cannot fire at all and the row
+                // is skipped with `send-refused` and left in place — making the
+                // 90 a measure of how long the BLOCK has lasted, not of
+                // deliverability.
+                //
+                // So: classify, then decide.
+                //
+                //   TERMINAL   `no-env-file` / `archived` — a human must clear
+                //              it, at any age. Files immediately, no threshold.
+                //   TRANSIENT  `rate-limited` / `not-running` — resolves with no
+                //              intervention. Never files on age alone.
+                //   REACHABLE  no block — waiting for a turn boundary. Files
+                //              only on positive evidence that the DRAIN LOOP has
+                //              stopped evaluating this lane, which is a real
+                //              hang; a long turn is not one.
+                //
+                // `reason_is_reapable` is the existing terminal list, whose own
+                // docstring says "One list, two consumers" (AMUX-3814, after a
+                // parallel re-derivation swept in `rate-limited` and reddened an
+                // invariant for 8 days). This is the third consumer, not a
+                // fourth spelling.
+                let terminal = block
+                    .as_deref()
+                    .is_some_and(crate::api::session_verbs::reason_is_reapable);
+                // (reason, seconds since the drain loop last evaluated this lane)
+                let skip = skips.get(&session).cloned();
+                // RATE-LIMITED IS DELIBERATELY UNTOUCHED HERE. AMUX-3815 already
+                // split it correctly a few lines below: a known FUTURE reset
+                // suppresses, and a reset that has passed — or a cap with no
+                // clock at all — files, because a missing reset time is a real
+                // parse gap (MC-1458) and not a lane waiting patiently. Folding
+                // it into "transient, never file" would delete two findings that
+                // are about amux being unable to read its own banner, which is
+                // not what AMUX-3927 argues. The card names `no-env-file` and
+                // `archived` as the states a human must clear at any age, and
+                // `not-running` and busy as the ones abnormal at no age.
+                let age_gated = matches!(block.as_deref(), Some("not-running") | None);
+                if !terminal && age_gated {
+                    // The one non-terminal case worth a card: the drain loop has
+                    // stopped looking at this lane. That is a hang, and it is a
+                    // STATE — "the loop is not trying" — rather than "the wait
+                    // got long".
+                    let loop_dead = match &skip {
+                        Some((_, since)) => *since > drain_loop_quiet_s(),
+                        // ABSENCE IS NOT EVIDENCE (ethos rule 4). The skip map is
+                        // in-memory and empty after a restart, which is exactly
+                        // when someone reads it, so "no record" cannot be read as
+                        // "the loop is dead". Say the measurement did not run.
+                        None => false,
+                    };
+                    if !loop_dead {
+                        suppressed.push(sup(
+                            DetectorKind::SilentSubsystem,
+                            &format!("silent|steering|{session}"),
+                            &match (&block, &skip) {
+                                (Some(r), _) => format!(
+                                    "{n} message(s) queued {:.0} min for {session}, blocked by '{r}'. NOT filed: that state \
+                                     clears without a human — a stopped lane restarts, a rate limit lifts — and age cannot \
+                                     tell a 6h outage from a permanent one. Over 7 days, 45 of 45 messages past the old \
+                                     {deadline_min:.0}-minute deadline drained untouched. Files when the reason becomes \
+                                     terminal (no-env-file / archived), not when the wait gets long.",
+                                    age / 60.0
+                                ),
+                                (None, Some((reason, since))) => format!(
+                                    "{n} message(s) queued {:.0} min for {session}, and the lane is REACHABLE. NOT filed: \
+                                     the drain loop evaluated it {:.0}s ago and deferred — last skip '{reason}'. That is a \
+                                     lane mid-turn, which is normal at any age; 82 deliveries sat 90-240 min and 63 past 240 \
+                                     min, all of them fine. A card here would send the reader to look for a hang that is not \
+                                     there.",
+                                    age / 60.0,
+                                    since
+                                ),
+                                (None, None) => format!(
+                                    "{n} message(s) queued {:.0} min for {session}; lane reachable. NOT filed, and NOT \
+                                     because it looks healthy: there is no skip record for this lane, so whether the drain \
+                                     loop is still evaluating it was NOT MEASURED. The map is in-memory and empty after a \
+                                     restart. why_unmeasured: no drain-loop skip recorded since the last server start. Filing \
+                                     on that absence would report every restart as a hang.",
+                                    age / 60.0
+                                ),
+                            },
+                        ));
+                        continue;
+                    }
                 }
                 let _ = stale_s;
                 // A RATE LIMIT IS TEMPORARY, AND CLAUDE'S BANNER SAYS WHEN
@@ -2761,6 +2875,28 @@ pub fn detect_silent(
                         // (ethos rule 1) — caught by reading this payload during
                         // the mutation run.
                         ("threshold_min".into(), format!("{deadline_min:.0}")),
+                        // THE FIELD THAT SEPARATES A HUNG LOOP FROM A BUSY LANE
+                        // (AMUX-3927). Computed by the drain loop and published
+                        // on /api/debug/steering since AMUX-3696, and read by
+                        // nothing, so every stall card ever filed omitted it. On
+                        // the live mixpeek-studio lane it read
+                        // "not-at-turn-boundary (within max age)" with an age of
+                        // 2 seconds — the loop had evaluated that lane two
+                        // seconds earlier and correctly deferred — while the card
+                        // said the queue was stalled.
+                        //
+                        // Absence is UNMEASURED, never healthy: the map is
+                        // in-memory and empty after a restart, which is exactly
+                        // when someone reads this.
+                        ("drain_loop_last_skip".into(), match &skip {
+                            Some((reason, since)) => format!(
+                                "{reason} ({:.0}s ago) — the loop IS evaluating this lane",
+                                since
+                            ),
+                            None => "not measured: no skip recorded since the last server start (the map is \
+                             in-memory). This is not evidence the loop is healthy, nor that it is hung."
+                                .to_string(),
+                        }),
                         // Say WHY this card is not addressed to the stalled lane,
                         // or the next reader "corrects" it straight back — the
                         // lane's name is in the title and assigning it there
@@ -5089,6 +5225,9 @@ pub async fn autofix_tick_with_ci(
     // reachability its own way could report a lane unreachable that the loop
     // will happily deliver to (ethos rule 1: a view must share the predicate of
     // the mechanism it claims to describe).
+    // The drain loop's own last-skip record per lane (AMUX-3927). Snapshotted
+    // here with the other runtime maps because the detector pass is sync.
+    let steer_skips_snap = crate::api::session_verbs::steer_skip_snapshot();
     let steer_blocked: BTreeMap<String, Option<String>> = {
         let sessions: Vec<String> = state
             .store
@@ -5196,7 +5335,7 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::Latency => detect_latency(&conn, now),
                 DetectorKind::DeadRoute => detect_dead_routes(&conn, now),
                 DetectorKind::SilentSubsystem => {
-                    detect_silent(&conn, now, &steer_blocked, &steer_resets, &steer_kinds)
+                    detect_silent(&conn, now, &steer_blocked, &steer_resets, &steer_kinds, &steer_skips_snap)
                 }
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
@@ -7246,7 +7385,13 @@ mod tests {
             .expect("seed");
     }
 
-    fn rate_limited(lanes: &[&str]) -> BTreeMap<String, Option<String>> {
+/// No drain-loop skip records — the post-restart state, and the one the
+    /// detector must read as UNMEASURED rather than as healthy (AMUX-3927).
+    fn no_skips() -> BTreeMap<String, (String, f64)> {
+        BTreeMap::new()
+    }
+
+        fn rate_limited(lanes: &[&str]) -> BTreeMap<String, Option<String>> {
         lanes.iter().map(|l| (l.to_string(), Some("rate-limited".to_string()))).collect()
     }
 
@@ -7284,7 +7429,7 @@ mod tests {
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = [("capped".to_string(), 0)].into();
         let kinds: BTreeMap<String, String> = [("capped".to_string(), "credit-banner".to_string())].into();
-        let (f, _) = detect_silent(&conn, now, &rate_limited(&["capped"]), &resets, &kinds);
+        let (f, _) = detect_silent(&conn, now, &rate_limited(&["capped"]), &resets, &kinds, &no_skips());
         let v = silent_verdict(&f, "capped");
         assert!(v.contains("CREDIT CAP"), "{v}");
         assert!(v.contains("no clock to read"), "{v}");
@@ -7306,7 +7451,7 @@ mod tests {
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = [("menu-lane".to_string(), 0)].into();
         let kinds: BTreeMap<String, String> = [("menu-lane".to_string(), "menu".to_string())].into();
-        let (f, _) = detect_silent(&conn, now, &rate_limited(&["menu-lane"]), &resets, &kinds);
+        let (f, _) = detect_silent(&conn, now, &rate_limited(&["menu-lane"]), &resets, &kinds, &no_skips());
         let v = silent_verdict(&f, "menu-lane");
         assert!(v.contains("parse_rate_limit_reset"), "{v}");
         assert!(v.contains("MENU"), "{v}");
@@ -7325,7 +7470,7 @@ mod tests {
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = [("old-lane".to_string(), 0)].into();
         let (f, _) =
-            detect_silent(&conn, now, &rate_limited(&["old-lane"]), &resets, &BTreeMap::new());
+            detect_silent(&conn, now, &rate_limited(&["old-lane"]), &resets, &BTreeMap::new(), &no_skips());
         let v = silent_verdict(&f, "old-lane");
         assert!(v.contains("no record of WHICH limit"), "{v}");
         assert!(
@@ -7350,7 +7495,7 @@ mod tests {
         let conn = st.store.read().unwrap();
         // No reset clock anywhere: the credit-cap case, which is the one that files.
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, sup) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new());
+        let (f, sup) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new(), &no_skips());
         assert!(
             !sup.iter().any(|x| x.signature.contains("<query failed>")),
             "the steering query did not prepare, so this test measures nothing: {sup:?}"
@@ -7391,7 +7536,7 @@ mod tests {
         seed_queues(&st, now, &lanes, 92.0).await;
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, _) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new());
+        let (f, _) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new(), &no_skips());
         assert!(
             !f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
             "two is a coincidence, not a pattern: {f:?}"
@@ -7431,7 +7576,7 @@ mod tests {
         let resets: BTreeMap<String, i64> =
             ["stopped-lane", "gone-lane"].iter().map(|l| (l.to_string(), 0)).collect();
         let conn = st.store.read().unwrap();
-        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
 
         let verdict = |sig: &str| -> String {
             f.iter()
@@ -7444,15 +7589,24 @@ mod tests {
                 .expect("a steering card carries a verdict")
         };
 
-        let stopped = verdict("silent|steering|stopped-lane");
+        // AMUX-3927 FINISHED THE ARGUMENT AMUX-3918 STARTED. Softening the
+        // wording still filed a card about a lane doing nothing wrong, so
+        // `not-running` now files NOTHING at any age — age cannot tell a 6-hour
+        // outage from a permanent one, and 45 of 45 messages past the old
+        // deadline drained untouched.
         assert!(
-            !stopped.contains("will not drain on its own"),
-            "a stopped lane gets started again and its queue drains untouched; asserting \
-             otherwise sent four cards to say the opposite of what the ledger records: {stopped}"
+            !f.iter().any(|x| x.signature == "silent|steering|stopped-lane"),
+            "a stopped lane restarts and its queue drains; no age makes that a card: {f:?}"
         );
+        // SUPPRESSED, NOT SILENT: the decision is recorded with its reason.
+        let stopped_sup = sup
+            .iter()
+            .find(|x| x.signature == "silent|steering|stopped-lane")
+            .expect("declining to file must be a RECORDED decision, not an absence");
         assert!(
-            stopped.contains("snapshot"),
-            "and it should say WHY it is not a verdict, not merely omit the claim: {stopped}"
+            stopped_sup.reason.contains("without a human"),
+            "say why the state clears itself: {}",
+            stopped_sup.reason
         );
 
         // CONTROL. Archived is terminal without a human, so the warning stays.
@@ -7461,6 +7615,126 @@ mod tests {
             gone.contains("will not drain on its own"),
             "an archived lane really cannot drain — removing the sentence everywhere would \
              delete the warning from the one state that earns it: {gone}"
+        );
+        // AND THE TRANSIENT GROUP DOES NOT ROLL UP, BECAUSE IT DOES NOT FILE
+        // (AMUX-3927). Three `not-running` lanes at the same age produce no card
+        // and no shared card — only recorded suppressions. Without this arm the
+        // swap above would have quietly deleted the not-running coverage rather
+        // than relocating it.
+        let stopped2 = ["off-1", "off-2", "off-3"];
+        let (st2, _d2) = state();
+        seed_queues(&st2, now, &stopped2, 92.0).await;
+        let mut blocked2 = BTreeMap::new();
+        for l in stopped2 {
+            blocked2.insert(l.to_string(), Some("not-running".to_string()));
+        }
+        let resets2: BTreeMap<String, i64> =
+            stopped2.iter().map(|l| (l.to_string(), 0)).collect();
+        let conn2 = st2.store.read().unwrap();
+        let (f2, sup2) =
+            detect_silent(&conn2, now, &blocked2, &resets2, &BTreeMap::new(), &no_skips());
+        assert!(
+            !f2.iter().any(|x| x.signature.contains("not-running")),
+            "a transient reason has nothing to roll up: {f2:?}"
+        );
+        for lane in stopped2 {
+            assert!(
+                sup2.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                "{lane} must leave a recorded suppression, not vanish: {sup2:?}"
+            );
+        }
+
+    }
+
+    /// THE CHECK AMUX-3927 ASKED FOR, VERBATIM: "a lane whose only sin is a long
+    /// turn must file NO card at any age, while a `no-env-file` lane files one at
+    /// any age. If the fix is still a number, that test cannot be written, which
+    /// is itself the argument."
+    ///
+    /// Both lanes are driven at FOUR AGES spanning three orders of magnitude —
+    /// one minute to twelve hours — against one detector call each. A
+    /// threshold-based fix cannot make both columns constant, because any number
+    /// it picks falls between two of these rows.
+    #[tokio::test]
+    async fn the_verdict_is_a_state_not_a_duration_at_every_age() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        for minutes in [1.0_f64, 89.0, 361.0, 720.0] {
+            let (st, _d) = state();
+            let now = unix_now();
+            seed_queues(&st, now, &["busy-lane", "dead-lane"], minutes).await;
+            let mut blocked = BTreeMap::new();
+            blocked.insert("busy-lane".to_string(), None);
+            blocked.insert("dead-lane".to_string(), Some("no-env-file".to_string()));
+            let conn = st.store.read().unwrap();
+            let (f, _) = detect_silent(
+                &conn,
+                now,
+                &blocked,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                &no_skips(),
+            );
+            assert!(
+                !f.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+                "a long turn is not a defect at {minutes} min: {f:?}"
+            );
+            assert!(
+                f.iter().any(|x| x.signature == "silent|steering|dead-lane"),
+                "a lane a human must fix is a defect at {minutes} min, including the first: {f:?}"
+            );
+        }
+    }
+
+    /// The filed card must CARRY the discriminator, not merely be gated on it.
+    /// A reader looking at a stall card could not previously tell a hung drain
+    /// loop from a lane mid-turn, because the one field that says which was
+    /// computed, published on /api/debug/steering, and read by nothing.
+    #[tokio::test]
+    async fn a_filed_card_reports_whether_the_drain_loop_is_still_looking() {
+        std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
+        let (st, _d) = state();
+        let now = unix_now();
+        seed_queues(&st, now, &["dead-lane"], 92.0).await;
+        let mut blocked = BTreeMap::new();
+        blocked.insert("dead-lane".to_string(), Some("no-env-file".to_string()));
+        let conn = st.store.read().unwrap();
+
+        // With a record: quote it, with its age.
+        let mut skips = BTreeMap::new();
+        skips.insert("dead-lane".to_string(), ("send-refused".to_string(), 7.0));
+        let (f, _) =
+            detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new(), &skips);
+        let ev: BTreeMap<_, _> = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|dead-lane")
+            .expect("card")
+            .evidence
+            .iter()
+            .cloned()
+            .collect();
+        assert!(
+            ev["drain_loop_last_skip"].contains("send-refused")
+                && ev["drain_loop_last_skip"].contains("7s ago"),
+            "quote the loop's own reason and how stale it is: {ev:?}"
+        );
+
+        // CONTROL, and the one that keeps this honest: with NO record the field
+        // must say UNMEASURED. Reporting silence as health here is the exact
+        // failure this detector family keeps producing (ethos rule 4), and the
+        // map is empty after every restart.
+        let (f2, _) =
+            detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new(), &no_skips());
+        let ev2: BTreeMap<_, _> = f2
+            .iter()
+            .find(|x| x.signature == "silent|steering|dead-lane")
+            .expect("card")
+            .evidence
+            .iter()
+            .cloned()
+            .collect();
+        assert!(
+            ev2["drain_loop_last_skip"].contains("not measured"),
+            "no record means unmeasured, never healthy: {ev2:?}"
         );
     }
 
@@ -7502,11 +7776,17 @@ mod tests {
             .expect("stamp senders");
 
         let mut blocked = rate_limited(&["capped-lane"]);
-        blocked.insert("dead-lane".into(), Some("not-running".into()));
+        // `no-env-file`, not `not-running`, since AMUX-3927 stopped filing for
+        // transient states at any age. The control's POINT is unchanged and is
+        // the half that matters: a per-lane fault with a real lever must keep
+        // its owner, or a fix that simply stopped assigning owners would pass
+        // the cap assertion above and quietly unassign every card that DOES
+        // have someone who can act.
+        blocked.insert("dead-lane".into(), Some("no-env-file".into()));
         let resets: BTreeMap<String, i64> =
             ["capped-lane", "dead-lane"].iter().map(|l| (l.to_string(), 0)).collect();
         let conn = st.store.read().unwrap();
-        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
 
         let capped = f
             .iter()
@@ -7518,12 +7798,13 @@ mod tests {
              and resending only queues a duplicate behind the same cap"
         );
 
-        // CONTROL: a per-lane fault keeps its owner. `not-running` has a real
-        // lever (start the lane), and the sender is the party who can pull it.
+        // CONTROL: a per-lane fault keeps its owner. `no-env-file` has a real
+        // lever (the lane name is wrong, or the env file is missing), and the
+        // sender is the party who can pull it.
         let dead = f
             .iter()
             .find(|x| x.signature == "silent|steering|dead-lane")
-            .expect("a not-running lane still gets its own card");
+            .expect("a terminal per-lane fault still gets its own card");
         assert_eq!(
             dead.owner,
             Some("some-sender".to_string()),
@@ -7551,26 +7832,33 @@ mod tests {
         std::env::remove_var("AMUX_STEERING_ROLLUP_AT");
         let (st, _d) = state();
         let now = unix_now();
+        // TWO TERMINAL REASONS, not one terminal and one transient. This group
+        // was `not-running` until AMUX-3927 stopped filing for it at any age, at
+        // which point the roll-up half of this test had nothing to roll up.
+        // `archived` keeps the shape the test is actually about — two full
+        // groups, each folding, neither merging into the other — using a state
+        // that still files. The `not-running` behaviour gets its own arm below
+        // rather than being lost.
         let stopped = ["stop-1", "stop-2", "stop-3"];
         let envless = ["env-1", "env-2", "env-3"];
         let all: Vec<&str> = stopped.iter().chain(envless.iter()).copied().collect();
         seed_queues(&st, now, &all, 92.0).await;
         let mut blocked = BTreeMap::new();
         for l in stopped {
-            blocked.insert(l.to_string(), Some("not-running".to_string()));
+            blocked.insert(l.to_string(), Some("archived".to_string()));
         }
         for l in envless {
             blocked.insert(l.to_string(), Some("no-env-file".to_string()));
         }
         let resets: BTreeMap<String, i64> = all.iter().map(|l| (l.to_string(), 0)).collect();
         let conn = st.store.read().unwrap();
-        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
 
         // Three stopped lanes become ONE card, and no lane keeps its own.
         let rolled = f
             .iter()
-            .find(|x| x.signature == "silent|steering|shared|not-running")
-            .expect("three lanes sharing not-running must roll up into one card");
+            .find(|x| x.signature == "silent|steering|shared|archived")
+            .expect("three lanes sharing archived must roll up into one card");
         assert!(rolled.title.contains("3 lanes"), "the count belongs in the title: {}", rolled.title);
         for lane in stopped {
             assert!(
@@ -7621,7 +7909,7 @@ mod tests {
         let mut blocked = rate_limited(&["cap-1", "cap-2", "cap-3"]);
         blocked.insert("no-env-lane".into(), Some("no-env-file".into()));
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+        let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
         assert!(
             f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
             "the three capped lanes still roll up: {f:?}"
@@ -7681,7 +7969,7 @@ mod tests {
         let mut blocked = BTreeMap::new();
         blocked.insert("busy-lane".to_string(), None);
         blocked.insert("dead-lane".to_string(), Some("no-env-file".to_string()));
-        let (f, sup) = detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new());
+        let (f, sup) = detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new(), &no_skips());
 
         // THE PREMISE, asserted rather than assumed: the query must have RUN.
         // If it did not prepare, the detector records a suppression saying so,
@@ -7709,40 +7997,96 @@ mod tests {
         assert!(ev["verdict"].contains("no-env-file"), "name the reason: {ev:?}");
         assert!(ev["lane_reachable"].starts_with("NO"), "{ev:?}");
 
-        // CELL 3 — reachable but far past the LARGER deadline: still reported,
-        // as the different thing it is. A lane that has not reached a turn
-        // boundary in 7h is worth a card; calling it a stuck queue is not.
-        let (f2, _) = detect_silent(&conn, now + 7.0 * 3600.0, &blocked, &BTreeMap::new(), &BTreeMap::new());
-        let late = f2
+        // CELL 3 — reachable and SEVEN HOURS past the old deadline: NO CARD,
+        // at any age. This is AMUX-3927's headline and it inverts what this
+        // cell used to assert.
+        //
+        // The old 360-minute deadline sat below the normal tail of the thing it
+        // measured. Distribution of all 11,752 deliveries with a `queued_at`:
+        // 82 sat 90-240 min and 63 past 240 min, and every message that crossed
+        // the deadline in 7 days drained — 45 of 45. Steering waits for a TURN
+        // BOUNDARY, so a lane deep in a long task has none for hours. That is
+        // the system working.
+        let (f2, sup2) = detect_silent(
+            &conn,
+            now + 7.0 * 3600.0,
+            &blocked,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &no_skips(),
+        );
+        assert!(
+            !f2.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+            "a long turn is not a hang at ANY age — filing on duration is the defect: {f2:?}"
+        );
+        // AND IT IS SUPPRESSED, NOT SILENT. A detector that just stopped looking
+        // is indistinguishable from one that looked and found nothing, which is
+        // the failure this whole family keeps producing (ethos rule 4).
+        let quiet = sup2
             .iter()
             .find(|x| x.signature == "silent|steering|busy-lane")
-            .expect("past the deliverable deadline it must still report");
+            .expect("not filing must still be RECORDED as a decision");
         assert!(
-            late.title.contains("has not taken a turn boundary"),
-            "the title must describe what is actually true: {}",
-            late.title
+            quiet.reason.contains("NOT MEASURED"),
+            "with no skip record the honest answer is unmeasured, not healthy: {}",
+            quiet.reason
         );
-        let ev2: BTreeMap<_, _> = late.evidence.iter().cloned().collect();
         assert!(
-            ev2["verdict"].contains("not a stall"),
-            "and must send the reader at the long turn, not at the queue: {ev2:?}"
+            quiet.reason.contains("why_unmeasured"),
+            "and it must say what stopped the measurement: {}",
+            quiet.reason
         );
-        // EVERY FIELD MUST AGREE WITH THE VERDICT BESIDE IT. Both of these were
-        // wrong on the first working draft and were caught by READING the
-        // payload during the mutation run, not by any assertion: `threshold_min`
-        // reported 90 on a card that fired at 360, and the `senders` blurb said
-        // "that lane may be unable to receive anything" directly under
-        // `lane_reachable: yes`. A card whose fields contradict each other is
-        // worse than a missing field, because each one is read as a fact.
-        assert_eq!(ev2["threshold_min"], "360", "report the deadline that APPLIED: {ev2:?}");
-        assert!(
-            ev2["senders"].contains("the lane is reachable"),
-            "the senders blurb must not assert unreachability on a reachable lane: {ev2:?}"
+
+        // CELL 4 — the DISCRIMINATOR the card is really about. With a live skip
+        // record the detector can say something stronger than "unmeasured": the
+        // drain loop evaluated this lane 2 seconds ago and deferred, so the lane
+        // is mid-turn and demonstrably not hung. This is the field that was
+        // computed and published on /api/debug/steering since AMUX-3696 and read
+        // by nothing until now.
+        let mut live = BTreeMap::new();
+        live.insert(
+            "busy-lane".to_string(),
+            ("not-at-turn-boundary (within max age)".to_string(), 2.0),
         );
-        assert_eq!(ev["threshold_min"], "90", "the blocked lane's deadline is the 90: {ev:?}");
+        let (f3, sup3) = detect_silent(
+            &conn,
+            now + 7.0 * 3600.0,
+            &blocked,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &live,
+        );
         assert!(
-            ev["senders"].contains("cannot receive anything right now"),
-            "...and there the blurb IS true: {ev:?}"
+            !f3.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+            "a loop that deferred 2s ago is alive: {f3:?}"
+        );
+        let seen = sup3
+            .iter()
+            .find(|x| x.signature == "silent|steering|busy-lane")
+            .expect("a live skip record must still be reported as a decision");
+        assert!(
+            seen.reason.contains("not-at-turn-boundary"),
+            "quote the drain loop's own reason: {}",
+            seen.reason
+        );
+
+        // CELL 5 — THE ARM THAT KEEPS THIS FROM BEING "never file". A drain loop
+        // that has not looked at this lane in hours IS a hang, and it is a STATE
+        // rather than a duration. Without this the fix would be indistinguishable
+        // from deleting the detector.
+        let mut stale_loop = BTreeMap::new();
+        stale_loop.insert("busy-lane".to_string(), ("send-refused".to_string(), 4000.0));
+        let (f4, _) = detect_silent(
+            &conn,
+            now + 7.0 * 3600.0,
+            &blocked,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &stale_loop,
+        );
+        assert!(
+            f4.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+            "a drain loop that stopped evaluating this lane is a real hang: {f4:?}"
         );
     }
 
@@ -7794,7 +8138,7 @@ mod tests {
             ("no-clock".to_string(), 0),
         ]
         .into();
-        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new());
+        let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
         assert!(
             !sup.iter().any(|x| x.signature.contains("<query failed>")),
             "the steering query did not prepare, so this test measures nothing: {sup:?}"

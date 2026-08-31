@@ -10171,6 +10171,34 @@ fn steer_skips() -> &'static std::sync::Mutex<BTreeMap<String, SkipRecord>> {
     M.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
 }
 
+/// Per-lane `(last_skip_reason, seconds_since_that_skip)` for the autofix
+/// detector (AMUX-3927).
+///
+/// The drain loop already records WHY it last declined to deliver each lane's
+/// oldest row, and `/api/debug/steering` already publishes it. Nothing else
+/// read it, so every stall card ever filed omitted the one field that separates
+/// a HUNG DRAIN LOOP from a lane that is simply mid-turn. On the live
+/// mixpeek-studio lane it read "not-at-turn-boundary (within max age)" with an
+/// age of 2 seconds: the loop had evaluated that lane two seconds earlier and
+/// correctly deferred, while the card said the queue was stalled.
+///
+/// ABSENCE IS NOT EVIDENCE. This map is in-memory and empty after a restart —
+/// which is exactly when someone reads it — so a missing entry means UNMEASURED,
+/// never "the loop is dead". Callers must distinguish those; the detector
+/// suppresses with `why_unmeasured` rather than filing.
+pub(crate) fn steer_skip_snapshot() -> BTreeMap<String, (String, f64)> {
+    let now = now_f64();
+    steer_skips()
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, (_, _, at))| *at > 0.0)
+                .map(|(k, (_, reason, at))| (k.clone(), (reason.clone(), now - at)))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Has this exact stall already been LOGGED in this hour, for this lane and this
 /// condition? Returns true the first time and false after, for the same key.
 ///
