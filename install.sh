@@ -324,6 +324,14 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
     > "$SYSTEMD_DIR/amux-playwright-mcp@.service" || die "failed to create amux-playwright-mcp@.service"
   chmod +x "$SCRIPT_DIR/scripts/amux-playwright-mcp.sh"
 
+  # worker-start: brings every registered lane back after a reboot, not just
+  # one hardcoded lane (AMUX-49, 2026-08-31) -- ExecStart points straight at
+  # the repo copy (ships on save, same convention as the playwright wrapper
+  # above), no separate ~/.local/bin copy to fall out of sync.
+  envsubst '$BIN_DIR $SCRIPT_DIR' < "$SCRIPT_DIR/scripts/amux-worker-start.service.template" \
+    > "$SYSTEMD_DIR/amux-worker-start.service" || die "failed to create amux-worker-start.service"
+  chmod +x "$SCRIPT_DIR/scripts/amux-start-worker.sh"
+
   # Reload systemd to recognize the new units.
   systemctl --user daemon-reload || die "systemctl daemon-reload failed"
 
@@ -332,10 +340,12 @@ if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
   say "  $SYSTEMD_DIR/amux-builder.service"
   say "  $SYSTEMD_DIR/amux-builder.timer"
   say "  $SYSTEMD_DIR/amux-playwright-mcp@.service (template — one instance per lane)"
+  say "  $SYSTEMD_DIR/amux-worker-start.service (starts every registered lane on boot)"
   echo ""
   say "Next: enable and start the services"
   echo "  ${DIM}systemctl --user enable amux-server${RESET}"
   echo "  ${DIM}systemctl --user enable amux-builder.timer${RESET}"
+  echo "  ${DIM}systemctl --user enable amux-worker-start${RESET}"
   echo "  ${DIM}systemctl --user start amux-server${RESET}"
   echo ""
   say "Playwright MCP lanes (edit ports/lanes to match your fleet):"
