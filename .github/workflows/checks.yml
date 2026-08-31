@@ -196,6 +196,12 @@ jobs:
           ./scripts/test-mass-delete-gate.sh
           ./scripts/test-observed-edits-walk.sh
           ./scripts/test-hook-drift-notice.sh
+          # The shared-checkout guard's own 114-case matrix. It existed and ran
+          # NOWHERE: not in CI, not in pre-commit. A safety-critical guard whose
+          # suite nothing executes is a suite that cannot tell you it broke, and
+          # AMUX-3932 was a live bypass in it found by hand rather than by this
+          # file. Cheap (no cargo), so there is no reason it was not here.
+          python3 ./scripts/git-hooks/test_git_shared_guard.py
       # CLI dispatch tests (AEAB-17). Language-agnostic like the two steps above,
       # and they belong HERE rather than in rust.yml because rust.yml is
       # path-filtered to `crates/**`, `Cargo.*` and `e2e/**` — so a change to

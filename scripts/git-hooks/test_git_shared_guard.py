@@ -438,8 +438,101 @@ def main():
             "strict one-shot behaviour, and did not")
     _mr101 = 6
 
+    # ------------------------------------------------------------------
+    # AMUX-3932: COMMAND SUBSTITUTION INSIDE A QUOTED ARGUMENT.
+    #
+    # THE INCIDENT. A lane built a JSON body whose PROSE quoted the very commands
+    # its card was about. Bash substituted them and actually ran `git add -A`,
+    # staging 779 paths across the shared checkout, 765 of them other lanes'.
+    # Nothing destructive armed and it was repaired with a scoped reset, but the
+    # staged-guard was down at that moment and logged NOT ENFORCED, so nothing
+    # caught it either.
+    #
+    # THE DEFECT was not "python3 bodies are treated as prose" (that hypothesis
+    # was tested and did not reproduce). It was that the scrubber could not tell
+    # an INERT quoted region from one bash will EXPAND. Two independent regex
+    # passes ran over the whole string, so single-quote stripping also fired
+    # INSIDE double-quoted regions where those quotes are literal characters --
+    # which is why the two substitution syntaxes disagreed in exactly one place.
+    #
+    # THE CONTROLS ARE HALF THE POINT. Stripping quoted bodies is RIGHT: it is
+    # what lets a lane file a card whose text mentions a guarded command. A fix
+    # that blocked every mention would pass the bypass rows below and make the
+    # guard unusable, which is the noise the stripper exists to prevent.
+    #
+    # Matrix reproduced against the live guard by amux and independently by
+    # mixpeek-homepage-claude, each feeding crafted strings on stdin so nothing
+    # executed. Their run caught a broken harness first (main() returns 0 unless
+    # tool_name == "Bash"), which is why every row here goes through run_hook.
+    subst = [
+        # (name, command, expect_block)
+        ("bare invocation still blocks",
+         "git stash", True),
+        ("single-quoted mention is INERT and must be allowed",
+         "amux board add 'x $(git stash)'", False),
+        ("single-quoted backticks are inert too",
+         "python3 -c 'x = `git stash`'", False),
+        ("unquoted substitution",
+         "echo $(git stash)", True),
+        # The four rows that bypassed. echo reports to nobody, which is what
+        # proves this is about QUOTING and not about which command carries a
+        # payload -- the original narrative blamed curl and `amux board add`
+        # and was withdrawn on this evidence.
+        ("double-quoted $() expands and must block",
+         'echo "$(git stash)"', True),
+        ("double-quoted backticks expand and must block",
+         'echo "`git stash`"', True),
+        ("curl payload with $()",
+         'curl -d "$(git stash)" http://x', True),
+        ("curl payload with backticks",
+         'curl -d "`git stash`" http://x', True),
+        ("board add with $() -- the exact shape of the incident",
+         'amux board add "note: $(git stash)"', True),
+        ("board add with backticks",
+         'amux board add "note: `git stash`"', True),
+        # THE ROW WHERE THE TWO SYNTAXES DIVERGED. $( ) was blocked here by
+        # ACCIDENT (escaped inner quotes desynced the regex) while backticks
+        # sailed through, and the backtick form is what caused the incident.
+        ("python3 -c body, $() form",
+         'python3 -c "print(\\"$(git stash)\\")"', True),
+        ("python3 -c body, backtick form inside literal triple-quotes",
+         "python3 -c \"x = '''note `git stash` here'''\"", True),
+        # AMUX-3932 extension found while fixing: an UNQUOTED heredoc delimiter
+        # expands regardless of the sink. Verified against bash directly --
+        # `python3 <<EOF` prints the EXPANDED value, `python3 <<'EOF'` prints the
+        # literal text.
+        ("unquoted heredoc delimiter expands, $()",
+         'python3 <<EOF\nx = "$(git stash)"\nEOF', True),
+        ("unquoted heredoc delimiter expands, backticks",
+         'python3 <<EOF\nx = "`git stash`"\nEOF', True),
+        ("quoted heredoc delimiter is inert",
+         "python3 <<'EOF'\nx = \"$(git stash)\"\nEOF", False),
+        # FALSE-POSITIVE CONTROLS. This hook runs on EVERY Bash call in the
+        # fleet, so an over-broad match is a worse outage than the bypass: it
+        # blocks ~55 lanes at once. Each of these mentions a guarded command in
+        # text bash will never run.
+        ("prose in a quoted heredoc body",
+         "amux board add --stdin <<'EOF'\nfixing the git add -A misuse\nEOF", False),
+        ("prose in an unquoted heredoc body with no substitution",
+         "python3 <<EOF\n# a note about git stash and git add -A\nEOF", False),
+        ("a double-quoted string that mentions a command but expands nothing",
+         'amux board add "we should never run git add -A here"', False),
+        ("a harmless substitution beside a mention must NOT block",
+         'amux board add "mentions git stash, stamped $(date)"', False),
+        ("grep for the string in a file",
+         "grep -n 'git stash' scripts/*.sh", False),
+    ]
+    for _name, _cmd, _expect in subst:
+        _rc, _err = run_hook(_cmd, work, tmp)
+        if (_rc != 0) != _expect:
+            failures.append(
+                "AMUX-3932/%s: expected %s, got %s for %r"
+                % (_name, "BLOCK" if _expect else "ALLOW",
+                   "BLOCK" if _rc != 0 else "ALLOW", _cmd))
+    _subst = len(subst)
+
     total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
-             + len(redir_cases) + _mr101)
+             + len(redir_cases) + _mr101 + _subst)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:

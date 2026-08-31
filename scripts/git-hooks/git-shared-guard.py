@@ -195,32 +195,154 @@ def _strip_heredoc_bodies(cmd):
     """MI-4083 (2026-07-05): remove heredoc BODIES so documentation text that
     merely MENTIONS a guarded git command (run-log blocks, memory notes, commit
     recipes) never pattern-matches. The intro line is kept (it is the real
-    command); bodies feeding a shell interpreter are kept too (executable)."""
+    command); bodies feeding a shell interpreter are kept too (executable).
+
+    AMUX-3932: an UNQUOTED delimiter is also executable, whatever the sink.
+    `python3 <<EOF` expands $(...) and backticks in the body before python ever
+    sees it -- verified against bash, which prints the EXPANDED value for <<EOF
+    and the literal text for <<'EOF'. Only the substitution bodies are kept, on
+    the same reasoning as the quoted-string path: keeping the whole body would
+    refuse a heredoc that merely mentions a command, which is what this function
+    exists to allow.
+    """
     lines = cmd.split("\n")
     out, i = [], 0
     while i < len(lines):
         line = lines[i]
         out.append(line)
-        tags = [m.group(2) for m in _HEREDOC_INTRO.finditer(line)]
+        intros = [(m.group(1), m.group(2)) for m in _HEREDOC_INTRO.finditer(line)]
         i += 1
-        if tags and _SHELL_SINK.search(line):
-            continue  # executable heredoc — leave the body in place for scanning
-        for tag in tags:
+        if intros and _SHELL_SINK.search(line):
+            continue  # executable heredoc -- leave the body in place for scanning
+        for quote, tag in intros:
+            body = []
             while i < len(lines) and lines[i].strip() != tag:
-                i += 1  # drop body line
+                body.append(lines[i])  # dropped from output, kept for inspection
+                i += 1
+            if not quote:
+                # <<EOF (unquoted): bash EXPANDS the body. Inert prose still goes,
+                # but anything it would RUN is surfaced for matching.
+                subs = _substitutions("\n".join(body))
+                if subs:
+                    out.append(" ; ".join(subs))
             if i < len(lines):
                 out.append(lines[i])  # keep the terminator (inert)
                 i += 1
     return "\n".join(out)
 
+def _substitutions(text, _depth=0):
+    """The parts of `text` bash will EXECUTE: $(...) and backtick bodies.
+
+    AMUX-3932. Stripping quoted regions is RIGHT -- it is what stops a card whose
+    description merely mentions a guarded command from being refused. The defect
+    was that a body-stripper cannot tell an inert quoted string from one bash
+    will expand: a double-quoted region and a single-quoted one look alike to it
+    and are opposite facts to a shell.
+
+    So the discriminator is a property of the QUOTING, which is knowable here,
+    rather than of the surrounding command name, which the guard used to key on.
+
+    Returns only the SUBSTITUTION BODIES, never the whole region, because only
+    those execute. Keeping the whole region would refuse
+    `amux board add "mentions git stash, ran $(date)"` -- banning mentions is
+    exactly the noise the stripper exists to prevent.
+
+    Bodies are scrubbed RECURSIVELY, so a substitution containing its own quoted
+    region has that region judged by the same rule instead of being matched as
+    prose. Bodies get strictly shorter, so this terminates; the depth cap is belt
+    and braces against a pathological input.
+    """
+    if _depth > 8:
+        return [text]
+    out = []
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if text.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "(":
+                    depth += 1
+                elif text[j] == ")":
+                    depth -= 1
+                j += 1
+            body = text[i + 2 : j - 1] if depth == 0 else text[i + 2 :]
+            out.append(_scrub_quotes(body, _depth + 1))
+            i = j
+            continue
+        if text[i] == "`":
+            j = text.find("`", i + 1)
+            body = text[i + 1 : j] if j > 0 else text[i + 1 :]
+            out.append(_scrub_quotes(body, _depth + 1))
+            i = (j + 1) if j > 0 else n
+            continue
+        i += 1
+    return out
+
+
+def _scrub_quotes(s, _depth=0):
+    """Remove INERT quoted text; keep what bash would execute.
+
+    A left-to-right scanner rather than two independent regex passes. The old
+    re.sub for single quotes ran over the WHOLE string, so it also stripped
+    single quotes sitting INSIDE a double-quoted region -- where bash treats them
+    as literal characters, not quoting operators.
+
+    That is why a python3 -c body using triple-single-quotes around a backticked
+    command was ALLOWED while the same body using $( ) was BLOCKED: the two
+    substitution syntaxes were being handled in different places, which is the
+    bug in miniature (mixpeek-homepage-claude's matrix, AMUX-3932). The blocked
+    row was blocked by accident -- escaped inner quotes happened to desync the
+    regex -- not by design.
+
+    Quoting state has to be tracked to get this right, so it is tracked.
+    """
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "\\" and i + 1 < n:
+            out.append(s[i : i + 2])
+            i += 2
+            continue
+        if c == "'":
+            # Single quotes are INERT in bash: no expansion of any kind.
+            j = s.find("'", i + 1)
+            out.append(" ")
+            i = (j + 1) if j >= 0 else n
+            continue
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if s[j] == "\\" and j + 1 < n:
+                    j += 2
+                    continue
+                if s[j] == '"':
+                    break
+                j += 1
+            inner = s[i + 1 : j] if j < n else s[i + 1 :]
+            subs = _substitutions(inner, _depth)
+            # Prose is dropped; only what bash would RUN survives. The separator
+            # keeps two substitutions from fusing into one token.
+            out.append(" " + " ; ".join(subs) + " " if subs else " ")
+            i = (j + 1) if j < n else n
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
 def _scrub(cmd):
-    # strip heredoc bodies FIRST (their intro quotes e.g. <<'EOF' must still be
-    # visible to the tag matcher), then quoted-string contents — so a subcommand
-    # merely mentioned in prose/JSON/docs isn't matched
-    s = _strip_heredoc_bodies(cmd)
-    s = re.sub(r"'[^']*'", " ", s)
-    s = re.sub(r'"[^"]*"', " ", s)
-    return s
+    # strip heredoc bodies FIRST (their intro quotes must still be visible to the
+    # tag matcher), then quoted-string contents -- so a subcommand merely
+    # mentioned in prose/JSON/docs isn't matched. What a shell would EXPAND
+    # inside those quotes survives (AMUX-3932).
+    return _scrub_quotes(_strip_heredoc_bodies(cmd))
 
 # How long a CONSUMED authorization still answers for the SAME command string
 # (MR-101). Seconds. 0 disables the replay window and restores strict one-shot.
