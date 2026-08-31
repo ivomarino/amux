@@ -3176,3 +3176,39 @@ CARD: AMUX-3829
 SYMPTOM: The browser idle-reaper held its "first seen empty" clock in a process-global map. The builder installs a new binary and the server self-adopts on EVERY commit, so the 3600s window restarted whenever anyone in the fleet committed. Measured that day: 22 builds between 06:33 and 16:26, median gap 16.7 minutes, and only TWO gaps of 60 minutes or more. Against a one-hour window that is a reaper which on a working day can almost never fire. Throughout, `/api/system-jobs` reported `spawned: true, ticks: N, status: ok`, and every word of that was TRUE — the loop was running perfectly. The job's health describes the LOOP; the defect was in state the loop carries. From outside, a reaper that can never fire and one about to fire were byte-identical.
 COST: A card shipped claiming "the 18-hour zombie that prompted this cannot recur" when it could, and it stayed that way until I went looking during a verification pass. Nothing in the system was going to surface it: there is no signal anywhere for "this job is alive and cannot succeed". The generalisable trap is that a runtime job's registered health answers "is the loop running", which is a different question from "can this job do its work", and the two come apart exactly when the work depends on state that does not survive a restart — on a machine that restarts its server on every commit, that is most stateful jobs.
 FIX: 5a8c85ab — the clock moves to `~/.amux/browser-idle.json`, rewritten whole each tick so stopped profiles drop out. The countdown is published on `/api/browser/status` as `idle_s` (null when not empty, which is a different fact from zero) so the invisible state becomes observable, and the release log carries `pre_boot_s`, how much of the window predates this process: a non-zero value there IS the restart-survival working, and the in-memory version could only ever print 0. The transferable question, which I would now ask of any registered job: if this process restarted right now, would the job lose progress, and would anything say so?
+
+## A graft-push checkout read as DIVERGED on every path, withholding the safe restore
+VALIDATED: mixpeek-frustrations | VALIDATED by the ORIGINATING session (mixpeek-frustrations, 2026-08-31), re-exercised live rather than read off the card, which they flagged as necessary because they are the REPORTER and the card is amux's, so a card read would have been them validating someone else's close with that person's own artifact. PRECONDITION ESTABLISHED FIRST, since this entry is specifically about graft-push checkouts and is untestable on a normal one: HEAD 7b762a7dd6 is not an ancestor of origin/main 7ebef48777, 177 commits ahead and 684 behind, so every path is genuinely two-directional at the ref level. Under that condition the nudge split the dirty set into FOUR populations with four different remedies (DIVERGED 16, OLD REVISION ON DISK 1, STALE 30, unknown ownership 282) and withheld nothing. A "DIVERGED on every path" regression would have produced ONE bucket; it produced four. They hand-checked two of the 16: FRUSTRATIONS.md had commits in both directions and was correctly called DIVERGED, and FRUSTRATIONS_ARCHIVE.md was novel-and-shorter and correctly NOT in the diverged list.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: mixpeek-frustrations (reported), amux (fixed)
+CARD: AMUX-3599
+SYMPTOM: The idle commit-nudge filed dirty append-only files as DIVERGED — "commits in BOTH
+  directions, neither single-arm remedy is safe" — on a checkout where the local commits were a
+  REPLAY of content already upstream. DIVERGED forbids both remedies, so the reader is left with
+  a union-merge they do not need and the safe `git checkout origin/main -- <file>` is withheld.
+  The classifier asked `git log origin/main..HEAD -- <path>`, which counts commits BY SHA, and a
+  commit already upstream under a different sha sits in that range permanently. On a graft-push
+  checkout that is EVERY path.
+COST: The wrong verdict on the exact file class the nudge singles out by name — the append-only
+  ledgers, where the union-merge directive is printed. A reader following it does more work than
+  needed and, worse, learns that the nudge's verdicts are unreliable on their checkout, which is
+  the expensive direction: the next DIVERGED that IS real gets read as more of the same. Nobody
+  lost data; the reported cost is a wrong prescription plus the turn spent establishing it.
+FIX: d55b7a63 — content set-difference instead of sha arithmetic, since sha identity is what a
+  replay destroys. The remedy overwrites the WORKTREE, so restore-safety is exactly "does the
+  worktree hold lines origin does not"; zero means nothing here can be lost. One-sided by design:
+  it only ever downgrades diverged->stale, only on a readable pair AND an empty difference, so
+  any error leaves DIVERGED standing.
+NOTE: This is the SECOND defect in this cell in four days and they point opposite ways. The cell
+  was ADDED on 2026-08-20 because the two-bucket classifier filed a genuinely-diverged path STALE
+  and the prescribed restore disarmed a data-loss push guard. This entry is the same cell now
+  over-firing. Both are the same underlying error — reading commit identity as content identity —
+  and it produced a false negative first, then a false positive, which is why "be more careful
+  with the direction test" would not have caught either. The durable form is that a classifier
+  prescribing a DESTRUCTIVE remedy has to be gated on what the remedy actually destroys, not on
+  a proxy for it. Also worth recording: the fix logs the downgrade, because STALE-because-
+  downgraded and STALE-outright were otherwise byte-identical in the log, which is the one-output-
+  two-states shape on the arm that prescribes the destructive remedy.
