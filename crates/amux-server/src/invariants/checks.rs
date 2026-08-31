@@ -1166,6 +1166,79 @@ pub struct LaneReport {
 }
 
 // ---------------------------------------------------------------------------
+// 5b. A registered, non-archived lane actually has a live tmux session.
+// ---------------------------------------------------------------------------
+
+/// INCIDENT this closes (AMUX-48, 2026-08-31): INIT-1 (closed 2026-08-30,
+/// "amux.service KillMode=mixed kills the whole tmux fleet on every deploy")
+/// fixed the RESTART path (`KillMode=process` — a deploy or reboot no longer
+/// SIGKILLs the tmux fleet's cgroup), but its own log named a second
+/// deliverable that was never actually built: nothing catches a session
+/// dying any OTHER way — an OOM kill of the pane, a manual `tmux
+/// kill-session`, a crash inside the pane — until a human happens to read
+/// the dashboard. Confirmed missing by grepping this file for the very
+/// check INIT-1's log describes, and finding nothing.
+///
+/// INVARIANT: every registered, non-archived lane (`all_lane_names()` — the
+/// SAME enumeration `amux start-all`/the sessions list/the ghost-rescue
+/// sweep all already use, chosen deliberately so this cannot disagree with
+/// them about what "registered" means) has a live tmux session, probed with
+/// the SAME `is_running()` `/api/sessions` itself trusts — not a bespoke
+/// `has-session` call that could drift from what the rest of the system
+/// already calls "running."
+///
+/// Archived lanes are excluded upstream, in `all_lane_names()` itself:
+/// `CC_ARCHIVED=1` is the one sanctioned "this lane is deliberately parked,
+/// not dead" signal this codebase has (`start_session` refuses to start an
+/// archived lane with "wake it first" rather than silently starting it) —
+/// so a lane reaching this check at all already means nothing said it was
+/// supposed to be stopped.
+pub fn registered_lanes_are_running(lanes: &[LaneRunState]) -> Vec<InvariantResult> {
+    const ID: &str = "session.registered_lane_is_running";
+    let mut out = Vec::new();
+    for l in lanes {
+        if l.is_running {
+            out.push(InvariantResult::pass(ID).entity(&l.name));
+        } else {
+            out.push(
+                InvariantResult::fail(
+                    ID,
+                    "a registered, non-archived lane has a live tmux session",
+                    format!(
+                        "{} is registered and not archived, but is_running() — the same \
+                         probe /api/sessions itself trusts — says it is not running",
+                        l.name
+                    ),
+                )
+                .entity(&l.name)
+                .evidence(json!({
+                    "session": l.name,
+                    "class": "session-died-silently",
+                    "incident": "AMUX-48/INIT-1: INIT-1 fixed the deploy-restart path via \
+                                 KillMode=process, but named a second, never-built half — \
+                                 catching a session that died some OTHER way (OOM, manual \
+                                 kill, crash). This is that check.",
+                    "fix": "amux start <name>, or amux start-all for the whole fleet",
+                })),
+            );
+        }
+    }
+    if out.is_empty() {
+        // Zero registered lanes is a real, if unusual, state (a fresh box) —
+        // not evidence the probe itself is broken.
+        out.push(InvariantResult::pass(ID));
+    }
+    out
+}
+
+/// One registered lane's expected-vs-actual running state.
+#[derive(Debug, Clone)]
+pub struct LaneRunState {
+    pub name: String,
+    pub is_running: bool,
+}
+
+// ---------------------------------------------------------------------------
 // 6. Shared-checkout git guard: does the running hook match its committed source?
 // ---------------------------------------------------------------------------
 

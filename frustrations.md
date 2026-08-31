@@ -2976,3 +2976,44 @@ FIX: `/home/syseng/src/amux/amux` (ships on save, already live): `-t "=$tname"` 
   (the 9th, `synthesia`, fails for a pre-existing unrelated reason — a macOS path
   baked into its config on this Linux box — and now says so clearly instead of the
   whole batch dying silently after the first session).
+
+## A fix that brings the fleet back up can itself make local cargo unsafe again
+AREA: build
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-31
+SESSION: amux
+CARD: AMUX-48
+SYMPTOM: Shortly after fixing AMUX-49 (every registered lane, not just `amux`,
+  now comes back up after a reboot — 6 more Claude sessions went from stopped to
+  running as a direct result), a plain `cargo check -p amux-server` — the ONE
+  cargo invocation the existing offload-builds guidance called safe to run
+  locally, single-crate, `.cargo/config.toml`'s `jobs=1`/`incremental=false`
+  throttle already active — got OOM-killed (exit 137) anyway. `free -h`
+  immediately after: 5.5GiB available out of 13GiB, zero swap. `.cargo/
+  config.toml`'s own header (written 2026-08-28, FRONT-2) already names the
+  mechanism: its throttle was tuned and verified against THAT day's baseline
+  memory occupancy, and it explicitly warns a kill under pressure is not
+  necessarily the build's own process — the OOM killer can reap an unrelated
+  Claude Code session as collateral instead. AMUX-49 raised this box's
+  baseline occupancy (8 running Claude processes instead of 2, ~200-400MB RSS
+  each) without anyone re-measuring whether the existing throttle still holds
+  against the new baseline.
+COST: A gate that could not be honestly satisfied: AMUX-48's new invariants
+  check (session.registered_lane_is_running) is written and follows an
+  established, already-working pattern closely, but could not be verified to
+  even COMPILE locally without risking re-crashing the same session AMUX-49
+  had just recovered — the exact irony of one fix undermining the safety
+  margin a sibling fix depended on. Remote build hosts were ALSO unreachable
+  at the same time (a separate, unrelated baar-site netbird outage), so there
+  was no fallback verification path at all for a period.
+FIX: none yet — this is a structural gap, not a one-line bug. The honest
+  interim mitigation (applied 2026-08-31): `offload-builds` memory widened to
+  say `cargo check -p <single-crate>` is no longer a blanket-safe default —
+  check `free -h` for real headroom before ANY local cargo invocation, treat
+  the margin as a property of current fleet occupancy, not of the command's
+  scope. A real fix would be either a durable local swap file (this box
+  currently has NONE — `free -h` shows `Swap: 0B`, so there is zero graceful
+  degradation under pressure and the OOM killer fires immediately) or a
+  standing, always-available remote build target instead of relying on
+  `docker.baar`/`thinkpad.atlantis` being up when needed.

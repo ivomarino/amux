@@ -95,6 +95,13 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(timestamp_units_check(state));
     out.extend(arrival_follows_boot_check(state));
 
+    // -- 5c. every registered, non-archived lane actually has a live tmux
+    // session (AMUX-48) — the log-signal half of INIT-1 that was never
+    // shipped. Catches a session dying any way OTHER than the deploy-restart
+    // path INIT-1's KillMode=process already covers (an OOM kill of the
+    // pane, a manual kill, a crash).
+    out.extend(registered_lanes_running_check().await);
+
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
     // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
     // time — these scripts deploy on COMMIT (install), not on binary rebuild, so
@@ -612,6 +619,23 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
     let mut results = checks::status_agrees_with_pane(&lanes);
     results.extend(checks::status_contradicts_fresh_idle_report(&lanes));
     results
+}
+
+/// AMUX-48: every registered, non-archived lane has a live tmux session.
+///
+/// `all_lane_names()` and `is_running()` are the SAME enumeration and the
+/// SAME probe `amux start-all`, the sessions list, and the ghost-rescue
+/// sweep already trust — reused here rather than a bespoke `has-session`
+/// call, so this check cannot disagree with the rest of the system about
+/// what "registered" or "running" means.
+async fn registered_lanes_running_check() -> Vec<InvariantResult> {
+    let names = crate::api::session_verbs::all_lane_names();
+    let mut lanes = Vec::with_capacity(names.len());
+    for name in names {
+        let is_running = crate::api::session_verbs::is_running(&name).await;
+        lanes.push(checks::LaneRunState { name, is_running });
+    }
+    checks::registered_lanes_are_running(&lanes)
 }
 
 /// Is the report control plane UP — are self-reports landing at all?
