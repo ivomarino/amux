@@ -148,7 +148,8 @@ Write a five-line brief that states each decision and the single most
 important open question, using only the connected sources.
 ```
 
-- `sources` is a list of connections, each `{path, prompt}`. `path` is a file, a folder (expanded to its files, size-capped), or another `.mdai` file, resolved relative to the containing `.mdai` file's directory. `prompt` is the configurable edge prompt; a sensible default is filled in when a connection is created without one. A bare string entry (just the path) is also accepted and gets the default prompt.
+- `sources` is a list of connections, each `{path, prompt}`. `path` is a file, a folder (expanded to its files, size-capped), another `.mdai` file resolved relative to the containing `.mdai` file's directory, or the live amux source `amux:messages?days=N&limit=N&offset=N`. `prompt` is the configurable edge prompt; a sensible default is filled in when a connection is created without one. A bare string entry (just the path) is also accepted and gets the default prompt.
+- `amux:messages` reads user directives from `cmd_history`. With no query it uses the last 14 days. `days=N` is capped at 90. A count window like `limit=1000` has no implicit day cutoff, and `offset=N` pages backward from the newest message; rows are rendered oldest-first with `MSG-<id>` evidence labels.
 - `model` is an optional per-file override.
 - The markdown body is the node synthesis instruction. A plain markdown file with no frontmatter is a valid node with no sources.
 

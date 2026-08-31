@@ -137,7 +137,9 @@ fn mdai_root() -> PathBuf {
     if let Some(p) = mdai_root_pref() {
         return p;
     }
-    std::env::var("HOME").map(PathBuf::from).unwrap_or_else(|_| "/".into())
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| "/".into())
 }
 
 /// The live `mdai_root` pref (a path), read with a short-lived read-only
@@ -457,7 +459,9 @@ impl ModelClient for CliModel {
         cmd.stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let mut child = cmd.spawn().map_err(|e| format!("could not run {cli}: {e}"))?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| format!("could not run {cli}: {e}"))?;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(MODEL_TIMEOUT_S);
         loop {
             match child.try_wait() {
@@ -508,7 +512,11 @@ fn resolve_existing(root_canon: &Path, base: &Path, rel: &str) -> Result<PathBuf
         return Err(MdaiError::BadRequest("empty path".into()));
     }
     let p = Path::new(rel);
-    let joined = if p.is_absolute() { p.to_path_buf() } else { base.join(p) };
+    let joined = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        base.join(p)
+    };
     let canon = joined
         .canonicalize()
         .map_err(|_| MdaiError::NotFound(rel.to_string()))?;
@@ -571,7 +579,10 @@ fn expand_folder(dir: &Path) -> Result<String, MdaiError> {
             out.push_str("\n...[folder truncated]");
             break;
         }
-        let name = f.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let name = f
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
         let remaining = MAX_FOLDER_BYTES.saturating_sub(out.len());
         let content = std::fs::read_to_string(&f).unwrap_or_default();
         out.push_str(&format!("### {name}\n{}\n\n", cap_str(&content, remaining)));
@@ -721,6 +732,72 @@ fn fmt_day_min(ts_ms: i64) -> String {
 const MSG_CAP: usize = 4_000;
 /// Total budget for the assembled message block.
 const MSGS_TOTAL_CAP: usize = 120_000;
+const DEFAULT_MESSAGES_DAYS: i64 = 14;
+const MAX_MESSAGES_DAYS: i64 = 90;
+const DEFAULT_MESSAGES_LIMIT: i64 = 4_000;
+const MAX_MESSAGES_LIMIT: i64 = 4_000;
+const MAX_MESSAGES_OFFSET: i64 = 20_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AmuxMessagesQuery {
+    /// None means no time cutoff. This is deliberate when a caller asks for a
+    /// count window (`limit=1000`): the count, not an implicit 14-day wall, is
+    /// the selection.
+    days: Option<i64>,
+    limit: i64,
+    offset: i64,
+    requested_days: Option<i64>,
+    requested_limit: Option<i64>,
+    requested_offset: Option<i64>,
+}
+
+fn query_value<'a>(query: &'a str, key: &str) -> Option<&'a str> {
+    query.split('&').find_map(|kv| {
+        let (k, v) = kv.trim().split_once('=')?;
+        (k == key).then_some(v.trim())
+    })
+}
+
+fn positive_i64(v: &str) -> Option<i64> {
+    v.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
+fn nonnegative_i64(v: &str) -> Option<i64> {
+    v.parse::<i64>().ok().filter(|n| *n >= 0)
+}
+
+fn parse_messages_query(query: &str) -> AmuxMessagesQuery {
+    let requested_limit = query_value(query, "limit")
+        .or_else(|| query_value(query, "count"))
+        .and_then(positive_i64);
+    let limit = requested_limit
+        .unwrap_or(DEFAULT_MESSAGES_LIMIT)
+        .clamp(1, MAX_MESSAGES_LIMIT);
+
+    let requested_offset = query_value(query, "offset").and_then(nonnegative_i64);
+    let offset = requested_offset.unwrap_or(0).clamp(0, MAX_MESSAGES_OFFSET);
+
+    let days_raw = query_value(query, "days").map(|v| v.trim().to_ascii_lowercase());
+    let requested_days = days_raw
+        .as_deref()
+        .filter(|v| !matches!(*v, "all" | "none" | "0"))
+        .and_then(positive_i64);
+    let days = match days_raw.as_deref() {
+        Some("all" | "none" | "0") => None,
+        Some(_) => requested_days.map(|d| d.clamp(1, MAX_MESSAGES_DAYS)),
+        None if requested_limit.is_some() || requested_offset.is_some() => None,
+        None => Some(DEFAULT_MESSAGES_DAYS),
+    };
+
+    AmuxMessagesQuery {
+        days,
+        limit,
+        offset,
+        requested_days,
+        requested_limit,
+        requested_offset,
+    }
+}
 
 /// Assemble the `amux:messages` block: SELECT newest-first (the caller orders
 /// `ts DESC`), RENDER oldest-first. Returns the block and how many messages
@@ -737,15 +814,15 @@ const MSGS_TOTAL_CAP: usize = 120_000;
 /// Same defect the logs endpoint carried until this morning (AF-131): a cap
 /// whose DIRECTION is part of its correctness, quietly taking the end nobody
 /// wants. Pure so both properties are testable without a database.
-pub(crate) fn assemble_messages<I: IntoIterator<Item = (i64, String, String)>>(
+pub(crate) fn assemble_messages<I: IntoIterator<Item = (i64, i64, String, String)>>(
     newest_first: I,
 ) -> (String, usize) {
     let mut lines: Vec<String> = Vec::new();
     let mut used = 0usize;
     let mut truncated = false;
-    for (ts_ms, session, text) in newest_first {
+    for (id, ts_ms, session, text) in newest_first {
         let line = format!(
-            "[{}] {session}: {}\n",
+            "[{}] MSG-{id} {session}: {}\n",
             fmt_day_min(ts_ms),
             cap_str(text.replace('\n', " ").trim(), MSG_CAP)
         );
@@ -767,40 +844,75 @@ pub(crate) fn assemble_messages<I: IntoIterator<Item = (i64, String, String)>>(
     (out, n)
 }
 
-/// Resolve an `amux:` data source (AMUX-3294). Grammar: `messages[?days=N]`
-/// (default 14, capped at 90). Reads `cmd_history` directly from the run's DB
-/// store and returns the recent user directives as text for the synthesis
+/// Resolve an `amux:` data source (AMUX-3294). Grammar:
+/// `messages[?days=N&limit=N&offset=N]` (default days=14, limit=4000; days is
+/// capped at 90 and limit at 4000). A count window like `limit=1000` has no
+/// implicit day cutoff: "last 1000" means the last 1000 stored user directives,
+/// not "up to 1000 from the last 14 days". Reads `cmd_history` directly from
+/// the run's DB store and returns user directives as text for the synthesis
 /// prompt. `cmd_history.ts` is in MILLISECONDS.
 fn resolve_amux_source(ctx: &RunCtx, spec: &str) -> Result<String, MdaiError> {
     let (kind, query) = spec.split_once('?').unwrap_or((spec, ""));
     let kind = kind.trim();
-    let days: i64 = query
-        .split('&')
-        .find_map(|kv| kv.trim().strip_prefix("days="))
-        .and_then(|v| v.parse().ok())
-        .filter(|d| *d > 0 && *d <= 90)
-        .unwrap_or(14);
     match kind {
         "messages" => {
+            let q = parse_messages_query(query);
+            if let Some(requested) = q.requested_limit.filter(|v| *v != q.limit) {
+                tracing::warn!(
+                    requested,
+                    served = q.limit,
+                    "mdai amux:messages limit clamped"
+                );
+            }
+            if let Some(requested) = q.requested_offset.filter(|v| *v != q.offset) {
+                tracing::warn!(
+                    requested,
+                    served = q.offset,
+                    "mdai amux:messages offset clamped"
+                );
+            }
+            if let Some(requested) = q
+                .requested_days
+                .filter(|v| q.days.map(|d| d != *v).unwrap_or(false))
+            {
+                tracing::warn!(
+                    requested,
+                    served = q.days.unwrap_or(0),
+                    "mdai amux:messages days clamped"
+                );
+            }
             let conn = ctx
                 .store
                 .read()
                 .map_err(|e| MdaiError::Io(format!("db read: {e}")))?;
-            let cutoff_ms = (now_secs() * 1000) - days * 86_400_000;
+            let mut sql = String::from(
+                "SELECT id, ts, COALESCE(session,''), COALESCE(text,'') \
+                 FROM cmd_history \
+                 WHERE type='user' AND COALESCE(text,'') <> ''",
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::new();
+            if let Some(days) = q.days {
+                let cutoff_ms = (now_secs() * 1000) - days * 86_400_000;
+                sql.push_str(" AND ts >= ?");
+                params.push(rusqlite::types::Value::Integer(cutoff_ms));
+            }
+            sql.push_str(" ORDER BY ts DESC LIMIT ? OFFSET ?");
+            params.push(rusqlite::types::Value::Integer(q.limit));
+            params.push(rusqlite::types::Value::Integer(q.offset));
+            let refs: Vec<&dyn rusqlite::types::ToSql> = params
+                .iter()
+                .map(|p| p as &dyn rusqlite::types::ToSql)
+                .collect();
             let mut stmt = conn
-                .prepare(
-                    "SELECT ts, COALESCE(session,''), COALESCE(text,'') \
-                     FROM cmd_history \
-                     WHERE type='user' AND ts >= ?1 AND COALESCE(text,'') <> '' \
-                     ORDER BY ts DESC LIMIT 4000",
-                )
+                .prepare(&sql)
                 .map_err(|e| MdaiError::Io(format!("db prepare: {e}")))?;
             let rows = stmt
-                .query_map(rusqlite::params![cutoff_ms], |r| {
+                .query_map(refs.as_slice(), |r| {
                     Ok((
                         r.get::<_, i64>(0)?,
-                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(1)?,
                         r.get::<_, String>(2)?,
+                        r.get::<_, String>(3)?,
                     ))
                 })
                 .map_err(|e| MdaiError::Io(format!("db query: {e}")))?;
@@ -808,10 +920,22 @@ fn resolve_amux_source(ctx: &RunCtx, spec: &str) -> Result<String, MdaiError> {
             let (body, n) = assemble_messages(rows.flatten());
             out.push_str(&body);
             if n == 0 {
-                return Ok(format!("(no user messages in the last {days} days)"));
+                let scope = q
+                    .days
+                    .map(|days| format!("last {days} days"))
+                    .unwrap_or_else(|| "all time".to_string());
+                return Ok(format!(
+                    "(no user messages selected from {scope}; limit {}, offset {})",
+                    q.limit, q.offset
+                ));
             }
+            let scope = q
+                .days
+                .map(|days| format!("the last {days} days"))
+                .unwrap_or_else(|| "all stored history".to_string());
             Ok(format!(
-                "The last {days} days of amux user directives ({n} messages), oldest first:\n\n{out}"
+                "Selected amux user directives from {scope} ({n} rendered; SQL window limit {}, offset {}), oldest first:\n\n{out}",
+                q.limit, q.offset
             ))
         }
         other => Err(MdaiError::Io(format!(
@@ -1017,7 +1141,9 @@ fn find_mdai_files(root: &Path) -> (Vec<PathBuf>, bool) {
             *cut = true;
             return;
         }
-        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in rd.flatten() {
             let p = entry.path();
             let name = entry.file_name().to_string_lossy().to_string();
@@ -1025,7 +1151,10 @@ fn find_mdai_files(root: &Path) -> (Vec<PathBuf>, bool) {
                 continue;
             }
             if p.is_dir() {
-                if matches!(name.as_str(), "node_modules" | "target" | ".git" | "Library") {
+                if matches!(
+                    name.as_str(),
+                    "node_modules" | "target" | ".git" | "Library"
+                ) {
                     continue;
                 }
                 walk(&p, out, depth + 1, deadline, cut);
@@ -1036,7 +1165,13 @@ fn find_mdai_files(root: &Path) -> (Vec<PathBuf>, bool) {
     }
     let mut out = Vec::new();
     let mut cut = false;
-    walk(root, &mut out, 0, std::time::Instant::now() + SCAN_BUDGET, &mut cut);
+    walk(
+        root,
+        &mut out,
+        0,
+        std::time::Instant::now() + SCAN_BUDGET,
+        &mut cut,
+    );
     out.sort();
     if cut {
         tracing::warn!(
@@ -1123,14 +1258,21 @@ async fn list(State(state): State<AppState>) -> Response {
             Json(json!({ "files": items, "truncated": truncated })).into_response()
         }
         Ok(Err(e)) => e.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
             .into_response(),
     }
 }
 
 /// `POST /api/files/mdai/run {path}` - run the DAG, record history, return the
 /// entry node's latest output.
-async fn run(State(state): State<AppState>, headers: HeaderMap, Json(body): Json<Value>) -> Response {
+async fn run(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
     let path = body["path"].as_str().unwrap_or("").trim().to_string();
     if path.is_empty() {
         return MdaiError::BadRequest("path required".into()).into_response();
@@ -1146,13 +1288,19 @@ async fn run(State(state): State<AppState>, headers: HeaderMap, Json(body): Json
     match res {
         Ok(Ok(r)) => Json(r).into_response(),
         Ok(Err(e)) => e.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
             .into_response(),
     }
 }
 
 /// `GET /api/files/mdai/history?path=...` - newest-first run history for a node.
-async fn history(State(state): State<AppState>, Query(q): Query<HashMap<String, String>>) -> Response {
+async fn history(
+    State(state): State<AppState>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
     let path = q.get("path").map(|s| s.trim()).unwrap_or("").to_string();
     if path.is_empty() {
         return MdaiError::BadRequest("path query param required".into()).into_response();
@@ -1200,8 +1348,13 @@ async fn history(State(state): State<AppState>, Query(q): Query<HashMap<String, 
     .await;
     match res {
         Ok(Ok(v)) => Json(v).into_response(),
-        Ok(Err(e)) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        Ok(Err(e)) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e}))).into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
             .into_response(),
     }
 }
@@ -1224,7 +1377,10 @@ async fn connect(State(_state): State<AppState>, Json(body): Json<Value>) -> Res
     match res {
         Ok(Ok(v)) => Json(v).into_response(),
         Ok(Err(e)) => e.into_response(),
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({"error": e.to_string()})))
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": e.to_string()})),
+        )
             .into_response(),
     }
 }
@@ -1238,7 +1394,9 @@ pub fn connect_edge(source: &str, target: &str, prompt: &str) -> Result<Value, M
     // The target must exist and be a .mdai file (we are editing its frontmatter).
     let target_abs = resolve_existing(&root_canon, &root_canon, target)?;
     if !is_mdai(&target_abs) {
-        return Err(MdaiError::BadRequest(format!("target is not a .{MDAI_EXT} file: {target}")));
+        return Err(MdaiError::BadRequest(format!(
+            "target is not a .{MDAI_EXT} file: {target}"
+        )));
     }
     // The source need not exist yet at connect time, but if a value is given it
     // must not escape the root. Resolve leniently: reject only a clear escape.
@@ -1325,9 +1483,15 @@ mod tests {
     #[test]
     fn a_model_timeout_is_a_504_and_other_model_errors_are_502() {
         let t = classify_model_err(format!("claude {MODEL_TIMEOUT_MARKER} 150s"));
-        assert!(matches!(t, MdaiError::ModelTimeout(_)), "the timeout shape must classify as one");
+        assert!(
+            matches!(t, MdaiError::ModelTimeout(_)),
+            "the timeout shape must classify as one"
+        );
         assert_eq!(t.status(), StatusCode::GATEWAY_TIMEOUT);
-        assert!(t.to_string().contains("model timeout"), "and read as one: {t}");
+        assert!(
+            t.to_string().contains("model timeout"),
+            "and read as one: {t}"
+        );
 
         // CONTROL: a genuine model fault keeps 502. Without this the classifier
         // could route everything to 504 and the assertion above would pass,
@@ -1346,7 +1510,10 @@ mod tests {
             produced.contains(MODEL_TIMEOUT_MARKER),
             "the timeout message and its classifier have drifted: {produced}"
         );
-        assert!(matches!(classify_model_err(produced), MdaiError::ModelTimeout(_)));
+        assert!(matches!(
+            classify_model_err(produced),
+            MdaiError::ModelTimeout(_)
+        ));
     }
 
     use super::*;
@@ -1360,7 +1527,9 @@ mod tests {
     }
     impl FakeModel {
         fn new() -> Self {
-            FakeModel { calls: Mutex::new(Vec::new()) }
+            FakeModel {
+                calls: Mutex::new(Vec::new()),
+            }
         }
         fn count(&self) -> usize {
             self.calls.lock().unwrap().len()
@@ -1408,11 +1577,26 @@ mod tests {
         let r = run_dag(&store, dir.path(), "mid.mdai", &fake, None).unwrap();
 
         let calls = fake.calls();
-        assert_eq!(calls.len(), 2, "leaf and mid each call the model exactly once");
+        assert_eq!(
+            calls.len(),
+            2,
+            "leaf and mid each call the model exactly once"
+        );
         // Upstream-first: leaf ran before mid.
-        assert!(calls[0].1.contains("LEAFBODY"), "first call is the leaf: {}", calls[0].1);
-        assert!(calls[0].1.contains("PLAINSOURCE"), "leaf sees the plain file");
-        assert!(calls[1].1.contains("MIDBODY"), "second call is the mid: {}", calls[1].1);
+        assert!(
+            calls[0].1.contains("LEAFBODY"),
+            "first call is the leaf: {}",
+            calls[0].1
+        );
+        assert!(
+            calls[0].1.contains("PLAINSOURCE"),
+            "leaf sees the plain file"
+        );
+        assert!(
+            calls[1].1.contains("MIDBODY"),
+            "second call is the mid: {}",
+            calls[1].1
+        );
         // The mid's assembled context contains the leaf's exact output.
         let leaf_output = &calls[0].2;
         assert!(
@@ -1433,8 +1617,16 @@ mod tests {
     fn a_cycle_is_detected_and_named() {
         let dir = tempfile::tempdir().unwrap();
         let store = temp_store(dir.path());
-        write(dir.path(), "a.mdai", "---\nsources:\n  - path: b.mdai\n---\nA body");
-        write(dir.path(), "b.mdai", "---\nsources:\n  - path: a.mdai\n---\nB body");
+        write(
+            dir.path(),
+            "a.mdai",
+            "---\nsources:\n  - path: b.mdai\n---\nA body",
+        );
+        write(
+            dir.path(),
+            "b.mdai",
+            "---\nsources:\n  - path: a.mdai\n---\nB body",
+        );
         let fake = FakeModel::new();
         let err = run_dag(&store, dir.path(), "a.mdai", &fake, None).unwrap_err();
         match err {
@@ -1445,7 +1637,11 @@ mod tests {
             }
             other => panic!("expected a cycle error, got {other:?}"),
         }
-        assert_eq!(fake.count(), 0, "a cyclic graph must not spend a model call");
+        assert_eq!(
+            fake.count(),
+            0,
+            "a cyclic graph must not spend a model call"
+        );
     }
 
     // (3) The cache short-circuits an unchanged re-run: the fake model is invoked
@@ -1468,7 +1664,11 @@ mod tests {
 
         // Unchanged re-run: reuse, no new model call.
         let r2 = run_dag(&store, dir.path(), "node.mdai", &fake, None).unwrap();
-        assert_eq!(fake.count(), 1, "unchanged re-run must NOT call the model again");
+        assert_eq!(
+            fake.count(),
+            1,
+            "unchanged re-run must NOT call the model again"
+        );
         assert!(r2.cached, "the re-run is served from cache");
         assert_eq!(r1.output, r2.output, "cached output is identical");
 
@@ -1522,42 +1722,183 @@ mod tests {
     fn the_message_block_keeps_the_newest_and_caps_each_one() {
         // Caller supplies ts DESC. 400 messages of ~500 bytes each overflows the
         // 120,000-byte budget, so the cap must bite and choose a side.
-        let rows: Vec<(i64, String, String)> = (0..400)
+        let rows: Vec<(i64, i64, String, String)> = (0..400)
             .map(|i| {
                 let ts = 1_700_000_000_000i64 + (i as i64) * 60_000;
-                (ts, "lane".to_string(), format!("m{i:04}-{}", "x".repeat(480)))
+                (
+                    i as i64,
+                    ts,
+                    "lane".to_string(),
+                    format!("m{i:04}-{}", "x".repeat(480)),
+                )
             })
             .rev() // newest first, as the SQL now returns
             .collect();
         let (block, n) = assemble_messages(rows);
 
         assert!(n > 0 && n < 400, "the cap must actually bite: n={n}");
-        assert!(block.len() <= MSGS_TOTAL_CAP + 200, "over budget: {}", block.len());
+        assert!(
+            block.len() <= MSGS_TOTAL_CAP + 200,
+            "over budget: {}",
+            block.len()
+        );
 
         // THE REGRESSION: the newest message must be present and the oldest gone.
         // Reversed, this test still passes on the broken version — which is why
         // both halves are asserted, not just "some messages survived".
-        assert!(block.contains("m0399-"), "the NEWEST message must survive the cap");
-        assert!(!block.contains("m0000-"), "the OLDEST must be the one dropped");
+        assert!(
+            block.contains("m0399-"),
+            "the NEWEST message must survive the cap"
+        );
+        assert!(
+            !block.contains("m0000-"),
+            "the OLDEST must be the one dropped"
+        );
 
         // Rendered oldest-first among those kept, which is what the prompt says.
         let first = block.find("m0").expect("no message rendered");
         let newest = block.find("m0399-").expect("newest missing");
         assert!(first < newest, "kept messages must render oldest-first");
-        assert!(block.starts_with("… (older messages"), "truncation must be announced: {}", &block[..40]);
+        assert!(
+            block.starts_with("… (older messages"),
+            "truncation must be announced: {}",
+            &block[..40]
+        );
 
         // PER-MESSAGE CAP: one message larger than the entire budget must not
         // blow through it. The old code pushed first and checked after, so a
         // single 5,974 KB message (there is one in the live window) produced a
         // ~6MB block from a 120KB cap.
-        let huge = vec![(1_700_000_000_000i64, "lane".into(), "y".repeat(6_000_000))];
+        let huge = vec![(
+            31152i64,
+            1_700_000_000_000i64,
+            "lane".into(),
+            "y".repeat(6_000_000),
+        )];
         let (block, n) = assemble_messages(huge);
         assert_eq!(n, 1, "the huge message should still be included, capped");
+        assert!(
+            block.contains("MSG-31152"),
+            "the source block must carry message ids"
+        );
         assert!(
             block.len() < MSG_CAP + 200,
             "one oversized message must be capped, not passed through: {}",
             block.len()
         );
+    }
+
+    #[test]
+    fn messages_query_limit_is_a_count_window_not_an_implicit_day_window() {
+        let default = parse_messages_query("");
+        assert_eq!(default.days, Some(DEFAULT_MESSAGES_DAYS));
+        assert_eq!(default.limit, DEFAULT_MESSAGES_LIMIT);
+        assert_eq!(default.offset, 0);
+
+        let count = parse_messages_query("limit=1000");
+        assert_eq!(count.days, None, "count windows must not inherit days=14");
+        assert_eq!(count.limit, 1000);
+        assert_eq!(count.offset, 0);
+
+        let all = parse_messages_query("days=all&count=250&offset=500");
+        assert_eq!(all.days, None);
+        assert_eq!(all.limit, 250);
+        assert_eq!(all.offset, 500);
+
+        let clamped = parse_messages_query("days=900&limit=99999&offset=99999");
+        assert_eq!(clamped.days, Some(MAX_MESSAGES_DAYS));
+        assert_eq!(clamped.limit, MAX_MESSAGES_LIMIT);
+        assert_eq!(clamped.offset, MAX_MESSAGES_OFFSET);
+        assert_eq!(clamped.requested_days, Some(900));
+        assert_eq!(clamped.requested_limit, Some(99999));
+        assert_eq!(clamped.requested_offset, Some(99999));
+    }
+
+    #[test]
+    fn amux_messages_source_uses_limit_offset_and_renders_message_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = temp_store(dir.path());
+        let now_ms = now_secs() * 1000;
+        store
+            .write(move |conn| {
+                for (id, days_ago, session, text, kind) in [
+                    (
+                        1i64,
+                        40i64,
+                        "oldest",
+                        "outside the default window one",
+                        "user",
+                    ),
+                    (2, 30, "middle-a", "outside the default window two", "user"),
+                    (
+                        3,
+                        20,
+                        "middle-b",
+                        "outside the default window three",
+                        "user",
+                    ),
+                    (4, 1, "newest", "inside the default window", "user"),
+                    (
+                        5,
+                        1,
+                        "ignored",
+                        "schedule rows are not user directives",
+                        "schedule",
+                    ),
+                ] {
+                    conn.execute(
+                        "INSERT INTO cmd_history (id, text, type, session, ts, origin) \
+                         VALUES (?1, ?2, ?3, ?4, ?5, '')",
+                        rusqlite::params![id, text, kind, session, now_ms - days_ago * 86_400_000,],
+                    )?;
+                }
+                Ok(WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
+            })
+            .unwrap();
+        write(
+            dir.path(),
+            "window.mdai",
+            "---\nsources:\n  - path: amux:messages?limit=2&offset=1\n    prompt: audit this window\n---\nBODY",
+        );
+
+        let fake = FakeModel::new();
+        run_dag(&store, dir.path(), "window.mdai", &fake, None).unwrap();
+        let prompt = &fake.calls()[0].1;
+
+        assert!(
+            prompt.contains("all stored history"),
+            "limit-only source must report an all-history selection: {prompt}"
+        );
+        assert!(
+            !prompt.contains("last 14 days"),
+            "limit-only source must not smuggle in the default day window: {prompt}"
+        );
+        assert!(
+            prompt.contains("MSG-2 middle-a"),
+            "offset window includes MSG-2: {prompt}"
+        );
+        assert!(
+            prompt.contains("MSG-3 middle-b"),
+            "offset window includes MSG-3: {prompt}"
+        );
+        assert!(
+            !prompt.contains("MSG-4 newest"),
+            "offset skips the newest row"
+        );
+        assert!(
+            !prompt.contains("MSG-1 oldest"),
+            "limit stops before the oldest row"
+        );
+        assert!(
+            !prompt.contains("schedule rows are not user directives"),
+            "non-user history rows must stay out of the user-directive source"
+        );
+        let two = prompt.find("MSG-2").expect("MSG-2 missing");
+        let three = prompt.find("MSG-3").expect("MSG-3 missing");
+        assert!(two < three, "selected rows render oldest-first: {prompt}");
     }
 
     // resolve_model: per-file override wins, then AMUX_HELPER_MODEL, then the
@@ -1603,7 +1944,11 @@ mod tests {
     fn connect_edge_writes_a_parseable_edge() {
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("AMUX_FILES_ROOT", dir.path());
-        write(dir.path(), "target.mdai", "---\nsources: []\n---\nTARGET body");
+        write(
+            dir.path(),
+            "target.mdai",
+            "---\nsources: []\n---\nTARGET body",
+        );
         write(dir.path(), "src.txt", "some source");
 
         let out = connect_edge("src.txt", "target.mdai", "custom edge prompt").unwrap();
@@ -1618,7 +1963,8 @@ mod tests {
 
         // A second connect with no prompt fills the sensible default.
         connect_edge("other.txt", "target.mdai", DEFAULT_EDGE_PROMPT).unwrap();
-        let doc2 = parse_mdai(&std::fs::read_to_string(dir.path().join("target.mdai")).unwrap()).unwrap();
+        let doc2 =
+            parse_mdai(&std::fs::read_to_string(dir.path().join("target.mdai")).unwrap()).unwrap();
         assert_eq!(doc2.sources.len(), 2);
         assert_eq!(doc2.sources[1].prompt, DEFAULT_EDGE_PROMPT);
 
