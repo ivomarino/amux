@@ -2571,6 +2571,54 @@ print(json.dumps(b))'         | _curl -sk -X PATCH -H 'Content-Type: application
       echo "$result" | _board_outcome "$id" "" "$_what"
       return $?
       ;;
+    block)
+      # AMUX-3960. The authoring path for `blocked_on` (AMUX-3949), which shipped
+      # as a dimension the frontier honours and NOTHING COULD SET. A dimension
+      # nobody can author is a column, not a feature.
+      #
+      # Attributed via X-Amux-Worker like every other verb here: AMUX-2325's
+      # defect was a nudge prescribing a remedy reachable only by an
+      # unattributed raw PATCH, so the setter went unrecorded.
+      local id="${1:-}"
+      _board_id_guard "block" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board block <ISSUE-ID> --on <what it is waiting for>
+       amux board unblock <ISSUE-ID>
+Blocks a card WITHOUT changing its status, so its lifecycle position survives.
+Excluded from 'amux board ready' until unblocked."
+      shift
+      local on=""
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --on)       on="${2:-}"; [[ -n "$on" ]] || die "--on needs a reason"; shift 2 ;;
+          --on-stdin) on="$(cat)"; shift ;;
+          --help|-h)  die "amux board block <ISSUE-ID> --on <reason> | --on-stdin" ;;
+          -*)         die "amux board block: unknown flag '$1'" ;;
+          *)          on="$1"; shift ;;
+        esac
+      done
+      # --on IS REQUIRED. "Blocked" with no stated cause is the shape AF-318
+      # measured across 445 needsyou cards; naming what it waits for is the entire
+      # point of the dimension.
+      [[ -n "${on// }" ]] || die "amux board block: --on is required — say what the card is waiting for.
+A block with no named cause is unfalsifiable: nobody else can tell when it clears."
+      local result
+      result=$(O="$on" python3 -c 'import json,os; print(json.dumps({"blocked_on": os.environ["O"].strip()}))' \
+        | _curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      echo "$result" | _board_outcome "$id" "" "blocked"
+      return $?
+      ;;
+    unblock)
+      local id="${1:-}"
+      _board_id_guard "unblock" "$id"
+      [[ -n "$id" ]] || die "Usage: amux board unblock <ISSUE-ID>"
+      local result
+      result=$(printf '{"blocked_on": ""}' \
+        | _curl -sk -X PATCH -H 'Content-Type: application/json' \
+            -H "X-Amux-Worker: ${AMUX_WORKER:-${AMUX_SESSION:-}}" -d @- "$AMUX_API/api/board/$id")
+      echo "$result" | _board_outcome "$id" "" "unblocked"
+      return $?
+      ;;
     add|create)
       # Title via --stdin/--file keeps it out of a shell-evaluated string
       # (AMUX-1888); the JSON body is built with json.dumps, not string
@@ -3104,6 +3152,11 @@ ${BOLD}amux board${RESET} — manage board issues from the CLI
   amux board type <ID> <type>      Correct a card's type (the gate is DERIVED from it)
   amux board epic <ID> <EPIC-ID>   Roll a card up under an epic ('none' detaches)
   amux board reviewer <ID> <W>     Name the peer a card in review is handed to
+  amux board block <ID> --on <why> Block a card WITHOUT changing its status, so its
+                                   lifecycle position survives. --on is required:
+                                   a block with no named cause is unfalsifiable.
+                                   Excluded from 'ready' until unblocked.
+  amux board unblock <ID>          Clear the block; status untouched.
   amux board next <ID> <text>      Continuation: what the next actor should DO.
                                    --stdin/--file preferred (a next action often
                                    quotes a command, and an inline arg is shell-
