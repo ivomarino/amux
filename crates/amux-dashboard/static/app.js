@@ -4920,7 +4920,8 @@ function editField(session, field, current, provider) {
       {v:'claude-haiku-4-5-20251001',l:'claude-haiku-4-5-20251001'}
     ];
     const codexModels = [
-      {v:'',l:'Default'},{v:'gpt-5.5',l:'gpt-5.5'},{v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
+      {v:'',l:'Default'},{v:'gpt-5.6-sol',l:'GPT-5.6 Sol'},{v:'gpt-5.5',l:'gpt-5.5'},
+      {v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
       {v:'gpt-4o',l:'gpt-4o'},{v:'gpt-4.1',l:'gpt-4.1'},{v:'gpt-4.1-mini',l:'gpt-4.1-mini'}
     ];
     const geminiModels = [
@@ -8213,7 +8214,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.756';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.757';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
