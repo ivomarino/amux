@@ -391,6 +391,15 @@ fn def_of(home: &std::path::Path, id: &str) -> Option<Def> {
     defs(home).into_iter().find(|d| d.id == id)
 }
 
+/// The env-var NAMES a connector declares, builtin or declared (AMUX-3994).
+///
+/// Exported so the `.mdai` engine can resolve a `connector:`-backed fetch
+/// without duplicating the registry or reading credentials itself: mdai asks
+/// for the NAMES, then reads the value from server.env like everything else.
+pub fn env_keys_for(home: &std::path::Path, id: &str) -> Option<Vec<String>> {
+    def_of(home, id).map(|d| d.env_keys)
+}
+
 /// A connector id must be safe to use as a path component (the token store is
 /// `~/.amux/connectors/<id>/`) and as a JSON key. Rejects rather than sanitises:
 /// a silently-rewritten id is one the caller cannot find again.
