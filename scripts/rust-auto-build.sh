@@ -298,7 +298,45 @@ fi
   # runs every 60s. Only the failing path pays for detail, which is the path
   # that needs it.
   BUILD_OUT=$(mktemp /tmp/amux-rs-buildout.XXXXXX)
-  if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" cargo build --release -p amux-server) > "$BUILD_OUT" 2>&1; then
+  # REMOTE BUILD, opt-in via AMUX_REMOTE_BUILD_HOST (~/.amux/server.env,
+  # private — never a hostname in this public script). Same output contract
+  # as the local branch below: on success the binary lands at the SAME
+  # conventional path ($HOME/.amux/rust-build-target/release/amux-server),
+  # so the `install` line after this block is unchanged for either path.
+  #
+  # Falls back to LOCAL on any remote failure (host unreachable, context
+  # misconfigured, remote build itself failed) rather than treating remote
+  # unavailability as a hard stop — this machine's own remote link has
+  # measured real, if infrequent, outages (a site-to-site netbird flake,
+  # not this script's problem to fix), and a fleet with no live deploy at
+  # all is worse than one that occasionally pays the local-build memory
+  # cost it was built to avoid. The fallback is LOGGED, never silent — see
+  # AMUX-48's frustrations.md entry for why a silent wrong-path here would
+  # cost exactly what it already cost once.
+  BUILD_OK=0
+  if [ -n "${AMUX_REMOTE_BUILD_HOST:-}" ]; then
+    if "$REPO/scripts/rust-remote-build.sh" "$WORK" \
+        "$HOME/.amux/rust-build-target/release/amux-server" > "$BUILD_OUT" 2>&1; then
+      BUILD_OK=1
+    else
+      { echo "== remote build on '$AMUX_REMOTE_BUILD_HOST' failed, falling back to local:"; \
+        cat "$BUILD_OUT"; } > "${BUILD_OUT}.remote" 2>&1
+      mv "${BUILD_OUT}.remote" "$BUILD_OUT"
+      if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" cargo build --release -p amux-server) >> "$BUILD_OUT" 2>&1; then
+        BUILD_OK=1
+      fi
+    fi
+  else
+    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" cargo build --release -p amux-server) > "$BUILD_OUT" 2>&1; then
+      BUILD_OK=1
+    fi
+  fi
+  # Explicit exit-code-derived flag, NOT a file-existence check: a stale
+  # binary from an earlier successful build sitting at this same path would
+  # make `[ -x ... ]` true even after a genuine failure, silently
+  # re-installing old code and reporting success — the exact "wrong answer,
+  # not wrong-looking" shape ethos rule 4 exists to catch.
+  if [ "$BUILD_OK" = 1 ]; then
     tail -3 "$BUILD_OUT"
     install -m 0755 "$HOME/.amux/rust-build-target/release/amux-server" "$INSTALL"
     echo "$head" > "$STAMP"
