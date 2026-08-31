@@ -505,6 +505,15 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // which the caller stamps in seconds, and backfilled through
     // `strftime('%s', ...)` which yields seconds (AMUX-3609).
     ("issues", "closed_at", false),
+    // SECONDS, same as every other `issues` timestamp and for the same reason:
+    // `entered_state_at_for_write` stamps `row.updated`, and `create_issue`
+    // stamps the same `now` it writes to `created`/`updated`. Nothing backfilled
+    // it, so there is no second unit to reconcile (AMUX-3947).
+    //
+    // Declared in the SAME COMMIT as the migration would have been better. It
+    // was not, and the invariant filed AMUX-3952 four evaluations later: adding
+    // a timestamp column is a two-part change and this file is the second part.
+    ("issues", "entered_state_at", false),
     ("issues", "last_verified_at", false),
     ("layout_presets", "created_at", false),
     ("logs", "ts", false),

@@ -627,6 +627,102 @@ fn capture_pipeline_check(state: &AppState) -> Vec<InvariantResult> {
 /// list. Five tables here name a column `ts` and use two different units; a
 /// sixth added tomorrow would inherit the trap silently, and the only thing that
 /// makes an author state the unit is a check that goes red until they do.
+/// Fill `found` with every (table, column) whose name looks like a wall-clock
+/// stamp AND whose declared type is numeric.
+///
+/// The runtime invariant and the compile-time test both call this, so the two
+/// cannot disagree about what "timestamp-shaped" means.
+fn scan_timestamp_shaped(conn: &rusqlite::Connection, found: &mut Vec<(String, String)>) {
+    // Table names first, so the statement is dropped before the per-table
+    // PRAGMA borrows `conn` again.
+    let tables: Vec<String> = match conn
+        .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+    {
+        Ok(mut stmt) => match stmt.query_map([], |r| r.get::<_, String>(0)) {
+            Ok(rows) => rows.flatten().collect(),
+            Err(_) => return,
+        },
+        Err(_) => return,
+    };
+    for t in tables {
+        let cols: Vec<(String, String)> = match conn.prepare(&format!("PRAGMA table_info(\"{t}\")"))
+        {
+            Ok(mut cs) => {
+                match cs.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?))) {
+                    Ok(rows) => rows.flatten().collect(),
+                    Err(_) => continue,
+                }
+            }
+            Err(_) => continue,
+        };
+        for (c, ty) in cols {
+            // NAME *AND* TYPE. The first draft keyed on `ts` alone, which
+            // exempted THREE of the five millisecond columns in this schema -- a
+            // check written to catch the unit trap could not see most of it. That
+            // is the rule-1 exemption shape, where the narrowing does not make it
+            // cheap, it makes it invisible.
+            //
+            // Type filters out ISO-8601 text columns, which are out of scope
+            // because a string says its own unit -- the exact property the
+            // numeric ones lack. DECLARED type, not a sampled value, so an empty
+            // table stays in scope.
+            let name_matches = c == "ts"
+                || c.ends_with("_ts")
+                || c.ends_with("_at")
+                || c == "time"
+                || c == "timestamp";
+            let up = ty.to_ascii_uppercase();
+            let numeric =
+                ["INT", "REAL", "NUM", "FLOA", "DOUB"].iter().any(|k| up.contains(k));
+            if name_matches && numeric {
+                found.push((t.clone(), c));
+            }
+        }
+    }
+}
+
+/// Timestamp-shaped columns in this schema with no declared unit.
+///
+/// EXTRACTED so a TEST can run the shipped predicate rather than a paraphrase of
+/// it (AMUX-3952). Adding a timestamp column is a two-part change -- the
+/// migration and the `TIMESTAMP_COLUMNS` entry -- and until this was callable,
+/// the only thing that noticed a missing second part was the runtime invariant.
+/// It works: it caught `issues.entered_state_at` four evaluations after deploy
+/// and filed a card. But that costs a deploy, a detector cycle and a lane's turn
+/// to learn something the schema already knew at compile time.
+///
+/// One predicate, two consumers, which is this repo's standing rule after
+/// AMUX-3814 (a parallel re-derivation reddened an invariant for 8 days).
+/// Returns `(undeclared, n_scanned)`.
+///
+/// `n_scanned` IS PART OF THE ANSWER, not decoration. An empty `undeclared` is
+/// the pass condition and is also what a broken scan returns, so a caller that
+/// reads only the list cannot tell "everything is declared" from "nothing was
+/// looked at" -- the AF-320 shape this repo publishes `measured`/`n_considered`
+/// for on every diagnostic endpoint.
+///
+/// Added because a mutant proved the point: disabling the scan's match left the
+/// first version of the test green.
+pub fn undeclared_timestamp_columns(conn: &rusqlite::Connection) -> (Vec<String>, usize) {
+    let mut found: Vec<(String, String)> = Vec::new();
+    scan_timestamp_shaped(conn, &mut found);
+    let n_scanned = found.len();
+    if found.is_empty() {
+        return (Vec::new(), 0);
+    }
+    let declared: std::collections::HashSet<String> = checks::TIMESTAMP_COLUMNS
+        .iter()
+        .map(|(t, c, _)| format!("{t}.{c}"))
+        .collect();
+    let mut out: Vec<String> = found
+        .iter()
+        .map(|(t, c)| format!("{t}.{c}"))
+        .filter(|n| !declared.contains(n))
+        .collect();
+    out.sort();
+    (out, n_scanned)
+}
+
 fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     const ID: &str = "schema.timestamp_units_declared";
     let Ok(conn) = state.store.read() else {
@@ -634,50 +730,7 @@ fn timestamp_units_check(state: &AppState) -> Vec<InvariantResult> {
     };
     // Every column whose name looks like a wall-clock stamp, across every table.
     let mut found: Vec<(String, String)> = Vec::new();
-    if let Ok(mut stmt) =
-        conn.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-    {
-        if let Ok(tables) = stmt.query_map([], |r| r.get::<_, String>(0)) {
-            for t in tables.flatten() {
-                let Ok(mut cs) = conn.prepare(&format!("PRAGMA table_info(\"{t}\")")) else {
-                    continue;
-                };
-                // (name, declared type)
-                let cols: Vec<(String, String)> =
-                    match cs.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?))) {
-                        Ok(rows) => rows.flatten().collect(),
-                        Err(_) => continue,
-                    };
-                {
-                    for (c, ty) in cols {
-                        // NAME *AND* TYPE. The first draft keyed on `ts` alone,
-                        // which exempted THREE of the five millisecond columns in
-                        // this schema — a check written to catch the unit trap
-                        // could not see most of it (amux caught this in review;
-                        // it is the rule-1 exemption shape, where the narrowing
-                        // does not make it cheap, it makes it invisible).
-                        //
-                        // Type filters out ISO-8601 text columns, which are out
-                        // of scope because a string says its own unit — the exact
-                        // property the numeric ones lack. DECLARED type, not a
-                        // sampled value, so an empty table stays in scope.
-                        let name_matches = c == "ts"
-                            || c.ends_with("_ts")
-                            || c.ends_with("_at")
-                            || c == "time"
-                            || c == "timestamp";
-                        let up = ty.to_ascii_uppercase();
-                        let numeric = ["INT", "REAL", "NUM", "FLOA", "DOUB"]
-                            .iter()
-                            .any(|k| up.contains(k));
-                        if name_matches && numeric {
-                            found.push((t.clone(), c));
-                        }
-                    }
-                }
-            }
-        }
-    }
+    scan_timestamp_shaped(&conn, &mut found);
     if found.is_empty() {
         // The schema read failed or matched nothing. Not a pass: an empty result
         // from a query that should always find `_amux_request_log.ts` means the

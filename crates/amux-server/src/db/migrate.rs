@@ -425,6 +425,14 @@ pub fn apply_all_guarded(conn: &mut Connection, db_path: &std::path::Path) -> an
 ///
 /// The two deliberately NARROW fixtures are left alone on purpose — they declare
 /// only the columns their test uses, so they mirror nothing and cannot drift.
+/// [`test_memdb`] for INTEGRATION tests, which are separate crates and cannot
+/// see `#[cfg(test)]` items (AMUX-3952). Same chain, same guarantee.
+pub fn test_memdb_pub() -> Connection {
+    let mut conn = Connection::open_in_memory().expect("in-memory db");
+    apply_all(&mut conn).expect("migrations must apply cleanly to a fresh db");
+    conn
+}
+
 #[cfg(test)]
 pub(crate) fn test_memdb() -> Connection {
     let mut conn = Connection::open_in_memory().expect("in-memory db");
