@@ -1846,6 +1846,40 @@ pub(crate) fn detect_latency_at(
         .iter()
         .filter(|((_, target), g)| g.worst_ms > design_budget_ms(target))
         .collect();
+    // A BUDGETED ROUTE IS A DECISION, AND IT WAS SILENT (AMUX-3940). The filter
+    // above drops long-by-design routes with no trace, while every other
+    // exclusion in this function records one — the two `tracing::info!` lines
+    // directly above exist for exactly that reason ("a silent exclusion and an
+    // exclusion that never ran read identically").
+    //
+    // Found by needing it: AMUX-3934 added the archive budget, AMUX-3940 re-filed
+    // the same route 87 seconds later, and /api/debug/autofix could not say
+    // whether the budget had suppressed it or the entry was unreachable. Both
+    // look like an absence. The answer had to be inferred from `findings: 0`,
+    // which is the reasoning this endpoint exists to make unnecessary.
+    //
+    // Recorded per target rather than per row: the reader wants "this route was
+    // budgeted", not one line per slow request.
+    for ((_, target), g) in seen.iter() {
+        let budget = design_budget_ms(target);
+        if budget > 0.0 && g.worst_ms > outlier_ms() && g.worst_ms <= budget {
+            suppressed.push(sup(
+                DetectorKind::Latency,
+                &format!("latency|outlier|{target}"),
+                &format!(
+                    "{} request(s) to {target} passed the {:.0}s outlier floor (worst {:.1}s), \
+                     NOT filed: this route is LONG_BY_DESIGN with a {:.0}s budget derived from \
+                     its own bounds. Past that budget it still files, so the one latency story \
+                     that would be wrong here — something hung, as against something that \
+                     waited on purpose — stays reportable.",
+                    g.n,
+                    outlier_ms() / 1000.0,
+                    g.worst_ms / 1000.0,
+                    budget / 1000.0
+                ),
+            ));
+        }
+    }
     let distinct_targets: std::collections::BTreeSet<&String> =
         candidates.iter().map(|((_, t), _)| t).collect();
     if distinct_targets.len() >= outlier_rollup_at() {
@@ -9943,7 +9977,22 @@ mod tests {
     /// only meaningful as an interval.
     #[test]
     fn the_archive_budget_brackets_the_sleep_ladder_without_hiding_a_wedge() {
-        let b = design_budget_ms("/api/sessions/{name}/archive");
+        // PIN THE LOOKUP, NOT JUST THE TABLE. The first version of this cell
+        // asserted the constant only, which is a check on the wrong layer: it
+        // is exactly as green whether or not the detector can ever reach the
+        // entry. `design_budget_ms` matches with `target == *p`, and the target
+        // comes from `normalize_target_verb`, so a key that does not survive
+        // that normalisation is a budget nothing consults. AMUX-3940 — a
+        // re-file of the same route minutes after the budget landed — is what
+        // made the difference worth asserting rather than assuming.
+        let real_target =
+            crate::api::request_log::normalize_target_verb("/api/sessions/ecology/archive");
+        assert_eq!(
+            real_target, "/api/sessions/{name}/archive",
+            "the LONG_BY_DESIGN key must be what the detector actually computes"
+        );
+        let b = design_budget_ms(&real_target);
+        assert!(b > 0.0, "the entry must be reachable through the real target, not just present");
 
         // The derived bound: 0.95 + 0.25 + 15.0 + 5.0 + 1.0 seconds of
         // deliberate waiting on the worst honest path, read off stop_session's
@@ -9963,6 +10012,52 @@ mod tests {
         assert!(
             b <= 30_000.0,
             "budget {b} must not swallow a scrollback capture wedged at its own 30s timeout"
+        );
+    }
+
+    /// AMUX-3940. A budgeted route must be RECORDED as suppressed, not silently
+    /// dropped.
+    ///
+    /// The filter that applies the budget left no trace, while every other
+    /// exclusion in the same function logs one. So when AMUX-3934's archive
+    /// budget landed and the same route re-filed 87 seconds later,
+    /// /api/debug/autofix could not say whether the budget had suppressed it or
+    /// the entry was simply unreachable — the two are the same absence. The
+    /// answer had to be inferred from `findings: 0`, which is precisely the
+    /// reasoning that endpoint exists to make unnecessary (AF-320).
+    #[tokio::test]
+    async fn a_budgeted_route_is_reported_as_suppressed_not_silently_dropped() {
+        let insert = |st: &AppState, ts: f64, ms: f64, path: &str| {
+            let p = path.to_string();
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status,                          latency_ms, client_ip, user_agent, amux_session, worker, answered_by)                          VALUES (?1,'POST',?2,'/api/sessions',200,?3,                         '127.0.0.1','curl/8','','','native')",
+                        rusqlite::params![ts, p, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let (st, _d) = state();
+        let now = unix_now();
+        // Over the 10s outlier floor, under the 30s archive budget.
+        insert(&st, now - 300.0, 19_384.0, "/api/sessions/ecology/archive");
+        let conn = st.store.read().unwrap();
+        let (f, sup) = detect_latency_at(&conn, now, None);
+
+        assert!(
+            !f.iter().any(|x| x.signature.contains("archive")),
+            "a route inside its design budget must not file: {f:?}"
+        );
+        let hit = sup
+            .iter()
+            .find(|x| x.signature.contains("archive"))
+            .expect("...and the decision must be RECORDED, or it is indistinguishable from                      an unreachable budget entry");
+        assert!(
+            hit.reason.contains("LONG_BY_DESIGN") && hit.reason.contains("30s budget"),
+            "the suppression must name the budget that applied: {}",
+            hit.reason
         );
     }
 
