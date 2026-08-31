@@ -2158,7 +2158,34 @@ fn stale_gate_excluded_todos(conn: &Connection, session: &str, fresh_cut: i64) -
 /// Select the next board task for `session`, or say why not. Pure over the
 /// connection: no sends, no writes — so a test can assert the DECISION without
 /// a fleet, and the caller owns the ordering of claim-then-deliver.
+/// [`select_pickup_with`] resolving the continuation flag from the lane's config.
+///
+/// The production entry point. Tests use the `_with` form so a lane's ON-DISK
+/// scope env cannot decide whether a unit test passes.
 pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
+    select_pickup_with(conn, session, now, bs::continuation_required(Some(session)))
+}
+
+/// [`select_pickup`] with the continuation gate passed in rather than read from
+/// the lane's scope env (AMUX-3771 fallout).
+///
+/// THE FLAG HAD TO COME OUT OF HERE. `select_pickup` is otherwise a pure
+/// function of a Connection, and reading `~/.amux/sessions/<lane>.env` inside it
+/// made unit tests depend on the machine's real lane config. Opting the `amux`
+/// lane into the continuation gate immediately failed
+/// `pickup_offers_a_card_only_to_its_session_owner`, which uses "amux" as its
+/// fixture lane name -- a shared test broken by one operator's personal config,
+/// in isolation, with nothing in the failure naming the cause.
+///
+/// Same seam and same reasoning as `detect_latency_at`, whose docstring already
+/// says it: with only the config-reading entry point, "that is not a seam, it is
+/// a coin flip on test order".
+pub fn select_pickup_with(
+    conn: &Connection,
+    session: &str,
+    now: f64,
+    continuation_gate: bool,
+) -> Pickup {
     // WIP cap (py:14449). Pickup claimed via raw UPDATE, bypassing the limit the
     // PATCH path enforces — one session accumulated TWELVE doing cards, a lie
     // every other session reads. Archived cards do NOT hold WIP (Ethan, primis
@@ -2389,7 +2416,7 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
         // same population as `missing_continuation`, so a lane that goes quiet
         // because of this can find out why in one request instead of looking
         // idle for no visible reason.
-        if bs::continuation_required(Some(session))
+        if continuation_gate
             && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
                 != bs::ContinuationVerdict::Ok
         {
@@ -6493,7 +6520,7 @@ mod tests {
         let now = 1_000_000.0;
         add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 3 * 86400, -1024.0, 0);
         add_full(&conn, "NEW", "lane", "todo", "code", now as i64, -99999.0, 0); // topmost pos
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("OLD"), "the 3-day-old card must be worked before the fresh one");
     }
 
@@ -6503,7 +6530,7 @@ mod tests {
         let now = 1_000_000.0;
         add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 5 * 86400, -1024.0, 0);
         add_full(&conn, "PIN", "lane", "todo", "code", now as i64, -50.0, 1); // pinned, fresh
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("PIN"), "a pinned card is the hard human override");
     }
 
@@ -6514,7 +6541,7 @@ mod tests {
         add_full(&conn, "CHORE", "lane", "todo", "chore", now as i64 - 2 * 86400, -1024.0, 0);
         add_full(&conn, "BUG", "lane", "todo", "bug", now as i64, -50.0, 0);
         tag(&conn, "BUG", "p0", now);
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("BUG"), "a fresh p0 bug must outrank a 2-day-old chore");
     }
 
@@ -6526,7 +6553,7 @@ mod tests {
         add_full(&conn, "DEP", "lane", "todo", "code", now as i64, -50.0, 0);
         add_dependent(&conn, "D1", "DEP");
         add_dependent(&conn, "D2", "DEP");
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("DEP"), "the card two others depend on must lead");
     }
 
@@ -6544,7 +6571,7 @@ mod tests {
     fn an_eligible_todo_is_selected_and_the_prompt_names_the_card() {
         let conn = board_db();
         add_card(&conn, "T-1", "lane", "todo", "Fix the parser", "SCOPE: real work\n- [ ] do it");
-        let p = select_pickup(&conn, "lane", now_f64());
+        let p = select_pickup_with(&conn, "lane", now_f64(), false);
         assert_eq!(claimed(&p), Some("T-1"), "an eligible todo must be claimed");
         let Pickup::Claim { prompt, .. } = &p else { unreachable!() };
         assert!(prompt.contains("T-1"), "the prompt must name the card id: {prompt}");
@@ -6559,7 +6586,7 @@ mod tests {
             let conn = board_db();
             add_card(&conn, "T-1", "lane", "todo", "Ask Ethan about pricing", "SCOPE: x\n- [ ] y");
             tag(&conn, "T-1", t, now_f64());
-            let p = select_pickup(&conn, "lane", now_f64());
+            let p = select_pickup_with(&conn, "lane", now_f64(), false);
             assert!(claimed(&p).is_none(), "{t} must exempt the card from pickup");
             assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 0, "{t} must not count as eligible");
         }
@@ -6984,7 +7011,7 @@ mod tests {
         tag(&conn, "T-3", "needs:you", now_f64());
         conn.execute("UPDATE issues SET archived=1 WHERE id='T-2'", []).expect("archive");
         assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 1);
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     /// AMUX-2983 (gtm-videos): the auto-pickup claimed GV-648 while it was
@@ -7105,13 +7132,59 @@ mod tests {
     /// to amux one second AFTER the claim; the predicate never disagreed with the
     /// owner. Control: the owner IS offered exactly the card, so the assertion can
     /// fail.
+    /// AMUX-3948/3946. Auto-pickup must not hand a lane a card that `doing`
+    /// would then refuse.
+    ///
+    /// `claim_card` swaps todo->doing with a direct SQL CAS, bypassing the PATCH
+    /// gate entirely, so before this the continuation gate was refusable by hand
+    /// and bypassable by waiting for pickup.
+    ///
+    /// BOTH ARMS, because the gate-on arm alone would pass for a pickup that
+    /// selected nothing at all, and the gate-off arm alone would pass for a
+    /// pickup that ignored the gate. Neither is the property.
+    #[test]
+    fn pickup_skips_a_card_that_cannot_say_what_to_do_next() {
+        let conn = board_db();
+        add_card(&conn, "AF-90", "lane", "todo", "no continuation", "SCOPE: real\n- [ ] do it");
+
+        // GATE OFF: the card is workable and pickup offers it. Without this the
+        // cell below passes for a pickup that is simply broken.
+        assert_eq!(
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
+            Some("AF-90"),
+            "with the gate off this is an ordinary claimable card"
+        );
+
+        // GATE ON, no next_action: skipped, because `doing` would refuse it and
+        // pickup's promise is "work it now".
+        assert!(
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), true)).is_none(),
+            "a card with no next_action must not be handed out as ready to work"
+        );
+
+        // GATE ON, WITH a next_action: offered again. This is the arm that keeps
+        // the gate from being a blanket refusal that empties every opted-in
+        // lane's queue.
+        conn.execute(
+            "UPDATE issues SET next_action='Rerun compatibility test 07 against KubeRay 1.4' \
+             WHERE id='AF-90'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), true)),
+            Some("AF-90"),
+            "satisfying the gate makes it claimable again, or the gate is a mute"
+        );
+    }
+
     #[test]
     fn pickup_offers_a_card_only_to_its_session_owner() {
         let conn = board_db();
         // Owned by `amux`; a different lane created it (as in the incident).
         add_card(&conn, "AF-78", "amux", "todo", "owned by amux", "SCOPE: real\n- [ ] do it");
         assert!(
-            claimed(&select_pickup(&conn, "amux-frustrations", now_f64())).is_none(),
+            claimed(&select_pickup_with(&conn, "amux-frustrations", now_f64(), false)).is_none(),
             "a card owned by 'amux' must never be offered to a non-owner lane"
         );
         assert_eq!(
@@ -7120,7 +7193,7 @@ mod tests {
             "and it must not count as eligible for the non-owner"
         );
         assert_eq!(
-            claimed(&select_pickup(&conn, "amux", now_f64())),
+            claimed(&select_pickup_with(&conn, "amux", now_f64(), false)),
             Some("AF-78"),
             "the owning lane is the only one the card is dispatched to"
         );
@@ -7241,7 +7314,7 @@ mod tests {
         let conn = board_db();
         add_card(&conn, "D-1", "lane", "doing", "already working", "SCOPE: x");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { reason, detail } => {
                 assert_eq!(reason, "wip-cap");
                 assert!(detail.contains("D-1"), "the trace must name what is held: {detail}");
@@ -7260,7 +7333,7 @@ mod tests {
         add_card(&conn, "D-1", "lane", "doing", "cleared", "SCOPE: x");
         conn.execute("UPDATE issues SET archived=1 WHERE id='D-1'", []).expect("archive");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     /// AMUX-3757, Ethan 2026-08-26: "why do i need to push @tubescience to
@@ -7287,7 +7360,7 @@ mod tests {
         conn.execute("UPDATE issues SET creator='amux' WHERE id='C-1'", []).expect("mint");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now_f64())),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
             Some("T-1"),
             "an unanswered prompt is not work in progress; the lane must still be dealt"
         );
@@ -7299,7 +7372,7 @@ mod tests {
         )
         .expect("reshape");
         conn.execute("UPDATE issues SET status='todo' WHERE id='T-1'", []).expect("reset");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { reason, detail } => {
                 assert_eq!(reason, "wip-cap");
                 assert!(detail.contains("C-1"), "the reshaped card holds the slot: {detail}");
@@ -7487,7 +7560,7 @@ mod tests {
 
         // The MECHANISM: it does not hold the slot.
         let blocks_pickup = matches!(
-            select_pickup(&conn, "lane", now_f64()),
+            select_pickup_with(&conn, "lane", now_f64(), false),
             Pickup::None { reason: "wip-cap", .. }
         );
         assert!(!blocks_pickup, "AMUX-3757: a capture shell must not hold the WIP slot");
@@ -7534,7 +7607,7 @@ mod tests {
             .expect("claim event");
         }
         add_card(&conn, "T-1", "lane", "todo", "fresh work", "SCOPE: x\n- [ ] y");
-        match select_pickup(&conn, "lane", now) {
+        match select_pickup_with(&conn, "lane", now, false) {
             Pickup::None { reason, .. } => assert_eq!(reason, "bounce-loop"),
             _ => panic!("three bounced claims in 2h must stop the deal"),
         }
@@ -7542,7 +7615,7 @@ mod tests {
         // claims whose card is still parked in todo count.
         conn.execute("UPDATE issues SET status='done' WHERE id='B-1'", []).expect("advance");
         assert!(
-            !matches!(select_pickup(&conn, "lane", now), Pickup::None { reason: "bounce-loop", .. }),
+            !matches!(select_pickup_with(&conn, "lane", now, false), Pickup::None { reason: "bounce-loop", .. }),
             "moving a bounced card must release the breaker"
         );
     }
@@ -7562,7 +7635,7 @@ mod tests {
         tag(&conn, "D-1", "needs:you", now - 31.0 * 3600.0);
         add_card(&conn, "T-1", "lane", "todo", "next real work", "SCOPE: x\n- [ ] y");
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now)),
+            claimed(&select_pickup_with(&conn, "lane", now, false)),
             Some("T-1"),
             "a human-blocked doing card must not idle the lane"
         );
@@ -7585,7 +7658,7 @@ mod tests {
         conn.execute("UPDATE issues SET type='tripwire' WHERE id='W-2'", []).expect("type");
         add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now_f64())),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
             Some("T-1"),
             "the watch must not hold WIP and the tripwire must not be dispatched"
         );
@@ -7599,7 +7672,7 @@ mod tests {
         let conn = board_db();
         add_card(&conn, "H-1", "lane", "todo", "Ethan: call the bank", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET owner_type='human' WHERE id='H-1'", []).expect("owner");
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
         assert_eq!(eligible_todo_count(&conn, "lane", now_f64()), 0);
     }
 
@@ -7627,14 +7700,14 @@ mod tests {
         // 1h ago: inside the 2h window -> still exempt.
         claim_at(now_f64() - 3600.0);
         assert!(
-            claimed(&select_pickup(&conn, "lane", now_f64())).is_none(),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none(),
             "a card claimed 1h ago is inside the 2h cooldown and must not re-deal"
         );
         // 3h ago: THE DEAD ZONE. Under the old 24h cooldown this was exempt for
         // 21 more hours and the lane starved; now it is dispatchable.
         claim_at(now_f64() - 3.0 * 3600.0);
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now_f64())),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
             Some("T-1"),
             "a card claimed 3h ago (past the 2h window) must be re-dealt — this is the AMUX-2987 fix"
         );
@@ -7650,7 +7723,7 @@ mod tests {
             rusqlite::params![now_f64() as i64 - 8 * 86400],
         )
         .expect("age");
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
     }
 
     /// py:14581, AMUX-2128: refusals used to RETURN, so one refusable card at the
@@ -7664,7 +7737,7 @@ mod tests {
         conn.execute("UPDATE issues SET pos=1 WHERE id='S-1'", []).expect("pos");
         add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET pos=2 WHERE id='T-1'", []).expect("pos");
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     #[test]
@@ -7678,7 +7751,7 @@ mod tests {
             "cleanup",
             "SCOPE: x\n- [ ] run git reset --hard on the shared checkout",
         );
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
     }
 
     #[test]
@@ -7687,9 +7760,9 @@ mod tests {
         add_card(&conn, "B-1", "other", "doing", "blocker", "SCOPE: x");
         add_card(&conn, "T-1", "lane", "todo", "dependent", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET depends_on='[\"B-1\"]' WHERE id='T-1'", []).expect("dep");
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
         conn.execute("UPDATE issues SET status='verified' WHERE id='B-1'", []).expect("close");
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     /// When a todo card is blocked only by the same session's own backlog cards,
@@ -7705,7 +7778,7 @@ mod tests {
         add_card(&conn, "D-2", "lane", "todo", "downstream work", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET depends_on='[\"D-1\"]' WHERE id='D-2'", [])
             .expect("dep");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::PromoteDeps { blocked_card, promoted } => {
                 assert_eq!(blocked_card, "D-2");
                 assert_eq!(promoted, vec!["D-1"]);
@@ -7723,7 +7796,7 @@ mod tests {
         add_card(&conn, "X-2", "lane", "todo", "blocked card", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET depends_on='[\"X-1\"]' WHERE id='X-2'", [])
             .expect("dep");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { reason, .. } => {
                 assert_eq!(reason, "all-candidates-refused");
             }
@@ -7736,7 +7809,7 @@ mod tests {
     #[test]
     fn an_empty_queue_produces_a_reason_not_a_silent_return() {
         let conn = board_db();
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { reason, detail } => {
                 assert_eq!(reason, "no-eligible-card");
                 assert!(!detail.is_empty(), "an empty board must still explain itself");
@@ -7750,7 +7823,7 @@ mod tests {
         let conn = board_db();
         add_card(&conn, "S-1", "lane", "todo", "shell one", "**Prompt:** please do a thing");
         add_card(&conn, "S-2", "lane", "todo", "shell two", "capture: session prompt");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::Decompose { ids, text } => {
                 assert_eq!(ids.len(), 2);
                 assert!(text.contains("S-1") && text.contains("S-2"), "must name the ids: {text}");
@@ -8158,7 +8231,7 @@ mod tests {
             "Fix the logo",
             "SCOPE: real work\n- [ ] see @/Users/ethan/.amux/uploads/b7965e0b2a8f-image.png",
         );
-        let Pickup::Claim { prompt, .. } = select_pickup(&conn, "lane", now_f64()) else {
+        let Pickup::Claim { prompt, .. } = select_pickup_with(&conn, "lane", now_f64(), false) else {
             panic!("the card is otherwise dispatchable and must still be claimed");
         };
         assert!(prompt.contains("T-1"), "the card id must survive: {prompt}");

@@ -5711,10 +5711,35 @@ pub async fn patch_item(
                     diverted,
                     status_transition: st,
                     progress_notify,
-                    reviewer_notify: reviewer_target
-                        .clone()
-                        .zip(appended_note_for_reviewer.clone())
-                        .map(|(r, note)| Box::new((r, next.title.clone(), note))),
+                    // FIRE ON THE TRANSITION INTO REVIEW, not only on a note
+                    // append (AMUX-3771, second pass, found by backend).
+                    //
+                    // The first version was `.zip(appended_note)`, so it fired
+                    // ONLY when somebody appended prose to a card already in
+                    // review. The natural act is the opposite one: set a
+                    // reviewer and MOVE the card to review, which appends no
+                    // note. backend re-ran their BACKE-3467 shape both ways --
+                    // raw PATCH {status:review} and `amux board review` -- and
+                    // my code emitted nothing at all: not the notify, not the
+                    // refusal, not the report. I had fixed the rarer trigger.
+                    //
+                    // Entering review is the request. A note on an
+                    // already-in-review card is a follow-up, and both should
+                    // reach the reviewer.
+                    reviewer_notify: reviewer_target.clone().and_then(|r| {
+                        let entering_review = status_event
+                            .as_ref()
+                            .is_some_and(|(f, t)| f != t && t == "review");
+                        match (appended_note_for_reviewer.clone(), entering_review) {
+                            (Some(note), _) => Some(Box::new((r, next.title.clone(), note))),
+                            (None, true) => Some(Box::new((
+                                r,
+                                next.title.clone(),
+                                String::new(),
+                            ))),
+                            (None, false) => None,
+                        }
+                    }),
                 },
                 WriteOutcome {
                     applied: true,
@@ -5945,9 +5970,14 @@ pub async fn patch_item(
                         // that might vanish. The cost of a stale arrival is one
                         // reader glancing at a closed card; the cost of a
                         // dropped request is a review that reaches nobody.
+                        let body_line = if note.trim().is_empty() {
+                            "The card has just been moved into review.".to_string()
+                        } else {
+                            note.clone()
+                        };
                         let prompt = format!(
                             "[review requested on {}: {}] {caller_for_notify} is waiting on \
-                             YOUR review:\n{note}\n(You are named REVIEWER on this card. The \
+                             YOUR review:\n{body_line}\n(You are named REVIEWER on this card. The \
                              full note is on it. This was queued when the card entered review \
                              and delivers at your next turn boundary, so if it has since left \
                              `review` it was already handled and you can ignore this.)",
