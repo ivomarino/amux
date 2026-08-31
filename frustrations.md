@@ -2124,3 +2124,36 @@ FIX: This is AF-316's class (one checkout, N lanes, one index) in the DELETE
   staged-guard's co-edit notice counts insertions and deletions per path but does not
   flag a staged DELETION of a file the committer never touched, which is the cheap
   version of this specific catch.
+
+---
+## A decision card carried two mechanisms, so the half needing no decision waited 13 days
+AREA: board
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux-frustrations
+CARD: AF-359
+SYMPTOM: AF-98 sat in `needsyou` from 2026-08-18 titled "Cross-group send blocks the
+  frustrations validation program", asking Ethan for "one-line config, or a deliberate
+  no". It described TWO different refusals as one problem. Reaching `desktop` is
+  refused by the isolated-raw-agent rule, which only the owner can work around and is
+  genuinely his call. Reaching `mixpeek-frustrations` and `mixpeek-research` is
+  refused by the ordinary intra-group rule, whose refusal text names its own remedy in
+  the body: "set CC_SEND_ALLOW on amux-frustrations". Both symptoms print as "send
+  refused" and only the refusal BODIES distinguish them, so from the card's own text
+  the two are indistinguishable.
+COST: 13 days of the frustrations program blocked on three entries that needed no
+  decision from anyone. I set CC_SEND_ALLOW="ops,new-features" on this lane's own env,
+  scoped rather than `*`, and all three routed immediately with no restart. The
+  mechanism had been printing the fix in every refusal for those 13 days. The deeper
+  cost is the shape: a card is ONE unit of work, something that can be honestly done or
+  not done, and this one could not be. No single answer finished it, so it parked in
+  the queue where the answerable half was invisible behind the unanswerable half.
+FIX: Fixed for this instance by splitting it: AF-98 is narrowed to the isolated-worker
+  half only, and the cross-group half is closed. The general form is the 451-folds rule
+  applied to `needsyou` specifically: before parking a card on a human, ask whether
+  EVERY part of it needs them, because the parts that do not will wait exactly as long
+  as the parts that do. A cheap version worth building: when a card enters `needsyou`,
+  have the typed `--ask` gate (AF-318) refuse an ask whose own body names a remedy the
+  ASKER can apply. That is detectable — this refusal literally contained an imperative
+  addressed to the sender.
