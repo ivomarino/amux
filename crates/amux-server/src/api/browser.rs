@@ -2491,6 +2491,36 @@ mod tests {
         );
         assert_eq!(survivor.map(|x| x.3), Some(424242), "same process, not a replacement");
 
+        // STOP WHAT THIS TEST ACTUALLY STARTED (AMUX-3973).
+        //
+        // The `default` start above is not a stub. `netsuite` is seeded but
+        // `default` is free, so the handler takes the real path and SPAWNS A
+        // HEADED CHROME into `<tempdir>/playwright-auth/profile`. Nothing here
+        // stopped it, so every `cargo test -p amux-server` on a machine with
+        // Chrome installed left one live browser and an ~87 MB profile behind.
+        // Measured 2026-08-31: 66 leaked profile dirs, 5.5 GB, oldest a day old,
+        // and a dock full of empty windows that Ethan reported twice.
+        //
+        // IT IS HERMETIC ON CI AND NOT ON A LAPTOP, which is why it survived.
+        // `chrome_binary()` probes two fixed macOS paths and then PATH; on a
+        // Linux runner it returns None, the launch fails, and the assertions
+        // above still pass because they only inspect the `netsuite` registry
+        // entry. Same shape as AMUX-3962 and AMUX-3969: behaviour that depends
+        // on the machine, green in the place nobody watches.
+        //
+        // Stopping rather than skipping the launch on purpose: the assertions
+        // are about what the REAL start path does to a peer's entry, so
+        // stubbing the spawn would leave them passing over code that no longer
+        // runs. Stop it instead, and the TempDir drop can then remove the
+        // profile it was holding open.
+        let _ = chrome::stop_profile(dir.path(), "default").await;
+        // ASSERTED, not assumed. A cleanup nobody checks is how this started:
+        // the launch was already invisible here, and a silent stop would be too.
+        assert!(
+            chrome::running_snapshot_for("default").is_none(),
+            "this test must not leave a browser running on `default`"
+        );
+
         // AND THE SAME-PROFILE CASE STILL REFUSES. This is the cell that keeps
         // the guard honest: two Chromes on one user_data_dir corrupt it, so a
         // cross-session start onto an OCCUPIED profile must still 409 and name
