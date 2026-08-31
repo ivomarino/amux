@@ -26,6 +26,22 @@ So this is ONE file, and a daily run does exactly three things to it:
 A day that changes nothing here is a normal day. Padding it is worse than
 skipping it.
 
+**A SECOND RUN ON THE SAME DAY INCREMENTS NOTHING.** Check `LAST_SEEN` before
+touching a theme: if it already reads today's date, this pass is a duplicate and
+the three operations above do not apply to it. Run the scan, compare, and say so.
+
+This is not hypothetical and it is the one way this file can corrupt itself.
+SCHED-399 fired at 11:00 on 2026-08-31 and the sweep was invoked twice, at 11:01
+and 11:11. The second scan returned an IDENTICAL active set with identical `n` for
+every signal; only `considered` moved, by 1 to 9 rows, as the rolling window slid
+nine minutes. Re-incrementing there would have written OCCURRENCES: 3 for a class
+seen once, and OCCURRENCES is the number the whole file exists to make
+trustworthy. A ledger that inflates its own counts is worth less than no ledger,
+and nothing else here would have noticed.
+
+The discriminator is cheap and it is already in the file: `LAST_SEEN` is the guard,
+so use it rather than memory of whether you ran today.
+
 ## Format: fixed fields so this greps
 
 ```
