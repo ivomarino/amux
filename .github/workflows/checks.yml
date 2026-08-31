@@ -316,6 +316,15 @@ jobs:
           # nobody sets is decoration (ethos rule 1), and an export placed after
           # serve-head.sh's `exec` would look correct in a diff and never run.
           ./scripts/test-e2e-no-self-adopt.sh
+          # AMUX-3965: `start-all` counts spawns that returned, not workers that
+          # came up, and fleet-boot.sh independently measures what is actually
+          # running. Both numbers were already in the script and nothing compared
+          # them, so the boot of 2026-08-30 exited 0 while its own log named six
+          # workers it had just reported as started. The cells run the SHIPPED
+          # fleet-boot.sh against a stub server; no real worker is started. Cell B
+          # is the control that keeps A honest (agreement must stay silent and
+          # green), and F separates a genuine `0 started` from a failed parse.
+          ./scripts/test-fleet-boot-divergence.sh
           # AMUX-3782: a GRAFTED commit must be as attributable as a committed
           # one. Cell B is the control — every other cell asserts a trailer is
           # present, so without B a version that stamped nothing would pass.
