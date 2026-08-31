@@ -319,6 +319,39 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(alert_channel_check(state));
 
     tm.mark(&out, "9. fire-alarm reachability");
+
+    // -- N. Nonterminal cards have a disposition (next_action).
+    match state.store.read() {
+        Err(_) => {
+            out.push(InvariantResult::unknown(
+                "board.nonterminal_has_disposition",
+                "store unreadable",
+            ));
+        }
+        Ok(conn) => {
+            let rows: Vec<checks::DispositionRow> = conn
+                .prepare(
+                    "SELECT id, status, next_action, session, COALESCE(type,'code') \
+                     FROM issues WHERE deleted IS NULL AND COALESCE(archived,0) = 0",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |r| {
+                        Ok(checks::DispositionRow {
+                            id: r.get(0)?,
+                            status: r.get(1)?,
+                            next_action: r.get(2)?,
+                            session: r.get(3)?,
+                            item_type: r.get(4)?,
+                        })
+                    })
+                    .and_then(|rows| rows.collect::<Result<Vec<_>, _>>())
+                })
+                .unwrap_or_default();
+            out.extend(checks::nonterminal_has_disposition(&rows));
+        }
+    }
+    tm.mark(&out, "N. nonterminal disposition");
+
     tm.finish();
     out
 }
@@ -1890,6 +1923,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let rs = super::board_list_read_check(&state);
         let r = rs
@@ -1926,6 +1960,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let rs = super::board_list_read_check(&state);
         let r = rs.iter().find(|r| r.invariant_id == "board.list_read_succeeds").unwrap();
@@ -2045,6 +2080,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         let rs = frustration_ledger_check(&state);
@@ -2100,6 +2136,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let rs = status_pane_check(&state);
         assert!(!rs.is_empty(), "the binding must always reach a verdict");

@@ -417,6 +417,8 @@ async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unhee
         ask_type: None,
         ask_question: None,
         ask_unblocks: None,
+        // AF-367: filed by the board drive loop.
+        source: Some("board_drive".into()),
     };
     let l = lane.to_string();
     let _ = state
@@ -7030,6 +7032,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let ins = |id: &str, status: &str| {
             let (id, status) = (id.to_string(), status.to_string());
@@ -7080,6 +7083,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         store
             .write(move |conn| {
@@ -7218,6 +7222,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let ins = |id: &str, owner: &str| {
             let (id, owner) = (id.to_string(), owner.to_string());

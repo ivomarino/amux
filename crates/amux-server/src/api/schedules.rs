@@ -1389,6 +1389,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let router = Router::new().nest("/api/schedules", routes()).with_state(state);
         (router, dir)

@@ -3533,6 +3533,8 @@ fn mint_capture_card(
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            // AF-367: an auto-captured human prompt — the population AF-367 is about.
+            source: Some("capture".into()),
         },
         now_ms / 1000,
     )?;
@@ -17383,6 +17385,7 @@ mod tests {
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
                 auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
             dir,
         )
@@ -19487,6 +19490,7 @@ mod steer_boundary_tests {
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
                 auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
             dir,
         )
@@ -19553,6 +19557,8 @@ mod steer_boundary_tests {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        // AF-367: an auto-captured human prompt — the population AF-367 is about.
+                        source: Some("capture".into()),
                     },
                     now_ms / 1000,
                 )?;
@@ -20013,6 +20019,7 @@ mod hot_model_switch_tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let out = deliver_hot_config(&state, "amux-no-such-session-2617", "/model sonnet", CC_MODEL_ACK).await;
         match out {

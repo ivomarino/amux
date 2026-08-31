@@ -599,6 +599,8 @@ async fn tick(state: AppState) {
                 ask_type: None,
                 ask_question: None,
                 ask_unblocks: None,
+                // AF-367: filed by the disk watcher.
+                source: Some("disk_watch".into()),
             };
             let row = bs::create_issue(conn, &new, crate::api::reclaim::now_secs())?;
             conn.execute(
@@ -853,6 +855,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let now = crate::api::reclaim::now_secs();
         seed_scan(&s, "S1", "done", now);

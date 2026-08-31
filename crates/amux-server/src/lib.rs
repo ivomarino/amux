@@ -349,11 +349,13 @@ async fn async_main() {
         tracing::info!(dir = %dir.display(), locks = ?removed, "cleaned stale Chrome profile locks");
     }
 
+    let reconciled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = api::AppState {
         store: store.clone(),
         started: Instant::now(),
         build_hash: build_hash(),
         auth_token,
+        reconciled: reconciled.clone(),
     };
     // EVERY BACKGROUND LOOP BELOW GOES THROUGH `registry::spawn_loop`, and
     // that is not a style preference. Three of these were dead or had never
@@ -556,18 +558,36 @@ async fn async_main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(amux_core::provider_fleet::DEFAULT_RESUME_STAGGER_SECS),
     });
-    match runtime.reconcile_on_startup().await {
-        Ok(report) => tracing::info!(
-            interrupted = report.interrupted.len(),
-            stale = report.stale_backend.len(),
-            probe_failures = report.backend_probe_failures.len(),
-            "startup reconciliation complete"
-        ),
-        Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
+    // AMUX-3969b: reconciliation runs in the BACKGROUND so the listener can
+    // bind immediately. The old sequence blocked here for ~88s (50 lanes ×
+    // 2 sequential tmux calls each), during which the port was not listening
+    // and the entire fleet got connection-refused. Now the fleet gets 503s
+    // (via the `reconciled` flag on /health) while reconciliation finishes
+    // in the background, and the orch tick loop starts only after it completes.
+    {
+        let runtime = runtime.clone();
+        let store = store.clone();
+        let reconciled = reconciled.clone();
+        tokio::spawn(async move {
+            match runtime.reconcile_on_startup().await {
+                Ok(report) => tracing::info!(
+                    interrupted = report.interrupted.len(),
+                    stale = report.stale_backend.len(),
+                    probe_failures = report.backend_probe_failures.len(),
+                    "startup reconciliation complete"
+                ),
+                Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
+            }
+            crate::api::reclaim::reap_orphaned_scans(&store);
+            reconciled.store(true, std::sync::atomic::Ordering::Release);
+            let orch_tick_secs = runtime.tick_secs.max(1);
+            jobs::spawn_loop(
+                jobs::ids::ORCH_RUNTIME,
+                Some(secs(orch_tick_secs)),
+                runtime.clone().run(),
+            );
+        });
     }
-    crate::api::reclaim::reap_orphaned_scans(&store);
-    let orch_tick_secs = runtime.tick_secs.max(1);
-    jobs::spawn_loop(jobs::ids::ORCH_RUNTIME, Some(secs(orch_tick_secs)), runtime.clone().run());
 
     // Worker event processors (RR-0065, AMUX-2613 gap 1): the durable
     // subscriber to protocol.events(). Without this spawn the whole event

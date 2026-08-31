@@ -67,6 +67,7 @@ fn app() -> axum::Router {
         build_hash: "test".into(),
         // None disables auth, so protected diagnostics answer here too.
         auth_token: None,
+    reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     })
 }
 

@@ -93,6 +93,7 @@ fn rig() -> Rig {
         started: std::time::Instant::now(),
         build_hash: "golden-remaining-test".into(),
         auth_token: None,
+    reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     Rig {
         app: router(state),

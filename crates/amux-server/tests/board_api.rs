@@ -34,6 +34,7 @@ fn app_with_store() -> (axum::Router, std::sync::Arc<Store>, tempfile::TempDir) 
         started: std::time::Instant::now(),
         build_hash: "test".into(),
         auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     (router(state), store, dir)
 }
@@ -51,6 +52,7 @@ fn app() -> (axum::Router, tempfile::TempDir) {
         started: std::time::Instant::now(),
         build_hash: "test".into(),
         auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     (router(state), dir)
 }
@@ -1894,6 +1896,7 @@ async fn board_routes_sit_behind_auth_when_token_configured() {
         started: std::time::Instant::now(),
         build_hash: "test".into(),
         auth_token: Some("sekrit".into()),
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     let app = router(state);
     let (st, _, _) = send(&app, "GET", "/api/board", None).await;
@@ -3802,4 +3805,98 @@ fn every_known_type_survives_the_round_trip_into_the_gate_vocabulary() {
             ty.as_str()
         );
     }
+}
+
+/// AF-367: a card carries WHERE it came from, and the field survives to the API.
+///
+/// `creator` cannot answer that question. `mint_capture_card` stamps
+/// `creator: "amux"` for every auto-captured human prompt and the amux LANE
+/// stamps the same string for cards it authors, so 49 of 90 cards carrying that
+/// value in one 24-hour window belonged to other lanes entirely. `owner_type`
+/// does not split them either: it reads `agent` for both populations.
+///
+/// The fix is ADDITIVE on purpose. Stamping captures `amux-capture` is the
+/// obvious alternative and it has a trap: `mint_capture_card`'s own dedup keys on
+/// `creator = 'amux'`, so changing the value would silently stop deduping and
+/// mint a card per prompt. That is this defect's own shape reappearing inside its
+/// fix, which is why nothing about `creator` moved.
+#[tokio::test]
+async fn a_card_records_where_it_came_from_and_the_api_publishes_it() {
+    let (app, _dir) = app();
+
+    // The HTTP create path is `agent`: a real POST, from a lane or a human.
+    let card = create(
+        &app,
+        json!({ "title": "an ordinary create", "session": "worker-1", "status": "todo" }),
+    )
+    .await;
+    assert_eq!(
+        card["source"],
+        json!("agent"),
+        "an API create must record itself as an agent create: {card}"
+    );
+
+    // AND IT SURVIVES THE READ. The insert and the SELECT are separate column
+    // lists kept in step by hand, so a field written but not selected is a real
+    // and silent outcome — the value would be in the database and absent from
+    // every payload, which is worse than not storing it at all.
+    let id = card["id"].as_str().unwrap();
+    let (st, _, got) = send(&app, "GET", &format!("/api/board/{id}"), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(
+        got["source"],
+        json!("agent"),
+        "source must survive the round-trip to the single-card GET: {got}"
+    );
+
+    // THE CONTROL, and it is the load-bearing one: the field must DISCRIMINATE.
+    // A column hardcoded to "agent" everywhere would pass both assertions above
+    // while answering nothing, which is exactly the state `creator` is already
+    // in and the reason this card exists. So drive a second population through
+    // the store directly and require a different value.
+    let conn = rusqlite::Connection::open(_dir.path().join("amux-test.db")).unwrap();
+    let row = amux_server::db::board_store::create_issue(
+        &conn,
+        &amux_server::db::board_store::NewIssue {
+            title: "a captured human prompt".into(),
+            desc: String::new(),
+            status: "doing".into(),
+            session: Some("worker-2".into()),
+            item_type: "code".into(),
+            creator: "amux".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            gate: vec![],
+            depends_on: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            source: Some("capture".into()),
+        },
+        1_788_000_000,
+    )
+    .unwrap();
+    assert_eq!(row.source.as_deref(), Some("capture"));
+    assert_eq!(
+        row.creator, "amux",
+        "the capture population still carries creator=amux — that is the collision, \
+         and this fix deliberately does not move it"
+    );
+
+    // NULL IS AN HONEST ANSWER, not a default. Rows predating the column read
+    // NULL, which means "unknown", and nothing is backfilled: guessing which
+    // population an old row belonged to would manufacture the confident wrong
+    // attribution the field exists to end.
+    conn.execute("UPDATE issues SET source = NULL WHERE id = ?1", [&row.id])
+        .unwrap();
+    let (st, _, aged) = send(&app, "GET", &format!("/api/board/{}", row.id), None).await;
+    assert_eq!(st, StatusCode::OK);
+    assert!(
+        aged["source"].is_null(),
+        "a row with no source must publish null, not invent one: {aged}"
+    );
 }

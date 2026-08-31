@@ -6537,6 +6537,8 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                 ask_type: None,
                 ask_question: None,
                 ask_unblocks: None,
+                // AF-367: filed by the autofix detector.
+                source: Some("autofix".into()),
             };
             let row = bs::create_issue(conn, &new, now_s)?;
             conn.execute(
@@ -9252,6 +9254,7 @@ mod tests {
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
                 auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
             dir,
         )
@@ -9649,6 +9652,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test-after-restart".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let r = autofix_tick(&restarted, std::path::Path::new("/nonexistent")).await;
         assert_eq!(
@@ -12479,6 +12483,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "after-restart".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         assert!(
             file_finding(&restarted, &f2[0]).await.unwrap().is_none(),

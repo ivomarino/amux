@@ -104,6 +104,10 @@ pub struct AppState {
     pub build_hash: String,
     /// Bearer token; None disables auth (tests, first-run).
     pub auth_token: Option<String>,
+    /// `false` until startup reconciliation completes. The listener binds
+    /// BEFORE reconciliation so the fleet gets 503s instead of connection-
+    /// refused during the startup window (AMUX-3969b: 88s blackout).
+    pub reconciled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 pub fn router(state: AppState) -> Router {

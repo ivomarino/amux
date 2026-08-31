@@ -129,6 +129,13 @@ pub struct Health {
     /// cost lands on the endpoint the whole fleet polls.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tailnet: Option<crate::runtime_jobs::tailnet_watch::TailnetHealth>,
+    /// AMUX-3969b: `false` while startup reconciliation is still running.
+    /// The listener binds immediately so the fleet gets a real HTTP response
+    /// instead of connection-refused, but session state may be stale until
+    /// this flips to `true`. Consumers that need consistent session state
+    /// can poll this field; everything else (board, health, config) is
+    /// already correct.
+    pub reconciled: bool,
 }
 
 #[derive(Serialize)]
@@ -537,6 +544,9 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<Health>)
             admission: admission(),
             disk: disk_health(),
             tailnet: crate::runtime_jobs::tailnet_watch::cached(),
+            reconciled: state
+                .reconciled
+                .load(std::sync::atomic::Ordering::Acquire),
         }),
     )
 }

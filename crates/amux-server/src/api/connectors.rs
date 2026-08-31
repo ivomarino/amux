@@ -2396,6 +2396,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let router = Router::new()
             .merge(routes_with(ctx.clone()))
@@ -2623,6 +2624,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let gapp = Router::new()
             .merge(crate::api::gmail_auth::callback_routes_with(gctx))
