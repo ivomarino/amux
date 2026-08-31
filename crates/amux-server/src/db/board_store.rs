@@ -1454,6 +1454,13 @@ pub struct IssueRow {
     /// card predates migration 0040 and has not moved since: not measured, and
     /// consumers must render it that way rather than as zero.
     pub entered_state_at: Option<i64>,
+    /// What this card is waiting for, orthogonal to `status` (AMUX-3949). NULL
+    /// means not blocked. A card keeps its lifecycle POSITION and separately
+    /// says it is stuck, which `status='blocked'` could not express.
+    ///
+    /// The legacy `blocked` status is grandfathered and still in use by 66 cards
+    /// belonging to other lanes, so every consumer must honour BOTH spellings.
+    pub blocked_on: Option<String>,
     pub next_action: Option<String>,
     pub last_result: Option<String>,
     pub unresolved: Option<String>,
@@ -1534,6 +1541,7 @@ impl IssueRow {
             "ask_question": self.ask_question,
             "ask_unblocks": self.ask_unblocks,
             "entered_state_at": self.entered_state_at,
+            "blocked_on": self.blocked_on,
             "next_action": self.next_action,
             "last_result": self.last_result,
             "unresolved": self.unresolved,
@@ -1639,7 +1647,7 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
      i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence, \
      i.ask_type, i.ask_question, i.ask_unblocks, \
-     i.next_action, i.last_result, i.unresolved, i.entered_state_at";
+     i.next_action, i.last_result, i.unresolved, i.entered_state_at, i.blocked_on";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -1751,6 +1759,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         ask_question: r.get(31)?,
         ask_unblocks: r.get(32)?,
         entered_state_at: r.get(36)?,
+        blocked_on: r.get(37)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2382,8 +2391,9 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
              epic = ?22, closed_at = ?23, evidence = ?24, ask_type = ?25, \
              ask_question = ?26, ask_unblocks = ?27, next_action = ?28, \
-             last_result = ?29, unresolved = ?30, entered_state_at = ?31 \
-         WHERE id = ?32 AND deleted IS NULL",
+             last_result = ?29, unresolved = ?30, entered_state_at = ?31, \
+             blocked_on = ?32 \
+         WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -2416,6 +2426,7 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.last_result,
             row.unresolved,
             row.entered_state_at,
+            row.blocked_on,
             row.id,
         ],
     )
@@ -3015,6 +3026,63 @@ mod tests {
 
     fn create_db() -> Connection {
         crate::db::migrate::test_memdb()
+    }
+
+    /// AMUX-3949. THE CARD'S CHECK: a card blocked in `review` and one blocked
+    /// in `doing` must report DIFFERENT positions.
+    ///
+    /// Under `status='blocked'` they were the same state and the position was
+    /// destroyed on the way in, which is exactly what you need when the block
+    /// clears.
+    #[test]
+    fn blocked_is_a_dimension_so_the_lifecycle_position_survives() {
+        let conn = create_db();
+        let mut in_review = create_issue(&conn, &new_card("review"), 1000).expect("a");
+        let mut in_doing = create_issue(&conn, &new_card("doing"), 1000).expect("b");
+
+        in_review.blocked_on = Some("waiting on the KubeRay answer".into());
+        in_doing.blocked_on = Some("waiting on the KubeRay answer".into());
+        save_patched(&conn, &mut in_review).expect("save a");
+        save_patched(&conn, &mut in_doing).expect("save b");
+
+        let a = get_issue(&conn, &in_review.id).expect("read").expect("row");
+        let b = get_issue(&conn, &in_doing.id).expect("read").expect("row");
+        assert_eq!(a.status, "review", "a blocked card keeps where it was");
+        assert_eq!(b.status, "doing", "and so does the other one");
+        assert_ne!(a.status, b.status, "which is the whole point: two positions, one block");
+        assert_eq!(a.blocked_on.as_deref(), Some("waiting on the KubeRay answer"));
+
+        // CLEARING IS INDEPENDENT of any status move. Blocking and unblocking
+        // must not require pretending the card changed position.
+        in_doing.blocked_on = None;
+        save_patched(&conn, &mut in_doing).expect("clear");
+        let b2 = get_issue(&conn, &in_doing.id).expect("read").expect("row");
+        assert_eq!(b2.blocked_on, None, "the dimension clears");
+        assert_eq!(b2.status, "doing", "and the position is untouched by the clear");
+    }
+
+    /// CONTROL, and the one that keeps this from being a regression: the LEGACY
+    /// `status='blocked'` spelling still exists on 66 cards owned by other lanes,
+    /// which this work deliberately did not rewrite (ethos rule 8). Both
+    /// spellings must remain recognisable as blocked.
+    ///
+    /// A consumer honouring only the new field would silently make every legacy
+    /// blocked card workable -- worse than the position-destroying status it
+    /// replaces, because at least that one was visible.
+    #[test]
+    fn the_legacy_blocked_status_is_still_blocked() {
+        let conn = create_db();
+        let legacy = create_issue(&conn, &new_card("blocked"), 1000).expect("legacy");
+        let row = get_issue(&conn, &legacy.id).expect("read").expect("row");
+        assert_eq!(row.status, "blocked", "the legacy spelling is untouched");
+        assert_eq!(
+            row.blocked_on, None,
+            "and it was NOT backfilled: 66 of the 67 belong to other lanes"
+        );
+        // The frontier's candidate query is `status='todo'`, so a legacy blocked
+        // card is excluded by position. Asserted here so that if anyone widens
+        // that query, this cell says what it costs.
+        assert_ne!(row.status, "todo", "a legacy blocked card is not a todo candidate");
     }
 
     /// AMUX-3948. THE CARD'S OWN CHECK: a card whose blocker is open must not
@@ -3639,6 +3707,7 @@ mod tests {
             ask_question: None,
             ask_unblocks: None,
             entered_state_at: None,
+            blocked_on: None,
             next_action: None,
             last_result: None,
             unresolved: None,
@@ -3748,6 +3817,7 @@ mod configured_gate_tests {
             source_ref: None, evidence: None, ask_type: None, ask_question: None,
             ask_unblocks: None,
             entered_state_at: None,
+            blocked_on: None,
             next_action: None,
             last_result: None,
             unresolved: None, last_verified_at: None, closed_at: None,

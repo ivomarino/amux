@@ -203,6 +203,130 @@ pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
 
+/// Why a candidate is NOT on the ready frontier, or `None` if it is ready.
+///
+/// EXTRACTED so a test can drive it (AMUX-3949). The first version of this logic
+/// lived inline in the handler, which needs `AppState`, so the only cells that
+/// could reach it tested the STORE instead -- and a mutant that disabled the
+/// blocked-on arm entirely left them all green. A predicate the tests cannot
+/// call is a predicate nothing pins.
+///
+/// Dependency blocking is NOT here: it needs a `Connection` and is already the
+/// shared `deps_blocking`. This covers the two per-row facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontierExclusion {
+    /// Carries the `blocked_on` dimension (AMUX-3949).
+    Blocked,
+    /// The continuation gate is on for this lane and the card cannot satisfy it
+    /// (AMUX-3946), so `doing` would refuse it.
+    NoContinuation,
+}
+
+pub(crate) fn frontier_exclusion(
+    row: &bs::IssueRow,
+    gate_on: bool,
+) -> Option<FrontierExclusion> {
+    // BOTH SPELLINGS OF BLOCKED. `blocked_on` is the dimension; `status='blocked'`
+    // is the legacy status still carried by 66 cards belonging to other lanes,
+    // which this work deliberately did not rewrite (ethos rule 8). A consumer
+    // honouring only the new one would silently make every legacy blocked card
+    // workable, which is worse than the position-destroying status it replaces
+    // because at least that one was visible.
+    if row.blocked_on.as_deref().is_some_and(|b| !b.trim().is_empty()) {
+        return Some(FrontierExclusion::Blocked);
+    }
+    if bs::parse_status(&row.status) == Some(TaskStatus::Blocked) {
+        return Some(FrontierExclusion::Blocked);
+    }
+    if gate_on
+        && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
+            != bs::ContinuationVerdict::Ok
+    {
+        return Some(FrontierExclusion::NoContinuation);
+    }
+    None
+}
+
+#[cfg(test)]
+mod frontier_exclusion_tests {
+    use super::*;
+
+    fn row(status: &str) -> bs::IssueRow {
+        let conn = crate::db::migrate::test_memdb();
+        let new = bs::NewIssue {
+            title: "t".into(),
+            desc: String::new(),
+            status: status.into(),
+            session: Some("lane".into()),
+            item_type: "code".into(),
+            creator: "lane".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            depends_on: vec![],
+            gate: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+        };
+        bs::create_issue(&conn, &new, 1000).expect("create")
+    }
+
+    /// AMUX-3949. The frontier must honour BOTH spellings of blocked.
+    ///
+    /// This cell exists because a mutant that disabled the blocked-on arm
+    /// entirely left every other cell green: the logic was inline in a handler
+    /// that needs AppState, so nothing could reach it. A predicate the tests
+    /// cannot call is a predicate nothing pins.
+    #[test]
+    fn the_frontier_excludes_both_spellings_of_blocked() {
+        // Ready: a plain todo with a continuation, gate on.
+        let mut r = row("todo");
+        r.next_action = Some("Run the compatibility suite against KubeRay 1.4".into());
+        assert_eq!(frontier_exclusion(&r, true), None, "this one is genuinely ready");
+
+        // The DIMENSION excludes it, without changing its position.
+        let mut d = r.clone();
+        d.blocked_on = Some("waiting on the KubeRay answer".into());
+        assert_eq!(frontier_exclusion(&d, true), Some(FrontierExclusion::Blocked));
+        assert_eq!(d.status, "todo", "and it is still a todo, which is the point");
+
+        // The LEGACY STATUS excludes it too. 66 cards owned by other lanes still
+        // use this spelling and were deliberately not rewritten.
+        let mut l = r.clone();
+        l.status = "blocked".into();
+        assert_eq!(frontier_exclusion(&l, true), Some(FrontierExclusion::Blocked));
+
+        // Whitespace is not a block. `blocked_on: "  "` is an empty field, and
+        // treating it as a blocker would park a card on a typo forever.
+        let mut w = r.clone();
+        w.blocked_on = Some("   ".into());
+        assert_eq!(frontier_exclusion(&w, true), None, "an empty string is not a block");
+    }
+
+    /// The continuation arm, and the control that it only fires when the gate is
+    /// ON for the lane. 51 lanes have not opted in, and excluding their cards
+    /// would empty every one of their frontiers.
+    #[test]
+    fn the_continuation_arm_only_fires_for_an_opted_in_lane() {
+        let r = row("todo"); // no next_action
+        assert_eq!(
+            frontier_exclusion(&r, true),
+            Some(FrontierExclusion::NoContinuation),
+            "with the gate on, a card `doing` would refuse must not be offered"
+        );
+        assert_eq!(
+            frontier_exclusion(&r, false),
+            None,
+            "with the gate OFF this card is workable, and excluding it would empty \
+             the frontier of every lane that has not opted in"
+        );
+    }
+}
+
 /// GET /api/board/ready — what this lane can actually work right now.
 ///
 /// AMUX-3948, G3 in docs/design/task-workflow-engine.md. `depends_on` was
@@ -299,14 +423,16 @@ async fn ready_frontier(
             blocked_by_deps += 1;
             continue;
         }
-        // The continuation gate is COMPUTABLE, so the frontier must respect it or
-        // it would offer cards `doing` will refuse (AMUX-3946).
-        if gate_on
-            && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
-                != bs::ContinuationVerdict::Ok
-        {
-            missing_continuation += 1;
-            continue;
+        match frontier_exclusion(&row, gate_on) {
+            Some(FrontierExclusion::Blocked) => {
+                blocked_by_deps += 1;
+                continue;
+            }
+            Some(FrontierExclusion::NoContinuation) => {
+                missing_continuation += 1;
+                continue;
+            }
+            None => {}
         }
         ready.push(json!({
             "id": row.id,
@@ -2869,7 +2995,7 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 26] = [
+const PATCH_WRITABLE: [&str; 27] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -2900,6 +3026,10 @@ const PATCH_WRITABLE: [&str; 26] = [
     "next_action",
     "last_result",
     "unresolved",
+    // AMUX-3949. A dimension, so it is set and cleared independently of any
+    // status move: blocking and unblocking a card must not require pretending
+    // it changed position.
+    "blocked_on",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -3744,6 +3874,7 @@ pub async fn patch_item(
             set_opt("next_action", &mut next.next_action, &mut changed);
             set_opt("last_result", &mut next.last_result, &mut changed);
             set_opt("unresolved", &mut next.unresolved, &mut changed);
+            set_opt("blocked_on", &mut next.blocked_on, &mut changed);
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
