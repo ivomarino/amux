@@ -5703,10 +5703,46 @@ pub async fn patch_item(
                 (!owner.is_empty() && !caller_lane.is_empty() && owner != caller_lane)
                     .then(|| (owner, next.title.clone(), note))
             });
+            // A NOTE ON AN ARCHIVED CARD REACHES NOBODY, AND THE WRITE SUCCEEDS
+            // (ts-gke, 2026-08-31).
+            //
+            // Archiving hides a card from every board view AND every autonomy
+            // loop. Appending to one still returns 200, so the sender gets a
+            // success with no signal that the card is invisible. That is the
+            // failure this whole family is about: recorded, reported as
+            // delivered, reaching nobody.
+            //
+            // Measured by ts-gke across the board: 1,334 ARCHIVED cards were
+            // updated in the last 3 days and 1,199 archived cards are
+            // amux-owned, so this is happening at volume rather than as an edge
+            // case. Three of my own cards were hit by it last night --
+            // AMUX-3771, AMUX-3119 and AMUX-3780 all took peer notes while
+            // archived by a board sweep, and two of them carried live findings I
+            // only saw because the peer chased me.
+            //
+            // WARN, NOT REFUSE. The note itself is worth keeping: it is the
+            // record, and refusing the write would lose content to protect a
+            // notification. Their framing, and it is the right trade: turn a
+            // SILENT loss into a VISIBLE one.
+            let mut body = detail_body(&next);
+            if appended_note_for_reviewer.is_some() && next.archived == 1 {
+                body["note_reaches_nobody"] = json!(true);
+                body["archived_warning"] = json!(
+                    "this card is ARCHIVED: the note is saved, but the card is hidden from \
+                     every board view and every autonomy loop, so nobody will see it. \
+                     `amux board unarchive <id>` if the note needs an audience."
+                );
+                tracing::warn!(
+                    note_on_archived_card = %next.id,
+                    owner = %next.session.as_deref().unwrap_or("-"),
+                    caller = %caller_lane,
+                    "board note appended to an ARCHIVED card — write succeeded, nobody will see it"
+                );
+            }
             finish(
                 &slot_w,
                 PatchOut::Applied {
-                    body: detail_body(&next),
+                    body,
                     ignored,
                     diverted,
                     status_transition: st,
