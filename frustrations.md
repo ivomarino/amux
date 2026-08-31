@@ -3017,3 +3017,45 @@ FIX: none yet — this is a structural gap, not a one-line bug. The honest
   degradation under pressure and the OOM killer fires immediately) or a
   standing, always-available remote build target instead of relying on
   `docker.baar`/`thinkpad.atlantis` being up when needed.
+
+## Same root cause as above, escalated: the auto-builder itself now fails repeatedly, not just a manual check
+AREA: build
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-08-31
+SESSION: amux
+CARD: AMUX-48
+SYMPTOM: Supersedes/extends "A fix that brings the fleet back up can itself
+  make local cargo unsafe again" (same date, above) — that entry covered a
+  manual `cargo check` getting OOM-killed once. Verifying AMUX-48's `done`
+  card an hour later surfaced something worse: `amux-builder.timer`
+  (enabled, polling every 60s) has been trying to build commit d7af60f5
+  since it landed and failed SIX consecutive times over ~15 minutes, every
+  attempt dying with a bare `Terminated` right after "Preparing worktree"
+  finishes, before any `Compiling` line ever appears in the log. Host load
+  climbed the whole time this was observed: 43.59 -> 58.08 (1-min, 4
+  cores) — not a one-off spike, a sustained, worsening trend. The
+  builder's own lock (mkdir-based, `scripts/rust-auto-build.sh`) IS working
+  correctly — attempts are serialized, not overlapping — so this is not the
+  builder compounding its own problem, it's the AMBIENT load (this
+  session's 8 concurrent Claude processes + a desktop stack (Xvfb/x11vnc/
+  openbox/chromium) that restarted mid-observation for unrelated reasons
+  (see FRONT-4) + everything else on this box) leaving no room for even a
+  single serialized release build to complete.
+COST: `/health`'s `commit` field has been stuck at `5e5f4b24da71` through
+  three real fix commits (e6d48d53, d428277a, d7af60f5) landing on top of
+  it — the fleet has been running increasingly-stale code for the whole
+  window, and AMUX-48's own invariants check (meant to catch OTHER
+  processes dying silently) cannot itself be confirmed live because the
+  binary that would contain it never finishes building. The exact
+  "outcome confirmed to still hold" a `verified` gate asks for could not be
+  honestly claimed for the live-deploy half of that question — recorded
+  as a caveat on the card rather than papered over.
+FIX: none yet. Same interim mitigation as the prior entry (offload,
+  headroom-check before local cargo) doesn't cover THIS case — the builder
+  is a system service, not something a session chooses to run or skip.
+  A real fix needs either genuinely lowering this box's baseline occupancy
+  (durable question: does this box need to run 8 concurrent Claude
+  sessions plus a full desktop stack plus periodic release builds, or does
+  one of those need to move), or giving the builder itself a remote-offload
+  path the way this session now does manually for ad hoc verification.
