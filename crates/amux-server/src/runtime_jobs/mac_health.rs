@@ -93,15 +93,10 @@ fn orphaned_ray_workers(grace_s: u64) -> Vec<(u32, u64, String)> {
     let text = String::from_utf8_lossy(&out.stdout);
     let mut result = Vec::new();
     for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(4, ' ').filter(|s| !s.is_empty()).collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        let (Ok(pid), Ok(ppid)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) else {
+        let Some((pid, ppid, etime, cmd_owned)) = ps_row(line) else {
             continue;
         };
-        let etime = parts[2].trim();
-        let cmd = parts[3].trim();
+        let cmd = cmd_owned.as_str();
         if !cmd.starts_with("ray::") {
             continue;
         }
@@ -149,6 +144,38 @@ fn parse_etime(s: &str) -> Option<u64> {
     }
 }
 
+/// Parse one `ps -o pid=,ppid=,etime=,command=` row into (pid, ppid, etime, command).
+///
+/// SPLIT ON WHITESPACE RUNS, NOT SINGLE SPACES (AMUX-3972). `ps` RIGHT-ALIGNS
+/// its numeric columns, so a real row begins with padding:
+///
+///   "  5923     1     05:28 /Applications/Google Chrome.app/..."
+///
+/// The previous code was `line.splitn(4, ' ').filter(|s| !s.is_empty())`, which
+/// consumes the first three SINGLE spaces — all of them padding — and yields
+/// ["", "5923", "", "   1     05:28 /Applications/..."]. Filtering the empties
+/// happens AFTER splitn has already committed its split points, so the result
+/// has 2 elements, `parts.len() < 4` fires, and the row is skipped. Every row,
+/// every pass. Measured on this box: 45 matching Chrome rows, 0 parsed.
+///
+/// The filter READS like it handles padding and cannot. That is why this is a
+/// function now: the identical block existed at two call sites (the ray-worker
+/// sweep and the orphaned-Chrome reaper) and both were dead in the same way.
+///
+/// The command is re-joined on single spaces. Every caller does `contains` on a
+/// substring with no whitespace runs in it, so that is lossless for this use.
+fn ps_row(line: &str) -> Option<(u32, u32, &str, String)> {
+    let mut it = line.split_whitespace();
+    let pid = it.next()?.parse::<u32>().ok()?;
+    let ppid = it.next()?.parse::<u32>().ok()?;
+    let etime = it.next()?;
+    let cmd = it.collect::<Vec<&str>>().join(" ");
+    if cmd.is_empty() {
+        return None;
+    }
+    Some((pid, ppid, etime, cmd))
+}
+
 /// Minimum age (seconds) before an orphaned Playwright Chrome is eligible for
 /// reaping. Short grace covers the window between Chrome launch and the parent
 /// Playwright process registering the PID. Default 300s (5 minutes).
@@ -165,28 +192,35 @@ fn playwright_chrome_grace_s() -> u64 {
 /// with PPID == 1 (parent Playwright process exited, Chrome reparented to
 /// init). Each Playwright session spawns ~8-9 Chrome helper processes; we
 /// only kill the root (PPID=1) and let the helpers die naturally.
-fn orphaned_playwright_chromes(grace_s: u64) -> Vec<(u32, u64)> {
+fn orphaned_playwright_chromes(grace_s: u64) -> (Vec<(u32, u64)>, usize) {
     let Ok(out) = std::process::Command::new("ps")
         .args(["-A", "-o", "pid=,ppid=,etime=,command="])
         .output()
     else {
-        return vec![];
+        // 0 parsed: `ps` itself failed, so the sweep did not run. The caller
+        // WARNs on this rather than reading it as a clean machine.
+        return (vec![], 0);
     };
     let text = String::from_utf8_lossy(&out.stdout);
     let mut result = Vec::new();
+    // HOW MANY ROWS THE PROBE COULD ACTUALLY READ (AMUX-3972, ethos rule 4).
+    //
+    // The old parse skipped 100% of rows and the job logged "no orphaned
+    // Playwright Chrome processes" — at 15:15:24 on 2026-08-31, with SIX live.
+    // A zero that means "none exist" and a zero that means "I could not read a
+    // single line" printed the same sentence, so the reaper looked healthy for
+    // as long as it was dead. Publishing the population makes those two
+    // different outputs.
+    let mut parsed = 0usize;
     for line in text.lines() {
-        let parts: Vec<&str> = line.splitn(4, ' ').filter(|s| !s.is_empty()).collect();
-        if parts.len() < 4 {
-            continue;
-        }
-        let (Ok(pid), Ok(ppid)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) else {
+        let Some((pid, ppid, etime, cmd_owned)) = ps_row(line) else {
             continue;
         };
+        parsed += 1;
         if ppid != 1 {
             continue; // only reap the root; helpers die with it
         }
-        let etime = parts[2].trim();
-        let cmd = parts[3];
+        let cmd = cmd_owned.as_str();
         // Must be a Chrome process with a Playwright temp-profile user-data-dir.
         let is_chrome = cmd.contains("Google Chrome") || cmd.contains("Chromium");
         let has_playwright_tmpdir = cmd.contains("/T/.tmp") && cmd.contains("playwright-auth/profile");
@@ -198,7 +232,7 @@ fn orphaned_playwright_chromes(grace_s: u64) -> Vec<(u32, u64)> {
             result.push((pid, elapsed_s));
         }
     }
-    result
+    (result, parsed)
 }
 
 /// Count running `claude` processes and warn if over threshold.
@@ -252,7 +286,17 @@ fn one_pass() {
     }
 
     // --- Orphaned Playwright Chrome sweep ---
-    let pw_orphans = orphaned_playwright_chromes(pw_grace);
+    let (pw_orphans, pw_rows_parsed) = orphaned_playwright_chromes(pw_grace);
+    if pw_rows_parsed == 0 {
+        // `ps -A` on a live machine always has rows. Zero parsed means the
+        // PROBE is broken, not that the machine is quiet — say so loudly rather
+        // than reporting a clean sweep.
+        tracing::warn!(
+            job = JOB,
+            "mac-health: parsed 0 rows from `ps -A` — the orphan sweep did NOT run. \
+             This is a broken probe, not a clean machine (AMUX-3972)."
+        );
+    }
     if !pw_orphans.is_empty() {
         tracing::warn!(
             job = JOB,
@@ -268,7 +312,11 @@ fn one_pass() {
             let _ = std::process::Command::new("kill").args([&pid.to_string()]).output();
         }
     } else {
-        tracing::debug!(job = JOB, "mac-health: no orphaned Playwright Chrome processes");
+        tracing::debug!(
+            job = JOB,
+            rows_parsed = pw_rows_parsed,
+            "mac-health: no orphaned Playwright Chrome processes"
+        );
     }
 
     // --- Claude process count ---
@@ -311,5 +359,68 @@ mod tests {
         assert!(age < 120, "60s < 120s grace, should not be reaped");
         let age2 = parse_etime("03:00").unwrap_or(0);
         assert!(age2 >= 120, "180s >= 120s grace, eligible");
+    }
+}
+
+#[cfg(test)]
+mod ps_row_tests {
+    use super::*;
+
+    /// A REAL row, captured verbatim from `ps -A -o pid=,ppid=,etime=,command=`
+    /// on 2026-08-31 while eight orphaned Chromes were live. The leading spaces
+    /// are the whole point: `ps` right-aligns pid and ppid, and it was that
+    /// padding the old `splitn(4, ' ')` consumed.
+    const REAL_ROW: &str =
+        " 5923     1       10:41 /Applications/Google Chrome.app/Contents/MacOS/Google Chrome \
+--user-data-dir=/var/folders/0x/T/.tmpLbY4NA/playwright-auth/profile";
+
+    /// GUARDS THE FIXTURE ITSELF. If someone "tidies" the leading whitespace out
+    /// of REAL_ROW, every assertion below still passes and stops testing the bug
+    /// — the padding IS the input under test.
+    #[test]
+    fn the_fixture_is_actually_padded_or_it_tests_nothing() {
+        assert!(
+            REAL_ROW.starts_with(' '),
+            "REAL_ROW must keep ps's right-alignment padding; without it this \
+             module cannot fail on the defect it exists for"
+        );
+        // And the old predicate really is defeated by it, so the cell below is
+        // not merely asserting that a correct parser is correct.
+        let old: Vec<&str> = REAL_ROW.splitn(4, ' ').filter(|s| !s.is_empty()).collect();
+        assert!(
+            old.len() < 4,
+            "the pre-AMUX-3972 parse must FAIL on this row (got {} parts) — if it \
+             succeeds, this fixture no longer reproduces the bug",
+            old.len()
+        );
+    }
+
+    #[test]
+    fn a_padded_ps_row_parses_into_its_four_fields() {
+        let (pid, ppid, etime, cmd) = ps_row(REAL_ROW).expect("a real ps row must parse");
+        assert_eq!(pid, 5923);
+        assert_eq!(ppid, 1);
+        assert_eq!(etime, "10:41");
+        assert!(cmd.starts_with("/Applications/Google Chrome.app/"), "cmd was: {cmd}");
+        // The command must survive intact through the re-join, or the reaper's
+        // `contains` checks silently stop matching.
+        assert!(cmd.contains("playwright-auth/profile"), "cmd was: {cmd}");
+        assert!(cmd.contains("/T/.tmp"), "cmd was: {cmd}");
+    }
+
+    #[test]
+    fn the_reaper_selects_that_row_end_to_end() {
+        // The predicate the reaper actually applies, against the real row.
+        let (_, ppid, _, cmd) = ps_row(REAL_ROW).unwrap();
+        assert_eq!(ppid, 1, "orphaned to init");
+        assert!(cmd.contains("Google Chrome"));
+        assert!(cmd.contains("/T/.tmp") && cmd.contains("playwright-auth/profile"));
+    }
+
+    #[test]
+    fn rows_without_a_command_are_rejected_rather_than_half_parsed() {
+        assert!(ps_row("  123   1   00:01").is_none(), "no command field");
+        assert!(ps_row("").is_none());
+        assert!(ps_row("not a ps row at all").is_none(), "pid must be numeric");
     }
 }
