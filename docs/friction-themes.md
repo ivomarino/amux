@@ -234,12 +234,39 @@ name. 29 open entries now carry this shape across both ledgers.
 SCOPE PROMOTED amux -> both on 2026-08-31, which is this sweep's main output.
 `ledger-cluster:attribution` stands at 33 open, 12 amux and 21 MIXPEEK, and
 `ledger-cluster:board-gates` at 83 open, 81 of them Mixpeek. The Mixpeek half is
-the same class arriving through different tooling: the studio `tsc` pre-push gate
-reads the SHARED WORKTREE so a peer's untracked file reds a push whose own diff is
-clean (autodesk, AUTOD-121); `tree-guards` is a SEVENTH worktree-reading check
-(byo-ray, BR-81); a graft-push updates origin but neither the shared index nor the
-worktree (autodesk, AUTOD-116). Nobody carried this between repos; both arrived at
-it independently, which is what makes it harness-level rather than one repo's quirk.
+the same class arriving through different tooling. CITATIONS CORRECTED 2026-08-31
+by mixpeek-frustrations, who read `.githooks/pre-push` rather than the cards and
+found one of my three instances stale:
+
+  BR-81 tree-guards      LIVE, and the sharpest instance. Reads the worktree in
+                         BOTH discovery (`cd server && grep -rl ... tests/unit/`,
+                         line 1215) and execution (`pytest $_guards`, line 1225).
+                         27 guards found, 23 walking the filesystem with no
+                         git-tracking check. They measured it single-variable in a
+                         tempdir: 2273 files walked / 5 of 5 PASS, versus 2274 with
+                         one plausible peer WIP file added / 1 FAIL. A blocking
+                         gate, and the pusher sees a pytest tail with nothing
+                         saying the file is not theirs.
+  AUTOD-121 studio tsc   FIXED by MC-1496, and my citation was stale. The gate now
+                         materialises (`git archive "$push_head" studio | tar -x`,
+                         line 427), verified here. It also fixed a half I could not
+                         have seen from the card: the ratchet used to compare
+                         against whatever tsc-baseline.json was on disk, so a
+                         peer's in-flight baseline decided your push.
+  AUTOD-116 graft-push   CLAIM correct, CITATION does not resolve: that id is an
+                         unrelated Autodesk email card. Held on their memory, not
+                         on a card, and recorded that way rather than dropped.
+
+THE DISTINCTION THAT WORDING MISSED, and it changed the global rule. In Mixpeek
+the SELECTION is not the leak: 20 call sites select from the pushed range
+(`git diff --name-only "${base}...${push_head}"`) and none select from
+`git status`. The leak is EXECUTION, the tool running against bytes on disk after
+selecting correctly. So `git status` answers "is a peer working" and NOT "is that
+what reddened me", because a gate only fires when YOUR range touches its paths.
+Both questions are now in the global rule with the command each one takes.
+
+Nobody carried this between repos; both arrived at it independently, which is what
+makes it harness-level rather than one repo's quirk.
 ABSORBED into `~/.claude/CLAUDE.md` as "Shared checkouts: a red build is not
 evidence it is yours", carrying two commands rather than a principle: check
 `git status --porcelain` before believing a red is yours, and treat an
