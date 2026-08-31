@@ -53,6 +53,9 @@ pub fn routes() -> Router<AppState> {
             get(list_session_gates).patch(patch_session_gates),
         )
         .route("/contract", get(get_contract))
+        // Static /ready outranks /{id}. The read side of the dependency graph
+        // (AMUX-3948) — READY is a query, never a stored status.
+        .route("/ready", get(ready_frontier))
         // Static /needsyou outranks /{id}. The one owner view (AF-318).
         .route("/needsyou", get(needsyou_queue))
         // DELETE was never registered, so the SPA's own Delete button on a
@@ -199,6 +202,146 @@ pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
 
 /// How many needsyou cards the owner view shows before hiding the rest.
 const NEEDSYOU_VIEW_CAP: usize = 10;
+
+/// GET /api/board/ready — what this lane can actually work right now.
+///
+/// AMUX-3948, G3 in docs/design/task-workflow-engine.md. `depends_on` was
+/// already CONSUMED (board_drive parks on it, auto-promotes off it, has a prose
+/// fallback) and answered no QUESTION. So auto-pickup selected by queue age,
+/// and a lane could be handed a card whose blocker was still open.
+///
+/// The plan's own cards demonstrated it while this was being built: pickup
+/// claimed P4 twice, whose control needs P3, which did not exist.
+///
+/// READY IS A QUERY, NOT A STATUS (decision 2 on AMUX-3945). "Gates pass and it
+/// is claimable" is derived from four facts that each move on their own; storing
+/// it would store a fact that goes stale the moment any one of them changes.
+///
+/// EVERY EXCLUSION IS COUNTED. An empty frontier has at least five distinct
+/// causes -- nothing queued, all of it blocked, the WIP cap is full, the lane
+/// has no cards, the probe never ran -- and they call for opposite responses.
+/// `measured` plus `n_considered` plus the `excluded` histogram is what lets a
+/// reader tell them apart (AF-320; the diagnostic contract).
+async fn ready_frontier(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let lane = q
+        .get("session")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| actor_from_headers(&headers).1);
+    if lane.trim().is_empty() {
+        return Json(crate::api::measured::unmeasured(
+            json!({"ready": [], "session": null}),
+            "no lane: pass ?session=<worker> or send X-Amux-Session. A frontier with no \
+             lane would be every lane's work at once, which is not an answer to \
+             'what can I work'.",
+        ))
+        .into_response();
+    }
+    let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 200);
+
+    let Ok(conn) = state.store.read() else {
+        return Json(crate::api::measured::unmeasured(
+            json!({"ready": [], "session": lane}),
+            "the board store could not be read, so nothing was examined. This is NOT an \
+             empty frontier.",
+        ))
+        .into_response();
+    };
+
+    // CAPACITY, from the same predicate the `doing` gate refuses on: same status,
+    // same type exclusions, same archived/deleted filter. A frontier that
+    // disagreed with the gate would offer cards the gate then refuses, which is
+    // the view/mechanism split ethos rule 1 is about.
+    let holding: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session = ?1 AND status = 'doing' \
+               AND deleted IS NULL AND COALESCE(archived,0) = 0 \
+               AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') ORDER BY id",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![lane], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    let cap = crate::runtime_jobs::board_drive::wip_cap().max(0) as usize;
+    let available = cap.saturating_sub(holding.len());
+
+    // Candidates: claimable cards this lane owns. `todo` only — `backlog` is
+    // parked on a trigger and `review` is somebody else's turn.
+    let ids: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session = ?1 AND status = 'todo' \
+               AND deleted IS NULL AND COALESCE(archived,0) = 0 \
+               AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
+             ORDER BY COALESCE(created,0) ASC",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![lane], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    let n_considered = ids.len();
+
+    let gate_on = bs::continuation_required(Some(&lane));
+    let (mut blocked_by_deps, mut missing_continuation) = (0usize, 0usize);
+    let mut ready: Vec<Value> = Vec::new();
+    let now = crate::config::now_f64();
+
+    for id in &ids {
+        let Ok(Some(row)) = bs::get_issue(&conn, id) else { continue };
+        // THE SHARED PREDICATE, not a second spelling of it (AMUX-3814).
+        let blockers = crate::runtime_jobs::board_drive::deps_blocking(&conn, &row);
+        if !blockers.is_empty() {
+            blocked_by_deps += 1;
+            continue;
+        }
+        // The continuation gate is COMPUTABLE, so the frontier must respect it or
+        // it would offer cards `doing` will refuse (AMUX-3946).
+        if gate_on
+            && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
+                != bs::ContinuationVerdict::Ok
+        {
+            missing_continuation += 1;
+            continue;
+        }
+        ready.push(json!({
+            "id": row.id,
+            "title": row.title,
+            "type": row.item_type,
+            "next_action": row.next_action,
+            "epic": row.epic,
+            // Time-in-state, now that it exists (AMUX-3947). NULL means the card
+            // predates migration 0040 and has not moved since: not measured,
+            // never zero.
+            "entered_state_at": row.entered_state_at,
+            "time_in_state_s": row.entered_state_at.map(|e| (now as i64 - e).max(0)),
+            "age_s": (now as i64 - row.created).max(0),
+        }));
+    }
+    ready.truncate(limit);
+
+    let body = json!({
+        "session": lane,
+        // Cards that pass every computable precondition, oldest first. Capacity
+        // is reported BESIDE this rather than emptying it: "nothing is ready" and
+        // "you are at the cap holding something" are different answers and a
+        // caller that wants to know what is next while finishing a card deserves
+        // the real list.
+        "ready": ready,
+        "claimable_now": available.min(ready.len()),
+        "wip": {"doing": holding.len(), "cap": cap, "available": available, "holding": holding},
+        "excluded": {
+            "blocked_by_deps": blocked_by_deps,
+            "missing_continuation": missing_continuation,
+            "continuation_gate_on": gate_on,
+        },
+    });
+    Json(crate::api::measured::measured(body, n_considered)).into_response()
+}
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.
 /// Every gate-blocked 409 tells the caller to `GET /api/board/contract`

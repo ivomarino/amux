@@ -3017,6 +3017,74 @@ mod tests {
         crate::db::migrate::test_memdb()
     }
 
+    /// AMUX-3948. THE CARD'S OWN CHECK: a card whose blocker is open must not
+    /// appear on the frontier, and must appear the moment the blocker closes.
+    ///
+    /// Driven through `deps_blocking`, the SHARED predicate the drive loop uses,
+    /// rather than a re-derivation. AMUX-3814 is why: a parallel re-derivation of
+    /// "which statuses are terminal" swept in an extra one and reddened an
+    /// invariant for 8 days.
+    #[test]
+    fn a_card_appears_on_the_frontier_the_moment_its_blocker_closes() {
+        let conn = create_db();
+        let mut blocker = create_issue(&conn, &new_card("todo"), 1000).expect("blocker");
+        let mut dependent = create_issue(&conn, &new_card("todo"), 1000).expect("dependent");
+        dependent.depends_on = vec![blocker.id.clone()];
+        save_patched(&conn, &mut dependent).expect("save deps");
+
+        let blocked = crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent);
+        assert_eq!(blocked, vec![blocker.id.clone()], "an open blocker blocks");
+
+        // CONTROL, and the half that stops this passing for the wrong reason: a
+        // card with NO dependencies is never blocked. Without it, a predicate
+        // that returned "blocked" for everything would satisfy the assertion
+        // above and the frontier would always be empty.
+        assert!(
+            crate::runtime_jobs::board_drive::deps_blocking(&conn, &blocker).is_empty(),
+            "a card with no dependencies must never be blocked"
+        );
+
+        // Close the blocker -> the dependent becomes ready in the same tick.
+        blocker.status = "done".into();
+        blocker.updated = 2000;
+        save_patched(&conn, &mut blocker).expect("close blocker");
+        assert!(
+            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
+            "closing the blocker must free the dependent immediately"
+        );
+
+        // A DEPENDENCY THAT RESOLVES TO NOTHING MUST NOT BLOCK, and this arm
+        // was NOT covered until a mutant said so. `None => true` survived the
+        // control above, because a card with an EMPTY depends_on never enters
+        // the filter at all -- so "a card with no dependencies is unblocked"
+        // is true whatever the None arm does. Two different things were both
+        // called "no dependency".
+        //
+        // The behaviour is the function's own documented rule: an id that
+        // resolves to nothing cannot be worked, and treating it as a blocker
+        // parks the holder forever.
+        dependent.depends_on = vec!["AMUX-DOES-NOT-EXIST".into()];
+        save_patched(&conn, &mut dependent).expect("save phantom dep");
+        assert!(
+            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
+            "a dependency on a card that does not exist must not park the holder forever"
+        );
+
+        // A DISCARDED blocker frees it too. Discard is a judgement, not a pause,
+        // and treating it as still-blocking parks the dependent forever.
+        let mut b2 = create_issue(&conn, &new_card("todo"), 1000).expect("b2");
+        dependent.depends_on = vec![b2.id.clone()];
+        save_patched(&conn, &mut dependent).expect("save deps 2");
+        assert!(!crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty());
+        b2.status = "discarded".into();
+        b2.updated = 3000;
+        save_patched(&conn, &mut b2).expect("discard b2");
+        assert!(
+            crate::runtime_jobs::board_drive::deps_blocking(&conn, &dependent).is_empty(),
+            "a discarded blocker is resolved, not pending"
+        );
+    }
+
     /// AMUX-3947. entered_state_at records the TRANSITION, and an ordinary edit
     /// must not move it.
     ///

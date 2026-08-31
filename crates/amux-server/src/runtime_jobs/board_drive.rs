@@ -527,7 +527,11 @@ use crate::config::env_f64;
 use crate::config::env_i64;
 
 /// py:14453 `AMUX_MAX_DOING_PER_SESSION`.
-fn wip_cap() -> i64 {
+///
+/// PUBLIC so the ready-frontier query reports the SAME capacity the drive loop
+/// enforces (AMUX-3948). A frontier computing its own cap would offer a card the
+/// gate then refuses, which is the view/mechanism split ethos rule 1 names.
+pub(crate) fn wip_cap() -> i64 {
     env_i64("AMUX_MAX_DOING_PER_SESSION", 1).max(1)
 }
 /// py:13387 `AMUX_ADVANCE_CARD_BUDGET`.
@@ -1407,7 +1411,11 @@ fn status_applies(conn: &Connection, status_id: &str, session: &str, tags: &[Str
 /// py:14189 `_deps_blocking` — card ids in `depends_on` that are still OPEN.
 /// Deleted or absent ids do NOT block: an id that resolves to nothing cannot be
 /// worked, and treating it as a blocker parks the holder forever.
-fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
+/// PUBLIC so the ready-frontier query reuses THIS predicate rather than
+/// re-deriving it (AMUX-3948). AMUX-3814 is the specimen for why: a parallel
+/// re-derivation of "which reasons are terminal" swept in `rate-limited` and
+/// reddened an invariant for 8 days. One list, two consumers.
+pub(crate) fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
     row.depends_on
         .iter()
         .filter(|d| {
