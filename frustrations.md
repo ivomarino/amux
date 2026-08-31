@@ -2422,3 +2422,38 @@ FIX: amux put it in VERIFY.md by name — `--lib` is a partial run whose number 
  they assert `> 0`, mutation-checked, at cc3b4221. What remains open is the general shape:
  a suite-shaped command that silently covers a subset is the same instrument failure as a
  probe reporting zero when it never ran, and `--lib` is not the only such flag.
+
+## The observed-edit record has no content hash, so "who edited this" is unfalsifiable by construction
+AREA: attribution
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-31
+SESSION: amux-frustrations
+CARD: AMUX-3954
+SYMPTOM: The staged-guard named me as a co-editor of
+ crates/amux-server/src/runtime_jobs/autofix.rs. Three timestamps break the claim:
+   my observed record for that path   20:41:38
+   the file's actual mtime            22:06:42   <- the bytes that were committed
+   the mass `cargo fmt` sweep         22:10:14   (alerts.rs, auth.rs, ~180 files)
+ My record is 85 minutes BEFORE the write whose content landed, and the file is 3.5
+ minutes off the fmt sweep, so it was a third, separate write. The record is
+ `<ts> <session> n=<count> paths=<names>` with no hash anywhere (confirmed in the writer
+ by amux), so the guard compares a TIMESTAMP WINDOW against a file that moved, and any
+ write to that path inside the window inherits whoever's window it was.
+COST: Two mis-attributions by one lane in a single day. This one, and earlier amux told
+ ts-gke their commit had absorbed 220 lines — the trailer evidence showed the commit was
+ not even ts-gke's conversation. Different signal, same shape: a name with no way to test
+ it. Each costs a round trip between two lanes to disprove, and the durable cost is worse
+ than the minutes: a guard that names the wrong peer teaches lanes to discount it, which
+ spends the credibility it needs for the cases where it is right. On this same day the
+ SAME guard correctly stopped a real sweep, so both outcomes are live.
+FIX: Hash each path at observation time and compare against the staged blob — match, name
+ them; differ, drop the name and say why. That turns "someone touched this path recently"
+ into "someone touched THIS CONTENT", which is the claim the warning already makes in
+ prose. Tracked as AMUX-3954, deliberately NOT built at the end of a long session: it is a
+ change to a safety-critical guard, which is how a fix becomes the next incident.
+NOTE THE THIRD OUTCOME, because neither party had a slot for it: this was not "you were
+ right" or "I was wrong". The signal was REAL and pointed at the WRONG EVENT. An
+ attribution system keyed on time rather than content will keep producing that verdict,
+ and the AF-179 caveat is doing real work — it is why amux hedged instead of asserting —
+ but a caveat cannot make an unfalsifiable signal falsifiable.
