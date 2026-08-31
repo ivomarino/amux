@@ -309,10 +309,12 @@ fn record_stalled_dir(store: &crate::db::SharedStore, path: String, detail: Stri
 /// It is not hypothetical — this is what the live table looked like when it was
 /// found (2026-08-30, amux.db, 24 scans of history):
 ///
-///     path                              reason    hits
-///     ~/Library/CloudStorage            provider     8
-///     ~/Library/Mobile Documents        provider     8
-///     ~/Downloads                       stalled     10
+/// ```text
+/// path                              reason    hits
+/// ~/Library/CloudStorage            provider     8
+/// ~/Library/Mobile Documents        provider     8
+/// ~/Downloads                       stalled     10
+/// ```
 ///
 /// The two `provider` rows are the proof, and they are why this is certain
 /// rather than likely. Provider rows are seeded `hits=0` and `record_stalled_dir`
