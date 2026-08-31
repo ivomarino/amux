@@ -72,7 +72,7 @@ scope was assessed on amux evidence and is re-measured across both repos daily.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-30
+LAST_SEEN: 2026-08-31
 OCCURRENCES: 2
 SIGNALS: board-resting:*, rule-restatement:backlog-growth
 FIX_SITE: crates/amux-server/src/api/board*, plus a runtime job
@@ -86,20 +86,29 @@ live and is currently faster on the Mixpeek side.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-29
-OCCURRENCES: 1
+LAST_SEEN: 2026-08-31
+OCCURRENCES: 2
+LAST_SEEN_NOTE: re-measured 2026-08-31
 SIGNALS: board-resting:*:needsyou
 FIX_SITE: board status gate; `needsyou` requires a typed `--ask`
 CARDS: AF-318
 EVIDENCE: 445 cards in `needsyou`, median 15d, and 51% match no ask-shape at all.
 Their titles are plain engineering work. The twenty that genuinely need Ethan
 are indistinguishable inside them.
+Re-measured 2026-08-31: Mixpeek `needsyou` is 300 cards against a 215 baseline
+seven days ago, so it grew 85 in a week and the typed-ask gate (AF-318, shipped
+for amux) has not reached the Mixpeek board. That is the same shape as the
+`measured` contract in the theme below: enforced on one side, watched on the other.
+One datapoint from this lane on the other side of it: four cards in this lane's own
+`needsyou` (AF-155, AF-206, AF-286 and a fourth filed before finding them) were ONE
+question asked four times. Consolidating them to a single card is the per-lane
+version of what the gate does globally.
 
 ## Nudging is the dominant channel and the loop has no negative feedback
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-29
+LAST_SEEN: 2026-08-31
 OCCURRENCES: 1
 SIGNALS: nudge-no-movement, rule-restatement:idle-stall
 FIX_SITE: `idle_backlog_drain_cooldown_s()` and the board_drive job
@@ -107,6 +116,14 @@ CARDS: AF-319
 EVIDENCE: 496 of 1,000 messages were `board_drive` nudges: 160k tokens in 34h
 and 84% of one lane's entire inbox, with the queue unmoved. Cadence scales UP
 with backlog size, so the biggest queues sit at the floor permanently.
+Re-measured 2026-08-31: `rule-restatement:idle-stall` fired 10 times in one day
+against a 1.23/day trailing baseline, EIGHT TIMES the baseline and the largest
+excursion of any signal this pass. Spans both repos (2 amux / 6 mixpeek / 2
+other). The prose already exists in three places (amux CLAUDE.md, the frustrations
+rule, mixpeek CLAUDE.md) and Ethan is still writing "keep going until theyre all
+verified at scale you dont need me" and "continue todo and everything until
+they're all verified". Prose in three files losing to the mechanism eight times in
+a day is the argument that AF-319 is a mechanism fix, not a wording fix.
 
 ## Verification is something Ethan has to demand, every single time
 SCOPE: both
@@ -126,14 +143,21 @@ watch whether the restatements migrate there. The class was still active on
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-29
+LAST_SEEN: 2026-08-31
 OCCURRENCES: 1
 SIGNALS: rule-restatement:permissions, ledger-cluster:auth-secrets
 FIX_SITE: a preflight that names required credentials before a lane starts
-CARDS: none
+CARDS: AF-372
 EVIDENCE: this is the class Ethan named by hand in MSG-35488 ("we always forget
 to add permissions to the right place"). Credential-shaped cards are 13% of
 `needsyou`, and every one of them is a task that had already started.
+Re-measured 2026-08-31: `rule-restatement:permissions` fired 5 times in one day
+against a 0.77/day baseline, SIX AND A HALF TIMES it, spanning both repos (1 amux
+/ 2 mixpeek / 2 other). The prose already exists in amux CLAUDE.md and the global
+CLAUDE.md. Specimens are mid-task every time, which is the whole shape: "use amux
+connector for gmail access and granola" (hoichoi, 11:00) arrives when the work is
+already underway, not before it. Carded as AF-372 rather than written as more
+prose, because two files already say it and the signal is at 6.5x anyway.
 
 ## Instruments that lie: the single largest cluster in either ledger
 SCOPE: both
@@ -172,17 +196,34 @@ it. The general shape is that extraction for testability stops at the function b
 and the bug moves one line up into the argument.
 
 ## One checkout, N lanes, and git has one index
-SCOPE: amux
-STATUS: open
+SCOPE: both
+STATUS: absorbed
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-30
-OCCURRENCES: 2
-SIGNALS: ledger-cluster:attribution
-FIX_SITE: per-lane git worktree
-CARDS: AF-316
+LAST_SEEN: 2026-08-31
+OCCURRENCES: 3
+SIGNALS: ledger-cluster:attribution, ledger-cluster:board-gates
+FIX_SITE: per-lane git worktree (AF-336); harness rule in ~/.claude/CLAUDE.md
+CARDS: AF-316, AF-336, AF-356, AF-365, AF-368
 EVIDENCE: 9 separate attribution entries across the ledger are one fact. A
 shared index means a peer's `git add` ships your in-flight work under their
 name. 29 open entries now carry this shape across both ledgers.
+SCOPE PROMOTED amux -> both on 2026-08-31, which is this sweep's main output.
+`ledger-cluster:attribution` stands at 33 open, 12 amux and 21 MIXPEEK, and
+`ledger-cluster:board-gates` at 83 open, 81 of them Mixpeek. The Mixpeek half is
+the same class arriving through different tooling: the studio `tsc` pre-push gate
+reads the SHARED WORKTREE so a peer's untracked file reds a push whose own diff is
+clean (autodesk, AUTOD-121); `tree-guards` is a SEVENTH worktree-reading check
+(byo-ray, BR-81); a graft-push updates origin but neither the shared index nor the
+worktree (autodesk, AUTOD-116). Nobody carried this between repos; both arrived at
+it independently, which is what makes it harness-level rather than one repo's quirk.
+ABSORBED into `~/.claude/CLAUDE.md` as "Shared checkouts: a red build is not
+evidence it is yours", carrying two commands rather than a principle: check
+`git status --porcelain` before believing a red is yours, and treat an
+mtime-derived owner as not-evidence. Both were measured the same day: a lane
+diagnosed a filesystem race on a peer's uncommitted file, and two lanes each held
+a record naming the other for a third lane's work. STATUS is `absorbed`, not
+`retired`: the prose shipped, the signals stay watched, and the mechanism fix
+(AF-336) is still open.
 
 ## Workers ask for authority they already have
 SCOPE: both
