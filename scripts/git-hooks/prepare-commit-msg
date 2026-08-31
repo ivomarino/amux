@@ -225,7 +225,34 @@ while [ "$_hops" -lt 12 ]; do
   case "${_exe##*/}" in
     claude|claude-code)
       _model="$(printf '%s' "$_cmd" | sed -n 's/.*--model[= ]\{1,\}\([^ ]\{1,\}\).*/\1/p')"
-      [ -n "$_model" ] || _model="unspecified"
+      # NOT "unspecified" (AMUX-3939). That word reads as "the field was not
+      # populated", i.e. the measurement did not run — and the measurement DID
+      # run. The walk found the right process; that process was launched as a
+      # bare `claude` with no `--model`, so it is running the account default
+      # and the flag is simply not there to read.
+      #
+      # CONFIRMED, not guessed. ts-gke reported 9fd67b10 stamped
+      # `model=unspecified` while its own Co-Authored-By said Sonnet 4.6. Its
+      # agent was pid 5559, whose command line is the single word `claude`,
+      # while all 30+ other live claude processes on this box carry `--model`.
+      # So the walk was not stopping at the wrong process, which was the other
+      # candidate cause and the one the card asked to rule out first.
+      #
+      # THE REAL MODEL IS RECOVERABLE, AND DELIBERATELY NOT RECOVERED HERE. The
+      # session transcript records it per message
+      # (~/.claude/projects/<slug>/<conv>.jsonl; for that commit it reads
+      # claude-sonnet-4-6, matching the Co-Authored-By exactly). Reaching it
+      # needs `conv`, which is resolved from amux's session meta and therefore
+      # MOVES WITH $AMUX_SESSION. This field's entire property is that it does
+      # not: "walked from the hook's own PROCESS ANCESTRY, which no env var can
+      # move", asserted by test-commit-stamp.sh. Buying a nicer model string
+      # with that invariance would trade the field's one guarantee for a
+      # convenience, and the invariance is what the four mis-stamped commits
+      # needed.
+      #
+      # So: say what was measured. A consumer that needs the true model has the
+      # conversation id on the very next trailer and can go read it.
+      [ -n "$_model" ] || _model="argv-absent"
       agent="pid=$_pp model=$_model"
       break
       ;;

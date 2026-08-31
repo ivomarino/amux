@@ -91,5 +91,65 @@ else
   no "a confirmed conv id must still be stamped" "$(run confirmed)"
 fi
 
+# 5. AMUX-3939: the MODEL fallback must say what was measured.
+#
+# `unspecified` read as "the field was not populated", i.e. the measurement did
+# not run. The measurement DID run: the walk found the right process, and that
+# process was launched as a bare `claude` with no `--model`. ts-gke's specimen
+# was 9fd67b10, stamped model=unspecified while its own Co-Authored-By said
+# Sonnet 4.6; its agent pid 5559 had the single-word command line `claude`,
+# while every other live claude process on the box carried --model.
+#
+# Driving this needs a CONTROLLED ANCESTRY, since the walk reads real parents.
+# A symlink named `claude` gives ps an argv[0] whose basename matches the
+# hook's binary test — the same "match the binary, not the substring" rule the
+# hook documents. A copied binary does not work on macOS (code signing kills
+# it), which is why this is a symlink.
+mkdir -p "$TMP/bin"
+ln -sf /bin/sh "$TMP/bin/claude"
+run_under() { # run_under <extra claude argv...> -> the Amux-Agent trailer
+  printf 'subject\n' > "$TMP/msg2"
+  AMUX_SESSION=lane-model AMUX_HOME="$TMP/home" \
+    "$TMP/bin/claude" -c "bash '$HOOK' '$TMP/msg2' >/dev/null 2>&1" "$@"
+  grep '^Amux-Agent:' "$TMP/msg2" 2>/dev/null
+}
+
+m_absent="$(run_under)"
+case "$m_absent" in
+  *"model=argv-absent"*)
+    ok "a bare \`claude\` reports model=argv-absent (measured, not missing)" ;;
+  *"model=unspecified"*)
+    no "the fallback must not say 'unspecified'" \
+       "that word means the probe did not run; it did — got '$m_absent'" ;;
+  *) no "a claude-named ancestor must produce an Amux-Agent trailer" "got '$m_absent'" ;;
+esac
+
+# CONTROL, and the card named it: "an explicitly-launched lane still reports its
+# real model, or the fix has just replaced one empty value with another."
+m_real="$(run_under --model claude-opus-5)"
+case "$m_real" in
+  *"model=claude-opus-5"*)
+    ok "an explicit --model is still read off argv (the fix is not a blanket string)" ;;
+  *) no "a launched-with--model lane must report its real model" "got '$m_real'" ;;
+esac
+
+# CONTROL 2: the invariance this field exists for is untouched. The model now
+# has a second possible value, and a fix that reached for the transcript to get
+# a nicer string would have coupled this field to \$AMUX_SESSION — which is
+# exactly what cell 1 forbids. Asserted again HERE, against the fallback path
+# specifically, because cell 1 runs under an ancestry that has a real --model
+# and so never exercises this branch.
+# Compare the MODEL field only: each run_under spawns its own shim, so the pids
+# differ by construction and comparing whole trailers would fail for a reason
+# that is not the property under test. (It did, on the first draft of this cell.)
+_model_of() { printf '%s' "$1" | sed -n 's/.*model=\([^ ]*\).*/\1/p'; }
+x="$(_model_of "$(AMUX_SESSION=aaa run_under)")"
+y="$(_model_of "$(AMUX_SESSION=bbb run_under)")"
+if [ -n "$x" ] && [ "$x" = "$y" ]; then
+  ok "the fallback path is ALSO invariant under \$AMUX_SESSION (model=$x)"
+else
+  no "model=argv-absent must not move with \$AMUX_SESSION" "aaa='$x' bbb='$y'"
+fi
+
 printf '\n%d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]
