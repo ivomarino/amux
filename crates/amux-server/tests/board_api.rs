@@ -569,17 +569,36 @@ async fn gates_derive_from_type_and_retyping_is_the_honest_exit() {
     assert_eq!(v["status"], json!("done"));
 
     // Unknown types are rejected at the door with the valid set — never
-    // silently mis-gated (the seven 'decision' cards incident).
+    // silently mis-gated.
+    //
+    // THE EXAMPLE USED TO BE `decision`, and swapping it is the point of AF-323
+    // rather than a detail. Refusing an UNLISTED type is correct and still
+    // asserted here; what was wrong was `decision` being unlisted while five
+    // live cards already stored it, so this test was pinning the defect. Its own
+    // comment tracked the count growing — "the seven 'decision' cards incident",
+    // filed at three — and a growing number in a test's prose is the tell that
+    // the test is describing a leak, not a guarantee.
+    //
+    // `task` carries the same provenance and is still genuinely unknown: the CLI
+    // advertised `task` and `decision` in its usage line until AMUX-2479, and
+    // neither was accepted. One of those two is now a real type; this is the
+    // other.
     let (st, _, v) = send(
         &app,
         "PATCH",
         &format!("/api/board/{id}"),
-        Some(json!({ "type": "decision" })),
+        Some(json!({ "type": "task" })),
     )
     .await;
     assert_eq!(st, StatusCode::BAD_REQUEST);
     assert!(v["error"].as_str().unwrap().contains("unknown type"));
     assert!(v["valid_types"].as_array().unwrap().contains(&json!("watch")));
+    // And the type this card family is named after is now IN that set, which is
+    // the half a "reject unknown types" test can never show on its own.
+    assert!(
+        v["valid_types"].as_array().unwrap().contains(&json!("decision")),
+        "decision must be offered as a valid type: {v}"
+    );
 }
 
 /// AMUX-3058: a gate OVERRIDE (`gate` field) pins the gate over the type, so
@@ -3658,4 +3677,129 @@ async fn a_scoped_export_declares_its_scope_and_an_unscoped_one_declares_that() 
     assert!(b.contains("alpha"), "scoped md must name the worker");
     assert!(b.contains("AAA"), "scoped md must carry the full desc");
     assert!(!b.contains("BBB"), "scoped md must not leak the other worker's card");
+}
+
+/// AF-323: a `decision` card can be FILED and CLOSED, through the real HTTP
+/// path, with a gate that does not demand a merge.
+///
+/// The friction this pins is that two components disagreed about one fact: the
+/// board stored `type: decision` on five live cards while the create path
+/// refused the word. The disagreement was load-bearing rather than cosmetic —
+/// an unlisted type falls through `core_item_type` to `Code`, the STRICTEST
+/// gate, so those five cards demanded "Implemented and merged" for work whose
+/// entire output is a sentence from the person who owns the call. No owner
+/// could close one honestly, which is ethos rule 3: a constraint with no
+/// truthful path in a legitimate state.
+///
+/// This is deliberately an END-TO-END test and not a `default_gates_for` unit
+/// test. AF-342 shipped four passing cells over a correct pure function while
+/// the production caller read the wrong input, so the fix was inert on every
+/// path in the fleet and every instrument still said pass. The gate arm being
+/// right is not the claim; the claim is that a lane can do this.
+#[tokio::test]
+async fn a_decision_card_can_be_filed_and_closed_without_claiming_a_merge() {
+    let (app, _dir) = app();
+
+    // 1. THE CREATE PATH ACCEPTS IT. This is the arm that returned
+    //    `unknown type "decision"` while the board held cards typed exactly this.
+    let card = create(
+        &app,
+        json!({
+            "title": "Which region for the new shard?",
+            "session": "worker-1",
+            "status": "doing",
+            "type": "decision",
+        }),
+    )
+    .await;
+    let id = card["id"].as_str().unwrap().to_string();
+    assert_eq!(card["type"], json!("decision"), "type must round-trip: {card}");
+
+    // 2. THE GATE IS NOT THE CODE GATE. A refused transition reports the gate it
+    //    enforced, so this reads the criteria the server actually applied rather
+    //    than re-deriving them here — the two can differ, and when they do it is
+    //    this one that governs.
+    //
+    //    The evidence is supplied on THIS call because the global asset-link
+    //    constraint is checked BEFORE the type gate and short-circuits it: a bare
+    //    `{"status":"done"}` comes back `done_requires_asset_link` with no `gate`
+    //    key at all. Worth stating rather than just working around, because it
+    //    means the first refusal a decision card hits says nothing about its type
+    //    — the honest `none:` path is offered in `how_to_fix`, so there IS a way
+    //    through, but a reader debugging one of the five live cards would see the
+    //    artifact demand first and the mis-gating never.
+    const DECIDED: &str =
+        "none: Ethan chose us-east-1 on 2026-08-31; a decision ships no artifact";
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": DECIDED })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::CONFLICT, "expected the gate to ask first: {v}");
+    let gate = v["gate"].as_array().unwrap_or_else(|| panic!("no gate key in refusal: {v}"));
+    assert!(
+        !gate.contains(&json!("Implemented and merged")),
+        "a decision card must not be asked to claim a merge: {gate:?}"
+    );
+    assert!(
+        gate.iter().any(|c| c.as_str().unwrap_or("").contains("by whom")),
+        "the decision gate must ask WHO decided, which is the field that stops a \
+         settled question being re-asked: {gate:?}"
+    );
+
+    // 3. AND IT CLOSES. The whole point is a truthful path to `done`, so a test
+    //    that stopped at the refusal above would pin half the fix — the half a
+    //    card stuck at the strictest gate already satisfied.
+    //
+    //    `none: <reason>` is the evidence: a decision produces no artifact, and
+    //    that escape is documented, stored and counted rather than a bypass.
+    let (st, _, v) = send(
+        &app,
+        "PATCH",
+        &format!("/api/board/{id}"),
+        Some(json!({ "status": "done", "evidence": DECIDED, "gate_ack": true })),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK, "a decision card must be closable: {v}");
+    assert_eq!(v["status"], json!("done"));
+}
+
+/// The two hand-synced type vocabularies must not drift.
+///
+/// `KNOWN_TYPES` (amux-server, what the API validates against) and
+/// `ItemType::ALL` (amux-core, what gates and the state machine derive from) are
+/// separate lists kept in step BY HAND — `KNOWN_TYPES`' own doc says so and asks
+/// for a future cleanup that derives one from the other. Until that exists, this
+/// is the thing that fails when someone adds a type to one list only.
+///
+/// That failure is not cosmetic, which is why it is worth a test rather than a
+/// comment: a type in `KNOWN_TYPES` but absent from `core_item_type` is ACCEPTED
+/// by the API and then silently gated as `code`. That is precisely AF-323's
+/// defect — a card whose stored type the gate layer does not believe in — and
+/// adding `decision` by hand to two lists is exactly the move that would
+/// reintroduce it one list at a time.
+#[test]
+fn every_known_type_survives_the_round_trip_into_the_gate_vocabulary() {
+    use amux_server::db::board_store as bs;
+    for t in bs::KNOWN_TYPES {
+        let core = bs::core_item_type(t);
+        assert_eq!(
+            core.as_str(),
+            t,
+            "`{t}` is offered by the API but `core_item_type` does not map it, so \
+             a card filed with it would be silently gated as `code` — AF-323's \
+             exact shape, one list at a time"
+        );
+    }
+    // And the reverse direction: a variant that exists in core but is not
+    // offered by the API is a type nobody can file.
+    for ty in amux_core::board::ItemType::ALL {
+        assert!(
+            bs::KNOWN_TYPES.contains(&ty.as_str()),
+            "`{}` exists as an ItemType but the API will not accept it",
+            ty.as_str()
+        );
+    }
 }

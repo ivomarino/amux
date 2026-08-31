@@ -128,6 +128,24 @@ pub enum ItemType {
     /// dormant type; its gate is the non-code default ("Outcome recorded"), an
     /// epic being done when its work is accounted for.
     Epic,
+    /// A choice that belongs to a human, carried as a card (AF-323). NOT a
+    /// synonym for `escalation`: an escalation is work that got stuck and needs
+    /// someone unblocked, while a decision card has no blocked work behind it
+    /// and is complete the moment the answer is given.
+    ///
+    /// It exists because the board was already STORING it. `mixpeek-orchestrator`
+    /// wrote five live cards typed `decision` through a path that skips
+    /// validation, the CLI advertised the word in its own usage line until
+    /// AMUX-2479, and 24% of `needsyou` has this shape (AF-318). Every one of
+    /// those fell through `core_item_type` to `Code` — the STRICTEST gate — so
+    /// closing them demanded "Implemented and merged" for a card whose entire
+    /// output is a sentence from Ethan. That is ethos rule 3: a constraint with
+    /// no truthful path in a legitimate state.
+    ///
+    /// Adding the type is what repairs those five cards. Retyping them is not
+    /// available: they belong to another lane, and rule 8 plus AMUX-3552 both
+    /// say surface, do not sweep.
+    Decision,
 }
 
 impl ItemType {
@@ -135,7 +153,7 @@ impl ItemType {
     /// hand-listed. The `is_dormant` comment below records what a re-typed
     /// literal already cost here once; this exists so the next one does not
     /// have to be written at all.
-    pub const ALL: [ItemType; 11] = [
+    pub const ALL: [ItemType; 12] = [
         ItemType::Code,
         ItemType::Escalation,
         ItemType::Blocker,
@@ -147,6 +165,7 @@ impl ItemType {
         ItemType::Tripwire,
         ItemType::Watch,
         ItemType::Epic,
+        ItemType::Decision,
     ];
 
     /// The wire/DB spelling — the same snake_case serde emits, so a value
@@ -164,6 +183,7 @@ impl ItemType {
             ItemType::Tripwire => "tripwire",
             ItemType::Watch => "watch",
             ItemType::Epic => "epic",
+            ItemType::Decision => "decision",
         }
     }
 
@@ -1364,6 +1384,11 @@ pub fn verified_is_meaningful(item_type: ItemType) -> bool {
         // An epic is a grouping container — it ships nothing itself, so there is
         // no prod to confirm; it is done when its children/outcome are recorded.
         | ItemType::Epic
+        // A decision produces an answer, not a deploy. Once it is recorded on
+        // the card there is no production to confirm it in, and asking the lane
+        // that ASKED the question to re-confirm the reply is the make-work this
+        // predicate exists to refuse. `done` is the honest end state (AF-323).
+        | ItemType::Decision
         | ItemType::Watch => false,
     }
 }

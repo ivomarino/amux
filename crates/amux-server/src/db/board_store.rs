@@ -129,7 +129,7 @@ pub fn status_to_db(target: TaskStatus, prior_raw: &str) -> String {
 
 /// The Python `_ITEM_TYPES` tuple, verbatim (order preserved for the
 /// `valid_types` field the CLI prints).
-pub const KNOWN_TYPES: [&str; 11] = [
+pub const KNOWN_TYPES: [&str; 12] = [
     "code",
     "escalation",
     "blocker",
@@ -144,6 +144,13 @@ pub const KNOWN_TYPES: [&str; 11] = [
     // `ItemType::ALL` and must be kept in step with it by hand — the enum's own
     // doc calls that out; a future cleanup should derive one from the other.
     "epic",
+    // AF-323. Added because the board was already STORING it: five live cards
+    // carried `type: decision` while this very list made the create path refuse
+    // it, so two components disagreed about the same fact and the disagreement
+    // was load-bearing — an unlisted type falls through `core_item_type` to
+    // `Code`, the strictest gate, and those five cards could not be closed
+    // honestly by anyone.
+    "decision",
 ];
 
 /// Core [`ItemType`] for GATE purposes. Unknown/legacy strings map to `Code`
@@ -163,6 +170,7 @@ pub fn core_item_type(raw: &str) -> ItemType {
         "tripwire" => ItemType::Tripwire,
         "watch" => ItemType::Watch,
         "epic" => ItemType::Epic,
+        "decision" => ItemType::Decision,
         _ => ItemType::Code,
     }
 }
@@ -846,6 +854,30 @@ pub fn default_gates_for(item_type_raw: &str, target: TaskStatus) -> Vec<String>
             "Confirmed working in prod",
             "Zero regressions",
         ],
+        // Decision (AF-323): a card whose only output is an answer from the
+        // person who owns the call. The non-code default below would ALMOST fit,
+        // but its `done` bar ("what happened, and why it is closed") is silent on
+        // the one thing that must be on the card — WHO decided, and WHAT they
+        // chose. An unrecorded decider is how a settled question gets re-asked,
+        // and re-asking is the cost this type exists to stop.
+        //
+        // `doing` deliberately does NOT ask for an owner in the code sense. The
+        // owner of a decision is the person who will answer, not the lane holding
+        // the card, and requiring "has an owner" of a lane that is waiting on
+        // Ethan asks it to assert something false.
+        (ItemType::Decision, TaskStatus::Doing) => &[
+            "The choice is stated as a question with its options",
+            "Named the person whose call this is",
+        ],
+        (ItemType::Decision, TaskStatus::Review) => {
+            &["Options and their trade-offs are written up", "Ready for the decider"]
+        }
+        (ItemType::Decision, TaskStatus::Done) => {
+            &["The decision is recorded on the card: what was chosen, by whom, and when"]
+        }
+        (ItemType::Decision, TaskStatus::Verified) => {
+            &["The decision has been acted on, and still holds"]
+        }
         // Every other (non-code, non-dormant) type: the honest non-code bar.
         (_, TaskStatus::Doing) => &["Scope is clear", "Has an owner"],
         (_, TaskStatus::Review) => &["Findings written up", "Ready for another set of eyes"],
@@ -3789,9 +3821,23 @@ mod tests {
             vec!["Outcome recorded in the item (what happened, and why it is closed)"]
         );
         // Unknown/legacy types inherit the strictest (code) gate.
+        //
+        // The example was `decision` until AF-323 made it a real type. Swapping
+        // it keeps the assertion — an unlisted type still gets the code gate —
+        // and drops the claim it had quietly acquired, that decision cards
+        // BELONG at that bar. Five live cards did, and none of their owners
+        // could close one honestly, because "Implemented and merged" is not a
+        // sentence anyone can say truthfully about a choice Ethan made.
+        assert_eq!(
+            default_gates_for("task", TaskStatus::Done),
+            default_gates_for("code", TaskStatus::Done)
+        );
+        // And the type that came out of that fall-through now has its own bar,
+        // which names the decider — the field whose absence lets a settled
+        // question get re-asked.
         assert_eq!(
             default_gates_for("decision", TaskStatus::Done),
-            default_gates_for("code", TaskStatus::Done)
+            vec!["The decision is recorded on the card: what was chosen, by whom, and when"]
         );
         assert_eq!(
             default_gates_for("watch", TaskStatus::Review),
