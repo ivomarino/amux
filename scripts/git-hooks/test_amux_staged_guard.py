@@ -145,6 +145,65 @@ def main():
                 "the restore remedy no longer says it edits the peer's index; "
                 "without the reason, the ordering above is arbitrary and reversible")
 
+    # AF-357: a staged DELETION from an area the commit does not otherwise touch.
+    #
+    # SPECIMEN, replayed exactly: 26c45798 deleted
+    # crates/amux-server/migrations/0035_reclaim_skipped_hits_repair.sql inside a
+    # commit whose other seven files are all under site/ and whose subject is
+    # "feat(seo)". The removal was correct, so nothing broke; the cost is that
+    # `git log` on that path now names a commit that cannot account for it.
+    #
+    # Measured before building: over the last 500 commits only TWO contain a
+    # deletion at all, and this predicate fires on exactly one, the incident. So
+    # the controls below matter more than the positive case, because a check this
+    # rare is only worth having if it stays silent otherwise.
+    incident = [
+        ("D", "crates/amux-server/migrations/0035_reclaim_skipped_hits_repair.sql"),
+        ("M", "site/AEO_BACKLOG.md"),
+        ("M", "site/changelog/index.html"),
+        ("A", "site/guides/splitting-work-across-ai-agents/index.html"),
+    ]
+    got = mod._orphan_deletions(incident)
+    if [p for p, _ in got] != ["crates/amux-server/migrations/0035_reclaim_skipped_hits_repair.sql"]:
+        failures.append(f"orphan_deletions missed the 26c45798 specimen: {got!r}")
+
+    # CONTROL 1: a deletion IN the area the commit works in is ordinary. Without
+    # this, a predicate that flagged every deletion would pass the case above.
+    same_area = [
+        ("D", "crates/amux-server/migrations/0035_old.sql"),
+        ("M", "crates/amux-server/src/db/migrate.rs"),
+    ]
+    if mod._orphan_deletions(same_area):
+        failures.append("a deletion inside the commit's own area must not fire")
+
+    # CONTROL 2: a commit with NO deletions is silent.
+    if mod._orphan_deletions([("M", "a/b.rs"), ("A", "a/c.rs")]):
+        failures.append("a commit with no deletions must not fire")
+
+    # CONTROL 3: a DELETION-ONLY commit is a deliberate removal, not a sweep.
+    # This is the arm that would make the check obnoxious on a real cleanup.
+    if mod._orphan_deletions([("D", "old/one.md"), ("D", "old/two.md")]):
+        failures.append("a deletion-only commit is deliberate and must not fire")
+
+    # The renderer must stay SILENT when there is nothing to say, for the same
+    # reason as split_risk: a notice on the normal path is one people scroll past,
+    # and it takes the real signal with it (AF-342).
+    out = []
+    mod._render_orphan_deletions(same_area, out.append)
+    if out:
+        failures.append(f"renderer must print NOTHING for an ordinary commit, got {out!r}")
+
+    out = []
+    mod._render_orphan_deletions(incident, out.append)
+    txt = "".join(out)
+    for needle, what in [
+        ("0035_reclaim_skipped_hits_repair.sql", "the deleted path"),
+        ("crates/", "the area nothing else touches"),
+        ("git restore --staged", "the remedy"),
+    ]:
+        if needle not in txt:
+            failures.append(f"orphan-deletion render omits {what} ({needle!r})")
+
     if failures:
         print(f"FAIL {len(failures)}:")
         for f in failures:

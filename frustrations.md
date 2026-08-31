@@ -1995,7 +1995,7 @@ FIXED 2026-08-31 in the commit naming AF-356. The wrapper now captures the dirty
 ## A peer's `git add` swept a migration DELETION into an SEO commit
 AREA: attribution
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-31
 SESSION: amux-frustrations
 CARD: AF-357
@@ -2020,6 +2020,18 @@ FIX: This is AF-316's class (one checkout, N lanes, one index) in the DELETE
   staged-guard's co-edit notice counts insertions and deletions per path but does not
   flag a staged DELETION of a file the committer never touched, which is the cheap
   version of this specific catch.
+FIXED 2026-08-31 in the commit naming AF-357. The staged-guard now flags a staged
+DELETION whose top-level directory appears nowhere else in the commit, names the
+path, and offers `git restore --staged`. MEASURED BEFORE BUILDING, because a check
+nobody wants is worse than none: over the last 500 commits only TWO contain a
+deletion at all, and the predicate fires on exactly ONE, which is 26c45798 itself.
+Deletions are 0.4% of commits here, so a check scoped to them is cheap by
+construction. Three controls keep it quiet: a deletion INSIDE the commit's own area
+does not fire, a commit with no deletions does not fire, and a deletion-ONLY commit
+is a deliberate removal and does not fire. Mutations both ways redden the right
+cells: dropping the discriminator fails the controls, and never firing fails the
+positive. This does not end the class (AF-336 does); it makes the one direction
+nobody could notice visible at the moment it happens.
 
 ---
 ## A decision card carried two mechanisms, so the half needing no decision waited 13 days

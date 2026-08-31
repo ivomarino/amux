@@ -395,6 +395,65 @@ def _derive_session_from_tmux():
     return name[len("amux-"):] if name.startswith("amux-") else ""
 
 
+def _orphan_deletions(staged):
+    """Staged DELETIONS whose top-level directory appears nowhere else in the
+    commit, as `[(path, top)]` (AF-357).
+
+    THE SHAPE THIS CATCHES. A peer's `git add` sweeping a DELETION into an
+    unrelated commit. Measured specimen `26c45798`: one `D` on
+    crates/amux-server/migrations/0035_reclaim_skipped_hits_repair.sql inside a
+    commit whose other seven files are all under `site/` and whose subject is
+    "feat(seo): parallel-feature-dev rewrite". The removal was correct and needed
+    doing, so nothing broke; the cost is deferred and total, because `git log` on
+    that path now names a commit whose message cannot account for it.
+
+    A DELETION IS THE HARD DIRECTION. Every other entry in this class is about a
+    peer's work being ADDED to your commit, where the content is at least present
+    to be noticed. A removed file is not there to look at, and the co-edit notice
+    above cannot see it either: that notice fires on files a peer EDITED, and
+    nobody has an edit record for a file they merely deleted.
+
+    WHY TOP-LEVEL DIRECTORY, and why this is not noise. Measured over the last 500
+    commits: only TWO contain a deletion at all, and this predicate fires on
+    exactly one of them, which is the incident. Deletions are 0.4% of commits
+    here, so a check scoped to them is cheap by construction, and the discriminator
+    that the deleted path shares no top-level directory with anything else in the
+    commit is what separates "I removed a file while working in that area" from
+    "this arrived from somewhere else".
+
+    Takes the staged list as an argument rather than shelling out, so the decision
+    is testable without a git fixture (the same reason `_render_split_risk` is its
+    own function).
+    """
+    dels = [p for st, p in staged if st.startswith("D")]
+    if not dels:
+        return []
+    others = {p.split("/")[0] for st, p in staged if not st.startswith("D")}
+    if not others:
+        # A commit that is ONLY deletions is a deliberate removal, not a sweep.
+        return []
+    return [(p, p.split("/")[0]) for p in dels if p.split("/")[0] not in others]
+
+
+def _render_orphan_deletions(staged, w):
+    """Print the above, or nothing. Silence is the normal case by design."""
+    orphans = _orphan_deletions(staged)
+    if not orphans:
+        return
+    w("\namux staged-guard: DELETION FROM AN UNRELATED AREA (AF-357)\n")
+    for path, topdir in orphans:
+        w("  %s\n" % path)
+        w("      nothing else in this commit touches `%s/`\n" % topdir)
+    w("  A deletion is the direction nobody notices: the file is not there to\n"
+      "  read, and the co-edit notice cannot see it because nobody holds an edit\n"
+      "  record for a file they only removed. If this is not yours, unstage it:\n")
+    for path, _ in orphans:
+        w("      git restore --staged %s\n" % path)
+    w("  If it IS yours, say so in the message. `git log` on that path will name\n"
+      "  this commit forever, and a subject that cannot account for a removed file\n"
+      "  costs the next reader the afternoon it cost on 26c45798.\n")
+
+
 def _render_split_risk(d, w):
     """AF-190: this commit SPLITS a peer's work, so it can fail to build even
     though the tree it came from compiles.
@@ -834,6 +893,12 @@ def main():
           "them in the window through something that records no content: %s)\n"
           % (len(_und), ", ".join(str(_u.get("path", "?")) for _u in _und[:4])))
     _render_split_risk(d, w)
+    try:
+        _st = [(l.split("\t")[0].strip(), l.split("\t")[-1].strip())
+               for l in _git_lines(["diff", "--cached", "--name-status"]) if "\t" in l]
+        _render_orphan_deletions(_st, w)
+    except Exception:
+        pass
     foreign = d.get("foreign") or []
     _m = _read_marker(sess, top)
     if not foreign:
