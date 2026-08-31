@@ -136,6 +136,82 @@ fn run_quiet(args: &[&str]) -> (i32, String) {
     (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stderr).into_owned())
 }
 
+/// A help text is DATA: no unquoted heredoc in the CLI may contain a live
+/// backtick or `$(`.
+///
+/// WHY THIS EXISTS BESIDE THE RUNTIME CELL BELOW, which is the same property.
+/// `help_prints_nothing_to_stderr` runs under a sanitized
+/// PATH=/usr/bin:/bin:/usr/local/bin — and on a dev box `/usr/local/bin/amux` is
+/// a SYMLINK TO THIS REPO. So the substitution SUCCEEDS locally, writes nothing
+/// to stderr, and the cell passes; the same source fails on a CI runner where no
+/// such symlink exists. Live specimen: `see \`amux board\`` (line ~3557, added
+/// 2026-08-18) shipped for 13 days, reddened `rust` for 4 consecutive runs, and
+/// every local run was green throughout.
+///
+/// Worse than the red: where it "passed", `amux help` was EXECUTING `amux board`
+/// and splicing that command's entire output into the middle of a help line.
+///
+/// This cell reads the SOURCE, so it cannot be satisfied by what happens to be on
+/// PATH. Same shape as AMUX-3962: a cell whose verdict depends on the ambient
+/// environment measures the launcher, not the code.
+#[test]
+fn no_unquoted_heredoc_in_the_cli_re_parses_its_own_text() {
+    let src = std::fs::read_to_string(repo_root().join("amux")).expect("read amux");
+    let mut in_heredoc: Option<String> = None;
+    let mut offenders: Vec<String> = Vec::new();
+
+    for (i, raw) in src.lines().enumerate() {
+        let line_no = i + 1;
+        if let Some(tag) = in_heredoc.clone() {
+            if raw.trim_end() == tag {
+                in_heredoc = None;
+                continue;
+            }
+            // BACKTICKS ONLY, and the narrowing is deliberate.
+            //
+            // `$(...)` in an unquoted heredoc is the INTENDED idiom here and is
+            // used on purpose: `# registered: $(date -Iseconds)` (line ~902) and
+            // `types: $(_board_valid_types)` (line ~1983) both want their value
+            // interpolated. Flagging those would be a check that cries wolf, and
+            // a check nobody trusts is worse than no check.
+            //
+            // Backticks are different: in this file they are always prose
+            // code-spans in help text, never a deliberate substitution. Every
+            // instance found across the whole CLI was the markdown habit, and it
+            // is the form that shipped the bug.
+            //
+            // THE LIMIT, stated rather than left to be discovered: a deliberate
+            // `$(evil)` inside a help line would still slip past this. The
+            // runtime cell below is the other half, and neither is complete
+            // alone.
+            let stripped = raw.replace("\\`", "");
+            if stripped.contains('`') {
+                offenders.push(format!("{line_no}: {raw}"));
+            }
+            continue;
+        }
+        // Opening an UNQUOTED heredoc: `<<TAG`. `<<'TAG'` and `<<\"TAG\"` are
+        // quoted, so bash does not expand them and they are not our problem.
+        if let Some(pos) = raw.find("<<") {
+            let rest = raw[pos + 2..].trim_start_matches('-');
+            let tag: String =
+                rest.chars().take_while(|c| c.is_ascii_uppercase() || *c == '_').collect();
+            if !tag.is_empty() && rest.starts_with(&tag) && rest[tag.len()..].trim().is_empty() {
+                in_heredoc = Some(tag);
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "live backtick inside an UNQUOTED heredoc in `amux`. bash will \
+         EXECUTE it: where the command resolves the output is spliced into the \
+         help text, and where it does not the error goes to stderr. Escape it as \
+         \\` or quote the heredoc tag (<<'EOF'):\n{}",
+        offenders.join("\n")
+    );
+}
+
 #[test]
 fn help_prints_nothing_to_stderr() {
     for args in [vec!["help"], vec!["board", "help"]] {

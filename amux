@@ -3554,7 +3554,7 @@ ${BOLD}CRM:${RESET}
 
 ${BOLD}Board:${RESET}
   amux board ls                  List all board issues
-  amux board add <title>         Create a new issue (--type/--desc*; see `amux board`)
+  amux board add <title>         Create a new issue (--type/--desc*; see \`amux board\`)
   amux board done <ID>           Mark issue as done
   amux board doing <ID>          Mark issue as in progress
   amux board todo <ID>           Mark issue as todo
