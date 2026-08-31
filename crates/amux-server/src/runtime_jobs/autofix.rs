@@ -5322,6 +5322,44 @@ fn open_card_for_fault(conn: &Connection, signature: &str) -> Option<String> {
     .ok()
 }
 
+/// The card that WAS suppressing this fault and no longer is, with why.
+///
+/// AMUX-3943. `open_card_for_fault` above stops matching the moment a card is
+/// archived (`AND archived = 0`), which is correct: archiving hides a card from
+/// every view and every autonomy loop, so a still-live fault with only an
+/// archived tracker is a fault nobody can see. Releasing the suppression is the
+/// right call.
+///
+/// What was missing is that the re-filed card could not say WHY IT APPEARED NOW.
+/// Measured: the `amux` board was bulk-archived at 21:46:03 and AMUX-3943 filed
+/// 45 seconds later for an occurrence from 16:17, which its predecessor
+/// AMUX-3864 had been holding for five and a half hours. 86 of the 159 archived
+/// cards were suppressing a fault signature, so that is 86 releases from one
+/// operator action, arriving as apparently-new reports.
+///
+/// A reader cannot act on that without knowing it. "New fault" and "a
+/// suppression you released" call for opposite responses, and nothing in the
+/// payload distinguished them (ethos rule 4: a wrong answer is rarely
+/// wrong-LOOKING; name what should appear BESIDE it).
+///
+/// Ordered by id DESC so the most recent predecessor wins, and returns the
+/// disposition rather than just the id, because "archived" and "discarded" mean
+/// different things to the reader: one was hidden, the other was judged.
+fn released_predecessor(conn: &Connection, signature: &str) -> Option<(String, String)> {
+    let ident = fault_identity(signature)?;
+    conn.query_row(
+        "SELECT id, CASE WHEN archived = 1 THEN 'archived' ELSE status END \
+           FROM issues \
+          WHERE source_ref LIKE ?1 \
+            AND deleted IS NULL \
+            AND (archived = 1 OR status IN ('done','verified','discarded')) \
+          ORDER BY id DESC LIMIT 1",
+        rusqlite::params![format!("autofix:{ident}|%")],
+        |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+    )
+    .ok()
+}
+
 /// One tick: run every detector, file what is new, note what went quiet.
 ///
 /// Returns the report rather than logging it, so the debug surface shows
@@ -5672,6 +5710,30 @@ pub async fn autofix_tick_with_ci(
                 continue;
                 }
             }
+        }
+        // WHY THIS CARD IS APPEARING NOW (AMUX-3943). If a predecessor held this
+        // exact fault and has stopped suppressing, say so ON the card. A reader
+        // handed a fresh report cannot otherwise tell a NEW fault from a
+        // suppression somebody released, and those call for opposite responses.
+        //
+        // The bulk case is the one that hurts: archiving the `amux` board
+        // released 86 fault suppressions in a single operator action, and the
+        // first re-file arrived 45 seconds later carrying an occurrence from
+        // five and a half hours earlier with nothing to say about either fact.
+        let released = state
+            .store
+            .read()
+            .ok()
+            .and_then(|c| released_predecessor(&c, &f.signature));
+        let mut f = f;
+        if let Some((card, disp)) = released {
+            f.evidence.push((
+                "why_now".into(),
+                format!(
+                    "{card} tracked this same fault and is now `{disp}`, so it stopped                      suppressing and the next occurrence filed here. If you {} that card,                      this is the consequence rather than a new fault — the underlying                      occurrence may predate this card by hours. Only OPEN, unarchived cards                      suppress (`open_card_for_fault`).",
+                    if disp == "archived" { "archived" } else { "closed" }
+                ),
+            ));
         }
         to_file.push(f);
     }
@@ -7126,6 +7188,76 @@ mod tests {
     ///
     /// So the treatment and the control pull against each other by design, and
     /// both have to hold: an OPEN card suppresses, a DISCARDED one does not.
+    /// AMUX-3943. A released suppression must be DISTINGUISHABLE from a new
+    /// fault on the card itself.
+    ///
+    /// `open_card_for_fault` stops matching the instant a card is archived, and
+    /// that is correct: archiving hides a card from every view and every
+    /// autonomy loop, so a live fault tracked only by an archived card is a
+    /// fault nobody can see. What was wrong is that the re-file said nothing
+    /// about why it appeared.
+    ///
+    /// The bulk case is what makes it matter: archiving the `amux` board
+    /// released 86 fault suppressions in one operator action.
+    #[test]
+    fn a_released_suppression_names_the_card_that_stopped_suppressing() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
+             archived INTEGER DEFAULT 0, deleted TEXT);",
+        )
+        .unwrap();
+        let sig = "latency|outlier|GET|/api/sessions|1788121035";
+        let ident = fault_identity(sig).expect("this signature has a fault identity");
+        let add = |id: &str, status: &str, archived: i64| {
+            conn.execute(
+                "INSERT INTO issues (id, source_ref, status, archived, deleted) \
+                 VALUES (?1, ?2, ?3, ?4, NULL)",
+                rusqlite::params![id, format!("autofix:{ident}|1788008538"), status, archived],
+            )
+            .unwrap();
+        };
+
+        // Nothing yet: a genuinely new fault has no predecessor to name.
+        assert!(
+            released_predecessor(&conn, sig).is_none(),
+            "a first-ever fault must not invent a predecessor"
+        );
+
+        // An ARCHIVED card is the specimen: still `review`, hidden by an operator.
+        add("AMUX-3864", "review", 1);
+        let (id, disp) = released_predecessor(&conn, sig).expect("the archived card must be found");
+        assert_eq!((id.as_str(), disp.as_str()), ("AMUX-3864", "archived"),
+                   "archived must be reported as archived, not as its underlying status");
+
+        // CONTROL, and it is the half that keeps this honest: an OPEN card must
+        // NOT be reported as a released predecessor. It is still suppressing, so
+        // naming it would tell the reader a suppression was released when it was
+        // not — the same class of wrong answer, pointed the other way.
+        let conn2 = Connection::open_in_memory().unwrap();
+        conn2
+            .execute_batch(
+                "CREATE TABLE issues (id TEXT, source_ref TEXT, status TEXT, \
+                 archived INTEGER DEFAULT 0, deleted TEXT);",
+            )
+            .unwrap();
+        conn2
+            .execute(
+                "INSERT INTO issues (id, source_ref, status, archived, deleted) \
+                 VALUES ('AMUX-9', ?1, 'review', 0, NULL)",
+                rusqlite::params![format!("autofix:{ident}|1788008538")],
+            )
+            .unwrap();
+        assert!(
+            released_predecessor(&conn2, sig).is_none(),
+            "an OPEN card is still suppressing and is not a released predecessor"
+        );
+        assert!(
+            open_card_for_fault(&conn2, sig).is_some(),
+            "...and the open-card path must still find it, or the two predicates disagree"
+        );
+    }
+
     #[test]
     fn one_open_card_per_fault_but_a_discarded_one_does_not_suppress() {
         let conn = Connection::open_in_memory().unwrap();
