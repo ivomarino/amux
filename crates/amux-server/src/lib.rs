@@ -278,13 +278,12 @@ async fn async_main() {
 
     // Load encrypted secrets (Phase 3: SecretStore initialization).
     // This decrypts secrets/amux-secrets.yaml once and caches in memory.
+    // No env-var mirroring step here anymore — see secrets.rs's module doc:
+    // consumers call `SecretStore::get()` directly (settings.rs's `get_env`,
+    // connectors.rs's `resolve_cred_in`) as an explicit fallback tier instead
+    // of relying on process env ever holding a decrypted value.
     if let Err(e) = secret_store.load().await {
         tracing::warn!(error = ?e, "failed to load encrypted secrets — continuing without them");
-    } else {
-        // Load secrets into environment variables for access by components
-        if let Err(e) = secret_store.load_env().await {
-            tracing::warn!(error = ?e, "failed to load secrets into environment variables");
-        }
     }
 
     // WAS THIS RESTART ANNOUNCED? (AF-176)

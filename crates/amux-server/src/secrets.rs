@@ -4,7 +4,23 @@
 //! 1. Read secrets/amux-secrets.yaml (encrypted with age)
 //! 2. Decrypt using age key from ~/.config/sops/age/keys.txt (or AMUX_AGE_KEY_PATH env var)
 //! 3. Parse YAML into in-memory SecretStore
-//! 4. Expose via environment variables and API
+//! 4. Expose via `get()`, called directly by consumers — never via process env
+//!
+//! Found 2026-08-31, in review: an earlier version of this file also
+//! mirrored every decrypted value into `std::env::set_var` (a `load_env()`
+//! step) so existing `std::env::var(...)` call sites would pick secrets up
+//! for free. That is unsafe in a running multithreaded server (races
+//! concurrent `getenv` in other threads — exactly why `set_var` is `unsafe`
+//! in Rust 2024) and, worse, means every credential this store ever holds
+//! gets inherited by every worker process amux spawns, since anything in
+//! the server's own environment is inherited by its children. Removed
+//! entirely — `SecretStore` never touches process env now. The two
+//! consumers that used to rely on the mirror (`api/settings.rs`'s
+//! `effective_env`, `api/connectors.rs`'s `env_val`/`resolve_cred_in`) call
+//! `get()` directly as an explicit third resolution tier instead, after
+//! their existing file_env-then-process-env checks — same
+//! injected-lookup-closure idiom already used by `config.rs::resolve_home`
+//! and `invariants/checks.rs::config_env_reaches_process`, not a new one.
 //!
 //! Usage:
 //! ```ignore
@@ -113,44 +129,19 @@ impl SecretStore {
         schema_only(&cache)
     }
 
-    /// Load secrets into environment variables
-    pub async fn load_env(&self) -> Result<(), Box<dyn std::error::Error>> {
-        let paths = self.list_paths().await;
-        
-        for path in paths {
-            if let Some(value) = self.get(&path).await {
-                // Convert dot-separated path to ENV-style name
-                let env_name = path.replace('.', "_").to_uppercase();
-                std::env::set_var(&env_name, &value);
-                
-                // Also set specific known env vars
-                match path.as_str() {
-                    "external_services.openai.api_key" => {
-                        std::env::set_var("OPENAI_API_KEY", &value);
-                    }
-                    "external_services.openai.organization" => {
-                        std::env::set_var("OPENAI_ORG_ID", &value);
-                    }
-                    "oauth.google.client_id" => {
-                        std::env::set_var("GOOGLE_OAUTH_CLIENT_ID", &value);
-                    }
-                    "oauth.google.client_secret" => {
-                        std::env::set_var("GOOGLE_OAUTH_CLIENT_SECRET", &value);
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        tracing::info!("Secrets loaded into environment variables");
-        Ok(())
-    }
-
     /// Reload secrets from disk (for manual refresh)
     pub async fn reload(&self) -> Result<(), Box<dyn std::error::Error>> {
-        self.load().await?;
-        self.load_env().await?;
-        Ok(())
+        self.load().await
+    }
+
+    /// An empty, unloaded store — for tests that need an `AppState.secrets`
+    /// but never touch the encrypted file. Same shape as `SecretStore::new`
+    /// with empty paths, given a name so ~73 call sites stop hand-duplicating
+    /// `SecretStore::new(PathBuf::new(), PathBuf::new())` (found 2026-08-31 —
+    /// not migrated here, that's a separate mechanical cleanup, but new test
+    /// code should use this instead of growing the duplication further).
+    pub fn empty() -> Self {
+        Self::new(PathBuf::new(), PathBuf::new())
     }
 
     /// Update a single secret and persist to encrypted file
@@ -181,10 +172,10 @@ impl SecretStore {
         // 3. Encrypt and persist to disk
         persist::encrypt_and_persist(&cache, &self.secrets_file, &self.age_key_path).await?;
 
-        // 4. Update env vars from new value
-        let env_name = path.replace('.', "_").to_uppercase();
-        std::env::set_var(&env_name, &value);
-
+        // No env-var mirroring step: this store never touches process env
+        // (see the module doc) — the write above is already visible to the
+        // next `get()` call through the same RwLock, which is what every
+        // reader (env_val/effective_env's SecretStore fallback tier) uses.
         tracing::info!(path = path, "✓ Updated and persisted secret");
         Ok(())
     }
@@ -214,6 +205,25 @@ impl SecretStore {
         }
 
         Ok(())
+    }
+}
+
+/// Inverse of the old `load_env`'s generic `path.replace('.', "_").to_uppercase()` —
+/// the small, curated set of env-var-shaped names that already had an
+/// established secrets.yaml path (visible in that removed function's own
+/// special-case match arms). Deliberately NOT a general algorithmic inverse:
+/// the naive reverse of the above transform for e.g. `ANTHROPIC_API_KEY` would
+/// be `anthropic.api.key`, which nothing ever wrote and nobody has decided is
+/// the right convention. Only wire up names this file already committed to;
+/// extending this table for a new key is a naming decision for whoever owns
+/// that key's convention, not something to guess here.
+pub fn known_env_secret_path(key: &str) -> Option<&'static str> {
+    match key {
+        "OPENAI_API_KEY" => Some("external_services.openai.api_key"),
+        "OPENAI_ORG_ID" => Some("external_services.openai.organization"),
+        "GOOGLE_OAUTH_CLIENT_ID" => Some("oauth.google.client_id"),
+        "GOOGLE_OAUTH_CLIENT_SECRET" => Some("oauth.google.client_secret"),
+        _ => None,
     }
 }
 
