@@ -2213,3 +2213,42 @@ FIX: Fixed. The wrapper now copies itself to a temp file and `exec`s that before
   snapshot, and has NO executable statement before it — position being the property
   that matters, since a snapshot taken after other work is a snapshot of a file that
   could already have moved. Both mutations now redden exactly one cell each.
+
+---
+## The staged-guard ships on INSTALL, so an edited hook is inert and nothing says so
+AREA: instruments
+SEVERITY: slows
+STATUS: open
+DATE: 2026-08-31
+SESSION: amux-frustrations
+CARD: AF-375
+SYMPTOM: I shipped two changes to `scripts/git-hooks/amux-staged-guard` today and
+  BOTH were inert. The hook is installed by COPY (`install-hooks.sh` cp's into
+  `.git/hooks/`), so a repo edit reaches no lane until someone re-installs:
+    grep -c 'COMMIT ONLY YOUR OWN PATHS'  installed=0  repo=1   (AF-365)
+    grep -c '_orphan_deletions'           installed=0  repo=4   (AF-357)
+  The installed copy was dated 09:34 and never moved. AF-365 was closed `done`
+  with evidence reading "ALL PASS", which was TRUE and was about the repo copy.
+  Nothing in the commit path, the test, or the card gate distinguishes "the file
+  changed" from "the behaviour changed for anyone".
+COST: One card closed on a false claim for about two hours, and a second fix that
+  would have been closed the same way if I had not checked. The near-miss is the
+  cost: I only looked because the day's own theme is "a fix ships, its tests pass,
+  and it does nothing in production", so I asked the question out of habit rather
+  than because anything prompted it. A lane without that habit closes both.
+  This is NOT the same as the amux bash CLI, which ships on SAVE and is live
+  immediately. Two hook-shaped files in one repo with opposite deploy semantics,
+  and no signal at either site saying which you are editing.
+FIX: The signal already exists and does not reach far enough. The SessionStart
+  freshness hook DID report "installed git hooks differ from this checkout" at the
+  start of this session, naming `prepare-commit-msg` and the remedy. I read it as
+  boilerplate about a file I had not touched, and it was right. Two cheap
+  improvements, either of which would have caught this:
+  (1) name the differing hooks by FILE and flag when a differing file is one the
+      CURRENT SESSION has edit records for, which turns a standing notice into a
+      statement about your own work;
+  (2) have the pre-commit hook itself compare its own bytes against
+      `scripts/git-hooks/` and warn on drift, which is the same trick
+      `install-hooks.sh` already does with `cmp` at the end of its run, moved to
+      the place where it would be read.
+  Not building either from here without deciding which; carded.
