@@ -77,6 +77,10 @@ pub fn routes() -> Router<AppState> {
         // SPA catch-all (405) and the CLI (pre-fix) exited 0 with the card
         // untouched — AMUX-2140 one layer down. Same mechanism auto-pickup uses.
         .route("/{id}/claim", post(claim_item))
+        .route("/{id}/capsule", get(capsule))
+        .route("/{id}/verifications", get(list_verifications))
+        .route("/{id}/artifacts", get(list_artifacts).post(create_artifact))
+        .route("/{id}/artifacts/{aid}", axum::routing::patch(patch_artifact).delete(delete_artifact))
 }
 
 /// GET /api/board/needsyou — THE owner view, capped (AF-318).
@@ -271,6 +275,8 @@ mod frontier_exclusion_tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
+            source: Some("agent".into()),
         };
         bs::create_issue(&conn, &new, 1000).expect("create")
     }
@@ -2764,6 +2770,9 @@ pub async fn create_item(
         ask_type: body_str(&map, "ask_type"),
         ask_question: body_str(&map, "ask_question"),
         ask_unblocks: body_str(&map, "ask_unblocks"),
+        // AF-367: the HTTP create path — a real POST /api/board from a lane or
+        // a human, as opposed to a card a daemon filed.
+        source: Some("agent".into()),
     };
 
     enum Out {
@@ -3029,7 +3038,7 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 27] = [
+const PATCH_WRITABLE: [&str; 31] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -3064,6 +3073,12 @@ const PATCH_WRITABLE: [&str; 27] = [
     // status move: blocking and unblocking a card must not require pretending
     // it changed position.
     "blocked_on",
+    // Workflow engine fields (Phase 2). acceptance_criteria is a JSON array of
+    // measurable conditions; decision_* fields structure type=decision cards.
+    "acceptance_criteria",
+    "decision_question",
+    "decision_rationale",
+    "decision_supersedes",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -3917,6 +3932,10 @@ pub async fn patch_item(
             set_opt("last_result", &mut next.last_result, &mut changed);
             set_opt("unresolved", &mut next.unresolved, &mut changed);
             set_opt("blocked_on", &mut next.blocked_on, &mut changed);
+            set_opt("acceptance_criteria", &mut next.acceptance_criteria, &mut changed);
+            set_opt("decision_question", &mut next.decision_question, &mut changed);
+            set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
+            set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -6598,6 +6617,273 @@ fn card_refs(text: &str) -> Vec<String> {
     out
 }
 
+// ---------------------------------------------------------------------------
+// Capsule endpoint (Phase 2a): L1 context for agent consumption.
+// ---------------------------------------------------------------------------
+
+/// GET /api/board/{id}/capsule
+///
+/// Returns the L1 continuation capsule: the minimal structured context an agent
+/// needs to pick up a task with zero conversation history. Deliberately small
+/// (300-800 tokens), designed for agent context windows.
+async fn capsule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    let row = match bs::get_issue(&conn, &id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let ac = row.acceptance_criteria.as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or(Value::Null);
+    let files: Vec<String> = conn
+        .prepare("SELECT path FROM issue_files WHERE issue_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![id], |r| r.get(0))?
+                .collect::<Result<Vec<String>, _>>()
+        })
+        .unwrap_or_default();
+    let deps_status: Vec<Value> = row.depends_on.iter().filter_map(|dep_id| {
+        bs::get_issue(&conn, dep_id).ok().flatten().map(|d| {
+            json!({"id": d.id, "title": d.title, "status": d.status})
+        })
+    }).collect();
+    let verifications = crate::db::verification_store::list_for_task(&conn, &id)
+        .unwrap_or_default();
+    let last_verification = verifications.first().map(|v| {
+        json!({"verdict": v.verdict, "actor": v.actor, "at": v.created_at})
+    });
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": row.id,
+            "title": row.title,
+            "type": row.item_type,
+            "status": row.status,
+            "session": row.session,
+            "next_action": row.next_action,
+            "last_result": row.last_result,
+            "unresolved": row.unresolved,
+            "blocked_on": row.blocked_on,
+            "evidence": row.evidence,
+            "acceptance_criteria": ac,
+            "depends_on": deps_status,
+            "artifacts": files,
+            "gate": row.gate_criteria(),
+            "last_verification": last_verification,
+            "entered_state_at": row.entered_state_at,
+            "decision_question": row.decision_question,
+            "decision_rationale": row.decision_rationale,
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Verification history (Phase 1a): structured records of every verify attempt.
+// ---------------------------------------------------------------------------
+
+/// GET /api/board/{id}/verifications
+async fn list_verifications(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    if bs::get_issue(&conn, &id).ok().flatten().is_none() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    let rows = match crate::db::verification_store::list_for_task(&conn, &id) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let items: Vec<Value> = rows.iter().map(|r| {
+        json!({
+            "id": r.id,
+            "task_id": r.task_id,
+            "verdict": r.verdict,
+            "reason": r.reason,
+            "actor": r.actor,
+            "created_at": r.created_at,
+        })
+    }).collect();
+    (StatusCode::OK, Json(json!(items))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Artifact CRUD (Phase 3a): per-task artifact registry.
+// ---------------------------------------------------------------------------
+
+/// GET /api/board/{id}/artifacts
+async fn list_artifacts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    if bs::get_issue(&conn, &id).ok().flatten().is_none() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    let rows = match crate::db::artifact_store::list_for_task(&conn, &id) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let items: Vec<Value> = rows.iter().map(|r| {
+        json!({
+            "id": r.id,
+            "task_id": r.task_id,
+            "kind": r.kind,
+            "ref": r.ref_value,
+            "state": r.state,
+            "description": r.description,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        })
+    }).collect();
+    (StatusCode::OK, Json(json!(items))).into_response()
+}
+
+/// POST /api/board/{id}/artifacts
+async fn create_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let kind = match body.get("kind").and_then(|v| v.as_str()) {
+        Some(k) => k.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind required"}))).into_response()
+        }
+    };
+    let ref_value = match body.get("ref").and_then(|v| v.as_str()) {
+        Some(r) => r.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "ref required"}))).into_response()
+        }
+    };
+    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("created").to_string();
+    let desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let now = chrono::Utc::now().timestamp();
+    let aid = format!("ART-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let row = crate::db::artifact_store::ArtifactRow {
+        id: aid.clone(),
+        task_id: id.clone(),
+        kind,
+        ref_value,
+        state: state_val,
+        description: desc,
+        created_at: now,
+        updated_at: now,
+    };
+    let aid_out = aid.clone();
+    let write = state.store.write_async(move |conn| {
+        if bs::get_issue(conn, &id).ok().flatten().is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        crate::db::artifact_store::insert(conn, &row)?;
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: aid.clone(),
+                mutation: amux_core::revision::MutationKind::Created,
+                payload: None,
+            }],
+        })
+    }).await;
+    match write {
+        Ok(_) => (StatusCode::CREATED, Json(json!({"id": aid_out}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// PATCH /api/board/{id}/artifacts/{aid}
+async fn patch_artifact(
+    State(state): State<AppState>,
+    Path((id, aid)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let new_state = body.get("state").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let new_desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if new_state.is_none() && new_desc.is_none() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "nothing to update"}))).into_response();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let write = state.store.write_async(move |conn| {
+        let existing = crate::db::artifact_store::get(conn, &aid)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if existing.task_id != id {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        if let Some(ref s) = new_state {
+            if !crate::db::artifact_store::ARTIFACT_STATES.contains(&s.as_str()) {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    format!("invalid state: {s}"),
+                ));
+            }
+            crate::db::artifact_store::update_state(conn, &aid, s, now)?;
+        }
+        if let Some(ref d) = new_desc {
+            conn.execute(
+                "UPDATE _amux_task_artifacts SET description = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![d, now, aid],
+            )?;
+        }
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: aid.clone(),
+                mutation: amux_core::revision::MutationKind::Updated,
+                payload: None,
+            }],
+        })
+    }).await;
+    match write {
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// DELETE /api/board/{id}/artifacts/{aid}
+async fn delete_artifact(
+    State(state): State<AppState>,
+    Path((_id, aid)): Path<(String, String)>,
+) -> Response {
+    let write = state.store.write_async(move |conn| {
+        let n = crate::db::artifact_store::delete(conn, &aid)?;
+        Ok(crate::db::WriteOutcome {
+            applied: n > 0,
+            events: if n > 0 {
+                vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                    entity_id: aid.clone(),
+                    mutation: amux_core::revision::MutationKind::Deleted,
+                    payload: None,
+                }]
+            } else {
+                vec![]
+            },
+        })
+    }).await;
+    match write {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
 #[cfg(test)]
 mod discard_orphan_tests {
     use super::card_refs;
@@ -7219,6 +7505,8 @@ mod slim_tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
+            source: Some("agent".into()),
         }
     }
 

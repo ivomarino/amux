@@ -237,6 +237,26 @@ const MIGRATIONS: &[Migration] = &[
         name: "0042_reclaim_skipped_hits_repair",
         sql: include_str!("../../migrations/0042_reclaim_skipped_hits_repair.sql"),
     },
+    Migration {
+        version: 43,
+        name: "0043_issues_source",
+        sql: include_str!("../../migrations/0043_issues_source.sql"),
+    },
+    Migration {
+        version: 44,
+        name: "0044_verifications",
+        sql: include_str!("../../migrations/0044_verifications.sql"),
+    },
+    Migration {
+        version: 45,
+        name: "0045_issues_workflow_fields",
+        sql: include_str!("../../migrations/0045_issues_workflow_fields.sql"),
+    },
+    Migration {
+        version: 46,
+        name: "0046_task_artifacts",
+        sql: include_str!("../../migrations/0046_task_artifacts.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

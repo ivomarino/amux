@@ -245,6 +245,8 @@ pub async fn tick(state: AppState) -> (usize, usize, usize) {
                     ask_type: None,
                     ask_question: None,
                     ask_unblocks: None,
+                    // AF-367: filed by the queue-disposition job.
+                    source: Some("queue_disposition".into()),
                 };
                 let _ = state
                     .store

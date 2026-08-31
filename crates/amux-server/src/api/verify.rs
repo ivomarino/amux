@@ -92,9 +92,17 @@ async fn verify_task(
         }
     };
 
-    // Persist the outcome: status change + log line through the board store.
+    // Persist the outcome: status change + log line + structured verification
+    // record through the board store.
     let id2 = id.clone();
+    let actor2 = actor.clone();
+    let run_json = serde_json::to_string(&run).ok();
     let target = if passed { "verified" } else { "doing" };
+    let verdict_str = if passed { "passed" } else { "failed" };
+    let reason_str = match &run.verdict {
+        VerificationResult::Failed { reason } => Some(reason.clone()),
+        _ => None,
+    };
     let write = state
         .store
         .write_async(move |conn| {
@@ -118,6 +126,20 @@ async fn verify_task(
                 row.last_verified_at = Some(chrono::Utc::now().timestamp());
             }
             board_store::save_patched(conn, &mut row)?;
+            let ver_id = format!("VER-{}", ulid::Ulid::new().to_string().to_lowercase());
+            let ver_row = crate::db::verification_store::VerificationRow {
+                id: ver_id,
+                task_id: id2.clone(),
+                verifier: json!({"type": "system", "component": "verify_api"}).to_string(),
+                criteria: "[]".into(),
+                evidence: "[]".into(),
+                verdict: verdict_str.into(),
+                reason: reason_str,
+                run_detail: run_json,
+                actor: actor2,
+                created_at: chrono::Utc::now().timestamp(),
+            };
+            crate::db::verification_store::insert(conn, &ver_row)?;
             Ok(crate::db::WriteOutcome {
                 applied: true,
                 events: vec![crate::db::PendingEvent {
@@ -127,9 +149,6 @@ async fn verify_task(
                         from: "done".into(),
                         to: target.into(),
                     },
-                    // RR-0111a: the row just saved is in hand — journal its
-                    // post-mutation snapshot so replay covers verification
-                    // outcomes too.
                     payload: Some(row.snapshot()),
                 }],
             })

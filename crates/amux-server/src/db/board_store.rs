@@ -1507,6 +1507,11 @@ pub struct IssueRow {
     /// card predates migration 0040 and has not moved since: not measured, and
     /// consumers must render it that way rather than as zero.
     pub entered_state_at: Option<i64>,
+    /// WHERE the card came from, as a KIND: `agent` for a real create through the
+    /// API, `capture` for an auto-captured human prompt, and the name of the job
+    /// for a card a runtime loop filed. NULL means the row predates the field
+    /// (AF-367) and is NOT a claim about which population it belonged to.
+    pub source: Option<String>,
     /// What this card is waiting for, orthogonal to `status` (AMUX-3949). NULL
     /// means not blocked. A card keeps its lifecycle POSITION and separately
     /// says it is stuck, which `status='blocked'` could not express.
@@ -1521,6 +1526,15 @@ pub struct IssueRow {
     /// Rust per-row version (migration 0002). Bumped alongside `rev`.
     pub version: i64,
     pub tags: Vec<String>,
+    /// JSON array of measurable acceptance criteria (migration 0045).
+    /// NULL means not specified, not "no criteria exist".
+    pub acceptance_criteria: Option<String>,
+    /// Structured decision fields (migration 0045). Only meaningful when
+    /// `item_type == "decision"`.
+    pub decision_question: Option<String>,
+    pub decision_rationale: Option<String>,
+    /// Semantic id of the decision this one supersedes.
+    pub decision_supersedes: Option<String>,
 }
 
 impl IssueRow {
@@ -1569,6 +1583,12 @@ impl IssueRow {
             "shepherd": self.shepherd,
             "type": self.item_type,
             "creator": self.creator,
+            // AF-367: WHERE the card came from, as a kind. `creator` cannot
+            // answer it — the capture daemon and the amux LANE both stamp
+            // "amux" there, 49 of 90 in one 24h window belonging to other
+            // lanes. NULL on rows that predate the field, which means "unknown"
+            // and not a claim about which population it was.
+            "source": self.source,
             "due": self.due,
             "due_time": self.due_time,
             "created": self.created,
@@ -1598,6 +1618,11 @@ impl IssueRow {
             "next_action": self.next_action,
             "last_result": self.last_result,
             "unresolved": self.unresolved,
+            "acceptance_criteria": self.acceptance_criteria.as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
+            "decision_question": self.decision_question,
+            "decision_rationale": self.decision_rationale,
+            "decision_supersedes": self.decision_supersedes,
             // In BOTH snapshots deliberately, i.e. NOT in `slim_omits`. The
             // motivating question ("which cards closed in this window") is a
             // LIST query, so omitting it from the list body would ship the
@@ -1700,7 +1725,9 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
      i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence, \
      i.ask_type, i.ask_question, i.ask_unblocks, \
-     i.next_action, i.last_result, i.unresolved, i.entered_state_at, i.blocked_on";
+     i.next_action, i.last_result, i.unresolved, i.entered_state_at, i.blocked_on, \
+     i.source, i.acceptance_criteria, i.decision_question, i.decision_rationale, \
+     i.decision_supersedes";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -1813,6 +1840,11 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         ask_unblocks: r.get(32)?,
         entered_state_at: r.get(36)?,
         blocked_on: r.get(37)?,
+        source: r.get(38)?,
+        acceptance_criteria: r.get(39)?,
+        decision_question: r.get(40)?,
+        decision_rationale: r.get(41)?,
+        decision_supersedes: r.get(42)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2248,6 +2280,20 @@ pub struct NewIssue {
     pub ask_type: Option<String>,
     pub ask_question: Option<String>,
     pub ask_unblocks: Option<String>,
+    /// WHO the card came from, as a KIND rather than a name: `agent` for a real
+    /// create, `capture` for an auto-captured human prompt (AF-367).
+    ///
+    /// `creator` cannot answer this. `mint_capture_card` stamps `creator: "amux"`
+    /// for every captured prompt and the amux LANE stamps the same string for
+    /// cards it authors, so 49 of 90 cards carrying that value in one 24h window
+    /// belonged to other lanes entirely. `owner_type` does not split them either;
+    /// it reads `agent` for both populations.
+    ///
+    /// `None` writes NULL, which means "predates the discriminator" and NOT a
+    /// claim about which population a row belonged to. Nothing is backfilled:
+    /// guessing retroactively would manufacture the confident wrong attribution
+    /// this field exists to end.
+    pub source: Option<String>,
 }
 
 /// Insert a new card, replicating the Python POST exactly: id minted from
@@ -2276,10 +2322,10 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
     conn.execute(
         "INSERT INTO issues (id, title, \"desc\", status, session, shepherd, type, creator, \
              due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on, \
-             ask_type, ask_question, ask_unblocks, entered_state_at, \
+             ask_type, ask_question, ask_unblocks, entered_state_at, source, \
              notified, pinned, archived, rev, version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, ?21, 0, 0, 0, 0, 0)",
+             ?18, ?19, ?20, ?21, ?22, 0, 0, 0, 0, 0)",
         params![
             id,
             new.title,
@@ -2304,6 +2350,7 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             // A new card enters its first status NOW, so this is measured from
             // the start and only PRE-0040 rows carry the honest NULL.
             now,
+            new.source.as_deref().filter(|x| !x.trim().is_empty()),
         ],
     )?;
     for tag in &new.tags {
@@ -2445,7 +2492,9 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              epic = ?22, closed_at = ?23, evidence = ?24, ask_type = ?25, \
              ask_question = ?26, ask_unblocks = ?27, next_action = ?28, \
              last_result = ?29, unresolved = ?30, entered_state_at = ?31, \
-             blocked_on = ?32 \
+             blocked_on = ?32, acceptance_criteria = ?34, \
+             decision_question = ?35, decision_rationale = ?36, \
+             decision_supersedes = ?37 \
          WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
@@ -2481,6 +2530,10 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.entered_state_at,
             row.blocked_on,
             row.id,
+            row.acceptance_criteria,
+            row.decision_question,
+            row.decision_rationale,
+            row.decision_supersedes,
         ],
     )
 }
@@ -3536,6 +3589,7 @@ mod tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            source: None,
         }
     }
 
@@ -3768,6 +3822,9 @@ mod tests {
             closed_at: None,
             version: 0,
             tags: vec![],
+            source: None,
+            acceptance_criteria: None, decision_question: None,
+            decision_rationale: None, decision_supersedes: None,
         };
         let mut items: Vec<IssueRow> = Vec::new();
         for i in 0..400 {
@@ -3889,6 +3946,9 @@ mod configured_gate_tests {
             last_result: None,
             unresolved: None, last_verified_at: None, closed_at: None,
             version: 0, tags: vec![],
+            source: None,
+            acceptance_criteria: None, decision_question: None,
+            decision_rationale: None, decision_supersedes: None,
         }
     }
 

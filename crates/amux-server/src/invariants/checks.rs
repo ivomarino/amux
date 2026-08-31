@@ -4483,3 +4483,108 @@ mod schedule_kind_tests {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// N. Nonterminal cards have a disposition (actionable next_action).
+// ---------------------------------------------------------------------------
+
+pub struct DispositionRow {
+    pub id: String,
+    pub status: String,
+    pub next_action: Option<String>,
+    pub session: Option<String>,
+    pub item_type: String,
+}
+
+pub fn nonterminal_has_disposition(cards: &[DispositionRow]) -> Vec<InvariantResult> {
+    const ID: &str = "board.nonterminal_has_disposition";
+    if cards.is_empty() {
+        return vec![InvariantResult::unknown(ID, "no cards to check")];
+    }
+    let nonterminal: Vec<_> = cards
+        .iter()
+        .filter(|c| !matches!(c.status.as_str(), "done" | "verified" | "discarded" | "backlog"))
+        .collect();
+    if nonterminal.is_empty() {
+        return vec![InvariantResult::pass(ID)
+            .evidence(serde_json::json!({"checked": 0, "reason": "no nonterminal cards"}))];
+    }
+    let missing: Vec<_> = nonterminal
+        .iter()
+        .filter(|c| c.next_action.as_ref().is_none_or(|s| s.trim().is_empty()))
+        .collect();
+    if missing.is_empty() {
+        vec![InvariantResult::pass(ID)
+            .evidence(serde_json::json!({"checked": nonterminal.len()}))]
+    } else {
+        let sample: Vec<_> = missing
+            .iter()
+            .take(5)
+            .map(|c| serde_json::json!({"id": c.id, "status": c.status, "session": c.session}))
+            .collect();
+        vec![InvariantResult::fail(
+            ID,
+            "nonterminal cards carry a next_action".to_string(),
+            format!(
+                "{} of {} nonterminal cards have no next_action",
+                missing.len(),
+                nonterminal.len()
+            ),
+        )
+        .evidence(serde_json::json!({
+            "missing_count": missing.len(),
+            "nonterminal_count": nonterminal.len(),
+            "sample": sample,
+        }))]
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::*;
+
+    fn row(id: &str, status: &str, next_action: Option<&str>) -> DispositionRow {
+        DispositionRow {
+            id: id.into(),
+            status: status.into(),
+            next_action: next_action.map(Into::into),
+            session: Some("test".into()),
+            item_type: "code".into(),
+        }
+    }
+
+    #[test]
+    fn all_nonterminal_with_disposition_passes() {
+        let cards = vec![
+            row("A-1", "doing", Some("implement the thing")),
+            row("A-2", "todo", Some("pick this up")),
+        ];
+        assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Pass);
+    }
+
+    #[test]
+    fn terminal_cards_without_disposition_still_pass() {
+        let cards = vec![
+            row("A-1", "done", None),
+            row("A-2", "verified", None),
+            row("A-3", "discarded", None),
+        ];
+        assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Pass);
+    }
+
+    #[test]
+    fn nonterminal_without_disposition_fails() {
+        let cards = vec![
+            row("A-1", "doing", None),
+            row("A-2", "todo", Some("pick up")),
+        ];
+        let out = nonterminal_has_disposition(&cards);
+        assert_eq!(out[0].status, Status::Fail);
+    }
+
+    #[test]
+    fn empty_next_action_counts_as_missing() {
+        let cards = vec![row("A-1", "doing", Some("  "))];
+        assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Fail);
+    }
+}

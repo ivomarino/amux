@@ -1389,6 +1389,8 @@ impl Runtime {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        // AF-367: minted by the orchestrator runtime.
+                        source: Some("orchestrator".into()),
                     },
                     now.timestamp(),
                 )?;
@@ -1935,6 +1937,8 @@ mod adherence_tests {
                         ask_type: None,
                         ask_question: None,
                         ask_unblocks: None,
+                        // AF-367: minted by the orchestrator runtime.
+                        source: Some("orchestrator".into()),
                     },
                     1_700_000_000,
                 )?;
