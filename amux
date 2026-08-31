@@ -799,6 +799,20 @@ cmd_start() {
     fi
   else
     [[ "$cmd" == *"--model"* ]] || cmd="$cmd --model sonnet"
+    # Resume the most recent conversation in this directory by default, so a
+    # restart (crash recovery, a deploy that killed the tmux server, `amux
+    # start-all`) picks up where the worker left off instead of silently
+    # registering a brand-new, untitled Claude Code session every time this
+    # runs — the gap that turned one `stop-all`+`start-all` recovery pass
+    # into 8 fresh sessions with random names and zero prior context
+    # (2026-08-30, see frustrations.md / INIT-3). Verified safe on a
+    # directory with NO prior conversation: `claude --continue` there just
+    # starts fresh, exit 0, no error — so this is safe on a worker's very
+    # first-ever start too. Skipped if the caller already asked to
+    # resume/start a specific conversation another way.
+    if [[ ! "$cmd" =~ (^|[[:space:]])(-c|--continue|--resume|--session-id|--from-pr|--teleport)([[:space:]]|$) ]]; then
+      cmd="$cmd --continue"
+    fi
   fi
 
   # Create tmux session and attach
@@ -844,37 +858,18 @@ cmd_start() {
     -e "AMUX_SESSION=$name" -e "AMUX_WORKER=$name" -e "AMUX_URL=$AMUX_API" \
     "${shell_setup}cd $(printf '%q' "$dir"); $cmd"
   # Lock the window name so Claude can't overwrite it with escape sequences.
-  #
-  # Both of these are `set-window-option`, and both end in `|| true`, because
-  # this pair silently broke EVERY real start for as long as tmux has treated
-  # allow-rename as a window option (3.6a here). It read
-  # `set-option -t "=$tname" allow-rename off`, which targets a SESSION with a
-  # window-only option: tmux answers "no such window", exits 1, `2>/dev/null`
-  # eats the message, and `set -euo pipefail` (line 19) kills the script right
-  # here — before the "started" echo, before automatic-rename is ever applied,
-  # and before the `--detach` return.
-  #
-  # So a start that fully SUCCEEDED (the tmux session exists and the worker is
-  # running) reported failure with no output at all. That is worse than a loud
-  # break, because the three callers each mis-read it differently:
-  #   * a human saw no confirmation and assumed nothing happened;
-  #   * `cmd_start_all` calls this in a loop, so set -e aborted the WHOLE loop
-  #     after the first worker — the fleet could never be brought up in bulk;
-  #   * any boot/CI script checking the exit code of `amux start --detach`,
-  #     which the comment below advertises as the script-friendly path, saw a
-  #     failure on every worker it started correctly.
-  # Found 2026-08-29 after a machine restart left 56 workers down (AMUX-3887).
-  #
-  # A cosmetic window-title option must never decide whether a start succeeded:
-  # that is what `|| true` is for. The failure is now reported (below) instead
-  # of being swallowed, so a future tmux rename of these options surfaces as a
-  # WARN line rather than as another silent fleet-wide outage.
-  local _rename_lock_failed=""
-  tmux set-window-option -t "=$tname" allow-rename off 2>/dev/null || _rename_lock_failed="allow-rename"
-  tmux set-window-option -t "=$tname" automatic-rename off 2>/dev/null || _rename_lock_failed="${_rename_lock_failed:+$_rename_lock_failed,}automatic-rename"
-  if [[ -n "$_rename_lock_failed" ]]; then
-    echo "${YELLOW}warn:${RESET} $name started, but tmux rejected the window-name lock ($_rename_lock_failed) — the worker is fine; its tmux window title may drift. tmux $(tmux -V 2>/dev/null)" >&2
-  fi
+  # Trailing `:` is load-bearing: allow-rename/automatic-rename are WINDOW
+  # options, and a bare `=$tname` session-exact-match target makes tmux look
+  # for a WINDOW literally named "=amux-<name>" instead of the current window
+  # of that session — "no such window", exit 1, and under `set -euo pipefail`
+  # (line 19) that silently kills the rest of cmd_start: no "started" echo,
+  # no attach, no error shown (stderr was already routed to /dev/null on the
+  # very line that fails). Reproduced 2026-08-30: any non-interactive fresh
+  # `amux start <name>` (no --detach, e.g. from `amux start-all`) died right
+  # here with empty output and exit 1, while the tmux session it had just
+  # created was left running and unlocked. See frustrations.md / INIT-2.
+  tmux set-option -t "=$tname:" allow-rename off 2>/dev/null
+  tmux set-window-option -t "=$tname:" automatic-rename off 2>/dev/null
   echo "${GREEN}started${RESET} ${BOLD}$name${RESET} in $dir"
   echo "  ${DIM}$cmd${RESET}"
   # The session is already created detached (new-session -d). Only attach when

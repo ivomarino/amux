@@ -231,6 +231,12 @@ const MIGRATIONS: &[Migration] = &[
         name: "0041_issues_blocked_on",
         sql: include_str!("../../migrations/0041_issues_blocked_on.sql"),
     },
+    // Renumbered from 35 (collision with regenerable_samples) per merge of PR #174
+    Migration {
+        version: 42,
+        name: "0042_reclaim_skipped_hits_repair",
+        sql: include_str!("../../migrations/0042_reclaim_skipped_hits_repair.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
