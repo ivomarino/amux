@@ -98,6 +98,53 @@ def main():
         if out:
             failures.append(f"split_risk must print NOTHING for {empty!r}, got {out!r}")
 
+    # AF-363: the BLOCKED remedy must offer the non-destructive exit FIRST.
+    #
+    # On a shared index `git restore --staged <their path>` mutates state that
+    # belongs to the other lane: their file is staged because THEY staged it, and
+    # unstaging is an edit to someone else's in-flight work made by a party who
+    # cannot see what they intended. `git commit <your paths>` ignores the index
+    # for everything it does not name, so both lanes commit whole in either order.
+    #
+    # HONEST ABOUT WHAT THIS PROVES. It reads the SHIPPED hook file rather than
+    # executing the branch, because that text is emitted inline in main() and
+    # reaching it needs a full multi-session git fixture. So this pins that the
+    # advice EXISTS and is ORDERED, not that the branch runs. That is weaker than
+    # the cells above and is worth saying rather than leaving the reader to assume
+    # parity. It still cannot pass against a paraphrase: it reads the artifact that
+    # ships, so deleting the advice reddens it.
+    hook_src = open(HOOK).read()
+    blocked_at = hook_src.find("COMMIT BLOCKED")
+    if blocked_at < 0:
+        failures.append("cannot find the COMMIT BLOCKED section in the shipped hook")
+    else:
+        tail = hook_src[blocked_at:]
+        pathspec_at = tail.find("COMMIT ONLY YOUR OWN PATHS")
+        # Anchor on strings that appear only in the EMITTED advice, never in a
+        # comment. The first version of this cell searched for "git restore
+        # --staged" and matched the explanatory comment above the code, which
+        # made the ordering assertion measure prose instead of output.
+        restore_at = tail.find("Or unstage theirs")
+        if pathspec_at < 0:
+            failures.append("the blocked remedy no longer offers a pathspec commit")
+        elif restore_at < 0:
+            failures.append("the blocked remedy no longer offers the unstage exit")
+        elif pathspec_at > restore_at:
+            failures.append(
+                "the DESTRUCTIVE remedy is listed before the non-destructive one; "
+                "`git restore --staged` edits the peer's staged work and should not "
+                "be the first thing a blocked lane reaches for")
+        # And the reason must travel with it. An unexplained ordering gets
+        # 'tidied' back by the next person who thinks restore reads better first.
+        # No arbitrary window: search from the pathspec advice to the end of the
+        # unstage line. A fixed byte bound silently stops covering the text it
+        # was chosen to cover as soon as anyone adds a comment above it, which
+        # is what a [:4000] bound did on the first run of this cell.
+        if "EDITS THE SHARED INDEX" not in tail[pathspec_at:restore_at + 400]:
+            failures.append(
+                "the restore remedy no longer says it edits the peer's index; "
+                "without the reason, the ordering above is arbitrary and reversible")
+
     if failures:
         print(f"FAIL {len(failures)}:")
         for f in failures:

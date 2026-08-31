@@ -856,7 +856,29 @@ def main():
         w("  %s   (edited by session '%s' %dm ago)%s\n"
           % (f.get("path"), f.get("owner"), mins,
              ("\n      %s" % _w) if _w else ""))
-    w("\nUnstage them:   git restore --staged "
+    # AF-363, technique found by `amux` on 2026-08-31 and it belongs FIRST because
+    # it is the only remedy here that touches nothing the peer owns.
+    #
+    # `git restore --staged` was the sole suggestion, and on a SHARED INDEX it
+    # mutates state that belongs to the other lane: their file was staged because
+    # THEY staged it, and unstaging is an edit to their in-flight work made by
+    # someone who cannot see what they intended. Committing by pathspec ignores
+    # the index for everything not named and leaves their entries exactly as they
+    # were, so both lanes commit whole, in either order.
+    #
+    # The near-miss that produced this: their checks.yml hunk sat unstaged at
+    # ~line 316 while a peer's hunk in the SAME FILE was staged at ~line 181.
+    # Committing that file would not have been plain absorption, it would have
+    # SPLIT the peer's change, landing their CI wiring under a stranger's message
+    # while the code it wired stayed uncommitted. Their own commit would then have
+    # wired nothing. `git add -p`, which this hook recommends two screens down for
+    # the partial-stage case, is the wrong tool for it: the problem is not which of
+    # YOUR hunks to take, it is that THEIRS are already staged.
+    w("\nCOMMIT ONLY YOUR OWN PATHS — leaves their staged entries untouched:\n"
+      "  git commit <your paths> -m ...   # a pathspec commit ignores the index for\n"
+      "                                   # everything it does not name\n")
+    w("\nOr unstage theirs — but note this EDITS THE SHARED INDEX, which is their\n"
+      "state, not yours:   git restore --staged "
       + " ".join(f.get("path", "") for f in foreign) + "\n")
     # AF-26. Two separate defects, both about an honest exit.
     #

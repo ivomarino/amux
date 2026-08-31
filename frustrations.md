@@ -1537,32 +1537,6 @@ NARROWED 2026-08-24 to the VOCABULARY half. The re-nag is fixed; the lying statu
   about, made while checking the fix for it.
 
 ---
-## Every amux-launched Chrome opens with the yellow "unsupported command-line flag" infobar
-AREA: browser
-SEVERITY: annoys
-STATUS: fixed
-DATE: 2026-08-24
-SESSION: mixpeek-research
-CARD: MR-38
-SYMPTOM: Ethan's screenshot at 15:40: "You are using an unsupported command-line flag:
-  --ignore-certificate-errors-spki-list=... Stability and security will suffer." across the top
-  of every window the amux browser opens. The SPKI pin is on Chrome's kBadFlags list
-  (chrome/browser/ui/startup/bad_flags_prompt.cc:107), so the bar has been on every launch since
-  the pin shipped. Nothing in amux could see it: it is browser chrome, not page content, and no
-  verb screenshots that, so the only detector was a human looking at the window.
-COST: every human-facing browser session since the pin shipped read as broken or unsafe to the
-  person looking at it, until Ethan screenshotted it. About 90 minutes across two lanes to land,
-  most of it the shared-checkout dance (the peer's whole-file write dropped two of three edits
-  once; see the entry above at "Mutation testing's obvious harness is a whole-file write").
-FIX: 9f4e6971. --test-type on the launch line: chromium infobar_utils.cc:173 returns before
-  ShowBadFlagsPrompt for a test-harness launch (ChromeDriver passes it on every session);
-  --enable-automation would also work but adds its own "controlled by automated test software"
-  bar. Flags extracted into chrome_launch_args() and launch_args_tests pins "bad flag =>
-  --test-type" with a control that the pin is really present; mutation-checked red without the
-  flag. NOT confirmed on screen from this lane: screencapture is refused for a tmux shell (no
-  Screen Recording grant), so the visual check is Ethan's next launch. Already-running Chromes
-  keep the bar until relaunched.
-
 ## A main lane with no $AMUX_SESSION in its env is invisible to the staged-guard's edit records
 AREA: attribution
 SEVERITY: slows
@@ -2104,3 +2078,35 @@ FIX: Fixed. The carry now retries three times with 2s between attempts, which co
   The general shape is worth keeping: an operation that is one verb to the user but
   two writes underneath needs to say which half it completed, and this one did, which
   is the only reason there was anything to fix rather than to discover later.
+
+---
+## The staged-guard's blocked-commit remedy edits the other lane's staged work
+AREA: attribution
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux (found the technique), amux-frustrations (filed and fixed)
+CARD: AF-365
+SYMPTOM: When the guard BLOCKS a commit over a peer's co-edited file, its only
+  suggestion was `git restore --staged <their paths>`. On a shared index that
+  mutates state belonging to the other lane: their file is staged because THEY
+  staged it, and unstaging is an edit to someone else's in-flight work made by a
+  party who cannot see what they intended. The near-miss that exposed it: amux had
+  an unstaged `checks.yml` hunk at ~line 316 while my hunk in the SAME FILE was
+  already staged at ~line 181.
+COST: No damage, because amux found the exit themselves and said the guard does not
+  suggest it. What the obvious path would have cost is worse than plain absorption:
+  committing that file would have SPLIT my change, landing my CI wiring under their
+  commit message while the app.js it wires stayed uncommitted, so my own commit
+  would have wired nothing. Two lanes, one file, and every documented move was wrong.
+  `git add -p`, which the guard recommends two screens down for the partial-stage
+  case, is also the wrong tool here: the problem is not which of YOUR hunks to take,
+  it is that THEIRS are already staged.
+FIX: Fixed. `git commit <your paths>` is now offered FIRST, labelled as the exit
+  that touches nothing the peer owns, and the unstage remedy now says out loud that
+  it edits the shared index. A cell in test_amux_staged_guard.py pins both the
+  presence and the ORDER, plus the stated reason, because an unexplained ordering
+  gets tidied back by the next person who thinks restore reads better first.
+  The cell reads the SHIPPED hook rather than executing the branch (that text is
+  inline in main() and reaching it needs a multi-session git fixture), and it says
+  so rather than implying parity with the cells above it.
