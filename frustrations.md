@@ -2228,35 +2228,6 @@ FIX: `cmd_start` uses `set-window-option` for both rename locks, `|| true`s them
 
 ---
 ---
-## staged-guard reports every shell-based edit as a line "matching nothing you edited firsthand"
-AREA: attribution
-SEVERITY: annoys
-STATUS: open
-DATE: 2026-08-30
-SESSION: amux-frustrations
-CARD: AF-342
-SYMPTOM: Committing four files I wrote start to finish (40fa0ce0), the guard printed
- 93 lines of warning: "15 staged added line(s) in docs/friction-themes.md match nothing
- you edited firsthand", the same for 55 lines in scripts/friction_themes.py and 22 in
- scripts/test-friction-themes.sh, plus a NOTE naming session 'amux' as a co-editor of
- all four, plus a SPLIT COMMIT WARNING. No peer had touched any of them. The guard's
- own caveats are correct and present (AF-179 mtime provenance, "if these are yours via
- shell edits, proceed"), so it is not claiming more than it knows.
-COST: Nothing shipped wrong, but the reader has to re-derive "these are all mine" from
- 93 lines of warning on every commit, and the true signal this guard exists for, a
- peer's hunk riding your `git add`, arrives in the same shape as the noise. Warnings
- that fire on the normal path are the ones people learn to scroll past, which is how
- the peer-hunk case gets missed. The guard correctly kept the peer's two dirty
- browser.rs files OUT of the commit, so its load-bearing half worked.
-FIX: The firsthand-edit record is fed by Edit/Write tool calls, so a session following
- the harness instruction to prefer Bash for edits (heredocs, sed, python patches) is
- unattributable BY CONSTRUCTION, every time. Two components disagreeing about the same
- fact: the harness says edit via Bash, the guard treats a Bash edit as unwitnessed.
- Either record a firsthand claim when a Bash command writes a tracked file in the
- session's own cwd, or suppress the per-line list when EVERY unmatched line is in a
- file whose only recorded writer is you and no peer has a recorded write in the window.
-
----
 ## `git commit -a` in a shared checkout swept three lanes' in-flight work into one lane's commit, twice in four hours
 AREA: attribution
 SEVERITY: slows

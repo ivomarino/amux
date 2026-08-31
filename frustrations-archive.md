@@ -2708,3 +2708,38 @@ SYMPTOM: amux-frustrations committed 72820477 (their AF-320 work) and swept up ~
   THE COMPOUNDING PART, and why this is not a small hole: this session runs under bypass-permissions, whose harness instruction is "Do your work through the Bash tool wherever it can accomplish the job ... make file changes with sed, heredocs, or short scripts, rather than using the dedicated Read, Edit, or Write tools." So the mode that makes editing fast is the mode that makes edits invisible to attribution, and every lane running that way is unattributable on every file it touches. It also inverts which case is loud: a lane using Edit gets protected, a lane told to use Bash does not.
 COST: ~250 lines and three tests shipped inside a commit whose message describes something else, so anyone bisecting the delivery ledger lands on "every diagnostic says whether its measurement ran" and has to work out why. Recovered only because I checked HEAD by hand afterwards; the peer attached a git note naming AMUX-3903 on the commit, which is the right repair and is also work neither of us should have needed to do. The deeper cost is that the guard's central promise is now conditional on a tool choice nobody makes for attribution reasons: I had staged only my own hunks a few commits earlier for exactly this hazard, and the guard could not have helped the peer do the same, because to it the file had one author.
 FIX: Ownership must come from the WRITE, not from the tool that performed it. The material already exists in the same transcript — `inferred-edit` sees the bash command and the path, and already logs a verdict about it — so the gap is that "unmeasured" is treated as "no claim" rather than as a weaker claim. Two candidate shapes, and the second is probably right: (a) teach the bash-write classifier the common write forms (`>`/`>>` redirect is already recognised; add `python3 - <<`, `sed -i`, `tee`, `cat >`), which narrows the hole but keeps the same shape and will leak again on the next form; or (b) treat an OBSERVED mtime move by a session that also ran a bash command touching that path as a claim of its own tier, so the `shared` notice can say "another session may have written this by a means the guard cannot attribute" instead of asserting nobody did. The rule that must not survive either way is the current one, where absence of an Edit record renders as a positive claim that no other session edited the file. That sentence is the one that did the damage, and it is false whenever the peer edits through Bash.
+
+## staged-guard reports every shell-based edit as a line "matching nothing you edited firsthand"
+VALIDATED: amux-frustrations | VALIDATED by the ORIGINATING session (amux-frustrations authored this entry, so this is a self-signoff and is labelled as one, not a peer review).
+THE ENTRY'S SENTENCE was: staged-guard reports EVERY shell-based edit as "matching nothing you edited firsthand". That sentence is no longer true. `line_accounting_mode(has_firsthand, mine_observed, peer_claims)` now returns Undecidable — suppressing the per-line list — when the committer has a content-record hole and NO peer claims the path. Shipped a728fe80, plus 8729cc0b for the reviewer's three findings.
+INDEPENDENT CONFIRMATION FROM A DIFFERENT LANE, which is what makes this more than my own read: amux re-derived it and reported from their own editing pattern — "almost everything I wrote today went through Bash, so has_firsthand is false and those paths take Skip. No line detail, no noise, and my commits today printed no unaccounted block while the path-level NOTE still fired."
+LIVE, not merely merged: serving a728fe80; before/after on a real staged mixed-edit path was unaccounted 1 path / 9 lines -> unaccounted 0, undecidable 1 path with its reason. Card AF-342 is `verified` with amux named as the reviewer who re-derived all four gate criteria.
+SCOPE OF THIS VALIDATION, stated because a validation is a claim about the ENTRY'S TEXT and not about the subsystem: the noise on the normal path is gone. Attribution in that guard is NOT thereby fixed — AMUX-3954 (observed records carry no content hash) is open and is a deeper entry on the same subsystem, still live in this file.
+AREA: attribution
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-30
+SESSION: amux-frustrations
+CARD: AF-342
+SYMPTOM: Committing four files I wrote start to finish (40fa0ce0), the guard printed
+ 93 lines of warning: "15 staged added line(s) in docs/friction-themes.md match nothing
+ you edited firsthand", the same for 55 lines in scripts/friction_themes.py and 22 in
+ scripts/test-friction-themes.sh, plus a NOTE naming session 'amux' as a co-editor of
+ all four, plus a SPLIT COMMIT WARNING. No peer had touched any of them. The guard's
+ own caveats are correct and present (AF-179 mtime provenance, "if these are yours via
+ shell edits, proceed"), so it is not claiming more than it knows.
+COST: Nothing shipped wrong, but the reader has to re-derive "these are all mine" from
+ 93 lines of warning on every commit, and the true signal this guard exists for, a
+ peer's hunk riding your `git add`, arrives in the same shape as the noise. Warnings
+ that fire on the normal path are the ones people learn to scroll past, which is how
+ the peer-hunk case gets missed. The guard correctly kept the peer's two dirty
+ browser.rs files OUT of the commit, so its load-bearing half worked.
+FIX: The firsthand-edit record is fed by Edit/Write tool calls, so a session following
+ the harness instruction to prefer Bash for edits (heredocs, sed, python patches) is
+ unattributable BY CONSTRUCTION, every time. Two components disagreeing about the same
+ fact: the harness says edit via Bash, the guard treats a Bash edit as unwitnessed.
+ Either record a firsthand claim when a Bash command writes a tracked file in the
+ session's own cwd, or suppress the per-line list when EVERY unmatched line is in a
+ file whose only recorded writer is you and no peer has a recorded write in the window.
+
+---
