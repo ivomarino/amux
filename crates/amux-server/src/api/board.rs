@@ -5921,10 +5921,36 @@ pub async fn patch_item(
                         );
                     }
                     None => {
+                        // SELF-CHECKING RATHER THAN PRECONDITIONED, and the
+                        // rejected alternative is the point (amux-frustrations,
+                        // 2026-08-31).
+                        //
+                        // Steering waits for a turn boundary: measured mean lag
+                        // 166s, max 3607s, 32% over a minute. So a review
+                        // request can sit pending for hours while the card is
+                        // reviewed and closed, and arrive asserting a premise
+                        // that has expired.
+                        //
+                        // `steer_enqueue_precond` exists for exactly that and is
+                        // WRONG HERE. It drops on any `rev` change, and its own
+                        // docstring says why that is safe for its callers:
+                        // "every producer here is a periodic trigger, so if the
+                        // condition still holds it fires again on the next tick".
+                        // A review request is not periodic. Dropped means gone,
+                        // so preconditioning it would silently swallow requests
+                        // whenever anybody appended a note -- recreating the
+                        // exact defect this card reports.
+                        //
+                        // A message that survives and explains itself beats one
+                        // that might vanish. The cost of a stale arrival is one
+                        // reader glancing at a closed card; the cost of a
+                        // dropped request is a review that reaches nobody.
                         let prompt = format!(
                             "[review requested on {}: {}] {caller_for_notify} is waiting on \
                              YOUR review:\n{note}\n(You are named REVIEWER on this card. The \
-                             full note is on it.)",
+                             full note is on it. This was queued when the card entered review \
+                             and delivers at your next turn boundary, so if it has since left \
+                             `review` it was already handled and you can ignore this.)",
                             body.get("id").and_then(Value::as_str).unwrap_or(""),
                             title.chars().take(60).collect::<String>()
                         );
