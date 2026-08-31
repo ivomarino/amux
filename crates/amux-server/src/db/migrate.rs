@@ -221,6 +221,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0039_issues_continuation",
         sql: include_str!("../../migrations/0039_issues_continuation.sql"),
     },
+    Migration {
+        version: 40,
+        name: "0040_issues_entered_state_at",
+        sql: include_str!("../../migrations/0040_issues_entered_state_at.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.

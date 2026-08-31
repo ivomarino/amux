@@ -1450,6 +1450,10 @@ pub struct IssueRow {
     /// `unresolved` is deliberately ungated: requiring it would make every card
     /// invent an open question to be claimable, and a manufactured question is
     /// worse than none because it reads as a real one.
+    /// When the card entered its CURRENT status (AMUX-3947). `None` means the
+    /// card predates migration 0040 and has not moved since: not measured, and
+    /// consumers must render it that way rather than as zero.
+    pub entered_state_at: Option<i64>,
     pub next_action: Option<String>,
     pub last_result: Option<String>,
     pub unresolved: Option<String>,
@@ -1529,6 +1533,7 @@ impl IssueRow {
             "ask_type": self.ask_type,
             "ask_question": self.ask_question,
             "ask_unblocks": self.ask_unblocks,
+            "entered_state_at": self.entered_state_at,
             "next_action": self.next_action,
             "last_result": self.last_result,
             "unresolved": self.unresolved,
@@ -1634,7 +1639,7 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      COALESCE(i.rev,0), i.source_ref, i.last_verified_at, COALESCE(i.version,0), \
      i.epic, i.closed_at, GROUP_CONCAT(t.tag), i.evidence, \
      i.ask_type, i.ask_question, i.ask_unblocks, \
-     i.next_action, i.last_result, i.unresolved";
+     i.next_action, i.last_result, i.unresolved, i.entered_state_at";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -1745,6 +1750,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         ask_type: r.get(30)?,
         ask_question: r.get(31)?,
         ask_unblocks: r.get(32)?,
+        entered_state_at: r.get(36)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2208,10 +2214,10 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
     conn.execute(
         "INSERT INTO issues (id, title, \"desc\", status, session, shepherd, type, creator, \
              due, due_time, created, updated, owner_type, pos, gate, reviewer, depends_on, \
-             ask_type, ask_question, ask_unblocks, \
+             ask_type, ask_question, ask_unblocks, entered_state_at, \
              notified, pinned, archived, rev, version) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
-             ?18, ?19, ?20, 0, 0, 0, 0, 0)",
+             ?18, ?19, ?20, ?21, 0, 0, 0, 0, 0)",
         params![
             id,
             new.title,
@@ -2233,6 +2239,9 @@ pub fn create_issue(conn: &Connection, new: &NewIssue, now: i64) -> rusqlite::Re
             new.ask_type.as_deref().filter(|x| !x.trim().is_empty()),
             new.ask_question.as_deref().filter(|x| !x.trim().is_empty()),
             new.ask_unblocks.as_deref().filter(|x| !x.trim().is_empty()),
+            // A new card enters its first status NOW, so this is measured from
+            // the start and only PRE-0040 rows carry the honest NULL.
+            now,
         ],
     )?;
     for tag in &new.tags {
@@ -2324,6 +2333,34 @@ fn closed_at_for_write(conn: &Connection, row: &IssueRow) -> Option<i64> {
     }
 }
 
+/// When this write should say the card entered its status (AMUX-3947).
+///
+/// Mirrors [`closed_at_for_write`] exactly, including its third arm, because
+/// the two answer the same shape of question: read the PREVIOUS status from the
+/// row on disk, and stamp only on an actual transition.
+///
+/// The arm that matters is the last one. An ordinary edit -- a progress note, a
+/// desc rewrite, an evidence append -- must NOT move this timestamp, or
+/// "in review for 9 days" silently becomes "in review for 0 days" every time
+/// somebody touches the card, and the field reports the opposite of the
+/// bottleneck it exists to surface.
+fn entered_state_at_for_write(conn: &Connection, row: &IssueRow) -> Option<i64> {
+    let prev: Option<String> = conn
+        .query_row("SELECT status FROM issues WHERE id = ?1", params![row.id], |r| r.get(0))
+        .ok();
+    match prev {
+        // A real transition: this write is the moment of entry.
+        Some(p) if p != row.status => Some(row.updated),
+        // Same status: carry whatever is there, INCLUDING None. A card that
+        // predates the column keeps its NULL until it actually moves, which is
+        // the honest answer and is why nothing was backfilled.
+        Some(_) => row.entered_state_at,
+        // Row not on disk yet. Carry the caller's value rather than inventing
+        // one; `create_issue` stamps it at insert.
+        None => row.entered_state_at,
+    }
+}
+
 pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<usize> {
     let dep_json = if row.depends_on.is_empty() {
         None
@@ -2337,6 +2374,7 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
     // inside this function has to land on the row or the journal quietly stops
     // being a faithful record — which is the one property replay depends on.
     row.closed_at = closed_at_for_write(conn, row);
+    row.entered_state_at = entered_state_at_for_write(conn, row);
     conn.execute(
         "UPDATE issues SET title = ?1, \"desc\" = ?2, status = ?3, session = ?4, due = ?5, \
              due_time = ?6, owner_type = ?7, pinned = ?8, pos = ?9, gate = ?10, shepherd = ?11, \
@@ -2344,8 +2382,8 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              rev = ?17, version = ?18, updated = ?19, source_ref = ?20, last_verified_at = ?21, \
              epic = ?22, closed_at = ?23, evidence = ?24, ask_type = ?25, \
              ask_question = ?26, ask_unblocks = ?27, next_action = ?28, \
-             last_result = ?29, unresolved = ?30 \
-         WHERE id = ?31 AND deleted IS NULL",
+             last_result = ?29, unresolved = ?30, entered_state_at = ?31 \
+         WHERE id = ?32 AND deleted IS NULL",
         params![
             row.title,
             row.desc,
@@ -2377,6 +2415,7 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.next_action,
             row.last_result,
             row.unresolved,
+            row.entered_state_at,
             row.id,
         ],
     )
@@ -2978,6 +3017,79 @@ mod tests {
         crate::db::migrate::test_memdb()
     }
 
+    /// AMUX-3947. entered_state_at records the TRANSITION, and an ordinary edit
+    /// must not move it.
+    ///
+    /// The second half is the one that carries the value. Stamping on every
+    /// write is easy and would pass a naive "the column is populated" check
+    /// while making "in review for 9 days" read as 0 days the moment anybody
+    /// appends a progress note -- reporting the opposite of the bottleneck this
+    /// column exists to surface.
+    #[test]
+    fn entered_state_at_records_the_transition_not_the_touch() {
+        let conn = create_db();
+        let mut row = create_issue(&conn, &new_card("todo"), 1000).expect("create");
+        assert_eq!(row.entered_state_at, Some(1000), "a new card enters its first status now");
+
+        // 1. A real transition re-stamps.
+        row.status = "doing".into();
+        row.updated = 2000;
+        save_patched(&conn, &mut row).expect("save");
+        assert_eq!(row.entered_state_at, Some(2000), "moving status stamps the moment of entry");
+
+        // 2. THE ARM THAT MATTERS: an ordinary edit does NOT.
+        row.desc = "a progress note, five days later".into();
+        row.updated = 7000;
+        save_patched(&conn, &mut row).expect("save");
+        assert_eq!(
+            row.entered_state_at,
+            Some(2000),
+            "an edit is not a transition; moving this would erase the age it measures"
+        );
+        let back = get_issue(&conn, &row.id).expect("read").expect("row");
+        assert_eq!(back.entered_state_at, Some(2000), "and it survives the round trip");
+
+        // 3. Moving again re-stamps, so the field tracks the CURRENT state.
+        row.status = "review".into();
+        row.updated = 9000;
+        save_patched(&conn, &mut row).expect("save");
+        assert_eq!(row.entered_state_at, Some(9000));
+    }
+
+    /// A PRE-0040 CARD KEEPS ITS NULL until it actually moves.
+    ///
+    /// Nothing was backfilled, and this pins why: `updated` is the last TOUCH,
+    /// so backfilling from it would have reported a card sitting in review since
+    /// August as "in review for 0 days" if anyone had appended a note that day.
+    /// NULL means not measured, which is true and is what consumers must render.
+    #[test]
+    fn a_card_that_predates_the_column_reads_unmeasured_not_zero() {
+        let conn = create_db();
+        conn.execute(
+            "INSERT INTO issues (id,title,status,created,updated) \
+             VALUES ('OLD-1','legacy','review',1,5000)",
+            [],
+        )
+        .unwrap();
+        let mut row = get_issue(&conn, "OLD-1").expect("read").expect("row");
+        assert_eq!(row.entered_state_at, None, "no backfill: absence is the honest answer");
+
+        // An unrelated edit must NOT invent a value for it.
+        row.desc = "touched".into();
+        row.updated = 6000;
+        save_patched(&conn, &mut row).expect("save");
+        assert_eq!(
+            row.entered_state_at, None,
+            "touching a legacy card must not fabricate a state-entry time"
+        );
+
+        // It self-heals the moment the card actually moves.
+        row.status = "done".into();
+        row.updated = 8000;
+        save_patched(&conn, &mut row).expect("save");
+        assert_eq!(row.entered_state_at, Some(8000), "a real move makes it measured");
+    }
+
     /// AMUX-3946. The continuation gate's predicate, both arms.
     ///
     /// The refusal is the headline; the ACCEPTANCE is what stops the fix from
@@ -3458,6 +3570,7 @@ mod tests {
             ask_type: None,
             ask_question: None,
             ask_unblocks: None,
+            entered_state_at: None,
             next_action: None,
             last_result: None,
             unresolved: None,
@@ -3566,6 +3679,7 @@ mod configured_gate_tests {
             archived: 0, depends_on: vec![], reviewer: None, epic: None, log: None, rev: 0,
             source_ref: None, evidence: None, ask_type: None, ask_question: None,
             ask_unblocks: None,
+            entered_state_at: None,
             next_action: None,
             last_result: None,
             unresolved: None, last_verified_at: None, closed_at: None,
