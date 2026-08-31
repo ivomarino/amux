@@ -2405,3 +2405,43 @@ NOTE THE THIRD OUTCOME, because neither party had a slot for it: this was not "y
  attribution system keyed on time rather than content will keep producing that verdict,
  and the AF-179 caveat is doing real work — it is why amux hedged instead of asserting —
  but a caveat cannot make an unfalsifiable signal falsifiable.
+
+## A test cell that reads the ambient process ancestry cannot fail on the box that wrote it
+AREA: tests
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux
+CARD: AMUX-3962
+SYMPTOM: `checks` red on main for the whole fleet, two consecutive runs. Failing step
+ `test-commit-stamp.sh`, cells 1 and 2, `alpha='' beta=''` and `got ''`. Both cells ran
+ the commit-msg hook under whatever process ancestry the test inherited and asserted on
+ the `Amux-Agent` trailer, which the hook populates by walking its own parents for a
+ `claude` process. On any dev box that walk finds the session running the test, so both
+ cells pass. In CI there is no claude anywhere in the tree, the hook correctly omits the
+ field, and both cells fail on an empty string. Reproduced locally by reparenting the
+ test to init, which is what a runner looks like from inside the walk: 7 passed, 2 failed,
+ same two cells, same empty values.
+COST: About an hour of fleet-wide red CI, and the specific cost is that `checks` is the
+ job every lane's `board done` evidence leans on, so a red there taxes work nobody
+ involved was doing. Worse, it was invisible in the only place anyone was looking: two
+ lanes independently ran the local suite that night and both read green (1665/0), because
+ the local suite and the CI job were not running the same thing. The commits that went
+ red were not the commits that broke it. The cells had NEVER been green in CI; run
+ 33396997200 was simply the first one to reach them, so the fleet-wide red landed on
+ whoever happened to push next, four commits downstream of the author.
+FIX: 232c212f. The two cells now build their own ancestry, the technique the later cells
+ in the same file already used: one `claude` shim (a symlink, so ps sees a matching
+ argv[0] basename), both hook runs under it, so ancestry is a test INPUT rather than a
+ property of whoever launched the test. 9/9 with a claude ancestor and 9/9 reparented to
+ init. Cell 2 got stronger on the way past: it asked `ps -p <pid>` for liveness, which
+ cannot tell the right process from any live one. Mutating the hook to stamp `pid=1` is
+ both invariant and live, and the old pair passed that completely clean; against the
+ shim's known pid it fails.
+THE SHAPE, which is the reusable part: a cell that reads the ambient environment measures
+ the LAUNCHER, not the code. It is not merely untested in the other environment, it is
+ structurally unable to fail in the one where it was written, so a local green carries no
+ information about it at all. The tell is an assertion whose subject was not constructed
+ by the test. That is ethos rule 7 with a location attached: "can your check actually
+ fail" has to be asked about the environment as well as the logic, and the way to ask it
+ is to run the file somewhere the ambient answer is absent.
