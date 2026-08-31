@@ -3157,6 +3157,14 @@ enum PatchOut {
         /// happens gains its consequence: a named consumer (the owner), at
         /// the next turn boundary, deduped.
         progress_notify: Option<(String, String, String)>,
+        /// The REVIEWER a note in `review` is actually for (AMUX-3771). Separate
+        /// from `progress_notify` because owner and reviewer are different roles
+        /// and the workaround this replaces was to conflate them.
+        ///
+        /// Boxed: adding a third String triple pushed this variant past clippy's
+        /// `large_enum_variant` threshold, and `NotFound` is a unit variant that
+        /// would have paid for it on every return.
+        reviewer_notify: Option<Box<(String, String, String)>>,
     },
 }
 
@@ -5668,6 +5676,28 @@ pub async fn patch_item(
             // AVE-36: a non-owner's append earns the owner a notice. Self-notes
             // and unattributed callers notify nobody (the automation that
             // appends server-side carries no session header on purpose).
+            // WHO ACTUALLY NEEDS THIS NOTE (AMUX-3771, two fresh instances from
+            // backend).
+            //
+            // This targeted the OWNER and only the owner, so a card in `review`
+            // with a cross-group reviewer notified nobody: the owner posting a
+            // review request IS the caller, `owner != caller_lane` is false, and
+            // the reviewer was never considered. BACKE-3467 sat in `review`
+            // reading healthy while waiting on no one, and was only caught when a
+            // human pointed it out. The workaround was to reassign card
+            // OWNERSHIP to the reviewer, which conflates the two roles.
+            //
+            // A reviewer is the party the note is FOR when a card is in review.
+            // Notifying them is not a second feature; it is the first one
+            // addressed correctly.
+            let appended_note_for_reviewer = appended_note.clone();
+            let reviewer_target = next
+                .reviewer
+                .clone()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty() && *r != caller_lane)
+                .filter(|r| Some(r.as_str()) != next.session.as_deref())
+                .filter(|_| bs::parse_status(&next.status) == Some(TaskStatus::Review));
             let progress_notify = appended_note.and_then(|note| {
                 let owner = next.session.clone().unwrap_or_default();
                 (!owner.is_empty() && !caller_lane.is_empty() && owner != caller_lane)
@@ -5681,6 +5711,10 @@ pub async fn patch_item(
                     diverted,
                     status_transition: st,
                     progress_notify,
+                    reviewer_notify: reviewer_target
+                        .clone()
+                        .zip(appended_note_for_reviewer.clone())
+                        .map(|(r, note)| Box::new((r, next.title.clone(), note))),
                 },
                 WriteOutcome {
                     applied: true,
@@ -5734,6 +5768,7 @@ pub async fn patch_item(
             diverted,
             status_transition,
             progress_notify,
+            reviewer_notify,
         }) => {
             body["applied"] = json!(true);
             body["global_rev"] = json!(reply.rev.0);
@@ -5850,6 +5885,77 @@ pub async fn patch_item(
                                 reason = reason,
                                 "board note saved but owner not notified"
                             );
+                        }
+                    }
+                }
+            }
+            // DELIVER TO THE REVIEWER (AMUX-3771). A card in `review` names the
+            // party the note is for; notifying only the owner is how BACKE-3467
+            // sat reading healthy while waiting on nobody.
+            //
+            // REACHABILITY IS CHECKED AND REPORTED, never silently skipped. The
+            // whole defect class here is a request that looks delivered from one
+            // side and never arrived on the other, so a refusal that produced
+            // silence would be the same bug wearing a fix.
+            if let Some(boxed) = reviewer_notify {
+                let (reviewer, title, note) = *boxed;
+                let owner_for_check = body
+                    .get("session")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                match crate::api::session_verbs::reviewer_unreachable_reason(
+                    &owner_for_check,
+                    &reviewer,
+                ) {
+                    Some(why) => {
+                        body["reviewer_notified"] = json!(false);
+                        body["reviewer_notify_reason"] = json!(format!(
+                            "the note is on the card, but reviewer '{reviewer}' could NOT be \
+                             told: {why}"
+                        ));
+                        tracing::warn!(
+                            reviewer_unreachable = %reviewer,
+                            owner = %owner_for_check,
+                            "board note: reviewer named on a card in review cannot be reached"
+                        );
+                    }
+                    None => {
+                        let prompt = format!(
+                            "[review requested on {}: {}] {caller_for_notify} is waiting on \
+                             YOUR review:\n{note}\n(You are named REVIEWER on this card. The \
+                             full note is on it.)",
+                            body.get("id").and_then(Value::as_str).unwrap_or(""),
+                            title.chars().take(60).collect::<String>()
+                        );
+                        match crate::api::session_verbs::steer_enqueue(
+                            &state,
+                            &reviewer,
+                            &prompt,
+                            "board-progress",
+                            &caller_for_notify,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                body["reviewer_notified"] = json!(true);
+                                body["reviewer_notify_note"] = json!(format!(
+                                    "{reviewer} will see the review request at their next turn \
+                                     boundary"
+                                ));
+                            }
+                            Err(reason) => {
+                                body["reviewer_notified"] = json!(false);
+                                body["reviewer_notify_reason"] = json!(format!(
+                                    "the note is on the card, but reviewer '{reviewer}' could \
+                                     NOT be notified: {reason}"
+                                ));
+                                tracing::warn!(
+                                    reviewer_undelivered = %reviewer,
+                                    reason = reason,
+                                    "board note: review request not delivered"
+                                );
+                            }
                         }
                     }
                 }
