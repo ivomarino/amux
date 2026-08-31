@@ -25,20 +25,54 @@ ok(){ PASS=$((PASS+1)); printf '  ok   %s\n' "$1"; }
 no(){ FAIL=$((FAIL+1)); printf '  FAIL %s\n     %s\n' "$1" "${2:-}"; }
 
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
-run(){ # run <session> -> prints the trailer block
+mkdir -p "$TMP/home/sessions"
+
+# A CONTROLLED ANCESTOR, because the ambient one is not a test input.
+#
+# Cells 1 and 2 used to run the hook directly and read whatever `claude` process
+# happened to be above the test. On a dev box that is the session running it, so
+# they passed; in CI there is no claude anywhere in the tree, `Amux-Agent` is
+# correctly omitted, and both cells failed on an empty string. They had never
+# been green in CI: the first CI run that reached them (33396997200, 2026-08-31)
+# went red on exactly these two, and stayed red for the fleet until this fix. A
+# cell whose verdict depends on who launched the test measures the launcher, not
+# the hook.
+#
+# A symlink named `claude` gives ps an argv[0] whose basename matches the hook's
+# binary test, which is the same "match the binary, not the substring" rule the
+# hook documents. A copied binary does not work on macOS (code signing kills
+# it), which is why this is a symlink and not a cp.
+mkdir -p "$TMP/bin"
+ln -sf /bin/sh "$TMP/bin/claude"
+
+run(){ # run <session> -> the trailer block, with NO claude ancestor
   printf 'subject\n' > "$TMP/msg"
   AMUX_SESSION="$1" AMUX_HOME="$TMP/home" bash "$HOOK" "$TMP/msg" >/dev/null 2>&1
   grep '^Amux-' "$TMP/msg" 2>/dev/null
 }
-mkdir -p "$TMP/home/sessions"
+
+# ONE shim, TWO claimed lanes. Both hook runs share a single claude ancestor, so
+# the pid the trailer names is the same process in both. That is what makes the
+# invariance below a comparison rather than a coincidence: two separate shims
+# would have two pids and the cell could never pass, whatever the hook did.
+cat > "$TMP/ancestry.sh" <<EOS
+printf 'subject\n' > "$TMP/msg_a"
+AMUX_SESSION=lane-alpha AMUX_HOME="$TMP/home" bash "$HOOK" "$TMP/msg_a" >/dev/null 2>&1
+printf 'subject\n' > "$TMP/msg_b"
+AMUX_SESSION=lane-beta  AMUX_HOME="$TMP/home" bash "$HOOK" "$TMP/msg_b" >/dev/null 2>&1
+printf '%s' "\$\$" > "$TMP/shim.pid"
+EOS
+"$TMP/bin/claude" "$TMP/ancestry.sh"
+shim="$(cat "$TMP/shim.pid" 2>/dev/null)"
 
 echo "commit-stamp cells (AMUX-3916)"
 
+a="$(grep  '^Amux-Agent:'   "$TMP/msg_a" 2>/dev/null)"
+b="$(grep  '^Amux-Agent:'   "$TMP/msg_b" 2>/dev/null)"
+sa="$(grep '^Amux-Session:' "$TMP/msg_a" 2>/dev/null)"
+sb="$(grep '^Amux-Session:' "$TMP/msg_b" 2>/dev/null)"
+
 # 1. THE INVARIANCE. Two different claimed lanes, one real committing process.
-a="$(run lane-alpha | grep '^Amux-Agent:')"
-b="$(run lane-beta  | grep '^Amux-Agent:')"
-sa="$(run lane-alpha | grep '^Amux-Session:')"
-sb="$(run lane-beta  | grep '^Amux-Session:')"
 [ "$sa" != "$sb" ] \
   && ok "Amux-Session follows \$AMUX_SESSION (it is the claim)" \
   || no "Amux-Session invariant" "both runs said '$sa'; the test is not exercising the spoof"
@@ -48,14 +82,17 @@ else
   no "Amux-Agent must be invariant under \$AMUX_SESSION" "alpha='$a' beta='$b'"
 fi
 
-# 2. IT NAMES A REAL PROCESS, not a placeholder. A field that is merely PRESENT
-#    looks identical to one that discriminates, which is the failure this whole
-#    card is about.
+# 2. IT NAMES THE REAL ANCESTOR, not a placeholder and not the hook itself. A
+#    field that is merely PRESENT looks identical to one that discriminates,
+#    which is the failure this whole card is about. `ps -p <pid>` liveness was
+#    the old proxy for that, and it cannot tell the RIGHT process from any live
+#    one: the hook's own pid would have satisfied it. The shim's pid is known
+#    here, so assert equality with it instead.
 pid="$(printf '%s' "$a" | sed -n 's/.*pid=\([0-9]\{1,\}\).*/\1/p')"
-if [ -n "$pid" ] && ps -p "$pid" >/dev/null 2>&1; then
-  ok "Amux-Agent pid=$pid is a live process"
+if [ -n "$pid" ] && [ -n "$shim" ] && [ "$pid" = "$shim" ]; then
+  ok "Amux-Agent pid=$pid is the claude ancestor, not the hook's own process"
 else
-  no "Amux-Agent must name a live pid" "got '$a'"
+  no "Amux-Agent must name the claude ancestor" "trailer='$a' shim pid='$shim'"
 fi
 
 # 3. REGRESSION: A PATH IS NOT A PROGRAM. The first draft matched `*claude*`
@@ -100,13 +137,8 @@ fi
 # Sonnet 4.6; its agent pid 5559 had the single-word command line `claude`,
 # while every other live claude process on the box carried --model.
 #
-# Driving this needs a CONTROLLED ANCESTRY, since the walk reads real parents.
-# A symlink named `claude` gives ps an argv[0] whose basename matches the
-# hook's binary test — the same "match the binary, not the substring" rule the
-# hook documents. A copied binary does not work on macOS (code signing kills
-# it), which is why this is a symlink.
-mkdir -p "$TMP/bin"
-ln -sf /bin/sh "$TMP/bin/claude"
+# Driving this needs a CONTROLLED ANCESTRY, since the walk reads real parents:
+# the `claude` shim built at the top of this file, whose rationale is there.
 run_under() { # run_under <extra claude argv...> -> the Amux-Agent trailer
   printf 'subject\n' > "$TMP/msg2"
   AMUX_SESSION=lane-model AMUX_HOME="$TMP/home" \
