@@ -2175,7 +2175,24 @@ const _origFetch = window.fetch.bind(window);
 // Never queue interactive/ephemeral endpoints: telemetry, speed tests, live
 // terminal keystrokes, uploads (bodies too big for localStorage), login and
 // tunnel flows, and request/response helpers whose answer the UI needs NOW.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser)/;
+// `files/mdai/run` joined this list for BOTH of the reasons the comment above
+// gives, and it is the clearest case of each (AF-371).
+//
+// ANSWER NEEDED NOW: an mdai run's whole product is the output the panel is
+// about to render. A synthetic 202 hands the panel `{ok:true,queued:true}`,
+// which has no output in it, and the run silently never happened.
+//
+// TOO EXPENSIVE TO REPLAY: a run is a chain of model calls, measured at 82-127s
+// on Priorities.mdai. Replaying it from the outbox hours later spends that again
+// on a question nobody is still asking, against sources that have since moved.
+// It is not idempotent in cost even where it is in effect.
+//
+// This is reachable on the ORDINARY path here, not on a real outage: the
+// auto-builder restarts the server on every commit, so any run straddling a
+// deploy has its fetch fail, get queued, and report success. Ethan saw the two
+// halves separately — "mdai files are stuck at running", and a banner reading
+// `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -8245,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.758';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.759';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -17260,7 +17277,25 @@ async function _mdaiRun(opts) {
       });
     } finally { clearTimeout(_to); }
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) {
+    // A LOCALLY-QUEUED RESPONSE IS NOT A RUN (AF-371).
+    //
+    // The outbox interceptor manufactures a 202 `{ok:true,queued:true}` when a
+    // fetch fails, and `r.ok` is TRUE for it with no `d.error`, so the success
+    // branch below took it and reported a completed run that never left the
+    // browser. `_isLocallyQueued` exists for exactly this and was called at one
+    // site out of every place it applies (ethos rule 1: the capability existed
+    // and did not reach the caller that needed it).
+    //
+    // Belt and braces alongside the _OUTBOX_SKIP entry above: that entry stops
+    // THIS url being queued, and this guard means any future path that hands the
+    // panel a synthetic 202 fails loudly instead of silently.
+    if (_isLocallyQueued(r)) {
+      _mdaiRunError = 'The server could not be reached, so this run was never sent. '
+        + 'Nothing was queued for later: an mdai run is a chain of model calls and '
+        + 'replaying it hours later would spend them on a question you are no longer '
+        + 'asking. Retry when amux is back.';
+      _mdaiRunCycle = null;
+    } else if (!r.ok || d.error) {
       _mdaiRunError = d.error || ('HTTP ' + r.status);
       _mdaiRunCycle = d.cycle || null;
     } else {

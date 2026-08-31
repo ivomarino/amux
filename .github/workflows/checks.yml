@@ -202,6 +202,17 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-contended-worktree.sh
+      # AF-371. An mdai run is 82-127s of model calls whose whole product is the
+      # output the panel renders. The outbox queued it on a failed fetch and
+      # handed the panel a synthetic 202, which is `ok` with no error, so the
+      # panel reported a completed run that never left the browser. Reachable on
+      # the ordinary path: the auto-builder restarts the server on every commit.
+      # Cells 3-5 are the controls that stop an over-broad skip regex from
+      # disabling offline sync for the whole app while passing cell 1.
+      - name: an mdai run never enters the offline outbox (AF-371)
+        run: |
+          set -uo pipefail
+          ./scripts/test-mdai-outbox.sh
       # AF-342. The staged-guard's SERVER decision has unit tests in
       # git_guard.rs; what a lane actually experiences is what the hook prints,
       # and that half had none. The defect was purely printing volume (93
