@@ -122,7 +122,32 @@ if (( server_up == 1 )); then
   if [[ "$http" != "200" ]]; then
     verdict="VERDICT UNAVAILABLE: /api/sessions returned HTTP ${http:-<none>}"
   else
-    verdict="$(SESS_FILE="$sess_tmp" python3 <<'PYEOF' 2>&1
+    # CLAIMED-UP, parsed from start-all's own summary. It counts `started` +
+    # `already running`, which is what start-all asserts is up when it exits.
+    #
+    # AMUX-3965. `started` is incremented when `cmd_start --detach` returns 0, and
+    # `tmux new-session -d` returns immediately — so the count is a claim about the
+    # SPAWN CALL, and the verdict below is a claim about the WORLD. On the boot of
+    # 2026-08-30 they differed by six: `55 started, 0 failed` while the verdict
+    # named 7 workers down, 6 of them in start-all's own started list. Both numbers
+    # were already in this script and nothing compared them, so the boot exited 0.
+    claimed_up="$(printf '%s\n' "$summary" | sed 's/\x1b\[[0-9;]*m//g' \
+      | awk '/^start-all:/ {
+            s=0; a=0; seen=0
+            for (i=1;i<=NF;i++) {
+              if ($i=="started" && $(i-1) ~ /^[0-9]+$/)          { s=$(i-1); seen=1 }
+              if ($i=="already" && $(i+1)=="running" && $(i-1) ~ /^[0-9]+$/) { a=$(i-1); seen=1 }
+            }
+            # Print NOTHING when neither field was found. Printing 0 here would
+            # be indistinguishable from a real `0 started`, and the caller would
+            # read a failed parse as a satisfied comparison — the same shape this
+            # whole check exists to catch, one level down. A genuine zero still
+            # prints, because `seen` tracks whether the TOKEN matched, not
+            # whether the value was non-zero.
+            if (seen) print s+a
+            exit
+          }')"
+    verdict="$(SESS_FILE="$sess_tmp" CLAIMED_UP="${claimed_up:-}" python3 <<'PYEOF' 2>&1
 import json, os
 try:
     with open(os.environ["SESS_FILE"]) as fh:
@@ -134,9 +159,31 @@ live = [x for x in d if not x.get("archived")]
 run = [x for x in live if x.get("running")]
 down = sorted(x["name"] for x in live if not x.get("running"))
 tail = (" · still down: " + ", ".join(down)) if down else " · all up"
+
+# The divergence line comes FIRST, because on a successful boot nobody reads
+# past the summary, and this is the only line that says the summary was wrong.
+claimed = os.environ.get("CLAIMED_UP", "").strip()
+if not claimed.isdigit():
+    # Say the comparison did not run rather than let its absence read as
+    # agreement (ethos rule 4). A parse failure here is not a clean boot.
+    print("DIVERGENCE UNMEASURED: could not read start-all's claimed-up count "
+          "from its summary, so 'started' was not checked against 'running'")
+elif len(run) < int(claimed):
+    print("DIVERGENCE: start-all claimed %s up, %d are actually running. "
+          "`started` counts spawns that returned, not workers that came up. "
+          "Down: %s" % (claimed, len(run), ", ".join(down) or "(none named)"))
+    print("EXIT_NONZERO")
+
 print("verdict: %d/%d non-archived workers running%s" % (len(run), len(live), tail))
 PYEOF
 )"
+    # Carry the divergence into the EXIT STATUS, so a boot whose own log knows
+    # something is wrong does not report success. The marker is stripped from
+    # what gets logged; the human-readable DIVERGENCE line stays.
+    if printf '%s\n' "$verdict" | grep -q '^EXIT_NONZERO$'; then
+      verdict="$(printf '%s\n' "$verdict" | grep -v '^EXIT_NONZERO$')"
+      (( rc == 0 )) && rc=1
+    fi
   fi
   rm -f "$sess_tmp"
   log "${verdict:-VERDICT UNAVAILABLE: /api/sessions probe produced nothing}"
