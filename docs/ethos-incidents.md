@@ -1158,3 +1158,59 @@ Two things to carry forward:
 2. **When a check reads a token whose meaning depends on context the token does not
    carry, the fix belongs on the WRITER, not the reader.** Any future version needs the
    card to say which namespace it means. Guessing is what produced the 57%.
+
+## The control that points at the wrong layer (2026-08-30, four in one session)
+
+Rule 7 asks whether your check can fail. These four all could, and all were green
+for the wrong reason. The CONTROL, not the assertion, was the broken half every
+time: it tested something adjacent to the thing that could break, so the headline
+assertion looked pinned and was not.
+
+All four were caught by `scripts/mutate.sh`, none by reading the tests. That is
+the point worth carrying: a control is exactly the kind of code nobody re-reads,
+because its job is to pass.
+
+**1. A predicate arm the fixture could not reach.** `deps_blocking` returns the
+open blockers in `depends_on`. The control asserted "a card with no dependencies
+is never blocked". Mutating `None => false` to `None => true` (an id resolving to
+nothing blocks, parking the holder forever) SURVIVED it, because a card with an
+EMPTY `depends_on` never enters the filter at all. Two different things were both
+being called "no dependency".
+
+**2. A control that tested the schema instead of the scan.** A new test asserted
+every timestamp-shaped column declares its unit. Its control asked
+`pragma_table_info` whether the columns exist, which proves the SCHEMA has them
+and says nothing about whether the SCAN finds them. Disabling the scan's match
+left both green. The fix was to make the function return `(undeclared,
+n_scanned)`, because an empty list is BOTH the pass condition and what a broken
+scan returns. That is the AF-320 `measured`/`n_considered` rule applied to a
+function rather than an endpoint.
+
+**3. Logic no test could call.** The ready frontier's blocked-on exclusion lived
+inline in a handler that needs `AppState`, so the only cells able to run tested
+the store instead. Disabling the arm outright kept every one of them green. A
+predicate the tests cannot call is a predicate nothing pins, whatever else is
+asserted about its neighbourhood.
+
+**4. Arrival is not payload.** A board note now notifies the named REVIEWER
+(AMUX-3771). Verified by inspecting the recipient's `steering_queue`, which
+proves the steer LANDED. `amux-frustrations`, from the receiving end, supplied
+the half that check could not: the payload named the right card and framed the
+role correctly. A notify path can deliver to the right lane and still mislabel
+the role or point at the wrong id, and from the sender's side that arm looks
+IDENTICAL. "It landed" is true in both cases.
+
+A fifth, independently, the same day: `amux-frustrations`'s own AF-346 test
+asserted the slim hydrate returns empty prose and the full one returns it. Both
+true, neither touched the consumer, so the suite was green while the dashboard
+blanked.
+
+**The shape.** Testing only the arm you expect to fire. The refusal without the
+acceptance, the acceptance without the refusal, the store without the consumer,
+the delivery without the contents. Each is half a claim wearing a whole one.
+
+**What to do instead.** Before believing a control, ask what it would still say
+if the thing it guards were deleted. If the answer is "the same", it is not a
+control. And prefer a control that runs through the SAME function the assertion
+trusts: every failure above came from a control that reached the subject by a
+different path than the code under test.
