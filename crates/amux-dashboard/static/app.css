@@ -5787,3 +5787,31 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
   .board-archived-section { margin-top: 8px; }
   .board-archived-row { padding: 10px; }
 }
+
+/* Declare-a-connector form (AMUX-3990). Grid collapses to one column under the
+   existing 600px breakpoint; inputs are 44px tall so they are touch targets on
+   the phone PWA, which is the primary surface. */
+.conn-add { margin: 10px 0 14px; }
+.conn-add-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+.conn-add-grid label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: .85em; color: var(--dim);
+}
+.conn-add-grid input, .conn-add-grid select {
+  min-height: 44px;
+  padding: 6px 8px;
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  background: var(--bg2, #1a1a1a);
+  color: inherit;
+  font-size: .95em;
+  min-width: 0;
+}
+@media (max-width: 600px) {
+  .conn-add-grid { grid-template-columns: 1fr; }
+}

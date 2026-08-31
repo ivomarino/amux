@@ -8262,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.760';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.761';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16778,6 +16778,122 @@ let _mdaiRootPath;   // cached mdai_root pref (the local.amux folder), '' if uns
 // /api/scope connectors capability. A connector is a scopable capability, not a
 // new subsystem — the tab composes primitives (scope + env), it does not add one.
 let _connectorsData = null;
+function _connAddToggle() {
+  const f = document.getElementById('conn-add-form');
+  if (!f) return;
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+}
+
+function _connAddKind() {
+  const k = (document.getElementById('conn-new-kind') || {}).value;
+  const ak = document.getElementById('conn-new-apikey');
+  const oa = document.getElementById('conn-new-oauth');
+  if (ak) ak.style.display = k === 'oauth2' ? 'none' : 'grid';
+  if (oa) oa.style.display = k === 'oauth2' ? 'grid' : 'none';
+}
+
+function _connAddScope() {
+  // global needs no name; group/worker do.
+  const lvl = (document.getElementById('conn-new-scope-level') || {}).value;
+  const wrap = document.getElementById('conn-new-scope-name-wrap');
+  if (wrap) wrap.style.display = (lvl === 'global') ? 'none' : 'block';
+}
+
+// Add the new connector to a scope layer WITHOUT clobbering what is already
+// there. The connectors capability stores one JSON object per level mapping
+// connector -> config, so a bare PUT of {id:{enabled:true}} would delete every
+// other connector's entry at that level. Read, merge, write.
+async function _connScopeEnable(id, level, name) {
+  const qs = '/api/scope?level=' + encodeURIComponent(level)
+    + (level === 'global' ? '' : '&name=' + encodeURIComponent(name || ''))
+    + '&capability=connectors';
+  let current = {};
+  try {
+    const r = await fetch(API + qs, { headers: _authHeaders() });
+    const d = await r.json();
+    if (d && d.connectors && typeof d.connectors === 'object') current = d.connectors;
+  } catch (e) { /* absent layer reads as {} — the merge below still writes ours */ }
+  current[id] = Object.assign({}, current[id] || {}, { enabled: true });
+  const r2 = await fetch(API + '/api/scope', {
+    method: 'PUT',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+    body: JSON.stringify({ level: level, name: name || '', capability: 'connectors', value: current }),
+  });
+  const d2 = await r2.json().catch(() => ({}));
+  if (!r2.ok || d2.error) throw new Error(d2.error || ('scope save failed (' + r2.status + ')'));
+}
+
+async function _connCreate() {
+  const msg = document.getElementById('conn-add-msg');
+  const val = (id) => ((document.getElementById(id) || {}).value || '').trim();
+  const kind = val('conn-new-kind') || 'api_key';
+  const level = val('conn-new-scope-level') || 'global';
+  const scopeName = val('conn-new-scope-name');
+  if (level !== 'global' && !scopeName) {
+    if (msg) { msg.textContent = 'Name the group or worker to scope to.'; msg.style.color = '#f85149'; }
+    return;
+  }
+  const body = {
+    id: (val('conn-new-id') || val('conn-new-label')).toLowerCase().replace(/[^a-z0-9_-]+/g, '-'),
+    label: val('conn-new-label'),
+    kind: kind,
+    setup_note: val('conn-new-note'),
+    docs: val('conn-new-docs'),
+  };
+  if (kind === 'oauth2') {
+    body.client_id_env = val('conn-new-cid-env').toUpperCase();
+    body.client_secret_env = val('conn-new-csec-env').toUpperCase();
+    body.authorize_url = val('conn-new-auth-url');
+    body.token_url = val('conn-new-token-url');
+    body.scopes = val('conn-new-scopes');
+  } else {
+    body.key_env = val('conn-new-key-env').toUpperCase();
+    body.test_url = val('conn-new-test-url');
+  }
+  if (msg) { msg.textContent = 'Creating…'; msg.style.color = 'var(--dim)'; }
+  try {
+    const r = await fetch(API + '/api/connectors', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) {
+      // Show the server's REASON verbatim: it explains WHY an id or env name was
+      // refused, and it refuses rather than rewriting.
+      if (msg) { msg.textContent = (d.error || ('create failed (' + r.status + ')')) + (d.how ? ' — ' + d.how : ''); msg.style.color = '#f85149'; }
+      return;
+    }
+    // The definition exists; now make the scope explicit. Reported separately,
+    // because a connector that was created but not scoped is a different state
+    // from one that failed to create, and saying "done" for both would hide it.
+    try {
+      await _connScopeEnable(body.id, level, scopeName);
+      if (msg) { msg.textContent = 'Created and enabled at ' + level + ' scope. Paste the key in its row below.'; msg.style.color = ''; }
+    } catch (e) {
+      if (msg) { msg.textContent = 'Created, but the scope write failed: ' + String(e.message || e) + ' — set it in the Scope tab.'; msg.style.color = '#b8860b'; }
+    }
+    _connAddToggle();
+    _connectorsTabLoad();
+  } catch (e) {
+    if (msg) { msg.textContent = 'Create failed: ' + String(e); msg.style.color = '#f85149'; }
+  }
+}
+
+async function _connDelete(id) {
+  if (!confirm('Forget connector "' + id + '"?\n\nThe definition is removed. Any credential VALUES already in server.env are left alone.')) return;
+  try {
+    const r = await fetch(API + '/api/connectors/' + encodeURIComponent(id), {
+      method: 'DELETE', headers: _authHeaders(),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'delete failed'); return; }
+    const left = (d.credentials_left_in_server_env || []).join(', ');
+    showToast('Removed ' + id + (left ? ' — ' + left + ' still in server.env' : ''));
+    _connectorsTabLoad();
+  } catch (e) { showToast('delete failed: ' + String(e)); }
+}
+
 async function _connectorsTabLoad() {
   const host = document.getElementById('connectors-list');
   if (!host) return;
@@ -16834,7 +16950,12 @@ function _connectorsRender(d) {
       html += '<div class="conn-gmail" id="conn-gmail-accounts"><div class="conn-gmail-loading">Loading Gmail accounts…</div></div>';
     }
     // test connection — verify it actually WORKS, not just that a key is present
-    html += '<div class="conn-test"><button class="conn-test-btn" onclick="_connectorTest(\'' + esc(c.id) + '\', this)">Test connection</button> <span class="conn-test-result" id="conn-test-' + esc(c.id) + '"></span></div>';
+    html += '<div class="conn-test"><button class="conn-test-btn" onclick="_connectorTest(\'' + esc(c.id) + '\', this)">Test connection</button> <span class="conn-test-result" id="conn-test-' + esc(c.id) + '"></span>';
+    // Delete is offered ONLY on declared rows. A builtin comes from the const
+    // registry and removing one is a code change, so the server refuses it —
+    // showing the button anyway would be an affordance that always fails.
+    if (c.custom) html += ' <button class="conn-test-btn" onclick="_connDelete(\'' + esc(c.id) + '\')">Forget</button>';
+    html += '</div>';
     // scope control (global / group / worker) — drives /api/scope
     html += '<div class="conn-scope"><span class="conn-slabel">Enable for:</span> '
       + '<button class="conn-scope-btn" onclick="_connectorScope(\'' + esc(c.id) + '\',\'global\',true)">Global</button>'

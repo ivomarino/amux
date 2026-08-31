@@ -222,6 +222,192 @@ fn provider(id: &str) -> Option<&'static Provider> {
     REGISTRY.iter().find(|p| p.id == id)
 }
 
+// ---------------------------------------------------------------------------
+// USER-DEFINED CONNECTORS (AMUX-3990)
+//
+// The registry above is a const table, which the module header calls "one row"
+// to add a connector. That row is a CODE EDIT: it needs a rebuild, a commit and
+// a deploy before Ethan can paste a key. For a connector whose only novelty is
+// "this vendor wants an API key in this env var", that is the whole cost, and it
+// is why the tab could show six providers and no way to add a seventh.
+//
+// So a connector may also be DECLARED AT RUNTIME and stored as data. Everything
+// else is unchanged and deliberately so:
+//
+//   * values still go to ~/.amux/server.env via set_server_env_key — the one
+//     place credential VALUES live. This store holds NAMES ONLY: the id, the
+//     label, and which env vars to ask for. Never a secret.
+//   * scope still comes from the `connectors` capability in scope.rs, which
+//     already has global/group/worker. Nothing here re-implements scoping.
+//
+// A custom row and a builtin row are resolved through ONE seam ([`def_of`]) and
+// rendered by one loop, rather than the tab growing a second list with its own
+// rules. That is the mistake this module's header warns about.
+// ---------------------------------------------------------------------------
+
+/// Where user-declared connectors live. NAMES ONLY — no credential value ever
+/// enters this file, so it is not a secret store and does not need the
+/// server.env handling.
+fn custom_store_path(home: &std::path::Path) -> PathBuf {
+    home.join("connectors").join("custom.json")
+}
+
+/// A connector Ethan declared in the tab.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+struct CustomProvider {
+    id: String,
+    label: String,
+    #[serde(default)]
+    category: String,
+    /// "api_key" or "oauth2".
+    kind: String,
+    /// api_key
+    #[serde(default)]
+    key_env: String,
+    /// oauth2
+    #[serde(default)]
+    client_id_env: String,
+    #[serde(default)]
+    client_secret_env: String,
+    #[serde(default)]
+    authorize_url: String,
+    #[serde(default)]
+    token_url: String,
+    #[serde(default)]
+    scopes: String,
+    #[serde(default)]
+    setup_note: String,
+    #[serde(default)]
+    docs: String,
+    #[serde(default)]
+    test_url: String,
+}
+
+fn load_custom(home: &std::path::Path) -> Vec<CustomProvider> {
+    std::fs::read_to_string(custom_store_path(home))
+        .ok()
+        .and_then(|t| serde_json::from_str::<Vec<CustomProvider>>(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_custom(home: &std::path::Path, list: &[CustomProvider]) -> std::io::Result<()> {
+    let path = custom_store_path(home);
+    if let Some(d) = path.parent() {
+        std::fs::create_dir_all(d)?;
+    }
+    let body = serde_json::to_string_pretty(list).unwrap_or_else(|_| "[]".into());
+    std::fs::write(&path, body)
+}
+
+/// The owned, source-agnostic view of a connector.
+///
+/// Builtins are `&'static`; custom ones are read off disk and cannot be. Rather
+/// than leak custom strings into 'static (which grows on every reload, since the
+/// store is re-read per request) or run two parallel code paths, both sources
+/// convert into this one owned type.
+#[derive(Clone)]
+struct Def {
+    id: String,
+    label: String,
+    category: String,
+    kind: &'static str,
+    env_keys: Vec<String>,
+    /// oauth2 only; empty for api_key.
+    authorize_url: String,
+    token_url: String,
+    scopes: String,
+    setup_note: String,
+    docs: String,
+    test_url: String,
+    /// False for rows declared in the tab — the UI offers Delete only on those,
+    /// and the delete endpoint refuses a builtin rather than silently no-oping.
+    builtin: bool,
+}
+
+impl From<&'static Provider> for Def {
+    fn from(p: &'static Provider) -> Def {
+        let (kind, authorize_url, token_url, scopes) = match p.auth {
+            Auth::ApiKey { .. } => ("api_key", String::new(), String::new(), String::new()),
+            Auth::OAuth2 { scopes, .. } => ("oauth2", String::new(), String::new(), scopes.to_string()),
+            Auth::LoginPassword { .. } => {
+                ("login_password", String::new(), String::new(), String::new())
+            }
+        };
+        Def {
+            id: p.id.to_string(),
+            label: p.label.to_string(),
+            category: p.category.to_string(),
+            kind,
+            env_keys: env_keys(p).into_iter().map(str::to_string).collect(),
+            authorize_url,
+            token_url,
+            scopes,
+            setup_note: p.setup_note.to_string(),
+            docs: p.docs.to_string(),
+            test_url: p.test_url.to_string(),
+            builtin: true,
+        }
+    }
+}
+
+impl From<&CustomProvider> for Def {
+    fn from(c: &CustomProvider) -> Def {
+        let (kind, env_keys) = if c.kind == "oauth2" {
+            ("oauth2", vec![c.client_id_env.clone(), c.client_secret_env.clone()])
+        } else {
+            ("api_key", vec![c.key_env.clone()])
+        };
+        Def {
+            id: c.id.clone(),
+            label: c.label.clone(),
+            category: if c.category.trim().is_empty() {
+                "Custom".to_string()
+            } else {
+                c.category.clone()
+            },
+            kind,
+            env_keys: env_keys.into_iter().filter(|k| !k.trim().is_empty()).collect(),
+            authorize_url: c.authorize_url.clone(),
+            token_url: c.token_url.clone(),
+            scopes: c.scopes.clone(),
+            setup_note: c.setup_note.clone(),
+            docs: c.docs.clone(),
+            test_url: c.test_url.clone(),
+            builtin: false,
+        }
+    }
+}
+
+/// Every connector, builtin first then declared. THE one place the two sources
+/// are joined.
+fn defs(home: &std::path::Path) -> Vec<Def> {
+    let mut out: Vec<Def> = REGISTRY.iter().map(Def::from).collect();
+    out.extend(load_custom(home).iter().map(Def::from));
+    out
+}
+
+/// Resolve one connector from either source.
+fn def_of(home: &std::path::Path, id: &str) -> Option<Def> {
+    defs(home).into_iter().find(|d| d.id == id)
+}
+
+/// A connector id must be safe to use as a path component (the token store is
+/// `~/.amux/connectors/<id>/`) and as a JSON key. Rejects rather than sanitises:
+/// a silently-rewritten id is one the caller cannot find again.
+fn valid_connector_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '_')
+}
+
+/// An env var name Ethan may declare. Same reasoning: reject, do not rewrite.
+fn valid_env_name(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 128
+        && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && !k.chars().next().is_some_and(|c| c.is_ascii_digit())
+}
+
 /// The env-var NAMES a provider needs, in paste order. OAuth needs two (client
 /// id + secret); ApiKey needs one.
 fn env_keys(p: &Provider) -> Vec<&'static str> {
@@ -668,10 +854,263 @@ async fn list() -> Response {
             })
         })
         .collect();
+    // DECLARED CONNECTORS, appended to the SAME array with the SAME field shape
+    // (AMUX-3990). One list, two constructors — not a second list with its own
+    // rules, which is the mistake this module's header warns about. The builtin
+    // loop above carries Google/Slack-family machinery that a declared row has
+    // no equivalent of, which is why the construction differs and the CONTRACT
+    // does not.
+    let home = amux_home();
+    let mut items = items;
+    for c in load_custom(&home) {
+        let d = Def::from(&c);
+        let key_status: Vec<Value> = d
+            .env_keys
+            .iter()
+            .map(|k| {
+                let v = env_val(&file_env, k);
+                json!({
+                    "name": k,
+                    "set": v.is_some(),
+                    "masked": v.as_deref().map(super::settings::mask_secret),
+                })
+            })
+            .collect();
+        let all_set = !key_status.is_empty()
+            && key_status.iter().all(|k| k["set"].as_bool().unwrap_or(false));
+        let is_oauth = d.kind == "oauth2";
+        let has_grant = !store_accounts(&home, &d.id).is_empty();
+        let status = if !all_set {
+            "needs_credentials"
+        } else if is_oauth && !has_grant {
+            "needs_auth"
+        } else {
+            "connected"
+        };
+        // An API key IS the credential, so it is usable the moment it is set.
+        // An OAuth row is only usable once a grant exists — the same honesty the
+        // builtin ladder applies, rather than calling a pasted client id
+        // "connected" and handing a caller nothing (AMUX-3362).
+        let usable = all_set && (!is_oauth || has_grant);
+        items.push(json!({
+            "id": d.id,
+            "label": d.label,
+            "category": d.category,
+            "auth": if is_oauth { "oauth2" } else { "apikey" },
+            "oauth": if is_oauth {
+                json!({
+                    "redirect_uri": format!("{}/api/connectors/{}/callback", origin(), d.id),
+                    "scopes": d.scopes,
+                    "authorize_url": d.authorize_url,
+                    "token_url": d.token_url,
+                })
+            } else {
+                Value::Null
+            },
+            "env_keys": key_status,
+            "status": status,
+            "cred_source": if all_set { json!("server.env") } else { Value::Null },
+            "usable": usable,
+            "token_endpoint": if usable {
+                json!(format!("/api/connectors/{}/token", d.id))
+            } else {
+                Value::Null
+            },
+            "detail": Value::Null,
+            "setup_note": d.setup_note,
+            "docs": d.docs,
+            // The ONLY field a builtin does not carry. The tab offers Delete on
+            // these and not on builtins, and the delete endpoint refuses a
+            // builtin rather than silently no-oping.
+            "custom": true,
+        }));
+    }
     Json(json!({
         "connectors": items,
         "origin": origin(),
         "note": "Paste credential VALUES here; they are written to ~/.amux/server.env and never returned. When a connector reports a token_endpoint, POST it to mint a ready-to-use short-lived bearer (no key path to know). Set scope (global/group/worker) via the Scope tab or the per-connector scope control (PUT /api/scope, capability=connectors).",
+    }))
+    .into_response()
+}
+
+/// POST /api/connectors — declare a NEW connector (AMUX-3990).
+///
+/// Body: `{id,label,kind,category?,key_env?|client_id_env+client_secret_env,
+///          authorize_url?,token_url?,scopes?,setup_note?,docs?,test_url?}`
+///
+/// NAMES ONLY. This endpoint never accepts a credential VALUE — the paste is a
+/// separate call to `/{id}/credentials`, which writes to server.env. Keeping the
+/// two apart is why the definition file can live unencrypted next to the token
+/// store without becoming a second secret store.
+///
+/// SCOPE IS NOT SET HERE, on purpose. The module header's rule is that this
+/// module never re-implements scoping, and it would be re-implementing it to
+/// write a prefs layer from here. The tab calls `PUT /api/scope` with
+/// `capability=connectors` after a successful create, defaulting the level to
+/// `global` — so the default is EXPLICIT and visible in the Scope tab rather
+/// than an implicit consequence of no layer existing anywhere.
+async fn create_connector(Json(body): Json<Value>) -> Response {
+    let home = amux_home();
+    let get = |k: &str| -> String {
+        body.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string()
+    };
+    let id = get("id").to_ascii_lowercase();
+    let label = get("label");
+    let kind = {
+        let k = get("kind");
+        if k.is_empty() { "api_key".to_string() } else { k }
+    };
+
+    let bad = |msg: String, how: &str| -> Response {
+        (StatusCode::BAD_REQUEST, Json(json!({"error": msg, "how": how}))).into_response()
+    };
+    if !valid_connector_id(&id) {
+        return bad(
+            format!("invalid connector id '{id}'"),
+            "lowercase letters, digits, '-' and '_' only, 1-64 chars — it is used as a path component under ~/.amux/connectors/ and is rejected rather than rewritten, so the id you get back is the id you asked for",
+        );
+    }
+    if label.is_empty() {
+        return bad("label is required".into(), "the human-readable name shown in the Connectors tab");
+    }
+    if kind != "api_key" && kind != "oauth2" {
+        return bad(format!("unknown kind '{kind}'"), "kind must be \"api_key\" or \"oauth2\"");
+    }
+    // A builtin wins: shadowing one from the tab would make the same id mean two
+    // things depending on which loop rendered it.
+    if provider(&id).is_some() {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("'{id}' is a built-in connector"),
+                "how": "pick another id — a declared connector may not shadow a builtin, or the same id would resolve differently depending on which list rendered it",
+            })),
+        )
+            .into_response();
+    }
+    let mut list = load_custom(&home);
+    if list.iter().any(|c| c.id == id) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": format!("connector '{id}' already exists"),
+                "how": "DELETE /api/connectors/{id} first, or pick another id",
+            })),
+        )
+            .into_response();
+    }
+
+    let c = CustomProvider {
+        id: id.clone(),
+        label,
+        category: get("category"),
+        kind: kind.clone(),
+        key_env: get("key_env").to_ascii_uppercase(),
+        client_id_env: get("client_id_env").to_ascii_uppercase(),
+        client_secret_env: get("client_secret_env").to_ascii_uppercase(),
+        authorize_url: get("authorize_url"),
+        token_url: get("token_url"),
+        scopes: get("scopes"),
+        setup_note: get("setup_note"),
+        docs: get("docs"),
+        test_url: get("test_url"),
+    };
+
+    // Every env name this connector will be allowed to write must be a legal
+    // env name, checked BEFORE the row is stored. `set_credentials` restricts a
+    // paste to exactly these, so an unchecked name here would be an unchecked
+    // name at write time.
+    let declared: Vec<&String> = if kind == "oauth2" {
+        vec![&c.client_id_env, &c.client_secret_env]
+    } else {
+        vec![&c.key_env]
+    };
+    for k in &declared {
+        if !valid_env_name(k) {
+            return bad(
+                format!("invalid env var name '{k}'"),
+                "A-Z, 0-9 and '_' only, not starting with a digit — this name is what the credential paste is restricted to, so it is validated before the connector is stored",
+            );
+        }
+    }
+    if kind == "oauth2" && (c.authorize_url.is_empty() || c.token_url.is_empty()) {
+        return bad(
+            "oauth2 needs authorize_url and token_url".into(),
+            "amux has no per-vendor knowledge for a declared connector, so the grant cannot start without both endpoints",
+        );
+    }
+
+    list.push(c);
+    if let Err(e) = save_custom(&home, &list) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("could not write the connector store: {e}")})),
+        )
+            .into_response();
+    }
+    let d = def_of(&home, &id).expect("just stored");
+    Json(json!({
+        "ok": true,
+        "connector": {
+            "id": d.id,
+            "label": d.label,
+            "category": d.category,
+            "auth": if d.kind == "oauth2" { "oauth2" } else { "apikey" },
+            "env_keys": d.env_keys,
+            "custom": true,
+        },
+        "next": format!("POST /api/connectors/{id}/credentials with {{\"<ENV_NAME>\": \"<value>\"}}"),
+        "scope_next": "PUT /api/scope capability=connectors level=global (the tab does this for you)",
+    }))
+    .into_response()
+}
+
+/// DELETE /api/connectors/{id} — forget a DECLARED connector.
+///
+/// Removes the definition only. The credential VALUES in server.env are left
+/// alone and named in the response: deleting a row in the tab should not
+/// silently destroy a key that other things may still read, and a caller who
+/// wants them gone can say so explicitly.
+async fn delete_connector(Path(id): Path<String>) -> Response {
+    let home = amux_home();
+    if def_of(&home, &id).is_some_and(|d| d.builtin) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": format!("'{id}' is a built-in connector and cannot be deleted"),
+                "how": "built-ins come from the const registry in connectors.rs; removing one is a code change",
+            })),
+        )
+            .into_response();
+    }
+    let mut list = load_custom(&home);
+    let before = list.len();
+    let removed: Vec<String> = list
+        .iter()
+        .filter(|c| c.id == id)
+        .flat_map(|c| Def::from(c).env_keys)
+        .collect();
+    list.retain(|c| c.id != id);
+    if list.len() == before {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(json!({"error": format!("no declared connector '{id}'")})),
+        )
+            .into_response();
+    }
+    if let Err(e) = save_custom(&home, &list) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("could not write the connector store: {e}")})),
+        )
+            .into_response();
+    }
+    Json(json!({
+        "ok": true,
+        "deleted": id,
+        // Said out loud rather than done silently, in both directions.
+        "credentials_left_in_server_env": removed,
+        "note": "the definition is gone; the credential VALUES above are still in ~/.amux/server.env and were NOT deleted",
     }))
     .into_response()
 }
@@ -682,10 +1121,14 @@ async fn list() -> Response {
 /// arbitrary env key). Values go to server.env and are redacted from the log and
 /// the response.
 async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Response {
-    let Some(p) = provider(&id) else {
+    // Resolved through the ONE seam, so a connector declared in the tab accepts
+    // a paste exactly like a builtin does (AMUX-3990). The restriction below is
+    // unchanged and is the security property: a paste for one connector can only
+    // write the env keys THAT connector declares, whichever source declared it.
+    let Some(d) = def_of(&amux_home(), &id) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown connector '{id}'")}))).into_response();
     };
-    let allowed = env_keys(p);
+    let allowed: Vec<&str> = d.env_keys.iter().map(String::as_str).collect();
     let Some(obj) = body.as_object() else {
         return (StatusCode::BAD_REQUEST, Json(json!({"error": "body must be a JSON object of {ENV_NAME: value}"}))).into_response();
     };
@@ -1281,6 +1724,58 @@ async fn complete_exchange(
 /// bearer value is NEVER logged — only the provider id, HTTP status and latency
 /// (grep `connector_test`).
 async fn test_connection(Path(id): Path<String>) -> Response {
+    // DECLARED CONNECTORS TEST GENERICALLY (AMUX-3990). The builtin ladder below
+    // branches per `Auth` because each vendor family has its own shape; a row
+    // declared in the tab has no such knowledge, so all amux can honestly do is
+    // GET the declared test_url with the declared key as a bearer. When no
+    // test_url was given, say the test did not RUN rather than return a
+    // pass/fail neither of us measured (ethos rule 4).
+    if let Some(d) = def_of(&amux_home(), &id).filter(|d| !d.builtin) {
+        let file_env = parse_env_file(&amux_home().join("server.env"));
+        let missing: Vec<&String> =
+            d.env_keys.iter().filter(|k| env_val(&file_env, k).is_none()).collect();
+        if !missing.is_empty() {
+            return Json(json!({
+                "ok": false,
+                "status": "needs_credentials",
+                "measured": false,
+                "detail": format!("set {} first — nothing to test yet", missing.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")),
+            }))
+            .into_response();
+        }
+        if d.test_url.trim().is_empty() {
+            return Json(json!({
+                "ok": true,
+                "status": "connected",
+                "measured": false,
+                "why_unmeasured": "no test_url was declared for this connector, so amux checked that the credential is PRESENT and did not verify it works",
+                "detail": format!("{} set", d.env_keys.join(", ")),
+            }))
+            .into_response();
+        }
+        let key = d.env_keys.first().and_then(|k| env_val(&file_env, k)).unwrap_or_default();
+        let res = ReqwestTransport::new().get(&d.test_url, Some(&key)).await;
+        return match res {
+            Ok((code, _)) if (200..300).contains(&code) => Json(json!({
+                "ok": true, "status": "connected", "measured": true, "http": code,
+            }))
+            .into_response(),
+            Ok((code, body)) => Json(json!({
+                "ok": false,
+                "status": "error",
+                "measured": true,
+                "http": code,
+                "detail": format!("{} answered {code}", d.test_url),
+                "body": body,
+            }))
+            .into_response(),
+            Err(e) => Json(json!({
+                "ok": false, "status": "error", "measured": true,
+                "detail": format!("{}: {e}", d.test_url),
+            }))
+            .into_response(),
+        };
+    }
     let Some(p) = provider(&id) else {
         return (StatusCode::NOT_FOUND, Json(json!({"error": format!("unknown connector '{id}'")}))).into_response();
     };
@@ -2091,7 +2586,8 @@ pub fn routes() -> Router<AppState> {
 
 pub fn routes_with(ctx: Arc<ConnectorsCtx>) -> Router<AppState> {
     Router::new()
-        .route("/api/connectors", get(list))
+        .route("/api/connectors", get(list).post(create_connector))
+        .route("/api/connectors/{id}", axum::routing::delete(delete_connector))
         .route("/api/connectors/accounts", get(accounts_view))
         .route("/api/connectors/{id}/credentials", post(set_credentials))
         .route("/api/connectors/{id}/auth", post(begin_auth))
@@ -2110,6 +2606,197 @@ pub fn callback_routes_with(ctx: Arc<ConnectorsCtx>) -> Router<AppState> {
     Router::new()
         .route("/api/connectors/{family}/callback", get(callback))
         .layer(Extension(ctx))
+}
+
+#[cfg(test)]
+mod declared_connector_tests {
+    use super::*;
+
+    /// Declaring a connector must not require a rebuild (AMUX-3990).
+    ///
+    /// Before this, the registry was a const table and the module header called
+    /// adding a row "trivial" — but it is a code edit, a commit and a deploy
+    /// before Ethan can paste a key. These cells pin the runtime path.
+    fn home() -> tempfile::TempDir {
+        tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn a_declared_api_key_connector_round_trips_through_the_store() {
+        let h = home();
+        let list = vec![CustomProvider {
+            id: "acme".into(),
+            label: "Acme".into(),
+            category: String::new(),
+            kind: "api_key".into(),
+            key_env: "ACME_API_KEY".into(),
+            client_id_env: String::new(),
+            client_secret_env: String::new(),
+            authorize_url: String::new(),
+            token_url: String::new(),
+            scopes: String::new(),
+            setup_note: String::new(),
+            docs: String::new(),
+            test_url: String::new(),
+        }];
+        save_custom(h.path(), &list).expect("save");
+        let d = def_of(h.path(), "acme").expect("declared connector must resolve");
+        assert_eq!(d.env_keys, vec!["ACME_API_KEY".to_string()]);
+        assert_eq!(d.kind, "api_key");
+        assert!(!d.builtin, "a declared row must not claim to be builtin");
+        assert_eq!(d.category, "Custom", "an empty category gets a default, not an empty column");
+    }
+
+    /// THE SEAM IS ONE SEAM. A builtin and a declared row must both resolve
+    /// through `def_of`, or the tab has two lists with two sets of rules — the
+    /// mistake this module's header warns about.
+    #[test]
+    fn builtins_and_declared_rows_resolve_through_the_same_function() {
+        let h = home();
+        save_custom(
+            h.path(),
+            &[CustomProvider {
+                id: "acme".into(),
+                label: "Acme".into(),
+                category: String::new(),
+                kind: "api_key".into(),
+                key_env: "ACME_API_KEY".into(),
+                client_id_env: String::new(),
+                client_secret_env: String::new(),
+                authorize_url: String::new(),
+                token_url: String::new(),
+                scopes: String::new(),
+                setup_note: String::new(),
+                docs: String::new(),
+                test_url: String::new(),
+            }],
+        )
+        .unwrap();
+        let all = defs(h.path());
+        assert!(all.iter().any(|d| d.id == "granola" && d.builtin), "builtins must be present");
+        assert!(all.iter().any(|d| d.id == "acme" && !d.builtin), "declared rows must be present");
+        // And a builtin still resolves with the SAME call the declared one uses.
+        assert!(def_of(h.path(), "granola").is_some_and(|d| d.builtin));
+    }
+
+    /// Ids are REJECTED, never rewritten. A silently-sanitised id is one the
+    /// caller cannot find again, and it is used as a path component under
+    /// ~/.amux/connectors/.
+    #[test]
+    fn ids_and_env_names_are_rejected_rather_than_sanitised() {
+        assert!(valid_connector_id("acme-corp_1"));
+        assert!(!valid_connector_id(""), "empty");
+        assert!(!valid_connector_id("Acme"), "uppercase");
+        assert!(!valid_connector_id("../etc/passwd"), "path traversal");
+        assert!(!valid_connector_id("a b"), "space");
+        assert!(!valid_connector_id(&"x".repeat(65)), "over length");
+
+        assert!(valid_env_name("ACME_API_KEY"));
+        assert!(!valid_env_name("acme_api_key"), "lowercase");
+        assert!(!valid_env_name("1ACME"), "leading digit");
+        assert!(!valid_env_name("ACME-KEY"), "hyphen is not legal in an env name");
+        assert!(!valid_env_name(""), "empty");
+    }
+
+    /// CONTROL for the cell above: the validators must ACCEPT the shape the tab
+    /// actually sends, or "reject everything" would pass every assertion there.
+    #[test]
+    fn the_validators_accept_a_realistic_declaration() {
+        assert!(valid_connector_id("linear"));
+        assert!(valid_connector_id("openai"));
+        assert!(valid_env_name("LINEAR_API_KEY"));
+        assert!(valid_env_name("OPENAI_API_KEY"));
+    }
+
+    /// An OAuth row exposes the two env names the paste is restricted to, and an
+    /// api_key row exposes one. `set_credentials` derives its allow-list from
+    /// exactly this, so a wrong shape here is a wrong write restriction there.
+    #[test]
+    fn oauth_declares_two_env_keys_and_api_key_declares_one() {
+        let oauth = CustomProvider {
+            id: "vend".into(),
+            label: "Vend".into(),
+            category: String::new(),
+            kind: "oauth2".into(),
+            key_env: String::new(),
+            client_id_env: "VEND_CLIENT_ID".into(),
+            client_secret_env: "VEND_CLIENT_SECRET".into(),
+            authorize_url: "https://vend.example/authorize".into(),
+            token_url: "https://vend.example/token".into(),
+            scopes: "read".into(),
+            setup_note: String::new(),
+            docs: String::new(),
+            test_url: String::new(),
+        };
+        let d = Def::from(&oauth);
+        assert_eq!(d.kind, "oauth2");
+        assert_eq!(d.env_keys, vec!["VEND_CLIENT_ID".to_string(), "VEND_CLIENT_SECRET".to_string()]);
+        assert_eq!(d.authorize_url, "https://vend.example/authorize");
+    }
+
+    /// The store holds NAMES ONLY. If a credential value ever reaches it, this
+    /// file becomes a secret store sitting unencrypted next to the token dir,
+    /// which is the one thing the design forbids.
+    #[test]
+    fn the_definition_store_never_contains_a_credential_value() {
+        let h = home();
+        save_custom(
+            h.path(),
+            &[CustomProvider {
+                id: "acme".into(),
+                label: "Acme".into(),
+                category: String::new(),
+                kind: "api_key".into(),
+                key_env: "ACME_API_KEY".into(),
+                client_id_env: String::new(),
+                client_secret_env: String::new(),
+                authorize_url: String::new(),
+                token_url: String::new(),
+                scopes: String::new(),
+                setup_note: String::new(),
+                docs: String::new(),
+                test_url: String::new(),
+            }],
+        )
+        .unwrap();
+        let raw = std::fs::read_to_string(custom_store_path(h.path())).unwrap();
+        assert!(raw.contains("ACME_API_KEY"), "the NAME is stored: {raw}");
+        // Assert the SHAPE, not a substring. My first version grepped for
+        // "secret" and failed on the field NAME `client_secret_env`, which is
+        // exactly the name-vs-value confusion this cell exists to police.
+        //
+        // Every key in the serialised form must be one of the known name-only
+        // fields. A new field carrying a VALUE would have to be added here
+        // deliberately, which is the review moment.
+        const NAME_ONLY_FIELDS: &[&str] = &[
+            "id", "label", "category", "kind", "key_env", "client_id_env",
+            "client_secret_env", "authorize_url", "token_url", "scopes",
+            "setup_note", "docs", "test_url",
+        ];
+        let rows: Vec<serde_json::Map<String, Value>> = serde_json::from_str(&raw).unwrap();
+        for row in &rows {
+            for k in row.keys() {
+                assert!(
+                    NAME_ONLY_FIELDS.contains(&k.as_str()),
+                    "unknown field '{k}' in the definition store — if it carries a credential \
+                     VALUE it belongs in server.env, not here"
+                );
+            }
+        }
+        // And the *_env fields hold NAMES: an env var name, never something that
+        // looks like a pasted secret.
+        for row in &rows {
+            for (k, v) in row.iter() {
+                if k.ends_with("_env") {
+                    let val = v.as_str().unwrap_or_default();
+                    assert!(
+                        val.is_empty() || valid_env_name(val),
+                        "{k} must hold an env var NAME, got '{val}'"
+                    );
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
