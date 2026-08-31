@@ -149,6 +149,58 @@ fn parse_etime(s: &str) -> Option<u64> {
     }
 }
 
+/// Minimum age (seconds) before an orphaned Playwright Chrome is eligible for
+/// reaping. Short grace covers the window between Chrome launch and the parent
+/// Playwright process registering the PID. Default 300s (5 minutes).
+fn playwright_chrome_grace_s() -> u64 {
+    std::env::var("AMUX_MAC_HEALTH_PLAYWRIGHT_GRACE_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(300)
+}
+
+/// Returns the PIDs of orphaned Playwright-launched Chrome processes.
+///
+/// Shape: `--user-data-dir=/var/folders/…/T/.tmp*/playwright-auth/profile`
+/// with PPID == 1 (parent Playwright process exited, Chrome reparented to
+/// init). Each Playwright session spawns ~8-9 Chrome helper processes; we
+/// only kill the root (PPID=1) and let the helpers die naturally.
+fn orphaned_playwright_chromes(grace_s: u64) -> Vec<(u32, u64)> {
+    let Ok(out) = std::process::Command::new("ps")
+        .args(["-A", "-o", "pid=,ppid=,etime=,command="])
+        .output()
+    else {
+        return vec![];
+    };
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut result = Vec::new();
+    for line in text.lines() {
+        let parts: Vec<&str> = line.splitn(4, ' ').filter(|s| !s.is_empty()).collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let (Ok(pid), Ok(ppid)) = (parts[0].trim().parse::<u32>(), parts[1].trim().parse::<u32>()) else {
+            continue;
+        };
+        if ppid != 1 {
+            continue; // only reap the root; helpers die with it
+        }
+        let etime = parts[2].trim();
+        let cmd = parts[3];
+        // Must be a Chrome process with a Playwright temp-profile user-data-dir.
+        let is_chrome = cmd.contains("Google Chrome") || cmd.contains("Chromium");
+        let has_playwright_tmpdir = cmd.contains("/T/.tmp") && cmd.contains("playwright-auth/profile");
+        if !is_chrome || !has_playwright_tmpdir {
+            continue;
+        }
+        let elapsed_s = parse_etime(etime).unwrap_or(0);
+        if elapsed_s >= grace_s {
+            result.push((pid, elapsed_s));
+        }
+    }
+    result
+}
+
 /// Count running `claude` processes and warn if over threshold.
 fn check_claude_count(max: usize) -> usize {
     let count = std::process::Command::new("pgrep")
@@ -172,6 +224,7 @@ fn check_claude_count(max: usize) -> usize {
 
 fn one_pass() {
     let grace = ray_orphan_grace_s();
+    let pw_grace = playwright_chrome_grace_s();
     let max_claude = max_claude();
 
     // --- Ray orphan sweep ---
@@ -198,6 +251,26 @@ fn one_pass() {
         tracing::debug!(job = JOB, "mac-health: raylet running, skipping ray orphan sweep");
     }
 
+    // --- Orphaned Playwright Chrome sweep ---
+    let pw_orphans = orphaned_playwright_chromes(pw_grace);
+    if !pw_orphans.is_empty() {
+        tracing::warn!(
+            job = JOB,
+            count = pw_orphans.len(),
+            grace_s = pw_grace,
+            "mac-health: orphaned Playwright temp-profile Chrome processes — sending SIGTERM"
+        );
+        for (pid, age_s) in &pw_orphans {
+            tracing::info!(
+                job = JOB, pid, age_s,
+                "mac-health: SIGTERM orphaned Playwright Chrome root"
+            );
+            let _ = std::process::Command::new("kill").args([&pid.to_string()]).output();
+        }
+    } else {
+        tracing::debug!(job = JOB, "mac-health: no orphaned Playwright Chrome processes");
+    }
+
     // --- Claude process count ---
     let claude_count = check_claude_count(max_claude);
     tracing::info!(
@@ -205,6 +278,7 @@ fn one_pass() {
         claude_count,
         max_claude,
         ray_alive = raylet_running(),
+        playwright_chromes_reaped = pw_orphans.len(),
         "mac-health tick"
     );
 }
