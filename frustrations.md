@@ -3016,7 +3016,8 @@ FIX: none yet — this is a structural gap, not a one-line bug. The honest
   currently has NONE — `free -h` shows `Swap: 0B`, so there is zero graceful
   degradation under pressure and the OOM killer fires immediately) or a
   standing, always-available remote build target instead of relying on
-  `docker.baar`/`thinkpad.atlantis` being up when needed.
+  the specific remote hosts named in CLAUDE.local.md (private, this repo
+  is public) being up when needed.
 
 ## Same root cause as above, escalated: the auto-builder itself now fails repeatedly, not just a manual check
 AREA: build
