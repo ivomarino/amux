@@ -119,9 +119,18 @@ CARDS: AF-318
 EVIDENCE: 445 cards in `needsyou`, median 15d, and 51% match no ask-shape at all.
 Their titles are plain engineering work. The twenty that genuinely need Ethan
 are indistinguishable inside them.
-Re-measured 2026-08-31: Mixpeek `needsyou` is 300 cards against a 215 baseline
-seven days ago, so it grew 85 in a week and the typed-ask gate (AF-318, shipped
-for amux) has not reached the Mixpeek board. That is the same shape as the
+Re-measured 2026-08-31: the scanner read Mixpeek `needsyou` at 300 against a 215
+baseline seven days ago. CORRECTED same day by mixpeek-frustrations, who counted
+the full board: 490 needsyou total, of which 120 are ARCHIVED and 370 live, and 77
+of the live ones already carry a typed ask (58 decision, 11 credential, 5 access,
+2 external, 1 judgment). So the typed-ask SCHEMA has reached that board and only
+the GATE has not, which is a cheaper fix than "ship AF-318 there" implies.
+The 120 archived is the number worth raising: an archived `needsyou` card asks
+nobody and appears in no view, so it is not waiting, it is gone, while still
+inflating every count of the queue. That is the shape amux already warns about for
+a NOTE appended to an archived card (the write succeeds and reaches nobody);
+archiving a card that is ASKING is the same silence one level up, and nothing
+warns. That is the same shape as the
 `measured` contract in the theme below: enforced on one side, watched on the other.
 One datapoint from this lane on the other side of it: four cards in this lane's own
 `needsyou` (AF-155, AF-206, AF-286 and a fourth filed before finding them) were ONE
