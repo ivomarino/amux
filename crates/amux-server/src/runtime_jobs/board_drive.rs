@@ -1857,47 +1857,28 @@ async fn promote_card(state: &AppState, card: &str, arm: PromoteArm) -> bool {
     let reply = state
         .store
         .write_async(move |conn| {
-            // The card could have been moved, archived, deleted, retyped or
-            // re-parked between the read scan and here. `WHERE status='backlog'`
-            // on the UPDATE makes the swap atomic against a concurrent move
-            // (mirrors claim_card's `WHERE status='todo'`); this makes it right.
+            // Pre-check: the card could have been moved, archived, deleted,
+            // retyped or re-parked between the read scan and here.
             let Some(row) = bs::get_issue(conn, &card_w)? else {
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             };
             if !still_promotable(conn, &row, arm) {
                 return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
             }
-            let now = now_f64() as i64;
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT log FROM issues WHERE id=?1",
-                    rusqlite::params![card_w],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
-            let hhmm = chrono::Local::now().format("%H:%M").to_string();
-            let log = bs::append_log(existing.as_deref(), &hhmm, arm.log_line());
-            let n = conn.execute(
-                "UPDATE issues SET status='todo', updated=?1, log=?2 \
-                 WHERE id=?3 AND status='backlog'",
-                rusqlite::params![now, log, card_w],
-            )?;
-            if n == 0 {
-                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-            }
-            let next = bs::get_issue(conn, &card_w)?
-                .expect("row present immediately after its own promote");
-            let event = crate::db::PendingEvent {
-                entity_type: amux_core::revision::EntityType::Task,
-                entity_id: next.id.clone(),
-                mutation: amux_core::revision::MutationKind::StatusChanged {
-                    from: "backlog".into(),
-                    to: "todo".into(),
-                },
-                payload: Some(next.snapshot()),
+            // Route through the single transition engine.
+            let opts = crate::db::advance::AdvanceOpts {
+                expected_from: Some("backlog".into()),
+                log_line: Some(arm.log_line().to_string()),
+                skip_continuation: true,
+                ..Default::default()
             };
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![event] })
+            match crate::db::advance::advance(conn, &card_w, "todo", "board_drive", &opts)? {
+                Ok(outcome) => Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: outcome.events,
+                }),
+                Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+            }
         })
         .await;
     matches!(reply, Ok(r) if r.applied)
@@ -4443,24 +4424,26 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
             // can claim the unblocked card. No nudge — the lane gets work
             // silently. Log so the trace is auditable.
             let to_promote = promoted.clone();
-            let promote_now = now;
             let result = state
                 .store
                 .write_async(move |conn| {
                     let mut promoted_ids: Vec<String> = Vec::new();
+                    let mut all_events = Vec::new();
                     for dep_id in &to_promote {
-                        let n = conn.execute(
-                            "UPDATE issues SET status='todo', updated=?1 \
-                             WHERE id=?2 AND status='backlog' AND deleted IS NULL",
-                            rusqlite::params![promote_now as i64, dep_id],
-                        )?;
-                        if n == 1 {
+                        let opts = crate::db::advance::AdvanceOpts {
+                            expected_from: Some("backlog".into()),
+                            skip_continuation: true,
+                            log_line: Some("auto-promoted: own backlog dep cleared".into()),
+                            ..Default::default()
+                        };
+                        if let Ok(outcome) = crate::db::advance::advance(conn, dep_id, "todo", "board_drive", &opts)? {
                             promoted_ids.push(dep_id.clone());
+                            all_events.extend(outcome.events);
                         }
                     }
                     Ok(crate::db::WriteOutcome {
                         applied: !promoted_ids.is_empty(),
-                        events: vec![],
+                        events: all_events,
                     })
                 })
                 .await;
@@ -5049,18 +5032,10 @@ pub async fn claim_card_from(
     let reply = state
         .store
         .write_async(move |conn| {
-            let now = now_f64() as i64;
             // Read the PRIOR owner in the same transaction as the swap. The card
             // log must be able to answer "which lane claimed this, and did it
             // already own it", because that is the exact question AF-79 could
-            // NOT answer. A lane created a card, it was auto-picked-up, and the
-            // log said only "Auto-picked up from queue" with no lane; the owner
-            // was then reassigned one second later, so a reader inspecting the
-            // card afterward could not tell the pickup HAD honored ownership and
-            // read it as a cross-owner dispatch. Recording the claimer (and the
-            // prior owner when it differs) makes the card self-explaining and
-            // makes a genuine mis-dispatch (prior != claimer, which every
-            // caller is supposed to prevent) visible in the card's own log.
+            // NOT answer (AMUX-3776).
             let prior_owner: String = conn
                 .query_row(
                     "SELECT COALESCE(session,'') FROM issues WHERE id=?1 AND status=?2",
@@ -5069,29 +5044,9 @@ pub async fn claim_card_from(
                 )
                 .optional()?
                 .unwrap_or_default();
-            let n = conn.execute(
-                "UPDATE issues SET status='doing', session=?1, updated=?2 WHERE id=?3 AND status=?4",
-                rusqlite::params![session_s, now, card_s, from],
-            )?;
-            if n == 0 {
-                // Not todo any more (closed, discarded, already doing, or gone):
-                // do NOT touch the log or claim — applied=false tells the caller.
-                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-            }
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT log FROM issues WHERE id=?1",
-                    rusqlite::params![card_s],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
+
             let reassigned = !prior_owner.is_empty() && prior_owner != session_s;
             let entry = if reassigned {
-                // Should be unreachable from every caller (auto-pickup selects on
-                // i.session=lane; manual claim 409s when owner != claimer), so if
-                // it fires it IS the cross-owner claim to investigate, so say so in
-                // the card log AND the server log so a sweep finds it.
                 tracing::warn!(
                     target: "amux::board_drive", claimer = %session_s, prior = %prior_owner, card = %card_s,
                     "claim REASSIGNED a card across owners; every caller is supposed to prevent this; \
@@ -5102,19 +5057,26 @@ pub async fn claim_card_from(
                 }
                 format!("Auto-picked up from queue by {session_s} (reassigned from {prior_owner})")
             } else if from == "backlog" {
-                // A backlog card is never queue-dispatched; this line only ever
-                // means a deliberate manual claim, so say that.
                 format!("Claimed from backlog by {session_s}")
             } else {
                 format!("Auto-picked up from queue by {session_s}")
             };
-            let hhmm = chrono::Local::now().format("%H:%M").to_string();
-            let log = bs::append_log(existing.as_deref(), &hhmm, &entry);
-            conn.execute(
-                "UPDATE issues SET log=?1 WHERE id=?2",
-                rusqlite::params![log, card_s],
-            )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+
+            let opts = crate::db::advance::AdvanceOpts {
+                expected_from: Some(from.to_string()),
+                assign_to: Some(session_s.clone()),
+                log_line: Some(entry),
+                force: true,
+                skip_continuation: true,
+                ..Default::default()
+            };
+            match crate::db::advance::advance(conn, &card_s, "doing", &session_s, &opts)? {
+                Ok(outcome) => Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: outcome.events,
+                }),
+                Err(_refusal) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+            }
         })
         .await;
     let claimed = matches!(reply, Ok(r) if r.applied);

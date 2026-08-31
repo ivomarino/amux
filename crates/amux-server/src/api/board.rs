@@ -1155,44 +1155,30 @@ async fn delete_status(
                 .query_map([&sid_w], |r| r.get::<_, String>(0))?
                 .filter_map(Result::ok)
                 .collect();
-            let stamp = hhmm();
             let mut events = Vec::new();
             for card in &moved {
-                let line = format!(
+                let log_line = format!(
                     "status: {sid_w} -> todo (column '{sid_w}' deleted by {actor})"
                 );
-                conn.execute(
-                    "UPDATE issues SET log = ?1 WHERE id = ?2",
-                    rusqlite::params![
-                        bs::append_log(
-                            conn.query_row(
-                                "SELECT log FROM issues WHERE id = ?1",
-                                [card],
-                                |r| r.get::<_, Option<String>>(0),
-                            )?
-                            .as_deref(),
-                            &stamp,
-                            &line,
-                        ),
-                        card
-                    ],
-                )?;
-                events.push(PendingEvent {
-                    entity_type: EntityType::Task,
-                    entity_id: card.clone(),
-                    mutation: MutationKind::StatusChanged {
-                        from: sid_w.clone(),
-                        to: "todo".into(),
+                let result = crate::db::advance::advance(
+                    conn,
+                    card,
+                    "todo",
+                    &actor,
+                    &crate::db::advance::AdvanceOpts {
+                        force: true,
+                        expected_from: Some(sid_w.clone()),
+                        log_line: Some(log_line),
+                        skip_continuation: true,
+                        ..crate::db::advance::AdvanceOpts::default()
                     },
-                    payload: None,
-                });
+                )?;
+                if let Ok(outcome) = result {
+                    events.extend(outcome.events);
+                }
             }
             conn.execute(
                 "DELETE FROM statuses WHERE id = ?1 AND is_builtin = 0",
-                [&sid_w],
-            )?;
-            conn.execute(
-                "UPDATE issues SET status = 'todo' WHERE status = ?1 AND deleted IS NULL",
                 [&sid_w],
             )?;
             *out_w.lock().expect("status slot poisoned") = Some(moved);
@@ -1352,33 +1338,55 @@ fn fold_capture_for_worker_card(
     let Some((cap_id, cap_rev)) = cap else {
         return Ok(None);
     };
-    let Some(mut c) = bs::get_issue(conn, &cap_id)? else {
+    use crate::db::advance::{self as adv, AdvanceOpts};
+    let result = adv::advance(
+        conn,
+        &cap_id,
+        "discarded",
+        sess,
+        &AdvanceOpts {
+            force: true,
+            expected_from: Some("doing".into()),
+            log_line: Some(format!("capture folded into {}", new.id)),
+            skip_continuation: true,
+            ..AdvanceOpts::default()
+        },
+    )?;
+    let Ok(outcome) = result else {
         return Ok(None);
     };
-    c.status = "discarded".into();
-    c.desc = format!(
-        "{}\n\n_Folded into {} — the worker carded this work directly (AMUX-3391)._",
-        c.desc, new.id
-    );
-    c.log = Some(bs::append_log(
-        c.log.as_deref(),
-        &hhmm(),
-        &format!("capture folded into {}", new.id),
-    ));
-    c.rev = cap_rev + 1;
-    c.version += 1;
-    c.updated = now;
-    bs::save_patched(conn, &mut c)?;
-    // Two-fixes rule: the fold leaves a trace, so a sweep can confirm it fires —
-    // and can compare fold-count against capture cards STILL discarded by hand (a
-    // fold that should have fired but did not). grep "ledger: capture folded".
+    // advance() handled status + version + log + save_patched. Update desc
+    // and rev (Python optimistic-concurrency counter) separately.
+    conn.execute(
+        "UPDATE issues SET \"desc\" = ?1, rev = ?2 WHERE id = ?3 AND deleted IS NULL",
+        rusqlite::params![
+            format!(
+                "{}\n\n_Folded into {} — the worker carded this work directly (AMUX-3391)._",
+                outcome.row.desc, new.id
+            ),
+            cap_rev + 1,
+            cap_id,
+        ],
+    )?;
     tracing::info!(
         session = %sess,
         capture = %cap_id,
         folded_into = %new.id,
         "ledger: capture folded into worker card (AMUX-3391)"
     );
-    Ok(Some((cap_id, ev_snap(&c, MutationKind::Updated))))
+    let event = outcome.events.into_iter().next().unwrap_or_else(|| {
+        let snap = bs::get_issue(conn, &cap_id)
+            .ok()
+            .flatten()
+            .map(|r| r.snapshot());
+        PendingEvent {
+            entity_type: amux_core::revision::EntityType::Task,
+            entity_id: cap_id.clone(),
+            mutation: MutationKind::Updated,
+            payload: snap,
+        }
+    });
+    Ok(Some((cap_id, event)))
 }
 
 fn now_secs() -> i64 {
@@ -3038,7 +3046,7 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 31] = [
+const PATCH_WRITABLE: [&str; 32] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -3079,6 +3087,7 @@ const PATCH_WRITABLE: [&str; 31] = [
     "decision_question",
     "decision_rationale",
     "decision_supersedes",
+    "waiting_on",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -3936,6 +3945,7 @@ pub async fn patch_item(
             set_opt("decision_question", &mut next.decision_question, &mut changed);
             set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
             set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
+            set_opt("waiting_on", &mut next.waiting_on, &mut changed);
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -4410,6 +4420,8 @@ pub async fn patch_item(
                         format!("{actor_name}: {from_raw} -> {target_raw} (user column)")
                     };
                     next.log = Some(bs::append_log(next.log.as_deref(), &stamp, &line));
+                    // Gap 4: waiting_on side effects before status change.
+                    crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                     next.status = target_raw.clone();
                     next.version += 1;
                     status_event = Some((from_raw, target_raw));
@@ -5393,6 +5405,8 @@ pub async fn patch_item(
                             // the permissive case the invisible case.
                             next.log =
                                 Some(bs::append_log(next.log.as_deref(), &stamp, &authz_line));
+                            // Gap 4: waiting_on side effects before status change.
+                            crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                             next.status = target_raw.clone();
                             next.version = i64::try_from(updated.version).unwrap_or(next.version + 1);
 

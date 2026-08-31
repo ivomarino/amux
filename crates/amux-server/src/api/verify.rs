@@ -106,26 +106,31 @@ async fn verify_task(
     let write = state
         .store
         .write_async(move |conn| {
-            let mut row = board_store::get_issue(conn, &id2)?
-                .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
-            let now = chrono::Local::now();
-            row.status = board_store::status_to_db(
-                if passed {
-                    amux_core::board::TaskStatus::Verified
-                } else {
-                    amux_core::board::TaskStatus::Doing
-                },
-                &row.status,
-            );
-            row.log = Some(board_store::append_log(
-                row.log.as_deref(),
-                &now.format("%H:%M").to_string(),
-                &summary,
-            ));
-            if passed {
-                row.last_verified_at = Some(chrono::Utc::now().timestamp());
-            }
-            board_store::save_patched(conn, &mut row)?;
+            let opts = crate::db::advance::AdvanceOpts {
+                force: true,
+                expected_from: Some("done".into()),
+                log_line: Some(summary),
+                skip_continuation: true,
+                ..Default::default()
+            };
+            let result = crate::db::advance::advance(conn, &id2, target, &actor2, &opts)?;
+            let events = match result {
+                Ok(outcome) => {
+                    if passed {
+                        conn.execute(
+                            "UPDATE issues SET last_verified_at = ?1 WHERE id = ?2",
+                            rusqlite::params![chrono::Utc::now().timestamp(), id2],
+                        )?;
+                    }
+                    outcome.events
+                }
+                Err(_) => {
+                    return Ok(crate::db::WriteOutcome {
+                        applied: false,
+                        events: vec![],
+                    });
+                }
+            };
             let ver_id = format!("VER-{}", ulid::Ulid::new().to_string().to_lowercase());
             let ver_row = crate::db::verification_store::VerificationRow {
                 id: ver_id,
@@ -142,15 +147,7 @@ async fn verify_task(
             crate::db::verification_store::insert(conn, &ver_row)?;
             Ok(crate::db::WriteOutcome {
                 applied: true,
-                events: vec![crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Task,
-                    entity_id: id2.clone(),
-                    mutation: amux_core::revision::MutationKind::StatusChanged {
-                        from: "done".into(),
-                        to: target.into(),
-                    },
-                    payload: Some(row.snapshot()),
-                }],
+                events,
             })
         })
         .await;

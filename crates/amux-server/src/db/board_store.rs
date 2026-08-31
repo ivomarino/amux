@@ -1535,6 +1535,11 @@ pub struct IssueRow {
     pub decision_rationale: Option<String>,
     /// Semantic id of the decision this one supersedes.
     pub decision_supersedes: Option<String>,
+    /// Structured wait, orthogonal to status (migration 0048). JSON object:
+    /// `{"actor":"human","type":"judgment","question":"...","unblocks":"..."}`.
+    /// NULL means not waiting on anyone specific. A card keeps its lifecycle
+    /// position and separately declares who it is waiting on.
+    pub waiting_on: Option<String>,
 }
 
 impl IssueRow {
@@ -1623,6 +1628,8 @@ impl IssueRow {
             "decision_question": self.decision_question,
             "decision_rationale": self.decision_rationale,
             "decision_supersedes": self.decision_supersedes,
+            "waiting_on": self.waiting_on.as_deref()
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok()),
             // In BOTH snapshots deliberately, i.e. NOT in `slim_omits`. The
             // motivating question ("which cards closed in this window") is a
             // LIST query, so omitting it from the list body would ship the
@@ -1727,7 +1734,7 @@ const COLS: &str = "i.id, i.title, i.\"desc\", i.status, i.session, i.creator, i
      i.ask_type, i.ask_question, i.ask_unblocks, \
      i.next_action, i.last_result, i.unresolved, i.entered_state_at, i.blocked_on, \
      i.source, i.acceptance_criteria, i.decision_question, i.decision_rationale, \
-     i.decision_supersedes";
+     i.decision_supersedes, i.waiting_on";
 
 /// Read an INTEGER-typed timestamp column that some row may hold as REAL or TEXT.
 ///
@@ -1845,6 +1852,7 @@ fn issue_from_row(r: &Row<'_>) -> rusqlite::Result<IssueRow> {
         decision_question: r.get(40)?,
         decision_rationale: r.get(41)?,
         decision_supersedes: r.get(42)?,
+        waiting_on: r.get(43)?,
         next_action: r.get(33)?,
         last_result: r.get(34)?,
         unresolved: r.get(35)?,
@@ -2494,7 +2502,7 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
              last_result = ?29, unresolved = ?30, entered_state_at = ?31, \
              blocked_on = ?32, acceptance_criteria = ?34, \
              decision_question = ?35, decision_rationale = ?36, \
-             decision_supersedes = ?37 \
+             decision_supersedes = ?37, waiting_on = ?38 \
          WHERE id = ?33 AND deleted IS NULL",
         params![
             row.title,
@@ -2534,6 +2542,7 @@ pub fn save_patched(conn: &Connection, row: &mut IssueRow) -> rusqlite::Result<u
             row.decision_question,
             row.decision_rationale,
             row.decision_supersedes,
+            row.waiting_on,
         ],
     )
 }
@@ -3825,6 +3834,7 @@ mod tests {
             source: None,
             acceptance_criteria: None, decision_question: None,
             decision_rationale: None, decision_supersedes: None,
+            waiting_on: None,
         };
         let mut items: Vec<IssueRow> = Vec::new();
         for i in 0..400 {
@@ -3949,6 +3959,7 @@ mod configured_gate_tests {
             source: None,
             acceptance_criteria: None, decision_question: None,
             decision_rationale: None, decision_supersedes: None,
+            waiting_on: None,
         }
     }
 
