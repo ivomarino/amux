@@ -71,7 +71,20 @@ base="${AMUX_FLEET_BOOT_BASE:-$("$AMUX_BIN" url 2>/dev/null || echo "https://loc
 # codex/ollama/gemini workers at a server that is not answering.
 #
 # So: check the HTTP CODE, and check that the body actually says status ok.
-health_tmp="$(mktemp -t amux-fleet-boot-health)"
+# PORTABLE TEMPLATE, and the `-t` form is why (AMUX-3965 follow-up).
+#
+# `mktemp -t name` with no trailing X's is accepted by BSD/macOS mktemp, which
+# appends its own randomness, and REFUSED by GNU coreutils with "too few X's in
+# template". On Linux this command therefore printed nothing, $health_tmp was the
+# empty string, and `curl -o ""` failed on every iteration — so the health probe
+# could never succeed and the boot logged "server never answered" no matter how
+# healthy the server was.
+#
+# It went unseen because this box is macOS and the failure is silent on the arm
+# that works. Caught by test-fleet-boot-divergence.sh running on a Linux CI
+# runner: every POSITIVE cell failed and every NEGATIVE cell passed, which is the
+# signature of a probe that never ran rather than a behaviour that changed.
+health_tmp="$(mktemp "${TMPDIR:-/tmp}/amux-fleet-boot-health.XXXXXX")"
 waited=0
 server_up=0
 while (( waited < HEALTH_TIMEOUT )); do
@@ -117,7 +130,8 @@ if (( server_up == 1 )); then
   #     whole time (200, 173KB, 0.1s); only the plumbing was wrong.
   # Reading a named file has neither edge, and a missing/short file is a
   # distinguishable, reportable state rather than a silent empty parse.
-  sess_tmp="$(mktemp -t amux-fleet-boot)"
+  # Same portability trap as $health_tmp above.
+  sess_tmp="$(mktemp "${TMPDIR:-/tmp}/amux-fleet-boot.XXXXXX")"
   http="$(curl -sk --max-time 45 "$base/api/sessions" -o "$sess_tmp" -w '%{http_code}' 2>/dev/null)"
   if [[ "$http" != "200" ]]; then
     verdict="VERDICT UNAVAILABLE: /api/sessions returned HTTP ${http:-<none>}"
