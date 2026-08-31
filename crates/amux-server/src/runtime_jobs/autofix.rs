@@ -294,6 +294,44 @@ const LONG_BY_DESIGN: &[(&str, f64)] = &[
     // budget keeps meaning what an outlier should: something hung, not
     // something that waited on purpose.
     ("/api/sessions/{name}/send", 15_000.0),
+    // POST /api/sessions/{name}/archive (AMUX-3934).
+    //
+    // NOT A TAIL — the shape is three flat clusters, which is what a fixed
+    // sleep ladder looks like from outside. All 20 archives ever recorded:
+    //     4 under 200ms      lane not running, early return
+    //     8 at 1969-2060ms   the lane took the /exit and the poll broke on its
+    //                        first iteration
+    //     7 at 5.6-19.4s     the lane did NOT exit, so the poll ran to
+    //                        exhaustion and the hard kill fired
+    // A 91ms spread across eight requests is not load, and no baseline-relative
+    // detector would call the 19s cluster anomalous either, because it IS the
+    // route's second mode.
+    //
+    // DERIVED FROM THE PATH'S OWN BOUNDS, adding up `stop_session`'s tmux arm on
+    // the worst HONEST path (the lane ignores /exit):
+    //   ~0.95s  /rename handshake: sleep_ms(150) + Enter + sleep_ms(800)
+    //   ~0.25s  C-u + /exit: sleep_ms(100) + sleep_ms(150)
+    //   15.0s   the graceful poll, `for _ in 0..30` at sleep_ms(500)
+    //   ~5.0s   pkill -9 -P, bounded by OP_TIMEOUT
+    //   ~1.0s   stty sane + sleep_ms(1000)
+    // = ~22.2s of deliberate, load-bearing waiting. The measured worst is
+    // 19.4s, which is that path with pkill returning fast rather than taking
+    // its bound — the derivation agrees with the measurement instead of being
+    // taken from it.
+    //
+    // 30s, not 2x the derived bound. The scrollback capture that runs BEFORE
+    // any of the above is `capture-pane -S -` under a 30s timeout, so a budget
+    // near 45-55s would also swallow a capture wedged at its own limit — and
+    // that is the one archive story that IS wrong. No observed capture came
+    // close (the 19.4s worst leaves ~2s for it), so 30s sits above every
+    // legitimate run and still leaves the wedge reportable.
+    //
+    // RESIDUAL GAP, stated because nothing else states it: the p95 detector
+    // groups by FAMILY and this path's family is `/api/sessions`, so a
+    // systematic shift in archive alone would be diluted across that whole
+    // family and this entry is the only thing watching the route. If archive's
+    // ladder is ever retuned, retune this number with it.
+    ("/api/sessions/{name}/archive", 30_000.0),
 ];
 
 fn design_budget_ms(target: &str) -> f64 {
@@ -9893,6 +9931,39 @@ mod tests {
                 finding.recheck
             );
         }
+    }
+
+    /// AMUX-3934. The archive budget must sit ABOVE the route's own deliberate
+    /// sleep ladder and BELOW the one thing on it that would be a real fault.
+    ///
+    /// Both bounds are asserted, because either alone is satisfiable by a wrong
+    /// number: too low and the routine 19s archive files forever (the nuisance
+    /// this closes), too high and a scrollback capture wedged at its own 30s
+    /// timeout is swallowed (the one archive story that IS wrong). A budget is
+    /// only meaningful as an interval.
+    #[test]
+    fn the_archive_budget_brackets_the_sleep_ladder_without_hiding_a_wedge() {
+        let b = design_budget_ms("/api/sessions/{name}/archive");
+
+        // The derived bound: 0.95 + 0.25 + 15.0 + 5.0 + 1.0 seconds of
+        // deliberate waiting on the worst honest path, read off stop_session's
+        // tmux arm. The budget must clear it, or the entry does not do its job.
+        let derived_ms = 950.0 + 250.0 + 15_000.0 + 5_000.0 + 1_000.0;
+        assert!(
+            b > derived_ms,
+            "budget {b} must exceed the {derived_ms}ms sleep ladder it exists to excuse"
+        );
+        // And clear every value ever measured on the route (worst 19_384ms).
+        assert!(b > 19_384.0, "budget {b} must clear the measured worst archive");
+
+        // THE HALF AN OVER-EAGER FIX DESTROYS. `capture-pane -S -` runs before
+        // the ladder under a 30s timeout; a capture pinned at that limit is a
+        // wedge, not a design duration. The budget must stay low enough to
+        // report it.
+        assert!(
+            b <= 30_000.0,
+            "budget {b} must not swallow a scrollback capture wedged at its own 30s timeout"
+        );
     }
 
     /// AMUX-3580: a long-by-design route is suppressed AT its design duration
