@@ -51,6 +51,48 @@ if [ "$_ec_files" = "0" ] && [ "${_ec_parents:-0}" -lt 3 ]; then
   echo "" >&2
 fi
 
+# ── A COMMITTED HOOK IS NOT AN INSTALLED HOOK (AF-375) ───────────────────────
+#
+# The hooks in scripts/git-hooks/ ship by COPY: install-hooks.sh cp's them into
+# .git/hooks/. So editing one and committing it changes NOTHING for any lane
+# until someone re-installs, and nothing anywhere said so.
+#
+# It cost two closes in one session. Both of that day's staged-guard changes were
+# in the repo and reaching nobody, and one card was marked `done` with evidence
+# reading "ALL PASS" that was true of the repo copy and silent about the
+# installed one:
+#     grep -c 'COMMIT ONLY YOUR OWN PATHS'  installed=0  repo=1
+#
+# WHY POST-COMMIT AND NOT PRE-COMMIT. 88 of the last 500 commits touch
+# scripts/git-hooks/, so warning on every one of those is a warning on the normal
+# path, which is the noise that trained people to scroll past the last one
+# (AF-342). Here the condition is compared, not assumed: it fires only while the
+# installed copy actually differs, and it stops firing the moment you install.
+# Editing a hook and not installing it IS the defect, so this reports a real
+# state rather than an activity.
+#
+# The comparison is `cmp`, the same one install-hooks.sh already runs at the end
+# of its own run. Moved to where it gets read.
+if git diff-tree --no-commit-id --name-only -r HEAD 2>/dev/null | grep -q '^scripts/git-hooks/'; then
+  _root=$(git rev-parse --show-toplevel 2>/dev/null)
+  _drift=""
+  for _h in pre-commit amux-staged-guard prepare-commit-msg pre-push post-commit append-only-push-guard; do
+    if [ -f "$_root/scripts/git-hooks/$_h" ] && [ -f "$_root/.git/hooks/$_h" ]; then
+      cmp -s "$_root/scripts/git-hooks/$_h" "$_root/.git/hooks/$_h" || _drift="$_drift $_h"
+    fi
+  done
+  if [ -n "$_drift" ]; then
+    echo "" >&2
+    echo "amux post-commit: HOOK COMMITTED BUT NOT INSTALLED —$_drift" >&2
+    echo "  These ship by COPY, so this commit changed the repo and nothing else." >&2
+    echo "  No lane runs your change, including you, until:" >&2
+    echo "      ./scripts/install-hooks.sh" >&2
+    echo "  Verify the INSTALLED copy afterwards, not the repo one: that distinction" >&2
+    echo "  is what let a fix be closed as done while it was inert (AF-375)." >&2
+    echo "" >&2
+  fi
+fi
+
 [ -n "$AMUX_SESSION" ] || exit 0
 sha=$(git rev-parse --short HEAD 2>/dev/null)
 # tr strips the two JSON-hostile characters instead of escaping them — a
