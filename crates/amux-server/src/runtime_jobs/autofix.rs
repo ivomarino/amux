@@ -125,7 +125,10 @@ fn ops_health_cards_enabled() -> bool {
 /// explicit falsey value turns it off.
 fn parse_ops_health_cards(v: Option<&str>) -> bool {
     match v {
-        Some(s) => !matches!(s.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"),
+        Some(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "off" | "no"
+        ),
         None => true,
     }
 }
@@ -404,8 +407,15 @@ fn quiet_h() -> f64 {
 /// point nobody is enrolled in is decoration).
 fn ci_repos() -> Vec<String> {
     let raw = env_str("AMUX_CI_REPOS");
-    let raw = if raw.is_empty() { "mixpeek/amux".to_string() } else { raw };
-    raw.split(',').map(|s| s.trim().to_string()).filter(|s| s.contains('/')).collect()
+    let raw = if raw.is_empty() {
+        "mixpeek/amux".to_string()
+    } else {
+        raw
+    };
+    raw.split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| s.contains('/'))
+        .collect()
 }
 /// How often to actually ask GitHub. The tick is 120s; asking every tick would
 /// be 720 API calls/day per repo for a signal that changes on push.
@@ -477,9 +487,16 @@ fn fixer_session() -> String {
 /// window somebody turned it off to look at.
 pub fn enabled(conn: &Connection) -> bool {
     let v: Option<String> = conn
-        .query_row("SELECT value FROM prefs WHERE key='autofix_enabled'", [], |r| r.get(0))
+        .query_row(
+            "SELECT value FROM prefs WHERE key='autofix_enabled'",
+            [],
+            |r| r.get(0),
+        )
         .ok();
-    !matches!(v.as_deref().map(str::trim), Some("0") | Some("false") | Some("off"))
+    !matches!(
+        v.as_deref().map(str::trim),
+        Some("0") | Some("false") | Some("off")
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -720,7 +737,12 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
     );
     let mut stmt = match q {
         Ok(s) => s,
-        Err(e) => return (vec![], vec![sup(DetectorKind::Http5xx, "query", &e.to_string())]),
+        Err(e) => {
+            return (
+                vec![],
+                vec![sup(DetectorKind::Http5xx, "query", &e.to_string())],
+            )
+        }
     };
     let rows = stmt.query_map(rusqlite::params![cutoff], |r| {
         Ok((
@@ -738,7 +760,12 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
     });
     let rows = match rows {
         Ok(r) => r,
-        Err(e) => return (vec![], vec![sup(DetectorKind::Http5xx, "query", &e.to_string())]),
+        Err(e) => {
+            return (
+                vec![],
+                vec![sup(DetectorKind::Http5xx, "query", &e.to_string())],
+            )
+        }
     };
     for row in rows.flatten() {
         let (ts, method, path, family, status, latency, ip, session, worker, body) = row;
@@ -760,7 +787,12 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
         // target still rides in `sample_path` and the evidence, so nothing is
         // lost — it just stops being the thing that splits the card.
         let key = if is_pool_exhaustion(&body) {
-            (status, "*".to_string(), "POOL".to_string(), "POOL".to_string())
+            (
+                status,
+                "*".to_string(),
+                "POOL".to_string(),
+                "POOL".to_string(),
+            )
         } else {
             (status, method.clone(), family.clone(), target.clone())
         };
@@ -825,7 +857,10 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
         let signature = if is_pool {
             format!("5xx|{status}|POOL|{}", g.last_ts as i64)
         } else {
-            format!("5xx|{status}|{method}|{family}|{target}|{}", g.last_ts as i64)
+            format!(
+                "5xx|{status}|{method}|{family}|{target}|{}",
+                g.last_ts as i64
+            )
         };
         // COMPUTED title: the signature in English, plus the count. No model.
         let title = if is_pool {
@@ -844,8 +879,10 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
             window_h() as i64
         );
         let evidence = vec![
-            ("verdict".into(), if is_pool {
-                format!(
+            (
+                "verdict".into(),
+                if is_pool {
+                    format!(
                     "{} request(s) across {} route(s) failed waiting for a database connection, \
                      from {} distinct client(s). THE ROUTES ARE VICTIMS, NOT THE FAULT — the \
                      cause is whatever was HOLDING connections, which is usually somewhere else \
@@ -857,25 +894,37 @@ pub fn detect_5xx(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppressed>
                     g.clients.len(),
                     g.targets.iter().take(12).cloned().collect::<Vec<_>>().join(", ")
                 )
-            } else {
-                format!(
-                    "{method} {target} answered HTTP {status} {} time(s) from {} distinct \
+                } else {
+                    format!(
+                        "{method} {target} answered HTTP {status} {} time(s) from {} distinct \
                      client(s). A 5xx is amux failing, not amux declining — if this is really a \
                      refusal, the fix is the STATUS CODE, not the caller.",
-                    g.count,
-                    g.clients.len()
-                )
-            }),
-            ("sample_request".into(), format!("{method} {}", g.sample_path)),
+                        g.count,
+                        g.clients.len()
+                    )
+                },
+            ),
+            (
+                "sample_request".into(),
+                format!("{method} {}", g.sample_path),
+            ),
             ("error_body".into(), truncate(&g.sample_body, 800)),
             ("first_seen".into(), rl::local_when(g.first_ts)),
             ("last_seen".into(), rl::local_when(g.last_ts)),
             ("count".into(), g.count.to_string()),
-            ("distinct_clients".into(), format!(
-                "{} ({})",
-                g.clients.len(),
-                g.clients.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
-            )),
+            (
+                "distinct_clients".into(),
+                format!(
+                    "{} ({})",
+                    g.clients.len(),
+                    g.clients
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            ),
             ("slowest_ms".into(), format!("{:.1}", g.max_latency)),
         ];
         out.push(Finding {
@@ -1185,20 +1234,35 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
             h.p95_w / h.p95_b
         ),
         evidence: vec![
-            ("verdict".into(), format!(
-                "{} p95 over the last {:.1}h is {:.0}ms against a {:.0}h trailing p95 of \
+            (
+                "verdict".into(),
+                format!(
+                    "{} p95 over the last {:.1}h is {:.0}ms against a {:.0}h trailing p95 of \
                  {:.0}ms ({:.1}x). Threshold: {mult}x with at least {min_n} samples on both \
                  sides.",
-                h.fam, window_h(), h.p95_w, baseline_h(), h.p95_b, h.p95_w / h.p95_b
-            )),
+                    h.fam,
+                    window_h(),
+                    h.p95_w,
+                    baseline_h(),
+                    h.p95_b,
+                    h.p95_w / h.p95_b
+                ),
+            ),
             ("window_samples".into(), h.win_n.to_string()),
             ("baseline_samples".into(), h.base_n.to_string()),
-            ("window_p50_p95_max".into(), format!(
-                "{:.0} / {:.0} / {:.0} ms", h.win_p50, h.p95_w, h.win_max
-            )),
-            ("baseline_p50_p95".into(), format!("{:.0} / {:.0} ms", h.base_p50, h.p95_b)),
-            ("percentile_method".into(),
-             "nearest-rank over the sorted window (same function /api/logs/stats reports)".into()),
+            (
+                "window_p50_p95_max".into(),
+                format!("{:.0} / {:.0} / {:.0} ms", h.win_p50, h.p95_w, h.win_max),
+            ),
+            (
+                "baseline_p50_p95".into(),
+                format!("{:.0} / {:.0} ms", h.base_p50, h.p95_b),
+            ),
+            (
+                "percentile_method".into(),
+                "nearest-rank over the sorted window (same function /api/logs/stats reports)"
+                    .into(),
+            ),
             // WHETHER THE SCAN SAW THE WHOLE PERIOD (AMUX-3910, ethos rule 4).
             // The row cap used to truncate the NEWEST rows — the window itself —
             // and say nothing on the card: one filed "p95 7173ms over 30
@@ -1206,21 +1270,26 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
             // while /api/logs/stats read 134.8ms over 15,882 for the same
             // period. A sample count is only a fact if the reader can tell it
             // apart from a horizon.
-            ("scan_coverage".into(), if h.scan_capped {
-                format!(
-                    "PARTIAL — the {}-row scan cap was reached, so the trailing norm spans \
+            (
+                "scan_coverage".into(),
+                if h.scan_capped {
+                    format!(
+                        "PARTIAL — the {}-row scan cap was reached, so the trailing norm spans \
                      {:.1}h rather than the {:.0}h named above. The WINDOW is complete: the \
                      scan is ordered newest-first, so a cap can only shorten the baseline. \
                      Treat the multiple as directional.",
-                    latency_scan_cap(), h.oldest_seen_h, baseline_h()
-                )
-            } else {
-                format!(
-                    "complete — every row in the {:.0}h period was scanned; the cap was not \
+                        latency_scan_cap(),
+                        h.oldest_seen_h,
+                        baseline_h()
+                    )
+                } else {
+                    format!(
+                        "complete — every row in the {:.0}h period was scanned; the cap was not \
                      reached",
-                    baseline_h()
-                )
-            }),
+                        baseline_h()
+                    )
+                },
+            ),
         ],
         recheck: format!(
             "curl -sk \"$AMUX_URL/api/logs/stats?since_h={}\" | python3 -c \"import json,sys; \
@@ -1292,15 +1361,17 @@ pub(crate) fn detect_latency_at(
            AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') \
          ORDER BY ts DESC LIMIT ?2",
     ) {
-        if let Ok(rows) = stmt.query_map(rusqlite::params![b_start, latency_scan_cap() as i64], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, f64>(1)?,
-                r.get::<_, f64>(2)?,
-                r.get::<_, Option<f64>>(3)?,
-                r.get::<_, Option<f64>>(4)?,
-            ))
-        }) {
+        if let Ok(rows) =
+            stmt.query_map(rusqlite::params![b_start, latency_scan_cap() as i64], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, f64>(2)?,
+                    r.get::<_, Option<f64>>(3)?,
+                    r.get::<_, Option<f64>>(4)?,
+                ))
+            })
+        {
             // A REQUEST WHOSE CLOCK SPANS A RESTART IS NOT A SLOW REQUEST
             // (AF-175). `latency_ms` is wall time from arrival to completion,
             // so a request that arrived before this process started and
@@ -1510,7 +1581,10 @@ pub(crate) fn detect_latency_at(
     if p95_hits.len() >= outlier_rollup_at() {
         let n_f = p95_hits.len();
         let fams: Vec<String> = p95_hits.iter().map(|h| h.fam.clone()).collect();
-        let worst = p95_hits.iter().map(|h| h.p95_w / h.p95_b).fold(0.0f64, f64::max);
+        let worst = p95_hits
+            .iter()
+            .map(|h| h.p95_w / h.p95_b)
+            .fold(0.0f64, f64::max);
         out.push(Finding {
             kind: DetectorKind::Latency,
             // Keyed on the FAMILY SET, matching the outlier rollup: a different
@@ -1522,29 +1596,52 @@ pub(crate) fn detect_latency_at(
                 "{n_f} families regressed at once — one event, not {n_f} tasks (worst {worst:.1}x)"
             ),
             evidence: vec![
-                ("verdict".into(), format!(
+                (
+                    "verdict".into(),
+                    format!(
                     "{n_f} DIFFERENT families exceeded {mult}x their own trailing p95 in the SAME \
                      window. Each statement is true and each is unactionable alone: nothing in a \
                      per-family payload separates \"this endpoint got slower\" from \"everything \
                      got slower\". Look for something host-wide or server-wide first."
-                )),
-                ("families".into(), p95_hits.iter()
-                    .map(|h| format!("\n  {} {:.0}ms vs {:.0}ms ({:.1}x)",
-                                     h.fam, h.p95_w, h.p95_b, h.p95_w / h.p95_b))
-                    .collect::<String>()),
-                ("percentile_method".into(),
-                 "nearest-rank over the sorted window (same function /api/logs/stats reports)".into()),
+                ),
+                ),
+                (
+                    "families".into(),
+                    p95_hits
+                        .iter()
+                        .map(|h| {
+                            format!(
+                                "\n  {} {:.0}ms vs {:.0}ms ({:.1}x)",
+                                h.fam,
+                                h.p95_w,
+                                h.p95_b,
+                                h.p95_w / h.p95_b
+                            )
+                        })
+                        .collect::<String>(),
+                ),
+                (
+                    "percentile_method".into(),
+                    "nearest-rank over the sorted window (same function /api/logs/stats reports)"
+                        .into(),
+                ),
                 ("host_load".into(), describe_window_load(&mut window_load)),
-                ("rollup_threshold".into(), format!(
-                    "{} families (AMUX_OUTLIER_ROLLUP_AT, shared with the outlier rollup)",
-                    outlier_rollup_at()
-                )),
-                ("if_this_is_wrong".into(),
-                 "If these really are independent regressions, raise AMUX_OUTLIER_ROLLUP_AT \
+                (
+                    "rollup_threshold".into(),
+                    format!(
+                        "{} families (AMUX_OUTLIER_ROLLUP_AT, shared with the outlier rollup)",
+                        outlier_rollup_at()
+                    ),
+                ),
+                (
+                    "if_this_is_wrong".into(),
+                    "If these really are independent regressions, raise AMUX_OUTLIER_ROLLUP_AT \
                   rather than splitting the card by hand. But check the host first: on this \
                   box the fleet compiles and tests this server continuously, and a 28-core \
                   machine carrying a load average of 37 makes every endpoint slow at once \
-                  (AMUX-3646).".into()),
+                  (AMUX-3646)."
+                        .into(),
+                ),
             ],
             recheck: format!(
                 "curl -sk \"$AMUX_URL/api/logs/stats?since_h={}\" | python3 -c \"import json,sys; \
@@ -1618,7 +1715,9 @@ pub(crate) fn detect_latency_at(
                 fams.join(", ")
             ),
             evidence: vec![
-                ("verdict".into(), format!(
+                (
+                    "verdict".into(),
+                    format!(
                     "{} famil{} had at least {min_n} request rows in the period and ZERO of them \
                      survived filtering, so no percentile can be computed and no regression can \
                      be filed for them. This is a detector outage, not a quiet endpoint: the \
@@ -1626,7 +1725,8 @@ pub(crate) fn detect_latency_at(
                      the most recently changed predicate in that function.",
                     fams.len(),
                     if fams.len() == 1 { "y" } else { "ies" },
-                )),
+                ),
+                ),
                 ("families".into(), fams.join(", ")),
                 ("rows_discarded".into(), discarded.to_string()),
                 ("detail".into(), detail),
@@ -1634,7 +1734,8 @@ pub(crate) fn detect_latency_at(
             ],
             recheck: "curl -sk \"$AMUX_URL/api/debug/autofix\" | python3 -c \"import json,sys; \
                       d=json.load(sys.stdin)['last']; print([s for s in d['suppressed'] \
-                      if s['detector']=='latency'])\"".into(),
+                      if s['detector']=='latency'])\""
+                .into(),
             owner: None,
             count: collapsed.len() as u64,
             last_ts: now,
@@ -1756,14 +1857,16 @@ pub(crate) fn detect_latency_at(
                 // coarse target deliberately: a 500 is a 500 whatever the verb,
                 // and its rollup wants the route shape.
                 let target = rl::normalize_target_verb(&path);
-                let e = seen.entry((method.clone(), target)).or_insert_with(|| OutlierGroup {
-                    n: 0,
-                    worst_ms: 0.0,
-                    last_ts: ts,
-                    sample: format!("{method} {path} → {status}"),
-                    worst_since_boot: None,
-                    worst_load1: None,
-                });
+                let e = seen
+                    .entry((method.clone(), target))
+                    .or_insert_with(|| OutlierGroup {
+                        n: 0,
+                        worst_ms: 0.0,
+                        last_ts: ts,
+                        sample: format!("{method} {path} → {status}"),
+                        worst_since_boot: None,
+                        worst_load1: None,
+                    });
                 e.n += 1;
                 // The age travels WITH the worst latency, so the evidence line
                 // describes the request the title quotes rather than whichever
@@ -1884,8 +1987,14 @@ pub(crate) fn detect_latency_at(
         candidates.iter().map(|((_, t), _)| t).collect();
     if distinct_targets.len() >= outlier_rollup_at() {
         let n_t = distinct_targets.len();
-        let worst_ms = candidates.iter().map(|(_, g)| g.worst_ms).fold(0.0f64, f64::max);
-        let last = candidates.iter().map(|(_, g)| g.last_ts).fold(0.0f64, f64::max);
+        let worst_ms = candidates
+            .iter()
+            .map(|(_, g)| g.worst_ms)
+            .fold(0.0f64, f64::max);
+        let last = candidates
+            .iter()
+            .map(|(_, g)| g.last_ts)
+            .fold(0.0f64, f64::max);
         let targets: Vec<String> = distinct_targets.iter().map(|t| (*t).clone()).collect();
         out.push(Finding {
             kind: DetectorKind::Latency,
@@ -1961,7 +2070,14 @@ pub(crate) fn detect_latency_at(
 
     for (
         (method, target),
-        OutlierGroup { n, worst_ms: worst, last_ts, sample, worst_since_boot, worst_load1 },
+        OutlierGroup {
+            n,
+            worst_ms: worst,
+            last_ts,
+            sample,
+            worst_since_boot,
+            worst_load1,
+        },
     ) in seen
     {
         // AMUX-3485: for long-by-design endpoints the effective threshold is
@@ -2140,9 +2256,13 @@ pub fn detect_dead_routes(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Sup
     for (ts, method, path, status, ua) in rows.flatten() {
         let target = rl::normalize_target(&path);
         let browser = ua.contains("Mozilla/");
-        let e = groups
-            .entry((status, method.clone(), target))
-            .or_insert((0, ts, ts, path.clone(), false));
+        let e = groups.entry((status, method.clone(), target)).or_insert((
+            0,
+            ts,
+            ts,
+            path.clone(),
+            false,
+        ));
         e.0 += 1;
         e.2 = ts;
         e.4 |= browser;
@@ -2196,41 +2316,62 @@ pub fn detect_dead_routes(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Sup
             suppressed.push(sup(
                 DetectorKind::DeadRoute,
                 &signature,
-                &format!("{count} hit(s) < {} — one fetch is not yet a pattern", dead_route_min_hits()),
+                &format!(
+                    "{count} hit(s) < {} — one fetch is not yet a pattern",
+                    dead_route_min_hits()
+                ),
             ));
             continue;
         }
         let routed = rl::routed_methods_at(&sample_path);
         let near = rl::nearest_routes(&sample_path, 3);
-        let verdict = if status == 405 {
-            rl::verdict_405(&method, &target, &routed, &sample_path)
-        } else if routed.is_empty() {
-            format!(
+        let verdict =
+            if status == 405 {
+                rl::verdict_405(&method, &target, &routed, &sample_path)
+            } else if routed.is_empty() {
+                format!(
                 "{method} {target}: no route is mounted at this path in the current build, and \
                  the SPA fetches it. Nearest routes: {}",
                 if near.is_empty() { "none".into() } else { near.join(", ") }
             )
-        } else {
-            format!(
-                "{method} {target}: the path IS routed (methods: {}) but answered 404 — the \
+            } else {
+                format!(
+                    "{method} {target}: the path IS routed (methods: {}) but answered 404 — the \
                  handler ran and found nothing, so this is a data/id problem, not a mount \
                  problem",
-                routed.join(", ")
-            )
-        };
+                    routed.join(", ")
+                )
+            };
         out.push(Finding {
             kind: DetectorKind::DeadRoute,
             signature,
             title: format!("SPA calls {method} {target} → {status} ({count}x)"),
             evidence: vec![
                 ("verdict".into(), verdict),
-                ("routed_methods".into(), if routed.is_empty() { "none".into() } else { routed.join(", ") }),
-                ("nearest_routes".into(), if near.is_empty() { "none".into() } else { near.join(", ") }),
+                (
+                    "routed_methods".into(),
+                    if routed.is_empty() {
+                        "none".into()
+                    } else {
+                        routed.join(", ")
+                    },
+                ),
+                (
+                    "nearest_routes".into(),
+                    if near.is_empty() {
+                        "none".into()
+                    } else {
+                        near.join(", ")
+                    },
+                ),
                 ("sample_request".into(), format!("{method} {sample_path}")),
                 ("count".into(), count.to_string()),
                 ("first_seen".into(), rl::local_when(first)),
                 ("last_seen".into(), rl::local_when(last)),
-                ("called_by".into(), "a browser (Mozilla/* user-agent) — i.e. the dashboard".into()),
+                (
+                    "called_by".into(),
+                    "a browser (Mozilla/* user-agent) — i.e. the dashboard".into(),
+                ),
             ],
             recheck: format!(
                 "curl -sk \"$AMUX_URL/api/debug/routes\" | grep -F '{target}' ; \
@@ -2367,7 +2508,10 @@ fn steering_fan_out(
         }
         let n_lanes = group.len();
         let total: i64 = group.iter().map(|(_, _, n, ..)| *n).sum();
-        let worst = group.iter().map(|(_, _, _, age, _)| *age).fold(0.0_f64, f64::max);
+        let worst = group
+            .iter()
+            .map(|(_, _, _, age, _)| *age)
+            .fold(0.0_f64, f64::max);
         let listing = group
             .iter()
             .map(|(_, s, n, age, _)| format!("  {s} — {n} queued, oldest {:.0} min", age / 60.0))
@@ -2570,7 +2714,9 @@ pub fn detect_silent(
         let mut late: Vec<(String, String, String, f64)> = Vec::new();
         if let Ok(rows) = rows {
             for (id, title, session, next_run, last_ran) in rows.flatten() {
-                let Some(due) = parse_ts(&next_run) else { continue };
+                let Some(due) = parse_ts(&next_run) else {
+                    continue;
+                };
                 let overdue_by = now - due;
                 if overdue_by < overdue_s {
                     continue;
@@ -2597,20 +2743,31 @@ pub fn detect_silent(
                 // Signature does NOT include the count: the subsystem is the
                 // fault, not each schedule. One card, not N.
                 signature: "silent|schedules|overdue".into(),
-                title: format!("{} schedule(s) overdue, worst by {:.0} min", late.len(), worst),
+                title: format!(
+                    "{} schedule(s) overdue, worst by {:.0} min",
+                    late.len(),
+                    worst
+                ),
                 evidence: vec![
-                    ("verdict".into(), format!(
+                    (
+                        "verdict".into(),
+                        format!(
                         "{} enabled schedule(s) are past next_run by more than {:.0} min with no \
                          schedule_runs row at or after their due time. The firing loop is not \
                          firing them — this is absence, so nothing else will report it.",
                         late.len(), schedule_overdue_min()
-                    )),
+                    ),
+                    ),
                     ("overdue".into(), listing),
-                    ("threshold_min".into(), format!("{:.0}", schedule_overdue_min())),
+                    (
+                        "threshold_min".into(),
+                        format!("{:.0}", schedule_overdue_min()),
+                    ),
                 ],
                 recheck: "sqlite3 ~/.amux/amux.db \"SELECT id, next_run, (SELECT MAX(ran_at) FROM \
                           schedule_runs r WHERE r.schedule_id=s.id) FROM schedules s WHERE \
-                          deleted IS NULL AND enabled=1 ORDER BY next_run;\"".into(),
+                          deleted IS NULL AND enabled=1 ORDER BY next_run;\""
+                    .into(),
                 owner: None,
                 count: late.len() as u64,
                 last_ts: now,
@@ -2811,9 +2968,8 @@ pub fn detect_silent(
                 // has no clock), and that case still files.
                 let reset = resets.get(&session).copied().unwrap_or(0);
                 let kind = kinds.get(&session).map(String::as_str).unwrap_or("");
-                let reset_pending = block.as_deref() == Some("rate-limited")
-                    && reset > 0
-                    && (reset as f64) > now;
+                let reset_pending =
+                    block.as_deref() == Some("rate-limited") && reset > 0 && (reset as f64) > now;
                 if reset_pending {
                     suppressed.push(sup(
                         DetectorKind::SilentSubsystem,
@@ -3114,7 +3270,17 @@ pub fn detect_silent(
 /// flap is how a board stops being read.
 /// One row of `_amux_invariant_incident`:
 /// (invariant_id, entity_key, status, first_seen, last_seen, occurrences, expected, observed).
-type InvRow = (String, String, String, f64, f64, i64, String, String, String);
+type InvRow = (
+    String,
+    String,
+    String,
+    f64,
+    f64,
+    i64,
+    String,
+    String,
+    String,
+);
 
 /// How many distinct entities one invariant must be failing for before it is
 /// filed as a SINGLE rollup card instead of one card per entity.
@@ -3249,7 +3415,13 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
         }
         let entities: Vec<String> = filing
             .iter()
-            .map(|r| if r.1.is_empty() { "fleet".to_string() } else { r.1.clone() })
+            .map(|r| {
+                if r.1.is_empty() {
+                    "fleet".to_string()
+                } else {
+                    r.1.clone()
+                }
+            })
             .collect();
         let worst = filing.iter().max_by_key(|r| r.5).unwrap();
         let first_seen = filing.iter().map(|r| r.3).fold(f64::MAX, f64::min);
@@ -3324,14 +3496,20 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
     }
 
     for (id, entity, _status, first, last, occ, expected, observed, evidence) in flat {
-        let sig_entity = if entity.is_empty() { "fleet".to_string() } else { entity.clone() };
+        let sig_entity = if entity.is_empty() {
+            "fleet".to_string()
+        } else {
+            entity.clone()
+        };
         // Episode identity, same reason as the ROLLUP arm above (AMUX-3633).
         let signature = format!("invariant|{id}|{sig_entity}|{}", first as i64);
         if occ < min_occ {
             suppressed.push(sup(
                 DetectorKind::InvariantBreach,
                 &signature,
-                &format!("{occ} occurrence(s) < {min_occ} — a flapping invariant is noise, not a card"),
+                &format!(
+                    "{occ} occurrence(s) < {min_occ} — a flapping invariant is noise, not a card"
+                ),
             ));
             continue;
         }
@@ -3435,7 +3613,11 @@ pub fn detect_invariants(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Supp
 ///
 /// Reads the builder's own log and stamp — filesystem, not a worker. If the
 /// builder is dead the log simply stops, which the stamp-age check catches.
-pub fn detect_build(_conn: &Connection, now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppressed>) {
+pub fn detect_build(
+    _conn: &Connection,
+    now: f64,
+    home: &std::path::Path,
+) -> (Vec<Finding>, Vec<Suppressed>) {
     let mut out = Vec::new();
     let mut suppressed = Vec::new();
     let stamp = home.join("rust-build-stamp");
@@ -3466,16 +3648,20 @@ pub fn detect_build(_conn: &Connection, now: f64, home: &std::path::Path) -> (Ve
             signature: "build|failing".into(),
             title: format!("auto-build failing — {failures} failure(s), none fixed since"),
             evidence: vec![
-                ("verdict".into(),
-                 "The Rust auto-builder is failing and has not installed a build since. The \
+                (
+                    "verdict".into(),
+                    "The Rust auto-builder is failing and has not installed a build since. The \
                   running server keeps the last good binary BY DESIGN, so nothing looks broken: \
-                  every session's committed work is simply not deploying, silently.".into()),
+                  every session's committed work is simply not deploying, silently."
+                        .into(),
+                ),
                 ("last_failure_line".into(), last),
                 ("failures_in_tail".into(), failures.to_string()),
                 ("log".into(), log.display().to_string()),
             ],
             recheck: "tail -40 ~/.amux/logs/rust-auto-build.log; \
-                      CARGO_TARGET_DIR=/tmp/amux-check cargo build --release -p amux-server".into(),
+                      CARGO_TARGET_DIR=/tmp/amux-check cargo build --release -p amux-server"
+                .into(),
             owner: None,
             count: failures as u64,
             last_ts: now,
@@ -3634,7 +3820,11 @@ fn du_one(p: &std::path::Path, deadline: std::time::Instant) -> DuOutcome {
         Err(_) => return DuOutcome::Unreadable(None),
     };
     let text = String::from_utf8_lossy(&out.stdout);
-    match text.split_whitespace().next().and_then(|t| t.parse::<u64>().ok()) {
+    match text
+        .split_whitespace()
+        .next()
+        .and_then(|t| t.parse::<u64>().ok())
+    {
         Some(kb) => DuOutcome::Sized(kb * 1024),
         None => DuOutcome::Unreadable(out.status.code()),
     }
@@ -3674,14 +3864,21 @@ struct Ranked {
 /// file survives; it is written only on the ticks that already paid for a `du`,
 /// which is only when free space is under the floor.
 fn du_cache_load(path: Option<&std::path::Path>) -> std::collections::HashMap<String, (u64, f64)> {
-    let Some(p) = path else { return Default::default() };
+    let Some(p) = path else {
+        return Default::default();
+    };
     std::fs::read_to_string(p)
         .ok()
-        .and_then(|t| serde_json::from_str::<std::collections::HashMap<String, (u64, f64)>>(&t).ok())
+        .and_then(|t| {
+            serde_json::from_str::<std::collections::HashMap<String, (u64, f64)>>(&t).ok()
+        })
         .unwrap_or_default()
 }
 
-fn du_cache_save(path: Option<&std::path::Path>, m: &std::collections::HashMap<String, (u64, f64)>) {
+fn du_cache_save(
+    path: Option<&std::path::Path>,
+    m: &std::collections::HashMap<String, (u64, f64)>,
+) {
     let Some(p) = path else { return };
     if let Some(dir) = p.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -3737,7 +3934,11 @@ fn du_top(
         sized: &mut Vec<Ranked>,
     ) {
         if let Some((bytes, at)) = cache.get(key).copied() {
-            sized.push(Ranked { path: key.to_string(), bytes, stale_age_s: Some(now - at) });
+            sized.push(Ranked {
+                path: key.to_string(),
+                bytes,
+                stale_age_s: Some(now - at),
+            });
         }
     }
     for p in paths.iter().filter(|p| p.exists()) {
@@ -3752,7 +3953,11 @@ fn du_top(
         match du_one(p, deadline) {
             DuOutcome::Sized(bytes) => {
                 cache.insert(key.clone(), (bytes, now));
-                sized.push(Ranked { path: key, bytes, stale_age_s: None });
+                sized.push(Ranked {
+                    path: key,
+                    bytes,
+                    stale_age_s: None,
+                });
             }
             DuOutcome::TimedOut => {
                 timed_out.push(key.clone());
@@ -3967,7 +4172,11 @@ fn disk_candidates(home: &std::path::Path) -> Vec<std::path::PathBuf> {
                 continue;
             }
             let cfg = crate::config::parse_env_file(&e.path());
-            let Some(dir) = cfg.get("CC_DIR").map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+            let Some(dir) = cfg
+                .get("CC_DIR")
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            else {
                 continue;
             };
             for sub in ["target", "node_modules"] {
@@ -4047,7 +4256,11 @@ fn local_snapshot_count() -> Option<usize> {
         &["listlocalsnapshots", "/"],
         std::time::Duration::from_secs(5),
     )?;
-    Some(String::from_utf8_lossy(&stdout).matches("com.apple.TimeMachine").count())
+    Some(
+        String::from_utf8_lossy(&stdout)
+            .matches("com.apple.TimeMachine")
+            .count(),
+    )
 }
 
 pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppressed>) {
@@ -4139,10 +4352,16 @@ pub fn detect_disk(now: f64, home: &std::path::Path) -> (Vec<Finding>, Vec<Suppr
     let mut evidence = vec![
         ("verdict".into(), verdict),
         ("free_gb".into(), format!("{free_gb:.1}")),
-        ("floor_gb".into(), format!("{floor:.0} (AMUX_DISK_MIN_FREE_GB)")),
+        (
+            "floor_gb".into(),
+            format!("{floor:.0} (AMUX_DISK_MIN_FREE_GB)"),
+        ),
         (
             "fall_gb_per_h".into(),
-            format!("{rate_gb_h:.1} over {span_min:.0} min (trigger: {:.0}, AMUX_DISK_FALL_GB_PER_H)", disk_fall_gb_per_h()),
+            format!(
+                "{rate_gb_h:.1} over {span_min:.0} min (trigger: {:.0}, AMUX_DISK_FALL_GB_PER_H)",
+                disk_fall_gb_per_h()
+            ),
         ),
         ("top_consumers".into(), format!("\n{listing}")),
     ];
@@ -4250,7 +4469,10 @@ fn open_fd_count() -> Option<usize> {
 /// 65536, or vice versa. The number that matters is the one this process is
 /// actually subject to.
 fn fd_limit() -> Option<u64> {
-    let mut rl = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+    let mut rl = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
     // SAFETY: getrlimit writes into a fully-initialised local; no aliasing.
     if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) } == 0 {
         Some(rl.rlim_cur)
@@ -4335,7 +4557,12 @@ pub fn detect_stuck_composer(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let aged: Vec<(String, i64)> = report
         .chips
         .iter()
-        .map(|l| (l.clone(), crate::api::session_verbs::composer_stuck_since(l)))
+        .map(|l| {
+            (
+                l.clone(),
+                crate::api::session_verbs::composer_stuck_since(l),
+            )
+        })
         .collect();
     stuck_composer_findings(&aged, now)
 }
@@ -4456,7 +4683,11 @@ pub fn detect_fd(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
         return (out, suppressed);
     };
     if limit == 0 {
-        suppressed.push(sup(DetectorKind::FdPressure, "fd|no-limit", "RLIMIT_NOFILE is 0"));
+        suppressed.push(sup(
+            DetectorKind::FdPressure,
+            "fd|no-limit",
+            "RLIMIT_NOFILE is 0",
+        ));
         return (out, suppressed);
     }
     let ratio = open as f64 / limit as f64;
@@ -4483,7 +4714,10 @@ pub fn detect_fd(now: f64) -> (Vec<Finding>, Vec<Suppressed>) {
     let (signature, title, verdict) = if trigger == "near-limit" {
         (
             "fd|near-limit".to_string(),
-            format!("fds: {open}/{limit} open ({:.0}% of the limit)", ratio * 100.0),
+            format!(
+                "fds: {open}/{limit} open ({:.0}% of the limit)",
+                ratio * 100.0
+            ),
             format!(
                 "This process holds {open} of its {limit} allowed descriptors. Past the limit, \
                  EVERY open and EVERY spawn fails with EMFILE at once — on 2026-08-10 that \
@@ -4644,10 +4878,14 @@ pub fn ci_deploy_escalations(runs: &[CiRun], now: f64) -> Vec<(String, String, i
         if !ci_is_deploy_workflow(&r.workflow) || !r.on_default_branch {
             continue;
         }
-        if r.event == "pull_request" || r.event == "pull_request_target" || r.status != "completed" {
+        if r.event == "pull_request" || r.event == "pull_request_target" || r.status != "completed"
+        {
             continue;
         }
-        groups.entry((r.repo.clone(), r.workflow.clone())).or_default().push(r);
+        groups
+            .entry((r.repo.clone(), r.workflow.clone()))
+            .or_default()
+            .push(r);
     }
     let mut out = Vec::new();
     for ((repo, workflow), mut all) in groups {
@@ -4688,7 +4926,10 @@ fn ci_is_failure(c: &str) -> bool {
 /// would reset the anchor and refile a card mid-outage — the 08-10 16:42 run in
 /// the motivating incident was exactly this.
 fn ci_is_inconclusive(c: &str) -> bool {
-    matches!(c, "cancelled" | "skipped" | "neutral" | "stale" | "action_required" | "")
+    matches!(
+        c,
+        "cancelled" | "skipped" | "neutral" | "stale" | "action_required" | ""
+    )
 }
 
 fn ci_sanitize(s: &str) -> String {
@@ -4729,17 +4970,34 @@ async fn connector_auth_probe(now: f64, home: &std::path::Path) -> (Vec<Finding>
 /// rotted account however many families or ticks report it.
 pub fn connector_findings_from_rollup(rollup: &serde_json::Value, now: f64) -> Vec<Finding> {
     let mut out = Vec::new();
-    for e in rollup.get("needs_reauth").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        let account = e.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    for e in rollup
+        .get("needs_reauth")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let account = e
+            .get("account")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         if account.is_empty() {
             continue;
         }
         let broken: Vec<String> = e
             .get("broken")
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
-        let reconnect = e.get("reconnect").and_then(|v| v.as_str()).unwrap_or("").to_string();
+        let reconnect = e
+            .get("reconnect")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
         out.push(Finding {
             kind: DetectorKind::ConnectorAuth,
             signature: format!("connector-reauth|{account}"),
@@ -4768,9 +5026,20 @@ pub fn connector_findings_from_rollup(rollup: &serde_json::Value, now: f64) -> V
     // `unreachable` is network trouble (a dead network is not connector rot
     // and must never fan out one card per account), `not_granted` is neutral,
     // and needs_reauth legs are already the reauth finding above.
-    for a in rollup.get("accounts").and_then(|v| v.as_array()).cloned().unwrap_or_default() {
-        let account = a.get("account").and_then(|v| v.as_str()).unwrap_or("").to_string();
-        let Some(canary) = a.get("canary").and_then(|v| v.as_object()) else { continue };
+    for a in rollup
+        .get("accounts")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default()
+    {
+        let account = a
+            .get("account")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let Some(canary) = a.get("canary").and_then(|v| v.as_object()) else {
+            continue;
+        };
         for (svc, leg) in canary {
             if leg.get("status").and_then(|v| v.as_str()) != Some("api_error") {
                 continue;
@@ -4835,7 +5104,10 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
     // — a detector whose findings reorder between ticks is one nobody can diff.
     let mut groups: BTreeMap<(String, String), Vec<&CiRun>> = BTreeMap::new();
     for r in runs {
-        groups.entry((r.repo.clone(), ci_sanitize(&r.workflow))).or_default().push(r);
+        groups
+            .entry((r.repo.clone(), ci_sanitize(&r.workflow)))
+            .or_default()
+            .push(r);
     }
 
     for ((repo, workflow), all) in groups {
@@ -4883,7 +5155,10 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
 
         // Inconclusive runs are dropped ENTIRELY (not counted, not
         // streak-breaking) — see `ci_is_inconclusive`.
-        let decisive: Vec<&&CiRun> = eligible.iter().filter(|r| !ci_is_inconclusive(&r.conclusion)).collect();
+        let decisive: Vec<&&CiRun> = eligible
+            .iter()
+            .filter(|r| !ci_is_inconclusive(&r.conclusion))
+            .collect();
         let n_cancelled = eligible.len() - decisive.len();
         if n_cancelled > 0 {
             suppressed.push(sup(
@@ -4896,7 +5171,9 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             ));
         }
 
-        let Some(newest) = decisive.first() else { continue };
+        let Some(newest) = decisive.first() else {
+            continue;
+        };
         if !ci_is_failure(&newest.conclusion) {
             // Green right now. Nothing to file. Whether an EXISTING card should
             // hear about it is `ci_recovered`'s job, and the answer is a note,
@@ -4928,7 +5205,10 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             continue;
         }
 
-        let oldest = streak.last().copied().expect("streak is non-empty: count >= min_failures >= 1");
+        let oldest = streak
+            .last()
+            .copied()
+            .expect("streak is non-empty: count >= min_failures >= 1");
         let anchor = match last_success {
             Some(_) => oldest.run_id.to_string(),
             // The window ran out before a green run did. Fixed anchor so the
@@ -4937,7 +5217,10 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
         };
         let signature = format!("ci|{repo}|{workflow}|{anchor}");
         let first_seen = oldest.created_at;
-        let step = newest.failing_step.clone().unwrap_or_else(|| "<step not resolved>".into());
+        let step = newest
+            .failing_step
+            .clone()
+            .unwrap_or_else(|| "<step not resolved>".into());
 
         let mut evidence: Vec<(String, String)> = vec![
             (
@@ -4952,13 +5235,25 @@ pub fn ci_findings(runs: &[CiRun], now: f64) -> (Vec<Finding>, Vec<Suppressed>) 
             ("repo".into(), repo.clone()),
             ("workflow".into(), workflow.clone()),
             ("consecutive_failures".into(), count.to_string()),
-            ("first_failure_at".into(), format!("{} (run {})", ci_when(first_seen), oldest.run_id)),
+            (
+                "first_failure_at".into(),
+                format!("{} (run {})", ci_when(first_seen), oldest.run_id),
+            ),
             ("first_failure_url".into(), oldest.url.clone()),
-            ("failing_for".into(), format!("{:.1}h", ((now - first_seen) / 3600.0).max(0.0))),
-            ("latest_run".into(), format!("{} (run {})", ci_when(newest.created_at), newest.run_id)),
+            (
+                "failing_for".into(),
+                format!("{:.1}h", ((now - first_seen) / 3600.0).max(0.0)),
+            ),
+            (
+                "latest_run".into(),
+                format!("{} (run {})", ci_when(newest.created_at), newest.run_id),
+            ),
             ("latest_run_url".into(), newest.url.clone()),
             ("failing_step".into(), step),
-            ("trigger".into(), format!("{} on {}", newest.event, newest.branch)),
+            (
+                "trigger".into(),
+                format!("{} on {}", newest.event, newest.branch),
+            ),
         ];
         match last_success {
             Some(s) => evidence.push((
@@ -5025,7 +5320,11 @@ pub fn ci_recovered(runs: &[CiRun], signature: &str) -> Option<String> {
                 && !ci_is_inconclusive(&r.conclusion)
         })
         .collect();
-    mine.sort_by(|a, b| b.created_at.partial_cmp(&a.created_at).unwrap_or(std::cmp::Ordering::Equal));
+    mine.sort_by(|a, b| {
+        b.created_at
+            .partial_cmp(&a.created_at)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     let newest = mine.first()?;
     if ci_is_failure(&newest.conclusion) {
         return None;
@@ -5043,29 +5342,44 @@ pub fn ci_recovered(runs: &[CiRun], signature: &str) -> Option<String> {
 /// Cached run list, so the 120s tick does not become 720 GitHub calls a day.
 #[allow(clippy::type_complexity)]
 fn ci_cache() -> &'static std::sync::RwLock<Option<(f64, Vec<CiRun>, Vec<Suppressed>)>> {
-    static CELL: std::sync::OnceLock<std::sync::RwLock<Option<(f64, Vec<CiRun>, Vec<Suppressed>)>>> =
-        std::sync::OnceLock::new();
+    static CELL: std::sync::OnceLock<
+        std::sync::RwLock<Option<(f64, Vec<CiRun>, Vec<Suppressed>)>>,
+    > = std::sync::OnceLock::new();
     CELL.get_or_init(|| std::sync::RwLock::new(None))
 }
 
 async fn gh(args: &[String], timeout_s: u64) -> Result<String, String> {
     // kill_on_drop: a fired timeout drops this future, and without it the `gh`
     // child is left unreaped as a zombie (DESKT-30).
-    let fut = tokio::process::Command::new("gh").args(args).kill_on_drop(true).output();
+    let fut = tokio::process::Command::new("gh")
+        .args(args)
+        .kill_on_drop(true)
+        .output();
     let out = match tokio::time::timeout(std::time::Duration::from_secs(timeout_s), fut).await {
-        Err(_) => return Err(format!("`gh {}` timed out after {timeout_s}s", args.join(" "))),
+        Err(_) => {
+            return Err(format!(
+                "`gh {}` timed out after {timeout_s}s",
+                args.join(" ")
+            ))
+        }
         Ok(Err(e)) => return Err(format!("cannot run `gh`: {e}")),
         Ok(Ok(o)) => o,
     };
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
-        return Err(format!("`gh {}` failed: {}", args.join(" "), truncate(err.trim(), 300)));
+        return Err(format!(
+            "`gh {}` failed: {}",
+            args.join(" "),
+            truncate(err.trim(), 300)
+        ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 fn ci_parse_ts(s: &str) -> f64 {
-    chrono::DateTime::parse_from_rfc3339(s).map(|d| d.timestamp() as f64).unwrap_or(0.0)
+    chrono::DateTime::parse_from_rfc3339(s)
+        .map(|d| d.timestamp() as f64)
+        .unwrap_or(0.0)
 }
 
 /// Ask GitHub. Impure by definition — kept in its own function so
@@ -5089,7 +5403,12 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
 
     for repo in ci_repos() {
         let default_branch = match gh(
-            &["api".into(), format!("repos/{repo}"), "--jq".into(), ".default_branch".into()],
+            &[
+                "api".into(),
+                format!("repos/{repo}"),
+                "--jq".into(),
+                ".default_branch".into(),
+            ],
             timeout_s,
         )
         .await
@@ -5110,9 +5429,12 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
 
         let list = match gh(
             &[
-                "run".into(), "list".into(),
-                "--repo".into(), repo.clone(),
-                "--limit".into(), ci_run_limit().to_string(),
+                "run".into(),
+                "list".into(),
+                "--repo".into(),
+                repo.clone(),
+                "--limit".into(),
+                ci_run_limit().to_string(),
                 "--json".into(),
                 "databaseId,conclusion,createdAt,event,headBranch,url,workflowName,status".into(),
             ],
@@ -5139,7 +5461,12 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
             ));
         }
         for v in parsed {
-            let s = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+            let s = |k: &str| {
+                v.get(k)
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
             let branch = s("headBranch");
             runs.push(CiRun {
                 repo: repo.clone(),
@@ -5199,7 +5526,11 @@ async fn fetch_ci_runs(now: f64) -> (Vec<CiRun>, Vec<Suppressed>) {
 }
 
 fn sup(kind: DetectorKind, signature: &str, reason: &str) -> Suppressed {
-    Suppressed { kind, signature: signature.to_string(), reason: reason.to_string() }
+    Suppressed {
+        kind,
+        signature: signature.to_string(),
+        reason: reason.to_string(),
+    }
 }
 
 fn truncate(s: &str, n: usize) -> String {
@@ -5222,13 +5553,24 @@ pub fn idem_of(signature: &str) -> String {
 /// before reading a word of prose.
 pub fn render_desc(f: &Finding) -> String {
     let mut s = String::new();
-    s.push_str("Filed automatically by amux (runtime_jobs/autofix) — nobody has looked at this yet.\n");
-    s.push_str("It is a REPORT, not a diagnosis: the evidence below is computed, the cause is not.\n\n");
+    s.push_str(
+        "Filed automatically by amux (runtime_jobs/autofix) — nobody has looked at this yet.\n",
+    );
+    s.push_str(
+        "It is a REPORT, not a diagnosis: the evidence below is computed, the cause is not.\n\n",
+    );
     for (k, v) in &f.evidence {
         s.push_str(&format!("{k}: {v}\n"));
     }
-    s.push_str(&format!("\ndetector: {}\nsignature: {}\n", f.kind.slug(), f.signature));
-    s.push_str(&format!("\nre-check (run this first — if it is now clean, say so on the card):\n  {}\n", f.recheck));
+    s.push_str(&format!(
+        "\ndetector: {}\nsignature: {}\n",
+        f.kind.slug(),
+        f.signature
+    ));
+    s.push_str(&format!(
+        "\nre-check (run this first — if it is now clean, say so on the card):\n  {}\n",
+        f.recheck
+    ));
     s.push_str(
         "\nIf this turns out not to be a defect, the fix is usually the INSTRUMENT: a refusal \
          wearing a 5xx, a threshold below its own baseline, or a probe that cannot express the \
@@ -5391,7 +5733,10 @@ pub async fn autofix_tick_with_ci(
 ) -> AutofixReport {
     let t0 = std::time::Instant::now();
     let now = unix_now();
-    let mut rep = AutofixReport { at: now, ..Default::default() };
+    let mut rep = AutofixReport {
+        at: now,
+        ..Default::default()
+    };
 
     let mut ci_sup = ci_sup;
     if ci_runs.is_empty() && ci_sup.is_empty() {
@@ -5448,14 +5793,24 @@ pub async fn autofix_tick_with_ci(
     // time — which the detector reports rather than treating as "now".
     let steer_resets: BTreeMap<String, i64> = steer_blocked
         .keys()
-        .map(|s| (s.clone(), crate::api::session_verbs::lane_rate_limit_reset(s)))
+        .map(|s| {
+            (
+                s.clone(),
+                crate::api::session_verbs::lane_rate_limit_reset(s),
+            )
+        })
         .collect();
     // WHICH KIND of limit, from the same meta the sweep stamps (MC-1458). A zero
     // reset cannot say whether a clock should exist, and the two answers want
     // opposite responses from whoever reads the card.
     let steer_kinds: BTreeMap<String, String> = steer_blocked
         .keys()
-        .map(|s| (s.clone(), crate::api::session_verbs::lane_rate_limit_kind(s)))
+        .map(|s| {
+            (
+                s.clone(),
+                crate::api::session_verbs::lane_rate_limit_kind(s),
+            )
+        })
         .collect();
 
     // DISK DETECTION RUNS OFF THE RUNTIME, AND OUTSIDE THE STORE LOCK (AF-97 —
@@ -5526,9 +5881,14 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::Http5xx => detect_5xx(&conn, now),
                 DetectorKind::Latency => detect_latency(&conn, now),
                 DetectorKind::DeadRoute => detect_dead_routes(&conn, now),
-                DetectorKind::SilentSubsystem => {
-                    detect_silent(&conn, now, &steer_blocked, &steer_resets, &steer_kinds, &steer_skips_snap)
-                }
+                DetectorKind::SilentSubsystem => detect_silent(
+                    &conn,
+                    now,
+                    &steer_blocked,
+                    &steer_resets,
+                    &steer_kinds,
+                    &steer_skips_snap,
+                ),
                 DetectorKind::InvariantBreach => detect_invariants(&conn, now),
                 DetectorKind::BuildDeploy => detect_build(&conn, now, home),
                 // Computed above, off-runtime and outside this lock (AF-97).
@@ -5538,9 +5898,10 @@ pub async fn autofix_tick_with_ci(
                 DetectorKind::CiFailure => ci_findings(ci_runs, now),
                 DetectorKind::FdPressure => detect_fd(now),
                 // Computed above, off-runtime and outside this lock, like disk.
-                DetectorKind::ConnectorAuth => {
-                    (std::mem::take(&mut connector_f), std::mem::take(&mut connector_s))
-                }
+                DetectorKind::ConnectorAuth => (
+                    std::mem::take(&mut connector_f),
+                    std::mem::take(&mut connector_s),
+                ),
                 DetectorKind::StuckComposer => detect_stuck_composer(now),
             };
             findings.extend(f);
@@ -5553,7 +5914,8 @@ pub async fn autofix_tick_with_ci(
     let ignore = ignore_list();
     let mut to_file: Vec<Finding> = Vec::new();
     for f in findings {
-        rep.signatures_seen.push((f.kind.slug().to_string(), f.signature.clone()));
+        rep.signatures_seen
+            .push((f.kind.slug().to_string(), f.signature.clone()));
         if let Some(pat) = ignore.iter().find(|p| f.signature.contains(p.as_str())) {
             rep.suppressed.push((
                 f.kind.slug().into(),
@@ -5684,30 +6046,30 @@ pub async fn autofix_tick_with_ci(
                     // Fall through to file. The decision is recorded above so
                     // "why did this re-file" is answerable without a bisect.
                 } else {
-                if stale_d.unwrap_or(0.0) >= mute_warn_days() {
-                    tracing::warn!(
-                        card = %card,
-                        detector = f.kind.slug(),
-                        signature = %f.signature,
-                        stale_days = stale_d.unwrap_or(0.0),
-                        "autofix_mute: this fault keeps recurring and is suppressed against a \
-                         card nobody has touched. Only OPEN cards suppress and `backlog` is \
-                         open, so a parked card mutes its entire class with no expiry \
-                         (AMUX-3774). Judge or discard the card to let occurrences through."
-                    );
-                }
-                rep.suppressed.push((
-                    f.kind.slug().into(),
-                    f.signature.clone(),
-                    format!(
-                        "{card} is open for this same fault — one card per fault, not one \
+                    if stale_d.unwrap_or(0.0) >= mute_warn_days() {
+                        tracing::warn!(
+                            card = %card,
+                            detector = f.kind.slug(),
+                            signature = %f.signature,
+                            stale_days = stale_d.unwrap_or(0.0),
+                            "autofix_mute: this fault keeps recurring and is suppressed against a \
+                             card nobody has touched. Only OPEN cards suppress and `backlog` is \
+                             open, so a parked card mutes its entire class with no expiry \
+                             (AMUX-3774). Judge or discard the card to let occurrences through."
+                        );
+                    }
+                    rep.suppressed.push((
+                        f.kind.slug().into(),
+                        f.signature.clone(),
+                        format!(
+                            "{card} is open for this same fault — one card per fault, not one \
                          per scan (AMUX-3667).{age} NOTE: suppressing does NOT bump that \
                          card, so its age is the only signal that this recurred. It stops \
                          suppressing at {:.1} day(s).",
-                        mute_expire_days()
-                    ),
-                ));
-                continue;
+                            mute_expire_days()
+                        ),
+                    ));
+                    continue;
                 }
             }
         }
@@ -5738,7 +6100,8 @@ pub async fn autofix_tick_with_ci(
         to_file.push(f);
     }
     for s in suppressed {
-        rep.suppressed.push((s.kind.slug().into(), s.signature, s.reason));
+        rep.suppressed
+            .push((s.kind.slug().into(), s.signature, s.reason));
     }
 
     for f in to_file {
@@ -5770,7 +6133,10 @@ pub async fn autofix_tick_with_ci(
                         .store
                         .write_async(move |conn| {
                             link_incident_to_card(conn, &c, &i, &e)?;
-                            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                            Ok(crate::db::WriteOutcome {
+                                applied: true,
+                                events: vec![],
+                            })
                         })
                         .await;
                 }
@@ -5783,7 +6149,8 @@ pub async fn autofix_tick_with_ci(
                          before {} (AMUX-3645)",
                         rl::local_when(t)
                     );
-                    rep.parked.push((card.clone(), f.signature.clone(), rl::local_when(t)));
+                    rep.parked
+                        .push((card.clone(), f.signature.clone(), rl::local_when(t)));
                 }
                 rep.filed.push((card, f.signature.clone()));
             }
@@ -5967,8 +6334,7 @@ fn invariant_signature_parts(sig: &str) -> Option<(String, String)> {
             // and if it ever is, this mis-links one card rather than dropping
             // the timestamp into every one.
             let ent = match rest.rsplit_once('|') {
-                Some((head, tail))
-                    if !head.is_empty() && tail.parse::<i64>().is_ok() => head,
+                Some((head, tail)) if !head.is_empty() && tail.parse::<i64>().is_ok() => head,
                 _ => rest,
             };
             (!ent.is_empty()).then(|| (inv.to_string(), ent.to_string()))
@@ -6057,7 +6423,13 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
             let Some((card_id, old_title, old_desc, updated_at)) = existing else {
                 return Ok(None);
             };
-            if !should_refresh(&old_title, &fresh_title, updated_at, now_s, refresh_min_secs()) {
+            if !should_refresh(
+                &old_title,
+                &fresh_title,
+                updated_at,
+                now_s,
+                refresh_min_secs(),
+            ) {
                 return Ok(None);
             }
             drop(conn);
@@ -6075,7 +6447,10 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                     "UPDATE issues SET title = ?2, desc = ?3, updated_at = ?4 WHERE id = ?1",
                     rusqlite::params![cid, ttl, body, now_s],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             });
             tracing::info!(
                 card = %card_id, detector = %f.signature,
@@ -6085,7 +6460,11 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
         }
     }
     let owner = f.owner.clone().unwrap_or_else(fixer_session);
-    let owner = if owner.trim().is_empty() { None } else { Some(owner) };
+    let owner = if owner.trim().is_empty() {
+        None
+    } else {
+        Some(owner)
+    };
     let title = truncate(&f.title, 160);
     let desc = render_desc(f);
     let item_type = f.kind.item_type();
@@ -6106,10 +6485,17 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
         .write_async(move |conn| {
             // Re-check inside the writer: two ticks cannot race a double file.
             if conn
-                .query_row("SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1", rusqlite::params![idem], |_| Ok(()))
+                .query_row(
+                    "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
+                    rusqlite::params![idem],
+                    |_| Ok(()),
+                )
                 .is_ok()
             {
-                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+                return Ok(crate::db::WriteOutcome {
+                    applied: false,
+                    events: vec![],
+                });
             }
             let new = bs::NewIssue {
                 title: title.clone(),
@@ -6127,7 +6513,11 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                 // ahead of an event; this one is filed after the event, and its
                 // exit is a date rather than a firing. Retyping it would trade
                 // one gate that does not fit for another.
-                status: if parked_until.is_some() { "backlog".into() } else { "todo".into() },
+                status: if parked_until.is_some() {
+                    "backlog".into()
+                } else {
+                    "todo".into()
+                },
                 session: owner.clone(),
                 item_type: item_type.into(),
                 creator: "autofix".into(),
@@ -6170,7 +6560,8 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
                     now_s as f64,
                     owner.clone().unwrap_or_default(),
                     "autofix.filed",
-                    json!({"card": row.id, "signature": signature, "detector": kind_slug}).to_string(),
+                    json!({"card": row.id, "signature": signature, "detector": kind_slug})
+                        .to_string(),
                     idem,
                     "autofix"
                 ],
@@ -6184,7 +6575,10 @@ async fn file_finding(state: &AppState, f: &Finding) -> anyhow::Result<Option<St
             if let Ok(mut g) = sink.lock() {
                 *g = Some(row.id.clone());
             }
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![event] })
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![event],
+            })
         })
         .await?;
     let created = created_id.lock().ok().and_then(|g| g.clone());
@@ -6266,13 +6660,24 @@ async fn note_resolved_incidents(state: &AppState) -> anyhow::Result<Vec<(String
                         .unwrap_or_else(|| "an unknown time".into()),
                 );
                 let idem = format!("autofix-inv-resolved:{card}:{inv}:{entity}");
-                Note { card, what: what.to_string(), line, idem }
+                Note {
+                    card,
+                    what: what.to_string(),
+                    line,
+                    idem,
+                }
             })
             .collect()
     };
 
     let mut noted: Vec<(String, String)> = Vec::new();
-    for Note { card, what, line, idem } in candidates {
+    for Note {
+        card,
+        what,
+        line,
+        idem,
+    } in candidates
+    {
         let already = {
             let conn = state.store.read()?;
             conn.query_row(
@@ -6292,9 +6697,11 @@ async fn note_resolved_incidents(state: &AppState) -> anyhow::Result<Vec<(String
             .write_async(move |conn| {
                 use rusqlite::OptionalExtension;
                 let existing: Option<String> = conn
-                    .query_row("SELECT log FROM issues WHERE id=?1", rusqlite::params![c2], |r| {
-                        r.get(0)
-                    })
+                    .query_row(
+                        "SELECT log FROM issues WHERE id=?1",
+                        rusqlite::params![c2],
+                        |r| r.get(0),
+                    )
                     .optional()?
                     .flatten();
                 let hhmm = chrono::Local::now().format("%H:%M").to_string();
@@ -6308,14 +6715,16 @@ async fn note_resolved_incidents(state: &AppState) -> anyhow::Result<Vec<(String
                      VALUES (?1, '', 'autofix.inv_resolved', ?2, ?3, 'autofix')",
                     rusqlite::params![unix_now(), json!({"card": c2}).to_string(), i2],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await?;
         noted.push((card, what));
     }
     Ok(noted)
 }
-
 
 /// "Stopped happening" is NOTED, never acted on.
 ///
@@ -6370,13 +6779,17 @@ async fn note_quiet_signatures(
             // Only the request-log-backed detectors can be asked "has this
             // recurred?"; the others have no per-occurrence row to count, so
             // they are left alone rather than guessed at.
-            let Some(rest) = sig.strip_prefix("5xx|") else { continue };
+            let Some(rest) = sig.strip_prefix("5xx|") else {
+                continue;
+            };
             let parts: Vec<&str> = rest.split('|').collect();
             if parts.len() != 4 {
                 continue;
             }
             let (status, method, target) = (parts[0], parts[1], parts[3]);
-            let Ok(status) = status.parse::<i64>() else { continue };
+            let Ok(status) = status.parse::<i64>() else {
+                continue;
+            };
             let recent: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM _amux_request_log WHERE status=?1 AND method=?2 AND ts >= ?3",
@@ -6401,11 +6814,21 @@ async fn note_quiet_signatures(
         }
     }
     let mut noted = Vec::new();
-    for Note { card, what, line, idem } in candidates {
+    for Note {
+        card,
+        what,
+        line,
+        idem,
+    } in candidates
+    {
         let already = {
             let conn = state.store.read()?;
-            conn.query_row("SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1", rusqlite::params![idem], |_| Ok(()))
-                .is_ok()
+            conn.query_row(
+                "SELECT 1 FROM session_events WHERE idem=?1 LIMIT 1",
+                rusqlite::params![idem],
+                |_| Ok(()),
+            )
+            .is_ok()
         };
         if already {
             continue;
@@ -6417,18 +6840,28 @@ async fn note_quiet_signatures(
             .write_async(move |conn| {
                 use rusqlite::OptionalExtension;
                 let existing: Option<String> = conn
-                    .query_row("SELECT log FROM issues WHERE id=?1", rusqlite::params![c2], |r| r.get(0))
+                    .query_row(
+                        "SELECT log FROM issues WHERE id=?1",
+                        rusqlite::params![c2],
+                        |r| r.get(0),
+                    )
                     .optional()?
                     .flatten();
                 let hhmm = chrono::Local::now().format("%H:%M").to_string();
                 let log = bs::append_log(existing.as_deref(), &hhmm, &line);
-                conn.execute("UPDATE issues SET log=?1 WHERE id=?2", rusqlite::params![log, c2])?;
+                conn.execute(
+                    "UPDATE issues SET log=?1 WHERE id=?2",
+                    rusqlite::params![log, c2],
+                )?;
                 conn.execute(
                     "INSERT OR IGNORE INTO session_events (ts, session, type, data, idem, source) \
                      VALUES (?1, '', 'autofix.quiet', ?2, ?3, 'autofix')",
                     rusqlite::params![unix_now(), json!({"card": c2}).to_string(), i2],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await?;
         noted.push((card, what));
@@ -6481,7 +6914,9 @@ pub use crate::config::amux_home;
 /// `GET /api/debug/autofix` — the answer to "why didn't it file?" in one
 /// request. Carries the toggle state, every threshold, every signature seen,
 /// every card filed, and every suppression WITH its reason.
-async fn debug_autofix(axum::extract::State(state): axum::extract::State<AppState>) -> axum::response::Response {
+async fn debug_autofix(
+    axum::extract::State(state): axum::extract::State<AppState>,
+) -> axum::response::Response {
     use axum::response::IntoResponse;
     let r = last_report();
     let on = state.store.read().map(|c| enabled(&c)).unwrap_or(true);
@@ -6622,7 +7057,10 @@ mod tests {
     fn no_published_sweep_is_reported_as_unmeasured_not_as_none_stuck() {
         // ghost_rescue has published nothing in a bare test process.
         let (findings, suppressed) = super::detect_stuck_composer(1_788_000_000.0);
-        assert!(findings.is_empty(), "must not file a card from an unmeasured state");
+        assert!(
+            findings.is_empty(),
+            "must not file a card from an unmeasured state"
+        );
         assert!(
             suppressed.iter().any(|s| s.signature == "stuck-composer|no-sweep"),
             "the unmeasured state must be DISCLOSED, not returned as an empty success: {suppressed:?}"
@@ -6644,7 +7082,11 @@ mod tests {
         // Clamped at both ends: 0 would file instantly, a week would re-create the
         // silence. Both bounds are load-bearing, so both are asserted.
         std::env::set_var("AMUX_STUCK_COMPOSER_CARD_MIN", "0");
-        assert_eq!(super::stuck_composer_card_after_s(), 60.0, "must clamp up to 1 min");
+        assert_eq!(
+            super::stuck_composer_card_after_s(),
+            60.0,
+            "must clamp up to 1 min"
+        );
         std::env::set_var("AMUX_STUCK_COMPOSER_CARD_MIN", "99999");
         assert_eq!(
             super::stuck_composer_card_after_s(),
@@ -6673,9 +7115,15 @@ mod tests {
             "5 minutes is inside ghost-rescue's own retry territory; 6 hours is the bug"
         );
         let f = &findings[0];
-        assert!(f.title.contains("6h"), "the age is the whole argument for the card: {}", f.title);
         assert!(
-            f.evidence.iter().any(|(k, v)| k == "lane" && v == "stuck-for-hours"),
+            f.title.contains("6h"),
+            "the age is the whole argument for the card: {}",
+            f.title
+        );
+        assert!(
+            f.evidence
+                .iter()
+                .any(|(k, v)| k == "lane" && v == "stuck-for-hours"),
             "the card has to NAME the lane: {:?}",
             f.evidence
         );
@@ -6698,7 +7146,10 @@ mod tests {
             Some("wedged-lane"),
             "a nudge to this lane would submit the paste nobody has read"
         );
-        assert_eq!(findings[0].owner, None, "None routes to AMUX_AUTOFIX_SESSION");
+        assert_eq!(
+            findings[0].owner, None,
+            "None routes to AMUX_AUTOFIX_SESSION"
+        );
     }
 
     /// TWO INSTRUMENTS DISAGREEING IS NOT AN AGE OF ZERO. ghost-rescue sees the
@@ -6711,9 +7162,14 @@ mod tests {
         let now = 1_788_000_000.0;
         let lanes = vec![("unstamped-lane".to_string(), 0)];
         let (findings, suppressed) = super::stuck_composer_findings(&lanes, now);
-        assert!(findings.is_empty(), "an unmeasurable age cannot become a card: {findings:?}");
         assert!(
-            suppressed.iter().any(|s| s.signature == "stuck-composer|unstamped-lane|unstamped"),
+            findings.is_empty(),
+            "an unmeasurable age cannot become a card: {findings:?}"
+        );
+        assert!(
+            suppressed
+                .iter()
+                .any(|s| s.signature == "stuck-composer|unstamped-lane|unstamped"),
             "the disagreement must be visible: {suppressed:?}"
         );
     }
@@ -6726,8 +7182,11 @@ mod tests {
         std::env::remove_var("AMUX_STUCK_COMPOSER_CARD_MIN");
         let now = 1_788_000_000.0;
         let a = super::stuck_composer_findings(&[("l".to_string(), (now - 7200.0) as i64)], now).0;
-        let b =
-            super::stuck_composer_findings(&[("l".to_string(), (now - 7200.0) as i64)], now + 900.0).0;
+        let b = super::stuck_composer_findings(
+            &[("l".to_string(), (now - 7200.0) as i64)],
+            now + 900.0,
+        )
+        .0;
         assert_eq!(a[0].signature, b[0].signature, "one lane, one card");
     }
 
@@ -6763,7 +7222,9 @@ mod tests {
         assert!(super::should_refresh(
             "disk: 4.2 GB free, below the 50 GB floor",
             "disk: 0.9 GB free, below the 50 GB floor",
-            0, 5 * day, 6 * 3600,
+            0,
+            5 * day,
+            6 * 3600,
         ));
     }
 
@@ -6784,7 +7245,13 @@ mod tests {
     fn a_moved_measurement_still_waits_out_the_rate_gate() {
         let now = 1_000_000;
         assert!(!super::should_refresh("a", "b", now - 60, now, 6 * 3600));
-        assert!(super::should_refresh("a", "b", now - 6 * 3600, now, 6 * 3600));
+        assert!(super::should_refresh(
+            "a",
+            "b",
+            now - 6 * 3600,
+            now,
+            6 * 3600
+        ));
     }
 
     /// The refresh block is REPLACED, never appended, or the card grows without
@@ -6797,10 +7264,15 @@ mod tests {
         assert_eq!(super::desc_without_refresh(&once), base);
         let twice = format!("{once}{}second", super::REFRESH_MARK);
         assert_eq!(
-            super::desc_without_refresh(&twice), base,
+            super::desc_without_refresh(&twice),
+            base,
             "a second refresh must still strip back to the original body"
         );
-        assert_eq!(super::desc_without_refresh(base), base, "no block is a no-op");
+        assert_eq!(
+            super::desc_without_refresh(base),
+            base,
+            "no block is a no-op"
+        );
     }
 
     // ── connector-auth: token rot files one card per ACCOUNT ────────────────
@@ -6826,8 +7298,14 @@ mod tests {
         assert!(matches!(f[0].kind, DetectorKind::ConnectorAuth));
         assert!(f[1].title.contains("two@x.io"), "{}", f[1].title);
         assert!(f[1].title.contains("gmail, google"), "{}", f[1].title);
-        let reconnect = f[0].evidence.iter().find(|(k, _)| k == "reconnect").unwrap();
-        assert!(reconnect.1.contains("/api/connectors/google/auth?account=broken@x.io"));
+        let reconnect = f[0]
+            .evidence
+            .iter()
+            .find(|(k, _)| k == "reconnect")
+            .unwrap();
+        assert!(reconnect
+            .1
+            .contains("/api/connectors/google/auth?account=broken@x.io"));
 
         // Healthy rollup → nothing to file (the check CAN pass).
         let quiet = connector_findings_from_rollup(&serde_json::json!({"needs_reauth": []}), 0.0);
@@ -6853,7 +7331,12 @@ mod tests {
             "needs_reauth": [],
         });
         let f = connector_findings_from_rollup(&rollup, 1000.0);
-        assert_eq!(f.len(), 1, "{:?}", f.iter().map(|x| &x.signature).collect::<Vec<_>>());
+        assert_eq!(
+            f.len(),
+            1,
+            "{:?}",
+            f.iter().map(|x| &x.signature).collect::<Vec<_>>()
+        );
         assert_eq!(f[0].signature, "connector-canary|acct@x.io|calendar");
         assert!(f[0].title.contains("HTTP 403"), "{}", f[0].title);
         let detail = f[0].evidence.iter().find(|(k, _)| k == "detail").unwrap();
@@ -6873,7 +7356,10 @@ mod tests {
         let d = std::env::temp_dir().join(format!("amux-du-ok-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&d);
         let _ = std::fs::write(d.join("f"), vec![0u8; 4096]);
-        let out = du_one(&d, std::time::Instant::now() + std::time::Duration::from_secs(10));
+        let out = du_one(
+            &d,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
         let _ = std::fs::remove_dir_all(&d);
         assert!(matches!(out, DuOutcome::Sized(_)), "got {out:?}");
     }
@@ -6954,7 +7440,10 @@ mod tests {
         let t0 = std::time::Instant::now();
         let got = bounded_output("/bin/sleep", &["30"], std::time::Duration::from_secs(1));
         let elapsed = t0.elapsed();
-        assert_eq!(got, None, "an overrun must report ABSENT, never an empty success");
+        assert_eq!(
+            got, None,
+            "an overrun must report ABSENT, never an empty success"
+        );
         assert!(
             elapsed < std::time::Duration::from_secs(5),
             "returned after {elapsed:?} — the 1s budget was not enforced"
@@ -6975,7 +7464,14 @@ mod tests {
     /// one would otherwise be counted as a snapshot.
     #[test]
     fn bounded_output_rejects_a_nonzero_exit() {
-        assert_eq!(bounded_output("/bin/sh", &["-c", "echo x; exit 3"], std::time::Duration::from_secs(10)), None);
+        assert_eq!(
+            bounded_output(
+                "/bin/sh",
+                &["-c", "echo x; exit 3"],
+                std::time::Duration::from_secs(10)
+            ),
+            None
+        );
     }
 
     #[test]
@@ -6994,7 +7490,10 @@ mod tests {
             .arg(&trash)
             .output();
         let denied = match probe {
-            Ok(o) => o.stdout.split(|c| c.is_ascii_whitespace()).next()
+            Ok(o) => o
+                .stdout
+                .split(|c| c.is_ascii_whitespace())
+                .next()
                 .and_then(|t| std::str::from_utf8(t).ok())
                 .and_then(|t| t.parse::<u64>().ok())
                 .is_none(),
@@ -7005,7 +7504,10 @@ mod tests {
         }
         // A generous deadline, so a TimedOut verdict here could only mean the
         // code confused the two — which is the whole point of the assertion.
-        let out = du_one(&trash, std::time::Instant::now() + std::time::Duration::from_secs(30));
+        let out = du_one(
+            &trash,
+            std::time::Instant::now() + std::time::Duration::from_secs(30),
+        );
         assert_eq!(
             out,
             DuOutcome::Unreadable(Some(1)),
@@ -7020,7 +7522,10 @@ mod tests {
     #[test]
     fn an_expired_deadline_is_a_timeout_not_an_unreadable_path() {
         let d = std::env::temp_dir();
-        let out = du_one(&d, std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let out = du_one(
+            &d,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+        );
         assert_eq!(out, DuOutcome::TimedOut, "got {out:?}");
     }
 
@@ -7039,7 +7544,10 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000));
         }
-        let out = du_one(&d, std::time::Instant::now() + std::time::Duration::from_secs(10));
+        let out = du_one(
+            &d,
+            std::time::Instant::now() + std::time::Duration::from_secs(10),
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -7138,10 +7646,22 @@ mod tests {
         let got = disk_candidates(home.path());
         std::env::remove_var("AMUX_DISK_FILE_MIN_MB");
 
-        let has = |n: &str| got.iter().any(|p| p.file_name().map(|f| f == n).unwrap_or(false));
-        assert!(has("big.db"), "a 2MB file above a 1MB floor must be a candidate: {got:?}");
-        assert!(has("a-directory"), "directories must STILL be candidates: {got:?}");
-        assert!(!has("small.txt"), "a file below the floor is noise, not a candidate: {got:?}");
+        let has = |n: &str| {
+            got.iter()
+                .any(|p| p.file_name().map(|f| f == n).unwrap_or(false))
+        };
+        assert!(
+            has("big.db"),
+            "a 2MB file above a 1MB floor must be a candidate: {got:?}"
+        );
+        assert!(
+            has("a-directory"),
+            "directories must STILL be candidates: {got:?}"
+        );
+        assert!(
+            !has("small.txt"),
+            "a file below the floor is noise, not a candidate: {got:?}"
+        );
     }
 
     /// The agent scratch root must be rankable (AF-275).
@@ -7165,17 +7685,29 @@ mod tests {
     #[test]
     fn the_agent_scratch_root_is_rankable_and_build_trees_still_are() {
         // Treatment: the specimen from the incident, and the shape on any host.
-        assert!(tmp_candidate_name("claude-501"), "the agent scratch root on this machine");
-        assert!(tmp_candidate_name("claude-0"), "and on a host with a different uid");
+        assert!(
+            tmp_candidate_name("claude-501"),
+            "the agent scratch root on this machine"
+        );
+        assert!(
+            tmp_candidate_name("claude-0"),
+            "and on a host with a different uid"
+        );
 
         // Control: the behaviour that already existed must survive.
-        assert!(tmp_candidate_name("amux-build-target"), "build trees must STILL rank");
+        assert!(
+            tmp_candidate_name("amux-build-target"),
+            "build trees must STILL rank"
+        );
         assert!(tmp_candidate_name("target"), "and a bare target dir");
 
         // Neither arm may become a catch-all: ranking all of /private/tmp would
         // spend the whole `du` budget on OS noise and crowd out real findings.
         assert!(!tmp_candidate_name("com.apple.launchd.abc123"));
-        assert!(!tmp_candidate_name("tmux-501"), "the tmux socket dir is tiny and not ours to rank");
+        assert!(
+            !tmp_candidate_name("tmux-501"),
+            "the tmux socket dir is tiny and not ours to rank"
+        );
     }
 
     /// AMUX-3667 follow-up, rebuilt from the eight cards themselves.
@@ -7227,8 +7759,11 @@ mod tests {
         // An ARCHIVED card is the specimen: still `review`, hidden by an operator.
         add("AMUX-3864", "review", 1);
         let (id, disp) = released_predecessor(&conn, sig).expect("the archived card must be found");
-        assert_eq!((id.as_str(), disp.as_str()), ("AMUX-3864", "archived"),
-                   "archived must be reported as archived, not as its underlying status");
+        assert_eq!(
+            (id.as_str(), disp.as_str()),
+            ("AMUX-3864", "archived"),
+            "archived must be reported as archived, not as its underlying status"
+        );
 
         // CONTROL, and it is the half that keeps this honest: an OPEN card must
         // NOT be reported as a released predecessor. It is still suppressing, so
@@ -7291,33 +7826,58 @@ mod tests {
         // CONTROL 1: discarded must NOT suppress, or judging a spurious report
         // would silence the fault permanently — the opposite failure, and the
         // one the trailing timestamp exists to avoid.
-        conn.execute("UPDATE issues SET status='discarded' WHERE id='AMUX-3650'", []).unwrap();
+        conn.execute(
+            "UPDATE issues SET status='discarded' WHERE id='AMUX-3650'",
+            [],
+        )
+        .unwrap();
         assert_eq!(
             open_card_for_fault(&conn, &sig(1787585376)),
             None,
             "a discarded card must let the next genuine occurrence through"
         );
         for st in ["done", "verified"] {
-            conn.execute("UPDATE issues SET status=?1 WHERE id='AMUX-3650'", rusqlite::params![st])
-                .unwrap();
+            conn.execute(
+                "UPDATE issues SET status=?1 WHERE id='AMUX-3650'",
+                rusqlite::params![st],
+            )
+            .unwrap();
             assert_eq!(open_card_for_fault(&conn, &sig(1787585376)), None, "{st}");
         }
         // An ARCHIVED open card is not in anyone's queue either.
-        conn.execute("UPDATE issues SET status='todo', archived=1 WHERE id='AMUX-3650'", [])
-            .unwrap();
-        assert_eq!(open_card_for_fault(&conn, &sig(1787585376)), None, "archived");
+        conn.execute(
+            "UPDATE issues SET status='todo', archived=1 WHERE id='AMUX-3650'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            open_card_for_fault(&conn, &sig(1787585376)),
+            None,
+            "archived"
+        );
 
         // CONTROL 2: a DIFFERENT fault must still file. Matching on the prefix
         // with a `LIKE` makes over-matching the live risk — `/api/browser` is a
         // prefix of `/api/browser/start`, so a sloppy pattern would fold every
         // endpoint under one card and the board would go quiet about real
         // faults.
-        conn.execute("UPDATE issues SET status='todo', archived=0 WHERE id='AMUX-3650'", [])
-            .unwrap();
+        conn.execute(
+            "UPDATE issues SET status='todo', archived=0 WHERE id='AMUX-3650'",
+            [],
+        )
+        .unwrap();
         let other = "5xx|502|POST|/api/browser|/api/browser/stop|1787585376";
-        assert_eq!(open_card_for_fault(&conn, other), None, "a different target is a different fault");
+        assert_eq!(
+            open_card_for_fault(&conn, other),
+            None,
+            "a different target is a different fault"
+        );
         let other_status = "5xx|500|POST|/api/browser|/api/browser/start|1787585376";
-        assert_eq!(open_card_for_fault(&conn, other_status), None, "a different status too");
+        assert_eq!(
+            open_card_for_fault(&conn, other_status),
+            None,
+            "a different status too"
+        );
 
         // AMUX-3673: a ROLLUP's identity is "the server was slow", not which
         // endpoints it caught. These two are the REAL signatures of AMUX-3651
@@ -7343,8 +7903,14 @@ mod tests {
         // CONTROL 3: only the two timestamped families have a fault identity at
         // all. Stripping a trailing field from an arbitrary signature would
         // merge unrelated faults.
-        assert_eq!(fault_identity("invariant|hooks.guard|fleet|1787223065"), None);
-        assert_eq!(fault_identity("5xx|502|POST|/api/x|/api/x|nota-number"), None);
+        assert_eq!(
+            fault_identity("invariant|hooks.guard|fleet|1787223065"),
+            None
+        );
+        assert_eq!(
+            fault_identity("5xx|502|POST|/api/x|/api/x|nota-number"),
+            None
+        );
         assert_eq!(
             fault_identity("latency|outlier|GET|/api/board|1787585028"),
             Some("latency|outlier|GET|/api/board")
@@ -7391,12 +7957,20 @@ mod tests {
         // sibling alone. A blanket fallback would smear one card across both.
         assert_eq!(link("AMUX-2", "route.callers", "GET /api/x"), 1);
         assert_eq!(card_of("route.callers", "GET /api/x"), "AMUX-2");
-        assert_eq!(card_of("route.callers", "GET /api/y"), "", "sibling must be untouched");
+        assert_eq!(
+            card_of("route.callers", "GET /api/y"),
+            "",
+            "sibling must be untouched"
+        );
 
         // CONTROL: a genuine miss stays a miss and reports 0, rather than the
         // fallback inventing a link to some unrelated fleet-wide row.
         assert_eq!(link("AMUX-3", "no.such.invariant", "fleet"), 0);
-        assert_eq!(card_of("hooks.shared_guard", ""), "AMUX-1", "must not be overwritten");
+        assert_eq!(
+            card_of("hooks.shared_guard", ""),
+            "AMUX-1",
+            "must not be overwritten"
+        );
     }
 
     /// AMUX-3665, rebuilt from the report that motivated it.
@@ -7448,7 +8022,10 @@ mod tests {
 
         let want_target = checkout.path().join("target");
         let want_modules = checkout.path().join("node_modules");
-        assert!(got.contains(&want_target), "the checkout's build tree must rank: {got:?}");
+        assert!(
+            got.contains(&want_target),
+            "the checkout's build tree must rank: {got:?}"
+        );
         assert!(got.contains(&want_modules), "node_modules too: {got:?}");
         assert_eq!(
             got.iter().filter(|p| **p == want_target).count(),
@@ -7473,7 +8050,8 @@ mod tests {
         let home = tempfile::tempdir().unwrap();
         std::fs::write(home.path().join("two-mb.bin"), vec![0u8; 2 * 1024 * 1024]).unwrap();
         let seen = |v: &[std::path::PathBuf]| {
-            v.iter().any(|p| p.file_name().map(|f| f == "two-mb.bin").unwrap_or(false))
+            v.iter()
+                .any(|p| p.file_name().map(|f| f == "two-mb.bin").unwrap_or(false))
         };
 
         std::env::set_var("AMUX_DISK_FILE_MIN_MB", "64");
@@ -7482,8 +8060,14 @@ mod tests {
         let low = disk_candidates(home.path());
         std::env::remove_var("AMUX_DISK_FILE_MIN_MB");
 
-        assert!(!seen(&high), "2MB is below a 64MB floor and must be excluded: {high:?}");
-        assert!(seen(&low), "2MB is above a 1MB floor and must be included: {low:?}");
+        assert!(
+            !seen(&high),
+            "2MB is below a 64MB floor and must be excluded: {high:?}"
+        );
+        assert!(
+            seen(&low),
+            "2MB is above a 1MB floor and must be included: {low:?}"
+        );
     }
 
     /// A file candidate must survive the whole pipeline, not merely be
@@ -7497,7 +8081,11 @@ mod tests {
         let f = dir.path().join("blob.bin");
         std::fs::write(&f, vec![0u8; 512 * 1024]).unwrap();
         let got = du_top(std::slice::from_ref(&f), 8, None);
-        assert_eq!(got.len(), 1, "a plain file must be sized, not dropped: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "a plain file must be sized, not dropped: {got:?}"
+        );
         assert!(got[0].bytes > 0, "a 512KB file must size non-zero: {got:?}");
     }
 
@@ -7511,8 +8099,14 @@ mod tests {
         std::fs::write(dir.path().join("f"), vec![0u8; 64 * 1024]).unwrap();
         let got = du_top(&[dir.path().to_path_buf()], 8, None);
         assert_eq!(got.len(), 1, "expected the tempdir to be measured: {got:?}");
-        assert!(got[0].bytes > 0, "measured size should be non-zero: {got:?}");
-        assert!(got[0].stale_age_s.is_none(), "a fresh walk must not be labelled stale: {got:?}");
+        assert!(
+            got[0].bytes > 0,
+            "measured size should be non-zero: {got:?}"
+        );
+        assert!(
+            got[0].stale_age_s.is_none(),
+            "a fresh walk must not be labelled stale: {got:?}"
+        );
     }
 
     // ── the carry-forward, both directions (AEAB-33) ───────────────────────
@@ -7539,7 +8133,9 @@ mod tests {
         // Seed the cache as a previous successful run would have left it.
         let measured_at = crate::runtime_jobs::registry::unix_now() - 7200.0;
         let seeded: std::collections::HashMap<String, (u64, f64)> =
-            [("/".to_string(), (9_900_000_000u64, measured_at))].into_iter().collect();
+            [("/".to_string(), (9_900_000_000u64, measured_at))]
+                .into_iter()
+                .collect();
         std::fs::write(&cf, serde_json::to_string(&seeded).unwrap()).unwrap();
 
         std::env::set_var("AMUX_DISK_DU_PATH_TIMEOUT_S", "0.001");
@@ -7548,10 +8144,22 @@ mod tests {
         std::env::remove_var("AMUX_DISK_DU_PATH_TIMEOUT_S");
         std::env::remove_var("AMUX_DISK_DU_TOTAL_TIMEOUT_S");
 
-        assert_eq!(got.len(), 1, "the unsizable path must NOT vanish from the ranking: {got:?}");
-        assert_eq!(got[0].bytes, 9_900_000_000, "it must carry the remembered size");
-        let age = got[0].stale_age_s.expect("a carried figure must be LABELLED stale, not passed off as fresh");
-        assert!((age - 7200.0).abs() < 60.0, "the age must be real, not a placeholder: {age}");
+        assert_eq!(
+            got.len(),
+            1,
+            "the unsizable path must NOT vanish from the ranking: {got:?}"
+        );
+        assert_eq!(
+            got[0].bytes, 9_900_000_000,
+            "it must carry the remembered size"
+        );
+        let age = got[0]
+            .stale_age_s
+            .expect("a carried figure must be LABELLED stale, not passed off as fresh");
+        assert!(
+            (age - 7200.0).abs() < 60.0,
+            "the age must be real, not a placeholder: {age}"
+        );
     }
 
     /// THE NEGATIVE HALF, and the one that keeps the fix honest. A path that has
@@ -7569,7 +8177,10 @@ mod tests {
         let got = du_top(&[std::path::PathBuf::from("/")], 8, Some(&cf));
         std::env::remove_var("AMUX_DISK_DU_PATH_TIMEOUT_S");
         std::env::remove_var("AMUX_DISK_DU_TOTAL_TIMEOUT_S");
-        assert!(got.is_empty(), "nothing was ever measured, so nothing may be claimed: {got:?}");
+        assert!(
+            got.is_empty(),
+            "nothing was ever measured, so nothing may be claimed: {got:?}"
+        );
     }
 
     /// The cache must survive a restart, because this process re-execs to adopt
@@ -7584,7 +8195,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f"), vec![0u8; 64 * 1024]).unwrap();
         let _ = du_top(&[dir.path().to_path_buf()], 8, Some(&cf));
-        assert!(cf.exists(), "the cache file was not written (parent dir not created?)");
+        assert!(
+            cf.exists(),
+            "the cache file was not written (parent dir not created?)"
+        );
         let reloaded = du_cache_load(Some(&cf));
         assert!(
             reloaded.contains_key(&dir.path().display().to_string()),
@@ -7626,7 +8240,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("f"), vec![0u8; 32 * 1024]).unwrap();
         let got = du_top(&[dir.path().to_path_buf()], 8, Some(&cf));
-        assert_eq!(got.len(), 1, "a bad cache must not stop a live measurement: {got:?}");
+        assert_eq!(
+            got.len(),
+            1,
+            "a bad cache must not stop a live measurement: {got:?}"
+        );
     }
 
     /// AMUX-3014: autofix cards must default ON (local ops board) and turn OFF
@@ -7634,12 +8252,21 @@ mod tests {
     /// customer boards do not carry the server's own health cards).
     #[test]
     fn ops_health_cards_default_on_off_only_when_explicitly_falsey() {
-        assert!(parse_ops_health_cards(None), "unset -> on (local ops default)");
+        assert!(
+            parse_ops_health_cards(None),
+            "unset -> on (local ops default)"
+        );
         assert!(parse_ops_health_cards(Some("1")), "1 -> on");
         assert!(parse_ops_health_cards(Some("true")), "true -> on");
-        assert!(parse_ops_health_cards(Some("")), "empty -> on (not an explicit off)");
+        assert!(
+            parse_ops_health_cards(Some("")),
+            "empty -> on (not an explicit off)"
+        );
         for off in ["0", "false", "off", "no", "OFF", " 0 ", "False"] {
-            assert!(!parse_ops_health_cards(Some(off)), "{off:?} must disable filing");
+            assert!(
+                !parse_ops_health_cards(Some(off)),
+                "{off:?} must disable filing"
+            );
         }
     }
 
@@ -7665,20 +8292,26 @@ mod tests {
                         rusqlite::params![format!("s-{lane}"), lane, now - queued_min * 60.0],
                     )?;
                 }
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .expect("seed");
     }
 
-/// No drain-loop skip records — the post-restart state, and the one the
+    /// No drain-loop skip records — the post-restart state, and the one the
     /// detector must read as UNMEASURED rather than as healthy (AMUX-3927).
     fn no_skips() -> BTreeMap<String, (String, f64)> {
         BTreeMap::new()
     }
 
-        fn rate_limited(lanes: &[&str]) -> BTreeMap<String, Option<String>> {
-        lanes.iter().map(|l| (l.to_string(), Some("rate-limited".to_string()))).collect()
+    fn rate_limited(lanes: &[&str]) -> BTreeMap<String, Option<String>> {
+        lanes
+            .iter()
+            .map(|l| (l.to_string(), Some("rate-limited".to_string())))
+            .collect()
     }
 
     // ── MC-1458: a zero reset time is two different facts ───────────────────
@@ -7701,7 +8334,11 @@ mod tests {
             .iter()
             .find(|x| x.signature == format!("silent|steering|{lane}"))
             .unwrap_or_else(|| panic!("no card for {lane}: {f:?}"));
-        hit.evidence.iter().find(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).unwrap_or_default()
+        hit.evidence
+            .iter()
+            .find(|(k, _)| k == "verdict")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
     }
 
     /// A CREDIT CAP MUST NOT SEND ANYONE TO THE PARSER. This is the common case
@@ -7714,8 +8351,16 @@ mod tests {
         seed_queues(&st, now, &["capped"], 92.0).await;
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = [("capped".to_string(), 0)].into();
-        let kinds: BTreeMap<String, String> = [("capped".to_string(), "credit-banner".to_string())].into();
-        let (f, _) = detect_silent(&conn, now, &rate_limited(&["capped"]), &resets, &kinds, &no_skips());
+        let kinds: BTreeMap<String, String> =
+            [("capped".to_string(), "credit-banner".to_string())].into();
+        let (f, _) = detect_silent(
+            &conn,
+            now,
+            &rate_limited(&["capped"]),
+            &resets,
+            &kinds,
+            &no_skips(),
+        );
         let v = silent_verdict(&f, "capped");
         assert!(v.contains("CREDIT CAP"), "{v}");
         assert!(v.contains("no clock to read"), "{v}");
@@ -7736,8 +8381,16 @@ mod tests {
         seed_queues(&st, now, &["menu-lane"], 92.0).await;
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = [("menu-lane".to_string(), 0)].into();
-        let kinds: BTreeMap<String, String> = [("menu-lane".to_string(), "menu".to_string())].into();
-        let (f, _) = detect_silent(&conn, now, &rate_limited(&["menu-lane"]), &resets, &kinds, &no_skips());
+        let kinds: BTreeMap<String, String> =
+            [("menu-lane".to_string(), "menu".to_string())].into();
+        let (f, _) = detect_silent(
+            &conn,
+            now,
+            &rate_limited(&["menu-lane"]),
+            &resets,
+            &kinds,
+            &no_skips(),
+        );
         let v = silent_verdict(&f, "menu-lane");
         assert!(v.contains("parse_rate_limit_reset"), "{v}");
         assert!(v.contains("MENU"), "{v}");
@@ -7755,15 +8408,24 @@ mod tests {
         seed_queues(&st, now, &["old-lane"], 92.0).await;
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = [("old-lane".to_string(), 0)].into();
-        let (f, _) =
-            detect_silent(&conn, now, &rate_limited(&["old-lane"]), &resets, &BTreeMap::new(), &no_skips());
+        let (f, _) = detect_silent(
+            &conn,
+            now,
+            &rate_limited(&["old-lane"]),
+            &resets,
+            &BTreeMap::new(),
+            &no_skips(),
+        );
         let v = silent_verdict(&f, "old-lane");
         assert!(v.contains("no record of WHICH limit"), "{v}");
         assert!(
             !v.contains("CREDIT CAP") && !v.contains("the parse failed"),
             "unknown must not be answered as either kind: {v}"
         );
-        let hit = f.iter().find(|x| x.signature == "silent|steering|old-lane").unwrap();
+        let hit = f
+            .iter()
+            .find(|x| x.signature == "silent|steering|old-lane")
+            .unwrap();
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         assert!(ev["limit_kind"].contains("unknown"), "{ev:?}");
     }
@@ -7781,33 +8443,53 @@ mod tests {
         let conn = st.store.read().unwrap();
         // No reset clock anywhere: the credit-cap case, which is the one that files.
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, sup) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new(), &no_skips());
+        let (f, sup) = detect_silent(
+            &conn,
+            now,
+            &rate_limited(&lanes),
+            &resets,
+            &BTreeMap::new(),
+            &no_skips(),
+        );
         assert!(
             !sup.iter().any(|x| x.signature.contains("<query failed>")),
             "the steering query did not prepare, so this test measures nothing: {sup:?}"
         );
 
-        let rollup: Vec<_> =
-            f.iter().filter(|x| x.signature == "silent|steering|account-rate-limit").collect();
+        let rollup: Vec<_> = f
+            .iter()
+            .filter(|x| x.signature == "silent|steering|account-rate-limit")
+            .collect();
         assert_eq!(rollup.len(), 1, "one cap is one card: {f:?}");
         for lane in lanes {
             assert!(
-                !f.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                !f.iter()
+                    .any(|x| x.signature == format!("silent|steering|{lane}")),
                 "{lane} must not also get its own card: {f:?}"
             );
             let s = sup
                 .iter()
                 .find(|x| x.signature == format!("silent|steering|{lane}"))
                 .expect("a folded lane must leave a trace, or the fold is invisible");
-            assert!(s.reason.contains("folded into the account-level card"), "{}", s.reason);
+            assert!(
+                s.reason.contains("folded into the account-level card"),
+                "{}",
+                s.reason
+            );
         }
         let ev: BTreeMap<_, _> = rollup[0].evidence.iter().cloned().collect();
-        assert!(ev["lanes"].contains("capped-b"), "the card must name the lanes: {ev:?}");
+        assert!(
+            ev["lanes"].contains("capped-b"),
+            "the card must name the lanes: {ev:?}"
+        );
         assert!(
             ev["verdict"].contains("ANTHROPIC_API_KEY"),
             "and say why several lanes at once is ONE fault: {ev:?}"
         );
-        assert_eq!(rollup[0].owner, None, "an account cap has no sender who can act on it");
+        assert_eq!(
+            rollup[0].owner, None,
+            "an account cap has no sender who can act on it"
+        );
     }
 
     /// BELOW THE THRESHOLD, NOTHING CHANGES. Two capped lanes are still two
@@ -7822,14 +8504,23 @@ mod tests {
         seed_queues(&st, now, &lanes, 92.0).await;
         let conn = st.store.read().unwrap();
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
-        let (f, _) = detect_silent(&conn, now, &rate_limited(&lanes), &resets, &BTreeMap::new(), &no_skips());
+        let (f, _) = detect_silent(
+            &conn,
+            now,
+            &rate_limited(&lanes),
+            &resets,
+            &BTreeMap::new(),
+            &no_skips(),
+        );
         assert!(
-            !f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
+            !f.iter()
+                .any(|x| x.signature == "silent|steering|account-rate-limit"),
             "two is a coincidence, not a pattern: {f:?}"
         );
         for lane in lanes {
             assert!(
-                f.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                f.iter()
+                    .any(|x| x.signature == format!("silent|steering|{lane}")),
                 "{lane} keeps its own card below the threshold: {f:?}"
             );
         }
@@ -7859,8 +8550,10 @@ mod tests {
         let mut blocked = BTreeMap::new();
         blocked.insert("stopped-lane".to_string(), Some("not-running".to_string()));
         blocked.insert("gone-lane".to_string(), Some("archived".to_string()));
-        let resets: BTreeMap<String, i64> =
-            ["stopped-lane", "gone-lane"].iter().map(|l| (l.to_string(), 0)).collect();
+        let resets: BTreeMap<String, i64> = ["stopped-lane", "gone-lane"]
+            .iter()
+            .map(|l| (l.to_string(), 0))
+            .collect();
         let conn = st.store.read().unwrap();
         let (f, sup) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
 
@@ -7881,7 +8574,8 @@ mod tests {
         // outage from a permanent one, and 45 of 45 messages past the old
         // deadline drained untouched.
         assert!(
-            !f.iter().any(|x| x.signature == "silent|steering|stopped-lane"),
+            !f.iter()
+                .any(|x| x.signature == "silent|steering|stopped-lane"),
             "a stopped lane restarts and its queue drains; no age makes that a card: {f:?}"
         );
         // SUPPRESSED, NOT SILENT: the decision is recorded with its reason.
@@ -7914,22 +8608,27 @@ mod tests {
         for l in stopped2 {
             blocked2.insert(l.to_string(), Some("not-running".to_string()));
         }
-        let resets2: BTreeMap<String, i64> =
-            stopped2.iter().map(|l| (l.to_string(), 0)).collect();
+        let resets2: BTreeMap<String, i64> = stopped2.iter().map(|l| (l.to_string(), 0)).collect();
         let conn2 = st2.store.read().unwrap();
-        let (f2, sup2) =
-            detect_silent(&conn2, now, &blocked2, &resets2, &BTreeMap::new(), &no_skips());
+        let (f2, sup2) = detect_silent(
+            &conn2,
+            now,
+            &blocked2,
+            &resets2,
+            &BTreeMap::new(),
+            &no_skips(),
+        );
         assert!(
             !f2.iter().any(|x| x.signature.contains("not-running")),
             "a transient reason has nothing to roll up: {f2:?}"
         );
         for lane in stopped2 {
             assert!(
-                sup2.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                sup2.iter()
+                    .any(|x| x.signature == format!("silent|steering|{lane}")),
                 "{lane} must leave a recorded suppression, not vanish: {sup2:?}"
             );
         }
-
     }
 
     /// THE CHECK AMUX-3927 ASKED FOR, VERBATIM: "a lane whose only sin is a long
@@ -7988,8 +8687,14 @@ mod tests {
         // With a record: quote it, with its age.
         let mut skips = BTreeMap::new();
         skips.insert("dead-lane".to_string(), ("send-refused".to_string(), 7.0));
-        let (f, _) =
-            detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new(), &skips);
+        let (f, _) = detect_silent(
+            &conn,
+            now,
+            &blocked,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &skips,
+        );
         let ev: BTreeMap<_, _> = f
             .iter()
             .find(|x| x.signature == "silent|steering|dead-lane")
@@ -8008,8 +8713,14 @@ mod tests {
         // must say UNMEASURED. Reporting silence as health here is the exact
         // failure this detector family keeps producing (ethos rule 4), and the
         // map is empty after every restart.
-        let (f2, _) =
-            detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new(), &no_skips());
+        let (f2, _) = detect_silent(
+            &conn,
+            now,
+            &blocked,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &no_skips(),
+        );
         let ev2: BTreeMap<_, _> = f2
             .iter()
             .find(|x| x.signature == "silent|steering|dead-lane")
@@ -8069,8 +8780,10 @@ mod tests {
         // the cap assertion above and quietly unassign every card that DOES
         // have someone who can act.
         blocked.insert("dead-lane".into(), Some("no-env-file".into()));
-        let resets: BTreeMap<String, i64> =
-            ["capped-lane", "dead-lane"].iter().map(|l| (l.to_string(), 0)).collect();
+        let resets: BTreeMap<String, i64> = ["capped-lane", "dead-lane"]
+            .iter()
+            .map(|l| (l.to_string(), 0))
+            .collect();
         let conn = st.store.read().unwrap();
         let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
 
@@ -8145,16 +8858,22 @@ mod tests {
             .iter()
             .find(|x| x.signature == "silent|steering|shared|archived")
             .expect("three lanes sharing archived must roll up into one card");
-        assert!(rolled.title.contains("3 lanes"), "the count belongs in the title: {}", rolled.title);
+        assert!(
+            rolled.title.contains("3 lanes"),
+            "the count belongs in the title: {}",
+            rolled.title
+        );
         for lane in stopped {
             assert!(
-                !f.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                !f.iter()
+                    .any(|x| x.signature == format!("silent|steering|{lane}")),
                 "{lane} must not ALSO get its own card"
             );
             // Every folded lane leaves a trace, or the fold is invisible to
             // anyone grepping the per-lane signature.
             assert!(
-                sup.iter().any(|x| x.signature == format!("silent|steering|{lane}")),
+                sup.iter()
+                    .any(|x| x.signature == format!("silent|steering|{lane}")),
                 "{lane} must leave a suppression trace"
             );
         }
@@ -8197,7 +8916,8 @@ mod tests {
         let resets: BTreeMap<String, i64> = lanes.iter().map(|l| (l.to_string(), 0)).collect();
         let (f, _) = detect_silent(&conn, now, &blocked, &resets, &BTreeMap::new(), &no_skips());
         assert!(
-            f.iter().any(|x| x.signature == "silent|steering|account-rate-limit"),
+            f.iter()
+                .any(|x| x.signature == "silent|steering|account-rate-limit"),
             "the three capped lanes still roll up: {f:?}"
         );
         let own = f
@@ -8246,7 +8966,10 @@ mod tests {
                         rusqlite::params![format!("s-{lane}"), lane, now - 92.0 * 60.0],
                     )?;
                 }
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .expect("seed");
@@ -8255,7 +8978,14 @@ mod tests {
         let mut blocked = BTreeMap::new();
         blocked.insert("busy-lane".to_string(), None);
         blocked.insert("dead-lane".to_string(), Some("no-env-file".to_string()));
-        let (f, sup) = detect_silent(&conn, now, &blocked, &BTreeMap::new(), &BTreeMap::new(), &no_skips());
+        let (f, sup) = detect_silent(
+            &conn,
+            now,
+            &blocked,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            &no_skips(),
+        );
 
         // THE PREMISE, asserted rather than assumed: the query must have RUN.
         // If it did not prepare, the detector records a suppression saying so,
@@ -8279,8 +9009,15 @@ mod tests {
             .find(|x| x.signature == "silent|steering|dead-lane")
             .expect("a lane with no env file will NEVER drain — that is the real defect");
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
-        assert!(hit.title.contains("cannot drain"), "not 'stuck': {}", hit.title);
-        assert!(ev["verdict"].contains("no-env-file"), "name the reason: {ev:?}");
+        assert!(
+            hit.title.contains("cannot drain"),
+            "not 'stuck': {}",
+            hit.title
+        );
+        assert!(
+            ev["verdict"].contains("no-env-file"),
+            "name the reason: {ev:?}"
+        );
         assert!(ev["lane_reachable"].starts_with("NO"), "{ev:?}");
 
         // CELL 3 — reachable and SEVEN HOURS past the old deadline: NO CARD,
@@ -8302,7 +9039,8 @@ mod tests {
             &no_skips(),
         );
         assert!(
-            !f2.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+            !f2.iter()
+                .any(|x| x.signature == "silent|steering|busy-lane"),
             "a long turn is not a hang at ANY age — filing on duration is the defect: {f2:?}"
         );
         // AND IT IS SUPPRESSED, NOT SILENT. A detector that just stopped looking
@@ -8343,7 +9081,8 @@ mod tests {
             &live,
         );
         assert!(
-            !f3.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+            !f3.iter()
+                .any(|x| x.signature == "silent|steering|busy-lane"),
             "a loop that deferred 2s ago is alive: {f3:?}"
         );
         let seen = sup3
@@ -8361,7 +9100,10 @@ mod tests {
         // rather than a duration. Without this the fix would be indistinguishable
         // from deleting the detector.
         let mut stale_loop = BTreeMap::new();
-        stale_loop.insert("busy-lane".to_string(), ("send-refused".to_string(), 4000.0));
+        stale_loop.insert(
+            "busy-lane".to_string(),
+            ("send-refused".to_string(), 4000.0),
+        );
         let (f4, _) = detect_silent(
             &conn,
             now + 7.0 * 3600.0,
@@ -8371,7 +9113,8 @@ mod tests {
             &stale_loop,
         );
         assert!(
-            f4.iter().any(|x| x.signature == "silent|steering|busy-lane"),
+            f4.iter()
+                .any(|x| x.signature == "silent|steering|busy-lane"),
             "a drain loop that stopped evaluating this lane is a real hang: {f4:?}"
         );
     }
@@ -8404,7 +9147,10 @@ mod tests {
                         rusqlite::params![format!("s-{lane}"), lane, now - 92.0 * 60.0],
                     )?;
                 }
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .await
             .expect("seed");
@@ -8432,7 +9178,8 @@ mod tests {
 
         // CELL 1 — reset still ahead: no card.
         assert!(
-            !f.iter().any(|x| x.signature == "silent|steering|resets-soon"),
+            !f.iter()
+                .any(|x| x.signature == "silent|steering|resets-soon"),
             "a limit that lifts in 35 min drains its own queue: {f:?}"
         );
         // CELL 2 — and the decision is VISIBLE, not silent. A detector that
@@ -8441,7 +9188,11 @@ mod tests {
             .iter()
             .find(|x| x.signature == "silent|steering|resets-soon")
             .expect("suppressing without recording it is the ethos-4 failure");
-        assert!(s.reason.contains("resumes at"), "say WHEN, not just that it will: {}", s.reason);
+        assert!(
+            s.reason.contains("resumes at"),
+            "say WHEN, not just that it will: {}",
+            s.reason
+        );
 
         // CELL 3 (CONTROL) — the reset has PASSED and the queue is still full.
         // That is a worse fact than the original card, not a lesser one.
@@ -8524,8 +9275,12 @@ mod tests {
     fn log_row(st: &AppState, r: Row<'_>) {
         let (ts, status, ms) = (r.ts, r.status, r.ms);
         let (m, p, f, b, w, u) = (
-            r.method.to_string(), r.path.to_string(), r.family.to_string(),
-            r.body.to_string(), r.worker.to_string(), r.ua.to_string(),
+            r.method.to_string(),
+            r.path.to_string(),
+            r.family.to_string(),
+            r.body.to_string(),
+            r.worker.to_string(),
+            r.ua.to_string(),
         );
         st.store
             .write(move |conn| {
@@ -8535,7 +9290,10 @@ mod tests {
                      VALUES (?1,?2,?3,?4,?5,?6,'127.0.0.1',?7,'',?8,'native',?9)",
                     rusqlite::params![ts, m, p, f, status, ms, u, w, b],
                 )?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
     }
@@ -8543,7 +9301,9 @@ mod tests {
     fn cards(st: &AppState) -> Vec<(String, String, String, String, String)> {
         let conn = st.store.read().unwrap();
         let mut stmt = conn
-            .prepare("SELECT id, title, desc, type, COALESCE(source_ref,'') FROM issues ORDER BY id")
+            .prepare(
+                "SELECT id, title, desc, type, COALESCE(source_ref,'') FROM issues ORDER BY id",
+            )
             .unwrap();
         let rows = stmt
             .query_map([], |r| {
@@ -8562,20 +9322,54 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         let pool = "{\"error\":\"timed out waiting for connection\"}";
-        for (i, path) in ["/api/board", "/api/board/statuses", "/api/calendar.ics", "/api/board"]
-            .iter()
-            .enumerate()
+        for (i, path) in [
+            "/api/board",
+            "/api/board/statuses",
+            "/api/calendar.ics",
+            "/api/board",
+        ]
+        .iter()
+        .enumerate()
         {
-            log_row(&st, Row { ts: now - 100.0 + i as f64, method: "GET", path, family: "/api",
-                               status: 500, body: pool, worker: "", ua: "curl/8", ms: 30_150.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 + i as f64,
+                    method: "GET",
+                    path,
+                    family: "/api",
+                    status: 500,
+                    body: pool,
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 30_150.0,
+                },
+            );
         }
         let (f, _) = detect_5xx(&st.store.read().unwrap(), now);
-        assert_eq!(f.len(), 1, "one starvation must be one card, got {:?}",
-                   f.iter().map(|x| &x.title).collect::<Vec<_>>());
+        assert_eq!(
+            f.len(),
+            1,
+            "one starvation must be one card, got {:?}",
+            f.iter().map(|x| &x.title).collect::<Vec<_>>()
+        );
         let card = &f[0];
-        assert!(card.title.contains("Connection pool starved"), "{}", card.title);
-        assert!(card.signature.starts_with("5xx|500|POOL|"), "{}", card.signature);
-        let verdict = &card.evidence.iter().find(|(k, _)| k == "verdict").unwrap().1;
+        assert!(
+            card.title.contains("Connection pool starved"),
+            "{}",
+            card.title
+        );
+        assert!(
+            card.signature.starts_with("5xx|500|POOL|"),
+            "{}",
+            card.signature
+        );
+        let verdict = &card
+            .evidence
+            .iter()
+            .find(|(k, _)| k == "verdict")
+            .unwrap()
+            .1;
         // THE VICTIMS ARE STILL NAMED. Collapsing must not cost the reader the
         // list of what was hit — that was the useful half of the four cards.
         for p in ["/api/board", "/api/board/statuses", "/api/calendar.ics"] {
@@ -8593,13 +9387,41 @@ mod tests {
     async fn two_unrelated_500s_are_still_two_cards() {
         let (st, _d) = state();
         let now = unix_now();
-        log_row(&st, Row { ts: now - 50.0, method: "GET", path: "/api/alpha", family: "/api",
-                           status: 500, body: "index out of bounds", worker: "", ua: "curl/8", ms: 5.0 });
-        log_row(&st, Row { ts: now - 40.0, method: "GET", path: "/api/beta", family: "/api",
-                           status: 500, body: "unwrap on None", worker: "", ua: "curl/8", ms: 5.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 50.0,
+                method: "GET",
+                path: "/api/alpha",
+                family: "/api",
+                status: 500,
+                body: "index out of bounds",
+                worker: "",
+                ua: "curl/8",
+                ms: 5.0,
+            },
+        );
+        log_row(
+            &st,
+            Row {
+                ts: now - 40.0,
+                method: "GET",
+                path: "/api/beta",
+                family: "/api",
+                status: 500,
+                body: "unwrap on None",
+                worker: "",
+                ua: "curl/8",
+                ms: 5.0,
+            },
+        );
         let (f, _) = detect_5xx(&st.store.read().unwrap(), now);
-        assert_eq!(f.len(), 2, "two unrelated 500s stay two cards: {:?}",
-                   f.iter().map(|x| &x.title).collect::<Vec<_>>());
+        assert_eq!(
+            f.len(),
+            2,
+            "two unrelated 500s stay two cards: {:?}",
+            f.iter().map(|x| &x.title).collect::<Vec<_>>()
+        );
     }
 
     /// The predicate alone. Matching too widely would fold unrelated 500s into
@@ -8607,7 +9429,9 @@ mod tests {
     #[test]
     fn only_a_real_pool_timeout_counts_as_starvation() {
         assert!(is_pool_exhaustion("timed out waiting for connection"));
-        assert!(is_pool_exhaustion("{\"error\":\"Timed out waiting for connection\"}"));
+        assert!(is_pool_exhaustion(
+            "{\"error\":\"Timed out waiting for connection\"}"
+        ));
         assert!(!is_pool_exhaustion("connection refused"));
         assert!(!is_pool_exhaustion("timed out waiting for the model"));
         assert!(!is_pool_exhaustion(""));
@@ -8622,16 +9446,46 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..14 {
-            log_row(&st, Row { ts: now - 60.0 - i as f64, method: "POST", path: &format!("/api/sessions/lane{i}/send"), family: "/api/sessions", status: 500, body: "{\"message\":\"boom\"}", worker: "lane", ua: "curl/8", ms: 12.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 60.0 - i as f64,
+                    method: "POST",
+                    path: &format!("/api/sessions/lane{i}/send"),
+                    family: "/api/sessions",
+                    status: 500,
+                    body: "{\"message\":\"boom\"}",
+                    worker: "lane",
+                    ua: "curl/8",
+                    ms: 12.0,
+                },
+            );
         }
         let r = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         let c = cards(&st);
-        assert_eq!(c.len(), 1, "14 rows must be ONE card, got {}: {c:#?}", c.len());
-        assert!(r.filed.len() == 1, "report must name the card it filed: {:?}", r.filed);
+        assert_eq!(
+            c.len(),
+            1,
+            "14 rows must be ONE card, got {}: {c:#?}",
+            c.len()
+        );
+        assert!(
+            r.filed.len() == 1,
+            "report must name the card it filed: {:?}",
+            r.filed
+        );
         // The 14 collapse because normalize_target folds the lane name into
         // the route pattern — the SAME collapse /api/logs/analyze uses.
-        assert!(c[0].1.contains("14x"), "count belongs in the computed title: {}", c[0].1);
-        assert!(c[0].1.contains("/api/sessions/{name}/{*verb}"), "title is the route, not a path: {}", c[0].1);
+        assert!(
+            c[0].1.contains("14x"),
+            "count belongs in the computed title: {}",
+            c[0].1
+        );
+        assert!(
+            c[0].1.contains("/api/sessions/{name}/{*verb}"),
+            "title is the route, not a path: {}",
+            c[0].1
+        );
     }
 
     /// AMUX-3774: a suppression must not claim a count it does not bump, and a
@@ -8654,7 +9508,20 @@ mod tests {
             let (st, _d) = state();
             let now = unix_now();
             for i in 0..4 {
-                log_row(&st, Row { ts: now - 60.0 - i as f64, method: "POST", path: "/api/browser/start", family: "/api/browser", status: 502, body: "{}", worker: "l", ua: "curl/8", ms: 9.0 });
+                log_row(
+                    &st,
+                    Row {
+                        ts: now - 60.0 - i as f64,
+                        method: "POST",
+                        path: "/api/browser/start",
+                        family: "/api/browser",
+                        status: 502,
+                        body: "{}",
+                        worker: "l",
+                        ua: "curl/8",
+                        ms: 9.0,
+                    },
+                );
             }
             let r = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
             assert!(!r.filed.is_empty(), "the first occurrence must file: {r:?}");
@@ -8667,12 +9534,28 @@ mod tests {
             // A newer row mints a newer trailing epoch, which is exactly the
             // real case: the fault recurred.
             let later = unix_now();
-            log_row(&st, Row { ts: later - 1.0, method: "POST", path: "/api/browser/start", family: "/api/browser", status: 502, body: "{}", worker: "l", ua: "curl/8", ms: 9.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: later - 1.0,
+                    method: "POST",
+                    path: "/api/browser/start",
+                    family: "/api/browser",
+                    status: 502,
+                    body: "{}",
+                    worker: "l",
+                    ua: "curl/8",
+                    ms: 9.0,
+                },
+            );
             let stamp = unix_now() - days * 86400.0;
             st.store
                 .write(move |c| {
                     c.execute("UPDATE issues SET updated=?1", rusqlite::params![stamp])?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .expect("age the card");
             let r2 = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
@@ -8739,7 +9622,20 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..5 {
-            log_row(&st, Row { ts: now - 60.0 - i as f64, method: "POST", path: "/api/sessions/x/send", family: "/api/sessions", status: 500, body: "boom", worker: "", ua: "curl/8", ms: 12.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 60.0 - i as f64,
+                    method: "POST",
+                    path: "/api/sessions/x/send",
+                    family: "/api/sessions",
+                    status: 500,
+                    body: "boom",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 12.0,
+                },
+            );
         }
         autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         assert_eq!(cards(&st).len(), 1);
@@ -8755,9 +9651,17 @@ mod tests {
             auth_token: None,
         };
         let r = autofix_tick(&restarted, std::path::Path::new("/nonexistent")).await;
-        assert_eq!(cards(&restarted).len(), 1, "a restart refiled the same signature");
+        assert_eq!(
+            cards(&restarted).len(),
+            1,
+            "a restart refiled the same signature"
+        );
         assert_eq!(r.filed.len(), 0, "nothing new should be filed");
-        assert_eq!(r.already_filed.len(), 1, "and the dedupe must SAY it deduped: {r:?}");
+        assert_eq!(
+            r.already_filed.len(),
+            1,
+            "and the dedupe must SAY it deduped: {r:?}"
+        );
     }
 
     /// 501/503 name what is missing. They are amux being honest about an
@@ -8768,8 +9672,35 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..8 {
-            log_row(&st, Row { ts: now - 60.0 - i as f64, method: "GET", path: "/api/email/search", family: "/api/email", status: 501, body: "{\"error\":\"not a connected Gmail account\",\"connected_hint\":\"...\"}", worker: "", ua: "curl/8", ms: 1.0 });
-            log_row(&st, Row { ts: now - 60.0 - i as f64, method: "GET", path: "/api/torrents", family: "/api/torrents", status: 503, body: "{\"error\":\"aria2c not running\",\"start\":\"aria2c --enable-rpc\"}", worker: "", ua: "curl/8", ms: 1.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 60.0 - i as f64,
+                    method: "GET",
+                    path: "/api/email/search",
+                    family: "/api/email",
+                    status: 501,
+                    body:
+                        "{\"error\":\"not a connected Gmail account\",\"connected_hint\":\"...\"}",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 1.0,
+                },
+            );
+            log_row(
+                &st,
+                Row {
+                    ts: now - 60.0 - i as f64,
+                    method: "GET",
+                    path: "/api/torrents",
+                    family: "/api/torrents",
+                    status: 503,
+                    body: "{\"error\":\"aria2c not running\",\"start\":\"aria2c --enable-rpc\"}",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 1.0,
+                },
+            );
         }
         let r = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         assert_eq!(cards(&st).len(), 0, "a 501/503 must never become a card");
@@ -8780,7 +9711,20 @@ mod tests {
         );
         // Control: a real 500 in the same window still files, so the test
         // cannot pass by the detector being broken outright.
-        log_row(&st, Row { ts: now - 30.0, method: "POST", path: "/api/foo", family: "/api/foo", status: 500, body: "kaboom", worker: "", ua: "curl/8", ms: 1.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 30.0,
+                method: "POST",
+                path: "/api/foo",
+                family: "/api/foo",
+                status: 500,
+                body: "kaboom",
+                worker: "",
+                ua: "curl/8",
+                ms: 1.0,
+            },
+        );
         autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         assert_eq!(cards(&st).len(), 1, "a genuine 500 must still file");
     }
@@ -8792,20 +9736,49 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..6 {
-            log_row(&st, Row { ts: now - 300.0 + i as f64, method: "POST", path: "/api/sessions/amux/send", family: "/api/sessions", status: 500, body: "{\"message\":\"session is in the background-conversation view\"}", worker: "amux", ua: "Mozilla/5.0", ms: 37.2 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 300.0 + i as f64,
+                    method: "POST",
+                    path: "/api/sessions/amux/send",
+                    family: "/api/sessions",
+                    status: 500,
+                    body: "{\"message\":\"session is in the background-conversation view\"}",
+                    worker: "amux",
+                    ua: "Mozilla/5.0",
+                    ms: 37.2,
+                },
+            );
         }
         autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         let c = cards(&st);
         assert_eq!(c.len(), 1);
         let (id, title, desc, ty, sref) = &c[0];
         for field in [
-            "verdict:", "sample_request:", "error_body:", "first_seen:", "last_seen:",
-            "count:", "distinct_clients:", "signature:", "re-check",
+            "verdict:",
+            "sample_request:",
+            "error_body:",
+            "first_seen:",
+            "last_seen:",
+            "count:",
+            "distinct_clients:",
+            "signature:",
+            "re-check",
         ] {
-            assert!(desc.contains(field), "card {id} is missing `{field}`:\n{desc}");
+            assert!(
+                desc.contains(field),
+                "card {id} is missing `{field}`:\n{desc}"
+            );
         }
-        assert!(desc.contains("background-conversation"), "the actual error body must be quoted");
-        assert!(desc.contains("/api/logs/analyze"), "the recheck must be a runnable query");
+        assert!(
+            desc.contains("background-conversation"),
+            "the actual error body must be quoted"
+        );
+        assert!(
+            desc.contains("/api/logs/analyze"),
+            "the recheck must be a runnable query"
+        );
         // AMUX-3591: the signature now carries OCCURRENCE IDENTITY (the newest
         // offending row's second-resolution ts), so it cannot be pinned as a
         // literal. Asserting the prefix keeps what this line was actually for —
@@ -8826,16 +9799,27 @@ mod tests {
         );
         // NEVER `code`: an auto-filed report has no merged commit to claim, so
         // a code gate could only be exited by asserting something untrue.
-        assert_eq!(ty, "investigation", "auto-filed faults must not be gated as code");
+        assert_eq!(
+            ty, "investigation",
+            "auto-filed faults must not be gated as code"
+        );
         assert!(!title.is_empty());
         // Owner comes from the request's own worker attribution.
         let conn = st.store.read().unwrap();
         let owner: Option<String> = conn
-            .query_row("SELECT session FROM issues WHERE id=?1", rusqlite::params![id], |r| r.get(0))
+            .query_row(
+                "SELECT session FROM issues WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(owner.as_deref(), Some("amux"));
         let ot: String = conn
-            .query_row("SELECT owner_type FROM issues WHERE id=?1", rusqlite::params![id], |r| r.get(0))
+            .query_row(
+                "SELECT owner_type FROM issues WHERE id=?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(ot, "agent", "board_drive only picks up agent-owned cards");
     }
@@ -8847,32 +9831,65 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..4 {
-            log_row(&st, Row { ts: now - 60.0 - i as f64, method: "POST", path: "/api/thing", family: "/api/thing", status: 500, body: "bang", worker: "", ua: "curl/8", ms: 3.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 60.0 - i as f64,
+                    method: "POST",
+                    path: "/api/thing",
+                    family: "/api/thing",
+                    status: 500,
+                    body: "bang",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 3.0,
+                },
+            );
         }
         st.store
             .write(|conn| {
-                conn.execute("INSERT OR REPLACE INTO prefs (key,value) VALUES ('autofix_enabled','0')", [])?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                conn.execute(
+                    "INSERT OR REPLACE INTO prefs (key,value) VALUES ('autofix_enabled','0')",
+                    [],
+                )?;
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         let r = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         assert!(!r.enabled);
         assert_eq!(cards(&st).len(), 0, "disabled must not write a card");
-        assert_eq!(r.signatures_seen.len(), 1, "but it must still SEE the fault: {r:?}");
+        assert_eq!(
+            r.signatures_seen.len(),
+            1,
+            "but it must still SEE the fault: {r:?}"
+        );
         assert!(
-            r.suppressed.iter().any(|(_, _, why)| why.contains("autofix_enabled=0")),
-            "and say why it did not file: {:?}", r.suppressed
+            r.suppressed
+                .iter()
+                .any(|(_, _, why)| why.contains("autofix_enabled=0")),
+            "and say why it did not file: {:?}",
+            r.suppressed
         );
         // Flip it back on: the same fault now files, with no restart.
         st.store
             .write(|conn| {
                 conn.execute("UPDATE prefs SET value='1' WHERE key='autofix_enabled'", [])?;
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: vec![],
+                })
             })
             .unwrap();
         let r2 = autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         assert!(r2.enabled);
-        assert_eq!(cards(&st).len(), 1, "the pref must take effect live, without a restart");
+        assert_eq!(
+            cards(&st).len(),
+            1,
+            "the pref must take effect live, without a restart"
+        );
     }
 
     /// A 404 nobody's browser asked for is a probe, not a broken feature.
@@ -8884,7 +9901,20 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..5 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/burn", family: "/api/burn", status: 404, body: "{\"error\":\"not found\"}", worker: "", ua: "curl/8.7.1", ms: 1.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/burn",
+                    family: "/api/burn",
+                    status: 404,
+                    body: "{\"error\":\"not found\"}",
+                    worker: "",
+                    ua: "curl/8.7.1",
+                    ms: 1.0,
+                },
+            );
         }
         let (f, s) = detect_dead_routes(&st.store.read().unwrap(), now);
         assert!(f.is_empty(), "a curl 404 must not file: {f:?}");
@@ -8894,7 +9924,20 @@ mod tests {
         );
 
         for i in 0..5 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/offline-origin", family: "/api/offline-origin", status: 404, body: "{\"error\":\"not found\"}", worker: "", ua: "Mozilla/5.0 (Macintosh)", ms: 1.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/offline-origin",
+                    family: "/api/offline-origin",
+                    status: 404,
+                    body: "{\"error\":\"not found\"}",
+                    worker: "",
+                    ua: "Mozilla/5.0 (Macintosh)",
+                    ms: 1.0,
+                },
+            );
         }
         let (f2, _) = detect_dead_routes(&st.store.read().unwrap(), now);
         assert_eq!(f2.len(), 1, "a path the SPA fetches must file: {f2:?}");
@@ -8988,11 +10031,37 @@ mod tests {
         // it and COMPLETE after it, which is the real restart-spanning shape.
         let boot = now - 100_000.0;
         for i in 0..60 {
-            log_row(&st, Row { ts: boot + i as f64, method: "GET", path: "/api/collapse", family: "/api/collapse", status: 200, body: "", worker: "", ua: "curl/8", ms: 200_000.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: boot + i as f64,
+                    method: "GET",
+                    path: "/api/collapse",
+                    family: "/api/collapse",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 200_000.0,
+                },
+            );
         }
         // Ordinary window traffic, well after the boot: never spanning.
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/collapse", family: "/api/collapse", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/collapse",
+                    family: "/api/collapse",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 5.0,
+                },
+            );
         }
 
         let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, Some(boot));
@@ -9000,10 +10069,20 @@ mod tests {
             .iter()
             .find(|x| x.signature.starts_with("latency|input-collapsed"))
             .unwrap_or_else(|| panic!("a family with 60 baseline rows and 0 survivors is a detector outage and must file: {f:?}"));
-        assert!(hit.signature.contains("/api/collapse"), "the card must name the family: {}", hit.signature);
+        assert!(
+            hit.signature.contains("/api/collapse"),
+            "the card must name the family: {}",
+            hit.signature
+        );
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
-        assert_eq!(ev["rows_discarded"], "60", "state how many rows were thrown away: {ev:?}");
-        assert!(ev["detail"].contains("0 of 60"), "state both counts: {ev:?}");
+        assert_eq!(
+            ev["rows_discarded"], "60",
+            "state how many rows were thrown away: {ev:?}"
+        );
+        assert!(
+            ev["detail"].contains("0 of 60"),
+            "state both counts: {ev:?}"
+        );
 
         // And the suppression must no longer be sayable by a quiet endpoint.
         let sup_txt = s
@@ -9021,11 +10100,13 @@ mod tests {
         // baseline rows really survived rather than the alarm being unreachable.
         let (f2, s2) = detect_latency_at(&st.store.read().unwrap(), now, None);
         assert!(
-            !f2.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            !f2.iter()
+                .any(|x| x.signature.starts_with("latency|input-collapsed")),
             "nothing was filtered, so there is no collapse to report: {f2:?}"
         );
         assert!(
-            !s2.iter().any(|x| x.signature == "latency|p95|/api/collapse"),
+            !s2.iter()
+                .any(|x| x.signature == "latency|p95|/api/collapse"),
             "a 60-row baseline needs no suppression — if this fires the rows were dropped: {s2:?}"
         );
     }
@@ -9047,20 +10128,49 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/ok", family: "/api/ok", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 200_000.0 - i as f64,
+                    method: "GET",
+                    path: "/api/ok",
+                    family: "/api/ok",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 6.0,
+                },
+            );
         }
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/ok", family: "/api/ok", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/ok",
+                    family: "/api/ok",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 6.0,
+                },
+            );
         }
         let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, None);
         assert!(
-            !f.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            !f.iter()
+                .any(|x| x.signature.starts_with("latency|input-collapsed")),
             "nothing collapsed, so nothing files: {f:?}"
         );
         let row = s
             .iter()
             .find(|x| x.signature == "latency|input-collapsed")
-            .unwrap_or_else(|| panic!("the healthy answer must be VISIBLE, not implied by an absence: {s:?}"));
+            .unwrap_or_else(|| {
+                panic!("the healthy answer must be VISIBLE, not implied by an absence: {s:?}")
+            });
         assert!(
             row.reason.contains("0 of 1 families"),
             "quote the zero AND the population it is out of: {:?}",
@@ -9078,11 +10188,25 @@ mod tests {
         let (st2, _d2) = state();
         let boot = now - 100_000.0;
         for i in 0..60 {
-            log_row(&st2, Row { ts: boot + i as f64, method: "GET", path: "/api/gone", family: "/api/gone", status: 200, body: "", worker: "", ua: "curl/8", ms: 200_000.0 });
+            log_row(
+                &st2,
+                Row {
+                    ts: boot + i as f64,
+                    method: "GET",
+                    path: "/api/gone",
+                    family: "/api/gone",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 200_000.0,
+                },
+            );
         }
         let (f2, s2) = detect_latency_at(&st2.store.read().unwrap(), now, Some(boot));
         assert!(
-            f2.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            f2.iter()
+                .any(|x| x.signature.starts_with("latency|input-collapsed")),
             "a wiped family must file: {f2:?}"
         );
         assert!(
@@ -9101,23 +10225,66 @@ mod tests {
         let now = unix_now();
         // Window traffic only. Nothing in the baseline period at all.
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/fresh", family: "/api/fresh", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/fresh",
+                    family: "/api/fresh",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 5.0,
+                },
+            );
         }
         // A second family with a real, thin, unfiltered baseline.
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/thin", family: "/api/thin", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/thin",
+                    family: "/api/thin",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 5.0,
+                },
+            );
         }
         for i in 0..5 {
-            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/thin", family: "/api/thin", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 200_000.0 - i as f64,
+                    method: "GET",
+                    path: "/api/thin",
+                    family: "/api/thin",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 5.0,
+                },
+            );
         }
 
         let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, None);
         assert!(
-            !f.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            !f.iter()
+                .any(|x| x.signature.starts_with("latency|input-collapsed")),
             "no rows were discarded, so nothing collapsed: {f:?}"
         );
-        let fresh = s.iter().find(|x| x.signature == "latency|p95|/api/fresh")
-            .map(|x| x.reason.clone()).unwrap_or_default();
+        let fresh = s
+            .iter()
+            .find(|x| x.signature == "latency|p95|/api/fresh")
+            .map(|x| x.reason.clone())
+            .unwrap_or_default();
         assert!(
             fresh.contains("no rows at all"),
             "a family with no history must say so plainly: {fresh:?}"
@@ -9126,8 +10293,11 @@ mod tests {
             !fresh.contains("filtering"),
             "nothing was filtered here — saying so is the confusion this card exists to end: {fresh:?}"
         );
-        let thin = s.iter().find(|x| x.signature == "latency|p95|/api/thin")
-            .map(|x| x.reason.clone()).unwrap_or_default();
+        let thin = s
+            .iter()
+            .find(|x| x.signature == "latency|p95|/api/thin")
+            .map(|x| x.reason.clone())
+            .unwrap_or_default();
         assert!(
             thin.contains("5 of 5"),
             "a thin but intact baseline must show kept AND considered: {thin:?}"
@@ -9149,14 +10319,41 @@ mod tests {
         // The real shape: the process started seconds ago; all history is older.
         let boot = now - 10.0;
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/hist", family: "/api/hist", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 200_000.0 - i as f64,
+                    method: "GET",
+                    path: "/api/hist",
+                    family: "/api/hist",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 6.0,
+                },
+            );
         }
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/hist", family: "/api/hist", status: 200, body: "", worker: "", ua: "curl/8", ms: 6.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/hist",
+                    family: "/api/hist",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 6.0,
+                },
+            );
         }
         let (f, s) = detect_latency_at(&st.store.read().unwrap(), now, Some(boot));
         assert!(
-            !f.iter().any(|x| x.signature.starts_with("latency|input-collapsed")),
+            !f.iter()
+                .any(|x| x.signature.starts_with("latency|input-collapsed")),
             "a 6ms row from before this boot never spanned anything and must be kept: {f:?}"
         );
         assert!(
@@ -9205,9 +10402,48 @@ mod tests {
         // Logged oldest-first with the worst in the MIDDLE, so insertion order,
         // timestamp order and latency order all disagree. Any one of them
         // standing in for "worst" picks a different row.
-        log_row(&st, Row { ts: now - 300.0, method: "POST", path: "/api/sessions/alpha/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 11_000.0 });
-        log_row(&st, Row { ts: now - 200.0, method: "POST", path: "/api/sessions/beta/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 20_000.0 });
-        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/sessions/gamma/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 12_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 300.0,
+                method: "POST",
+                path: "/api/sessions/alpha/report",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 11_000.0,
+            },
+        );
+        log_row(
+            &st,
+            Row {
+                ts: now - 200.0,
+                method: "POST",
+                path: "/api/sessions/beta/report",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 20_000.0,
+            },
+        );
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "POST",
+                path: "/api/sessions/gamma/report",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 12_000.0,
+            },
+        );
 
         let (f, _s) = detect_latency_at(&st.store.read().unwrap(), now, None);
         let card = f
@@ -9224,7 +10460,11 @@ mod tests {
         );
 
         let ev = |k: &str| {
-            card.evidence.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap_or_default()
+            card.evidence
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_default()
         };
         let sample = ev("sample_request");
         assert!(
@@ -9262,8 +10502,34 @@ mod tests {
     async fn a_long_by_design_verb_is_budgeted_without_blinding_its_wildcard_siblings() {
         let (st, _d) = state();
         let now = unix_now();
-        log_row(&st, Row { ts: now - 200.0, method: "POST", path: "/api/sessions/alpha/send", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 12_000.0 });
-        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/sessions/beta/report", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 11_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 200.0,
+                method: "POST",
+                path: "/api/sessions/alpha/send",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 12_000.0,
+            },
+        );
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "POST",
+                path: "/api/sessions/beta/report",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 11_000.0,
+            },
+        );
 
         let (f, _s) = detect_latency_at(&st.store.read().unwrap(), now, None);
         let sigs: Vec<&str> = f
@@ -9273,7 +10539,8 @@ mod tests {
             .collect();
 
         assert!(
-            sigs.iter().any(|s| s.contains("/api/sessions/{name}/report")),
+            sigs.iter()
+                .any(|s| s.contains("/api/sessions/{name}/report")),
             "report has no design budget and exceeded the floor — it MUST still file, or the \
              budget for its sibling has blinded it: {sigs:?}"
         );
@@ -9320,7 +10587,10 @@ mod tests {
                          '127.0.0.1','curl/8','','','native')",
                         rusqlite::params![ts, ms],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         };
@@ -9383,7 +10653,10 @@ mod tests {
                          '127.0.0.1','curl/8','','','native')",
                         rusqlite::params![ts, ms],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         };
@@ -9427,7 +10700,10 @@ mod tests {
                          '127.0.0.1','curl/8','','','native',?3)",
                         rusqlite::params![ts, ms, m],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .unwrap();
         };
@@ -9477,10 +10753,36 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/prefs", family: "/api/prefs", status: 200, body: "", worker: "", ua: "curl/8", ms: 0.54 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 200_000.0 - i as f64,
+                    method: "GET",
+                    path: "/api/prefs",
+                    family: "/api/prefs",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 0.54,
+                },
+            );
         }
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/prefs", family: "/api/prefs", status: 200, body: "", worker: "", ua: "curl/8", ms: 2.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/prefs",
+                    family: "/api/prefs",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 2.0,
+                },
+            );
         }
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
@@ -9498,10 +10800,36 @@ mod tests {
         // A tiny baseline and a slow window: the multiple is enormous, but
         // there is no norm to compare against, so it must not file.
         for i in 0..3 {
-            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/slow", family: "/api/slow", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 200_000.0 - i as f64,
+                    method: "GET",
+                    path: "/api/slow",
+                    family: "/api/slow",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 5.0,
+                },
+            );
         }
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 100.0 - i as f64, method: "GET", path: "/api/slow", family: "/api/slow", status: 200, body: "", worker: "", ua: "curl/8", ms: 4000.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 100.0 - i as f64,
+                    method: "GET",
+                    path: "/api/slow",
+                    family: "/api/slow",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 4000.0,
+                },
+            );
         }
         let (f, s) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
@@ -9516,13 +10844,31 @@ mod tests {
         // Now give it a real baseline. Same window; it must file, and the card
         // must state the threshold it used.
         for i in 0..60 {
-            log_row(&st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: "/api/slow", family: "/api/slow", status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 200_000.0 - i as f64,
+                    method: "GET",
+                    path: "/api/slow",
+                    family: "/api/slow",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms: 5.0,
+                },
+            );
         }
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now);
-        let hit = f2.iter().find(|x| x.signature == "latency|p95|/api/slow")
+        let hit = f2
+            .iter()
+            .find(|x| x.signature == "latency|p95|/api/slow")
             .expect("a 800x p95 regression over 60 samples must file");
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
-        assert!(ev["verdict"].contains("Threshold"), "state the threshold: {ev:?}");
+        assert!(
+            ev["verdict"].contains("Threshold"),
+            "state the threshold: {ev:?}"
+        );
         assert!(ev.contains_key("window_samples") && ev.contains_key("baseline_samples"));
     }
 
@@ -9548,10 +10894,36 @@ mod tests {
     async fn simultaneous_p95_regressions_collapse_to_one_card_but_two_do_not() {
         let fast_then_slow = |st: &crate::api::AppState, now: f64, fam: &'static str| {
             for i in 0..60 {
-                log_row(st, Row { ts: now - 200_000.0 - i as f64, method: "GET", path: fam, family: fam, status: 200, body: "", worker: "", ua: "curl/8", ms: 5.0 });
+                log_row(
+                    st,
+                    Row {
+                        ts: now - 200_000.0 - i as f64,
+                        method: "GET",
+                        path: fam,
+                        family: fam,
+                        status: 200,
+                        body: "",
+                        worker: "",
+                        ua: "curl/8",
+                        ms: 5.0,
+                    },
+                );
             }
             for i in 0..60 {
-                log_row(st, Row { ts: now - 100.0 - i as f64, method: "GET", path: fam, family: fam, status: 200, body: "", worker: "", ua: "curl/8", ms: 4000.0 });
+                log_row(
+                    st,
+                    Row {
+                        ts: now - 100.0 - i as f64,
+                        method: "GET",
+                        path: fam,
+                        family: fam,
+                        status: 200,
+                        body: "",
+                        worker: "",
+                        ua: "curl/8",
+                        ms: 4000.0,
+                    },
+                );
             }
         };
 
@@ -9580,8 +10952,10 @@ mod tests {
             fast_then_slow(&st3, now3, fam);
         }
         let (f3, _) = detect_latency(&st3.store.read().unwrap(), now3);
-        let rollups: Vec<_> =
-            f3.iter().filter(|x| x.signature.contains("p95|ROLLUP")).collect();
+        let rollups: Vec<_> = f3
+            .iter()
+            .filter(|x| x.signature.contains("p95|ROLLUP"))
+            .collect();
         assert_eq!(
             rollups.len(),
             1,
@@ -9589,7 +10963,8 @@ mod tests {
             f3.iter().map(|x| &x.signature).collect::<Vec<_>>()
         );
         assert!(
-            !f3.iter().any(|x| x.signature.starts_with("latency|p95|/api/three")),
+            !f3.iter()
+                .any(|x| x.signature.starts_with("latency|p95|/api/three")),
             "the per-family cards must be REPLACED, not accompanied — otherwise the rollup \
              adds a card instead of collapsing three: {:?}",
             f3.iter().map(|x| &x.signature).collect::<Vec<_>>()
@@ -9635,10 +11010,24 @@ mod tests {
         seed("live-lane", now - 600.0); // failing 10 minutes ago
         let conn = st.store.read().unwrap();
         let (f, _) = detect_invariants(&conn, now);
-        let ents: Vec<&str> = f.iter().filter_map(|x| x.evidence.iter().find(|(k, _)| k == "verdict").map(|(_, v)| v.as_str())).collect();
+        let ents: Vec<&str> = f
+            .iter()
+            .filter_map(|x| {
+                x.evidence
+                    .iter()
+                    .find(|(k, _)| k == "verdict")
+                    .map(|(_, v)| v.as_str())
+            })
+            .collect();
         let all = ents.join(" | ");
-        assert!(all.contains("live-lane"), "a fresh failure must file: {all}");
-        assert!(!all.contains("quiet-lane"), "a stale open incident must not mint cards: {all}");
+        assert!(
+            all.contains("live-lane"),
+            "a fresh failure must file: {all}"
+        );
+        assert!(
+            !all.contains("quiet-lane"),
+            "a stale open incident must not mint cards: {all}"
+        );
     }
 
     /// AMUX-3485 both directions: a run INSIDE an endpoint's design budget
@@ -9651,16 +11040,44 @@ mod tests {
     async fn a_long_by_design_endpoint_files_only_past_its_own_budget() {
         let (st, _d) = state();
         let now = unix_now();
-        log_row(&st, Row { ts: now - 500.0, method: "POST", path: "/api/files/mdai/run", family: "/api/files", status: 200, body: "", worker: "", ua: "curl/8", ms: 109_896.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 500.0,
+                method: "POST",
+                path: "/api/files/mdai/run",
+                family: "/api/files",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 109_896.0,
+            },
+        );
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter().any(|x| x.signature.contains("/api/files/mdai/run")),
+            !f.iter()
+                .any(|x| x.signature.contains("/api/files/mdai/run")),
             "a synthesis inside its 150s design budget is designed behavior: {f:?}"
         );
-        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/files/mdai/run", family: "/api/files", status: 200, body: "", worker: "", ua: "curl/8", ms: 200_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "POST",
+                path: "/api/files/mdai/run",
+                family: "/api/files",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 200_000.0,
+            },
+        );
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
         assert!(
-            f2.iter().any(|x| x.signature.contains("/api/files/mdai/run")),
+            f2.iter()
+                .any(|x| x.signature.contains("/api/files/mdai/run")),
             "past the design budget the endpoint's own timeout failed — that must file: {f2:?}"
         );
     }
@@ -9681,21 +11098,49 @@ mod tests {
         let now = unix_now();
         // The filed row, and a longer one that is still inside the timeout.
         for ms in [54_922.0, 400_000.0] {
-            log_row(&st, Row { ts: now - 500.0, method: "POST", path: "/api/schedules/SCHED-173/run", family: "/api/schedules", status: 200, body: "", worker: "", ua: "curl/8", ms });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 500.0,
+                    method: "POST",
+                    path: "/api/schedules/SCHED-173/run",
+                    family: "/api/schedules",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms,
+                },
+            );
         }
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter().any(|x| x.signature.contains("/api/schedules/{id}/run")),
+            !f.iter()
+                .any(|x| x.signature.contains("/api/schedules/{id}/run")),
             "a synchronous run inside its own 600s timeout is the endpoint working: {f:?}"
         );
 
         // PAST THE TIMEOUT the bound failed, and that must still file — without
         // this cell the entry above is indistinguishable from switching the
         // route off.
-        log_row(&st, Row { ts: now - 100.0, method: "POST", path: "/api/schedules/SCHED-173/run", family: "/api/schedules", status: 200, body: "", worker: "", ua: "curl/8", ms: 900_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "POST",
+                path: "/api/schedules/SCHED-173/run",
+                family: "/api/schedules",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 900_000.0,
+            },
+        );
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
         assert!(
-            f2.iter().any(|x| x.signature.contains("/api/schedules/{id}/run")),
+            f2.iter()
+                .any(|x| x.signature.contains("/api/schedules/{id}/run")),
             "900s exceeds the 600s the endpoint enforces on itself — a bound failed: {f2:?}"
         );
     }
@@ -9724,8 +11169,34 @@ mod tests {
         let now = unix_now();
         // Six browser 404s each, which is well past the min-hits floor.
         for _ in 0..6 {
-            log_row(&st, Row { ts: now - 500.0, method: "GET", path: "/api/stripe/status", family: "/api/stripe", status: 404, body: "", worker: "", ua: "Mozilla/5.0", ms: 3.0 });
-            log_row(&st, Row { ts: now - 500.0, method: "GET", path: "/api/board/statuses", family: "/api/board", status: 404, body: "", worker: "", ua: "Mozilla/5.0", ms: 3.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 500.0,
+                    method: "GET",
+                    path: "/api/stripe/status",
+                    family: "/api/stripe",
+                    status: 404,
+                    body: "",
+                    worker: "",
+                    ua: "Mozilla/5.0",
+                    ms: 3.0,
+                },
+            );
+            log_row(
+                &st,
+                Row {
+                    ts: now - 500.0,
+                    method: "GET",
+                    path: "/api/board/statuses",
+                    family: "/api/board",
+                    status: 404,
+                    body: "",
+                    worker: "",
+                    ua: "Mozilla/5.0",
+                    ms: 3.0,
+                },
+            );
         }
         let (f, sup) = detect_dead_routes(&st.store.read().unwrap(), now);
 
@@ -9737,8 +11208,9 @@ mod tests {
             "a path served by the gateway 404s here on every deployment: {f:?}"
         );
         assert!(
-            sup.iter().any(|s| s.signature.contains("/api/stripe/status")
-                && s.reason.contains("gateway-owned")),
+            sup.iter()
+                .any(|s| s.signature.contains("/api/stripe/status")
+                    && s.reason.contains("gateway-owned")),
             "the exclusion must be recorded, not silent: {sup:?}"
         );
 
@@ -9746,7 +11218,8 @@ mod tests {
         //    that matched everything would pass — and over-broad matching is a
         //    bug this list has actually had.
         assert!(
-            f.iter().any(|x| x.signature.contains("/api/board/statuses")),
+            f.iter()
+                .any(|x| x.signature.contains("/api/board/statuses")),
             "an ordinary unrouted path the SPA fetches is still a dead route: {f:?}"
         );
     }
@@ -9771,28 +11244,70 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         // The filed row, verbatim: 502 at the 30s CDP timeout.
-        log_row(&st, Row { ts: now - 500.0, method: "GET", path: "/api/browser/screenshot", family: "/api/browser", status: 502, body: "", worker: "", ua: "curl/8", ms: 30_006.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 500.0,
+                method: "GET",
+                path: "/api/browser/screenshot",
+                family: "/api/browser",
+                status: 502,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 30_006.0,
+            },
+        );
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter().any(|x| x.signature.contains("/api/browser/screenshot")),
+            !f.iter()
+                .any(|x| x.signature.contains("/api/browser/screenshot")),
             "a 502 at its own timeout is the 5xx path's card, not a latency card: {f:?}"
         );
 
         // A 4xx stays IN: nothing else would report a slow one, so excluding it
         // would be a blind spot rather than a de-duplication.
-        log_row(&st, Row { ts: now - 400.0, method: "GET", path: "/api/browser/state", family: "/api/browser", status: 404, body: "", worker: "", ua: "curl/8", ms: 40_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 400.0,
+                method: "GET",
+                path: "/api/browser/state",
+                family: "/api/browser",
+                status: 404,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 40_000.0,
+            },
+        );
         let (f4, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
         assert!(
-            f4.iter().any(|x| x.signature.contains("/api/browser/state")),
+            f4.iter()
+                .any(|x| x.signature.contains("/api/browser/state")),
             "a 4xx has no other filer — excluding it would hide the row entirely: {f4:?}"
         );
 
         // And the SUCCESS case on the very route the exclusion touches, so the
         // first cell cannot be passing because the detector went silent.
-        log_row(&st, Row { ts: now - 300.0, method: "GET", path: "/api/browser/screenshot", family: "/api/browser", status: 200, body: "", worker: "", ua: "curl/8", ms: 45_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 300.0,
+                method: "GET",
+                path: "/api/browser/screenshot",
+                family: "/api/browser",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 45_000.0,
+            },
+        );
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 2.0);
         assert!(
-            f2.iter().any(|x| x.signature.contains("/api/browser/screenshot")),
+            f2.iter()
+                .any(|x| x.signature.contains("/api/browser/screenshot")),
             "a 200 that really took 45s is a latency story nothing else reports: {f2:?}"
         );
     }
@@ -9833,21 +11348,49 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for ms in [12_906.0, 9_772.0] {
-            log_row(&st, Row { ts: now - 500.0, method: "POST", path: "/api/browser/navigate", family: "/api/browser", status: 200, body: "", worker: "", ua: "curl/8", ms });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 500.0,
+                    method: "POST",
+                    path: "/api/browser/navigate",
+                    family: "/api/browser",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms,
+                },
+            );
         }
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
-            !f.iter().any(|x| x.signature.contains("/api/browser/navigate")),
+            !f.iter()
+                .any(|x| x.signature.contains("/api/browser/navigate")),
             "a page load inside its own 40s bound is designed behaviour: {f:?}"
         );
 
         // PAST the budget: the navigate timeout failed to bound it, which is a
         // real defect and must still file.
         let (st2, _d2) = state();
-        log_row(&st2, Row { ts: now - 500.0, method: "POST", path: "/api/browser/navigate", family: "/api/browser", status: 200, body: "", worker: "", ua: "curl/8", ms: 41_000.0 });
+        log_row(
+            &st2,
+            Row {
+                ts: now - 500.0,
+                method: "POST",
+                path: "/api/browser/navigate",
+                family: "/api/browser",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 41_000.0,
+            },
+        );
         let (f2, _) = detect_latency(&st2.store.read().unwrap(), now);
         assert!(
-            f2.iter().any(|x| x.signature.contains("/api/browser/navigate")),
+            f2.iter()
+                .any(|x| x.signature.contains("/api/browser/navigate")),
             "past its own timeouts, a navigate is a hang and must file: {f2:?}"
         );
     }
@@ -9861,7 +11404,20 @@ mod tests {
             ("/api/email/search", 11_350.0), // worst of 3226 over 7 days
             ("/api/email/inbox", 14_105.0),  // the 4-hourly count=600 tick
         ] {
-            log_row(&st, Row { ts: now - 500.0, method: "GET", path, family: "/api/email", status: 200, body: "", worker: "", ua: "curl/8", ms });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 500.0,
+                    method: "GET",
+                    path,
+                    family: "/api/email",
+                    status: 200,
+                    body: "",
+                    worker: "",
+                    ua: "curl/8",
+                    ms,
+                },
+            );
         }
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         assert!(
@@ -9871,7 +11427,20 @@ mod tests {
              LONG_BY_DESIGN table exists for: {f:?}"
         );
 
-        log_row(&st, Row { ts: now - 100.0, method: "GET", path: "/api/email/search", family: "/api/email", status: 200, body: "", worker: "", ua: "curl/8", ms: 45_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "GET",
+                path: "/api/email/search",
+                family: "/api/email",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 45_000.0,
+            },
+        );
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 1.0);
         assert!(
             f2.iter().any(|x| x.signature.contains("/api/email/search")),
@@ -9889,17 +11458,64 @@ mod tests {
     async fn a_new_outlier_occurrence_is_a_new_signature_the_same_rows_are_not() {
         let (st, _d) = state();
         let now = unix_now();
-        log_row(&st, Row { ts: now - 3000.0, method: "PATCH", path: "/api/sessions/desktop/config", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 22_371.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 3000.0,
+                method: "PATCH",
+                path: "/api/sessions/desktop/config",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 22_371.0,
+            },
+        );
         let (f1, _) = detect_latency(&st.store.read().unwrap(), now);
         let (f2, _) = detect_latency(&st.store.read().unwrap(), now + 60.0);
-        let sig1 = f1.iter().find(|x| x.signature.starts_with("latency|outlier|PATCH")).expect("files").signature.clone();
-        let sig2 = f2.iter().find(|x| x.signature.starts_with("latency|outlier|PATCH")).expect("files").signature.clone();
-        assert_eq!(sig1, sig2, "same rows re-scanned must mint the same signature");
+        let sig1 = f1
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|PATCH"))
+            .expect("files")
+            .signature
+            .clone();
+        let sig2 = f2
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|PATCH"))
+            .expect("files")
+            .signature
+            .clone();
+        assert_eq!(
+            sig1, sig2,
+            "same rows re-scanned must mint the same signature"
+        );
         // A new occurrence: newer ts -> new signature.
-        log_row(&st, Row { ts: now - 100.0, method: "PATCH", path: "/api/sessions/desktop/config", family: "/api/sessions", status: 200, body: "", worker: "", ua: "curl/8", ms: 30_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 100.0,
+                method: "PATCH",
+                path: "/api/sessions/desktop/config",
+                family: "/api/sessions",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 30_000.0,
+            },
+        );
         let (f3, _) = detect_latency(&st.store.read().unwrap(), now + 120.0);
-        let sig3 = f3.iter().find(|x| x.signature.starts_with("latency|outlier|PATCH")).expect("files").signature.clone();
-        assert_ne!(sig1, sig3, "a NEW slow request must be a NEW signature, filed whatever became of the old card");
+        let sig3 = f3
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|PATCH"))
+            .expect("files")
+            .signature
+            .clone();
+        assert_ne!(
+            sig1, sig3,
+            "a NEW slow request must be a NEW signature, filed whatever became of the old card"
+        );
     }
 
     /// A single absurd request files on its own rather than being folded into a
@@ -9938,7 +11554,20 @@ mod tests {
     async fn a_latency_card_says_how_many_rows_its_filters_removed() {
         let (st, _d) = state();
         let now = unix_now();
-        log_row(&st, Row { ts: now - 50.0, method: "GET", path: "/api/board", family: "/api/board", status: 200, body: "", worker: "", ua: "curl/8", ms: 21_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 50.0,
+                method: "GET",
+                path: "/api/board",
+                family: "/api/board",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "curl/8",
+                ms: 21_000.0,
+            },
+        );
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
         let hit = f
             .iter()
@@ -9968,11 +11597,30 @@ mod tests {
     async fn absurd_single_requests_file_on_their_own() {
         let (st, _d) = state();
         let now = unix_now();
-        log_row(&st, Row { ts: now - 50.0, method: "PUT", path: "/api/upload/abc123/chunk/7", family: "/api/upload", status: 200, body: "", worker: "", ua: "Mozilla/5.0", ms: 27_000.0 });
+        log_row(
+            &st,
+            Row {
+                ts: now - 50.0,
+                method: "PUT",
+                path: "/api/upload/abc123/chunk/7",
+                family: "/api/upload",
+                status: 200,
+                body: "",
+                worker: "",
+                ua: "Mozilla/5.0",
+                ms: 27_000.0,
+            },
+        );
         let (f, _) = detect_latency(&st.store.read().unwrap(), now);
-        let hit = f.iter().find(|x| x.signature.starts_with("latency|outlier|PUT"))
+        let hit = f
+            .iter()
+            .find(|x| x.signature.starts_with("latency|outlier|PUT"))
             .expect("a 27s request must file on its own: {f:?}");
-        assert!(hit.title.contains("27.0s"), "the number belongs in the title: {}", hit.title);
+        assert!(
+            hit.title.contains("27.0s"),
+            "the number belongs in the title: {}",
+            hit.title
+        );
         let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
         let verdict = &ev["verdict"];
         assert!(
@@ -10023,7 +11671,10 @@ mod tests {
                                  '','','{}',3.0,?2)",
                         rusqlite::params![s2, c2],
                     )?;
-                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                    Ok(crate::db::WriteOutcome {
+                        applied: true,
+                        events: vec![],
+                    })
                 })
                 .await
                 .unwrap();
@@ -10031,7 +11682,10 @@ mod tests {
             let noted = note_resolved_incidents(&st).await.unwrap();
             assert_eq!(noted.len(), 1, "the card must be told ({status})");
             assert_eq!(noted[0].0, card);
-            assert_eq!(noted[0].1, expect_word, "the terminal status must not be paraphrased");
+            assert_eq!(
+                noted[0].1, expect_word,
+                "the terminal status must not be paraphrased"
+            );
 
             let (log, st_after): (Option<String>, String) = {
                 let conn = st.store.read().unwrap();
@@ -10043,7 +11697,10 @@ mod tests {
                 .unwrap()
             };
             let log = log.unwrap_or_default();
-            assert!(log.contains(expect_word), "the log line must say WHICH terminal state: {log}");
+            assert!(
+                log.contains(expect_word),
+                "the log line must say WHICH terminal state: {log}"
+            );
             assert_eq!(
                 st_after, "todo",
                 "NOTED, never acted on — closing someone's card because the condition healed is \
@@ -10052,7 +11709,10 @@ mod tests {
 
             // Exactly-once: a second tick must not re-nag.
             let again = note_resolved_incidents(&st).await.unwrap();
-            assert!(again.is_empty(), "a resolved incident must not re-nag every tick");
+            assert!(
+                again.is_empty(),
+                "a resolved incident must not re-nag every tick"
+            );
         }
     }
 
@@ -10075,8 +11735,15 @@ mod tests {
     #[test]
     fn an_invariant_recheck_asks_the_surface_where_a_pass_is_visible() {
         // Drives the real grouping path, per invariant_findings' own note.
-        let f = invariant_findings(&[inv_row("schema.timestamp_units_declared", "waitlist.ts", 19)]);
-        assert!(!f.is_empty(), "precondition: a finding must be produced to inspect");
+        let f = invariant_findings(&[inv_row(
+            "schema.timestamp_units_declared",
+            "waitlist.ts",
+            19,
+        )]);
+        assert!(
+            !f.is_empty(),
+            "precondition: a finding must be produced to inspect"
+        );
         for finding in &f {
             assert!(
                 finding.recheck.contains("/api/debug/invariants"),
@@ -10124,7 +11791,10 @@ mod tests {
             "the LONG_BY_DESIGN key must be what the detector actually computes"
         );
         let b = design_budget_ms(&real_target);
-        assert!(b > 0.0, "the entry must be reachable through the real target, not just present");
+        assert!(
+            b > 0.0,
+            "the entry must be reachable through the real target, not just present"
+        );
 
         // The derived bound: 0.95 + 0.25 + 15.0 + 5.0 + 1.0 seconds of
         // deliberate waiting on the worst honest path, read off stop_session's
@@ -10135,7 +11805,10 @@ mod tests {
             "budget {b} must exceed the {derived_ms}ms sleep ladder it exists to excuse"
         );
         // And clear every value ever measured on the route (worst 19_384ms).
-        assert!(b > 19_384.0, "budget {b} must clear the measured worst archive");
+        assert!(
+            b > 19_384.0,
+            "budget {b} must clear the measured worst archive"
+        );
 
         // THE HALF AN OVER-EAGER FIX DESTROYS. `capture-pane -S -` runs before
         // the ladder under a 30s timeout; a capture pinned at that limit is a
@@ -10258,25 +11931,51 @@ mod tests {
         let (st, _d) = state();
         let now = unix_now();
         for i in 0..4 {
-            log_row(&st, Row { ts: now - 300.0 + i as f64, method: "GET", path: "/api/sessions",
-                family: "/api/sessions", status: 500, body: "timed out waiting for connection",
-                worker: "amux", ua: "curl/8.7.1", ms: 30_100.0 });
+            log_row(
+                &st,
+                Row {
+                    ts: now - 300.0 + i as f64,
+                    method: "GET",
+                    path: "/api/sessions",
+                    family: "/api/sessions",
+                    status: 500,
+                    body: "timed out waiting for connection",
+                    worker: "amux",
+                    ua: "curl/8.7.1",
+                    ms: 30_100.0,
+                },
+            );
         }
         autofix_tick(&st, std::path::Path::new("/nonexistent")).await;
         let first = sref(&st);
-        assert!(first.starts_with("autofix:5xx|"), "precondition: a 5xx card was filed: {first}");
+        assert!(
+            first.starts_with("autofix:5xx|"),
+            "precondition: a 5xx card was filed: {first}"
+        );
 
         // Re-scan the identical rows, exactly as the next tick does while they
         // sit inside the window. Nothing new happened, so nothing new is news.
         let (st2, _d2) = state();
         for i in 0..4 {
-            log_row(&st2, Row { ts: now - 300.0 + i as f64, method: "GET", path: "/api/sessions",
-                family: "/api/sessions", status: 500, body: "timed out waiting for connection",
-                worker: "amux", ua: "curl/8.7.1", ms: 30_100.0 });
+            log_row(
+                &st2,
+                Row {
+                    ts: now - 300.0 + i as f64,
+                    method: "GET",
+                    path: "/api/sessions",
+                    family: "/api/sessions",
+                    status: 500,
+                    body: "timed out waiting for connection",
+                    worker: "amux",
+                    ua: "curl/8.7.1",
+                    ms: 30_100.0,
+                },
+            );
         }
         autofix_tick(&st2, std::path::Path::new("/nonexistent")).await;
         assert_eq!(
-            sref(&st2), first,
+            sref(&st2),
+            first,
             "the same rows must mint the SAME signature — otherwise a discard re-arms and the \
              identical specimen comes back (AMUX-3581 -> 3589 -> 3591)"
         );
@@ -10285,13 +11984,25 @@ mod tests {
         // signature, so the detector still fires after a discard.
         let (st3, _d3) = state();
         for i in 0..4 {
-            log_row(&st3, Row { ts: now - 10.0 + i as f64, method: "GET", path: "/api/sessions",
-                family: "/api/sessions", status: 500, body: "timed out waiting for connection",
-                worker: "amux", ua: "curl/8.7.1", ms: 30_100.0 });
+            log_row(
+                &st3,
+                Row {
+                    ts: now - 10.0 + i as f64,
+                    method: "GET",
+                    path: "/api/sessions",
+                    family: "/api/sessions",
+                    status: 500,
+                    body: "timed out waiting for connection",
+                    worker: "amux",
+                    ua: "curl/8.7.1",
+                    ms: 30_100.0,
+                },
+            );
         }
         autofix_tick(&st3, std::path::Path::new("/nonexistent")).await;
         assert_ne!(
-            sref(&st3), first,
+            sref(&st3),
+            first,
             "a NEW occurrence must mint a NEW signature, or this trades a refile loop for a \
              detector that goes silent after one discard"
         );
@@ -10320,7 +12031,10 @@ mod tests {
             ("/api/board/statuses", 30_100.0),
             ("/api/board/session-gates", 30_100.0),
         ];
-        let distinct = hang.iter().map(|(t, _)| *t).collect::<std::collections::BTreeSet<_>>();
+        let distinct = hang
+            .iter()
+            .map(|(t, _)| *t)
+            .collect::<std::collections::BTreeSet<_>>();
         assert!(
             distinct.len() >= outlier_rollup_at(),
             "the recorded incident must reach the rollup threshold, or this fix does not \
@@ -10358,7 +12072,10 @@ mod tests {
             v.sort_unstable();
             v.join(",")
         });
-        assert_eq!(sig_a, sig_b, "the same target set must mint the same signature");
+        assert_eq!(
+            sig_a, sig_b,
+            "the same target set must mint the same signature"
+        );
         assert!(
             !sig_a.contains(&format!("{}", ts as i64)),
             "the rollup signature must NOT carry an occurrence timestamp — a systemic fault is \
@@ -10385,7 +12102,7 @@ mod tests {
     fn a_row_is_excluded_on_arrival_before_its_boot_never_on_latency() {
         let now = 1_787_000_000.0;
         let old_boot = now - 40_000.0; // ~11h ago, several restarts back
-        let cur_boot = now - 300.0;    // the process running now
+        let cur_boot = now - 300.0; // the process running now
 
         // THE FOUR LIVE FALSE EXCLUSIONS. (age since its own boot, latency ms).
         // The last two are `GET /api/sessions-git` during the AMUX-3684
@@ -10393,8 +12110,16 @@ mod tests {
         for (age_s, ms, what) in [
             (2.06, 2_445.0, "POST /api/git/staged-guard 11:15:50"),
             (2.929, 3_326.0, "POST /api/git/staged-guard 14:38:48"),
-            (14.601, 14_949.0, "GET /api/sessions-git 12:03:23 (AMUX-3684 stampede)"),
-            (15.195, 15_577.0, "GET /api/sessions-git 12:03:23 (AMUX-3684 stampede)"),
+            (
+                14.601,
+                14_949.0,
+                "GET /api/sessions-git 12:03:23 (AMUX-3684 stampede)",
+            ),
+            (
+                15.195,
+                15_577.0,
+                "GET /api/sessions-git 12:03:23 (AMUX-3684 stampede)",
+            ),
         ] {
             let ts = old_boot + age_s;
             assert!(
@@ -10499,7 +12224,9 @@ mod tests {
         );
         // Entity that CONTAINS a pipe, plus the episode. Both must survive.
         assert_eq!(
-            invariant_signature_parts("invariant|route.callers_have_routes|GET /api/x|y|1787569200"),
+            invariant_signature_parts(
+                "invariant|route.callers_have_routes|GET /api/x|y|1787569200"
+            ),
             Some(("route.callers_have_routes".into(), "GET /api/x|y".into()))
         );
         // No episode suffix (a pre-3633 signature, or a rollup shape): unchanged.
@@ -10549,19 +12276,27 @@ mod tests {
 
         let conn = st.store.read().unwrap();
         let (status, log): (String, Option<String>) = conn
-            .query_row("SELECT status, log FROM issues WHERE id=?1", rusqlite::params![id], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT status, log FROM issues WHERE id=?1",
+                rusqlite::params![id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(status, "todo", "the card must NOT be closed or moved");
         let log = log.unwrap_or_default();
-        assert!(log.contains("STOPPED HAPPENING IS NOT FIXED"), "the note must say what it means: {log}");
+        assert!(
+            log.contains("STOPPED HAPPENING IS NOT FIXED"),
+            "the note must say what it means: {log}"
+        );
         drop(conn);
 
         // And it must not re-nag: a second sweep adds nothing. A note that
         // fires every tick forever is its own well-documented failure here.
         let again = note_quiet_signatures(&st, now, &[]).await.unwrap();
-        assert!(again.is_empty(), "the quiet note must be exactly-once, got {again:?}");
+        assert!(
+            again.is_empty(),
+            "the quiet note must be exactly-once, got {again:?}"
+        );
     }
 
     /// Every detector's item type must be closable honestly — i.e. never
@@ -10570,7 +12305,11 @@ mod tests {
     #[test]
     fn no_detector_files_a_code_card() {
         for k in DetectorKind::all() {
-            assert_ne!(k.item_type(), "code", "{k:?} would be gated on a merge it cannot claim");
+            assert_ne!(
+                k.item_type(),
+                "code",
+                "{k:?} would be gated on a merge it cannot claim"
+            );
             assert!(!k.slug().is_empty());
         }
     }
@@ -10622,34 +12361,81 @@ mod tests {
     #[tokio::test]
     async fn a_failing_workflow_produces_a_card_with_its_streak() {
         let (st, _d) = state();
-        let mut runs = vec![ci_run("Deploy to cloud.amux.io", 31_182_322_406, "success", 4400.0)];
+        let mut runs = vec![ci_run(
+            "Deploy to cloud.amux.io",
+            31_182_322_406,
+            "success",
+            4400.0,
+        )];
         for i in 0..31 {
-            let mut r = ci_run("Deploy to cloud.amux.io", 31_200_000_000 + i, "failure", 4000.0 - i as f64 * 100.0);
+            let mut r = ci_run(
+                "Deploy to cloud.amux.io",
+                31_200_000_000 + i,
+                "failure",
+                4000.0 - i as f64 * 100.0,
+            );
             if i == 30 {
                 r.failing_step = Some("deploy / Gateway env — admin emails".into());
             }
             runs.push(r);
         }
         let (f, _s) = ci_findings(&runs, unix_now());
-        assert_eq!(f.len(), 1, "31 failures of one workflow are ONE incident, got {}", f.len());
-        let ev: BTreeMap<&str, &str> =
-            f[0].evidence.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        assert_eq!(ev["consecutive_failures"], "31", "the count is the whole point");
-        assert!(ev["first_failure_at"].contains("31200000000"), "first-seen names the run: {ev:?}");
-        assert!(ev["latest_run_url"].contains("31200000030"), "run URL must be the NEWEST failure");
-        assert!(ev["failing_step"].contains("Gateway env"), "the failing STEP is required evidence");
-        assert!(ev["last_success"].contains("31182322406"), "last green run belongs on the card");
-        assert!(f[0].recheck.contains("--log-failed"), "recheck must be runnable: {}", f[0].recheck);
+        assert_eq!(
+            f.len(),
+            1,
+            "31 failures of one workflow are ONE incident, got {}",
+            f.len()
+        );
+        let ev: BTreeMap<&str, &str> = f[0]
+            .evidence
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            ev["consecutive_failures"], "31",
+            "the count is the whole point"
+        );
+        assert!(
+            ev["first_failure_at"].contains("31200000000"),
+            "first-seen names the run: {ev:?}"
+        );
+        assert!(
+            ev["latest_run_url"].contains("31200000030"),
+            "run URL must be the NEWEST failure"
+        );
+        assert!(
+            ev["failing_step"].contains("Gateway env"),
+            "the failing STEP is required evidence"
+        );
+        assert!(
+            ev["last_success"].contains("31182322406"),
+            "last green run belongs on the card"
+        );
+        assert!(
+            f[0].recheck.contains("--log-failed"),
+            "recheck must be runnable: {}",
+            f[0].recheck
+        );
 
         // …and it reaches the board through the real filing path.
-        let card = file_finding(&st, &f[0]).await.unwrap().expect("a finding must file a card");
+        let card = file_finding(&st, &f[0])
+            .await
+            .unwrap()
+            .expect("a finding must file a card");
         let (status, _log, sref) = card_row(&st, &card);
         assert_eq!(status, "todo", "a filed fault is queued, not pre-closed");
         assert_eq!(sref, format!("autofix:{}", f[0].signature));
         let c = cards(&st);
         assert_eq!(c.len(), 1);
-        assert_eq!(c[0].3, "blocker", "a red deploy is a blocker, not a code card");
-        assert!(c[0].1.contains("31x"), "count belongs in the computed title: {}", c[0].1);
+        assert_eq!(
+            c[0].3, "blocker",
+            "a red deploy is a blocker, not a code card"
+        );
+        assert!(
+            c[0].1.contains("31x"),
+            "count belongs in the computed title: {}",
+            c[0].1
+        );
     }
 
     /// Dedupe, durably. A nightly failure files ONCE. This is the property that
@@ -10666,7 +12452,10 @@ mod tests {
         ];
         let f1 = ci_findings(&base, unix_now()).0;
         assert_eq!(f1.len(), 1);
-        assert!(file_finding(&st, &f1[0]).await.unwrap().is_some(), "first sighting files");
+        assert!(
+            file_finding(&st, &f1[0]).await.unwrap().is_some(),
+            "first sighting files"
+        );
 
         // Night 2 and night 3: the SAME outage, more failures. Same anchor,
         // same signature, no new card.
@@ -10674,8 +12463,14 @@ mod tests {
         later.push(ci_run("rust", 903, "failure", 200.0));
         later.push(ci_run("rust", 904, "failure", 100.0));
         let f2 = ci_findings(&later, unix_now()).0;
-        assert_eq!(f2[0].signature, f1[0].signature, "the streak anchor must not move mid-outage");
-        assert!(file_finding(&st, &f2[0]).await.unwrap().is_none(), "night 2 must not refile");
+        assert_eq!(
+            f2[0].signature, f1[0].signature,
+            "the streak anchor must not move mid-outage"
+        );
+        assert!(
+            file_finding(&st, &f2[0]).await.unwrap().is_none(),
+            "night 2 must not refile"
+        );
 
         // A RESTART: new AppState over the same DB, in-memory report cleared.
         *last_report_cell().write().unwrap() = None;
@@ -10689,7 +12484,11 @@ mod tests {
             file_finding(&restarted, &f2[0]).await.unwrap().is_none(),
             "a restart refiled the same outage — the dedupe is not durable"
         );
-        assert_eq!(cards(&st).len(), 1, "three nights and a restart are ONE card");
+        assert_eq!(
+            cards(&st).len(),
+            1,
+            "three nights and a restart are ONE card"
+        );
     }
 
     /// The other half of dedupe, which a workflow-keyed signature gets wrong:
@@ -10710,8 +12509,14 @@ mod tests {
         new.push(ci_run("rust", 210, "failure", 500.0));
         let sig_new = ci_findings(&new, unix_now()).0[0].signature.clone();
 
-        assert_ne!(sig_old, sig_new, "a second outage must not be deduped against the first");
-        assert!(sig_new.ends_with("|200"), "the anchor is the streak's OLDEST failure: {sig_new}");
+        assert_ne!(
+            sig_old, sig_new,
+            "a second outage must not be deduped against the first"
+        );
+        assert!(
+            sig_new.ends_with("|200"),
+            "the anchor is the streak's OLDEST failure: {sig_new}"
+        );
     }
 
     /// "Stopped failing is not fixed." A green run appends a line and changes
@@ -10730,23 +12535,44 @@ mod tests {
         let card = file_finding(&st, &f[0]).await.unwrap().unwrap();
 
         // While red, there is nothing to say.
-        let noted = note_quiet_signatures(&st, unix_now(), &broken).await.unwrap();
-        assert!(noted.is_empty(), "a still-failing workflow must not be reported as recovered");
+        let noted = note_quiet_signatures(&st, unix_now(), &broken)
+            .await
+            .unwrap();
+        assert!(
+            noted.is_empty(),
+            "a still-failing workflow must not be reported as recovered"
+        );
 
         let mut green = broken.clone();
         green.push(ci_run("checks", 13, "success", 10.0));
-        let noted = note_quiet_signatures(&st, unix_now(), &green).await.unwrap();
+        let noted = note_quiet_signatures(&st, unix_now(), &green)
+            .await
+            .unwrap();
         assert_eq!(noted.len(), 1, "a green run must be NOTED: {noted:?}");
 
         let (status, log, _) = card_row(&st, &card);
-        assert_eq!(status, "todo", "green must not close, move or resolve the card");
-        assert!(log.contains("GREEN again"), "the note must be on the card: {log}");
-        assert!(log.contains("STOPPED FAILING IS NOT FIXED"), "and must say what green does NOT prove");
+        assert_eq!(
+            status, "todo",
+            "green must not close, move or resolve the card"
+        );
+        assert!(
+            log.contains("GREEN again"),
+            "the note must be on the card: {log}"
+        );
+        assert!(
+            log.contains("STOPPED FAILING IS NOT FIXED"),
+            "and must say what green does NOT prove"
+        );
 
         // Exactly once, forever — a recovery that re-nags every tick is its
         // own well-documented failure in this repo.
-        let again = note_quiet_signatures(&st, unix_now(), &green).await.unwrap();
-        assert!(again.is_empty(), "the green note must be exactly-once, got {again:?}");
+        let again = note_quiet_signatures(&st, unix_now(), &green)
+            .await
+            .unwrap();
+        assert!(
+            again.is_empty(),
+            "the green note must be exactly-once, got {again:?}"
+        );
     }
 
     /// The suppressions the card asked for, and the rule that a decision NOT to
@@ -10765,8 +12591,16 @@ mod tests {
         ];
         runs.push(ci_run("Deploy to cloud.amux.io", 4, "cancelled", 600.0));
         let (f, s) = ci_findings(&runs, now);
-        assert_eq!(f.len(), 1, "a cancelled run must not mask the outage behind it");
-        assert!(f[0].signature.ends_with("|2"), "cancel must not move the anchor: {}", f[0].signature);
+        assert_eq!(
+            f.len(),
+            1,
+            "a cancelled run must not mask the outage behind it"
+        );
+        assert!(
+            f[0].signature.ends_with("|2"),
+            "cancel must not move the anchor: {}",
+            f[0].signature
+        );
         assert!(
             s.iter().any(|x| x.reason.contains("cancelled")),
             "the decision to ignore a cancelled run must be PUBLISHED: {s:?}"
@@ -10780,7 +12614,10 @@ mod tests {
         let mut pr2 = pr.clone();
         pr2.run_id = 51;
         let (f, s) = ci_findings(&[pr, pr2], now);
-        assert!(f.is_empty(), "PR/fork runs must never file against main: {f:?}");
+        assert!(
+            f.is_empty(),
+            "PR/fork runs must never file against main: {f:?}"
+        );
         assert!(
             s.iter().any(|x| x.reason.contains("pull-request")),
             "the exclusion must be visible, not silent: {s:?}"
@@ -10789,7 +12626,10 @@ mod tests {
         // One red run is below the threshold — and says so, rather than
         // vanishing. An unexplained non-filing is the failure this file exists
         // to end.
-        let one = vec![ci_run("rust", 60, "success", 900.0), ci_run("rust", 61, "failure", 10.0)];
+        let one = vec![
+            ci_run("rust", 60, "success", 900.0),
+            ci_run("rust", 61, "failure", 10.0),
+        ];
         let (f, s) = ci_findings(&one, now);
         assert!(f.is_empty());
         assert!(
@@ -10817,12 +12657,18 @@ mod tests {
             "autofix_tick fetched live CI: {:?}",
             r.signatures_seen
         );
-        assert!(r.filed.is_empty(), "a temp DB and no traffic must file nothing: {:?}", r.filed);
+        assert!(
+            r.filed.is_empty(),
+            "a temp DB and no traffic must file nothing: {:?}",
+            r.filed
+        );
         // …and the absence is REPORTED, not silent: "no findings" and "nobody
         // looked" are different facts and the debug surface must tell them
         // apart (ethos rule 4).
         assert!(
-            r.suppressed.iter().any(|(k, _, why)| k == "ci" && why.contains("absence of DATA")),
+            r.suppressed
+                .iter()
+                .any(|(k, _, why)| k == "ci" && why.contains("absence of DATA")),
             "a tick with no CI input must say so rather than imply CI is green: {:?}",
             r.suppressed
         );
@@ -10856,7 +12702,10 @@ mod tests {
         for s in &sup {
             println!("  SUPPRESSED {}: {}", s.signature, s.reason);
         }
-        assert!(!runs.is_empty(), "gh returned nothing — is it installed and authenticated?");
+        assert!(
+            !runs.is_empty(),
+            "gh returned nothing — is it installed and authenticated?"
+        );
         let (f, s2) = ci_findings(&runs, now);
         for x in &s2 {
             println!("  SUPPRESSED {}: {}", x.signature, x.reason);
@@ -10875,7 +12724,10 @@ mod tests {
     fn no_runs_is_not_the_same_as_no_failures() {
         let (f, s) = ci_findings(&[], unix_now());
         assert!(f.is_empty());
-        assert!(s.is_empty(), "an empty list alone says nothing — the REASON comes from the fetch");
+        assert!(
+            s.is_empty(),
+            "an empty list alone says nothing — the REASON comes from the fetch"
+        );
         // The fetch is what knows why the list is empty, and it emits a
         // Suppressed naming the cause; `ci_findings` cannot and must not guess.
         // Guarded here so nobody later "helpfully" makes an empty list file a
@@ -10893,7 +12745,14 @@ mod tests {
     fn a_multi_day_deploy_outage_escalates_past_the_card() {
         let now = unix_now();
         let runs: Vec<CiRun> = (0..32)
-            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", 60.0 + i as f64 * 150.0))
+            .map(|i| {
+                ci_run(
+                    "Deploy to cloud.amux.io",
+                    i,
+                    "failure",
+                    60.0 + i as f64 * 150.0,
+                )
+            })
             .collect();
         let esc = ci_deploy_escalations(&runs, now);
         assert_eq!(esc.len(), 1, "the deploy outage must escalate");
@@ -10909,30 +12768,49 @@ mod tests {
         let burst: Vec<CiRun> = (0..12)
             .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", i as f64 * 3.0))
             .collect();
-        assert!(ci_deploy_escalations(&burst, now).is_empty(), "a burst is not an outage");
+        assert!(
+            ci_deploy_escalations(&burst, now).is_empty(),
+            "a burst is not an outage"
+        );
         // 3 failures over a week — over the time bar, under the streak bar.
         let trickle: Vec<CiRun> = (0..3)
             .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", i as f64 * 2880.0))
             .collect();
-        assert!(ci_deploy_escalations(&trickle, now).is_empty(), "3 reds is a card, not an alarm");
+        assert!(
+            ci_deploy_escalations(&trickle, now).is_empty(),
+            "3 reds is a card, not an alarm"
+        );
     }
 
     #[test]
     fn a_green_run_ends_the_streak_and_a_test_suite_is_never_a_deploy() {
         let now = unix_now();
         let mut runs: Vec<CiRun> = (0..30)
-            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", 120.0 + i as f64 * 180.0))
+            .map(|i| {
+                ci_run(
+                    "Deploy to cloud.amux.io",
+                    i,
+                    "failure",
+                    120.0 + i as f64 * 180.0,
+                )
+            })
             .collect();
         // A success NEWER than all of them: the deploy recovered.
         runs.push(ci_run("Deploy to cloud.amux.io", 999, "success", 30.0));
-        assert!(ci_deploy_escalations(&runs, now).is_empty(), "a green run ends it");
+        assert!(
+            ci_deploy_escalations(&runs, now).is_empty(),
+            "a green run ends it"
+        );
 
         // The narrowness that keeps this from becoming a general CI alarm: a red
         // test suite is bad and gets a card, but shipped work is still shipping.
         let tests: Vec<CiRun> = (0..40)
             .map(|i| ci_run("rust", i, "failure", 60.0 + i as f64 * 180.0))
             .collect();
-        assert!(ci_deploy_escalations(&tests, now).is_empty(), "'rust' is not a deploy workflow");
+        assert!(
+            ci_deploy_escalations(&tests, now).is_empty(),
+            "'rust' is not a deploy workflow"
+        );
         assert!(ci_is_deploy_workflow("Deploy to cloud.amux.io"));
         assert!(ci_is_deploy_workflow("release-please"));
         assert!(!ci_is_deploy_workflow("rust"));
@@ -10946,11 +12824,22 @@ mod tests {
     fn a_cancelled_run_mid_outage_does_not_reset_the_escalation() {
         let now = unix_now();
         let mut runs: Vec<CiRun> = (0..20)
-            .map(|i| ci_run("Deploy to cloud.amux.io", i, "failure", 120.0 + i as f64 * 180.0))
+            .map(|i| {
+                ci_run(
+                    "Deploy to cloud.amux.io",
+                    i,
+                    "failure",
+                    120.0 + i as f64 * 180.0,
+                )
+            })
             .collect();
         runs.push(ci_run("Deploy to cloud.amux.io", 999, "cancelled", 60.0));
         let esc = ci_deploy_escalations(&runs, now);
-        assert_eq!(esc.len(), 1, "a cancelled run must not look like a recovery");
+        assert_eq!(
+            esc.len(),
+            1,
+            "a cancelled run must not look like a recovery"
+        );
         assert_eq!(esc[0].2, 20, "and must not count toward the streak either");
     }
 
@@ -10990,7 +12879,11 @@ mod tests {
         // report that the process is merely RUNNING (the ethos-7 spin-catcher:
         // a threshold below the baseline is not a detector).
         assert_eq!(fd_trigger(0.20, 0.0, 0.7, 0.2), None);
-        assert_eq!(fd_trigger(0.69, 0.0, 0.7, 0.2), None, "just under the ceiling, not climbing");
+        assert_eq!(
+            fd_trigger(0.69, 0.0, 0.7, 0.2),
+            None,
+            "just under the ceiling, not climbing"
+        );
     }
 
     /// When both fire, "you are nearly out" beats "you are heading for nearly
@@ -11007,7 +12900,17 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn inv_row(id: &str, entity: &str, occ: i64) -> InvRow {
-        (id.into(), entity.into(), "fail".into(), 1000.0, 2000.0, occ, "expected".into(), "observed".into(), String::new())
+        (
+            id.into(),
+            entity.into(),
+            "fail".into(),
+            1000.0,
+            2000.0,
+            occ,
+            "expected".into(),
+            "observed".into(),
+            String::new(),
+        )
     }
 
     /// The same row with a DECLARED self-heal epoch, the shape a dwell-window
@@ -11049,10 +12952,21 @@ mod tests {
     fn one_invariant_failing_across_many_entities_is_one_card_not_many() {
         // The real shape: 64 routes, one invariant, same occurrence count.
         let rows: Vec<_> = (0..64)
-            .map(|i| inv_row("route.callers_have_routes", &format!("GET /api/thing{i}"), 1857))
+            .map(|i| {
+                inv_row(
+                    "route.callers_have_routes",
+                    &format!("GET /api/thing{i}"),
+                    1857,
+                )
+            })
             .collect();
         let f = invariant_findings(&rows);
-        assert_eq!(f.len(), 1, "64 entities of ONE invariant must produce ONE card, got {}", f.len());
+        assert_eq!(
+            f.len(),
+            1,
+            "64 entities of ONE invariant must produce ONE card, got {}",
+            f.len()
+        );
         // Keyed on the INVARIANT, not an entity. AMUX-3633 appended an episode
         // suffix, so this can no longer be an `ends_with` — asserted as the
         // ROLLUP marker plus the property the suffix exists for, rather than
@@ -11068,13 +12982,23 @@ mod tests {
             "the episode suffix must be a bare epoch second, got {episode:?} — without it a \
              judged breach refiles on every scan while the SAME failure run continues"
         );
-        assert!(f[0].title.contains("64 entities"), "the count belongs in the title: {}", f[0].title);
+        assert!(
+            f[0].title.contains("64 entities"),
+            "the count belongs in the title: {}",
+            f[0].title
+        );
         // The entity list must SURVIVE into the card — rolling up must not
         // destroy the information the 64 cards carried, or this trades an
         // unreadable board for an unactionable one.
-        let ev: String = f[0].evidence.iter().map(|(k, v)| format!("{k}{v}")).collect();
-        assert!(ev.contains("GET /api/thing0") && ev.contains("GET /api/thing63"),
-                "every entity must still be named in the evidence");
+        let ev: String = f[0]
+            .evidence
+            .iter()
+            .map(|(k, v)| format!("{k}{v}"))
+            .collect();
+        assert!(
+            ev.contains("GET /api/thing0") && ev.contains("GET /api/thing63"),
+            "every entity must still be named in the evidence"
+        );
     }
 
     /// AMUX-3645, rebuilt from AMUX-3640's own artifact.
@@ -11102,9 +13026,16 @@ mod tests {
         // The park is what keeps a lane from being handed work it cannot do.
         assert_eq!(f[0].parked_until, Some(99_999.0), "{:?}", f[0]);
 
-        let verdict: String =
-            f[0].evidence.iter().filter(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).collect();
-        assert!(verdict.contains("DWELL WINDOW"), "verdict must name the shape: {verdict}");
+        let verdict: String = f[0]
+            .evidence
+            .iter()
+            .filter(|(k, _)| k == "verdict")
+            .map(|(_, v)| v.clone())
+            .collect();
+        assert!(
+            verdict.contains("DWELL WINDOW"),
+            "verdict must name the shape: {verdict}"
+        );
         assert!(
             !verdict.contains("has not self-healed"),
             "the misleading clause from AMUX-3640 must be gone: {verdict}"
@@ -11117,7 +13048,9 @@ mod tests {
             f[0].title
         );
         assert!(
-            f[0].evidence.iter().any(|(k, v)| k == "occurrences" && v == "5301"),
+            f[0].evidence
+                .iter()
+                .any(|(k, v)| k == "occurrences" && v == "5301"),
             "the count is still recorded, just not as the headline: {:?}",
             f[0].evidence
         );
@@ -11130,8 +13063,12 @@ mod tests {
     fn an_ordinary_invariant_breach_is_not_parked() {
         let f = invariant_findings(&[inv_row("some.invariant", "entity-a", 50)]);
         assert_eq!(f[0].parked_until, None, "{:?}", f[0]);
-        let verdict: String =
-            f[0].evidence.iter().filter(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).collect();
+        let verdict: String = f[0]
+            .evidence
+            .iter()
+            .filter(|(k, _)| k == "verdict")
+            .map(|(_, v)| v.clone())
+            .collect();
         assert!(verdict.contains("has not self-healed"), "{verdict}");
         assert!(f[0].title.contains("(50x)"), "{}", f[0].title);
     }
@@ -11148,9 +13085,17 @@ mod tests {
             5301,
             1.0, // long before the fixture's now=9999
         )]);
-        assert_eq!(f[0].parked_until, None, "a lapsed dwell must not park: {:?}", f[0]);
-        let verdict: String =
-            f[0].evidence.iter().filter(|(k, _)| k == "verdict").map(|(_, v)| v.clone()).collect();
+        assert_eq!(
+            f[0].parked_until, None,
+            "a lapsed dwell must not park: {:?}",
+            f[0]
+        );
+        let verdict: String = f[0]
+            .evidence
+            .iter()
+            .filter(|(k, _)| k == "verdict")
+            .map(|(_, v)| v.clone())
+            .collect();
         assert!(verdict.contains("has not self-healed"), "{verdict}");
     }
 
@@ -11186,7 +13131,9 @@ mod tests {
         // Grouping is by invariant. Five different invariants failing once each
         // is five faults, not one — collapsing them would be the same defect
         // pointed the other way.
-        let rows: Vec<_> = (0..5).map(|i| inv_row(&format!("inv.{i}"), "same-entity", 99)).collect();
+        let rows: Vec<_> = (0..5)
+            .map(|i| inv_row(&format!("inv.{i}"), "same-entity", 99))
+            .collect();
         assert_eq!(invariant_findings(&rows).len(), 5);
     }
 
@@ -11200,8 +13147,15 @@ mod tests {
             .collect();
         rows.push(inv_row("noisy.invariant", "real", 500));
         let f = invariant_findings(&rows);
-        assert_eq!(f.len(), 1, "only the one entity above the flap threshold files");
-        assert!(!f[0].signature.ends_with("|ROLLUP"), "one real breach is a per-entity card, not a rollup");
+        assert_eq!(
+            f.len(),
+            1,
+            "only the one entity above the flap threshold files"
+        );
+        assert!(
+            !f[0].signature.ends_with("|ROLLUP"),
+            "one real breach is a per-entity card, not a rollup"
+        );
     }
 
     /// The measurement path must work on THIS machine, or the pure logic above
@@ -11212,7 +13166,10 @@ mod tests {
     fn the_descriptor_measurement_works_without_spawning_anything() {
         let open = open_fd_count().expect("/dev/fd must be readable");
         let limit = fd_limit().expect("getrlimit(RLIMIT_NOFILE) must answer");
-        assert!(open > 0, "a running test process holds at least stdin/stdout/stderr");
+        assert!(
+            open > 0,
+            "a running test process holds at least stdin/stdout/stderr"
+        );
         assert!(limit > 0, "RLIMIT_NOFILE must be a real limit");
         assert!(
             (open as u64) < limit,
