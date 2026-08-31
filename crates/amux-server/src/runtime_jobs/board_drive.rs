@@ -5349,8 +5349,148 @@ fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
     })
 }
 
+/// GET /api/board/nudges — current CC_STANDING_ORDERS state at every scope.
+///
+/// Returns `{"global": bool, "groups": {"name": bool, ...}, "workers": {"name": bool, ...}}`
+/// where `true` = nudges ON (the default), `false` = disabled at that level.
+///
+/// Reads the env files directly — same source `standing_orders_on_in` reads.
+pub async fn get_nudges() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let home = crate::api::session_verbs::home();
+
+    let global_val = crate::config::parse_env_file(&home.join("amux.env"))
+        .into_iter()
+        .find(|(k, _)| k == "CC_STANDING_ORDERS")
+        .map(|(_, v)| crate::api::session_verbs::auto_continue_on(Some(v.as_str())));
+
+    // Groups: ~/.amux/env/<name>.env
+    let mut groups: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Ok(rd) = std::fs::read_dir(home.join("env")) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("env") {
+                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                if name.is_empty() { continue; }
+                let val = crate::config::parse_env_file(&p)
+                    .into_iter()
+                    .find(|(k, _)| k == "CC_STANDING_ORDERS")
+                    .map(|(_, v)| crate::api::session_verbs::auto_continue_on(Some(v.as_str())));
+                if let Some(b) = val {
+                    groups.insert(name, Value::Bool(b));
+                }
+            }
+        }
+    }
+
+    // Workers: ~/.amux/workers/<name>/env
+    let mut workers: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Ok(rd) = std::fs::read_dir(home.join("workers")) {
+        for entry in rd.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let env_path = entry.path().join("env");
+                if env_path.exists() {
+                    let val = crate::config::parse_env_file(&env_path)
+                        .into_iter()
+                        .find(|(k, _)| k == "CC_STANDING_ORDERS")
+                        .map(|(_, v)| crate::api::session_verbs::auto_continue_on(Some(v.as_str())));
+                    if let Some(b) = val {
+                        workers.insert(name, Value::Bool(b));
+                    }
+                }
+            }
+        }
+    }
+
+    (axum::http::StatusCode::OK, axum::Json(json!({
+        "key": "CC_STANDING_ORDERS",
+        "note": "true = nudges on (default), false = disabled. Scopes: global > group > worker.",
+        "global": global_val,
+        "groups": groups,
+        "workers": workers,
+    }))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct NudgesPatch {
+    pub level: String,          // "global" | "group" | "worker"
+    pub name: Option<String>,   // group or worker name (required unless level=global)
+    pub enabled: bool,
+}
+
+/// PATCH /api/board/nudges — enable or disable board nudges at a scope.
+///
+/// `{"level": "global", "enabled": false}` — silences all nudges fleet-wide.
+/// `{"level": "group", "name": "my-group", "enabled": false}` — group-level.
+/// `{"level": "worker", "name": "ts-gke", "enabled": false}` — per-worker.
+///
+/// Writes/removes CC_STANDING_ORDERS in the appropriate env file, which is the
+/// same file `standing_orders_on` reads. No restart required.
+pub async fn patch_nudges(
+    axum::Json(body): axum::Json<NudgesPatch>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let home = crate::api::session_verbs::home();
+    let level = body.level.as_str();
+    let name = body.name.as_deref().unwrap_or("");
+
+    if matches!(level, "group" | "worker") && name.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "name is required for group/worker level"}))).into_response();
+    }
+
+    let path = match level {
+        "global" => home.join("amux.env"),
+        "group"  => home.join("env").join(format!("{name}.env")),
+        "worker" => home.join("workers").join(name).join("env"),
+        _ => return (axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "level must be global, group, or worker"}))).into_response(),
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": e.to_string()}))).into_response();
+        }
+    }
+
+    // Read current env, set or remove CC_STANDING_ORDERS, write back.
+    let mut env: std::collections::BTreeMap<String, String> = if path.exists() {
+        crate::config::parse_env_file(&path).into_iter().collect()
+    } else {
+        Default::default()
+    };
+
+    if body.enabled {
+        env.remove("CC_STANDING_ORDERS");  // remove = default ON; explicit True is redundant
+    } else {
+        env.insert("CC_STANDING_ORDERS".into(), "False".into());
+    }
+
+    let text: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    if let Err(e) = std::fs::write(&path, text) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": e.to_string()}))).into_response();
+    }
+
+    (axum::http::StatusCode::OK, axum::Json(json!({
+        "ok": true,
+        "level": level,
+        "name": name,
+        "enabled": body.enabled,
+        "note": if body.enabled {
+            "CC_STANDING_ORDERS removed from env (nudges on by default)"
+        } else {
+            "CC_STANDING_ORDERS=False written to env (nudges disabled)"
+        },
+    }))).into_response()
+}
+
 pub fn routes() -> axum::Router<AppState> {
-    axum::Router::new().route("/api/debug/board-drive", axum::routing::get(debug_board_drive))
+    axum::Router::new()
+        .route("/api/debug/board-drive", axum::routing::get(debug_board_drive))
+        .route("/api/board/nudges", axum::routing::get(get_nudges).patch(patch_nudges))
 }
 
 // ---------------------------------------------------------------------------

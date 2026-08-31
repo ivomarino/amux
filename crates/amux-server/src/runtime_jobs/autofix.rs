@@ -1051,6 +1051,20 @@ pub fn detect_latency(conn: &Connection, now: f64) -> (Vec<Finding>, Vec<Suppres
 /// and a wrong denominator is worse than an absent one because it invites a
 /// confident conclusion. `_SC_NPROCESSORS_ONLN` is the online count, which is the
 /// right one for oversubscription (a core the OS has parked cannot run a thread).
+/// How many request-log rows one latency scan may read (AMUX-3910).
+///
+/// Configurable because a hardcoded cap is a number no test can reach: the
+/// direction bug this guards against needed 400,000 rows to reproduce, so it
+/// shipped unreproduced and was found from a false card instead. With a knob the
+/// regression runs in milliseconds against the shipped query.
+fn latency_scan_cap() -> usize {
+    std::env::var("AMUX_LATENCY_SCAN_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(400_000)
+}
+
 fn host_ncpu() -> Option<i64> {
     // SAFETY: sysconf takes an int name and returns a long; no pointers.
     let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
@@ -1108,6 +1122,11 @@ struct P95Hit {
     base_p50: f64,
     win_n: usize,
     base_n: usize,
+    /// Did the 400k row cap bite, and how far back did the scan actually reach
+    /// (AMUX-3910)? Carried onto the card so `baseline_samples` cannot claim a
+    /// 72h norm that was computed over 68h.
+    scan_capped: bool,
+    oldest_seen_h: f64,
 }
 
 /// The per-family p95 card, unchanged in content from when it was built inline.
@@ -1142,6 +1161,28 @@ fn p95_finding(h: &P95Hit, mult: f64, min_n: i64, now: f64) -> Finding {
             ("baseline_p50_p95".into(), format!("{:.0} / {:.0} ms", h.base_p50, h.p95_b)),
             ("percentile_method".into(),
              "nearest-rank over the sorted window (same function /api/logs/stats reports)".into()),
+            // WHETHER THE SCAN SAW THE WHOLE PERIOD (AMUX-3910, ethos rule 4).
+            // The row cap used to truncate the NEWEST rows — the window itself —
+            // and say nothing on the card: one filed "p95 7173ms over 30
+            // samples" for a family that served 15,907 requests in that window,
+            // while /api/logs/stats read 134.8ms over 15,882 for the same
+            // period. A sample count is only a fact if the reader can tell it
+            // apart from a horizon.
+            ("scan_coverage".into(), if h.scan_capped {
+                format!(
+                    "PARTIAL — the {}-row scan cap was reached, so the trailing norm spans \
+                     {:.1}h rather than the {:.0}h named above. The WINDOW is complete: the \
+                     scan is ordered newest-first, so a cap can only shorten the baseline. \
+                     Treat the multiple as directional.",
+                    latency_scan_cap(), h.oldest_seen_h, baseline_h()
+                )
+            } else {
+                format!(
+                    "complete — every row in the {:.0}h period was scanned; the cap was not \
+                     reached",
+                    baseline_h()
+                )
+            }),
         ],
         recheck: format!(
             "curl -sk \"$AMUX_URL/api/logs/stats?since_h={}\" | python3 -c \"import json,sys; \
@@ -1178,6 +1219,12 @@ pub(crate) fn detect_latency_at(
     // answer is only useful next to how much was looked at.
     let mut considered_rows = 0usize;
     let mut excluded_rows = 0usize;
+    // Whether the 400k cap bit, and how far back the scan actually reached
+    // (AMUX-3910). Both travel onto the card: a baseline number computed over a
+    // shorter period than the card names is a number that disagrees with its own
+    // label, which is the class of defect this detector keeps producing.
+    let mut scan_capped = false;
+    let mut oldest_seen = now;
     // Rows stamped slow_ok are REQUESTED latency, not service latency
     // (AMUX-3513): a browser `wait` action polls for up to its caller-chosen
     // budget and a timed-out wait is a 200 at exactly that budget — twelve of
@@ -1185,10 +1232,29 @@ pub(crate) fn detect_latency_at(
     // The endpoint declares the semantics (x-amux-slow-ok response header ->
     // req_meta.slow_ok); both latency shapes skip what the caller asked for.
     if let Ok(mut stmt) = conn.prepare(
+        // `ORDER BY ts DESC` IS LOAD-BEARING (AMUX-3910). Without it this scan
+        // walked `idx_reqlog_ts` ASCENDING and the LIMIT cut the NEWEST rows —
+        // which is precisely the WINDOW this detector exists to measure, while
+        // the baseline stayed intact. A truncated window against a whole
+        // baseline is a comparison guaranteed to skew, and the direction of a
+        // cap is part of its correctness (AF-131).
+        //
+        // Measured on the specimen: 405,744 rows in the 72h range against a
+        // 400,000 cap, so the detector's horizon stopped 1.7h short of now and
+        // it filed "p95 7173ms over 30 samples" for a family that served 15,907
+        // requests in that window. /api/logs/stats, reading the same period
+        // unclipped, said 134.8ms over 15,882. The card was a report about 30
+        // rows sitting at the truncation edge.
+        //
+        // Descending, anything dropped is the OLDEST baseline row. The window is
+        // ~32k rows and can never be reached by a 400k cap; the baseline is a
+        // trailing reference and degrades gracefully by getting shorter, which
+        // is reported below rather than hidden.
         "SELECT family, latency_ms, ts, boot_at, load1 FROM _amux_request_log WHERE ts >= ?1 \
-           AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') LIMIT 400000",
+           AND (req_meta IS NULL OR req_meta NOT LIKE '%\"slow_ok\"%') \
+         ORDER BY ts DESC LIMIT ?2",
     ) {
-        if let Ok(rows) = stmt.query_map(rusqlite::params![b_start], |r| {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![b_start, latency_scan_cap() as i64], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, f64>(1)?,
@@ -1219,6 +1285,9 @@ pub(crate) fn detect_latency_at(
             let mut considered = 0usize;
             for (fam, ms, ts, row_boot, row_load) in rows.flatten() {
                 considered += 1;
+                if ts < oldest_seen {
+                    oldest_seen = ts;
+                }
                 // AMUX-3646: the host's load during the WINDOW, so the rollup can
                 // say "28 cores were carrying 37" instead of naming five innocent
                 // endpoints. Window rows only; the baseline spans days and its
@@ -1269,15 +1338,26 @@ pub(crate) fn detect_latency_at(
             );
             considered_rows = considered;
             excluded_rows = spanned_restart;
-            if considered >= 400_000 {
-                // The query's LIMIT is binding, so the sample is a silent,
-                // unordered truncation of the period rather than the period.
-                // A cap's direction is part of its correctness (AF-131) and
-                // this one has no ORDER BY, so which rows survive is arbitrary.
+            if considered >= latency_scan_cap() {
+                // The cap is binding. It is now DIRECTED (newest first), so the
+                // window is whole and only the far end of the baseline is lost —
+                // but that still shortens the trailing norm every comparison is
+                // made against, and a reader deserves to know the baseline is
+                // 68h rather than the 72h the card names.
+                //
+                // This warning existed BEFORE the fix and correctly described
+                // the defect ("no ORDER BY, so which rows survive is arbitrary").
+                // It went to the log and nothing else, so the card it invalidated
+                // was filed anyway and read as fact. A warning that does not
+                // reach the artifact it invalidates is not an instrument.
+                scan_capped = true;
                 tracing::warn!(
                     considered,
-                    "latency: row cap reached — the p95 window is a TRUNCATED, unordered \
-                     sample of the period and the percentiles below are not the period's"
+                    cap = latency_scan_cap(),
+                    oldest_seen_h = (now - oldest_seen) / 3600.0,
+                    "latency: row cap reached — baseline is truncated to the most recent rows; \
+                     the WINDOW is complete (ORDER BY ts DESC, AMUX-3910) but the trailing norm \
+                     spans less than the configured baseline period"
                 );
             }
         }
@@ -1363,6 +1443,8 @@ pub(crate) fn detect_latency_at(
             base_p50: rl::percentile_sorted(&base, 0.5),
             win_n: win.len(),
             base_n: base.len(),
+            scan_capped,
+            oldest_seen_h: (now - oldest_seen) / 3600.0,
         });
     }
 
@@ -9000,6 +9082,126 @@ mod tests {
         assert!(
             !sigs.iter().any(|s| s.contains("{*verb}")),
             "no card may still be keyed on the wildcard itself: {sigs:?}"
+        );
+    }
+
+    /// AMUX-3910. The scan cap truncated the NEWEST rows — the window this
+    /// detector exists to measure — while leaving the baseline whole, and said
+    /// nothing about it on the card.
+    ///
+    /// THE SPECIMEN: 405,744 rows in the 72h range against a 400,000 cap, so the
+    /// scan's horizon stopped 1.7h short of now. It filed "/api/sessions p95
+    /// 7173ms over 30 samples, 5.9x its trailing norm" for a family that served
+    /// 15,907 requests in that window; /api/logs/stats, reading the same period
+    /// unclipped, said 134.8ms over 15,882. The card was a report about 30 rows
+    /// sitting at the truncation edge, and `window_samples: 30` read as "this
+    /// endpoint was quiet" rather than "we could only see 30 of 15,907".
+    ///
+    /// The detector's own log line already said "no ORDER BY, so which rows
+    /// survive is arbitrary". It went to the log and nowhere else, so the card it
+    /// invalidated was filed anyway.
+    ///
+    /// The fixture makes the cap bite with a baseline LARGER than the cap, so
+    /// ascending order reaches zero window rows and the detector goes blind to
+    /// the very period it reports on.
+    #[tokio::test]
+    async fn the_scan_cap_truncates_the_baseline_never_the_window() {
+        let insert = |st: &AppState, ts: f64, ms: f64| {
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                         latency_ms, client_ip, user_agent, amux_session, worker, answered_by) \
+                         VALUES (?1,'GET','/api/sessions','/api/sessions',200,?2,\
+                         '127.0.0.1','curl/8','','','native')",
+                        rusqlite::params![ts, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let (st, _d) = state();
+        let now = unix_now();
+        // 300 fast baseline rows, older than the window. On its own this exceeds
+        // the cap below, which is the whole point: ascending, the scan is used up
+        // before it ever reaches the window.
+        for i in 0..300 {
+            insert(&st, now - 200_000.0 - i as f64, 5.0);
+        }
+        // 60 slow rows INSIDE the window — a real regression the detector should
+        // see and report.
+        for i in 0..60 {
+            insert(&st, now - 300.0 - i as f64, 900.0);
+        }
+        std::env::set_var("AMUX_LATENCY_SCAN_CAP", "200");
+        let conn = st.store.read().unwrap();
+        let (f, _) = detect_latency_at(&conn, now, None);
+        std::env::remove_var("AMUX_LATENCY_SCAN_CAP");
+
+        let hit = f
+            .iter()
+            .find(|x| x.signature == "latency|p95|/api/sessions")
+            .expect("the window is complete under a descending scan, so the real regression files");
+        let ev: BTreeMap<_, _> = hit.evidence.iter().cloned().collect();
+
+        // THE ASSERTION THAT PINS THE DIRECTION. Every window row must be
+        // present; a cap may only eat baseline. Ascending, this reads 0.
+        assert_eq!(
+            ev["window_samples"], "60",
+            "the cap must never reach the window — a truncated window against a whole \
+             baseline is a comparison guaranteed to skew: {ev:?}"
+        );
+        // AND THE CARD SAYS ITS COVERAGE WAS PARTIAL (ethos rule 4). A sample
+        // count is only a fact if the reader can tell it apart from a horizon.
+        assert!(
+            ev["scan_coverage"].starts_with("PARTIAL"),
+            "a capped scan must say so on the artifact, not only in the log: {ev:?}"
+        );
+        assert!(
+            ev["scan_coverage"].contains("WINDOW is complete"),
+            "and must say which side was lost, or the reader cannot weigh the number: {ev:?}"
+        );
+    }
+
+    /// CONTROL. With the cap out of reach the same fixture reports COMPLETE
+    /// coverage. Without this, hardcoding "PARTIAL" would pass the cell above
+    /// and permanently label every card as untrustworthy — which is the same
+    /// failure as never labelling one.
+    #[tokio::test]
+    async fn an_uncapped_scan_reports_complete_coverage() {
+        let insert = |st: &AppState, ts: f64, ms: f64| {
+            st.store
+                .write(move |conn| {
+                    conn.execute(
+                        "INSERT INTO _amux_request_log (ts, method, path, family, status, \
+                         latency_ms, client_ip, user_agent, amux_session, worker, answered_by) \
+                         VALUES (?1,'GET','/api/sessions','/api/sessions',200,?2,\
+                         '127.0.0.1','curl/8','','','native')",
+                        rusqlite::params![ts, ms],
+                    )?;
+                    Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                })
+                .unwrap();
+        };
+        let (st, _d) = state();
+        let now = unix_now();
+        for i in 0..60 {
+            insert(&st, now - 200_000.0 - i as f64, 5.0);
+            insert(&st, now - 300.0 - i as f64, 900.0);
+        }
+        let conn = st.store.read().unwrap();
+        let (f, _) = detect_latency_at(&conn, now, None);
+        let ev: BTreeMap<_, _> = f
+            .iter()
+            .find(|x| x.signature == "latency|p95|/api/sessions")
+            .expect("a real regression still files")
+            .evidence
+            .iter()
+            .cloned()
+            .collect();
+        assert!(
+            ev["scan_coverage"].starts_with("complete"),
+            "nothing was truncated here and the card must say so plainly: {ev:?}"
         );
     }
 

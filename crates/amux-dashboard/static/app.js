@@ -7428,6 +7428,116 @@ function exportPeekBoard(fmt) {
   showToast(`Exporting ${scoped ? peekSession + "'s" : 'the whole'} board as ${fmt.toUpperCase()} (full descriptions)`);
 }
 
+// ── Board nudges panel ──────────────────────────────────────────────────────
+// Reads/writes CC_STANDING_ORDERS at global, group, or worker scope via
+// GET/PATCH /api/board/nudges. The panel opens from the toolbar "Nudges" button.
+
+let _nudgesState = null;   // last GET /api/board/nudges response
+
+async function _nudgesLoad() {
+  try {
+    const r = await fetch(API + '/api/board/nudges', { headers: _authHeaders() });
+    _nudgesState = await r.json();
+  } catch (e) { _nudgesState = null; }
+  _nudgesRender();
+}
+
+function _nudgesRow(label, enabled, level, name) {
+  // Use data attributes so onclick strings stay simple and quote-safe.
+  const on = enabled !== false;
+  return '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid var(--border);">'
+    + '<span style="color:var(--text);font-size:0.76rem;">' + esc(label) + '</span>'
+    + '<button class="btn' + (on ? '' : ' primary') + '" data-nlvl="' + esc(level) + '" data-nname="' + esc(name || '') + '" data-nen="' + (!on) + '" style="font-size:0.7rem;min-height:28px;padding:3px 9px;flex:0 0 auto;" onclick="_nudgesRowClick(this)">'
+    + (on ? 'On' : 'Off') + '</button>'
+    + '</div>';
+}
+
+function _nudgesRowClick(btn) {
+  const level = btn.dataset.nlvl;
+  const name = btn.dataset.nname || null;
+  const enabled = btn.dataset.nen === 'true';
+  _nudgesSet(level, name, enabled);
+}
+
+function _nudgesRender() {
+  const el = document.getElementById('nudges-panel');
+  if (!el || el.style.display === 'none') return;
+  const s = _nudgesState;
+  if (!s) { el.innerHTML = '<div style="color:var(--dim);">Loading…</div>'; return; }
+
+  let h = '<div style="font-size:0.7rem;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Board nudges</div>';
+
+  // Global row — null/undefined means key absent = on
+  h += _nudgesRow('Global (all workers)', s.global, 'global', null);
+
+  // Group rows — only groups with an explicit value
+  const grps = s.groups || {};
+  const grpNames = Object.keys(grps).sort();
+  if (grpNames.length) {
+    h += '<div style="color:var(--dim);font-size:0.68rem;margin:6px 0 2px;">Groups with overrides</div>';
+    grpNames.forEach(g => { h += _nudgesRow(g, grps[g], 'group', g); });
+  }
+
+  // Worker rows — only workers with an explicit value
+  const wkrs = s.workers || {};
+  const wkrNames = Object.keys(wkrs).sort();
+  if (wkrNames.length) {
+    h += '<div style="color:var(--dim);font-size:0.68rem;margin:6px 0 2px;">Workers with overrides</div>';
+    wkrNames.forEach(w => { h += _nudgesRow(w, wkrs[w], 'worker', w); });
+  }
+
+  // Quick-set for the currently open worker peek
+  if (peekSession) {
+    h += '<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">'
+      + '<div style="color:var(--dim);font-size:0.68rem;margin-bottom:4px;">Set for: <b>' + esc(peekSession) + '</b></div>'
+      + '<div style="display:flex;gap:6px;">'
+      + '<button class="btn" data-nlvl="worker" data-nname="' + esc(peekSession) + '" data-nen="true" style="font-size:0.7rem;min-height:28px;flex:1;" onclick="_nudgesRowClick(this)">On</button>'
+      + '<button class="btn primary" data-nlvl="worker" data-nname="' + esc(peekSession) + '" data-nen="false" style="font-size:0.7rem;min-height:28px;flex:1;" onclick="_nudgesRowClick(this)">Off</button>'
+      + '</div></div>';
+  }
+
+  h += '<div style="color:var(--dim);font-size:0.66rem;margin-top:8px;">On = default. Off disables board nudges at that scope (sets CC_STANDING_ORDERS=False).</div>';
+  el.innerHTML = h;
+}
+
+async function _nudgesSet(level, name, enabled) {
+  const body = { level, enabled };
+  if (name) body.name = name;
+  try {
+    await fetch(API + '/api/board/nudges', {
+      method: 'PATCH',
+      headers: Object.assign({}, _authHeaders(), { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    showToast('Nudges ' + (enabled ? 'enabled' : 'disabled') + ' at ' + level + (name ? ':' + name : ''));
+    await _nudgesLoad();
+  } catch (e) { showToast('Failed to update nudges: ' + e.message); }
+}
+
+function _nudgesTogglePanel(e) {
+  if (e) e.stopPropagation();
+  const el = document.getElementById('nudges-panel');
+  if (!el) return;
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    el.innerHTML = '<div style="color:var(--dim);">Loading…</div>';
+    _nudgesLoad();
+    setTimeout(() => document.addEventListener('click', _nudgesPanelOutside, true), 0);
+  } else {
+    el.style.display = 'none';
+    document.removeEventListener('click', _nudgesPanelOutside, true);
+  }
+}
+
+function _nudgesPanelOutside(e) {
+  const el = document.getElementById('nudges-panel');
+  const btn = document.getElementById('nudges-btn');
+  if (el && !el.contains(e.target) && e.target !== btn) {
+    el.style.display = 'none';
+    document.removeEventListener('click', _nudgesPanelOutside, true);
+  }
+}
+
 function togglePeekIssuesAll() {
   _peekIssuesAllSessions = !_peekIssuesAllSessions;
   localStorage.setItem('amux_peek_issues_all', _peekIssuesAllSessions ? '1' : '0');
@@ -8103,7 +8213,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.755';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.756';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
