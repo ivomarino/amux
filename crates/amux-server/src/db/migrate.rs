@@ -512,7 +512,81 @@ pub fn apply_all(conn: &mut Connection) -> anyhow::Result<()> {
             tracing::info!(migration = m.name, duration_ms = ms, "migration applied");
         }
     }
+    report_renumbered_migrations(conn);
     Ok(())
+}
+
+/// Versions whose RECORDED name differs from the name now registered for them,
+/// as `(version, recorded, registered)`.
+///
+/// AF-353. The runner dedupes on VERSION alone — `SELECT 1 FROM _amux_migrations
+/// WHERE version = ?1`, the name never consulted — so a version this database
+/// has already applied is skipped no matter WHICH migration now claims it. That
+/// is fine while a version keeps its meaning, and this repo routinely takes it
+/// away: renumbering an incoming migration is the DOCUMENTED fix for a
+/// contributor collision (see `versions_are_dense_and_match_their_filenames`
+/// below). Renumbering frees a number, the freed number gets handed to a
+/// different migration, and every database that recorded the old one at that
+/// version skips the new one forever, with a clean boot and a green `/health`.
+///
+/// `versions_are_dense_and_match_their_filenames` constrains the ARRAY, and
+/// nothing constrained the array against what a DATABASE already recorded.
+/// The benign case and the destructive case are byte-identical to the runner,
+/// which is why this reports rather than refuses: an old database legitimately
+/// carries an old name for a migration that was renumbered, and refusing to boot
+/// over that would be a gate with no truthful path (ethos rule 3).
+///
+/// Live on this box when written: v35 recorded as `0029_regenerable_samples`,
+/// registered as `0035_regenerable_samples`. Same migration, renumbered, nothing
+/// skipped. The point is that nothing anywhere noticed it had moved.
+pub(crate) fn renumbered_migrations(conn: &Connection) -> Vec<(i64, String, String)> {
+    let mut stmt = match conn.prepare("SELECT version, name FROM _amux_migrations") {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    let rows = match stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))) {
+        Ok(r) => r,
+        Err(_) => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    for row in rows.flatten() {
+        let (version, recorded) = row;
+        if let Some(m) = MIGRATIONS.iter().find(|m| m.version == version) {
+            if m.name != recorded {
+                out.push((version, recorded, m.name.to_string()));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Log the above. Separate from the query so the decision is testable without a
+/// tracing subscriber, and so the count is emitted even when the list is empty
+/// — a silent probe and a clean database are the same output otherwise, which is
+/// the `measured` contract (ethos rule 4) at the point where someone greps.
+fn report_renumbered_migrations(conn: &Connection) {
+    let found = renumbered_migrations(conn);
+    if found.is_empty() {
+        tracing::info!(renumbered_migrations = 0, "migration version/name binding checked");
+        return;
+    }
+    for (version, recorded, registered) in &found {
+        tracing::warn!(
+            migration_version = version,
+            recorded_name = %recorded,
+            registered_name = %registered,
+            "migration version {version} was applied as {recorded:?} but is now registered as \
+             {registered:?}. The runner skips a version it has already applied WITHOUT reading \
+             the name, so if these are different migrations rather than one renumbered, this \
+             database has silently skipped {registered:?} and its schema lags the code."
+        );
+    }
+    tracing::warn!(
+        renumbered_migrations = found.len(),
+        "{} migration version(s) do not match their recorded name — see the lines above",
+        found.len()
+    );
 }
 
 /// Apply ONE migration's body, honouring `-- ADDCOL:` directives.
@@ -670,6 +744,85 @@ mod registration_guard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AF-353: a version whose recorded name is no longer the registered one
+    /// must be REPORTED, and a clean database must stay quiet.
+    ///
+    /// Both directions on purpose. A detector that reported every version would
+    /// pass the first half of this alone while being useless, and one that
+    /// reported nothing would pass the second half alone while being the bug.
+    ///
+    /// It drives the SHIPPED query against a real database built through
+    /// `apply_all`, not a hand-made fixture. The defect being guarded lives in
+    /// the disagreement between what a database RECORDED and what the code now
+    /// registers, so a fixture that writes both sides itself would be asserting
+    /// against its own construction.
+    #[test]
+    fn a_version_applied_under_a_different_name_is_reported() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all(&mut conn).unwrap();
+
+        // THE CONTROL, and it is load-bearing: a database the code agrees with
+        // reports nothing. Without it, `renumbered_migrations` returning
+        // everything would look like a pass below.
+        assert_eq!(
+            renumbered_migrations(&conn),
+            Vec::new(),
+            "a database in step with MIGRATIONS must report no renumbering"
+        );
+
+        // Now the real shape: version 1 was applied under the name it had
+        // before someone renumbered it. This is what every database that ran
+        // the pre-renumber code looks like, and the runner cannot tell it from
+        // the case where version 1 now means a DIFFERENT migration entirely.
+        let registered = MIGRATIONS[0].name;
+        conn.execute(
+            "UPDATE _amux_migrations SET name = ?1 WHERE version = ?2",
+            rusqlite::params!["0001_under_its_old_name", MIGRATIONS[0].version],
+        )
+        .unwrap();
+
+        let found = renumbered_migrations(&conn);
+        assert_eq!(found.len(), 1, "expected exactly the one mismatch: {found:?}");
+        assert_eq!(found[0].0, MIGRATIONS[0].version);
+        assert_eq!(found[0].1, "0001_under_its_old_name", "the RECORDED name");
+        assert_eq!(found[0].2, registered, "the REGISTERED name");
+
+        // And it survives a re-run. `apply_all` skips already-applied versions,
+        // so the mismatch must still be visible on the next boot rather than
+        // being a one-shot only the very first startup could have caught.
+        apply_all(&mut conn).unwrap();
+        assert_eq!(
+            renumbered_migrations(&conn).len(),
+            1,
+            "the mismatch must still be reported on a later boot"
+        );
+    }
+
+    /// A version RECORDED but no longer registered at all is NOT a renumber and
+    /// must not be reported as one.
+    ///
+    /// This is the false-positive edge: a database that ran a migration the code
+    /// has since dropped has a row with no counterpart, and reporting it would
+    /// send someone hunting a skipped migration that does not exist. The check
+    /// joins on the registered side for exactly this reason, and a join is the
+    /// kind of thing that gets "simplified" into a scan.
+    #[test]
+    fn a_recorded_version_the_code_no_longer_registers_is_not_a_renumber() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        apply_all(&mut conn).unwrap();
+        let orphan = MIGRATIONS.iter().map(|m| m.version).max().unwrap() + 999;
+        conn.execute(
+            "INSERT INTO _amux_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![orphan, "9999_dropped_long_ago", "2026-01-01T00:00:00+00:00"],
+        )
+        .unwrap();
+        assert_eq!(
+            renumbered_migrations(&conn),
+            Vec::new(),
+            "a version the code no longer registers has nothing to disagree with"
+        );
+    }
 
     #[test]
     fn migrations_apply_to_fresh_db_and_are_idempotent() {
