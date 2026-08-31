@@ -3270,3 +3270,30 @@ FIX: `ln -sfn`, in both branches of the axis, with the reason stated inline so i
   The generalisable half: a detector that names a remedy owes the same scrutiny to the
   REMEDY as to the check. This one could fail, fired correctly, and still closed the loop
   back onto itself.
+
+## Every amux-launched Chrome opens with the yellow "unsupported command-line flag" infobar
+VALIDATED: mixpeek-research | VALIDATED by the ORIGINATING session (mixpeek-research, 2026-08-31), re-exercised today rather than read off the card. They started a FRESH amux browser (pid 93701) and its argv carries both the kBadFlags trigger and --test-type on one line, so the suppressor reaches NEW production launches and not only the process measured on 08-30, which is the arm that distinguishes a fix from a one-off observation. Mechanism is source-verified as the ChromeDriver-standard suppression rather than inferred from the absence of the bar. HONEST LIMIT, recorded by them unprompted rather than papered over: the PIXEL layer is still unobservable from any lane because screencapture and accessibility permissions are both ungranted (AMUX-3848, unchanged), so this is validated on verified flag delivery plus the source-verified mechanism, with the pixel layer marked UNOBSERVABLE rather than checked. Their own reopening condition, kept here so it is actionable: if the bar reappears on a window Ethan sees, that sighting re-opens the entry.
+AREA: browser
+SEVERITY: annoys
+STATUS: fixed
+DATE: 2026-08-24
+SESSION: mixpeek-research
+CARD: MR-38
+SYMPTOM: Ethan's screenshot at 15:40: "You are using an unsupported command-line flag:
+  --ignore-certificate-errors-spki-list=... Stability and security will suffer." across the top
+  of every window the amux browser opens. The SPKI pin is on Chrome's kBadFlags list
+  (chrome/browser/ui/startup/bad_flags_prompt.cc:107), so the bar has been on every launch since
+  the pin shipped. Nothing in amux could see it: it is browser chrome, not page content, and no
+  verb screenshots that, so the only detector was a human looking at the window.
+COST: every human-facing browser session since the pin shipped read as broken or unsafe to the
+  person looking at it, until Ethan screenshotted it. About 90 minutes across two lanes to land,
+  most of it the shared-checkout dance (the peer's whole-file write dropped two of three edits
+  once; see the entry above at "Mutation testing's obvious harness is a whole-file write").
+FIX: 9f4e6971. --test-type on the launch line: chromium infobar_utils.cc:173 returns before
+  ShowBadFlagsPrompt for a test-harness launch (ChromeDriver passes it on every session);
+  --enable-automation would also work but adds its own "controlled by automated test software"
+  bar. Flags extracted into chrome_launch_args() and launch_args_tests pins "bad flag =>
+  --test-type" with a control that the pin is really present; mutation-checked red without the
+  flag. NOT confirmed on screen from this lane: screencapture is refused for a tmux shell (no
+  Screen Recording grant), so the visual check is Ethan's next launch. Already-running Chromes
+  keep the bar until relaunched.
