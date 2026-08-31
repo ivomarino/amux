@@ -8262,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.759';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.760';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8550,16 +8550,22 @@ function openPeek(name, opts) {
     if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
   });
   _peekUpdateTabCounts();
-  // AMUX-3201: a codex/ollama peek opens straight to the Claude-like structured
-  // transcript rather than the raw native TUI (Ethan's complaint). The Terminal
-  // tab stays one tap away as the raw-terminal toggle. Guarded: a hidden
-  // Transcript tab, a non-codex provider, or a missing helper is a no-op that
-  // leaves openPeek's default terminal view untouched.
-  try {
-    const _pv = _peekSess ? sessionProvider(_peekSess) : 'claude';
-    const _hidden = (typeof peekHiddenTabs !== 'undefined' && peekHiddenTabs.has) ? peekHiddenTabs.has('transcript') : false;
-    if ((_pv === 'codex' || _pv === 'ollama') && !_hidden) setPeekTab('transcript');
-  } catch (e) {}
+  // Every worker opens on its live terminal. A provider-specific default made
+  // Codex/Ollama workers jump to Transcript after the reset above, so the
+  // default differed by provider and hid the interactive pane at the moment a
+  // user opened a worker. Transcript remains an explicit tab, never a redirect.
+  // If a later call reintroduces an override, leave a server-visible signal for
+  // `/api/client-debug` and the normal log sweep rather than relying on a
+  // screenshot to discover it.
+  if (_peekTab !== 'terminal') {
+    try {
+      fetch(API + '/api/client-debug', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+        body: JSON.stringify({ kind: 'peek-default-tab-violation', ver: APP_VER, tab: _peekTab,
+          provider: _peekSess ? sessionProvider(_peekSess) : 'unknown' }),
+      }).catch(() => {});
+    } catch (e) {}
+  }
   loadPeekCommitGuard(name);
   updateConnectionStatus();
   const peekOv = document.getElementById('peek-overlay');
