@@ -98,7 +98,7 @@ def main():
         if out:
             failures.append(f"split_risk must print NOTHING for {empty!r}, got {out!r}")
 
-    # AF-363: the BLOCKED remedy must offer the non-destructive exit FIRST.
+    # AF-365: the BLOCKED remedy must offer the non-destructive exit FIRST.
     #
     # On a shared index `git restore --staged <their path>` mutates state that
     # belongs to the other lane: their file is staged because THEY staged it, and
