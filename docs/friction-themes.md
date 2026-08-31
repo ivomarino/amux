@@ -26,9 +26,17 @@ So this is ONE file, and a daily run does exactly three things to it:
 A day that changes nothing here is a normal day. Padding it is worse than
 skipping it.
 
-**A SECOND RUN ON THE SAME DAY INCREMENTS NOTHING.** Check `LAST_SEEN` before
-touching a theme: if it already reads today's date, this pass is a duplicate and
-the three operations above do not apply to it. Run the scan, compare, and say so.
+**A SECOND RUN ON THE SAME DAY DOES NOT RE-INCREMENT.** Check `LAST_SEEN` before
+touching a theme: if it already reads today's date, that theme was counted this
+cycle and a second pass must not count it again. Run the scan, compare, say so.
+
+ADDING is still allowed, and the distinction is the whole point. The ban is on
+counting ONE observation twice, not on recording something the earlier pass did
+not see. A class that first became visible during the second pass has been
+observed once and belongs in the file once. Written this way because the first
+draft of this rule said "the three operations do not apply", which would have
+suppressed a real finding to protect a count, and the very next thing this sweep
+did was find one.
 
 This is not hypothetical and it is the one way this file can corrupt itself.
 SCHED-399 fired at 11:00 on 2026-08-31 and the sweep was invoked twice, at 11:01
@@ -265,6 +273,34 @@ FIX_SITE: a lane status a human can read without asking the lane
 CARDS: none
 EVIDENCE: the same instruction reaching two or more lanes in a day is the
 measurable form. Four instances on 2026-08-30, one of them spanning both repos.
+
+## The auto-builder restarts the server under in-flight work, and every caller fails differently
+SCOPE: amux
+STATUS: open
+FIRST_SEEN: 2026-08-31
+LAST_SEEN: 2026-08-31
+OCCURRENCES: 1
+SIGNALS: ledger-cluster:instruments, ledger-cluster:cli
+FIX_SITE: the seam between the builder's restart and any caller holding a request
+CARDS: AF-362, AF-371
+EVIDENCE: three instances in ONE day, each failing a different way, which is why
+none of them looked like a class until they were put side by side. The builder
+rebuilds and swaps the binary on EVERY commit, so the window is not rare: it opens
+several times an hour on a day when lanes are committing.
+(1) `frustrations-archive.py`'s card-carry got curl exit 7 on two entries and
+REPORTED IT honestly, leaving the entry archived and the card without its symptom.
+Half-completed, visibly. AF-362.
+(2) An mdai run was captured by the offline outbox and handed a synthetic 202, so
+the panel reported a COMPLETED RUN that never left the browser and the op sat in
+the outbox as `Syncing 0/1`. Reported as success, which is the worst of the three.
+Ethan hit this one twice and reported it as two separate bugs. AF-371.
+(3) `amux board add` returned rc=7 and printed NOTHING at all. Silent. Caught only
+because the caller checked the exit code of a command it expected to print an id.
+The three failure modes are honest-partial, false-success, and silent, from one
+cause. Any fix aimed at one of them leaves the other two, which is the argument for
+the theme rather than three cards.
+NOT SCOPE: both. The auto-builder is amux-only; Mixpeek has no equivalent, and no
+Mixpeek ledger entry carries this shape.
 
 ## The message bus cannot say whether a message landed
 SCOPE: amux
