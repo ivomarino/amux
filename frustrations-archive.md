@@ -2743,3 +2743,28 @@ FIX: The firsthand-edit record is fed by Edit/Write tool calls, so a session fol
  file whose only recorded writer is you and no peer has a recorded write in the window.
 
 ---
+
+## The board stores a card type its own create path rejects
+VALIDATED: amux-frustrations | VALIDATED by the ORIGINATING session (amux-frustrations authored this entry, so this is a self-signoff and is labelled as one, not a peer review). Fixed in 9bdfc7f6 (card AF-323, now done): `decision` is a real card type with its own gate naming the decider. Took the add-the-type arm, not the migrate arm: the stored cards belong to mixpeek-orchestrator and ethos rule 8 plus AMUX-3552 both say surface, do not sweep, so listing the word repairs them where they sit with no edit to another lane's data. The entry's count was already stale when validated: it read three cards, five were live. Evidence: scripts/test-contended.sh -p amux-server -> 1665 passed, 0 failed; clippy clean; mutation putting core_item_type back to Code fails both new tests; live after the builder adopted the commit, GET /api/board/contract offers `decision` and gates.decision.done reads "The decision is recorded on the card: what was chosen, by whom, and when". Two tests were PINNING this defect, both using `decision` as their stand-in for an unknown type; repointed at `task`, which is still genuinely unknown.
+AREA: board
+SEVERITY: annoys
+STATUS: open
+DATE: 2026-08-29
+SESSION: amux-frustrations
+CARD: AF-323
+SYMPTOM: `amux board add --type decision` returns
+  `{"error": "unknown type \"decision\"", "valid_types": [code, escalation, blocker,
+  investigation, ops, research, chore, doc, tripwire, watch, epic]}` — while three cards
+  on the live board carry `type: decision` right now (ETHAN-36, MO-3036, MO-3034, all
+  created by mixpeek-orchestrator, all in `todo`, all literal Ethan-decision cards).
+COST: One retry and a re-file, ~2 minutes. The larger cost is conceptual: the error text
+  explains that the gate is DERIVED from type and an unknown type would silently fall back
+  to the strictest gate. That reasoning is right, and it means the three stored cards are
+  sitting on a gate nobody chose for them. It also lands badly against AF-318, which
+  proposes typed `needsyou --ask decision|access|...`: `decision` describes 24% of the 445
+  needsyou cards, and it is the one type you cannot file.
+FIX: Reconcile storage with validation. Either add `decision` to valid_types with its own
+  gate, or migrate the three existing cards and reject it on the WRITE path, not only in
+  the CLI. Whichever way it goes, one of the two components is currently lying.
+
+---

@@ -2192,29 +2192,6 @@ COST: I nearly reported 8 failures as a regression in a peer's area, and spent a
 FIX: none yet. The cheap instrument, not the cure: have the test run record whether a build was in flight (the builder's lock is already on disk at `~/.amux/rust-build.lock`) and print it beside the result, so a red suite says whether it was contended. The cure is either per-lane target dirs (rejected before, for disk) or serialising the spawn-a-binary tests behind the same lock the builder takes. Naming the instrument first because the wrong lesson from this entry is "ignore red suites", and a contention flag is what separates the two honestly.
 
 ---
-## The board stores a card type its own create path rejects
-AREA: board
-SEVERITY: annoys
-STATUS: open
-DATE: 2026-08-29
-SESSION: amux-frustrations
-CARD: AF-323
-SYMPTOM: `amux board add --type decision` returns
-  `{"error": "unknown type \"decision\"", "valid_types": [code, escalation, blocker,
-  investigation, ops, research, chore, doc, tripwire, watch, epic]}` — while three cards
-  on the live board carry `type: decision` right now (ETHAN-36, MO-3036, MO-3034, all
-  created by mixpeek-orchestrator, all in `todo`, all literal Ethan-decision cards).
-COST: One retry and a re-file, ~2 minutes. The larger cost is conceptual: the error text
-  explains that the gate is DERIVED from type and an unknown type would silently fall back
-  to the strictest gate. That reasoning is right, and it means the three stored cards are
-  sitting on a gate nobody chose for them. It also lands badly against AF-318, which
-  proposes typed `needsyou --ask decision|access|...`: `decision` describes 24% of the 445
-  needsyou cards, and it is the one type you cannot file.
-FIX: Reconcile storage with validation. Either add `decision` to valid_types with its own
-  gate, or migrate the three existing cards and reject it on the WRITE path, not only in
-  the CLI. Whichever way it goes, one of the two components is currently lying.
-
----
 ## Nothing owned the WORKERS at boot — a reboot left 56 of 58 down, holding 69 `doing` cards
 AREA: cli
 SEVERITY: blocks
