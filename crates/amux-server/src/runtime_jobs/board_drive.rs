@@ -2370,6 +2370,32 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
             skipped.push(format!("{id} blocked by {}", blocking.join(",")));
             continue;
         }
+        // THE CONTINUATION GATE APPLIES TO THIS DOOR TOO (AMUX-3948, closing a
+        // gap AMUX-3946 opened hours earlier).
+        //
+        // `claim_card` swaps todo->doing with a direct SQL CAS, so it never
+        // passes the PATCH gate. A card with no `next_action` was therefore
+        // refused when a lane ran `amux board doing`, and CLAIMED SILENTLY when
+        // auto-pickup did it — same card, same lane, opposite answers, with the
+        // automated path being the permissive one. That is AMUX-3929's shape
+        // exactly: the gate held on the doors I checked and not on the one I
+        // did not.
+        //
+        // Skipping rather than claiming is the honest arm. Pickup's whole
+        // promise is "work it now", and a card that cannot say what to do next
+        // is the one case where that prompt has nothing behind it.
+        //
+        // The skip is RECORDED in the trace, and /api/board/ready counts the
+        // same population as `missing_continuation`, so a lane that goes quiet
+        // because of this can find out why in one request instead of looking
+        // idle for no visible reason.
+        if bs::continuation_required(Some(session))
+            && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
+                != bs::ContinuationVerdict::Ok
+        {
+            skipped.push(format!("{id} has no next_action (continuation gate)"));
+            continue;
+        }
         // Prose fallback fires ONLY when the structured field is empty.
         if row.depends_on.is_empty() {
             let hay = format!("{}\n{}", row.title, blob_desc);
