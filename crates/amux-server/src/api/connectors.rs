@@ -223,7 +223,7 @@ fn provider(id: &str) -> Option<&'static Provider> {
 }
 
 // ---------------------------------------------------------------------------
-// USER-DEFINED CONNECTORS (AMUX-3990)
+// USER-DEFINED CONNECTORS (AMUX-3993)
 //
 // The registry above is a const table, which the module header calls "one row"
 // to add a connector. That row is a CODE EDIT: it needs a rebuild, a commit and
@@ -855,7 +855,7 @@ async fn list() -> Response {
         })
         .collect();
     // DECLARED CONNECTORS, appended to the SAME array with the SAME field shape
-    // (AMUX-3990). One list, two constructors — not a second list with its own
+    // (AMUX-3993). One list, two constructors — not a second list with its own
     // rules, which is the mistake this module's header warns about. The builtin
     // loop above carries Google/Slack-family machinery that a declared row has
     // no equivalent of, which is why the construction differs and the CONTRACT
@@ -933,7 +933,7 @@ async fn list() -> Response {
     .into_response()
 }
 
-/// POST /api/connectors — declare a NEW connector (AMUX-3990).
+/// POST /api/connectors — declare a NEW connector (AMUX-3993).
 ///
 /// Body: `{id,label,kind,category?,key_env?|client_id_env+client_secret_env,
 ///          authorize_url?,token_url?,scopes?,setup_note?,docs?,test_url?}`
@@ -1122,7 +1122,7 @@ async fn delete_connector(Path(id): Path<String>) -> Response {
 /// the response.
 async fn set_credentials(Path(id): Path<String>, Json(body): Json<Value>) -> Response {
     // Resolved through the ONE seam, so a connector declared in the tab accepts
-    // a paste exactly like a builtin does (AMUX-3990). The restriction below is
+    // a paste exactly like a builtin does (AMUX-3993). The restriction below is
     // unchanged and is the security property: a paste for one connector can only
     // write the env keys THAT connector declares, whichever source declared it.
     let Some(d) = def_of(&amux_home(), &id) else {
@@ -1724,7 +1724,7 @@ async fn complete_exchange(
 /// bearer value is NEVER logged — only the provider id, HTTP status and latency
 /// (grep `connector_test`).
 async fn test_connection(Path(id): Path<String>) -> Response {
-    // DECLARED CONNECTORS TEST GENERICALLY (AMUX-3990). The builtin ladder below
+    // DECLARED CONNECTORS TEST GENERICALLY (AMUX-3993). The builtin ladder below
     // branches per `Auth` because each vendor family has its own shape; a row
     // declared in the tab has no such knowledge, so all amux can honestly do is
     // GET the declared test_url with the declared key as a bearer. When no
@@ -2612,7 +2612,7 @@ pub fn callback_routes_with(ctx: Arc<ConnectorsCtx>) -> Router<AppState> {
 mod declared_connector_tests {
     use super::*;
 
-    /// Declaring a connector must not require a rebuild (AMUX-3990).
+    /// Declaring a connector must not require a rebuild (AMUX-3993).
     ///
     /// Before this, the registry was a const table and the module header called
     /// adding a row "trivial" — but it is a code edit, a commit and a deploy

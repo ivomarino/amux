@@ -1111,6 +1111,14 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/board/nudges", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH", "DELETE"] },
+    // The workflow-engine landing (board.rs:80-83) mounted these four and did
+    // not add them here, which is what reddened `rust`. Methods read off the
+    // router, not guessed: capsule/verifications are GET, artifacts is
+    // GET+POST, artifacts/{aid} is PATCH+DELETE.
+    RouteEntry { path: "/api/board/{id}/capsule", methods: &["GET"] },
+    RouteEntry { path: "/api/board/{id}/verifications", methods: &["GET"] },
+    RouteEntry { path: "/api/board/{id}/artifacts", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/board/{id}/artifacts/{aid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/{id}/archive", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/restore", methods: &["POST"] },
     // -- workers (+dead-letters merge)
@@ -1320,7 +1328,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // Connectors (integrations): registry + status, credential paste, OAuth
     // begin/callback, live Test, and the DWD token mint (AMUX-3362). `list` is
     // GET; credentials/auth/test/token are POST; callback is the GET landing.
-    RouteEntry { path: "/api/connectors", methods: &["GET"] },
+    // POST declares a connector at runtime, DELETE forgets one (AMUX-3993).
+    RouteEntry { path: "/api/connectors", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/connectors/{id}", methods: &["DELETE"] },
     RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },
     RouteEntry { path: "/api/connectors/{id}/credentials", methods: &["POST"] },
     RouteEntry { path: "/api/connectors/{id}/auth", methods: &["POST"] },
