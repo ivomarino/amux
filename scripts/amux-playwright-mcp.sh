@@ -46,7 +46,23 @@ CONFIG_FILE="$HOME/.amux/playwright-mcp-config.json"
 CONFIG_ARGS=()
 [ -f "$CONFIG_FILE" ] && CONFIG_ARGS=(--config "$CONFIG_FILE")
 
-exec npx -y @playwright/mcp@latest \
+# PINNED, NOT @latest (AMUX-3989).
+#
+# `@latest` means an upstream lifecycle change lands on this fleet with no amux
+# commit, no review and no way to bisect. Measured 2026-08-31: the npx cache on
+# this box holds 0.0.68 — what the fleet has actually been running — while
+# `@latest` resolves to 0.0.79. Eleven versions of drift waiting for whichever
+# lane next triggered a cold npx, and browser lifecycle is precisely where an
+# upstream change is expensive (see the epic AMUX-3988).
+#
+# Pinned to the version already in service, so this commit changes NOTHING about
+# today's behaviour. That is the point: an upgrade is now a deliberate one-line
+# commit somebody reviews, rather than a side effect of when a cache expired.
+#
+# To upgrade: bump the version here, restart one instance, verify, then the rest.
+PLAYWRIGHT_MCP_VERSION="${AMUX_PLAYWRIGHT_MCP_VERSION:-0.0.68}"
+
+exec npx -y "@playwright/mcp@${PLAYWRIGHT_MCP_VERSION}" \
   --port "$PORT" \
   --user-data-dir "$PROFILE" \
   --host 0.0.0.0 \

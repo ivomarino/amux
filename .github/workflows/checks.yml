@@ -346,6 +346,12 @@ jobs:
           # is the control that keeps A honest (agreement must stay silent and
           # green), and F separates a genuine `0 started` from a failed parse.
           ./scripts/test-fleet-boot-divergence.sh
+          # AMUX-3989: the playwright-mcp wrapper must name a VERSION. `@latest`
+          # put an upstream release on the fleet with no amux commit behind it —
+          # measured 08-31, the npx cache held 0.0.68 while @latest resolved to
+          # 0.0.79. Pure text inspection of the shipped script: no network, no
+          # npx, no browser, so it answers the same on a laptop and a runner.
+          ./scripts/test-playwright-mcp-pin.sh
           # AMUX-3782: a GRAFTED commit must be as attributable as a committed
           # one. Cell B is the control — every other cell asserts a trailer is
           # present, so without B a version that stamped nothing would pass.
