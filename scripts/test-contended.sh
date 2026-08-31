@@ -49,8 +49,37 @@ trap 'kill "$SAMPLER" 2>/dev/null; rm -f "$FLAG"' EXIT INT TERM
 
 sample & SAMPLER=$!
 
+# THE SECOND WAY A PEER REDDENS YOUR SUITE (AF-356).
+#
+# The builder is one of TWO causes and this wrapper only ever measured that one,
+# so its clean verdict ("NOT build contention") read as "therefore your bug". The
+# other cause is a peer's UNCOMMITTED SOURCE sitting in the shared worktree: cargo
+# compiles the tree, not your commit, so their half-finished edit fails a test in a
+# module you never opened, and it passes on a rerun after they finish. Identical
+# symptom to ETXTBSY, and nothing distinguished them.
+#
+# Measured live 2026-08-31: `amux` ran the suite and got one failure in
+# `gate_table_matches_python`, which they had not touched. They read this
+# wrapper's clean verdict, concluded ETXTBSY, and carried that into a
+# verification request as its stated weakest evidence line. The real cause was my
+# uncommitted `ItemType::Decision` in the shared tree. Both of us were reasoning
+# from an instrument that answered a narrower question than the sentence it printed.
+#
+# Captured BEFORE and AFTER, because a tree that CHANGED under the compile is the
+# strongest form of the signal and a single snapshot cannot see it.
+#
+# Deliberately NOT attributed to a lane. Owner-by-mtime is the inference that has
+# been wrong repeatedly on this checkout (AF-179, AMUX-3662, where a lane's own
+# writes read as a phantom co-editor), and a confident wrong owner is worse than a
+# named file with no owner. The file names are what a reader needs; they can tell
+# in one second whether a path is theirs.
+dirty_now() { git status --porcelain --untracked-files=no 2>/dev/null | awk '{print $NF}' | sort; }
+DIRTY_BEFORE=$(dirty_now)
+
 cargo test "$@"
 RC=$?
+
+DIRTY_AFTER=$(dirty_now)
 
 kill "$SAMPLER" 2>/dev/null
 wait "$SAMPLER" 2>/dev/null
@@ -98,6 +127,34 @@ else
   echo "contention: THAT IS THE ONLY THING RULED OUT. Host pressure still fails tests that"
   echo "contention: start workers — check the failure body for a 503 admission refusal"
   echo "contention: before reading a red as a regression."
+fi
+
+# THE WORKTREE CLAUSE — printed on BOTH arms, never only the clean one.
+#
+# A caveat that lives inside one branch is a caveat the other branch's reader
+# never sees (ethos rule 1: a statement about a whole set belongs at the top
+# level, not inside one arm). A dirty tree explains a red just as well when the
+# builder WAS running, and reading only the ETXTBSY note would stop the search
+# one cause short.
+if [ -n "$DIRTY_BEFORE" ] || [ -n "$DIRTY_AFTER" ]; then
+  n_before=$(printf '%s\n' "$DIRTY_BEFORE" | grep -c . || true)
+  n_after=$(printf '%s\n' "$DIRTY_AFTER" | grep -c . || true)
+  echo "worktree:  $n_before uncommitted file(s) at start, $n_after at end."
+  if [ "$DIRTY_BEFORE" != "$DIRTY_AFTER" ]; then
+    echo "worktree:  THE TREE CHANGED DURING THIS RUN. cargo compiled the worktree, not"
+    echo "worktree:  your commit, so a file that moved under the compile can fail a test"
+    echo "worktree:  in a module you never opened. This is the strongest form of the signal."
+    printf '%s\n%s\n' "$DIRTY_BEFORE" "$DIRTY_AFTER" | sort -u | sed 's/^/worktree:    /'
+  else
+    printf '%s\n' "$DIRTY_AFTER" | sed 's/^/worktree:    /'
+  fi
+  echo "worktree:  Any of these — yours OR a peer's — can redden a module you did not"
+  echo "worktree:  touch. Owner is NOT inferred here: mtime-based attribution has been"
+  echo "worktree:  wrong on this checkout before (AF-179), and a confident wrong owner is"
+  echo "worktree:  worse than a named file with none. You can tell which are yours."
+else
+  echo "worktree:  clean at start and end, so no peer's uncommitted source was in this"
+  echo "worktree:  build. Stated because a silent probe and a clean tree look identical."
 fi
 
 exit "$RC"

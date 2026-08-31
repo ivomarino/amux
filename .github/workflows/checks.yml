@@ -192,6 +192,16 @@ jobs:
         run: |
           set -uo pipefail
           ./scripts/test-send-time-stamp.sh
+      # AF-356. The contention wrapper measured ONE of the two ways a peer
+      # reddens your suite. Its clean verdict ("NOT build contention") read as
+      # "therefore your bug", while a peer's uncommitted source in the shared
+      # worktree produces the identical symptom. Cell (c2) is the load-bearing
+      # one: the worktree clause must print on the BUILDER arm too, since a
+      # caveat inside one branch is one the other branch's reader never sees.
+      - name: the contention wrapper reports the worktree, on both arms (AF-356)
+        run: |
+          set -uo pipefail
+          ./scripts/test-contended-worktree.sh
       # AF-342. The staged-guard's SERVER decision has unit tests in
       # git_guard.rs; what a lane actually experiences is what the hook prints,
       # and that half had none. The defect was purely printing volume (93

@@ -1952,7 +1952,7 @@ THE SHAPE, which is the reusable part: a cell that reads the ambient environment
 ## test-contended.sh rules out the builder, so its green verdict reads as "therefore your bug"
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-31
 SESSION: amux-frustrations (diagnosed), amux (paid the cost)
 CARD: AF-356
@@ -1980,6 +1980,16 @@ FIX: The wrapper already answers "was the builder rebuilding". Have it also answ
   two facts instead of one, and the missing clause stops being invisible. Ethos rule 4:
   the output that can read "clean" must publish whether it measured the thing at all,
   and this one measures one of two causes while its sentence implies both.
+FIXED 2026-08-31 in the commit naming AF-356. The wrapper now captures the dirty set
+  BEFORE and AFTER the run and prints it beside the verdict, on BOTH arms. The
+  before/after pair is the strongest form: a tree that CHANGED under the compile is
+  the case a single snapshot cannot see. It deliberately does NOT attribute an owner,
+  because mtime attribution has been wrong on this checkout repeatedly (AF-179,
+  AMUX-3662) and a confident wrong owner is worse than a named file with none. Clean
+  is STATED rather than left silent, since a silent probe and a clean tree are
+  otherwise the same output. scripts/test-contended-worktree.sh, 7 cells, wired into
+  CI; the mutation that writes it the obvious wrong way (clause inside the clean arm
+  only) fails exactly (c2) and (d).
 
 ---
 ## A peer's `git add` swept a migration DELETION into an SEO commit
