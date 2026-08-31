@@ -433,6 +433,27 @@ pub const CONTINUATION_REQUIRED_KEY: &str = "AMUX_CONTINUATION_REQUIRED";
 /// first and eats it, per the dogfooding rule, and the default flips once there
 /// is a measurement rather than a guess about what it costs.
 ///
+/// THE MEASUREMENT EXISTS NOW (2026-08-31, AF-355). It says do not flip yet, and
+/// the reason is that the two doors cost different amounts:
+///
+/// * The MANUAL door (`board.rs`, on the transition) costs one extra
+///   `amux board next` per future claim, and nothing up front — cards already in
+///   `doing` are not re-gated. Cheap.
+/// * AUTO-PICKUP (`board_drive.rs`) SKIPS a card whose next_action is not Ok.
+///   Measured across /api/board: 10 of 2042 cards carry a next_action at all,
+///   all ten written by the one lane that has the gate on, and 4 of 1220
+///   pickup-eligible cards would pass. Flipping the default makes pickup skip
+///   ~1216 of 1220 and every lane on the drive loop goes idle.
+///
+/// That circularity is the finding: lanes do not write the field because the gate
+/// is off, and the gate cannot go on until they do. So "just flip it" and "leave
+/// it" are both wrong, and the way through is to turn it on for a few lanes with
+/// active backlogs and measure idle time against a matched set that stays off.
+///
+/// The tempting shortcut — gate the manual door fleet-wide, leave pickup open —
+/// is the same-card-opposite-answers defect that `board_drive.rs`'s own comment
+/// rejects (AMUX-3929's shape). Named here so it is not re-derived.
+///
 /// Structured exactly like `needsyou_ask_required` so the two cannot drift:
 /// env var wins, then the per-lane scoped setting. Only the DEFAULT differs,
 /// and it differs on purpose.
