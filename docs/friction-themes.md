@@ -110,9 +110,9 @@ live and is currently faster on the Mixpeek side.
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-31
-OCCURRENCES: 2
-LAST_SEEN_NOTE: re-measured 2026-08-31
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 3
+LAST_SEEN_NOTE: re-measured 2026-09-01, and it is GROWING
 SIGNALS: board-resting:*:needsyou
 FIX_SITE: board status gate; `needsyou` requires a typed `--ask`
 CARDS: AF-318
@@ -137,6 +137,12 @@ One datapoint from this lane on the other side of it: four cards in this lane's 
 question asked four times. Consolidating them to a single card is the per-lane
 version of what the gate does globally.
 
+Re-measured 2026-09-01: Mixpeek `needsyou` is 313 cards, median age 17.0 days,
+70% over a week old, oldest 60.9 days, and +93 against the 220 open seven days
+ago. It is not resting, it is GROWING at roughly 13 cards a day. The typed-ask
+schema reached that board (see above) and the gate still has not, so the queue
+keeps taking cards that ask nobody anything.
+
 ## Nudging is the dominant channel and the loop has no negative feedback
 SCOPE: both
 STATUS: open
@@ -160,24 +166,46 @@ a day is the argument that AF-319 is a mechanism fix, not a wording fix.
 
 ## Verification is something Ethan has to demand, every single time
 SCOPE: both
-STATUS: absorbed
+STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-30
-OCCURRENCES: 2
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 3
 SIGNALS: rule-restatement:verification, rule-restatement:evidence
-FIX_SITE: VERIFY.md per repo + evidence required on `done` (shipped for amux)
-CARDS: AF-321
+FIX_SITE: NOT prose. A push: nothing routes a `done` card to a verifier, so the
+author has to remember to ask. See AF-393.
+CARDS: AF-321, AF-393
 EVIDENCE: he re-dictated what verification means 7 times in 34 hours. The gate
 now refuses `done` without evidence in amux. Mixpeek has no equivalent gate, so
 watch whether the restatements migrate there. The class was still active on
 2026-08-30 with 4 hits, all Mixpeek-side.
+STATUS MOVED BACK TO open ON 2026-09-01, and that is the finding rather than a
+bookkeeping change. The theme was marked `absorbed` on 2026-08-30 because the
+prose and the amux evidence gate shipped. The next measurement is
+`rule-restatement:verification` n=16 against a 3.46/day baseline: FOUR AND A HALF
+TIMES it, the highest reading this file has recorded for any class, and it went up
+AFTER absorption. 10 of 16 Mixpeek, 3 amux, 3 other, so it is not one repo's gap.
+The file's own warning about `absorbed` ("nine of the ten themes existed as correct
+prose BEFORE they were measured, and the prose lost") is now measured on itself.
+WHAT THE EVIDENCE SAYS THE MECHANISM IS. Ethan names it himself in MSG-37657:
+"figure out why this wasn't automatically verified as part of the board gate". The
+gate is not the missing piece and adding prose is not either. Measured across the
+fleet the same day: 2260 cards are `verified`, so the gate is satisfiable at scale,
+and tubescience runs 95% verified across 619 of them. The distribution is bimodal,
+not low: amux-cloud 75%, amux-gtm 64%, amux-homepage 39%, amux-frustrations 16%,
+amux 3%, all under the SAME group gate. The lanes with huge `done` piles are the
+ones that never ASK a peer, and nothing in the system asks for them. Verification
+is pull-only; every hit above is Ethan doing the routing by hand.
+Confirmed from the inside on 2026-09-01: this lane sent two verification requests
+carrying the reproduce command, the expected output and a mutation to run. Six
+cards cleared in one round trip, by amux-cloud and amux-homepage, both of whom had
+spare capacity the whole time. The ask was the only missing step.
 
 ## Access and credential gaps surface mid-task, never before
 SCOPE: both
 STATUS: open
 FIRST_SEEN: 2026-08-29
-LAST_SEEN: 2026-08-31
-OCCURRENCES: 1
+LAST_SEEN: 2026-09-01
+OCCURRENCES: 2
 SIGNALS: rule-restatement:permissions, ledger-cluster:auth-secrets
 FIX_SITE: a preflight that names required credentials before a lane starts
 CARDS: AF-372
@@ -191,6 +219,13 @@ CLAUDE.md. Specimens are mid-task every time, which is the whole shape: "use amu
 connector for gmail access and granola" (hoichoi, 11:00) arrives when the work is
 already underway, not before it. Carded as AF-372 rather than written as more
 prose, because two files already say it and the signal is at 6.5x anyway.
+
+Re-measured 2026-09-01: `rule-restatement:permissions` fired 4 times against a
+0.85/day baseline, 4.7x, spanning both repos (2 amux / 1 mixpeek / 1 other). Every
+specimen is mid-task again, and two of the four are the SAME session asking twice
+in 54 minutes (MSG-37628 07:34, MSG-37678 08:28), the second one asking for the
+list to be written into a README so a human can enable them up front. That is the
+preflight this theme has been asking for, requested by Ethan in his own words.
 
 ## Instruments that lie: the single largest cluster in either ledger
 SCOPE: both

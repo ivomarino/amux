@@ -127,7 +127,24 @@ RULE_CLASSES = [
      r"permission|credential|settings\.json"),
     ("deploy-live", r"\bdeploy(?:ed)?\b|\bship(?:ped)?\b|\bis it live\b|\bpush(?:ed)? to (?:main|prod)\b|\brollout\b",
      r"deploy|/health|builder"),
-    ("attribution", r"\battribut|\bwho (?:did|wrote|sent)\b|\bwhich session\b|\borigin\b|\bblame\b",
+    # ATTRIBUTION MEANS THE SESSION/GIT SENSE, NOT THE MARKETING ONE (AF-392).
+    # The bare `\battribut` and `\borigin\b` arms scored 3 of 3 hits on
+    # 2026-09-01 that had nothing to do with who edited a file: "measurement
+    # attribution" for GTM playbooks, "attribute meta-properties to each email",
+    # and a deep-dive asking for "proper attribution" of worker schedules. n=3
+    # against a 0.15/day baseline read as a 20x spike and was entirely noise,
+    # which is the dangerous direction: a signal that manufactures an alarm.
+    #
+    # So `attribut` now has to co-occur with a word from the class it belongs to,
+    # and the specific arms carry the rest. Measured against those three messages
+    # and four constructed true positives: the false positives all drop, and TWO
+    # true positives the old pattern MISSED now match (`X-Amux-Session` and
+    # `misattributed`). Tightening it made it more sensitive, not less.
+    ("attribution",
+     r"(?s)(?:(?=.*\b(?:session|lane|worker|commit|author|git|blame|provenance)\b)\battribut)"
+     r"|\bmisattribut|\bwho (?:did|wrote|sent|edited|committed)\b|\bwhich session\b"
+     r"|\bX-Amux-Session\b|\bblame(?:d|s)?\b|\bprovenance\b|\bwrong (?:owner|author|session|lane)\b"
+     r"|\borigin[- ]stamp",
      r"attribut|X-Amux-Session|origin"),
     ("autonomy", r"\bdon'?t ask\b|\byou have my authority\b|\bjust do it\b|\bstop asking\b|\bdo whatever you think\b|\byou don'?t need me\b",
      r"authority|act, then report|standing authority"),

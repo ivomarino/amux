@@ -239,6 +239,44 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Cell H: "attribution" in the MARKETING sense must not score the session class
+# (AF-392). Cell E covers a word appearing only in PASTED CONTEXT; this is the
+# other miss, where Ethan writes the word himself in a different domain. Three of
+# three hits on 2026-09-01 were GTM measurement attribution, and n=3 against a
+# 0.15/day baseline read as a 20x spike that was entirely noise.
+#
+# Pins BOTH directions against the SHIPPED pattern, because a fix that simply
+# stopped matching would satisfy the first half alone.
+# ---------------------------------------------------------------------------
+if python3 - "$(pwd)/scripts/friction_themes.py" <<'ATTRPY'
+import importlib.util, re, sys
+spec = importlib.util.spec_from_file_location("ft", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+pat = dict((k, p) for k, p, _ in m.RULE_CLASSES)["attribution"]
+rx = re.compile(pat, re.I)
+
+marketing = [
+    "go thru our gtm playbooks and tickers and make sure we have measurement attribution",
+    "we should also have the ability to attribute some kind of meta-properties to each email",
+]
+session = [
+    "the staged-guard named the wrong session as the editor, fix the attribution",
+    "who wrote this file? the blame says one thing and the record says another",
+    "every write should carry X-Amux-Session so the audit trail names who made it",
+    "this misattributed my commit to another lane",
+]
+for t in marketing:
+    assert not rx.search(t), "marketing sense scored the session class: " + t
+for t in session:
+    assert rx.search(t), "a real attribution restatement stopped matching: " + t
+ATTRPY
+then
+  ok "H: marketing 'attribution' does not score the session class, and real ones still do"
+else
+  bad "H: the attribution class no longer discriminates the marketing sense from the session one"
+fi
+
+# ---------------------------------------------------------------------------
 # Cell D: `continue` is fleet operation, not a rule restatement.
 # ---------------------------------------------------------------------------
 if echo "$OUT" | python3 -c "
