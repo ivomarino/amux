@@ -300,6 +300,18 @@ that it now works.
 
 ## Telegram
 
+> **NOT LIVE ON THIS SERVER YET.** Telegram is still open PR #170 as of
+> 2026-09-01, and none of the routes below are in the running route table:
+> `/api/telegram/status`, `/api/telegram/send`, `/api/telegram/mappings`,
+> `/api/connectors/telegram/credentials` all answer 404 today. Verified against
+> `GET /api/debug/routes` (318 routes) rather than assumed.
+>
+> This section belongs with the three in "Not yet deployed" above and escaped
+> that list; the note there even cites the "Gmail/Telegram pattern" as though
+> Telegram had shipped. Read everything below as the shape it WILL have, and
+> promote it into a real section when #170 lands rather than deleting this
+> banner, exactly as that section instructs.
+
 Bot connector — **inbound** via long-polling
 (`runtime_jobs::telegram_poll`; `GET /api/telegram/status` reports
 last-poll time/error and routing counts), **outbound** via
