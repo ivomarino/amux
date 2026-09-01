@@ -57,13 +57,46 @@
 when:
   event: [push, pull_request, manual]
 
+# Found live 2026-09-01, pipeline #1: Woodpecker's DEFAULT checkout path is
+# /woodpecker/src/<forge-url> and its steps used CARGO_TARGET_DIR=/woodpecker/target
+# -- neither matches /build, where Dockerfile.rust-base bakes amux-rust-base's
+# whole warm dependency-compile cache (COPY . . at WORKDIR /build, then
+# `cargo build --release -p amux-server` right there). Mismatched paths meant
+# every pipeline run was recompiling the ENTIRE dependency tree from object-code
+# zero -- the registry-source cache still worked (no re-download), but the
+# expensive part (compiling axum/tokio/reqwest/etc.) was not being reused at
+# all. Pinning the checkout to the SAME path the base image already built at
+# is what makes cargo's own incremental cache (keyed off /build/target's
+# existing .fingerprint/.d files) actually apply -- this is the exact
+# mechanism Dockerfile.rust-base's own header already claims ("a `cargo
+# check` against an already-baked base image completed in 48s") and what the
+# ad-hoc `docker build` verify runs this session actually measured (~110s for
+# check+clippy+test together, vs. a from-scratch compile of the same tree).
+workspace:
+  base: /build
+  path: .
+
+# Shallow clone -- pipeline #1 (the very first real run) sat in the `clone`
+# step alone for 10+ minutes and never reached `check`, consistent with
+# CLAUDE.local.md's own note that this build fleet's `.baar` hosts sit
+# behind a slower/less reliable link than `atlantis`/`home`. A CI check
+# needs the working tree at HEAD, not this repo's full history, so a
+# shallow clone cuts however much of that stall was "transferring commits
+# check/clippy/test will never look at" -- cheap to add, nothing here reads
+# git history.
+clone:
+  git:
+    image: woodpeckerci/plugin-git
+    settings:
+      depth: 1
+
 steps:
   # Cheapest, most-likely-to-fail-fast check first (matches CLAUDE.md's own
   # local ordering: "Syntax gates: cargo check --workspace").
   - name: check
     image: amux-rust-base
     environment:
-      CARGO_TARGET_DIR: /woodpecker/target
+      CARGO_TARGET_DIR: /build/target
     commands:
       - source /root/.cargo/env
       - cargo check --workspace --all-targets
@@ -71,7 +104,7 @@ steps:
   - name: clippy
     image: amux-rust-base
     environment:
-      CARGO_TARGET_DIR: /woodpecker/target
+      CARGO_TARGET_DIR: /build/target
     commands:
       - source /root/.cargo/env
       - cargo clippy --workspace --all-targets -- -D warnings
@@ -81,7 +114,7 @@ steps:
   - name: test
     image: amux-rust-base
     environment:
-      CARGO_TARGET_DIR: /woodpecker/target
+      CARGO_TARGET_DIR: /build/target
     commands:
       - source /root/.cargo/env
       - cargo test -p amux-server --lib
