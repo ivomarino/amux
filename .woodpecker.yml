@@ -57,38 +57,41 @@
 when:
   event: [push, pull_request, manual]
 
-# Found live 2026-09-01, pipeline #1: Woodpecker's DEFAULT checkout path is
-# /woodpecker/src/<forge-url> and its steps used CARGO_TARGET_DIR=/woodpecker/target
-# -- neither matches /build, where Dockerfile.rust-base bakes amux-rust-base's
-# whole warm dependency-compile cache (COPY . . at WORKDIR /build, then
-# `cargo build --release -p amux-server` right there). Mismatched paths meant
-# every pipeline run was recompiling the ENTIRE dependency tree from object-code
-# zero -- the registry-source cache still worked (no re-download), but the
-# expensive part (compiling axum/tokio/reqwest/etc.) was not being reused at
-# all. Pinning the checkout to the SAME path the base image already built at
-# is what makes cargo's own incremental cache (keyed off /build/target's
-# existing .fingerprint/.d files) actually apply -- this is the exact
-# mechanism Dockerfile.rust-base's own header already claims ("a `cargo
-# check` against an already-baked base image completed in 48s") and what the
-# ad-hoc `docker build` verify runs this session actually measured (~110s for
-# check+clippy+test together, vs. a from-scratch compile of the same tree).
-workspace:
-  base: /build
-  path: .
-
-# Shallow clone -- pipeline #1 (the very first real run) sat in the `clone`
-# step alone for 10+ minutes and never reached `check`, consistent with
-# CLAUDE.local.md's own note that this build fleet's `.baar` hosts sit
-# behind a slower/less reliable link than `atlantis`/`home`. A CI check
-# needs the working tree at HEAD, not this repo's full history, so a
-# shallow clone cuts however much of that stall was "transferring commits
-# check/clippy/test will never look at" -- cheap to add, nothing here reads
-# git history.
+# Found live 2026-09-01, pipeline #1: Woodpecker's default checkout path is
+# /woodpecker/src/<forge-url>, while Dockerfile.rust-base bakes
+# amux-rust-base's warm, already-compiled dependency tree at /build/target
+# (COPY . . at WORKDIR /build, then `cargo build --release -p amux-server`
+# right there). Tried a `workspace: {base: /build, path: .}` override to
+# align them -- turned out not to matter and actively broke the clone step
+# (git init landed at /woodpecker/.git regardless of the override; per
+# Woodpecker's own docs, "plugins maintain the workspace base at /woodpecker
+# regardless of custom configuration"). Removed. It doesn't matter because
+# cargo's cache identity for REGISTRY-sourced deps (axum/tokio/reqwest/etc,
+# the expensive 99% of the tree) is keyed by crate name+version+features,
+# not by the local checkout's absolute path -- pointing CARGO_TARGET_DIR at
+# /build/target (below) is sufficient on its own for those to be found and
+# reused. Only amux's OWN crates (path-sourced, so their cache identity DOES
+# include the absolute path) miss the cache and get freshly compiled every
+# run -- which they need to be anyway, since their source changes every
+# commit, and they're a small fraction of total build time.
+#
+# Shallow, non-partial clone -- pipeline #1 sat in `clone` alone for 10+
+# minutes (consistent with CLAUDE.local.md's note that this build fleet's
+# `.baar` hosts sit behind a slower/less reliable link than
+# `atlantis`/`home`); pipeline #2's plain `depth: 1` used a partial
+# (`--filter=tree:0`) fetch by default, which then needs a SECOND
+# lazy-fetch round-trip for tree objects on `git reset --hard` -- that
+# second round-trip is what actually failed ("could not fetch ... from
+# promisor remote", RPC timeout, confirmed live from pipeline #2's log).
+# `partial: false` fetches everything in the one shallow request instead of
+# a two-phase dance, trading a bit more upfront data for one fewer
+# round-trip to time out on.
 clone:
   git:
     image: woodpeckerci/plugin-git
     settings:
       depth: 1
+      partial: false
 
 steps:
   # Cheapest, most-likely-to-fail-fast check first (matches CLAUDE.md's own
