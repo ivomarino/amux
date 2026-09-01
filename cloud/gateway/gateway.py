@@ -26,6 +26,21 @@ STRIPE_PRO_PRICE_ID     = os.environ.get("STRIPE_PRO_PRICE_ID", "")      # month
 STRIPE_ANNUAL_PRICE_ID  = os.environ.get("STRIPE_ANNUAL_PRICE_ID", "")   # annual
 STRIPE_PLATFORM_FEE_PRICE_ID = os.environ.get("STRIPE_PLATFORM_FEE_PRICE_ID", "")  # one-time onboarding fee
 STRIPE_PLATFORM_PRICE_ID = os.environ.get("STRIPE_PLATFORM_PRICE_ID", "")          # $5k/mo platform plan (the only plan shown)
+# NEVER PROVISION the ids in PROVISION_DENYLIST (SP-615 / MF-816). A conceded
+# fraud dispute means the customer is being made whole via the chargeback, so
+# provisioning Pro on their account — no matter what a webhook replays or an
+# invoice re-sends — is the worst-ordered outcome (compute granted to an account
+# we just refunded for fraud). Matched against the event's customer id AND its
+# client_reference_id / org id, because a checkout keys on the ref and
+# invoice.paid keys on the customer. A denied provision logs loudly; the
+# downgrade branches are unaffected (setting free is always safe).
+#
+# The VALUES are customer PII (Stripe customer/sub ids, an internal user id) and
+# this repo is PUBLIC, so they live ONLY in the host gateway.env as
+# PROVISION_DENYLIST=cus_x,user_y,sub_z — never hardcoded here. Empty default
+# means the committed code denies no one; the host env is the source of truth.
+PROVISION_DENYLIST = set(filter(None,
+    os.environ.get("PROVISION_DENYLIST", "").replace(" ", "").split(",")))
 TRIAL_DAYS              = int(os.environ.get("TRIAL_DAYS", "7"))
 TRIAL_BUDGET_USD        = float(os.environ.get("TRIAL_BUDGET_USD", "5"))  # default spend cap for provisioned trials
 REFERRAL_BONUS_DAYS     = int(os.environ.get("REFERRAL_BONUS_DAYS", "7"))
@@ -2171,16 +2186,28 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 import stripe
                 stripe.api_key = STRIPE_SECRET_KEY
-                event = stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
+                # construct_event does ONE job here: verify the signature. It raises
+                # on a bad signature -> 400. We do NOT read fields off its return
+                # value: stripe>=8 returns StripeObjects whose `.get()` raises
+                # AttributeError('get') and whose dict() raises KeyError, which
+                # crashed the handler on EVERY real event (SP-615 — the webhook was
+                # never wired until now, so it never surfaced; wiring it alone would
+                # have provisioned NOBODY). Read fields off the raw JSON instead.
+                stripe.Webhook.construct_event(payload, sig, STRIPE_WEBHOOK_SECRET)
             except Exception as e:
                 return self._json({"error": f"webhook verify failed: {e}"}, 400)
             db = get_db()
+            event = json.loads(payload)            # plain dict — safe .get() below
             etype = event["type"]
             obj = event["data"]["object"]
             if etype == "checkout.session.completed":
                 cust_id = obj.get("customer")
                 ref_id = obj.get("client_reference_id")  # org_id (or legacy user_id)
                 sub_id = obj.get("subscription")
+                if PROVISION_DENYLIST & {cust_id, ref_id, sub_id}:
+                    print(f"[stripe] DENYLIST: refusing to provision ref={ref_id} cust={cust_id} "
+                          f"sub={sub_id} — account is on the no-provision list (conceded dispute, SP-615)", flush=True)
+                    return self._json({"ok": True, "provisioned": False, "reason": "denylist"})
                 if ref_id and cust_id:
                     trial_end = None
                     if sub_id:
@@ -2230,6 +2257,10 @@ class Handler(BaseHTTPRequestHandler):
                         print(f"[stripe] WARN provisioned NOTHING for paid checkout ref={ref_id} cust={cust_id} sub={sub_id} — no orgs row matched directly or via membership/owner; customer CHARGED but on free plan", flush=True)
             elif etype == "invoice.paid":
                 cust_id = obj.get("customer")
+                if cust_id in PROVISION_DENYLIST:
+                    print(f"[stripe] DENYLIST: refusing invoice.paid provision for cust={cust_id} "
+                          f"(conceded dispute, SP-615)", flush=True)
+                    return self._json({"ok": True, "provisioned": False, "reason": "denylist"})
                 if cust_id:
                     with _db_lock:
                         db.execute("UPDATE orgs SET plan='pro' WHERE stripe_customer_id=?", (cust_id,))
