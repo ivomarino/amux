@@ -1906,6 +1906,23 @@ The '$status' transition was NOT applied and the card is unchanged — this is a
 transport failure, not a refused gate. Re-run when the server is back." >&2
     return 1
   fi
+  # SAY WHERE THE TRIGGER WENT (AF-379).
+  #
+  # `--trigger` works: it stores the condition in `source_ref` and stamps
+  # `last_verified_at`. But the success line is about the STATUS ("MR-112 ->
+  # backlog") and never names the field, so a reader who checks reasonably looks
+  # for a key called `trigger`, does not find one, and concludes the payload was
+  # dropped. mvs-research filed exactly that, having verified against a card whose
+  # text WAS stored. My own first probe on this made the same mistake, and so did
+  # my probe on AF-359 an hour earlier.
+  #
+  # A flag whose effect is real and invisible is indistinguishable from one that
+  # was discarded, and the reader pays either way. One line on stderr, so the
+  # captured JSON on stdout is untouched.
+  if [[ -n "${trigger:-}" ]]; then
+    printf '%s\n' "  trigger stored in source_ref (+ last_verified_at). Read it back with:
+      curl -sk \"\$AMUX_URL/api/board/$id\" | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"source_ref\"])'" >&2
+  fi
   printf '%s' "$_tresp"
 }
 
