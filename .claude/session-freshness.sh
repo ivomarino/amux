@@ -384,7 +384,7 @@ fi
 hooks_dir="$(git -C "$REPO" rev-parse --git-path hooks 2>/dev/null || true)"
 case "$hooks_dir" in /*) : ;; ?*) hooks_dir="$REPO/$hooks_dir" ;; esac
 if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
-  stale_hooks=""; any_missing=""; any_older=""
+  stale_hooks=""; any_missing=""; any_older=""; stale_names=""
   for src in "$REPO"/scripts/git-hooks/*; do
     [ -f "$src" ] || continue
     name="$(basename "$src")"
@@ -395,6 +395,7 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
     dst="$hooks_dir/$name"
     if [ ! -e "$dst" ]; then
       stale_hooks="${stale_hooks}${stale_hooks:+, }${name} (MISSING)"
+      stale_names="${stale_names} ${name}"
       any_missing=1
     elif ! diff -q "$src" "$dst" >/dev/null 2>&1; then
       # NAME THE VERSION ON BOTH SIDES when the file carries one. The byte diff
@@ -424,6 +425,7 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
         detail=" (installed carries no GUARD_VERSION; checkout $cv)"; any_older=1
       fi
       stale_hooks="${stale_hooks}${stale_hooks:+, }${name}${detail}"
+      stale_names="${stale_names} ${name}"
     fi
   done
   if [ -n "$stale_hooks" ]; then
@@ -441,6 +443,46 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
     fi
     out+="    ./scripts/install-hooks.sh"$'
 '
+
+    # AF-375, the half of the fix that was still open. This block was already
+    # correct and already printed at the top of the session that shipped TWO
+    # inert edits to `amux-staged-guard`; it was read as boilerplate about files
+    # the reader had not touched. It was right, and it was about somebody else's
+    # problem as far as the reader could tell.
+    #
+    # So cross it with the ONE thing that makes it the reader's problem: does
+    # this session have an edit record for one of the drifting files. That turns
+    # a standing notice into a statement about your own work, which is the whole
+    # difference between a line people skip and a line people act on.
+    #
+    # WHAT THE RECORD CAN AND CANNOT SAY (AMUX-3954). It is `<ts> <session> n=
+    # <count> paths=<names>` with no content hash, so it cannot testify that YOUR
+    # bytes are the difference. It can testify that this session wrote to that
+    # path, which is a claim about your own writes rather than about a peer's,
+    # and that is the weaker claim printed below on purpose. The remedy line
+    # names the falsifiable check rather than asking for trust: grep the
+    # INSTALLED copy, which is the check whose absence let AF-365 close on
+    # evidence that was true of the repo copy only.
+    _oe="${AMUX_OBSERVED_EDITS_LOG:-$HOME/.amux/hooks/state/observed-edits.log}"
+    if [ -n "${AMUX_SESSION:-}" ] && [ -r "$_oe" ]; then
+      _mine=""
+      # Bounded read: this log is megabytes and grows all day, and a SessionStart
+      # hook that scans it whole is a hook someone deletes.
+      _recent="$(tail -n 4000 "$_oe" 2>/dev/null | grep -F " ${AMUX_SESSION} " || true)"
+      for _n in $stale_names; do
+        case "$_recent" in *"git-hooks/$_n"*) _mine="${_mine}${_mine:+, }$_n";; esac
+      done
+      if [ -n "$_mine" ]; then
+        out+="    YOU EDITED THIS SESSION: ${_mine}"$'\n'
+        out+=$'    so do not assume your edit is what runs on commit. This hook ships by COPY,\n'
+        out+=$'    unlike the bash CLI beside it, which ships on save.\n'
+        out+="    check the INSTALLED copy, not the repo one: grep <your string> ${hooks_dir}/<hook>"$'\n'
+      fi
+    else
+      # A silent no is the failure this file exists to prevent: absent record and
+      # "none of these is yours" are different answers (ethos rule 4).
+      out+=$'    (whether one of these is your own edit was NOT checked: no session or no edit record)\n'
+    fi
   fi
 fi
 

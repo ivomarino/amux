@@ -379,7 +379,13 @@ hooks_repo() { # $1 name
     echo seed > seed.txt; git add -A; git commit -qm seed ) >/dev/null 2>&1
   echo "$d/work"
 }
-hooks_run() { ( cd "$1"; AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
+# $2 = AMUX_SESSION, $3 = observed-edits log. BOTH default to empty on purpose:
+# without that, these cases read the developer's real session name and real
+# ~/.amux edit log, and a cell would pass or fail depending on what the host had
+# been editing that afternoon. The suite already made this argument for build
+# provenance; the AF-375 cross-reference needs it for the same reason.
+hooks_run() { ( cd "$1"; AMUX_SESSION="${2-}" AMUX_OBSERVED_EDITS_LOG="${3-}" \
+                        AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
                         bash .claude/session-freshness.sh 2>&1 ); }
 
 # (i) CONTROL — installed hooks identical to the checkout: say NOTHING.
@@ -402,6 +408,50 @@ w=$(hooks_repo hk_missing)
 rm -f "$w/.git/hooks/pre-push"
 out=$(hooks_run "$w")
 says "MISSING" "$out"
+
+# ── AF-375: is one of the drifting hooks a file THIS session edited? ─────────
+#
+# The block above was already correct, already specific, and already printed at
+# the top of the session that shipped two INERT edits to amux-staged-guard. It
+# was read as boilerplate about files the reader had not touched. Nothing on the
+# line said otherwise, because nothing on the line was about the reader.
+#
+# So these three cells pin the cross-reference and, more importantly, its two
+# negative directions: a record belonging to somebody ELSE must not become your
+# name, and a missing record must not read as "none of these is yours".
+MINEMARK="YOU EDITED THIS SESSION"
+
+# (l1) drift AND this session has an edit record for that exact hook.
+w=$(hooks_repo hk_mine)
+printf '#!/bin/sh\n# v0 stale\n' > "$w/.git/hooks/amux-staged-guard"
+printf '%s lane1 n=1 sent paths=scripts/git-hooks/amux-staged-guard\n' "$(date +%s)" > "$TMP/oe-mine.log"
+out=$(hooks_run "$w" lane1 "$TMP/oe-mine.log")
+says "$MINEMARK" "$out"
+says "amux-staged-guard" "$out"
+# The remedy must name the FALSIFIABLE check. AF-365 closed on evidence that was
+# true of the repo copy, so "grep the installed copy" is the sentence that would
+# have caught it, and a reinstall command alone would not have.
+says "check the INSTALLED copy" "$out"
+
+# (l2) drift, and a record exists, but it is ANOTHER lane's. Naming their write
+#      as yours is the AMUX-3662 error rewritten in a friendlier place, and this
+#      record cannot support it: it has no content hash (AMUX-3954), so all it
+#      can ever say is which session wrote to a path.
+w=$(hooks_repo hk_theirs)
+printf '#!/bin/sh\n# v0 stale\n' > "$w/.git/hooks/amux-staged-guard"
+printf '%s lane2 n=1 sent paths=scripts/git-hooks/amux-staged-guard\n' "$(date +%s)" > "$TMP/oe-theirs.log"
+out=$(hooks_run "$w" lane1 "$TMP/oe-theirs.log")
+says "$HOOKMARK" "$out"
+lacks "$MINEMARK" "$out"
+
+# (l3) drift, and NO edit record readable. An absent probe and a probe that ran
+#      and found nothing are different answers, and the silent version of this
+#      is the exact failure the file exists to record (ethos rule 4).
+w=$(hooks_repo hk_norec)
+printf '#!/bin/sh\n# v0 stale\n' > "$w/.git/hooks/amux-staged-guard"
+out=$(hooks_run "$w" lane1 "$TMP/no-such-edit-record.log")
+lacks "$MINEMARK" "$out"
+says "was NOT checked" "$out"
 
 # (l) a file in scripts/git-hooks that install-hooks.sh does NOT install must be
 #     IGNORED. Without this the axis nags forever about something whose printed
