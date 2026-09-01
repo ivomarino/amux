@@ -100,8 +100,39 @@ def field(block, key):
     a comment: nothing about reading the `NOTE-CARD:` line suggests it could
     blank `CARD:` above it, and the tool's only symptom was a correct-sounding
     "no CARD field".
+
+    THE CONTINUATION IS LINE-SHAPED AND ACCEPTS ANY INDENT (AF-387). It used to
+    be `((?:.|\n  )+?)` with a lookahead terminator: one alternation branch for
+    ordinary characters and one for the literal two-space newline. `.` does not
+    cross a newline without re.S, so an entry indenting its continuations by ONE
+    space could not extend the group past its first line, the lookahead then had
+    to match a line starting with a space, it did not, and the whole match
+    failed. Same symptom as above, one width over: the tool said "entry has no
+    SYMPTOM/COST to carry" about an entry that had both.
+
+    Widening that alternation to `\n[ \t]+` fixed the reading and introduced a
+    worse bug: two branches that can both consume the same text, under a `+?`,
+    with a lookahead that fails, is catastrophic backtracking. It hung for over
+    two minutes on the real ledger before it was killed, where the two-space form
+    had been fast only because its second branch almost never matched.
+
+    So the shape changed rather than the width. `(.*(?:\n[ \t]+.*)*)` is a first
+    line plus any number of indented lines, each alternative anchored to a
+    different position, no lookahead, no ambiguity. It needs no terminator
+    because the next field and the next `## ` both start at column zero, which is
+    the property the format already guarantees. Same 65 entries: 0.00s.
+
+    Measured when this was written: 5 of 65 live entries and 2 of 98 archived
+    ones were unreadable this way. The two archived ones had already been retired
+    with their symptom and cost never reaching their cards, so the AF-38
+    guarantee was quietly unmet on those moves exactly as AF-264 found it unmet
+    on every move before it.
+
+    Worth stating as a rule rather than a third patch: a hand-written indent
+    width is a guess about how somebody else formats prose, and every wrong guess
+    fails silently in the direction of "the field is not there".
     """
-    m = re.search(rf"^{key}:\s*((?:.|\n  )+?)(?=\n[A-Z][A-Z_-]*:|\n## |\Z)", block, re.M)
+    m = re.search(rf"^{key}:[ \t]*(.*(?:\n[ \t]+.*)*)", block, re.M)
     return m.group(1).strip() if m else ""
 
 

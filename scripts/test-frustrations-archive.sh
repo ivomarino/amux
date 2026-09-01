@@ -245,5 +245,41 @@ else
 fi
 has "(r2) and an unreachable server is still REPORTED, not swallowed" "NOT carried" "$R/out.txt"
 
+# -- (s) field() reads a continuation at ANY indent width (AF-387) -----------
+#
+# The parser matched continuations with the literal two-space "\n  ". An entry
+# indenting by ONE space could not extend past its first line, the lookahead had
+# to match a line starting with a space, and the whole match failed. field()
+# then returned "" and the caller said "entry has no SYMPTOM/COST to carry"
+# about an entry that had both. 5 of 65 live entries and 2 of 98 archived ones
+# were unreadable that way, and those two had already been retired with nothing
+# reaching their cards.
+#
+# This calls the SHIPPED field() rather than restating its regex, and pins both
+# directions: it must READ the wider set, and the next field must still
+# TERMINATE it. A fix that swallowed the rest of the entry would satisfy the
+# first assertion alone.
+if python3 - "$ARCHIVE_TOOL" <<'FIELDPY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fa", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+
+one = "## t\nCARD: X-9\nSYMPTOM: first line\n second line one-space\nCOST: c\n"
+two = "## t\nCARD: X-9\nSYMPTOM: first line\n  second line two-space\nCOST: c\n"
+tab = "## t\nCARD: X-9\nSYMPTOM: first line\n\ttabbed line\nCOST: c\n"
+
+assert m.field(one, "SYMPTOM").endswith("one-space"), repr(m.field(one, "SYMPTOM"))
+assert m.field(two, "SYMPTOM").endswith("two-space"), repr(m.field(two, "SYMPTOM"))
+assert m.field(tab, "SYMPTOM").endswith("tabbed line"), repr(m.field(tab, "SYMPTOM"))
+
+# TERMINATION, the direction a greedy fix breaks silently.
+assert m.field(one, "COST") == "c", repr(m.field(one, "COST"))
+assert "COST" not in m.field(one, "SYMPTOM"), repr(m.field(one, "SYMPTOM"))
+assert m.field(one, "CARD") == "X-9", repr(m.field(one, "CARD"))
+FIELDPY
+then ok "(s) field() reads one-space, two-space and tab continuations, and still stops at the next field"
+else bad "(s) field() cannot read a continuation at every indent width, or it swallowed the next field"
+fi
+
 printf '\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1
