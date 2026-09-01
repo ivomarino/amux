@@ -8,7 +8,19 @@
   <a href="https://amux.io/changelog/"><img src="https://img.shields.io/badge/changelog-amux.io%2Fchangelog-green?style=flat-square" alt="Changelog"/></a>
 </p>
 
-**amux is a multi-session agent orchestrator.** Run dozens of parallel AI agent workers (Claude Code, Codex, Gemini CLI) from a web dashboard or your phone: a shared kanban board with status gates, schedulers, inter-worker messaging, per-scope memory and environment, browser automation, email, and self-healing recovery. Local-first, self-hosted, SQLite-backed.
+**amux is the open-source control plane for AI coding agents.** Run an AI engineering team: dozens of parallel workers (Claude Code, Codex, Gemini CLI, OpenCode, Ollama) coordinated from one web dashboard or your phone. Local-first, self-hosted, SQLite-backed, one Rust binary.
+
+What the fleet gets that a single agent never had:
+
+- **Atomic tasks**: a shared kanban board where claiming is compare-and-swap, so two workers can never grab the same card; `done` requires evidence, `verified` requires a peer check
+- **Worker awareness**: every worker sees the fleet (who is live, what they own, what they are doing) and can peek into any peer's terminal before interrupting
+- **@ each other**: origin-stamped inter-worker messaging; the server records the true sender, so provenance is a fact rather than a claim
+- **Steering**: type into any running session from the dashboard or phone; redirect mid-task without stopping the run
+- **Schedules & loops**: cron-style recurring prompts (`daily at 9am`, `every 15m`) plus self-pacing autonomous loops for overnight runs
+- **Groups & scope**: workers organize into lanes that share memory, environment, and gates; settings resolve card → worker → group → global
+- **Model switching**: swap the model or provider on a running worker; pick the brain per task, keep the context
+- **Message history**: every prompt, reply, and delivery is a ledger row you can fetch later
+- **Self-healing**: a watchdog that auto-compacts, restarts crashed sessions, and replays the last message
 
 > **[amux.io](https://amux.io)** · [Getting started](https://amux.io/guides/getting-started/) · [FAQ](https://amux.io/faq/) · [Blog](https://amux.io/blog/)
 
@@ -353,5 +365,3 @@ amux is growing into the durable operating system around agents: it owns executi
 - iOS app: [App Store](https://apps.apple.com/us/app/amux-agent-multiplexer/id6760410435) · Managed onboarding: [amux.io/concierge](https://amux.io/concierge/)
 
 If amux saves you time, a ⭐ helps others find it.
-
-[![Star History Chart](https://api.star-history.com/svg?repos=mixpeek/amux&type=Date)](https://star-history.com/#mixpeek/amux&Date)
