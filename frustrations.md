@@ -1370,6 +1370,23 @@ NOTE: this is AMUX-1768's class one layer up. browser.rs:104-113 removed the SER
   The client-side constant survived the fix. Fourth member of the 2026-08-23 misattribution
   cluster with AF-179 and AF-182; the other three name a WRONG owner, which is recoverable, and
   this one names none.
+STATUS-2026-09-01: HALF SHIPPED, and the half that is left is not code. The
+  request-log lookup this entry asks for EXISTS and is wired: api/browser.rs
+  carries `StartOrigin` with three states (Found / NotFound / NotLooked, so "we
+  looked and found nothing" cannot collapse into "we did not look"),
+  `lookup_start_origin` reads client_ip and user_agent off `_amux_request_log`,
+  and the refusal consults it. So the caller now gets "127.0.0.1 + curl/8.7.1" or
+  "100.66.26.84 + Mozilla/5.0 (Macintosh...)" instead of "(unattributed)", which
+  is the discrimination the COST line names: an agent on this box against a human
+  at a browser.
+  The TITLE's claim is still true. `let _bwSession = 'amux';` is live at
+  app.js:34858, so a browser a human opens from the Browser tab is still recorded
+  as owned by the `amux` LANE, and the guard's same-session shortcut still treats
+  that lane's start as the human's own restart. The entry stays open on that
+  clause alone.
+  Not fixable from here without deciding what the dashboard should call itself,
+  which is whose identity it is (ethos rule 8). AF-183 is in `needsyou` with the
+  question in one sentence and a recommendation.
 
 ## A peer's mid-edit fails MY test run, and a rerun is the only way to tell
 AREA: attribution
