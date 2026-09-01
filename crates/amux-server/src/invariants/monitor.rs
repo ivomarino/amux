@@ -188,6 +188,19 @@ pub async fn evaluate_all(state: &AppState) -> Vec<InvariantResult> {
     out.extend(arrival_follows_boot_check(state));
 
     tm.mark(&out, "5b. do the `ts` columns hold what their readers assu");
+    // -- 5c. every registered, non-archived lane actually has a live tmux
+    // session (AMUX-48) — the log-signal half of INIT-1 that was never
+    // shipped. Catches a session dying any way OTHER than the deploy-restart
+    // path INIT-1's KillMode=process already covers (an OOM kill of the
+    // pane, a manual kill, a crash).
+    out.extend(registered_lanes_running_check().await);
+    // -- 5d. did any pane's WHOLE systemd scope just get OOM-killed, not just
+    // a process inside it? (AMUX-70) — the log signal for the incident that
+    // filed this: a local cargo run OOM-killed took the whole interactive
+    // session down with it.
+    out.extend(pane_scope_oom_kill_check().await);
+
+    tm.mark(&out, "5c. every registered, non-archived lane actually has");
     // -- 6. shared-checkout git guard: does the RUNNING hook match its committed
     // source? (AMUX-3033). AF-132: the committed side is read from HEAD at CHECK
     // time — these scripts deploy on COMMIT (install), not on binary rebuild, so
@@ -895,6 +908,64 @@ fn status_pane_check(state: &AppState) -> Vec<InvariantResult> {
     let mut results = checks::status_agrees_with_pane(&lanes);
     results.extend(checks::status_contradicts_fresh_idle_report(&lanes));
     results
+}
+
+/// AMUX-48: every registered, non-archived lane has a live tmux session.
+///
+/// `all_lane_names()` and `is_running()` are the SAME enumeration and the
+/// SAME probe `amux start-all`, the sessions list, and the ghost-rescue
+/// sweep already trust — reused here rather than a bespoke `has-session`
+/// call, so this check cannot disagree with the rest of the system about
+/// what "registered" or "running" means.
+async fn registered_lanes_running_check() -> Vec<InvariantResult> {
+    let names = crate::api::session_verbs::all_lane_names();
+    let mut lanes = Vec::with_capacity(names.len());
+    for name in names {
+        let is_running = crate::api::session_verbs::is_running(&name).await;
+        lanes.push(checks::LaneRunState { name, is_running });
+    }
+    checks::registered_lanes_are_running(&lanes)
+}
+
+/// AMUX-70: has any interactive pane's WHOLE systemd scope been OOM-killed
+/// recently (not merely a process inside it)? Shells out to `journalctl
+/// --user` for the raw lines and hands them to the pure checker
+/// (`checks::no_pane_scope_oom_kills`) — this function owns the ONE bit of
+/// IO, the check owns the logic, matching this file's own separation.
+///
+/// systemd-journal-less environments (macOS dev boxes, some CI) are a real,
+/// expected absence, not a failure — `Unknown` says so honestly rather than
+/// a false-clean `Pass`, per this repo's rule 4 (a probe that never ran must
+/// say so, not read as a quiet window).
+async fn pane_scope_oom_kill_check() -> Vec<InvariantResult> {
+    const ID: &str = "session.pane_scope_not_oom_killed";
+    let window_h: u64 = std::env::var("AMUX_PANE_OOM_WINDOW_H")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(6);
+    let since = format!("-{window_h}h");
+    let output = tokio::process::Command::new("journalctl")
+        .args(["--user", "-q", "--no-pager", "--since", &since])
+        .output()
+        .await;
+    match output {
+        Ok(out) if out.status.success() => {
+            let text = String::from_utf8_lossy(&out.stdout);
+            let lines: Vec<String> = text.lines().map(str::to_string).collect();
+            checks::no_pane_scope_oom_kills(&lines)
+        }
+        Ok(out) => vec![InvariantResult::unknown(
+            ID,
+            format!(
+                "journalctl exited {} — cannot confirm no pane was OOM-killed",
+                out.status
+            ),
+        )],
+        Err(e) => vec![InvariantResult::unknown(
+            ID,
+            format!("journalctl unavailable ({e}) — this host may not run systemd --user"),
+        )],
+    }
 }
 
 /// Is the report control plane UP — are self-reports landing at all?
