@@ -20,11 +20,19 @@
 #
 # No hostnames, no secrets in this file — those live in AMUX_REMOTE_BUILD_HOST
 # (~/.amux/server.env, private/gitignored), this file is in a public repo.
+#
+# python3 is a real runtime test dependency, not a build tool -- 4 tests in
+# api::session_verbs (cr_only_tui_redraws_reach_the_log_without_any_linefeed
+# and siblings) shell out to `python3 -c ...` as a PTY-writer test fixture.
+# Every human dev box already has python3, so this gap was invisible until
+# the first real `cargo test` inside a genuinely minimal container (the
+# Woodpecker pipeline, confirmed live 2026-09-01: 4 failures, all
+# "sh: 1: python3: not found" / BrokenPipe from the same missing writer).
 FROM debian:trixie
 SHELL ["/bin/bash", "-c"]
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl build-essential pkg-config libssl-dev ca-certificates git \
+    curl build-essential pkg-config libssl-dev ca-certificates git python3 \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
