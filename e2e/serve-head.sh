@@ -29,6 +29,26 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # concurrent build WAIT and then find the work done, which is cheap.
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 
+# FLEET ENV MUST NOT LEAK INTO THE THROWAWAY HOME (AC-404). Every fleet session
+# exports the shared ~/.amux/server.env into its shell (AMUX_TASK_GUARD=1 among
+# others), and the server's effective_env() falls back to the PROCESS env for any
+# key the throwaway home's server.env does not set. So a "fresh" e2e server
+# inherited the fleet's behavior toggles: settings_task_guard asserts default-OFF,
+# read ON, and reds LOCALLY for every session on this box while clean-env CI
+# passes — a red indistinguishable from a code regression (2026-09-01, found
+# during AC-403's sweep). Keep only what this harness is parameterized by:
+# AMUX_HOME + AMUX_RS_PORT (per-project, from playwright.config.ts),
+# AMUX_NO_SELF_ADOPT (pinned below), and the AMUX_E2E_* opts. Announce the rest
+# by name, since a scrub nobody can see is indistinguishable from no scrub.
+_scrubbed=""
+for _k in ${!AMUX_@}; do
+  case "$_k" in
+    AMUX_HOME|AMUX_RS_PORT|AMUX_NO_SELF_ADOPT|AMUX_E2E_*) ;;
+    *) unset "$_k"; _scrubbed="$_scrubbed $_k" ;;
+  esac
+done
+[ -n "$_scrubbed" ] && echo "[e2e] ENV: scrubbed fleet vars:$_scrubbed (a throwaway home must not inherit fleet toggles)"
+
 # AEAB-52. THIS SCRIPT EXISTS TO PIN A SPECIFIC BUILD, so a server that hot-swaps
 # itself mid-suite is running a different binary from the one the suite chose.
 #
