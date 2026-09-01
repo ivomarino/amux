@@ -171,8 +171,9 @@ FIRST_SEEN: 2026-08-29
 LAST_SEEN: 2026-09-01
 OCCURRENCES: 3
 SIGNALS: rule-restatement:verification, rule-restatement:evidence
-FIX_SITE: NOT prose. A push: nothing routes a `done` card to a verifier, so the
-author has to remember to ask. See AF-393.
+FIX_SITE: NOT prose, and NOT a new push either. See AF-393: the push exists and is
+unused. The likely fix is that `verified` should WRITE the peer into the `reviewer`
+field, so the gate's own "name them" criterion becomes queryable.
 CARDS: AF-321, AF-393
 EVIDENCE: he re-dictated what verification means 7 times in 34 hours. The gate
 now refuses `done` without evidence in amux. Mixpeek has no equivalent gate, so
@@ -199,6 +200,25 @@ Confirmed from the inside on 2026-09-01: this lane sent two verification request
 carrying the reproduce command, the expected output and a mutation to run. Six
 cards cleared in one round trip, by amux-cloud and amux-homepage, both of whom had
 spare capacity the whole time. The ask was the only missing step.
+
+CORRECTED SAME DAY, 2026-09-01, and the correction is the more useful finding.
+This theme's first version said "nothing routes a done card to a verifier". Wrong:
+`reviewer` is a real field with a real push behind it, `reviewer_notify` in
+board.rs and a reviewer nudge in board_drive.rs firing on `status == review AND
+reviewer == you`. Measured across the whole board:
+
+  done      2483 cards,  225 with a reviewer named   ( 9%)
+  verified  2271 cards,  233 with a reviewer named   (10%)
+  review      32 cards,    4 with a reviewer named   (12%)
+
+The mechanism is built, wired and unused. 2038 of 2271 cards reached `verified`
+without ever naming a reviewer, and only 32 cards are in `review` at all.
+So the defect is one layer over: the verified gate's own criterion is "Peer-reviewed
+by a DIFFERENT worker (NAME THEM)", and 90% name them only in free-text evidence.
+The board cannot answer "who verified this?" as data, which makes every
+verification ratio in this file uncheckable, including the ones above. That is
+ethos rule 4 inside the gate that exists to enforce evidence: the answer is
+required, supplied, and stored where nothing can read it.
 
 ## Access and credential gaps surface mid-task, never before
 SCOPE: both
