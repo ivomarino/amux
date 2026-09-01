@@ -305,6 +305,51 @@ async function toggleAutofix(checked) {
 // dropping the server-resolved --model (passing `flags` at create would replace
 // it). Default OFF: skipping permission prompts is opt-in, per worker or globally.
 let _yoloDefault = false;
+// FLEET-WIDE cross-group default (AMUX-4018). Writes the GLOBAL env layer, which
+// `cross_group_send_ok` resolves at worker > group > global — so a per-worker
+// setting still wins and this is genuinely a default rather than an override.
+//
+// No X-Amux-Session header: the server refuses this write from a worker origin,
+// because a session that could set it would be granting itself and every peer a
+// standing cross-group channel.
+async function toggleCrossGroupDefault(checked) {
+  const note = document.getElementById('crossgroup-default-note');
+  try {
+    const r = await fetch(API + '/api/config/cross-group', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ allow: checked ? '*' : '' }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) {
+      showToast(d.error || 'could not save');
+      const cb = document.getElementById('crossgroup-default-checkbox');
+      if (cb) cb.checked = !checked;      // put the switch back
+      return;
+    }
+    showToast(d.message || (checked ? 'Cross-group messaging on' : 'Cross-group messaging off'));
+    if (note && d.gate_enforcing === false) {
+      note.textContent = 'Note: AMUX_GROUP_SEND_ENFORCE is off, so all cross-group sends pass regardless of this switch.';
+    }
+  } catch (e) { showToast('failed: ' + String(e)); }
+}
+
+(async function initCrossGroupDefault() {
+  try {
+    const r = await fetch(API + '/api/config/cross-group', { headers: _authHeaders() });
+    const d = await r.json();
+    const cb = document.getElementById('crossgroup-default-checkbox');
+    if (cb) cb.checked = !!d.enabled;
+    // SAY IT OUT LOUD when the gate is not enforcing at all. Otherwise an
+    // operator reads an OFF switch as a closed door that is not there.
+    const note = document.getElementById('crossgroup-default-note');
+    if (note && d.gate_enforcing === false) {
+      note.textContent = 'AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this switch.';
+      note.style.color = '#b8860b';
+    }
+  } catch (e) {}
+})();
+
 async function toggleYoloDefault(checked) {
   _yoloDefault = !!checked;
   await fetch('/api/prefs', {
@@ -8327,7 +8372,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.770';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.771';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

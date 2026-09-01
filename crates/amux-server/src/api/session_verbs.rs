@@ -11027,6 +11027,9 @@ pub async fn steer_deliver_loop(state: AppState) {
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        // Fleet-wide cross-group default (AMUX-4018). GET is open; PUT is
+        // owner-only, enforced in the handler.
+        .route("/api/config/cross-group", axum::routing::get(get_cross_group_config).put(put_cross_group_config))
         .route("/api/sessions/{name}", any(session_root_handler))
         // A WARN nobody can query is the same gap one layer out: this is
         // where a sweep or an autofix loop asks "did anything get delivered
@@ -12880,6 +12883,87 @@ fn cross_group_send_ok(origin: &str, target: &str) -> Result<&'static str, Strin
          bare desc PATCH records without notifying).",
         fmt(&og), fmt(&tg)
     ))
+}
+
+/// GET /api/config/cross-group — the FLEET-WIDE default for cross-group sends.
+///
+/// Reports the resolved global value plus whether the gate is enforcing at all,
+/// because those are different facts and only one of them is a policy choice:
+/// `AMUX_GROUP_SEND_ENFORCE=0` switches the whole gate OFF, which also disables
+/// the isolated-target protection and stops emitting the refusal events. A
+/// global allowance leaves the gate running and simply grants every lane, so
+/// isolation still holds and every crossing is still auditable. The UI offers
+/// the second; this endpoint reports both so an operator can see when the first
+/// one is what is really in effect.
+async fn get_cross_group_config() -> Response {
+    let home = crate::config::amux_home();
+    let global = crate::config::parse_env_file(&home.join("amux.env"))
+        .get("CC_SEND_ALLOW")
+        .map(|v| v.trim().trim_matches('"').to_string())
+        .unwrap_or_default();
+    let enforcing = std::env::var("AMUX_GROUP_SEND_ENFORCE")
+        .map(|v| !matches!(v.trim(), "0" | "false" | "no"))
+        .unwrap_or(true);
+    j200(json!({
+        "default_allow": global,
+        "enabled": !global.is_empty(),
+        // Named separately and never folded into `enabled`: a reader who turns
+        // the toggle off while enforcement is disabled would otherwise believe
+        // they had closed a door that is not there.
+        "gate_enforcing": enforcing,
+        "note": if enforcing {
+            "the gate is active; this default grants every worker a standing allowance"
+        } else {
+            "AMUX_GROUP_SEND_ENFORCE is off, so ALL cross-group sends pass regardless of this setting"
+        },
+    }))
+}
+
+/// PUT /api/config/cross-group — set the fleet-wide default.
+///
+/// OWNER ONLY, the same rule `/api/scope` applies to its global layer: a session
+/// that could write this could grant ITSELF and every peer a standing
+/// cross-group channel, which is the escalation the scope policy exists to stop.
+/// A request carrying no worker origin is the dashboard.
+async fn put_cross_group_config(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
+    if ["x-amux-session", "x-amux-worker"].iter().any(|h| {
+        headers.get(*h).and_then(|v| v.to_str().ok()).is_some_and(|s| !s.trim().is_empty())
+    }) {
+        return jresp(StatusCode::FORBIDDEN, json!({
+            "error": "a worker may not set the fleet-wide cross-group default",
+            "why": "this grants EVERY lane a standing allowance, so a session writing it \
+                    would be granting itself and its peers new capability. Same rule \
+                    /api/scope applies to the global layer.",
+            "how": "set it from the dashboard, or per worker via PATCH /api/sessions/{name}/config",
+        }));
+    }
+    let b = body.map(|Json(v)| v).unwrap_or(Value::Null);
+    let allow = b.get("allow").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    let home = crate::config::amux_home();
+    let f = home.join("amux.env");
+    let mut cfg = EnvFile::load(&f);
+    cfg.set("CC_SEND_ALLOW", &allow);
+    if cfg.write(&f).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write amux.env"}));
+    }
+    tracing::warn!(
+        default_allow = %allow,
+        "config: FLEET-WIDE cross-group default changed (global CC_SEND_ALLOW)"
+    );
+    j200(json!({
+        "ok": true,
+        "default_allow": allow,
+        "enabled": !allow.is_empty(),
+        // A worker-level value still overrides this, so the honest message says
+        // "default" rather than implying it settles every lane.
+        "message": if allow.is_empty() {
+            "cross-group sends are refused by default again; per-worker allowances still apply"
+        } else if allow == "*" {
+            "every worker may now send to any group by default, no approval needed"
+        } else {
+            "workers may now send to the listed groups by default"
+        },
+    }))
 }
 
 /// The message id a send answers with (Ethan 2026-08-11: "we should have all

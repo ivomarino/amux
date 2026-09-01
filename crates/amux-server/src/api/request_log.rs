@@ -1330,6 +1330,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // GET; credentials/auth/test/token are POST; callback is the GET landing.
     // POST declares a connector at runtime, DELETE forgets one (AMUX-3993).
     // Owner-approved ad-hoc permission grants (AMUX-3997).
+    RouteEntry { path: "/api/config/cross-group", methods: &["GET", "PUT"] },
     RouteEntry { path: "/api/grants", methods: &["GET"] },
     RouteEntry { path: "/api/grants/{id}/approve", methods: &["POST"] },
     RouteEntry { path: "/api/grants/{id}/reject", methods: &["POST"] },
