@@ -83,6 +83,39 @@
 //! - `unclaimed` — staged, and NO session has an edit record inside the
 //!   window: warned. Not blockable (no owner to defer to) but silence here is
 //!   what let 762e06e sweep a peer's staged work.
+//!
+//! # A CLAIM DOES NOT EXIST UNTIL THE COMMAND THAT MADE IT FINISHES
+//!
+//! Measured 2026-08-30, and worth stating here because it cost two wrong
+//! diagnoses (AMUX-3904, AMUX-3905) before anyone tested it. Claude Code writes
+//! a Bash `tool_use` block to the transcript when the command COMPLETES, not
+//! when it starts. Every claim this module derives from Bash is read out of that
+//! transcript, so a session that writes a file and then asks the guard about it
+//! INSIDE THE SAME COMMAND is asking about a write whose record does not exist
+//! yet, and correctly gets `unclaimed`.
+//!
+//! The probe that shows it, and the reason a reader will otherwise blame the
+//! 30-second `EDIT_CACHE_TTL`:
+//!
+//! ```text
+//! cmd A: write + stage + staged-guard -> unclaimed;  transcript -> 0 records
+//! cmd B: transcript -> 1 record   AND   staged-guard -> claimed   (same instant)
+//! ```
+//!
+//! Cache staleness would have shown the record PRESENT while the verdict still
+//! said unclaimed. It does not; the verdict flips exactly when the record lands.
+//!
+//! THIS IS FAIL-SAFE IN THE FLOW THAT MATTERS, which is why it is documented
+//! rather than fixed. A peer commits in THEIR command, after your writing
+//! command ended, so your record is there by then. The only party whose record
+//! can be missing is the COMMITTER, about their own in-flight command — and a
+//! missing committer record makes `committer_fresher` false, which routes the
+//! path to `foreign` and BLOCKS. The lag errs toward refusing a commit, never
+//! toward sweeping one.
+//!
+//! What it DOES break is a self-query used as a probe. If you are testing this
+//! module by hand, put the write and the question in separate commands, or you
+//! will measure the command boundary and think you found a bug.
 
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
@@ -201,6 +234,12 @@ fn realpath(p: &Path) -> String {
 async fn git_out(dir: &str, args: &[&str]) -> Option<String> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.arg("-C").arg(dir).args(args);
+    // Without this, a fired GIT_TIMEOUT drops the future and leaves the child
+    // neither killed nor reaped — a zombie per timeout. Measured 2026-08-29: 97
+    // zombies parented to amux-server-rs, accumulated in bursts over 15 hours.
+    // git runs constantly here (a shared checkout, ~50 lanes), so this site is
+    // the highest-frequency one that was missing it (DESKT-30).
+    cmd.kill_on_drop(true);
     let out = tokio::time::timeout(GIT_TIMEOUT, cmd.output()).await.ok()?.ok()?;
     out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
@@ -697,11 +736,63 @@ fn is_pure_read_command(cmd: &str) -> bool {
                 _ => return false,
             }
         }
+        if verb == "sed" {
+            if sed_is_pure_read(seg) {
+                continue;
+            }
+            return false;
+        }
         if !READ_ONLY_VERBS.contains(&verb) {
             return false;
         }
     }
     saw
+}
+
+/// `sed -n '1,50p' <file>` is a READ, and it is the read this fleet is TOLD to
+/// use: bypass-permissions sessions are instructed to "read files with cat,
+/// head, or sed -n". `sed` is absent from `READ_ONLY_VERBS` on purpose, since
+/// `sed -i` authors — so the most-instructed read idiom fell through to the
+/// mtime gate and could mint an inferred edit claim on a file the session only
+/// read, which is AMUX-2841's mechanism ("a Bash command that merely NAMED a
+/// path"). Measured 2026-08-28 before the fix: `sed -n '1,50p' foo.rs`
+/// classified as a potential write, exactly like `sed -i`.
+///
+/// Read-only requires `-n` PRESENT and every write route ABSENT. `-n` is
+/// REQUIRED rather than assumed, so a bare `sed 's/a/b/' f` keeps today's
+/// conservative treatment; anything unrecognized still falls through to
+/// authored, so no real write loses its attribution — the direction this must
+/// never get wrong.
+fn sed_is_pure_read(seg: &str) -> bool {
+    let mut saw_n = false;
+    for tok in seg.split_whitespace().skip(1) {
+        if tok == "--in-place" || tok.starts_with("--in-place=") {
+            return false;
+        }
+        if tok.starts_with("--") {
+            continue;
+        }
+        if let Some(flags) = tok.strip_prefix('-') {
+            // A SHORT-FLAG CLUSTER carries both letters: `-ni` is in-place AND
+            // quiet, so finding `n` must never license an `i` sitting beside
+            // it. `-i.bak` lands here too, since the suffix rides in the same
+            // token.
+            if flags.contains('i') {
+                return false;
+            }
+            if flags.contains('n') {
+                saw_n = true;
+            }
+        }
+    }
+    // `s/a/b/w out` and `/re/w out` write a file with no shell redirection at
+    // all, so `has_output_redirection` cannot see them. Matched loosely on
+    // purpose: a path containing `/w` costs an unnecessary authored record,
+    // which is the over-warning direction this file already prefers.
+    if seg.contains("/w") || seg.contains("/W") {
+        return false;
+    }
+    saw_n
 }
 
 /// MG-1484: is this command a RESTORE and nothing else? True when every
@@ -1071,6 +1162,113 @@ pub(crate) fn unaccounted_added_lines(added: &[String], own_content: &str) -> Ve
         .collect()
 }
 
+/// What unaccounted-line accounting can do for one staged path (AF-342).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum LineAccounting {
+    /// No firsthand content at all: an entirely shell-edited file. Comparing
+    /// would flag every line, so nothing is reported and nothing is claimed.
+    /// This arm predates AF-342 and is the original AMUX-3446 behaviour.
+    ///
+    /// NOTE THE ASYMMETRY, and do not read this arm as "checked and clean"
+    /// (amux, reviewing AF-342). `Skip` ignores `peer_claims` entirely, while
+    /// `(true, true, true)` exists precisely BECAUSE a peer's claim is when
+    /// line detail matters most. That is correct rather than inconsistent:
+    /// with no firsthand content there is nothing to compare against, so a
+    /// contested path here would return every line as unaccounted and say
+    /// nothing true. But this is the arm covering a file written entirely
+    /// through the shell, which is the exact shape swept twice on 2026-08-30,
+    /// so "we did not look" is the honest reading and "we looked and it was
+    /// fine" is not.
+    Skip,
+    /// Firsthand content EXISTS, but the committer ALSO has a write here that
+    /// recorded no content. That is the general property, not "a shell edit"
+    /// (ts-gke's correction on AF-342): a heredoc is one way for a write to
+    /// carry no content record, and a codegen step, a `git checkout` and an
+    /// editor outside the harness are three more. Whatever produced it, a line
+    /// absent from the firsthand content is then equally consistent with "my
+    /// own unrecorded write put it there" and "a peer's hunk rode my git add".
+    /// The probe cannot separate them, and says so instead of guessing.
+    Undecidable,
+    /// Firsthand content, and no observed write of mine. A line the committer's
+    /// own content cannot account for is then a real anomaly: this is the
+    /// 7797e45 peer-hunk shape the check was built for.
+    Check,
+}
+
+/// AF-342, the pure half so the three-way decision is PINNED rather than held
+/// by a control-flow reading. The two `true` arms differ in what they mean and
+/// collapsing them is the bug: before this existed, a file with a PARTIAL
+/// content record (created with Write, then changed by something that records
+/// no content) took the `Check` arm, and every line from the unrecorded write
+/// came back as unaccounted. Measured on commit 40fa0ce0: 93 warning lines
+/// across three files written entirely by one session, no peer involved.
+///
+/// `mine_observed` is an mtime, so it is already the general property and not
+/// a shell-edit test: it fires for a heredoc, a codegen step or a `git
+/// checkout` alike. That generality is deliberate (ts-gke, AF-342) — scoping
+/// this to "shell edits" would require the harness and the guard to agree
+/// about how edits are made, which is a coupling neither should carry.
+///
+/// Why the noise matters more than the false positive: partial content records
+/// are the NORMAL shape here, and a warning that fires on the normal path is
+/// one people learn to scroll past. That is not hypothetical. Twenty minutes
+/// after this was filed, ts-gke's 78009d90 swept 87 lines of a peer's
+/// in-flight `with_cause` work into a commit about a browser-reaper TTL, past
+/// this very warning; `git log -S with_cause` now answers with the wrong
+/// commit. The protection is only as good as the odds the warning gets read.
+///
+/// `peer_claims` is why this takes three arguments rather than two. An observed
+/// record is an MTIME MY BASH WINDOW CAUGHT, and on a shared checkout that
+/// includes writes I did not make: measured live while building this fix, a
+/// peer's `integrations/browser.rs` write landed inside my window and entered
+/// MY observed set 59 seconds later (the `mine_observed_only` provenance
+/// AMUX-3662 exists for). Suppressing on my observed record ALONE would
+/// therefore also suppress the one case the check is most useful in. So when a
+/// peer also claims the path, the detail stays on: that is exactly when a
+/// reader needs to see which lines are not theirs.
+/// Does a cotenant have AUTHORED CONTENT at this path, as opposed to merely a
+/// record of it? This one line is the whole of AF-342's second iteration, and
+/// it lives here rather than inline because inline it was untestable and wrong
+/// for a full release: v1 read `inputs.theirs`, any mtime satisfied that, and
+/// on a 52-lane shared checkout the noisy arm therefore stayed on everywhere
+/// while all four unit cells passed. A mutation putting `theirs` back is the
+/// specific regression `peer_content_is_not_peer_mtime` refuses.
+pub(crate) fn peer_authored_content(inputs: &GuardInputs, ap: &str) -> bool {
+    inputs.theirs_transcript.contains(ap)
+}
+
+/// HOW TO VERIFY THIS BY HAND, and the trap in the obvious recipe (AF-342).
+///
+///   1. Create a mixed path: an Edit/Write, THEN a shell append.
+///   2. `git add` it.
+///   3. Query POST /api/git/staged-guard for that path.
+///
+/// RUN STEP 1 AND STEP 3 AS SEPARATE COMMANDS. `mine_observed` is read from the
+/// session's own transcript, and a write issued in the SAME tool call as the
+/// query is not in the transcript yet when the guard reads it. The mode then
+/// falls to `(true, false, _) => Check`, the line comes back unaccounted, and
+/// the arm looks inert. A reviewer hit exactly this and came within one report
+/// of filing the fix as broken; 20 seconds later, nothing else changed, the
+/// same query returned `unaccounted: []` and the undecidable path.
+///
+/// It has no effect on the real path, where a pre-commit hook runs long after
+/// the writes. It only bites a hand-verification that is too fast, which is the
+/// most likely way anyone will check this.
+pub(crate) fn line_accounting_mode(
+    has_firsthand: bool,
+    mine_observed: bool,
+    peer_claims: bool,
+) -> LineAccounting {
+    match (has_firsthand, mine_observed, peer_claims) {
+        (false, _, _) => LineAccounting::Skip,
+        // My shell write, and nobody else is anywhere near this path.
+        (true, true, false) => LineAccounting::Undecidable,
+        // A peer claims it too: keep the line detail, noise and all.
+        (true, true, true) => LineAccounting::Check,
+        (true, false, _) => LineAccounting::Check,
+    }
+}
+
 /// AMUX-3128 surfacing half: every INFERRED edit record (a Bash command whose
 /// named path moved mtime within slack) is logged so the class stays countable.
 /// A future false co-authorship now leaves a trace naming the verb — and if a
@@ -1087,7 +1285,82 @@ static INFERRED_WARNED: Mutex<Option<HashMap<String, f64>>> = Mutex::new(None);
 /// fleet-wide — the number was in a draft card before its author read the
 /// function. Returns None for a pure-read command; "redirect" when only the
 /// output redirection blocks.
+/// Drop heredoc BODIES before any shell tokenising (AMUX-3822).
+///
+/// A heredoc body is DATA, and this file's tokenisers treat the whole command
+/// string as shell. The cost is not hypothetical: `first_blocking_verb` splits
+/// on `(`, so a conventional-commit subject written through the form this
+/// repo's own CLAUDE.md prescribes —
+///
+/// ```text
+/// cat > /tmp/msg.txt <<'EOF'
+/// fix(board-drive): `done` is a resting place, not a debt
+/// EOF
+/// ```
+///
+/// — yields a segment beginning `fix`, and the `inferred-edit` WARN then
+/// reports `blocked_by=fix` as though it were a shell verb. Four of eight WARNs
+/// on 2026-08-28 were the reporter's own commit subjects (`fix`, `feat`,
+/// `test`). That field is the one the WARN's own text tells a reader to
+/// classify, so the instrument was answering with the reader's prose.
+///
+/// The opener LINE is kept — `cat > f <<'EOF'` is a real write and must still
+/// read as one. Only the body is dropped.
+///
+/// `<<<` is a herestring, not a heredoc: it has no body and no terminator, so
+/// treating it as one would swallow the rest of the command.
+fn strip_heredoc_bodies(cmd: &str) -> String {
+    let mut out: Vec<&str> = Vec::new();
+    let mut lines = cmd.lines();
+    while let Some(line) = lines.next() {
+        out.push(line);
+        let Some(delim) = heredoc_delimiter(line) else { continue };
+        // Skip to the terminator. An UNTERMINATED heredoc consumes the rest,
+        // which is correct: everything after the opener is body.
+        for body in lines.by_ref() {
+            if body.trim() == delim {
+                break;
+            }
+        }
+    }
+    out.join("\n")
+}
+
+/// The delimiter word of a heredoc opener on this line, if any.
+fn heredoc_delimiter(line: &str) -> Option<String> {
+    let i = line.find("<<")?;
+    let rest = &line[i + 2..];
+    // `<<<` is a herestring.
+    if rest.starts_with('<') {
+        return None;
+    }
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim_start();
+    let (quote, rest) = match rest.chars().next() {
+        Some(q @ ('\'' | '"')) => (Some(q), &rest[1..]),
+        _ => (None, rest),
+    };
+    let end = match quote {
+        Some(q) => rest.find(q)?,
+        None => rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(rest.len()),
+    };
+    let d = &rest[..end];
+    (!d.is_empty()).then(|| d.to_string())
+}
+
+/// Is `verb` a token this file can actually classify as a READ? (AMUX-3822)
+///
+/// The `inferred-edit` WARN asks its reader to decide whether `blocked_by` is a
+/// READ verb — the case that means a reader was mistaken for a co-author. A
+/// token that is in neither vocabulary cannot support that judgement, and
+/// saying so is more useful than passing it through as though it were a verb.
+fn is_known_read_verb(verb: &str) -> bool {
+    READ_ONLY_VERBS.contains(&verb) || GIT_READ_SUBCMDS.contains(&verb)
+}
+
 fn first_blocking_verb(cmd: &str) -> Option<String> {
+    let cmd = strip_heredoc_bodies(cmd);
     for seg in cmd.split(['|', ';', '&', '\n', '(', ')', '`']) {
         let seg = seg.trim();
         if seg.is_empty() || seg.starts_with('#') {
@@ -1122,14 +1395,36 @@ fn first_blocking_verb(cmd: &str) -> Option<String> {
             return Some(verb);
         }
     }
-    if has_output_redirection(cmd) {
+    if has_output_redirection(&cmd) {
         return Some("redirect".into());
     }
     None
 }
 
+/// The three UNTRUSTED fields of the inferred-edit WARN, redacted (AF-343).
+///
+/// Pure, and extracted for exactly one reason: the leak was never that the
+/// redactor was missing. `redact_secrets` already existed and already matched
+/// this key family. What was missing was anything that tested whether the log
+/// site CALLED it, and a call site inside a `tracing::warn!` is not reachable
+/// from a test without a capture harness this crate does not have. That is the
+/// same shape as AF-342, where a correct pure function had four passing cells
+/// and a one-line untestable derivation shipped inert. So the decision moves
+/// into a function a test can call.
+pub(crate) fn inferred_warn_fields(
+    base: &str,
+    verb: &str,
+    blocked_by: &str,
+) -> (String, String, String) {
+    let r = crate::api::session_verbs::redact_secrets;
+    (r(base), r(verb), r(blocked_by))
+}
+
 fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
-    let verb = cmd
+    // Same stripper as `first_blocking_verb` (AMUX-3822): this extractor had
+    // the identical defect and produced `verb=persona_tick.json`, a filename.
+    let cmd_shell = strip_heredoc_bodies(cmd);
+    let verb = cmd_shell
         .split(['|', ';', '&', '\n', '(', ')', '`'])
         .filter_map(|s| s.split_whitespace().next())
         .next()
@@ -1151,17 +1446,51 @@ fn warn_inferred_edit(session: &str, abs_path: &str, cmd: &str) {
         }
         m.insert(key, now);
     }
+    // CLASSIFY IT HERE RATHER THAN ASKING THE READER TO (AMUX-3822). The old
+    // sentence told the reader to decide whether `blocked_by` was a READ verb.
+    // That is only answerable if the field holds a verb, and before the heredoc
+    // stripper above it often held the reporter's own commit subject — four of
+    // eight WARNs on 2026-08-28 read `fix`, `feat`, `test`. Handing someone a
+    // field they must interpret, when it can hold something uninterpretable, is
+    // the `['s]` shape from AMUX-3816.
+    //
+    // So the WARN now states the verdict it can support. `unknown` is a real
+    // third answer and must stay distinguishable from both others: it means the
+    // token is in neither vocabulary, so this row cannot be classified and is
+    // not evidence either way.
+    let verdict = if is_known_read_verb(&blocked_by) {
+        "READ verb — is_pure_read_command missed a reader, so this record may be minting \
+         FALSE co-authorship. This is the specimen AMUX-2841 wants"
+    } else if blocked_by == "redirect" {
+        "output redirection — a write, the record working as designed"
+    } else {
+        "NOT a known read verb, and not classifiable from this token alone — treat as \
+         unmeasured rather than as a write (AMUX-3822)"
+    };
+    // AF-343: `verb`, `blocked_by` and `base` are TOKENS LIFTED OUT OF A BASH
+    // COMMAND, so anything a lane typed can reach this line, and this line goes
+    // to a file. Measured before the fix: 192 live-looking `mxp_sk_` secrets in
+    // server-rs.log and 454 in its rotation, because a command beginning with
+    // `MXPKEY="..."` makes the whole assignment the first token, and the first
+    // token is what gets logged as the "verb" (96 WARN lines carried one key).
+    //
+    // The redactor already existed and already covered this key family; it was
+    // simply never applied on this path, and it was private to session_verbs so
+    // it could not be. Redacting at the LOG SITE rather than at the extractor is
+    // deliberate: it covers every shape a token can take, including the ones
+    // nobody has thought of, and it keeps working if the extractor changes.
+    let (safe_base, safe_verb, safe_blocked_by) =
+        inferred_warn_fields(base, verb, &blocked_by);
     tracing::warn!(
         target: "staged_guard",
-        "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} blocked_by={} — \
-         ownership INFERRED from a bash command, not a firsthand Edit/Write. A READ verb in \
-         blocked_by means is_pure_read_command missed a reader and may be minting false \
-         co-authorship; a WRITE verb there is the record working as designed (AF-126: the \
-         first segment's verb is usually `cd` and says nothing).",
+        "[staged-guard/inferred-edit AMUX-3128] session={} path={} verb={} blocked_by={} \
+         verdict={} — ownership INFERRED from a bash command, not a firsthand Edit/Write. \
+         (AF-126: the first segment's verb is usually `cd` and says nothing.)",
         if session.is_empty() { "(none)" } else { session },
-        base,
-        verb,
-        blocked_by,
+        safe_base,
+        safe_verb,
+        safe_blocked_by,
+        verdict,
     );
 }
 
@@ -1312,7 +1641,28 @@ pub(crate) struct GuardInputs {
     /// abs realpath -> (owner session, newest ts), all cotenants.
     pub theirs: HashMap<String, (String, f64)>,
     /// abs realpath, any cotenant, first-hand only.
+    ///
+    /// NB `apply_observed` INSERTS INTO THIS at firsthand rank (AF-123, and
+    /// deliberately: an mtime is a fact about the disk). So after that call it
+    /// means "a peer has a record here", NOT "a peer authored content here".
+    /// If you need the second question, use `theirs_transcript`.
     pub theirs_firsthand: HashSet<String>,
+    /// abs realpath where a cotenant has a TRANSCRIPT (Edit/Write) record, so
+    /// their authored CONTENT for it exists somewhere. Snapshotted before
+    /// `apply_observed` runs and never written by it, which is the whole
+    /// point: `theirs_firsthand` answers "is there a peer record here" and
+    /// this answers "did a peer author content here".
+    ///
+    /// AF-342 shipped once without this and was inert in production. It gated
+    /// on `theirs`, which any mtime satisfies, and on a 52-lane shared
+    /// checkout a peer's Bash window catches nearly every actively-edited
+    /// path. The live response said it out loud in its own `co_signal`:
+    /// "observed mtime coinciding with your own edit - possibly one write seen
+    /// through two sessions' Bash windows, not a real co-editor (AMUX-3497)".
+    /// A phantom co-editor was therefore enough to keep the noisy arm on
+    /// everywhere, which is authorship inferred from an mtime, the exact move
+    /// `line_accounting_mode` exists to refuse.
+    pub theirs_transcript: HashSet<String>,
     /// abs realpath whose WINNING peer claim came from an OBSERVED (mtime)
     /// row rather than a transcript record (AMUX-3497). An observed row is a
     /// fact about the disk, but on a shared checkout its attribution to the
@@ -1763,6 +2113,13 @@ struct Envelope {
     /// shell-edited file has no firsthand content and is skipped entirely,
     /// and a partial Edit+sed workflow can false-positive, so the hook WARNs.
     unaccounted: Vec<Value>,
+    /// AF-342: staged paths where unaccounted-line accounting COULD NOT RUN,
+    /// because the committer also wrote the file in the window through
+    /// something that records no content. Published beside
+    /// `unaccounted` so an empty list there is readable as "nothing found"
+    /// rather than "nothing looked" — the measured/n_considered contract
+    /// (AF-320) applied to this probe.
+    unaccounted_undecidable: Vec<Value>,
     /// A verdict WAS computed but may UNDER-report: a peer we could not see, a
     /// git call that failed, paths truncated.
     degraded: Vec<String>,
@@ -1792,6 +2149,7 @@ impl Envelope {
             // degradation for an advisory.
             "split_risk": self.verdict.split_risk,
             "unaccounted": self.unaccounted,
+            "unaccounted_undecidable": self.unaccounted_undecidable,
             "cotenants": self.cotenants,
             "window_secs": self.window as i64,
             "undecided": self.undecided.is_some(),
@@ -1901,6 +2259,60 @@ pub async fn staged_guard(
 /// Notifying an owner from it would tell them their file was being swept every
 /// time a nudge tick ran — a notice that is false, repeated, and precisely the
 /// noise that gets a channel muted (ethos rule 5).
+/// What the pre-commit hook SAW staged, per `(session, dir)` (AMUX-3837).
+///
+/// amux-frustrations demonstrated the mechanism behind the empty commit, and it
+/// needs no `--allow-empty`: git decides to proceed and writes the tree AFTER
+/// the hooks return, so anything that empties the index during the pre-commit
+/// window produces a zero-file commit that reports success. Two lines in a
+/// scratch repo reproduce it, confirmed independently here.
+///
+/// The route in THIS repo is not hypothetical. Sessions share one git index,
+/// and our pre-commit window is a full `cargo check --workspace --all-targets`
+/// plus clippy: 30 to 90 seconds of exposure per commit, during which a peer's
+/// `git reset` or `git restore --staged` lands in the same index.
+///
+/// So the pair is worth recording. The hook already tells the server what it
+/// saw; the commit report already knows what landed. Holding the first lets the
+/// second say "the hook saw N files and this commit has none" instead of
+/// leaving it to be reconstructed from request-log timestamps, which is what it
+/// cost this time.
+fn staged_seen_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (f64, usize)>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(Default::default)
+}
+
+fn staged_seen_key(session: &str, dir: &str) -> String {
+    format!("{}\u{1}{}", session.trim().to_lowercase(), dir.trim())
+}
+
+/// Record what the hook saw. Called on every staged-guard POST.
+pub fn record_staged_seen(session: &str, dir: &str, count: usize, now: f64) {
+    if session.trim().is_empty() || dir.trim().is_empty() {
+        return;
+    }
+    let mut g = staged_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    g.insert(staged_seen_key(session, dir), (now, count));
+    // Bounded: one entry per lane per checkout, and a commit's hook-to-report
+    // gap is seconds. Anything older than an hour is a lane that has gone away.
+    g.retain(|_, (ts, _)| now - *ts < 3600.0);
+}
+
+/// How many files the hook saw for this lane's most recent commit attempt in
+/// this checkout, if that attempt is recent enough to be the SAME commit.
+///
+/// `None` where the answer is unknown, never 0: an absent record means the hook
+/// did not report (a lane on another machine, a disabled guard, a server that
+/// restarted between the two calls), and reporting that as "the hook saw no
+/// files" would turn a missing measurement into evidence (ethos rule 4).
+pub fn staged_seen(session: &str, dir: &str, now: f64, within_s: f64) -> Option<usize> {
+    let g = staged_seen_map().lock().unwrap_or_else(|e| e.into_inner());
+    g.get(&staged_seen_key(session, dir))
+        .filter(|(ts, _)| now - *ts <= within_s)
+        .map(|(_, n)| *n)
+}
+
 pub async fn staged_guard_inner(
     state: Option<super::AppState>,
     headers: HeaderMap,
@@ -1947,6 +2359,12 @@ pub async fn staged_guard_inner(
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
         .unwrap_or_default();
+
+    // Hold what the hook saw, for the commit report to compare against
+    // (AMUX-3837). Recorded from the RAW paths, before any filtering, because
+    // the question is "did the index empty between here and the commit" and the
+    // guard's own opinion of those paths is a different question.
+    record_staged_seen(&session, &wd_raw, raw_paths.len(), crate::config::now_f64());
 
     let wd = std::fs::canonicalize(&wd_raw)
         .map(|p| p.to_string_lossy().into_owned())
@@ -2223,6 +2641,9 @@ pub async fn staged_guard_inner(
         // Filled by apply_observed, same as theirs_observed_only below.
         mine_observed_only: HashSet::new(),
         theirs,
+        // Same source, two fields on purpose: `apply_observed` will merge
+        // mtime rows into `theirs_firsthand` and must never touch this one.
+        theirs_transcript: theirs_fh.clone(),
         theirs_firsthand: theirs_fh,
         theirs_observed_only: HashSet::new(), // filled by apply_observed
         theirs_restore,
@@ -2239,9 +2660,14 @@ pub async fn staged_guard_inner(
     // the structural firsthand=0 penalty on Bash-editing lanes: their writes
     // become facts here regardless of how the command spelled the path.
     let mut inputs = inputs;
+    // Hoisted out of the block below because the per-line check further down
+    // needs it too (AF-342): "does my own content record for this path have a
+    // hole in it" is the question that decides whether the check can
+    // discriminate at all, and an observed mtime is how a hole shows up.
+    let mut mine_obs: HashMap<String, f64> = HashMap::new();
     if let Some(st) = state.as_ref() {
         if let Ok(conn) = st.store.read() {
-            let mine_obs = if session.is_empty() {
+            mine_obs = if session.is_empty() {
                 HashMap::new()
             } else {
                 load_observed(&conn, &session, window)
@@ -2262,6 +2688,7 @@ pub async fn staged_guard_inner(
     // every line), and never blocking — but a hit is the one signal that
     // survives peer-record expiry, which is the hole 7797e45 shipped through.
     let mut unaccounted_rows: Vec<Value> = Vec::new();
+    let mut unaccounted_undecidable: Vec<Value> = Vec::new();
     if !session.is_empty() {
         let own = tokio::task::spawn_blocking({
             let s = session.clone();
@@ -2271,6 +2698,54 @@ pub async fn staged_guard_inner(
         .await
         .unwrap_or_default();
         for (rel, ap) in &pairs {
+            // AF-342. The Skip arm handles the file with NO content record at
+            // all: no firsthand
+            // content, no comparison, no false positive. It does not handle the
+            // PARTIAL one, which is now the dominant shape: a file gets CREATED
+            // with Write, so `own` holds content for it, and is then changed by
+            // something that records none (a heredoc, a codegen step, a
+            // checkout), so every such line reads as unaccounted.
+            //
+            // Measured on commit 40fa0ce0: four files written entirely by one
+            // session, 93 lines of "matching nothing you edited firsthand"
+            // across three of them, zero peer involvement. The docstring on
+            // `Envelope::unaccounted` has named this false positive since
+            // AMUX-3446 ("a partial Edit+sed workflow can false-positive").
+            //
+            // An observed record (AF-123) is the missing half: the hook pair
+            // saw this file's mtime move during one of my own commands. Content
+            // for that write exists nowhere — no extractor can recover what a
+            // heredoc or a generator wrote — so the comparison's premise
+            // ("these lines match nothing you edited") is simply false here,
+            // and the honest answer is that the probe cannot decide.
+            //
+            // Reported, not dropped (ethos rule 4): a check that silently stops
+            // running is worse than the false positive it replaced, so the path
+            // moves to `unaccounted_undecidable` and travels in the same
+            // payload. The check stays FULLY LIVE for its real target, a file
+            // with firsthand content and NO observed write of mine — which is
+            // exactly the 7797e45 peer-hunk shape it was built for, since a
+            // peer's hunk riding my `git add` moves no mtime in MY window.
+            let observed = mine_obs.get(ap);
+            // A peer claim gates the line check only when that peer has
+            // CONTENT behind it, because content is the only thing the
+            // comparison can attribute. `theirs` alone is satisfied by an
+            // mtime, which made this arm inert in production (see the field
+            // doc on `theirs_transcript`).
+            let peer_claims = peer_authored_content(&inputs, ap);
+            match line_accounting_mode(own.contains_key(ap), observed.is_some(), peer_claims) {
+                LineAccounting::Skip => continue,
+                LineAccounting::Undecidable => {
+                    let ts = observed.copied().unwrap_or(now);
+                    unaccounted_undecidable.push(json!({
+                        "path": rel,
+                        "observed_write_age_s": (now - ts).max(0.0) as i64,
+                        "why_undecidable": "you also wrote this file in the window through something that records no content (observed record, AF-123: a heredoc, a generator, a checkout). Your own content record is therefore incomplete here, so unaccounted-line accounting cannot tell your lines from a peer's hunk. Path-level ownership above is unaffected.",
+                    }));
+                    continue;
+                }
+                LineAccounting::Check => {}
+            }
             let Some(content) = own.get(ap) else { continue };
             let Some(diff) = git_out(&wd, &["diff", "--cached", "--unified=0", "--", rel]).await
             else {
@@ -2292,6 +2767,24 @@ pub async fn staged_guard_inner(
                 "note": "staged ADDED lines matching nothing you edited firsthand in the window — on a shared checkout these are likely a peer's in-flight hunks riding your git add (AMUX-3446; a per-file add stages whatever is in the file). If they are yours via shell edits, proceed; otherwise stage per-hunk (git add -p).",
             }));
         }
+    }
+
+    // AF-342, the surfacing half: this suppression must be COUNTABLE, or the
+    // next sweep cannot tell "the line check found nothing" from "the line
+    // check never ran". If this counter climbs while `unaccounted` stays at
+    // zero fleet-wide, the probe has quietly stopped covering the mixed-edit
+    // workflow entirely and needs a content record for shell writes, not a
+    // wider skip.
+    if !unaccounted_undecidable.is_empty() {
+        tracing::info!(
+            target: "staged_guard",
+            session = %session,
+            undecidable_paths = unaccounted_undecidable.len(),
+            unaccounted_paths = unaccounted_rows.len(),
+            "unaccounted-line accounting skipped on {} path(s): the committer also wrote them \
+             in the window through something that records no content (AF-342)",
+            unaccounted_undecidable.len()
+        );
     }
 
     if !v.foreign.is_empty() {
@@ -2515,7 +3008,7 @@ pub async fn staged_guard_inner(
     (
         StatusCode::OK,
         Json(
-            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, verdict_id, ..Default::default() }
+            Envelope { verdict: v, cotenants, window, degraded, hook_outdated, unaccounted: unaccounted_rows, unaccounted_undecidable, verdict_id, ..Default::default() }
                 .json(),
         ),
     )
@@ -2697,7 +3190,10 @@ pub async fn guard_outcomes_debug(
         Err(e) => {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                axum::Json(json!({"error": e.to_string()})),
+                axum::Json(crate::api::measured::unmeasured(
+                    json!({"error": e.to_string()}),
+                    "the store could not be opened, so no guard verdict was counted",
+                )),
             )
         }
     };
@@ -2732,9 +3228,7 @@ pub async fn guard_outcomes_debug(
             recent = rows.flatten().collect();
         }
     }
-    (
-        StatusCode::OK,
-        axum::Json(json!({
+    let body = json!({
             "since_h": since_h,
             "verdicts": {
                 "allow": count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1 AND verdict='allow'", &[c]),
@@ -2759,7 +3253,24 @@ pub async fn guard_outcomes_debug(
             },
             "recent_blocks": recent,
             "note": "proceeded cells are DECLARED (the committer's own override env var); trimmed/reallowed are hook-OBSERVED staged-set comparisons; aborted is inferred at read time and named so. -1 = query failed, never silently 0.",
-        })),
+        });
+    // AF-320 makes the `-1 = query failed` convention machine-readable. That
+    // sentinel is in a NOTE, so a reader has to know to look for it; a caller
+    // summing the cells gets a plausible number either way. `window_verdicts`
+    // is the population every cell above is drawn from, and a negative one
+    // means the count itself failed.
+    let window_verdicts = count("SELECT COUNT(*) FROM guard_verdicts WHERE ts>?1", &[c]);
+    (
+        StatusCode::OK,
+        axum::Json(if window_verdicts < 0 {
+            crate::api::measured::unmeasured(
+                body,
+                "guard_verdicts could not be counted, so every cell in this report is -1 \
+                 or unfounded — the schema is older than this binary expects",
+            )
+        } else {
+            crate::api::measured::measured(body, window_verdicts as usize)
+        }),
     )
 }
 
@@ -3517,6 +4028,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let hdrs = || {
             let mut h = HeaderMap::new();
@@ -3592,6 +4104,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let now = now_epoch();
         store
@@ -3747,6 +4260,165 @@ mod tests {
         // Everything accounted -> silence (the check CAN pass).
         let all_mine = unaccounted_added_lines(&added[..1], my_edit_content);
         assert!(all_mine.is_empty(), "{all_mine:?}");
+    }
+
+    /// AF-342. The mixed-edit file is the one this decision exists for, and it
+    /// is the shape the harness PRODUCES: bypass-permissions sessions are told
+    /// to prefer Bash, but a file still gets created with Write, so `own` has
+    /// content for it and every later sed/heredoc line looks unaccounted.
+    /// Commit 40fa0ce0 printed 93 such lines across three files with no peer
+    /// anywhere near them.
+    ///
+    /// The two `true` arms must stay DISTINCT. Collapsing Undecidable into
+    /// Check is the bug being fixed; collapsing it into Skip would be worse,
+    /// because the payload would then be silent about a probe that did not
+    /// run, which is the measured/n_considered failure (AF-320) one layer up.
+    #[test]
+    fn mixed_edit_files_are_undecidable_not_unaccounted() {
+        // Content record PARTIAL (created with Write, then changed by
+        // something that records none), nobody else near it: the AF-342
+        // shape, and the only arm that got quieter.
+        assert_eq!(
+            line_accounting_mode(true, true, false),
+            LineAccounting::Undecidable,
+            "a file only this session wrote, with a partial content record, cannot be line-accounted"
+        );
+        // The check's REAL target must stay live: a peer's hunk riding my
+        // `git add` moves no mtime inside MY observed window, so firsthand
+        // content with no observed write of mine is still fully checked.
+        // If this arm ever stops being Check, 7797e45 can recur silently.
+        assert_eq!(
+            line_accounting_mode(true, false, false),
+            LineAccounting::Check,
+            "the peer-hunk shape must still be checked"
+        );
+        // THE ARM THAT KEEPS THE SUPPRESSION HONEST, and the one the
+        // 78009d90 sweep makes non-negotiable. An observed record is an mtime,
+        // not an authorship proof: a peer writing during my window enters MY
+        // observed set (seen live 2026-08-30, a peer's browser.rs write landed
+        // in this session's records 59s later). Suppressing on my observed
+        // record alone would hide the line detail in precisely the case it is
+        // most wanted — a contested path — which is the case where ts-gke
+        // swept 87 lines of a peer's work past this warning. So a path a peer
+        // also claims stays fully checked.
+        assert_eq!(
+            line_accounting_mode(true, true, true),
+            LineAccounting::Check,
+            "a path a peer also claims keeps its line detail, noise and all"
+        );
+        // Pre-existing AMUX-3446 behaviour, unchanged: an all-shell file has
+        // no content to compare against and is skipped without a claim.
+        for peer in [true, false] {
+            assert_eq!(line_accounting_mode(false, true, peer), LineAccounting::Skip);
+            assert_eq!(line_accounting_mode(false, false, peer), LineAccounting::Skip);
+        }
+    }
+
+    /// AF-343. The staged-guard writes tokens lifted out of a bash command to a
+    /// LOG FILE, so anything a lane typed can land there. Measured on the live
+    /// box before the fix: 192 `mxp_sk_` secrets in server-rs.log and 454 in its
+    /// rotation, 96 of them on WARN lines, because a command starting with
+    /// `KEY="..."` makes the whole assignment the first token and the first
+    /// token is logged as the "verb".
+    ///
+    /// The token shape here is the one that actually appeared, not an invented
+    /// one. The key body is synthetic.
+    #[test]
+    fn inferred_warn_fields_redact_a_secret_lifted_from_a_command() {
+        let leaky = "MXPKEY=\"mxp_sk_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"";
+        let (base, verb, blocked) = inferred_warn_fields("notes.md", leaky, leaky);
+        for (name, got) in [("verb", &verb), ("blocked_by", &blocked)] {
+            assert!(
+                !got.contains("mxp_sk_AAAA"),
+                "{name} still carries the key body: {got}"
+            );
+        }
+        // And the field must still SAY something: a redactor that blanked the
+        // line would pass the assertion above while destroying the diagnostic
+        // this WARN exists to provide.
+        assert!(verb.contains("MXPKEY"), "the non-secret part must survive: {verb}");
+        // An ordinary token is untouched, or every WARN becomes unreadable.
+        assert_eq!(base, "notes.md");
+        let (_, plain, _) = inferred_warn_fields("a", "sed", "sed");
+        assert_eq!(plain, "sed");
+    }
+
+    /// AF-342 second iteration, THE CELL THAT CAN ACTUALLY FAIL ON THE BUG.
+    /// The sibling below pins the ordering property of the SET; this pins the
+    /// DERIVATION, and only this one turns red when `peer_authored_content`
+    /// goes back to reading `theirs`. That distinction is the entire lesson of
+    /// v1: four green cells over a correct pure function, a one-line call site
+    /// nobody could test, and a fix that did nothing in production.
+    #[test]
+    fn peer_content_is_not_peer_mtime() {
+        let path = "/repo/shared.rs".to_string();
+        let mut inputs = GuardInputs::default();
+        // Phantom co-editor: a peer's Bash window caught a write, no transcript.
+        apply_observed(
+            &mut inputs,
+            &HashMap::new(),
+            &[("peer".to_string(), HashMap::from([(path.clone(), 100.0)]))],
+        );
+        assert!(
+            !peer_authored_content(&inputs, &path),
+            "an observed mtime must NOT count as a peer authoring content, or the \
+             Undecidable arm goes inert on every actively-edited path in the fleet"
+        );
+        // And the real thing still counts: a peer with a transcript record.
+        let mut real = GuardInputs::default();
+        real.theirs_transcript.insert(path.clone());
+        real.theirs.insert(path.clone(), ("peer".into(), 100.0));
+        assert!(
+            peer_authored_content(&real, &path),
+            "a peer transcript record MUST still gate the check on, or the \
+             7797e45 peer-hunk case loses its line detail"
+        );
+    }
+
+    /// AF-342, second iteration, and the cell that would have caught the first
+    /// one being INERT. The pure decision above was correct and fully tested;
+    /// what was wrong was the DERIVATION of `peer_claims` at the call site,
+    /// which read `theirs` and so counted a bare mtime as a peer authoring
+    /// content. On a 52-lane shared checkout a peer's Bash window catches
+    /// nearly every actively-edited path, so that arm stayed on everywhere and
+    /// the fix did nothing in production while every unit test passed.
+    ///
+    /// The property that makes the derivation safe is an ORDERING one:
+    /// `apply_observed` merges mtime rows into `theirs_firsthand` at firsthand
+    /// rank, on purpose, so only a set it never writes can answer "did a peer
+    /// author content here". This pins that `theirs_transcript` is that set.
+    /// If a future change starts maintaining it inside `apply_observed`, the
+    /// arm silently goes inert again and no other test in this file notices.
+    #[test]
+    fn apply_observed_never_writes_the_peer_transcript_set() {
+        let path = "/repo/shared.rs".to_string();
+        let mut inputs = GuardInputs::default();
+        // A peer with NO transcript record, whose only signal is an mtime that
+        // coincides with my own write: the AMUX-3497 phantom co-editor, and
+        // the exact shape the live response reported.
+        let theirs_obs = vec![("peer".to_string(), HashMap::from([(path.clone(), 100.0)]))];
+        apply_observed(&mut inputs, &HashMap::new(), &theirs_obs);
+
+        assert!(
+            inputs.theirs_firsthand.contains(&path),
+            "apply_observed must still rank observed rows WITH firsthand (AF-123)"
+        );
+        assert!(
+            inputs.theirs.contains_key(&path),
+            "and the observed row must still win the path-level claim"
+        );
+        assert!(
+            !inputs.theirs_transcript.contains(&path),
+            "an mtime is not authorship: theirs_transcript must stay empty, or \
+             a phantom co-editor re-inerts the Undecidable arm"
+        );
+        // The two questions must be answerable apart. If these ever agree for
+        // an observed-only row, the derivation has nothing left to key on.
+        assert_ne!(
+            inputs.theirs_firsthand.contains(&path),
+            inputs.theirs_transcript.contains(&path),
+            "the 'has a record' and 'authored content' questions must differ here"
+        );
     }
 
     /// MG-1484: a restore writes bytes equal to a committed ref — an edit
@@ -3947,6 +4619,64 @@ mod tests {
     }
 
     /// AMUX-3128 RECURRED (gtm-ticker): a careful VERIFIER reads a digest with
+    /// AMUX-3822: a heredoc body is DATA, and tokenising it as shell made the
+    /// WARN report the reporter's own prose as a shell verb.
+    ///
+    /// THE SPECIMEN IS THIS REPO'S PRESCRIBED COMMIT FORM. CLAUDE.md tells
+    /// every lane to write commit messages with `git commit -F` and a heredoc,
+    /// and conventional-commit subjects are parenthesised by convention — so
+    /// `fix(board-drive): ...` split at the `(` and yielded `fix`. Four of the
+    /// eight `inferred-edit` WARNs on 2026-08-28 were commit subjects.
+    #[test]
+    fn a_heredoc_body_is_not_tokenised_as_shell() {
+        let cmd = "cat > /tmp/msg.txt <<'EOF'\n\
+                   fix(board-drive): `done` is a resting place, not a debt\n\
+                   feat(x): another line\n\
+                   EOF\n\
+                   git commit -F /tmp/msg.txt";
+        let stripped = strip_heredoc_bodies(cmd);
+        assert!(!stripped.contains("fix(board-drive)"), "body must be gone: {stripped}");
+        // THE OPENER SURVIVES. `cat > f <<EOF` is a real write and must still
+        // read as one — dropping the whole line would turn a write into a
+        // silent no-op, which is the opposite and worse failure.
+        assert!(stripped.contains("cat > /tmp/msg.txt"), "the opener is command: {stripped}");
+        assert!(stripped.contains("git commit"), "and so is everything after the terminator");
+        // The verb must no longer be a word from the message.
+        let v = first_blocking_verb(cmd).unwrap_or_default();
+        assert_ne!(v, "fix", "the commit subject is not a shell verb");
+        assert_ne!(v, "feat");
+
+        // CONTROLS.
+        // 1. A herestring has no body; treating it as a heredoc would swallow
+        //    the rest of the command and hide real writes.
+        let hs = "grep -q x <<< \"$VAR\"\ncat > f.md";
+        assert!(strip_heredoc_bodies(hs).contains("cat > f.md"), "`<<<` is not a heredoc");
+        // 2. Quoted, unquoted and dash forms all parse.
+        assert_eq!(heredoc_delimiter("cat <<'PY'").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<\"PY\"").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<PY").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<-PY").as_deref(), Some("PY"));
+        assert_eq!(heredoc_delimiter("cat <<< x"), None);
+        assert_eq!(heredoc_delimiter("echo hello"), None);
+        // 3. A command with NO heredoc must be unchanged, or the stripper is
+        //    silently rewriting every command it sees.
+        let plain = "cd /repo && python3 -c 'open(\"x\",\"w\")'";
+        assert_eq!(strip_heredoc_bodies(plain), plain);
+    }
+
+    /// The WARN must state the verdict it can support, not hand the reader a
+    /// token to classify (AMUX-3822). `unknown` is a real third answer.
+    #[test]
+    fn the_read_verb_vocabulary_separates_classifiable_from_unmeasured() {
+        assert!(is_known_read_verb("cat"), "a read verb is the specimen case");
+        assert!(is_known_read_verb("blame"), "git read subcommands count too");
+        // THE CONTROLS: neither a write verb nor a commit-subject word may
+        // classify as a read, or the WARN would name the wrong verdict.
+        assert!(!is_known_read_verb("fix"), "a commit subject word is not a verb");
+        assert!(!is_known_read_verb("feat"));
+        assert!(!is_known_read_verb("cp"), "a write verb is not a read verb");
+    }
+
     /// `git show` / `git log --stat` / `git diff` / `git grep` / `git blame`, whose
     /// verb is `git` (absent from READ_ONLY_VERBS), so each minted an inferred edit
     /// and flagged the reader as co-author — blocking the committer and PUNISHING
@@ -4268,4 +4998,97 @@ mod cd_is_not_a_mutation {
             assert!(!is_pure_read_command(cmd), "must NOT be a pure read: {cmd}");
         }
     }
+}
+
+#[cfg(test)]
+mod staged_seen_tests {
+    use super::{record_staged_seen, staged_seen};
+
+    /// AMUX-3837. The pair that turns an empty commit from a forensic
+    /// reconstruction into a stated fact.
+    #[test]
+    fn what_the_hook_saw_is_scoped_recent_and_absent_rather_than_zero() {
+        let now = 5_000_000.0;
+        record_staged_seen("lane-a", "/repo/one", 3, now);
+        record_staged_seen("lane-b", "/repo/one", 7, now);
+        record_staged_seen("lane-a", "/repo/two", 1, now);
+
+        assert_eq!(staged_seen("lane-a", "/repo/one", now, 300.0), Some(3));
+        assert_eq!(staged_seen("LANE-A", "/repo/one", now, 300.0), Some(3), "lane name is case-folded");
+        // SCOPED BOTH WAYS. Another lane in the same checkout, and the same lane
+        // in another checkout, are different commits — reading either as this
+        // one's staged count would manufacture the discrepancy this detects.
+        assert_eq!(staged_seen("lane-b", "/repo/one", now, 300.0), Some(7));
+        assert_eq!(staged_seen("lane-a", "/repo/two", now, 300.0), Some(1));
+
+        // NEVER MEASURED IS NOT ZERO. A lane that did not report must come back
+        // None, or a missing measurement becomes evidence that nothing was
+        // staged (ethos rule 4).
+        assert_eq!(staged_seen("lane-c", "/repo/one", now, 300.0), None, "never reported");
+        assert_eq!(staged_seen("lane-a", "/repo/nope", now, 300.0), None, "different checkout");
+
+        // STALE IS ALSO NOT AN ANSWER. The window is a pre-commit build, so a
+        // record from an hour ago belongs to a different commit entirely.
+        assert_eq!(staged_seen("lane-a", "/repo/one", now + 301.0, 300.0), None, "past the window");
+        assert_eq!(staged_seen("lane-a", "/repo/one", now + 299.0, 300.0), Some(3), "inside it");
+
+        // A hook that genuinely saw nothing is Some(0), distinct from None.
+        record_staged_seen("lane-d", "/repo/one", 0, now);
+        assert_eq!(staged_seen("lane-d", "/repo/one", now, 300.0), Some(0));
+
+        // Blank inputs record nothing rather than colliding on one key.
+        record_staged_seen("", "/repo/one", 9, now);
+        record_staged_seen("lane-e", "", 9, now);
+        assert_eq!(staged_seen("", "/repo/one", now, 300.0), None);
+        assert_eq!(staged_seen("lane-e", "", now, 300.0), None);
+    }
+
+
+    /// AMUX-2841: the read idiom the fleet is INSTRUCTED to use must not mint an
+    /// inferred edit claim.
+    ///
+    /// `sed` is deliberately absent from READ_ONLY_VERBS because `sed -i`
+    /// authors, so every `sed` fell through to the mtime gate. Meanwhile
+    /// bypass-permissions sessions are told to "read files with cat, head, or
+    /// sed -n", which is the same shape as the `head -40 digests/x.md` case
+    /// that put the read-only exemption here in the first place: a lane reading
+    /// a file while a peer writes it takes an inferred claim on it.
+    ///
+    /// The write routes are asserted individually because each is a separate
+    /// way to author, and `-ni` and `s/a/b/w out` are the two a whitelist of
+    /// `-n` alone would wave through. The reads at the end are the control: if
+    /// they ever go false this test is broken rather than the code.
+    #[test]
+    fn sed_n_reads_but_every_sed_write_route_still_authors() {
+        for w in [
+            "sed -i 's/a/b/' foo.rs",
+            "sed -ni 's/a/b/p' foo.rs",
+            "sed -i.bak 's/a/b/' foo.rs",
+            "sed --in-place 's/a/b/' foo.rs",
+            "sed --in-place=.bak 's/a/b/' foo.rs",
+            "sed -n 's/a/b/w out.txt' foo.rs",
+            "sed -n '/re/w out.txt' foo.rs",
+            "sed 's/a/b/' foo.rs",
+            "sed -n '1,5p' foo.rs > out.txt",
+            "cd /repo && sed -i 's/a/b/' foo.rs",
+        ] {
+            assert!(
+                !super::is_pure_read_command(w),
+                "sed write route classified as a pure read, so a real author would lose its \
+                 attribution: {w}"
+            );
+        }
+        for r in [
+            "sed -n '1,50p' foo.rs",
+            "cd /repo && sed -n '1,50p' foo.rs",
+            "sed -n -e '1,50p' foo.rs",
+            "head -40 foo.rs",
+        ] {
+            assert!(
+                super::is_pure_read_command(r),
+                "a pure read still mints an inferred edit claim on a file it only read: {r}"
+            );
+        }
+    }
+
 }

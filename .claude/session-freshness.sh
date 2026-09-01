@@ -294,7 +294,7 @@ fi
 hooks_dir="$(git -C "$REPO" rev-parse --git-path hooks 2>/dev/null || true)"
 case "$hooks_dir" in /*) : ;; ?*) hooks_dir="$REPO/$hooks_dir" ;; esac
 if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
-  stale_hooks=""
+  stale_hooks=""; any_missing=""; any_older=""
   for src in "$REPO"/scripts/git-hooks/*; do
     [ -f "$src" ] || continue
     name="$(basename "$src")"
@@ -305,14 +305,52 @@ if [ -n "${hooks_dir:-}" ] && [ -d "$REPO/scripts/git-hooks" ]; then
     dst="$hooks_dir/$name"
     if [ ! -e "$dst" ]; then
       stale_hooks="${stale_hooks}${stale_hooks:+, }${name} (MISSING)"
+      any_missing=1
     elif ! diff -q "$src" "$dst" >/dev/null 2>&1; then
-      stale_hooks="${stale_hooks}${stale_hooks:+, }${name}"
+      # NAME THE VERSION ON BOTH SIDES when the file carries one. The byte diff
+      # is the right DETECTOR and is unchanged; what it cannot do is support the
+      # sentence this block used to print. On 2026-08-30 the only drift was a
+      # comment rewrite and BOTH copies read `GUARD_VERSION = 11`, so the guard
+      # had not stopped guarding in any sense â yet the notice said it had. That
+      # is ethos rule 4 failing in the direction that costs trust rather than
+      # safety: cry wolf on every doc edit to a hook and the remedy line stops
+      # being read, which is how the one real MISSING case gets waved through.
+      #
+      # Only amux-staged-guard carries a version today. The other three get the
+      # bare name, because inventing a confidence signal they cannot supply is
+      # the same error rewritten â and note that equal versions do NOT prove
+      # the logic matches, only that nobody bumped it. That is why this reports
+      # the two numbers and lets the reader judge, rather than declaring "safe".
+      iv="$(grep -m1 -oE '^GUARD_VERSION *= *[0-9]+' "$dst" 2>/dev/null | grep -oE '[0-9]+$' || true)"
+      cv="$(grep -m1 -oE '^GUARD_VERSION *= *[0-9]+' "$src" 2>/dev/null | grep -oE '[0-9]+$' || true)"
+      detail=""
+      if [ -n "$iv" ] && [ -n "$cv" ]; then
+        if [ "$iv" -lt "$cv" ] 2>/dev/null; then
+          detail=" (installed GUARD_VERSION $iv < checkout $cv)"; any_older=1
+        else
+          detail=" (GUARD_VERSION $iv on both)"
+        fi
+      elif [ -z "$iv" ] && [ -n "$cv" ]; then
+        detail=" (installed carries no GUARD_VERSION; checkout $cv)"; any_older=1
+      fi
+      stale_hooks="${stale_hooks}${stale_hooks:+, }${name}${detail}"
     fi
   done
   if [ -n "$stale_hooks" ]; then
-    out+="  - installed git hooks differ from this checkout: ${stale_hooks}"$'\n'
-    out+=$'    a stale guard does not announce itself — it just stops guarding\n'
-    out+="    ./scripts/install-hooks.sh"$'\n'
+    out+="  - installed git hooks differ from this checkout: ${stale_hooks}"$'
+'
+    if [ -n "$any_missing" ]; then
+      out+=$'    a hook that is not installed is not running â that one is off, not stale
+'
+    elif [ -n "$any_older" ]; then
+      out+=$'    the installed copy is OLDER: it is guarding by the previous rules
+'
+    else
+      out+=$'    a byte diff cannot tell a comment edit from a disabled check â reinstalling settles it
+'
+    fi
+    out+="    ./scripts/install-hooks.sh"$'
+'
   fi
 fi
 

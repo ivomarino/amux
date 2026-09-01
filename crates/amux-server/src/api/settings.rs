@@ -977,6 +977,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let router = Router::new().nest("/api/settings", routes()).with_state(state);
         (router, dir)
@@ -1235,6 +1236,13 @@ mod tests {
     /// `external_services.openai.api_key`. Same `age` fixture as
     /// `tests/secrets_decrypt.rs`; see that file's module doc for why this
     /// skips (not fails) when the `age` binary isn't on PATH.
+    // `test_env::LOCK` serializes CROSS-THREAD access to process-global env
+    // vars between test functions — each `#[tokio::test]` gets its own
+    // isolated single-test runtime, so holding a std::sync::Mutex across an
+    // .await here never blocks another task on a SHARED runtime the way
+    // clippy's lint is warning about; it just holds the OS thread for this
+    // one test's duration, which is the serialization this lock exists for.
+    #[allow(clippy::await_holding_lock)]
     #[tokio::test]
     async fn get_env_falls_back_to_the_encrypted_store_when_unset_elsewhere() {
         if tokio::process::Command::new("age").arg("--version").output().await.is_err() {
@@ -1264,6 +1272,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let app = Router::new().nest("/api/settings", routes()).with_state(state);
 

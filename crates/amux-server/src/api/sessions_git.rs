@@ -453,6 +453,7 @@ mod tests {
             build_hash: "test".into(),
             auth_token: None,
             secrets: std::sync::Arc::new(crate::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
         // Seed a KNOWN-WRONG value with an old timestamp, the way a stale entry
@@ -508,6 +509,7 @@ mod tests {
             build_hash: "test".into(),
             auth_token: None,
             secrets: std::sync::Arc::new(crate::secrets::SecretStore::new(std::path::PathBuf::new(), std::path::PathBuf::new())),
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let disposition = |r: &Response| {
             r.headers()

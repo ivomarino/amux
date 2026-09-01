@@ -713,6 +713,7 @@ mod tests {
             started: Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let app = axum::Router::new()
             .nest("/api/usage", routes_with(probe_fn(UsageProbe::Ok(json!({})), Arc::new(AtomicUsize::new(0)))))
@@ -851,6 +852,7 @@ mod tests {
             started: Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         Router::new()
             .nest("/api/usage", routes_with(probe))

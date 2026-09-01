@@ -309,6 +309,13 @@
   .orch-plan-inc { display: flex; align-items: center; gap: 6px; font-size: 0.85rem; cursor: pointer; }
   .orch-plan-worker { font-weight: 600; color: var(--accent); }
   .orch-plan-why { font-size: 0.7rem; color: var(--dim); text-align: right; }
+  /* WHICH ACTION this row is (AMUX-2984). The plan used to be send-only, so a
+     row needed no type; now a card, a message and a `stop` sit in one list and
+     the reader is approving all three from the same checkbox. `flex-shrink:0`
+     because at 375px the why-text is what should wrap, not the verb. */
+  .orch-plan-act { font-size: 0.68rem; color: var(--dim); background: var(--card);
+    border: 1px solid var(--border); border-radius: 4px; padding: 1px 6px;
+    white-space: nowrap; flex-shrink: 0; }
   .orch-plan-msg { width: 100%; font-size: 0.85rem; padding: 6px 8px; border-radius: 6px;
     border: 1px solid var(--border); background: var(--card); color: var(--text); font-family: inherit;
     box-sizing: border-box; resize: vertical; }
@@ -1992,6 +1999,19 @@
     background: none; border: none; color: var(--text); font-size: 0.85rem; padding: 9px 10px;
     border-radius: 6px; cursor: pointer; white-space: nowrap; -webkit-tap-highlight-color: transparent; }
   .peek-more-menu button:hover { background: var(--bg); }
+  /* The one destructive entry. A rule above it rather than a colour alone,
+     because on the phone this menu is a thumb-sized stack of near-identical
+     rows and "Clear input" is the only one that throws work away. The tint is
+     deliberately mild: this is not an error state, it is a reminder to aim. */
+  .peek-more-menu button.peek-more-danger { color: var(--red, #d9534f); margin-top: 4px;
+    padding-top: 11px; border-top: 1px solid var(--border); border-radius: 0 0 6px 6px; }
+  .peek-more-menu button.peek-more-danger:hover { background: rgba(217,83,79,0.12); }
+  /* 44px touch targets on the phone (.claude/rules/css-mobile.md). The desktop
+     padding gives ~34px, which is under the minimum on exactly the surface this
+     menu is mostly used from. */
+  @media (max-width: 600px) {
+    .peek-more-menu button { min-height: 44px; padding: 11px 12px; }
+  }
   /* Expand-to-fullscreen affordance inside the input's top-right corner */
   #peek-cmd-input { padding-right: 30px; }
   .peek-input-expand { position: absolute; top: 5px; right: 5px; z-index: 3; line-height: 1;
@@ -5791,4 +5811,32 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 @media (max-width: 600px) {
   .board-archived-section { margin-top: 8px; }
   .board-archived-row { padding: 10px; }
+}
+
+/* Declare-a-connector form (AMUX-3990). Grid collapses to one column under the
+   existing 600px breakpoint; inputs are 44px tall so they are touch targets on
+   the phone PWA, which is the primary surface. */
+.conn-add { margin: 10px 0 14px; }
+.conn-add-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 8px 12px;
+  margin-bottom: 8px;
+}
+.conn-add-grid label {
+  display: flex; flex-direction: column; gap: 4px;
+  font-size: .85em; color: var(--dim);
+}
+.conn-add-grid input, .conn-add-grid select {
+  min-height: 44px;
+  padding: 6px 8px;
+  border: 1px solid var(--border, #333);
+  border-radius: 6px;
+  background: var(--bg2, #1a1a1a);
+  color: inherit;
+  font-size: .95em;
+  min-width: 0;
+}
+@media (max-width: 600px) {
+  .conn-add-grid { grid-template-columns: 1fr; }
 }

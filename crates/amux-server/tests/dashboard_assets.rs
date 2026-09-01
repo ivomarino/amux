@@ -185,3 +185,34 @@ fn no_two_top_level_functions_in_app_js_share_a_name() {
         dupes.join(", ")
     );
 }
+
+/// THE AUTO-COMPACT COPY MUST STATE THE REAL THRESHOLD (AMUX-3857).
+///
+/// `COMPACT_BELOW_PCT_REMAINING`'s own doc says it is "named so the policy, its
+/// tests, and any UI copy cannot drift apart". The UI copy was a hardcoded
+/// literal that never read it, so it drifted anyway: the toggle promised
+/// "context < 50%" while the trigger fires below 15% remaining. An operator
+/// watched a lane fall from 50% to 13% with auto-compact ENABLED and correctly
+/// concluded it was broken — it was working, at a number the UI did not say.
+///
+/// A comment asking two files to agree is not a mechanism. This is.
+#[test]
+fn the_auto_compact_copy_states_the_threshold_the_server_actually_uses() {
+    let html = asset("index.html");
+    let pct = amux_server::orchestrator::compaction::COMPACT_BELOW_PCT_REMAINING;
+    let line = html
+        .lines()
+        .find(|l| l.contains("Send /compact when context"))
+        .expect("the auto-compact help copy must exist — if it moved, this check is now blind");
+    assert!(
+        line.contains(&format!("{pct}%")),
+        "the toggle's copy must name the real trigger ({pct}% remaining), got: {line}"
+    );
+    // CONTROL: the old wrong number must not be what satisfies it. Without this
+    // a copy saying "50%" passes the moment somebody sets the constant to 50
+    // for an unrelated reason.
+    assert!(
+        !line.contains("50%") || pct == 50,
+        "copy still names 50% while the constant is {pct}: {line}"
+    );
+}

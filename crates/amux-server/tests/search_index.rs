@@ -24,6 +24,7 @@ fn app() -> (axum::Router, Arc<Store>, tempfile::TempDir) {
         started: std::time::Instant::now(),
         build_hash: "test".into(),
         auth_token: None,
+    reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
     };
     (router(state), store, dir)
 }
@@ -342,4 +343,51 @@ async fn archived_cards_stay_searchable_and_carry_the_flag() {
     let (_, v) = get(&app, "/api/search?q=aardvark").await;
     assert_eq!(hit_ids(&v), vec!["T-1"], "archived cards must remain findable: {v}");
     assert_eq!(v["hits"][0]["meta"]["archived"], 1, "the flag must ride along so a client can filter: {v}");
+}
+
+/// TG-3303: a zero from search must say whether the measurement RAN.
+///
+/// ts-gke searched for a card they had created two hours earlier, got
+/// `{"hits":[]}` with HTTP 200, and were one step from re-filing a peer's work
+/// as untracked. Only a known-positive control — searching for a card id they
+/// had personally created that evening — told them the instrument was dead
+/// rather than the data absent.
+///
+/// What makes it worse than a papercut: `/api/board` REFUSES `q=` with a 400
+/// whose own text redirects the caller here. So the documented way to find a
+/// card by content was the one that could silently answer "nothing", and a
+/// caller following the documentation had no reason to doubt the zero. A
+/// silently-empty search does not fail, it AGREES WITH YOU, which makes every
+/// "no prior art exists, I will build it" decision through it unfalsifiable.
+///
+/// THREE CELLS, and the third is the one that stops this being a blunt "503 on
+/// any zero" that would break every legitimate no-match search.
+#[tokio::test]
+async fn an_empty_index_is_an_error_and_a_real_no_match_is_not() {
+    let (app, store, _d) = app();
+
+    // CELL 1 — nothing indexed at all. This cannot answer any query, so a 200
+    // with an empty list is the lie. It is a 503 naming the repair.
+    let (st, v) = get(&app, "/api/search?q=anything").await;
+    assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE, "an empty index must not serve a quiet zero: {v}");
+    assert_eq!(v["index_docs"], serde_json::json!(0));
+    assert!(v["error"].as_str().unwrap_or_default().contains("empty"), "{v}");
+    assert!(v["fix"].as_str().unwrap_or_default().contains("reindex"), "name the repair: {v}");
+
+    card(&store, "AM-1", "tunnel relay port", "the long-poll client", None);
+
+    // CELL 2 — the positive control. Without it, a handler that 503'd
+    // everything would pass cell 1 and cell 3 both.
+    let (st, v) = get(&app, "/api/search?q=tunnel").await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(hit_ids(&v), vec!["AM-1"], "{v}");
+
+    // CELL 3 — a REAL no-match, which must stay a 200. The index has documents
+    // and none of them match, and that is a legitimate answer to a legitimate
+    // question. `index_docs` rides along so the caller can tell this zero from
+    // cell 1's without running a control of their own.
+    let (st, v) = get(&app, "/api/search?q=zzzzznotathing").await;
+    assert_eq!(st, StatusCode::OK, "a genuine no-match is not an error: {v}");
+    assert_eq!(v["hits"].as_array().map(Vec::len), Some(0));
+    assert_eq!(v["index_docs"], serde_json::json!(1), "the zero must publish what was searched: {v}");
 }

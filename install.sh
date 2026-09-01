@@ -130,9 +130,41 @@ else
 #
 # Lowest precedence of cargo's three: CARGO_TARGET_DIR and --target-dir still
 # override it, which is what keeps the e2e worktree build and CI unaffected.
+#
+# incremental=false (FRONT-2, 2026-08-28): cargo's default parallelism (=
+# nproc) correlated with repeated session crashes on one memory-constrained
+# box in this fleet — every tmux session in a shared checkout lives in the
+# same container, so a kill under memory pressure is not necessarily the
+# build's own process; it can reap an unrelated session's Claude Code
+# process as collateral. Measured the actual culprit rather than guessing:
+# with incremental compilation on, a bare \`cargo check -p amux-server\`
+# drove available memory to ~48MiB and crashed the session; with
+# CARGO_INCREMENTAL=0, the identical check completed clean at ~195MiB
+# available. Incremental trades memory for faster rebuilds by keeping extra
+# state between runs — on a box this size that trade isn't affordable.
+# Costs slower rebuilds everywhere, but that cost doesn't scale with fleet
+# size the way serializing every lane's build would, so it applies
+# unconditionally rather than behind a knob.
 [build]
 target-dir = "$SHARED_TARGET_DIR"
+incremental = false
 EOF
+  # jobs cap: opt-in, NOT unconditional like incremental above. Cargo's
+  # default (jobs = nproc) is correct almost everywhere in this fleet — one
+  # constrained box needing jobs=1 does not mean every box should serialize.
+  # The pre-commit hook runs `cargo check --workspace --all-targets` on
+  # every commit across ~50 shared-checkout lanes; hardcoding jobs=1 here
+  # would take that gate from N-way to 1-way parallelism for all of them on
+  # boxes with no memory pressure at all — a permanent, fleet-wide cost to
+  # fix a condition that exists on one box. Same shape this repo already
+  # uses for other machine-specific policy constants (AMUX_HELPER_MODEL,
+  # AMUX_OLLAMA_DEFAULT_MODEL, deviation D4): env-overridable, so a
+  # constrained box sets it once (`AMUX_CARGO_JOBS=1 ./install.sh`) and
+  # nobody else pays for it.
+  if [[ -n "${AMUX_CARGO_JOBS:-}" ]]; then
+    printf 'jobs = %s\n' "$AMUX_CARGO_JOBS" >> "$SCRIPT_DIR/.cargo/config.toml"
+    say "cargo config: jobs capped at $AMUX_CARGO_JOBS (AMUX_CARGO_JOBS set)"
+  fi
   say "cargo config: builds in this checkout target $SHARED_TARGET_DIR"
 fi
 
@@ -283,19 +315,85 @@ else
 fi
 
 # ── 5. Service ──────────────────────────────────────────────────────────────
+if [[ "$OS" == "Linux" ]] && command -v systemctl &>/dev/null; then
+  # envsubst ships in gettext-base (Debian/Ubuntu) / gettext (Fedora), not
+  # always present on a minimal install — checked explicitly (review
+  # @esteininger, PR #166) alongside the other tool checks above (cargo,
+  # tmux, herdr) instead of letting it fail inside the `|| die` below with
+  # a message that names the template, not the missing package.
+  command -v envsubst >/dev/null 2>&1 || die "envsubst required (apt install gettext-base / dnf install gettext)"
+
+  # Create systemd user services from templates.
+  SYSTEMD_DIR="$HOME/.config/systemd/user"
+  mkdir -p "$SYSTEMD_DIR"
+
+  # Substitute variables in service templates and write to systemd directory.
+  # Export variables so envsubst can find them.
+  export BIN_DIR PORT AMUX_HOME SCRIPT_DIR
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-server.service.template" \
+    > "$SYSTEMD_DIR/amux-server.service" || die "failed to create amux-server.service"
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-builder.service.template" \
+    > "$SYSTEMD_DIR/amux-builder.service" || die "failed to create amux-builder.service"
+
+  envsubst < "$SCRIPT_DIR/scripts/amux-builder.timer.template" \
+    > "$SYSTEMD_DIR/amux-builder.timer" || die "failed to create amux-builder.timer"
+
+  # playwright-mcp: a template unit (%i = "<lane>-<port>"), one instance per
+  # browser-automation lane. envsubst only needs to fill $SCRIPT_DIR here —
+  # the wrapper script (amux-playwright-mcp.sh) resolves %i into a port and
+  # a per-lane profile dir at run time.
+  envsubst '$SCRIPT_DIR' < "$SCRIPT_DIR/scripts/amux-playwright-mcp@.service.template" \
+    > "$SYSTEMD_DIR/amux-playwright-mcp@.service" || die "failed to create amux-playwright-mcp@.service"
+  chmod +x "$SCRIPT_DIR/scripts/amux-playwright-mcp.sh"
+
+  # Reload systemd to recognize the new units.
+  systemctl --user daemon-reload || die "systemctl daemon-reload failed"
+
+  say "systemd user services created:"
+  say "  $SYSTEMD_DIR/amux-server.service"
+  say "  $SYSTEMD_DIR/amux-builder.service"
+  say "  $SYSTEMD_DIR/amux-builder.timer"
+  say "  $SYSTEMD_DIR/amux-playwright-mcp@.service (template — one instance per lane)"
+  echo ""
+  say "Next: enable and start the services"
+  echo "  ${DIM}systemctl --user enable amux-server${RESET}"
+  echo "  ${DIM}systemctl --user enable amux-builder.timer${RESET}"
+  echo "  ${DIM}systemctl --user start amux-server${RESET}"
+  echo ""
+  say "Playwright MCP lanes (edit ports/lanes to match your fleet):"
+  echo "  ${DIM}for i in frontstage-8931 synthesia-8932 backstage-8933 amux-8934 infra-8935; do${RESET}"
+  echo "  ${DIM}  systemctl --user enable --now amux-playwright-mcp@\$i.service${RESET}"
+  echo "  ${DIM}done${RESET}"
+  echo ""
+  say "View logs: ${DIM}journalctl --user -u amux-server -f${RESET}"
+  echo ""
+  echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
+  echo ""
+  say "See docs/systemd-setup.md for full documentation"
+  echo ""
+  # Deliberate, not incidental (review @esteininger, PR #166): this path
+  # never starts the server — it prints the enable/start commands above and
+  # exits — so there is nothing running yet to wait on. The macOS path
+  # below this one DOES start the service and polls /health before
+  # declaring success; saying so here keeps the two honest with each other
+  # instead of leaving Linux users to notice the asymmetry on their own.
+  say "Unlike the macOS path, this installer does not start the service or"
+  say "verify /health on Linux — run the two 'systemctl --user' commands"
+  say "above, then check https://localhost:$PORT/health yourself."
+  exit 0
+fi
+
+# Non-systemd Linux or unsupported OS.
 if [[ "$OS" != "Darwin" ]]; then
-  # Honest degrade: no launchd here, and pretending to manage systemd from a
-  # bash installer is how services half-exist. Print exactly what to run.
-  warn "$OS: no service manager configured by this installer."
+  warn "$OS: systemd not detected. No service manager configured."
   echo ""
   echo "Run the server in the foreground:"
   echo "    AMUX_RS_PORT=$PORT $BIN_DIR/amux-server-rs"
   echo ""
   echo "Or wrap it in a systemd user unit (~/.config/systemd/user/amux.service):"
-  echo "    [Service]"
-  echo "    ExecStart=$BIN_DIR/amux-server-rs"
-  echo "    Environment=AMUX_RS_PORT=$PORT"
-  echo "    Restart=always"
+  echo "    See docs/systemd-setup.md for template"
   echo ""
   echo "Then: dashboard at ${BOLD}https://localhost:$PORT${RESET} · token in $AMUX_HOME/auth_token"
   exit 0
@@ -361,6 +459,48 @@ PLIST
   launchctl bootout "gui/$UID_N/$BUILDER_LABEL" 2>/dev/null || true
   launchctl bootstrap "gui/$UID_N" "$BUILDER_PLIST"
   say "launchd agent loaded: $BUILDER_LABEL (rebuilds + redeploys on new commits in $SCRIPT_DIR)"
+fi
+
+# ── Fleet cold-start ────────────────────────────────────────────────────────
+#
+# launchd brought back the SERVER after a reboot and nothing brought back the
+# WORKERS. On 2026-08-29 a restart left 56 of 58 non-archived workers down,
+# holding 69 cards in `doing`, until a human noticed hours later and started
+# them by hand. Every service in this installer had an owner at boot except the
+# processes the whole system exists to run (AMUX-3887).
+#
+# RunAtLoad + no KeepAlive: this is a cold-start, not a supervisor. A worker a
+# human deliberately stopped must stay stopped (ethos rule 8), and the watchdog
+# deliberately owns liveness for the server alone. Set AMUX_NO_FLEET_START=1 to
+# skip installing it.
+if [[ "${AMUX_NO_FLEET_START:-}" != "1" ]]; then
+  FLEET_LABEL="com.amux.fleet-start"
+  FLEET_PLIST="$PLIST_DIR/$FLEET_LABEL.plist"
+  cat > "$FLEET_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$FLEET_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$SCRIPT_DIR/scripts/fleet-boot.sh</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AMUX_BIN</key><string>$SCRIPT_DIR/amux</string>
+    <key>AMUX_HOME</key><string>$AMUX_HOME</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$LAUNCHD_PATH</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>$AMUX_HOME/logs/fleet-boot.log</string>
+  <key>StandardErrorPath</key><string>$AMUX_HOME/logs/fleet-boot.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$UID_N/$FLEET_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_N" "$FLEET_PLIST"
+  say "launchd agent loaded: $FLEET_LABEL (starts every non-archived worker at login; log: $AMUX_HOME/logs/fleet-boot.log)"
 fi
 
 # ── 6. Wait for /health ─────────────────────────────────────────────────────

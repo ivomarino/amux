@@ -45,7 +45,42 @@ make test       # clippy + cargo test
 
 `make run` is the command after `git pull` — it rebuilds release, installs the binary, and the launchd-managed server picks it up automatically. `make dev` is for working on migrations or features you don't want touching the live DB.
 
-**Requirements:** macOS (primary; on Linux the installer builds and installs the binaries and prints how to run the server), tmux 3.2+, and at least one of Claude Code, Codex CLI, or Gemini CLI. The Rust toolchain is installed via rustup if you don't have it (with your confirmation).
+**Requirements:** tmux 3.2+, and at least one of Claude Code, Codex CLI, or Gemini CLI. The Rust toolchain is installed via rustup if you don't have it (with your confirmation).
+
+### Linux: systemd user services
+
+On Linux with systemd (Ubuntu 22.04+, Debian 11+, Fedora 36+), `./install.sh` automatically creates and enables three user-level services:
+
+- `amux-server.service` — the main server
+- `amux-builder.service` — auto-rebuild on code changes  
+- `amux-builder.timer` — periodic rebuild check (every 60s)
+
+After `./install.sh` completes, the services are ready to start:
+
+```bash
+systemctl --user enable amux-server amux-builder.timer
+systemctl --user start amux-server
+```
+
+View logs and status:
+
+```bash
+journalctl --user -u amux-server -f      # follow logs
+systemctl --user status amux-server      # service status
+```
+
+See [docs/systemd-setup.md](docs/systemd-setup.md) for complete documentation: troubleshooting, multi-user setup, environment overrides, and migration between versions.
+
+For other Linux distributions without systemd, run the server manually:
+
+```bash
+AMUX_RS_PORT=8824 ~/.local/bin/amux-server-rs
+```
+
+**Platform support:**
+- **macOS** (primary) — `./install.sh` sets up launchd agents for automatic startup and rebuild
+- **Linux** (systemd) — `./install.sh` creates systemd user services (Ubuntu 22.04+, Debian 11+, Fedora 36+)
+- **Other Linux** — `./install.sh` builds and installs binaries; run the server manually or wrap in your process manager
 
 > **License:** [MIT + Commons Clause](LICENSE) — free to use, modify, and self-host. Commercial resale requires a separate license.
 
@@ -113,7 +148,8 @@ Write a five-line brief that states each decision and the single most
 important open question, using only the connected sources.
 ```
 
-- `sources` is a list of connections, each `{path, prompt}`. `path` is a file, a folder (expanded to its files, size-capped), or another `.mdai` file, resolved relative to the containing `.mdai` file's directory. `prompt` is the configurable edge prompt; a sensible default is filled in when a connection is created without one. A bare string entry (just the path) is also accepted and gets the default prompt.
+- `sources` is a list of connections, each `{path, prompt}`. `path` is a file, a folder (expanded to its files, size-capped), another `.mdai` file resolved relative to the containing `.mdai` file's directory, or the live amux source `amux:messages?days=N&limit=N&offset=N`. `prompt` is the configurable edge prompt; a sensible default is filled in when a connection is created without one. A bare string entry (just the path) is also accepted and gets the default prompt.
+- `amux:messages` reads user directives from `cmd_history`. With no query it uses the last 14 days. `days=N` is capped at 90. A count window like `limit=1000` has no implicit day cutoff, and `offset=N` pages backward from the newest message; rows are rendered oldest-first with `MSG-<id>` evidence labels.
 - `model` is an optional per-file override.
 - The markdown body is the node synthesis instruction. A plain markdown file with no frontmatter is a valid node with no sources.
 

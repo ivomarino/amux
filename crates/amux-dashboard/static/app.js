@@ -693,12 +693,19 @@ let _connState = null;   // 'live' | 'polling' | 'offline' — null until first 
 let _connEvents = [];
 try { _connEvents = JSON.parse(localStorage.getItem('amux_conn_events') || '[]'); } catch(e) { _connEvents = []; }
 const _CONN_SESSION_START = Date.now();
+// AMUX-3917. `hid` records whether the PAGE WAS HIDDEN at the transition.
+// Without it a backgrounded phone and a server outage are the same row: Ethan's
+// panel showed "Disconnected (offline) 4h 16m, 9:38 PM → 1:55 AM", which was an
+// iPhone asleep overnight, rendered as the largest incident on the screen. The
+// browser fires the same offline transition for both, so no amount of reading
+// the transitions can separate them; the discriminator has to be recorded AT the
+// transition or it does not exist.
 function _recordConnState(s) {
   if (s === _connState) return;
   const prev = _connState;
   _connState = s;
   if (prev === null) return;   // first observation — not a transition, don't log
-  _connEvents.push({ ts: Date.now(), from: prev, to: s });
+  _connEvents.push({ ts: Date.now(), from: prev, to: s, hid: document.hidden ? 1 : 0 });
   if (_connEvents.length > 300) _connEvents = _connEvents.slice(-300);
   try { localStorage.setItem('amux_conn_events', JSON.stringify(_connEvents)); } catch(e) {}
 }
@@ -709,7 +716,12 @@ function _connEpisodes() {
   let cur = null;
   for (const e of _connEvents) {
     if (e.to !== 'live') {
-      if (!cur) cur = { start: e.ts, worst: e.to };
+      // `hid` is absent on events stored before AMUX-3917. Undefined is carried
+      // through as UNKNOWN rather than coerced to false: "we did not look" and
+      // "we looked and the page was visible" are different facts, and reading
+      // the first as the second is what would let an old sleep keep posing as
+      // an outage with a confident new label on it.
+      if (!cur) cur = { start: e.ts, worst: e.to, hid: ('hid' in e) ? !!e.hid : null };
       else if (e.to === 'offline') cur.worst = 'offline';
     } else if (cur) {
       cur.end = e.ts; eps.push(cur); cur = null;
@@ -717,6 +729,24 @@ function _connEpisodes() {
   }
   if (cur) eps.push(cur);   // still degraded (ongoing)
   return eps.reverse();     // most recent first
+}
+
+// A momentary fallback to polling that recovered on its own is the reconnect
+// logic WORKING. Ten of them listed as incidents is what made the panel read as
+// a wall of outages; six of the ten rows on Ethan's screen were 0s or 1s.
+const _CONN_BLIP_MS = 5000;
+
+// What a row IS, separated from how it renders so it can be reasoned about (and
+// tested) without a DOM.
+//   'sleep'  — offline that began while the page was hidden: the device slept or
+//              the app was backgrounded. Not an amux outage.
+//   'blip'   — under 5s and never offline: recovered automatically.
+//   'outage' — everything else, including any offline episode we cannot attribute.
+function _connEpisodeKind(ep, now) {
+  const dur = (ep.end || now) - ep.start;
+  if (ep.worst === 'offline' && ep.hid === true) return 'sleep';
+  if (ep.worst !== 'offline' && ep.end && dur < _CONN_BLIP_MS) return 'blip';
+  return 'outage';
 }
 // _fmtDur lives once, further down. A second copy was declared here; the last
 // declaration wins in a classic script, so this one was already dead — the
@@ -791,24 +821,52 @@ function showConnHistory() {
   const eps = _connEpisodes();
   const stateLabel = { live: '● Live', polling: '● Polling', offline: '● Offline' }[_connState] || '● —';
   const stateColor = { live: '#3fb950', polling: '#facc15', offline: '#f85149' }[_connState] || 'var(--dim)';
+  const _now = Date.now();
+  const kinds = eps.map(ep => _connEpisodeKind(ep, _now));
+  const blips = eps.filter((_, i) => kinds[i] === 'blip');
+  const shown = eps.filter((_, i) => kinds[i] !== 'blip');
   let rows = '';
   if (!eps.length) {
-    rows = '<div style="color:var(--dim);font-size:0.85rem;padding:10px 2px;">No disconnections recorded on this device since ' + _fmtClock(_CONN_SESSION_START) + '. Solid connection. 🟢</div>';
+    rows = '<div style="color:var(--dim);font-size:0.85rem;padding:10px 2px;">No interruptions recorded on this device since ' + _fmtClock(_CONN_SESSION_START) + '. Solid connection. 🟢</div>';
+  } else if (!shown.length) {
+    rows = '<div style="color:var(--dim);font-size:0.85rem;padding:10px 2px;">No outages on this device since ' + _fmtClock(_CONN_SESSION_START) + '. Solid connection. 🟢</div>';
   } else {
-    rows = eps.map(ep => {
+    rows = shown.map(ep => {
+      const kind = _connEpisodeKind(ep, _now);
       const ongoing = !ep.end;
-      const dur = _fmtDur((ep.end || Date.now()) - ep.start);
+      const dur = _fmtDur((ep.end || _now) - ep.start);
       const isOff = ep.worst === 'offline';
-      const ico = isOff ? '🔴' : '🟡';
-      const label = isOff ? 'Disconnected (offline)' : 'Degraded to polling';
+      const sleep = kind === 'sleep';
+      const ico = sleep ? '🌙' : isOff ? '🔴' : '🟡';
+      const label = sleep ? 'Device asleep or app backgrounded'
+                  : isOff ? 'Disconnected (offline)'
+                  : 'Degraded to polling';
       const when = _fmtClock(ep.start) + ' → ' + (ongoing ? '<span style="color:' + (isOff ? '#f85149' : '#facc15') + '">ongoing</span>' : _fmtClock(ep.end));
+      // WHAT THE RECORD CANNOT SAY, said in the row rather than left to the
+      // reader (AMUX-3917). An offline episode stored before this build carries
+      // no visibility flag, so a sleeping phone and a real outage are the same
+      // bytes. Claiming either would be a guess; naming the gap is not.
+      const note = sleep
+        ? '<div style="color:var(--dim);font-size:0.72rem;">Not an amux outage: the browser reports offline while the page is hidden. Data resumed on wake.</div>'
+        : (isOff && ep.hid === null
+            ? '<div style="color:var(--dim);font-size:0.72rem;">Cause not recorded on this build — a sleeping or backgrounded device looks identical to an outage here.</div>'
+            : '');
       return '<div style="display:flex;gap:8px;align-items:baseline;padding:7px 2px;border-top:1px solid var(--border);font-size:0.82rem;">'
         + '<span style="flex-shrink:0;">' + ico + '</span>'
         + '<div style="flex:1;min-width:0;"><div style="font-weight:600;">' + label + '</div>'
-        + '<div style="color:var(--dim);font-size:0.76rem;">' + when + '</div></div>'
+        + '<div style="color:var(--dim);font-size:0.76rem;">' + when + '</div>' + note + '</div>'
         + '<span style="color:var(--dim);flex-shrink:0;font-variant-numeric:tabular-nums;">' + dur + '</span></div>';
     }).join('');
   }
+  // THE COUNT BESIDE THE ZERO. Folded blips are summarised, never silently
+  // dropped: "no outages" and "no data" must not render the same, and a client
+  // that starts flapping should show it as a rising number here.
+  const blipHtml = blips.length
+    ? '<div style="display:flex;gap:8px;align-items:baseline;padding:7px 2px;border-top:1px solid var(--border);font-size:0.82rem;color:var(--dim);">'
+      + '<span style="flex-shrink:0;">✅</span><div style="flex:1;min-width:0;">'
+      + blips.length + ' momentary fallback' + (blips.length === 1 ? '' : 's') + ' to polling, under '
+      + Math.round(_CONN_BLIP_MS / 1000) + 's each, recovered automatically. Not listed above.</div></div>'
+    : '';
   const pending = offlineQueue.length + drafts.length;
   const pendingHtml = pending
     ? '<div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border);font-size:0.8rem;color:var(--dim);">' + pending + ' operation' + (pending === 1 ? '' : 's') + ' queued while offline. <a href="#" onclick="event.preventDefault();document.getElementById(\'conn-hist-modal\').remove();showQueueModal();" style="color:var(--accent);">View queue</a></div>'
@@ -823,8 +881,8 @@ function showConnHistory() {
   modal.innerHTML = '<div onclick="event.stopPropagation()" style="background:var(--bg);border:1px solid var(--border);border-radius:12px;max-width:440px;width:100%;max-height:80dvh;overflow:auto;padding:1.2rem;box-shadow:0 8px 32px rgba(0,0,0,0.4);">'
     + '<div style="display:flex;align-items:center;gap:8px;margin-bottom:4px;"><b style="font-size:1rem;flex:1;">Connection</b>'
     + '<span style="color:' + stateColor + ';font-size:0.82rem;font-weight:600;">' + stateLabel + '</span></div>'
-    + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Disconnections from this device (this browser)</div>'
-    + _pingWidgetHtml() + rows + pendingHtml + clearHtml + '</div>';
+    + '<div style="color:var(--dim);font-size:0.76rem;margin-bottom:10px;">Connection interruptions on this device (this browser)</div>'
+    + _pingWidgetHtml() + rows + blipHtml + pendingHtml + clearHtml + '</div>';
   document.body.appendChild(modal);
 }
 
@@ -2117,7 +2175,24 @@ const _origFetch = window.fetch.bind(window);
 // Never queue interactive/ephemeral endpoints: telemetry, speed tests, live
 // terminal keystrokes, uploads (bodies too big for localStorage), login and
 // tunnel flows, and request/response helpers whose answer the UI needs NOW.
-const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser)/;
+// `files/mdai/run` joined this list for BOTH of the reasons the comment above
+// gives, and it is the clearest case of each (AF-371).
+//
+// ANSWER NEEDED NOW: an mdai run's whole product is the output the panel is
+// about to render. A synthetic 202 hands the panel `{ok:true,queued:true}`,
+// which has no output in it, and the run silently never happened.
+//
+// TOO EXPENSIVE TO REPLAY: a run is a chain of model calls, measured at 82-127s
+// on Priorities.mdai. Replaying it from the outbox hours later spends that again
+// on a question nobody is still asking, against sources that have since moved.
+// It is not idempotent in cost even where it is in effect.
+//
+// This is reachable on the ORDINARY path here, not on a real outage: the
+// auto-builder restarts the server on every commit, so any run straddling a
+// deploy has its fetch fail, get queued, and report success. Ethan saw the two
+// halves separately — "mdai files are stuck at running", and a banner reading
+// `Syncing 0/1 · POST /api/files/mdai/run` that never cleared.
+const _OUTBOX_SKIP = /\/api\/(client-debug|speedtest|tts|lookup|sql|suggest-branch|terminal\/|upload|fs\/upload|sessions\/login\/|tunnel\/|push\/test|browser|files\/mdai\/run)/;
 const _OUTBOX_METHODS = { POST: 1, PATCH: 1, PUT: 1, DELETE: 1 };
 function _outboxQueueable(url, init) {
   if (!url || typeof url !== 'string') return false;
@@ -4665,29 +4740,79 @@ async function _orchPlan() {
     list.innerHTML = '<div style="color:#f85149;padding:12px;">' + esc(e.message || 'error') + '</div>';
   }
 }
+// The plan is no longer send-only (AMUX-2984). An entry is a send, a board
+// action (create a card, or append a note to an existing one) or a lifecycle
+// verb. `action` is absent on entries from an older server, and that means
+// send — the shape this endpoint had for its first two weeks.
+//
+// Each type keeps ONE editable field, because the review step is where a
+// misheard word gets corrected and a field you cannot edit is a field you have
+// to reject and re-record.
+function _orchEditableOf(p) {
+  const a = p.action || 'send';
+  if (a === 'board') return p.card ? 'note' : 'title';
+  if (a === 'verb') return null;              // a verb has nothing to word
+  return 'message';
+}
+function _orchLabelOf(p) {
+  const a = p.action || 'send';
+  if (a === 'board') return p.card ? 'note on ' + p.card : 'new card';
+  if (a === 'verb') return p.verb;
+  return 'message';
+}
 function _orchRenderPlan(d) {
-  _orchPlanData = (d.plan || []).map((p, i) => ({ worker: p.worker, message: p.message, why: p.why || '', include: true, idx: i }));
+  _orchPlanData = (d.plan || []).map((p, i) => ({
+    action: p.action || 'send', worker: p.worker, message: p.message || '',
+    title: p.title || '', card: p.card || '', note: p.note || '', verb: p.verb || '',
+    why: p.why || '', include: true, idx: i,
+  }));
   const summary = document.getElementById('orch-plan-summary');
   const list = document.getElementById('orch-plan-list');
   const drop = document.getElementById('orch-plan-dropped');
   const sendBtn = document.getElementById('orch-send-btn');
-  if (drop) drop.textContent = (d.dropped_unknown_workers && d.dropped_unknown_workers.length)
-    ? '⚠ dropped unknown worker(s): ' + d.dropped_unknown_workers.join(', ') : '';
+  // EVERY DROPPED CLASS, SEPARATELY. A refused verb is amux declining something
+  // it understood; an unknown worker is a mis-hearing. Collapsing them would
+  // tell the reader something was discarded without telling them whether the
+  // command needs re-wording or was simply not allowed.
+  if (drop) {
+    const bits = [];
+    if ((d.dropped_unknown_workers || []).length) bits.push('unknown worker(s): ' + d.dropped_unknown_workers.join(', '));
+    if ((d.dropped_unknown_cards || []).length) bits.push('unknown card(s): ' + d.dropped_unknown_cards.join(', '));
+    if ((d.dropped_unknown_verbs || []).length) bits.push('not a verb: ' + d.dropped_unknown_verbs.join(', '));
+    if ((d.refused_verbs || []).length) bits.push('refused from voice: ' + d.refused_verbs.join(', ')
+      + ' (do these by hand; only ' + (d.verbs_available || []).join('/') + ' are voice-proposable)');
+    drop.textContent = bits.length ? '⚠ ' + bits.join(' · ') : '';
+  }
   if (!_orchPlanData.length) {
-    if (summary) summary.textContent = 'No workers matched';
-    list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">The router did not find a worker for this command. Edit the wording above (Re-record → edit) and re-route, or start over.</div>';
+    // AN EMPTY PLAN AFTER A REFUSAL IS NOT "NOTHING MATCHED". Measured live:
+    // "delete the tubescience worker" produced an empty plan because the router
+    // understood it perfectly and declined, and this branch told the human the
+    // opposite — that it had not found a worker. Say which happened.
+    const ref = d.refused_verbs || [];
+    if (ref.length) {
+      if (summary) summary.textContent = 'Understood, and refused';
+      list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">amux will not take <b>'
+        + esc(ref.join(', ')) + '</b> from a spoken command &mdash; a misheard word is too cheap for an action that expensive. '
+        + 'Only <b>' + esc((d.verbs_available || []).join(', ')) + '</b> are voice-proposable; do this one by hand.</div>';
+    } else {
+      if (summary) summary.textContent = 'No workers matched';
+      list.innerHTML = '<div style="color:var(--dim);padding:14px;text-align:center;">The router did not find a worker for this command. Edit the wording above (Re-record → edit) and re-route, or start over.</div>';
+    }
     if (sendBtn) sendBtn.style.display = 'none';
     return;
   }
   if (sendBtn) sendBtn.style.display = '';
-  if (summary) summary.innerHTML = _orchPlanData.length + ' message' + (_orchPlanData.length === 1 ? '' : 's')
-    + ' &mdash; review, edit, then send' + (d.via ? ' <span style="color:var(--dim);font-size:0.7rem;">via ' + esc(d.via) + '</span>' : '');
-  list.innerHTML = _orchPlanData.map(p =>
-    '<div class="orch-plan-item" data-idx="' + p.idx + '">'
-    + '<div class="orch-plan-top"><label class="orch-plan-inc"><input type="checkbox" checked onchange="_orchToggleInc(' + p.idx + ',this.checked)"> <span class="orch-plan-worker">' + esc(p.worker) + '</span></label>'
-    + (p.why ? '<span class="orch-plan-why">' + esc(p.why) + '</span>' : '') + '</div>'
-    + '<textarea class="orch-plan-msg" rows="2" oninput="_orchEditMsg(' + p.idx + ',this.value)">' + esc(p.message) + '</textarea>'
-    + '</div>').join('');
+  if (summary) summary.innerHTML = _orchPlanData.length + ' action' + (_orchPlanData.length === 1 ? '' : 's')
+    + ' &mdash; review, edit, then run' + (d.via ? ' <span style="color:var(--dim);font-size:0.7rem;">via ' + esc(d.via) + '</span>' : '');
+  list.innerHTML = _orchPlanData.map(p => {
+    const f = _orchEditableOf(p);
+    return '<div class="orch-plan-item" data-idx="' + p.idx + '">'
+      + '<div class="orch-plan-top"><label class="orch-plan-inc"><input type="checkbox" checked onchange="_orchToggleInc(' + p.idx + ',this.checked)"> <span class="orch-plan-worker">' + esc(p.worker) + '</span></label>'
+      + '<span class="orch-plan-act">' + esc(_orchLabelOf(p)) + '</span>'
+      + (p.why ? '<span class="orch-plan-why">' + esc(p.why) + '</span>' : '') + '</div>'
+      + (f ? '<textarea class="orch-plan-msg" rows="2" oninput="_orchEditMsg(' + p.idx + ',this.value)">' + esc(p[f]) + '</textarea>' : '')
+      + '</div>';
+  }).join('');
   _orchUpdateSendBtn();
 }
 function _orchToggleInc(idx, on) {
@@ -4695,33 +4820,62 @@ function _orchToggleInc(idx, on) {
   document.querySelector('.orch-plan-item[data-idx="' + idx + '"]')?.classList.toggle('excluded', !on);
   _orchUpdateSendBtn();
 }
-function _orchEditMsg(idx, v) { const p = _orchPlanData.find(x => x.idx === idx); if (p) p.message = v; }
+function _orchEditMsg(idx, v) {
+  const p = _orchPlanData.find(x => x.idx === idx); if (!p) return;
+  const f = _orchEditableOf(p); if (f) p[f] = v;
+}
+// A verb has no text, so "has text" cannot be the readiness test any more —
+// that would silently exclude every verb from the count and the run.
+function _orchReady(p) {
+  const f = _orchEditableOf(p);
+  return p.include && (!f || (p[f] || '').trim() !== '');
+}
 function _orchUpdateSendBtn() {
-  const n = _orchPlanData.filter(p => p.include && p.message.trim()).length;
+  const n = _orchPlanData.filter(_orchReady).length;
   const b = document.getElementById('orch-send-btn');
-  if (b) { b.textContent = 'Send ' + n + ' message' + (n === 1 ? '' : 's'); b.disabled = n === 0; }
+  if (b) { b.textContent = 'Run ' + n + ' action' + (n === 1 ? '' : 's'); b.disabled = n === 0; }
+}
+// Each action goes through the endpoint that ALREADY owns it — send, board,
+// session verb. The orchestrator composes primitives; it does not grow a
+// private execution path, and every one of these carries the same attribution
+// and gates a human clicking the same button by hand would get.
+function _orchRequestFor(p) {
+  const w = encodeURIComponent(p.worker);
+  if (p.action === 'board' && p.card) {
+    return { url: API + '/api/board/' + encodeURIComponent(p.card), method: 'PATCH',
+             body: { desc_append: '`voice` ' + p.note } };
+  }
+  if (p.action === 'board') {
+    return { url: API + '/api/board', method: 'POST',
+             body: { title: p.title, session: p.worker, status: 'todo' } };
+  }
+  if (p.action === 'verb') {
+    return { url: API + '/api/sessions/' + w + '/' + encodeURIComponent(p.verb), method: 'POST', body: {} };
+  }
+  return { url: API + '/api/sessions/' + w + '/send', method: 'POST',
+           body: { text: p.message, record_history: true, deliver_now: true } };
 }
 async function _orchSendAll() {
-  const items = _orchPlanData.filter(p => p.include && p.message.trim());
+  const items = _orchPlanData.filter(_orchReady);
   if (!items.length) return;
-  const btn = document.getElementById('orch-send-btn'); if (btn) { btn.disabled = true; btn.textContent = 'Sending…'; }
+  const btn = document.getElementById('orch-send-btn'); if (btn) { btn.disabled = true; btn.textContent = 'Running…'; }
   const results = [];
   for (const p of items) {
+    const label = p.worker + ' · ' + _orchLabelOf(p);
     try {
-      const r = await fetch(API + '/api/sessions/' + encodeURIComponent(p.worker) + '/send',
-        { method: 'POST', headers: _authHeaders({ 'Content-Type': 'application/json' }),
-          body: JSON.stringify({ text: p.message, record_history: true, deliver_now: true }) });
+      const q = _orchRequestFor(p);
+      const r = await fetch(q.url, { method: q.method, headers: _authHeaders({ 'Content-Type': 'application/json' }), body: JSON.stringify(q.body) });
       const d = await r.json().catch(() => ({}));
-      results.push({ worker: p.worker, ok: r.ok && d.ok !== false, msg: d.error || (typeof d.msg === 'string' ? d.msg : '') || (r.ok ? 'sent' : 'failed') });
-    } catch (e) { results.push({ worker: p.worker, ok: false, msg: e.message || 'error' }); }
+      results.push({ label, ok: r.ok && d.ok !== false, msg: d.error || (typeof d.msg === 'string' ? d.msg : '') || (r.ok ? 'done' : 'failed') });
+    } catch (e) { results.push({ label, ok: false, msg: e.message || 'error' }); }
   }
   const ok = results.filter(r => r.ok).length;
   _orchShowStep('');
   const res = document.getElementById('orch-result');
   if (res) {
     res.style.display = '';
-    res.innerHTML = '<div class="orch-label">Sent ' + ok + ' of ' + results.length + '</div>'
-      + results.map(r => '<div class="orch-res-row ' + (r.ok ? 'ok' : 'bad') + '">' + (r.ok ? '&#10003;' : '&#10007;') + ' <b>' + esc(r.worker) + '</b> <span style="color:var(--dim);">' + esc(r.msg) + '</span></div>').join('')
+    res.innerHTML = '<div class="orch-label">Ran ' + ok + ' of ' + results.length + '</div>'
+      + results.map(r => '<div class="orch-res-row ' + (r.ok ? 'ok' : 'bad') + '">' + (r.ok ? '&#10003;' : '&#10007;') + ' <b>' + esc(r.label) + '</b> <span style="color:var(--dim);">' + esc(r.msg) + '</span></div>').join('')
       + '<div class="orch-actions" style="margin-top:12px;"><button class="btn" onclick="_orchReset()">Orchestrate again</button><button class="btn primary" onclick="_orchClose()">Done</button></div>';
   }
 }
@@ -4783,7 +4937,8 @@ function editField(session, field, current, provider) {
       {v:'claude-haiku-4-5-20251001',l:'claude-haiku-4-5-20251001'}
     ];
     const codexModels = [
-      {v:'',l:'Default'},{v:'gpt-5.5',l:'gpt-5.5'},{v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
+      {v:'',l:'Default'},{v:'gpt-5.6-sol',l:'GPT-5.6 Sol'},{v:'gpt-5.5',l:'gpt-5.5'},
+      {v:'o3',l:'o3'},{v:'o4-mini',l:'o4-mini'},
       {v:'gpt-4o',l:'gpt-4o'},{v:'gpt-4.1',l:'gpt-4.1'},{v:'gpt-4.1-mini',l:'gpt-4.1-mini'}
     ];
     const geminiModels = [
@@ -5429,6 +5584,43 @@ function hidePeekLoading() {
   if (ind) ind.style.display = 'none';
 }
 
+/// Does `text` already open with a send-time stamp this client wrote?
+///
+/// The stamp shape is `[<clock time>[ <author>]] `, so the discriminator is a
+/// CLOCK TIME immediately inside the leading bracket. Deliberately not "starts
+/// with a bracket": `[urgent] ship this` is an ordinary message and must still
+/// get stamped. AM/PM is optional because `toLocaleTimeString` drops it in a
+/// 24-hour locale, and the stamp has to be recognised in the same locale that
+/// wrote it.
+function _hasSendTimeStamp(text) {
+  return /^\[\s*\d{1,2}:\d{2}(?::\d{2})?\s*(?:[AP]\.?M\.?)?[^\]]*\]\s/i.test(text || '');
+}
+
+/// Prefix `text` with the send time, ONCE.
+///
+/// Idempotent on purpose. Re-sending a message that already carries a stamp is
+/// ordinary: Ethan re-asks by pasting the text back out of the transcript, and
+/// the offline queue replays a payload that was already built. Both used to
+/// produce a nested stamp, measured live on MSG-35221, whose stored text is
+///
+///   "[10:00 AM] [11:32 PM] where are we at with all of the items ..."
+///
+/// The inner one is 10.5 hours stale and reaches the model as message CONTENT,
+/// because the reader strips a SINGLE leading stamp (`strip_context_wrapper`,
+/// opencode/events.rs) and the survivor looks exactly like a real one. So the
+/// lane is told a time that is not when the message was sent, and cannot tell
+/// which of the two is now.
+///
+/// Returning the text unchanged rather than restamping it is the deliberate
+/// choice: the FIRST stamp is the one that was true when a human typed it, and
+/// a replay from the offline queue should not claim to have been sent at replay
+/// time.
+function _stampSendTime(text, now, author) {
+  if (_hasSendTimeStamp(text)) return text;
+  const ts = (now || new Date()).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: true});
+  return `[${ts}${author ? ` ${author}` : ''}] ${text}`;
+}
+
 async function doSend(name, text) {
   showSendingIndicator();
   // OPTIMISTIC STATUS (Ethan, 2026-08-16: "very snappy"). Flip to working the
@@ -5447,13 +5639,7 @@ async function doSend(name, text) {
   // Slash commands (e.g. /clear, /compact) must be sent verbatim — no timestamp prefix
   const isSlashCmd = /^\/[a-z]/.test(text.trim());
   amuxTrack('message_sent', { session: name, is_slash: isSlashCmd, cmd: isSlashCmd ? text.trim().split(/\s+/)[0] : null, length: text.length });
-  let payload = text;
-  if (!isSlashCmd) {
-    const now = new Date();
-    const ts = now.toLocaleTimeString([], {hour: '2-digit', minute: '2-digit', hour12: true});
-    const author = _cloudEmail ? ` ${_cloudEmail}` : '';
-    payload = `[${ts}${author}] ${text}`;
-  }
+  const payload = isSlashCmd ? text : _stampSendTime(text, new Date(), _cloudEmail);
   // One msg_id per logical send, reused verbatim by the offline-queue replay:
   // the server dedups on it, so a retry after a lost response (e.g. the
   // server restarted mid-request AFTER the keys landed) can't deliver twice.
@@ -7263,6 +7449,144 @@ function setPeekIssuesView(mode) {
   renderPeekIssues();
 }
 
+/// Export THIS worker's board, from the server, with complete descriptions.
+///
+/// Deliberately not the client-side `exportBoard()` the main Board tab uses.
+/// That one exports what is rendered, and the rendered rows carry `desc_head`
+/// because `GET /api/board` never sends `desc` (AMUX-3861). On a worker page
+/// the thing you want is that worker's cards IN FULL, which only the server can
+/// produce — so this hits `/api/board/export` and lets the browser download the
+/// response.
+///
+/// Honours the "This worker / All workers" toggle rather than ignoring it: the
+/// scope you can see in the panel is the scope you get in the file, and the
+/// export's own header restates it so the file is readable out of context.
+function exportPeekBoard(fmt) {
+  const scoped = !_peekIssuesAllSessions && peekSession;
+  const qs = new URLSearchParams({ format: fmt });
+  if (scoped) qs.set('worker', peekSession);
+  const url = _authUrl('/api/board/export?' + qs.toString());
+  const a = document.createElement('a');
+  a.href = url;
+  // The server sets Content-Disposition with the filename; this attribute only
+  // matters if that header is ever dropped by a proxy.
+  a.download = '';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  showToast(`Exporting ${scoped ? peekSession + "'s" : 'the whole'} board as ${fmt.toUpperCase()} (full descriptions)`);
+}
+
+// ── Board nudges panel ──────────────────────────────────────────────────────
+// Reads/writes CC_STANDING_ORDERS at global, group, or worker scope via
+// GET/PATCH /api/board/nudges. The panel opens from the toolbar "Nudges" button.
+
+let _nudgesState = null;   // last GET /api/board/nudges response
+
+async function _nudgesLoad() {
+  try {
+    const r = await fetch(API + '/api/board/nudges', { headers: _authHeaders() });
+    _nudgesState = await r.json();
+  } catch (e) { _nudgesState = null; }
+  _nudgesRender();
+}
+
+function _nudgesRow(label, enabled, level, name) {
+  // Use data attributes so onclick strings stay simple and quote-safe.
+  const on = enabled !== false;
+  return '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;padding:4px 0;border-bottom:1px solid var(--border);">'
+    + '<span style="color:var(--text);font-size:0.76rem;">' + esc(label) + '</span>'
+    + '<button class="btn' + (on ? '' : ' primary') + '" data-nlvl="' + esc(level) + '" data-nname="' + esc(name || '') + '" data-nen="' + (!on) + '" style="font-size:0.7rem;min-height:28px;padding:3px 9px;flex:0 0 auto;" onclick="_nudgesRowClick(this)">'
+    + (on ? 'On' : 'Off') + '</button>'
+    + '</div>';
+}
+
+function _nudgesRowClick(btn) {
+  const level = btn.dataset.nlvl;
+  const name = btn.dataset.nname || null;
+  const enabled = btn.dataset.nen === 'true';
+  _nudgesSet(level, name, enabled);
+}
+
+function _nudgesRender() {
+  const el = document.getElementById('nudges-panel');
+  if (!el || el.style.display === 'none') return;
+  const s = _nudgesState;
+  if (!s) { el.innerHTML = '<div style="color:var(--dim);">Loading…</div>'; return; }
+
+  let h = '<div style="font-size:0.7rem;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:0.05em;margin-bottom:8px;">Board nudges</div>';
+
+  // Global row — null/undefined means key absent = on
+  h += _nudgesRow('Global (all workers)', s.global, 'global', null);
+
+  // Group rows — only groups with an explicit value
+  const grps = s.groups || {};
+  const grpNames = Object.keys(grps).sort();
+  if (grpNames.length) {
+    h += '<div style="color:var(--dim);font-size:0.68rem;margin:6px 0 2px;">Groups with overrides</div>';
+    grpNames.forEach(g => { h += _nudgesRow(g, grps[g], 'group', g); });
+  }
+
+  // Worker rows — only workers with an explicit value
+  const wkrs = s.workers || {};
+  const wkrNames = Object.keys(wkrs).sort();
+  if (wkrNames.length) {
+    h += '<div style="color:var(--dim);font-size:0.68rem;margin:6px 0 2px;">Workers with overrides</div>';
+    wkrNames.forEach(w => { h += _nudgesRow(w, wkrs[w], 'worker', w); });
+  }
+
+  // Quick-set for the currently open worker peek
+  if (peekSession) {
+    h += '<div style="margin-top:8px;border-top:1px solid var(--border);padding-top:8px;">'
+      + '<div style="color:var(--dim);font-size:0.68rem;margin-bottom:4px;">Set for: <b>' + esc(peekSession) + '</b></div>'
+      + '<div style="display:flex;gap:6px;">'
+      + '<button class="btn" data-nlvl="worker" data-nname="' + esc(peekSession) + '" data-nen="true" style="font-size:0.7rem;min-height:28px;flex:1;" onclick="_nudgesRowClick(this)">On</button>'
+      + '<button class="btn primary" data-nlvl="worker" data-nname="' + esc(peekSession) + '" data-nen="false" style="font-size:0.7rem;min-height:28px;flex:1;" onclick="_nudgesRowClick(this)">Off</button>'
+      + '</div></div>';
+  }
+
+  h += '<div style="color:var(--dim);font-size:0.66rem;margin-top:8px;">On = default. Off disables board nudges at that scope (sets CC_STANDING_ORDERS=False).</div>';
+  el.innerHTML = h;
+}
+
+async function _nudgesSet(level, name, enabled) {
+  const body = { level, enabled };
+  if (name) body.name = name;
+  try {
+    await fetch(API + '/api/board/nudges', {
+      method: 'PATCH',
+      headers: Object.assign({}, _authHeaders(), { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(body),
+    });
+    showToast('Nudges ' + (enabled ? 'enabled' : 'disabled') + ' at ' + level + (name ? ':' + name : ''));
+    await _nudgesLoad();
+  } catch (e) { showToast('Failed to update nudges: ' + e.message); }
+}
+
+function _nudgesTogglePanel(e) {
+  if (e) e.stopPropagation();
+  const el = document.getElementById('nudges-panel');
+  if (!el) return;
+  if (el.style.display === 'none') {
+    el.style.display = 'block';
+    el.innerHTML = '<div style="color:var(--dim);">Loading…</div>';
+    _nudgesLoad();
+    setTimeout(() => document.addEventListener('click', _nudgesPanelOutside, true), 0);
+  } else {
+    el.style.display = 'none';
+    document.removeEventListener('click', _nudgesPanelOutside, true);
+  }
+}
+
+function _nudgesPanelOutside(e) {
+  const el = document.getElementById('nudges-panel');
+  const btn = document.getElementById('nudges-btn');
+  if (el && !el.contains(e.target) && e.target !== btn) {
+    el.style.display = 'none';
+    document.removeEventListener('click', _nudgesPanelOutside, true);
+  }
+}
+
 function togglePeekIssuesAll() {
   _peekIssuesAllSessions = !_peekIssuesAllSessions;
   localStorage.setItem('amux_peek_issues_all', _peekIssuesAllSessions ? '1' : '0');
@@ -7938,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.748';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.762';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -8226,16 +8550,22 @@ function openPeek(name, opts) {
     if (el) { el.textContent = ''; el.classList.remove('has-count', 'has-pending', 'sched-on', 'sched-off'); }
   });
   _peekUpdateTabCounts();
-  // AMUX-3201: a codex/ollama peek opens straight to the Claude-like structured
-  // transcript rather than the raw native TUI (Ethan's complaint). The Terminal
-  // tab stays one tap away as the raw-terminal toggle. Guarded: a hidden
-  // Transcript tab, a non-codex provider, or a missing helper is a no-op that
-  // leaves openPeek's default terminal view untouched.
-  try {
-    const _pv = _peekSess ? sessionProvider(_peekSess) : 'claude';
-    const _hidden = (typeof peekHiddenTabs !== 'undefined' && peekHiddenTabs.has) ? peekHiddenTabs.has('transcript') : false;
-    if ((_pv === 'codex' || _pv === 'ollama') && !_hidden) setPeekTab('transcript');
-  } catch (e) {}
+  // Every worker opens on its live terminal. A provider-specific default made
+  // Codex/Ollama workers jump to Transcript after the reset above, so the
+  // default differed by provider and hid the interactive pane at the moment a
+  // user opened a worker. Transcript remains an explicit tab, never a redirect.
+  // If a later call reintroduces an override, leave a server-visible signal for
+  // `/api/client-debug` and the normal log sweep rather than relying on a
+  // screenshot to discover it.
+  if (_peekTab !== 'terminal') {
+    try {
+      fetch(API + '/api/client-debug', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, keepalive: true,
+        body: JSON.stringify({ kind: 'peek-default-tab-violation', ver: APP_VER, tab: _peekTab,
+          provider: _peekSess ? sessionProvider(_peekSess) : 'unknown' }),
+      }).catch(() => {});
+    } catch (e) {}
+  }
   loadPeekCommitGuard(name);
   updateConnectionStatus();
   const peekOv = document.getElementById('peek-overlay');
@@ -10120,6 +10450,38 @@ function retryCardFile(name, idx) {
   const f = (_cardFiles[name] || [])[idx];
   if (!f || f.inflight || f.path) return;
   _runUpload(f, _cardSink(name));
+}
+
+/// Clear the composer: text, the saved draft, and any staged attachments.
+///
+/// CLEARS THE DRAFT, NOT JUST THE BOX. Blanking `inp.value` alone leaves
+/// `_draftGet(session)` holding the text, and the next open puts it back — which
+/// is the ghost AMUX-3388 was about, where an already-sent message reappeared
+/// and got sent twice. The comment above `_draftGet` says drafts live in ONE
+/// place precisely so a clear cannot hit one store and miss another; this uses
+/// that one place.
+///
+/// Attachments go too, because a "clear" that silently left files staged would
+/// put them on the NEXT message, which is a worse surprise than losing them. The
+/// toast names what went so it is not silent either way. This is the same
+/// four-step sequence the send path uses, deliberately: the composer has exactly
+/// one notion of "emptied", and two spellings of it would drift.
+function _peekClearInput() {
+  const inp = document.getElementById('peek-cmd-input');
+  if (!inp) return;
+  const hadText = (inp.value || '').trim().length > 0;
+  const nFiles = (typeof peekFiles !== 'undefined' && peekFiles) ? peekFiles.length : 0;
+  if (!hadText && !nFiles) { showToast('Composer is already empty'); return; }
+  inp.value = '';
+  inp.style.height = 'auto';
+  _draftClear(peekSession);
+  if (nFiles) clearPeekFiles();
+  try { inp.focus(); } catch (e) {}
+  showToast(
+    nFiles
+      ? `Cleared${hadText ? ' input and' : ''} ${nFiles} attachment${nFiles === 1 ? '' : 's'}`
+      : 'Cleared input'
+  );
 }
 
 function clearPeekFiles() {
@@ -15524,22 +15886,33 @@ let _filesShowHidden = true;
 
 async function openInFinder() {
   const path = _filesPath || '/';
-  // If accessing remote server, construct smb:// or sftp:// URL for Finder
-  const isRemote = location.hostname !== 'localhost' && location.hostname !== '127.0.0.1' && !location.hostname.endsWith('.local');
-  if (isRemote) {
-    // Open as SFTP remote folder in Finder via sftp:// URL scheme
-    const host = location.hostname;
-    const url = 'sftp://' + host + path;
-    window.open(url, '_blank');
-    showToast('Opening remote folder: ' + host + ':' + path);
-    return;
-  }
+  // THE CLIENT CANNOT KNOW IF IT IS LOCAL, SO IT NO LONGER GUESSES (AF-282).
+  //
+  // This used to test `location.hostname` against localhost/127.0.0.1/.local and
+  // treat everything else as remote, emitting `sftp://<host><path>`. Reaching
+  // your own desktop by its Tailscale name is none of those three, so a LOCAL
+  // machine took the remote branch: Chrome handed `sftp://` to whatever
+  // registered the scheme (VLC) and it failed with "Your input can't be opened".
+  // macOS Finder has no `sftp://` handler either, so the branch was broken for
+  // genuinely-remote too — it could not succeed in either case it split on.
+  //
+  // The server is the only party that can answer this: it compares the request's
+  // peer IP against the addresses the Host header resolves to. So we always ask,
+  // and render whatever it says. A 409 here is a real answer, not a failure.
   try {
     const r = await apiCall(API + '/api/fs/open', {
       method: 'POST', headers: {'Content-Type':'application/json'},
       body: JSON.stringify({ path })
     });
-    if (r) showToast('Opened in Finder');
+    if (r && r.ok) { showToast('Opened in Finder'); return; }
+    if (r && r.local === false) {
+      // Remote browser: the folder lives on the server's machine. Say so and
+      // leave the path where it can be copied, rather than reporting a success
+      // the user would never see.
+      showToast('That folder is on the amux server, not this machine — ' + (r.path || path));
+      return;
+    }
+    showToast((r && r.error) ? r.error : 'Failed to open folder');
   } catch(e) { showToast('Failed to open folder'); }
 }
 
@@ -16405,6 +16778,122 @@ let _mdaiRootPath;   // cached mdai_root pref (the local.amux folder), '' if uns
 // /api/scope connectors capability. A connector is a scopable capability, not a
 // new subsystem — the tab composes primitives (scope + env), it does not add one.
 let _connectorsData = null;
+function _connAddToggle() {
+  const f = document.getElementById('conn-add-form');
+  if (!f) return;
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+}
+
+function _connAddKind() {
+  const k = (document.getElementById('conn-new-kind') || {}).value;
+  const ak = document.getElementById('conn-new-apikey');
+  const oa = document.getElementById('conn-new-oauth');
+  if (ak) ak.style.display = k === 'oauth2' ? 'none' : 'grid';
+  if (oa) oa.style.display = k === 'oauth2' ? 'grid' : 'none';
+}
+
+function _connAddScope() {
+  // global needs no name; group/worker do.
+  const lvl = (document.getElementById('conn-new-scope-level') || {}).value;
+  const wrap = document.getElementById('conn-new-scope-name-wrap');
+  if (wrap) wrap.style.display = (lvl === 'global') ? 'none' : 'block';
+}
+
+// Add the new connector to a scope layer WITHOUT clobbering what is already
+// there. The connectors capability stores one JSON object per level mapping
+// connector -> config, so a bare PUT of {id:{enabled:true}} would delete every
+// other connector's entry at that level. Read, merge, write.
+async function _connScopeEnable(id, level, name) {
+  const qs = '/api/scope?level=' + encodeURIComponent(level)
+    + (level === 'global' ? '' : '&name=' + encodeURIComponent(name || ''))
+    + '&capability=connectors';
+  let current = {};
+  try {
+    const r = await fetch(API + qs, { headers: _authHeaders() });
+    const d = await r.json();
+    if (d && d.connectors && typeof d.connectors === 'object') current = d.connectors;
+  } catch (e) { /* absent layer reads as {} — the merge below still writes ours */ }
+  current[id] = Object.assign({}, current[id] || {}, { enabled: true });
+  const r2 = await fetch(API + '/api/scope', {
+    method: 'PUT',
+    headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+    body: JSON.stringify({ level: level, name: name || '', capability: 'connectors', value: current }),
+  });
+  const d2 = await r2.json().catch(() => ({}));
+  if (!r2.ok || d2.error) throw new Error(d2.error || ('scope save failed (' + r2.status + ')'));
+}
+
+async function _connCreate() {
+  const msg = document.getElementById('conn-add-msg');
+  const val = (id) => ((document.getElementById(id) || {}).value || '').trim();
+  const kind = val('conn-new-kind') || 'api_key';
+  const level = val('conn-new-scope-level') || 'global';
+  const scopeName = val('conn-new-scope-name');
+  if (level !== 'global' && !scopeName) {
+    if (msg) { msg.textContent = 'Name the group or worker to scope to.'; msg.style.color = '#f85149'; }
+    return;
+  }
+  const body = {
+    id: (val('conn-new-id') || val('conn-new-label')).toLowerCase().replace(/[^a-z0-9_-]+/g, '-'),
+    label: val('conn-new-label'),
+    kind: kind,
+    setup_note: val('conn-new-note'),
+    docs: val('conn-new-docs'),
+  };
+  if (kind === 'oauth2') {
+    body.client_id_env = val('conn-new-cid-env').toUpperCase();
+    body.client_secret_env = val('conn-new-csec-env').toUpperCase();
+    body.authorize_url = val('conn-new-auth-url');
+    body.token_url = val('conn-new-token-url');
+    body.scopes = val('conn-new-scopes');
+  } else {
+    body.key_env = val('conn-new-key-env').toUpperCase();
+    body.test_url = val('conn-new-test-url');
+  }
+  if (msg) { msg.textContent = 'Creating…'; msg.style.color = 'var(--dim)'; }
+  try {
+    const r = await fetch(API + '/api/connectors', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) {
+      // Show the server's REASON verbatim: it explains WHY an id or env name was
+      // refused, and it refuses rather than rewriting.
+      if (msg) { msg.textContent = (d.error || ('create failed (' + r.status + ')')) + (d.how ? ' — ' + d.how : ''); msg.style.color = '#f85149'; }
+      return;
+    }
+    // The definition exists; now make the scope explicit. Reported separately,
+    // because a connector that was created but not scoped is a different state
+    // from one that failed to create, and saying "done" for both would hide it.
+    try {
+      await _connScopeEnable(body.id, level, scopeName);
+      if (msg) { msg.textContent = 'Created and enabled at ' + level + ' scope. Paste the key in its row below.'; msg.style.color = ''; }
+    } catch (e) {
+      if (msg) { msg.textContent = 'Created, but the scope write failed: ' + String(e.message || e) + ' — set it in the Scope tab.'; msg.style.color = '#b8860b'; }
+    }
+    _connAddToggle();
+    _connectorsTabLoad();
+  } catch (e) {
+    if (msg) { msg.textContent = 'Create failed: ' + String(e); msg.style.color = '#f85149'; }
+  }
+}
+
+async function _connDelete(id) {
+  if (!confirm('Forget connector "' + id + '"?\n\nThe definition is removed. Any credential VALUES already in server.env are left alone.')) return;
+  try {
+    const r = await fetch(API + '/api/connectors/' + encodeURIComponent(id), {
+      method: 'DELETE', headers: _authHeaders(),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'delete failed'); return; }
+    const left = (d.credentials_left_in_server_env || []).join(', ');
+    showToast('Removed ' + id + (left ? ' — ' + left + ' still in server.env' : ''));
+    _connectorsTabLoad();
+  } catch (e) { showToast('delete failed: ' + String(e)); }
+}
+
 async function _connectorsTabLoad() {
   const host = document.getElementById('connectors-list');
   if (!host) return;
@@ -16461,7 +16950,12 @@ function _connectorsRender(d) {
       html += '<div class="conn-gmail" id="conn-gmail-accounts"><div class="conn-gmail-loading">Loading Gmail accounts…</div></div>';
     }
     // test connection — verify it actually WORKS, not just that a key is present
-    html += '<div class="conn-test"><button class="conn-test-btn" onclick="_connectorTest(\'' + esc(c.id) + '\', this)">Test connection</button> <span class="conn-test-result" id="conn-test-' + esc(c.id) + '"></span></div>';
+    html += '<div class="conn-test"><button class="conn-test-btn" onclick="_connectorTest(\'' + esc(c.id) + '\', this)">Test connection</button> <span class="conn-test-result" id="conn-test-' + esc(c.id) + '"></span>';
+    // Delete is offered ONLY on declared rows. A builtin comes from the const
+    // registry and removing one is a code change, so the server refuses it —
+    // showing the button anyway would be an affordance that always fails.
+    if (c.custom) html += ' <button class="conn-test-btn" onclick="_connDelete(\'' + esc(c.id) + '\')">Forget</button>';
+    html += '</div>';
     // scope control (global / group / worker) — drives /api/scope
     html += '<div class="conn-scope"><span class="conn-slabel">Enable for:</span> '
       + '<button class="conn-scope-btn" onclick="_connectorScope(\'' + esc(c.id) + '\',\'global\',true)">Global</button>'
@@ -16910,7 +17404,25 @@ async function _mdaiRun(opts) {
       });
     } finally { clearTimeout(_to); }
     const d = await r.json().catch(() => ({}));
-    if (!r.ok || d.error) {
+    // A LOCALLY-QUEUED RESPONSE IS NOT A RUN (AF-371).
+    //
+    // The outbox interceptor manufactures a 202 `{ok:true,queued:true}` when a
+    // fetch fails, and `r.ok` is TRUE for it with no `d.error`, so the success
+    // branch below took it and reported a completed run that never left the
+    // browser. `_isLocallyQueued` exists for exactly this and was called at one
+    // site out of every place it applies (ethos rule 1: the capability existed
+    // and did not reach the caller that needed it).
+    //
+    // Belt and braces alongside the _OUTBOX_SKIP entry above: that entry stops
+    // THIS url being queued, and this guard means any future path that hands the
+    // panel a synthetic 202 fails loudly instead of silently.
+    if (_isLocallyQueued(r)) {
+      _mdaiRunError = 'The server could not be reached, so this run was never sent. '
+        + 'Nothing was queued for later: an mdai run is a chain of model calls and '
+        + 'replaying it hours later would spend them on a question you are no longer '
+        + 'asking. Retry when amux is back.';
+      _mdaiRunCycle = null;
+    } else if (!r.ok || d.error) {
       _mdaiRunError = d.error || ('HTTP ' + r.status);
       _mdaiRunCycle = d.cycle || null;
     } else {
@@ -19447,6 +19959,9 @@ function _fmtRelTime(ts) {
 // ═══════ BOARD ═══════
 let activeView = 'sessions';
 let boardItems = [];
+// The exact set the last renderBoard() painted, after every filter. Export uses
+// it so "export" always means "what I am looking at". See renderBoard().
+let _boardLastVisible = [];
 // Archived cards are fetched LAZILY (AMUX-2271). They are 1577 of 1624 rows and
 // 97% of the payload, and the board hides them everywhere unless something asks
 // for them: `_bqWantsArchived` for the global board, the per-session peek panel
@@ -24248,6 +24763,91 @@ function _boardStatsHTML(rows) {
     + '</div>';
 }
 
+// ── Board export ────────────────────────────────────────────────────────────
+//
+// Exports WHAT IS ON SCREEN: `_boardLastVisible`, the set renderBoard() last
+// painted, after the owner toggle, the archived rule and the structured query.
+//
+// THE HEADER NAMES THE FILTER, and that is not decoration. An export of a
+// filtered board that does not say it was filtered is indistinguishable from an
+// export of the whole board, and it is the version that gets pasted into a
+// status update. Any output that can read partial has to publish whether it was
+// (.claude/rules/ethos.md rule 4), so the count and the active query travel with
+// the file.
+//
+// DESCRIPTIONS ARE TRUNCATED AT THE SOURCE and the file says so per card.
+// `GET /api/board` returns `desc_head` + `desc_len`, never the full `desc`
+// (AMUX-3861), so this cannot emit complete descriptions no matter how it is
+// written. Marking each cut one beats shipping a file that looks whole.
+function _boardExportName(ext) {
+  const d = new Date();
+  const p = n => String(n).padStart(2, '0');
+  return `amux-board-${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}.${ext}`;
+}
+
+function _boardExportMd(items, query) {
+  const order = ['doing', 'review', 'todo', 'backlog', 'done', 'verified', 'discarded'];
+  const groups = {};
+  items.forEach(i => { const st = _statusCanon(i.status || 'todo'); (groups[st] = groups[st] || []).push(i); });
+  const stamp = new Date().toISOString().replace('T', ' ').slice(0, 16);
+  let md = `# amux board\n\n_${items.length} issue(s) · exported ${stamp}_\n`;
+  md += query && query.trim()
+    ? `\n> **Filtered view.** Query: \`${query.trim()}\`. This is not the whole board.\n`
+    : `\n> Unfiltered: every issue currently visible on the board.\n`;
+  // NAME THE WAY OUT, not just the limitation (AMUX-3868). Descriptions here
+  // are heads because the list API sends heads; disclosing that without saying
+  // where the full text lives leaves the reader stuck with a known-partial file
+  // and no next step.
+  md += `>\n> Descriptions are heads. For complete text: \`GET /api/board/export?format=md\` (add \`&worker=NAME\` to scope).\n`;
+  const keys = order.concat(Object.keys(groups).filter(k => !order.includes(k)));
+  keys.forEach(st => {
+    const g = groups[st];
+    if (!g || !g.length) return;
+    md += `\n## ${st} (${g.length})\n\n`;
+    g.forEach(i => {
+      const who = i.session || i.worker || '—';
+      md += `- **${i.id}** ${i.title || ''}\n`;
+      md += `  - worker: ${who} · type: ${i.type || 'code'}`;
+      if (i.gate && i.gate.length) md += ` · gate: ${[].concat(i.gate).join(' / ')}`;
+      md += `\n`;
+      const head = (i.desc_head || '').trim();
+      if (head) {
+        const cut = i.desc_len && i.desc_len > head.length;
+        md += `  - ${head.replace(/\n+/g, ' ')}${cut ? ` … _(truncated: ${i.desc_len} chars total; the board list API returns only a head)_` : ''}\n`;
+      }
+    });
+  });
+  return md;
+}
+
+function exportBoard(fmt) {
+  const items = (_boardLastVisible || []).slice();
+  if (!items.length) { showToast('Nothing to export — no issues match the current filter.'); return; }
+  const q = (typeof boardSearchQuery !== 'undefined' ? boardSearchQuery : '') || '';
+  let body, mime, ext;
+  if (fmt === 'json') {
+    body = JSON.stringify({
+      exported_at: new Date().toISOString(),
+      filtered: !!q.trim(),
+      query: q.trim() || null,
+      count: items.length,
+      // Stated in the payload rather than left for the reader to discover.
+      desc_note: 'desc_head is a prefix; desc_len is the true length. The board list API does not return full desc (AMUX-3861).',
+      issues: items,
+    }, null, 2);
+    mime = 'application/json'; ext = 'json';
+  } else {
+    body = _boardExportMd(items, q);
+    mime = 'text/markdown'; ext = 'md';
+  }
+  const url = URL.createObjectURL(new Blob([body], { type: mime + ';charset=utf-8' }));
+  const a = document.createElement('a');
+  a.href = url; a.download = _boardExportName(ext);
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  showToast(`Exported ${items.length} issue(s) as ${ext.toUpperCase()}${q.trim() ? ' (filtered)' : ''}`);
+}
+
 function renderBoard() {
   _boardEnsureFull();
   // Skip re-render while a drag is in progress — queue it for when drag ends
@@ -24281,6 +24881,13 @@ function renderBoard() {
   // so the old search behaviour is a strict subset of this.
   visible = _bqHideArchived(visible, boardSearchQuery);
   visible = _bqFilter(visible, boardSearchQuery);
+
+  // EXPORT READS THIS, rather than re-deriving the filter pipeline (owner
+  // toggle -> archived rule -> structured query). Two implementations of "what
+  // is on screen" drift the moment either side gains a facet, and the drift is
+  // invisible: the file looks fine, it is just not what you were looking at.
+  // Captured at the one point where `visible` is final for every view mode.
+  _boardLastVisible = visible;
 
   if (boardViewMode === 'list') {
     // Linear-dense List view (AMUX-2152): grouped by status with counts,

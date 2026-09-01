@@ -56,6 +56,24 @@ def main():
     # executable heredoc bodies must STILL be scanned
     A("bash heredoc real reset", "bash <<'EOF'\ngit reset --hard HEAD~1\nEOF", True),
     A("sh heredoc real clean", "sh <<EOF\ngit clean -fd\nEOF", True),
+    # AF-316 — the SHARED INDEX, staged half. `git commit -a` was already
+    # blocked; these reach the same hazard one step earlier.
+    A("add -A bare", "git add -A", True)
+    A("add . bare", "git add .", True)
+    A("add --all bare", "git add --all", True)
+    # `git add -- .` is the same command as `git add .` and is the obvious next
+    # thing to type after being refused once — it must not read as "scoped".
+    A("add -- . bypass", "git add -- .", True)
+    # BOUNDED forms must PASS, or the rule stops being a scoping rule and
+    # becomes a ban. Each of these is someone doing the right thing.
+    A("add -A bounded by pathspec", "git add -A -- crates/amux-server/src/lib.rs", False)
+    A("add named path", "git add crates/amux-server/src/lib.rs", False)
+    A("add relative named path", "git add ./crates/amux-server/src/lib.rs", False)
+    A("add interactive", "git add -p", False)
+    A("add -u scoped to a dir", "git add -u crates/", False)
+    # Mention, not invocation — the same class the heredoc pins above cover.
+    A("add -A mentioned in a commit message", 'git commit -m "never git add -A here" -- f.txt', False)
+
     # quoted mentions (existing behavior, regression pins)
     A("quoted commit-msg mention", 'git commit -m "never git reset --hard again" -- f.txt', False)
     A("echo quoted amend mention", 'echo "recipe: git commit --amend needs a pin"', False)
@@ -110,6 +128,34 @@ def main():
     scratch = os.path.join(tmp, "scratch-clone")
     os.makedirs(scratch, exist_ok=True)
     A("literal -C escape still works from shared cwd", f"git -C {scratch} reset --hard", False)
+
+    # AMUX-3893 (tuple from mixpeek-cicd): a depth-limited fetch truncates the
+    # SHARED history, and every `merge-base --is-ancestor` past the cut then
+    # returns a bare exit 1 that is indistinguishable from a real "not an
+    # ancestor". 2026-08-29: rev-list --count on ~/Dev/mixpeek fell ~38,700 -> 50
+    # and four hours of "is fix X in sha Y" answered wrongly, silently
+    # (TUBES-2339); the same trap produced a false "REVERT DETECTED" in CI the
+    # same day (MG-1532).
+    A("fetch --depth=", "git fetch --depth=1 origin", True)
+    A("fetch --depth space", "git fetch --depth 50 origin", True)
+    A("pull --depth=", "git pull --depth=1 origin main", True)
+    A("fetch --depth after operands", "git fetch origin main --depth=1", True)
+    A("fetch -q --depth with shas", "git fetch -q --depth=1 origin abc123 def456", True)
+    A("fetch --shallow-since", "git fetch --shallow-since=2026-01-01 origin", True)
+    A("fetch --shallow-exclude", "git fetch --shallow-exclude=v1.0 origin", True)
+    A("fetch --depth with -C", f"git -C {work} fetch --depth=1", True)
+    # The REMEDY must never be blocked, or the refusal names an action the guard
+    # itself refuses — the shape ethos rule 3 is about.
+    A("fetch --unshallow is the remedy", "git fetch --unshallow origin", False)
+    A("fetch --deepen is the remedy", "git fetch --deepen=100 origin", False)
+    A("fetch --deepen space", "git fetch --deepen 100 origin", False)
+    A("plain fetch", "git fetch origin", False)
+    A("fetch --all --prune", "git fetch --all --prune", False)
+    A("pull --rebase", "git pull --rebase origin main", False)
+    # `clone --depth` makes a NEW repo and cannot shallow this one. Blocking it
+    # would false-positive on real callers that shallow-clone EXTERNAL repos.
+    A("clone --depth= is not fetch", "git clone --depth=1 https://github.com/x/y /tmp/y", False)
+    A("clone --depth space", "git clone --depth 1 https://github.com/x/y", False)
 
     failures = []
     for name, cmd, cwd, expect_block in cases:
@@ -231,7 +277,262 @@ def main():
             f"found only {_bodies} staged-guard POST bodies — the AST walk is not "
             f"reaching them, so the `op` check above is vacuous")
 
-    total = len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
+    # ── AMUX-3890: a redirect is not a pathspec ────────────────────────────
+    #
+    # Tested at the helper rather than end-to-end ON PURPOSE. `_discard_verdict`
+    # POSTs to /api/git/staged-guard and FAILS OPEN when the server is
+    # unreachable, so an end-to-end "this command is not blocked" case passes
+    # just as green with the bug present as with it fixed. It would pin nothing.
+    # `_strip_redirections` is the seam where the defect actually lives and the
+    # only place a check here can genuinely fail (ethos rule 7).
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location("_gsg", HOOK)
+    _gsg = _ilu.module_from_spec(_spec)
+    _spec.loader.exec_module(_gsg)
+    _operands = _gsg._discard_operands
+
+    # Called through `_discard_operands`, the WIRED path, not `_strip_redirections`
+    # directly. The first version of this test called the helper and passed a
+    # mutation that deleted its only call site, which is ethos rule 7 exactly: a
+    # check pinning the wrong layer is as green as one pinning the right layer.
+    # Inputs are raw command strings, so the operand regex, shlex, the `--` split
+    # and the redirection strip are all under test together.
+    D = "/Users/ethan/Dev/mixpeek"
+    redir_cases = [
+        # The reported specimen. `2>&1` is truncated to a bare `2>` by the operand
+        # regex (it stops at `&`), and that `2>` was reaching the path list and
+        # being reported as another session's uncommitted file.
+        ("reported specimen",
+         f"git -C {D} checkout origin/main -- docs/platform/syncs.mdx docs/retrieval/cookbook.mdx 2>&1 | head -30",
+         ["docs/platform/syncs.mdx", "docs/retrieval/cookbook.mdx"]),
+        ("fused 2>/dev/null",
+         "git checkout origin/main -- a.mdx 2>/dev/null", ["a.mdx"]),
+        ("stdout to file",
+         "git checkout origin/main -- a.mdx > out.txt", ["a.mdx"]),
+        ("append to file",
+         "git checkout origin/main -- a.mdx >> log", ["a.mdx"]),
+        ("fused >out",
+         "git checkout origin/main -- a.mdx >out.txt", ["a.mdx"]),
+        ("both streams",
+         "git checkout origin/main -- a.mdx &> log", ["a.mdx"]),
+        ("stdin redirect",
+         "git checkout origin/main -- a.mdx < in.txt", ["a.mdx"]),
+        ("restore with redirect",
+         "git restore --worktree --source=origin/main -- a.mdx 2>&1", ["a.mdx"]),
+        ("no-dashdash form with redirect",
+         "git checkout origin/main a.mdx 2>/dev/null", ["a.mdx"]),
+        # Must NOT over-strip: real pathspecs still arrive, redirect or not.
+        ("plain, no redirect",
+         "git checkout origin/main -- a.mdx b.mdx", ["a.mdx", "b.mdx"]),
+        ("path containing >",
+         "git checkout origin/main -- 'weird>name.txt'", ["weird>name.txt"]),
+    ]
+    for _name, _cmd, _want in redir_cases:
+        _paths, _ = _operands(_cmd)
+        if _paths != _want:
+            failures.append(
+                f"_discard_operands/{_name}: paths {_paths} != expected {_want} "
+                f"(from {_cmd!r}) — a redirection token reaching the path list is "
+                f"AMUX-3890, where the guard reported a file literally named `2>` "
+                f"as another session's uncommitted work while clearing both real "
+                f"paths in the same message")
+
+    # ---- MR-101: a CONSUMED authorization implies the command was ALLOWED ----
+    #
+    # mixpeek-research saw one tool call produce BOTH "ALLOWED once" and
+    # "BLOCKED", the marker gone, the consumption in the audit log, and git never
+    # running. The discard branch is straight-line code evaluated once per
+    # process, so one process cannot print both: the hook ran TWICE for one tool
+    # call. The first run consumed the marker and allowed, the second found no
+    # marker and blocked, and the block is what the tool call returned.
+    #
+    # These run the guard as a SUBPROCESS twice with the same command, against a
+    # real HOME, so the marker/audit files are the shipped ones rather than a
+    # paraphrase of them.
+    import pathlib, time as _time
+    _home = tempfile.mkdtemp(prefix="guardhome-")
+    (pathlib.Path(_home) / ".amux" / "logs").mkdir(parents=True, exist_ok=True)
+    _marker = pathlib.Path(_home) / ".amux" / "guard-allow-once"
+    _audit = pathlib.Path(_home) / ".amux" / "logs" / "guard-overrides.jsonl"
+    # A command the guard blocks on its own: discarding another session's work.
+    # `git checkout HEAD -- f.txt` against a dirty f.txt is the discard shape.
+    open(os.path.join(work, "f.txt"), "w").write("dirty\n")
+    _discard = "git checkout HEAD -- f.txt"
+
+    def _hook(cmd, env=None):
+        # AMUX_URL points at a dead port on purpose. The discard branch fires
+        # either when a peer owns the path or when co-tenancy CANNOT BE VERIFIED
+        # ("REFUSING an unrecoverable discard rather than guessing"), and the
+        # second is reachable from a temp fixture where the first is not — a
+        # scratch repo has no peer edit records. It is also the exact shape the
+        # reporter saw beside their incident: byo-ray hit "the amux server is
+        # unreachable (TimeoutError)" from this guard minutes earlier.
+        e = dict(os.environ, AMUX_SHARED_CHECKOUTS=work, HOME=_home,
+                 AMUX_URL="https://127.0.0.1:9")
+        e.update(env or {})
+        p = subprocess.run(
+            [sys.executable, HOOK],
+            input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": work}),
+            capture_output=True, text=True, env=e, timeout=30)
+        return p.returncode, p.stderr
+
+    _marker.write_text(_discard)
+    rc1, err1 = _hook(_discard)
+    consumed = not _marker.exists()
+    rc2, err2 = _hook(_discard)
+
+    if consumed and rc1 != 0:
+        failures.append(
+            "MR-101/consumed-implies-allowed: the marker was CONSUMED but the run "
+            f"that consumed it returned {rc1}. A consumption that does not allow "
+            "spends the owner's one-off on nothing")
+    if consumed and rc2 != 0:
+        failures.append(
+            "MR-101/replay: second invocation of the SAME command returned "
+            f"{rc2} after the first consumed the marker. This is the reported "
+            f"bug: one tool call, both verdicts, git never ran. stderr: {err2[:200]}")
+    if consumed and rc2 == 0 and "REPLAYED" not in err2:
+        failures.append(
+            "MR-101/replay-is-loud: the replay was allowed but said nothing. "
+            "Allowing twice must be greppable, not silent")
+
+    # CONTROL 1 — a DIFFERENT destructive command inside the window gets nothing.
+    # Without this the replay could be 'any recent override allows anything'.
+    rc3, _ = _hook("git reset --hard HEAD~1")
+    if rc3 == 0:
+        failures.append(
+            "MR-101/control-different-command: an unrelated destructive command "
+            "was allowed inside the replay window — the window must key on the "
+            "AUTHORIZED TEXT, not on 'an override happened recently'")
+
+    # CONTROL 2 — the window EXPIRES. Backdate the audit record past the window
+    # and the same command must block again, or 'allow once' has become 'allow
+    # forever' for any command an owner ever sanctioned.
+    if not _audit.exists():
+        failures.append(
+            "MR-101/premise: the discard branch never fired, so none of these cells "
+            "measured anything. The fixture must reach a state where the guard "
+            "refuses a discard (a peer-owned path, or an unverifiable co-tenancy)")
+        _rows = []
+    else:
+        _rows = [json.loads(l) for l in _audit.read_text().splitlines() if l.strip()]
+    for _r in _rows:
+        _r["ts"] = _time.time() - 3600
+    if _rows:
+        _audit.write_text("".join(json.dumps(r) + "\n" for r in _rows))
+    rc4, _ = _hook(_discard)
+    if _rows and rc4 == 0:
+        failures.append(
+            "MR-101/control-window-expires: the same command was still allowed an "
+            "hour after its authorization was consumed — the replay window is not "
+            "bounded, so a one-off has become permanent")
+
+    # CONTROL 3 — the window can be switched OFF, restoring strict one-shot.
+    _audit.write_text("")
+    _marker.write_text(_discard)
+    _hook(_discard, {"AMUX_GUARD_ALLOW_REPLAY_S": "0"})
+    rc5, _ = _hook(_discard, {"AMUX_GUARD_ALLOW_REPLAY_S": "0"})
+    if rc5 == 0:
+        failures.append(
+            "MR-101/control-disable: AMUX_GUARD_ALLOW_REPLAY_S=0 must restore the "
+            "strict one-shot behaviour, and did not")
+    _mr101 = 6
+
+    # ------------------------------------------------------------------
+    # AMUX-3932: COMMAND SUBSTITUTION INSIDE A QUOTED ARGUMENT.
+    #
+    # THE INCIDENT. A lane built a JSON body whose PROSE quoted the very commands
+    # its card was about. Bash substituted them and actually ran `git add -A`,
+    # staging 779 paths across the shared checkout, 765 of them other lanes'.
+    # Nothing destructive armed and it was repaired with a scoped reset, but the
+    # staged-guard was down at that moment and logged NOT ENFORCED, so nothing
+    # caught it either.
+    #
+    # THE DEFECT was not "python3 bodies are treated as prose" (that hypothesis
+    # was tested and did not reproduce). It was that the scrubber could not tell
+    # an INERT quoted region from one bash will EXPAND. Two independent regex
+    # passes ran over the whole string, so single-quote stripping also fired
+    # INSIDE double-quoted regions where those quotes are literal characters --
+    # which is why the two substitution syntaxes disagreed in exactly one place.
+    #
+    # THE CONTROLS ARE HALF THE POINT. Stripping quoted bodies is RIGHT: it is
+    # what lets a lane file a card whose text mentions a guarded command. A fix
+    # that blocked every mention would pass the bypass rows below and make the
+    # guard unusable, which is the noise the stripper exists to prevent.
+    #
+    # Matrix reproduced against the live guard by amux and independently by
+    # mixpeek-homepage-claude, each feeding crafted strings on stdin so nothing
+    # executed. Their run caught a broken harness first (main() returns 0 unless
+    # tool_name == "Bash"), which is why every row here goes through run_hook.
+    subst = [
+        # (name, command, expect_block)
+        ("bare invocation still blocks",
+         "git stash", True),
+        ("single-quoted mention is INERT and must be allowed",
+         "amux board add 'x $(git stash)'", False),
+        ("single-quoted backticks are inert too",
+         "python3 -c 'x = `git stash`'", False),
+        ("unquoted substitution",
+         "echo $(git stash)", True),
+        # The four rows that bypassed. echo reports to nobody, which is what
+        # proves this is about QUOTING and not about which command carries a
+        # payload -- the original narrative blamed curl and `amux board add`
+        # and was withdrawn on this evidence.
+        ("double-quoted $() expands and must block",
+         'echo "$(git stash)"', True),
+        ("double-quoted backticks expand and must block",
+         'echo "`git stash`"', True),
+        ("curl payload with $()",
+         'curl -d "$(git stash)" http://x', True),
+        ("curl payload with backticks",
+         'curl -d "`git stash`" http://x', True),
+        ("board add with $() -- the exact shape of the incident",
+         'amux board add "note: $(git stash)"', True),
+        ("board add with backticks",
+         'amux board add "note: `git stash`"', True),
+        # THE ROW WHERE THE TWO SYNTAXES DIVERGED. $( ) was blocked here by
+        # ACCIDENT (escaped inner quotes desynced the regex) while backticks
+        # sailed through, and the backtick form is what caused the incident.
+        ("python3 -c body, $() form",
+         'python3 -c "print(\\"$(git stash)\\")"', True),
+        ("python3 -c body, backtick form inside literal triple-quotes",
+         "python3 -c \"x = '''note `git stash` here'''\"", True),
+        # AMUX-3932 extension found while fixing: an UNQUOTED heredoc delimiter
+        # expands regardless of the sink. Verified against bash directly --
+        # `python3 <<EOF` prints the EXPANDED value, `python3 <<'EOF'` prints the
+        # literal text.
+        ("unquoted heredoc delimiter expands, $()",
+         'python3 <<EOF\nx = "$(git stash)"\nEOF', True),
+        ("unquoted heredoc delimiter expands, backticks",
+         'python3 <<EOF\nx = "`git stash`"\nEOF', True),
+        ("quoted heredoc delimiter is inert",
+         "python3 <<'EOF'\nx = \"$(git stash)\"\nEOF", False),
+        # FALSE-POSITIVE CONTROLS. This hook runs on EVERY Bash call in the
+        # fleet, so an over-broad match is a worse outage than the bypass: it
+        # blocks ~55 lanes at once. Each of these mentions a guarded command in
+        # text bash will never run.
+        ("prose in a quoted heredoc body",
+         "amux board add --stdin <<'EOF'\nfixing the git add -A misuse\nEOF", False),
+        ("prose in an unquoted heredoc body with no substitution",
+         "python3 <<EOF\n# a note about git stash and git add -A\nEOF", False),
+        ("a double-quoted string that mentions a command but expands nothing",
+         'amux board add "we should never run git add -A here"', False),
+        ("a harmless substitution beside a mention must NOT block",
+         'amux board add "mentions git stash, stamped $(date)"', False),
+        ("grep for the string in a file",
+         "grep -n 'git stash' scripts/*.sh", False),
+    ]
+    for _name, _cmd, _expect in subst:
+        _rc, _err = run_hook(_cmd, work, tmp)
+        if (_rc != 0) != _expect:
+            failures.append(
+                "AMUX-3932/%s: expected %s, got %s for %r"
+                % (_name, "BLOCK" if _expect else "ALLOW",
+                   "BLOCK" if _rc != 0 else "ALLOW", _cmd))
+    _subst = len(subst)
+
+    total = (len(cases) + len(trio) + len(quad) + len(matrix) + _bodies + 1
+             + len(redir_cases) + _mr101 + _subst)
     if failures:
         print(f"FAIL {len(failures)}/{total}:")
         for f in failures:
