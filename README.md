@@ -232,6 +232,96 @@ Server configuration lives in `~/.amux/server.env` (plain `KEY=value`; process e
 
 [`server.env.example`](server.env.example) documents the full set. Never commit your real `server.env` — several values are secrets.
 
+## macOS permissions
+
+amux drives a few system apps on your behalf, and macOS gates each one behind
+TCC. Each grant below is load-bearing. Without it the feature hangs or fails
+silently rather than reporting a problem. Granting them takes about two minutes, and
+they are listed **most-unblocking first** so you can stop when you have what you
+use.
+
+Everything is under **System Settings → Privacy & Security**.
+
+### 1. Automation → Messages  *(the urgent owner alert)*
+
+**Grant:** Privacy & Security → Automation → find your terminal (iTerm, Terminal)
+and the `amux-server-rs` entry → tick **Messages**.
+
+**Without it:** `amux alert` cannot text you. The send *hangs* for the full 12s
+timeout on every page, so the fire alarm is slowest exactly when it matters. amux breaks the circuit after the first timeout and says so in the
+channel map, but the message does not arrive.
+
+**Also check:** Messages must be *signed in to iMessage* (Messages → Settings →
+iMessage). AppleScript can accept a `send` against a signed-out account and report success,
+so treat the grant and the delivery as two separate things to confirm.
+
+### 2. Automation → iTerm2  *(creating and inspecting workers)*
+
+**Grant:** Privacy & Security → Automation → your terminal → tick **iTerm2**.
+
+**Without it:** `amux start`, the worker grid and pane discovery cannot see or
+place panes. `worker_create.rs` asks iTerm2 to list panes and gives up after 5s.
+
+### 3. Full Disk Access  *(reading Messages history, Mail, Calendar stores)*
+
+**Grant:** Privacy & Security → Full Disk Access → add your terminal **and**
+`~/.local/bin/amux-server-rs`.
+
+**Without it:** reads of `~/Library/Messages/chat.db` and the Mail/Calendar
+stores fail with `authorization denied`. Anything that reconciles what was
+actually delivered against what amux believes it sent is blind.
+
+### 4. Automation → Mail  *(only if you use a non-Gmail account)*
+
+**Grant:** Privacy & Security → Automation → your terminal → tick **Mail**.
+
+**Without it:** nothing, if your accounts are Gmail or Workspace. Those go through
+the Gmail API and never touch Mail.app. This is the fallback path only.
+
+### 5. Accessibility  *(only if you use keystroke automation)*
+
+**Grant:** Privacy & Security → Accessibility → add your terminal.
+
+**Without it:** anything driving another app through System Events keystrokes
+fails. Core amux does not need this; grant it if a worker of yours does.
+
+### What amux does NOT need
+
+Camera, Microphone, Location, Contacts, Reminders, Photos. If something asks,
+it is a worker's own tooling and not the harness. Browser automation uses a
+dedicated Chrome profile over CDP, so it needs no Screen Recording grant either.
+
+### After granting
+
+macOS caches TCC decisions per binary. The auto-builder replaces
+`amux-server-rs` on every commit, and an ad-hoc-signed rebuild reads as a *new
+program*, so prompts can reappear. Setting a stable signing identity
+(`AMUX_CODESIGN_IDENTITY`) makes an approval stick across rebuilds.
+
+Verify a grant by what it *did*, not by the checkbox:
+
+```bash
+amux alert "permissions test" "verifying Automation for Messages"
+curl -sk $(amux url)/api/alert/owner | head -c 400   # read the channels map
+```
+
+### Evidence this list is real
+
+Measured across ~1.5 GB of fleet logs on 2026-09-01, counting only machine-emitted
+signatures (prose describing an error cannot match these):
+
+| Signature | Count |
+|---|---|
+| `(-1712)` AppleEvent timed out | 166 |
+| `kTCCServiceScreenCapture` | 12 |
+| `Operation not permitted` | 9 |
+| `Not authorized to send Apple events` | 6 |
+| `errAEEventNotPermitted` | 5 |
+
+An earlier pass over the same logs reported far larger numbers. It was matching
+this document's own prose being echoed back through the message log, which is why
+the counts above are restricted to strings a human report would not contain.
+
 ## Naming
 
 A **worker** is one agent lane. A **group** is a label shared by several workers; workers see and coordinate with same-group peers. The HTTP API and env vars still carry the older `session`/`tag` spellings (`/api/sessions`, `X-Amux-Session`, `CC_TAGS`); renaming them would break every running worker at once, so the wire names migrate behind aliases. Worker = session, group = tag, wherever you see them in a request.
