@@ -112,6 +112,25 @@ def _evidence_for(cookie, org, worker):
     clean = re.sub(r"\x1b\[[0-9;]*m", "", hist)
     tool_calls = len(re.findall(r"⏺\s+\*?\*?(Read|Edit|Write|Bash|Grep|Glob)", clean))
     hist_lines = d.get("history_lines") if isinstance(d, dict) else 0
+    # A prompt DELIVERED but never SUBMITTED sits in the TUI's input box (`❯ ...`)
+    # with an empty history — the send reported 200, the Enter was swallowed by a
+    # boot/welcome modal, and every counter above reads 0. capital-express's
+    # compliance-audit sat like that for 10 days (AC-405); three daily WARNs said
+    # "no logs and no files" without once naming the cause, which was VISIBLE in
+    # the viewport the whole time. Read the current frame for it, so the verdict
+    # names the mechanism instead of the absence.
+    viewport = (d.get("output") or "") if isinstance(d, dict) else ""
+    vclean = re.sub(r"\x1b\[[0-9;]*m", "", viewport)
+    stuck_input = None
+    for m in re.finditer(r"^\s*❯\s+(\S.{14,})$", vclean, re.M):
+        cand = m.group(1).strip()
+        # An idle input box shows a grey placeholder (`Try "edit <filepath> to..."`)
+        # and captures can carry box-drawing runs — neither is typed text. Real
+        # stuck input is prose: mostly letters, not a Try-hint.
+        if cand.startswith('Try "') or sum(c.isalnum() for c in cand) < 10:
+            continue
+        stuck_input = cand[:80]
+        break
     files = 0
     if worker.get("dir"):
         st2, fl = gm.get(cookie, f"/api/fs/list?path={worker['dir']}", org)
@@ -120,7 +139,8 @@ def _evidence_for(cookie, org, worker):
                 if isinstance(fl.get(k), list):
                     files = len(fl[k])
                     break
-    return {"history_lines": hist_lines or 0, "tool_calls": tool_calls, "files": files}
+    return {"history_lines": hist_lines or 0, "tool_calls": tool_calls, "files": files,
+            "stuck_input": stuck_input}
 
 
 def _send_probe(cookie, org, name):
@@ -204,7 +224,18 @@ def check_env(cookie, plan, org_id, send_probe):
         res["reasons"].append(f"personas did not reply to a user message: {probe_fail}")
     elif no_evidence:
         res["status"] = "WARN"
-        res["reasons"].append(f"personas present but show no logs and no files: {no_evidence}")
+        # Name the mechanism where it is knowable: an unsubmitted prompt in the
+        # input box is a DELIVERY failure (the send's Enter was swallowed), not a
+        # silent worker — and it is recoverable by re-sending Enter (AC-405).
+        stuck = [p["name"] for p in res["personas"] if p["name"] in no_evidence
+                 and p["evidence"].get("stuck_input")]
+        quiet = [n for n in no_evidence if n not in stuck]
+        if stuck:
+            res["reasons"].append(
+                f"prompt delivered but never SUBMITTED — text sitting in the input box "
+                f"with empty history (send Enter to recover): {stuck}")
+        if quiet:
+            res["reasons"].append(f"personas present but show no logs and no files: {quiet}")
     else:
         res["status"] = "PASS"
     return res
