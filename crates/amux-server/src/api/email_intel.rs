@@ -144,8 +144,13 @@ fn theme_prompt(corpus: &[String]) -> String {
 this person actually spends attention on.\n\n\
 Infer the 5-9 THEMES that characterise their priorities. For each, give concrete handles that a \
 plain string matcher can use to spot a related EMAIL: keywords (lowercase, single words or short \
-phrases that would literally appear in a relevant subject or body) and senders (domains or \
-addresses, if the messages imply any).\n\n\
+phrases that would literally appear in a relevant subject or body) and senders.\n\n\
+SENDERS MUST BE EMAIL DOMAINS OR ADDRESSES — \"acme.com\", \"billing@stripe.com\" — and nothing \
+else. The messages below are addressed to internal AI workers, so they are full of worker names \
+like \"gtm-playbooks\" or \"mixpeek-general\". Those are NOT email senders and will never match \
+the From line of a real message; putting them here silently disables half the ranking. If a theme \
+implies no real email domain, return an EMPTY senders list — that is the correct answer, not a \
+worker name.\n\n\
 Return ONLY a JSON array, no prose, no code fence:\n\
 [{{\"label\":\"...\",\"weight\":1-10,\"keywords\":[\"...\"],\"senders\":[\"...\"],\"rationale\":\"one sentence\"}}]\n\n\
 Rules: weight is how much this person cares, 10 highest. Prefer specific keywords over generic \
