@@ -5815,3 +5815,23 @@ input.mdai-edge-path-input:focus { border-color: var(--accent); box-shadow: 0 0 
 @media (max-width: 600px) {
   .conn-add-grid { grid-template-columns: 1fr; }
 }
+
+/* Email tab layout (AMUX-3998).
+   A flex item's default `min-width: auto` refuses to shrink below its content,
+   so the long From addresses forced the wrapper to 432px inside a 343px parent
+   and clipped the account and folder chips on the right at phone width. Measured
+   at 390px: subtabs container 400px wide, chips cut off.
+   `min-width: 0` is the fix that lets a flex child actually be narrower than its
+   content; the ellipsis rules below then decide WHAT gets truncated, rather than
+   the browser silently cutting whatever hangs past the edge. */
+#email-view > div { min-width: 0; max-width: 100%; box-sizing: border-box; }
+#email-subtabs, #email-folders { min-width: 0; max-width: 100%; }
+#email-subtabs button, #email-folders button {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* The row's text column has to be shrinkable too, or the same rule that clipped
+   the chips clips the subject instead. */
+#email-list > div > div { min-width: 0; }
