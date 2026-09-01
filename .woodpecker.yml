@@ -46,6 +46,17 @@
 #     question determines whether this ever produces a binary meant to be
 #     installed anywhere.
 
+# Explicit event filter, workflow-wide, per the linter's own bad_habit warning
+# (https://woodpecker-ci.org/docs/usage/linter#event-filter-for-all-steps).
+# Covers every trigger mechanism this pipeline is meant to work under (see
+# the "Left deliberately OUT" note above): push and pull_request for whatever
+# forge trigger gets wired up, manual for the API-triggered runs used to
+# stand this up and sanity-check it (confirmed working 2026-09-01 via
+# POST /api/repos?forge_remote_id=... then POST /api/repos/{id}/pipelines,
+# no browser step needed after the token exists).
+when:
+  event: [push, pull_request, manual]
+
 steps:
   # Cheapest, most-likely-to-fail-fast check first (matches CLAUDE.md's own
   # local ordering: "Syntax gates: cargo check --workspace").
