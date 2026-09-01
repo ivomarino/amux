@@ -1991,7 +1991,7 @@ FIX: Fixed. The wrapper now copies itself to a temp file and `exec`s that before
 ## The staged-guard ships on INSTALL, so an edited hook is inert and nothing says so
 AREA: instruments
 SEVERITY: slows
-STATUS: open
+STATUS: fixed
 DATE: 2026-08-31
 SESSION: amux-frustrations
 CARD: AF-375
@@ -2025,6 +2025,16 @@ FIX: The signal already exists and does not reach far enough. The SessionStart
       `install-hooks.sh` already does with `cmp` at the end of its run, moved to
       the place where it would be read.
   Not building either from here without deciding which; carded.
+  SHIPPED: both halves. (2) is 4f668224. The post-commit hook compares its own
+  bytes against scripts/git-hooks/ and warns on drift. (1) is df97f802. The
+  SessionStart hooks-drift axis now crosses the drifting names against THIS
+  session's observed-edit records and, on a hit, points at the falsifiable check
+  (grep the INSTALLED copy, not the repo one), which is the sentence that would
+  have caught AF-365. Its two negative cells are the load-bearing ones: another
+  lane's record must not become your name, and a missing record must say the
+  check did not run rather than reading as "none of these is yours".
+  Self-signed is NOT available here: this lane both hit it and fixed it, so the
+  entry stays until a lane that pays the cost confirms the notice reaches them.
 
 ---
 ## The freshness hook's `git merge origin/main` exits 2 in the exact state it prescribes it for
