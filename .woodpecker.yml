@@ -118,7 +118,11 @@ steps:
     environment:
       CARGO_TARGET_DIR: /build/target
     commands:
-      - source /root/.cargo/env
+      # Woodpecker's docker backend runs step commands via `/bin/sh` (dash on
+      # this base image), not bash -- `source` is a bash builtin and fails
+      # there with "source: not found" (confirmed live, pipeline #7). The
+      # POSIX `.` builtin does the same job and works in both.
+      - . /root/.cargo/env
       - cargo check --workspace --all-targets
 
   - name: clippy
@@ -126,7 +130,7 @@ steps:
     environment:
       CARGO_TARGET_DIR: /build/target
     commands:
-      - source /root/.cargo/env
+      - . /root/.cargo/env
       - cargo clippy --workspace --all-targets -- -D warnings
 
   # amux-server only, matching CLAUDE.md's own documented test command --
@@ -136,5 +140,5 @@ steps:
     environment:
       CARGO_TARGET_DIR: /build/target
     commands:
-      - source /root/.cargo/env
+      - . /root/.cargo/env
       - cargo test -p amux-server --lib
