@@ -8262,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.765';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.766';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -17047,47 +17047,110 @@ function _emailRenderThemes(r) {
     + '</b> of your messages via <code>' + esc(r.model || '?') + '</code> at ' + esc(when) + '.';
 }
 
+// ---- inbox rendering -------------------------------------------------------
+//
+// These follow MAIL-CLIENT conventions rather than the scored-list shape this
+// started as. The first version put five always-visible buttons under every row,
+// which is a control panel, not an inbox: it tripled row height, buried the
+// subject, and made the list unscannable — the one thing an inbox is for.
+//
+// What the conventions actually are, and why each is here:
+//   * SENDER first and fixed-width, so the eye scans one column, not ragged text
+//   * SUBJECT bold + snippet dimmed on ONE line, the Gmail/Mail/Outlook shape
+//   * TIME right-aligned, relative (time today, month-day this year, else date)
+//   * UNREAD is bold — the oldest convention in mail, and `read` was already in
+//     the payload and ignored
+//   * ACTIONS ON HOVER, not always on. A row at rest shows content; the controls
+//     appear when you are pointing at the thing they act on
+//   * CLICK THE ROW TO OPEN IT, because that is what every mail client does
+
+function _emailSender(from) {
+  const f = String(from || '');
+  const m = f.match(/^\s*"?([^"<]+?)"?\s*<(.+)>\s*$/);
+  if (m) return { name: m[1].trim(), addr: m[2].trim() };
+  return { name: f.replace(/[<>]/g, '').trim(), addr: f.replace(/[<>]/g, '').trim() };
+}
+
+// Relative like a mail client: a time for today, a date for this year, a full
+// date beyond it. An absolute timestamp on every row is noise you have to read.
+function _emailWhen(d) {
+  const t = Date.parse(d || '');
+  if (!t || isNaN(t)) return '';
+  const dt = new Date(t), now = new Date();
+  if (dt.toDateString() === now.toDateString()) {
+    return dt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' });
+  }
+  if (dt.getFullYear() === now.getFullYear()) {
+    return dt.toLocaleDateString([], { month: 'short', day: 'numeric' });
+  }
+  return dt.toLocaleDateString([], { year: '2-digit', month: 'numeric', day: 'numeric' });
+}
+
+// One line, tags stripped, whitespace collapsed. A raw body carries invisible
+// padding characters that render as a long blank gap in the preview.
+function _emailSnippet(body) {
+  return String(body || '')
+    .replace(/<[^>]*>/g, ' ')
+    .replace(/[͏​-‍⁠﻿­]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+}
+
 function _emailRenderList(msgs) {
   const host = document.getElementById('email-list');
   if (!host) return;
-  if (!msgs.length) { host.innerHTML = '<div class="conn-empty">Nothing in the window.</div>'; return; }
+  if (!msgs.length) {
+    host.innerHTML = '<div class="conn-empty">Nothing here.</div>';
+    return;
+  }
   let html = '';
   for (const m of msgs) {
+    const s = _emailSender(m.from);
+    const unread = m.read === false;
     const score = Number(m.score || 0);
     const hits = Array.isArray(m.matched_themes) ? m.matched_themes : [];
-    // The score is shown WITH its reason. A ranking a person cannot argue with
-    // is one they stop trusting the first time it is wrong.
-    html += '<div class="conn-row" style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--border);">'
-      + '<div style="min-width:2.6em;text-align:right;font-weight:700;'
-      + (score > 0 ? 'color:var(--accent,#2563eb);' : 'opacity:0.45;') + '">'
-      + (score > 0 ? score.toFixed(0) : '—') + '</div>'
-      + '<div style="flex:1;min-width:0;">'
-      + '<div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;">' + esc(m.subject || '(no subject)') + '</div>'
-      + '<div style="font-size:0.78rem;color:var(--dim);overflow:hidden;text-overflow:ellipsis;">' + esc(m.from || '') + '</div>'
-      + (hits.length
-          ? '<div style="font-size:0.72rem;margin-top:3px;">' + hits.map(h =>
-              '<span class="conn-cat">' + esc(h) + '</span>').join(' ') + '</div>'
-          : '')
-      // The nudge is shown SEPARATELY from the computed score, so a surprising
-      // position is arguable: "we scored 6, you added 20" explains itself.
-      + (Number(m.rank_delta || 0) !== 0
-          ? '<div style="font-size:0.7rem;opacity:0.7;margin-top:2px;">base '
-            + Number(m.base_score || 0).toFixed(0) + ' · your nudge '
-            + (Number(m.rank_delta) > 0 ? '+' : '') + Number(m.rank_delta).toFixed(0) + '</div>'
-          : '')
-      + '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;">'
-      + _emailBtn(m, 'approved', m.verdict === 'approved' ? '✓ Kept' : 'Keep')
-      + _emailBtn(m, 'rejected', m.verdict === 'rejected' ? '✕ Rejected' : 'Reject')
-      + '<button class="conn-test-btn" onclick="_emailAnnotate(' + _emailArg(m) + ',{flagged:'
-      + (m.flagged ? 'false' : 'true') + '})">' + (m.flagged ? '★ Unflag' : '☆ Flag') + '</button>'
-      + '<button class="conn-test-btn" onclick="_emailAnnotate(' + _emailArg(m)
-      + ',{rank_delta:' + (Number(m.rank_delta || 0) + 5) + '})">▲ Boost</button>'
-      + '<button class="conn-test-btn" onclick="_emailAnnotate(' + _emailArg(m)
-      + ',{rank_delta:' + (Number(m.rank_delta || 0) - 5) + '})">▼ Derank</button>'
+    const arg = _emailArg(m);
+    const id = 'em-' + (m.gmail_id || Math.random().toString(36).slice(2));
+    html += '<div class="mail-row' + (unread ? ' unread' : '') + (m.flagged ? ' flagged' : '') + '"'
+      + ' onclick="_emailToggleBody(\'' + id + '\')">'
+      // Star is the flag, in the position every client puts it.
+      + '<button class="mail-star" title="Flag" onclick="event.stopPropagation();_emailAnnotate('
+      + arg + ',{flagged:' + (m.flagged ? 'false' : 'true') + '})">' + (m.flagged ? '★' : '☆') + '</button>'
+      + '<div class="mail-from" title="' + esc(s.addr) + '">' + esc(s.name || s.addr) + '</div>'
+      + '<div class="mail-mid">'
+      + '<span class="mail-subj">' + esc(m.subject || '(no subject)') + '</span>'
+      + '<span class="mail-snip"> — ' + esc(_emailSnippet(m.body)) + '</span>'
+      + (hits.length ? '<span class="mail-themes">' + hits.map(h => '<span class="conn-cat">'
+          + esc(h) + '</span>').join('') + '</span>' : '')
       + '</div>'
-      + '</div></div>';
+      // The score is why this row is HERE, so it sits with the metadata, small.
+      + '<div class="mail-score" title="' + (hits.length ? 'matched: ' + esc(hits.join(', ')) : 'no theme matched')
+      + (Number(m.rank_delta || 0) !== 0 ? ' · base ' + Number(m.base_score || 0).toFixed(0)
+          + ', your nudge ' + (Number(m.rank_delta) > 0 ? '+' : '') + Number(m.rank_delta).toFixed(0) : '')
+      + '">' + (score > 0 ? score.toFixed(0) : '') + '</div>'
+      + '<div class="mail-when">' + esc(_emailWhen(m.date)) + '</div>'
+      // AT REST this is hidden and the time shows; on hover they swap. Same slot,
+      // so the row never reflows and the list does not jump under the cursor.
+      + '<div class="mail-actions" onclick="event.stopPropagation()">'
+      + '<button title="Keep" onclick="_emailAnnotate(' + arg + ',{verdict:\''
+        + (m.verdict === 'approved' ? '' : 'approved') + '\'})">✓</button>'
+      + '<button title="Reject" onclick="_emailAnnotate(' + arg + ',{verdict:\''
+        + (m.verdict === 'rejected' ? '' : 'rejected') + '\'})">✕</button>'
+      + '<button title="Rank higher" onclick="_emailAnnotate(' + arg + ',{rank_delta:'
+        + (Number(m.rank_delta || 0) + 5) + '})">▲</button>'
+      + '<button title="Rank lower" onclick="_emailAnnotate(' + arg + ',{rank_delta:'
+        + (Number(m.rank_delta || 0) - 5) + '})">▼</button>'
+      + '</div>'
+      + '</div>'
+      + '<div class="mail-body" id="' + id + '" hidden>' + esc(String(m.body || '').slice(0, 4000)) + '</div>';
   }
   host.innerHTML = html;
+}
+
+function _emailToggleBody(id) {
+  const el = document.getElementById(id);
+  if (el) el.hidden = !el.hidden;
 }
 
 function _emailArg(m) {
@@ -17099,13 +17162,6 @@ function _emailArg(m) {
     score: Number(m.base_score || m.score || 0),
     matched_themes: Array.isArray(m.matched_themes) ? m.matched_themes : [],
   }).replace(/"/g, '&quot;');
-}
-
-function _emailBtn(m, verdict, label) {
-  const on = m.verdict === verdict;
-  return '<button class="conn-test-btn" style="' + (on ? 'background:var(--accent,#2563eb);color:#fff;' : '')
-    + '" onclick="_emailAnnotate(' + _emailArg(m) + ',{verdict:\'' + (on ? '' : verdict) + '\'})">'
-    + label + '</button>';
 }
 
 async function _emailAnnotate(ctx, patch) {
