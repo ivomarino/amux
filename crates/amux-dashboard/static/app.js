@@ -3170,6 +3170,7 @@ function render() {
                (AMUX-2559, "I cant add a worker to a group"). The label is the
                vocab; the field is the contract. */ ''}
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','tags','${escJs(s.tags.join(", "))}')"><span class="mi">&#x1F3F7;</span> Groups</div>
+          <div class="card-menu-item" onclick="event.stopPropagation();toggleSpansGroups('${s.name}')" title="Let this worker message workers in OTHER groups with no per-message approval. Writes CC_SEND_ALLOW on this worker; a group or global layer can also grant it from the Scope tab."><span class="mi">${s.spans_groups?'&#x2611;':'&#x2610;'}</span> Spans groups${_spansLabel(s)}</div>
           <div class="card-menu-item" onclick="event.stopPropagation();editField('${s.name}','dir','${esc(s.dir)}')"><span class="mi">&#x1F4C1;</span> Directory</div>
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doRestart('${s.name}')"><span class="mi">&#x21BB;</span> Restart</div>` : ''}
           ${s.running ? `<div class="card-menu-item" onclick="event.stopPropagation();closeAllMenus();doStop('${s.name}')"><span class="mi">&#x23F9;</span> Stop</div>` : ''}
@@ -5332,6 +5333,39 @@ async function togglePin(session) {
 // harness (AMUX_SESSION/URL env, self-report hooks, --mcp-config) and hides the
 // worker from peers at the NEXT spawn, so the toast says restart to apply. Paint
 // the flip immediately like togglePin, then let fetchSessions be the truth.
+// Says WHERE the allowance comes from, because the resolved value and the
+// worker's own value are different facts. A lane granted by a group layer shows
+// a ticked box it cannot untick here, and saying "(inherited)" is the difference
+// between a confusing control and an honest one.
+function _spansLabel(s) {
+  if (!s.spans_groups) return '';
+  const v = s.spans_groups_value || '';
+  const scope = v === '*' ? 'all' : v;
+  return s.spans_groups_own ? ': ' + esc(scope) : ': ' + esc(scope) + ' (inherited)';
+}
+
+async function toggleSpansGroups(session) {
+  closeAllMenus();
+  const s = sessions.find(x => x.name === session);
+  const was = s ? !!s.spans_groups : false;
+  // Turning OFF only clears this worker's own value. If a group or global layer
+  // granted it, the server says so in its reply rather than reporting success
+  // for a change the next send would disprove.
+  if (was && s && !s.spans_groups_own) {
+    showToast('Granted by a group or global layer — turn it off in the Scope tab');
+    return;
+  }
+  const next = !was;
+  if (s) { s.spans_groups = next; lastSessionsJSON = ''; render(); }
+  const r = await apiCall(API + '/api/sessions/' + session + '/config', {
+    method: 'PATCH', headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ spans_groups: next })
+  });
+  if (!r && s) { s.spans_groups = was; lastSessionsJSON = ''; render(); }
+  else if (r) { showToast(r.message || (next ? 'Spans groups on' : 'Spans groups off')); }
+  await fetchSessions();
+}
+
 async function toggleIsolated(session) {
   closeAllMenus();
   const s = sessions.find(x => x.name === session);
@@ -8293,7 +8327,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.769';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.770';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").

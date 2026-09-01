@@ -2640,6 +2640,25 @@ fn python_fleet_sessions(signals: &FleetSignals) -> Vec<serde_json::Value> {
             // badge; the peer-facing list strips these entries entirely in
             // list_sessions_legacy (a peer must not even see it exists).
             "isolated": env.get("CC_ISOLATED").map(|v| v == "1").unwrap_or(false),
+            // SPANS GROUPS (AMUX-4015 / AMUX-4016): may this worker send across
+            // group boundaries with no per-message approval.
+            //
+            // RESOLVED worker > group > global, because that is what the gate
+            // actually enforces. Reading the worker file alone would render the
+            // toggle OFF for a lane that a group or global layer already grants,
+            // which is a checkbox contradicting the behaviour it describes.
+            //
+            // `_own` says whether the WORKER's own file sets it, so the UI can
+            // tell "this worker" from "inherited" and can refuse to offer a
+            // local switch-off for something it did not set locally.
+            "spans_groups": crate::api::session_verbs::scoped_setting_in(
+                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
+            ).map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
+            "spans_groups_value": crate::api::session_verbs::scoped_setting_in(
+                &crate::config::amux_home(), &name, "CC_SEND_ALLOW",
+            ).map(|v| v.trim().trim_matches('"').to_string()).unwrap_or_default(),
+            "spans_groups_own": env.get("CC_SEND_ALLOW")
+                .map(|v| !v.trim().trim_matches('"').is_empty()).unwrap_or(false),
             "steering_queue": [],
             "managed_by": "python",
         }));

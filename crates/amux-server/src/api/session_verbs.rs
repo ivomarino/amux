@@ -15929,6 +15929,62 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
         }));
     }
 
+    // SPANS GROUPS (AMUX-4016): the per-worker standing allowance, written as
+    // the env key `CC_SEND_ALLOW` — the environment primitive the gate already
+    // reads, not a new store.
+    //
+    // Two shapes on purpose:
+    //   `spans_groups: true`      -> "*", may reach any group
+    //   `send_allow: "gtm,canvas"` -> exactly those groups
+    // A bare toggle covers the common case; the string covers "these, not all",
+    // which a checkbox cannot express and which is the honest default for a
+    // permission.
+    //
+    // WRITES THE WORKER LAYER ONLY. Group and global layers are the Scope tab's
+    // to set, and silently writing one from a per-worker menu would change every
+    // lane in that group from a control labelled with one worker's name.
+    if body.get("spans_groups").is_some() || body.get("send_allow").is_some() {
+        let value = if let Some(sv) = body.get("send_allow").and_then(Value::as_str) {
+            sv.trim().to_string()
+        } else if py_truthy(body.get("spans_groups").unwrap_or(&Value::Null)) {
+            "*".to_string()
+        } else {
+            String::new()
+        };
+        cfg.set("CC_SEND_ALLOW", &value);
+        if cfg.write(&f).is_err() {
+            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+        }
+        // Resolved AFTER the write, so the answer is what the gate will actually
+        // enforce rather than what was just typed — a group or global layer can
+        // still grant this lane even when its own value is now empty, and
+        // reporting "off" there would be a lie the next send disproves.
+        let effective = scoped_setting_in(&crate::config::amux_home(), name, "CC_SEND_ALLOW")
+            .unwrap_or_default();
+        let effective = effective.trim().trim_matches('"').to_string();
+        tracing::info!(
+            session = %name, send_allow = %value, effective = %effective,
+            "config: cross-group standing allowance set (CC_SEND_ALLOW)"
+        );
+        return j200(json!({
+            "ok": true,
+            "spans_groups": !effective.is_empty(),
+            "send_allow": value,
+            "effective": effective,
+            // Applies to the NEXT send, not at spawn: the gate resolves this on
+            // every send rather than caching it at launch, so no restart.
+            "message": if effective.is_empty() {
+                "cross-group sends refused again for this worker".to_string()
+            } else if value.is_empty() {
+                format!("worker value cleared, but a group or global layer still grants: {effective}")
+            } else if effective == "*" {
+                "this worker may now send to any group, no approval needed".to_string()
+            } else {
+                format!("this worker may now send to: {effective}")
+            },
+        }));
+    }
+
     // Branch (py:76679).
     if let Some(bv) = body.get("branch") {
         cfg.set("CC_BRANCH", bv.as_str().unwrap_or("").trim());
