@@ -918,7 +918,7 @@ impl ModelClient for ApiModel {
 
 /// Picks the best available model client: [`ApiModel`] if `ANTHROPIC_API_KEY` is
 /// set (direct HTTP, no process boot), else [`CliModel`] (CLI subprocess).
-fn best_model() -> Box<dyn ModelClient> {
+pub(crate) fn best_model() -> Box<dyn ModelClient> {
     if let Some(api) = ApiModel::from_env() {
         tracing::info!("mdai: using direct Anthropic API (ANTHROPIC_API_KEY set)");
         Box::new(api)

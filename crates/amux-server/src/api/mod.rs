@@ -24,6 +24,7 @@ pub mod file_viewer;
 pub mod files;
 pub mod fs;
 pub mod git_guard;
+pub mod email_intel;
 pub mod grants;
 pub mod gmail_auth;
 pub mod google_sa;

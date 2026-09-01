@@ -96,6 +96,7 @@ pub mod ids {
     pub const EVENT_PROCESSORS: &str = "event-processors";
     pub const SCAN: &str = "terminal-scan";
     pub const BOOTSTRAP: &str = "session-bootstrap";
+    pub const EMAIL_THEMES: &str = "email-themes";
     pub const COMMIT_NUDGE: &str = "commit-nudge";
     pub const COMMIT_MENTION_NOTES: &str = "commit-mention-notes";
     pub const SELF_ADOPT: &str = "self-adoption";

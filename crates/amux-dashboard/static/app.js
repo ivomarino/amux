@@ -8262,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.762';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.763';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -16959,6 +16959,182 @@ async function _connDelete(id) {
   } catch (e) { showToast('delete failed: ' + String(e)); }
 }
 
+let _emailAccount = null;
+let _emailFolder = 'inbox';
+
+async function _emailLoad() {
+  const host = document.getElementById('email-list');
+  if (!host) return;
+  // Accounts come from the SAME place the Connectors tab reads, so a mailbox
+  // cannot appear here and be missing there.
+  let accounts = [];
+  try {
+    const r = await fetch(API + '/api/gmail/accounts', { headers: _authHeaders() });
+    const d = await r.json();
+    accounts = Array.isArray(d.accounts) ? d.accounts : [];
+    _emailRenderSubtabs(accounts, d.health || {});
+  } catch (e) { /* fall through: the list below will say it found nothing */ }
+  if (!accounts.length) {
+    host.innerHTML = '<div class="conn-empty">No connected email accounts. Connect one in the Connectors tab.</div>';
+    return;
+  }
+  if (!_emailAccount || accounts.indexOf(_emailAccount) < 0) _emailAccount = accounts[0];
+  _emailRenderSubtabs(accounts, {});
+  host.innerHTML = '<div class="conn-empty">Loading ' + esc(_emailAccount) + '…</div>';
+  try {
+    const r = await fetch(API + '/api/email/ranked?count=60&folder=' + encodeURIComponent(_emailFolder)
+      + '&account=' + encodeURIComponent(_emailAccount), { headers: _authHeaders() });
+    const d = await r.json();
+    if (!r.ok || d.error) {
+      // Name WHICH half failed. `stage` distinguishes a mailbox problem from a
+      // ranking problem, and sending a reader to the themes for an IMAP error
+      // is the wrong door.
+      host.innerHTML = '<div class="conn-empty">Could not load '
+        + esc(_emailAccount) + (d.stage ? ' (' + esc(d.stage) + ')' : '') + ': '
+        + esc(String(d.error || r.status)) + '</div>';
+      return;
+    }
+    _emailRenderFolders();
+    _emailRenderThemes(d.ranking || {});
+    _emailRenderList(d.messages || []);
+  } catch (e) {
+    host.innerHTML = '<div class="conn-empty">Failed to load: ' + esc(String(e)) + '</div>';
+  }
+}
+
+function _emailRenderSubtabs(accounts, health) {
+  const el = document.getElementById('email-subtabs');
+  if (!el) return;
+  el.innerHTML = accounts.map(a => {
+    const on = a === _emailAccount;
+    const bad = health[a] && health[a] !== 'ok';
+    return '<button class="conn-scope-btn" onclick="_emailPick(\'' + esc(a) + '\')" '
+      + 'style="min-height:34px;' + (on ? 'background:var(--accent,#2563eb);color:#fff;' : '') + '">'
+      + esc(a) + (bad ? ' ⚠️' : '') + '</button>';
+  }).join('');
+}
+
+function _emailPick(a) { _emailAccount = a; _emailLoad(); }
+function _emailFolderPick(f) { _emailFolder = f; _emailLoad(); }
+
+function _emailRenderFolders() {
+  const el = document.getElementById('email-folders');
+  if (!el) return;
+  // Inbox is the UNFILED set, not "everything" — a list that keeps showing mail
+  // you already filed is one you stop reading.
+  el.innerHTML = [['inbox','Inbox'],['approved','Approved'],['rejected','Rejected']].map(([k,label]) => {
+    const on = k === _emailFolder;
+    return '<button class="conn-scope-btn" onclick="_emailFolderPick(\'' + k + '\')" '
+      + 'style="min-height:34px;' + (on ? 'background:var(--accent,#2563eb);color:#fff;' : '') + '">'
+      + label + '</button>';
+  }).join('');
+}
+
+// The inference's provenance, stated rather than implied. An all-zero ranking
+// with measured:false is a probe that never ran; with measured:true it is a
+// genuine "none of this is about anything you asked for".
+function _emailRenderThemes(r) {
+  const el = document.getElementById('email-themes');
+  if (!el) return;
+  if (!r.measured) {
+    el.innerHTML = '<b>Not ranked yet.</b> ' + esc(r.why_unmeasured || 'the inference has not run')
+      + ' — scores below are all 0 because nothing has been learned, not because nothing matters.';
+    return;
+  }
+  const when = r.computed_at ? new Date(r.computed_at * 1000).toLocaleString() : 'unknown';
+  el.innerHTML = 'Ranking on <b>' + (r.themes || 0) + ' learned theme'
+    + ((r.themes === 1) ? '' : 's') + '</b>, inferred from <b>' + (r.n_considered || 0)
+    + '</b> of your messages via <code>' + esc(r.model || '?') + '</code> at ' + esc(when) + '.';
+}
+
+function _emailRenderList(msgs) {
+  const host = document.getElementById('email-list');
+  if (!host) return;
+  if (!msgs.length) { host.innerHTML = '<div class="conn-empty">Nothing in the window.</div>'; return; }
+  let html = '';
+  for (const m of msgs) {
+    const score = Number(m.score || 0);
+    const hits = Array.isArray(m.matched_themes) ? m.matched_themes : [];
+    // The score is shown WITH its reason. A ranking a person cannot argue with
+    // is one they stop trusting the first time it is wrong.
+    html += '<div class="conn-row" style="display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-bottom:1px solid var(--border);">'
+      + '<div style="min-width:2.6em;text-align:right;font-weight:700;'
+      + (score > 0 ? 'color:var(--accent,#2563eb);' : 'opacity:0.45;') + '">'
+      + (score > 0 ? score.toFixed(0) : '—') + '</div>'
+      + '<div style="flex:1;min-width:0;">'
+      + '<div style="font-weight:600;overflow:hidden;text-overflow:ellipsis;">' + esc(m.subject || '(no subject)') + '</div>'
+      + '<div style="font-size:0.78rem;color:var(--dim);overflow:hidden;text-overflow:ellipsis;">' + esc(m.from || '') + '</div>'
+      + (hits.length
+          ? '<div style="font-size:0.72rem;margin-top:3px;">' + hits.map(h =>
+              '<span class="conn-cat">' + esc(h) + '</span>').join(' ') + '</div>'
+          : '')
+      // The nudge is shown SEPARATELY from the computed score, so a surprising
+      // position is arguable: "we scored 6, you added 20" explains itself.
+      + (Number(m.rank_delta || 0) !== 0
+          ? '<div style="font-size:0.7rem;opacity:0.7;margin-top:2px;">base '
+            + Number(m.base_score || 0).toFixed(0) + ' · your nudge '
+            + (Number(m.rank_delta) > 0 ? '+' : '') + Number(m.rank_delta).toFixed(0) + '</div>'
+          : '')
+      + '<div style="display:flex;gap:6px;margin-top:6px;flex-wrap:wrap;">'
+      + _emailBtn(m, 'approved', m.verdict === 'approved' ? '✓ Kept' : 'Keep')
+      + _emailBtn(m, 'rejected', m.verdict === 'rejected' ? '✕ Rejected' : 'Reject')
+      + '<button class="conn-test-btn" onclick="_emailAnnotate(' + _emailArg(m) + ',{flagged:'
+      + (m.flagged ? 'false' : 'true') + '})">' + (m.flagged ? '★ Unflag' : '☆ Flag') + '</button>'
+      + '<button class="conn-test-btn" onclick="_emailAnnotate(' + _emailArg(m)
+      + ',{rank_delta:' + (Number(m.rank_delta || 0) + 5) + '})">▲ Boost</button>'
+      + '<button class="conn-test-btn" onclick="_emailAnnotate(' + _emailArg(m)
+      + ',{rank_delta:' + (Number(m.rank_delta || 0) - 5) + '})">▼ Derank</button>'
+      + '</div>'
+      + '</div></div>';
+  }
+  host.innerHTML = html;
+}
+
+function _emailArg(m) {
+  // The message's IDENTITY plus what the ranker was SHOWING. Both travel to the
+  // server: the verdict alone teaches nothing once the themes are recomputed.
+  return JSON.stringify({
+    message_id: m.message_id || m.id || '',
+    from: m.from || '', subject: m.subject || '',
+    score: Number(m.base_score || m.score || 0),
+    matched_themes: Array.isArray(m.matched_themes) ? m.matched_themes : [],
+  }).replace(/"/g, '&quot;');
+}
+
+function _emailBtn(m, verdict, label) {
+  const on = m.verdict === verdict;
+  return '<button class="conn-test-btn" style="' + (on ? 'background:var(--accent,#2563eb);color:#fff;' : '')
+    + '" onclick="_emailAnnotate(' + _emailArg(m) + ',{verdict:\'' + (on ? '' : verdict) + '\'})">'
+    + label + '</button>';
+}
+
+async function _emailAnnotate(ctx, patch) {
+  try {
+    const body = Object.assign({ account: _emailAccount }, ctx, patch);
+    const r = await fetch(API + '/api/email/annotate', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, _authHeaders()),
+      body: JSON.stringify(body),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'could not save'); return; }
+  } catch (e) { showToast('failed: ' + String(e)); return; }
+  _emailLoad();
+}
+
+async function _emailThemesRefresh(btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Learning…'; }
+  try {
+    const r = await fetch(API + '/api/email/themes/refresh', { method: 'POST', headers: _authHeaders() });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'could not re-learn'); }
+    else if (!d.measured) { showToast('Not enough of your messages yet to infer themes'); }
+    else { showToast('Learned ' + d.themes + ' themes from ' + d.n_considered + ' messages'); }
+  } catch (e) { showToast('failed: ' + String(e)); }
+  if (btn) { btn.disabled = false; btn.textContent = 'Re-learn priorities'; }
+  _emailLoad();
+}
+
 async function _connectorsTabLoad() {
   const host = document.getElementById('connectors-list');
   if (!host) return;
@@ -20608,6 +20784,7 @@ function switchView(view) {
   if (view === 'messages') _messagesLoad(true, '');
   if (view === 'files') { loadFiles(_filesPath); _filesRenderBookmarks(); }
   if (view === 'mdai') _mdaiTabLoad();
+  if (view === 'email') _emailLoad();
   if (view === 'connectors') _connectorsTabLoad();
   if (view === 'proxies') { loadProxies(); _startProxiesTimer(); } else { _stopProxiesTimer(); }
   if (view !== 'files') {
@@ -33585,7 +33762,18 @@ function _gmailFmtDate(ts) {
 }
 
 // ── Notifications ────────────────────────────────────────────────────────────
-async function _emailLoad() {
+// ORPHANED (AMUX-3998). This is the entry point of an older Gmail client that
+// is UNREACHABLE: every DOM id it renders into — gmail-messages-list,
+// gmail-sidebar, gmail-thread-view, gmail-accounts-list, the compose fields —
+// is absent from index.html, so no markup has ever existed for it.
+//
+// Renamed rather than deleted: it is somebody's work and it may be the basis of
+// a fuller client later. But it could not keep the name, because function
+// declarations HOIST — this later definition silently replaced the live one
+// above and every call site would have run this body instead.
+// `no_two_top_level_functions_in_app_js_share_a_name` caught it, which is the
+// ethos rule 7 check ("every name you DEFINE must not already") earning its keep.
+async function _gmailLegacyLoad_UNREACHABLE() {
   // Load connected accounts, then render inbox
   const r = await fetch(API + '/api/gmail/accounts').catch(() => null);
   if (!r || !r.ok) { _gmailRenderEmpty('Could not connect to server'); return; }

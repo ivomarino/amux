@@ -267,6 +267,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0048_issues_waiting_on",
         sql: include_str!("../../migrations/0048_issues_waiting_on.sql"),
     },
+    Migration {
+        version: 49,
+        name: "0049_email_annotations",
+        sql: include_str!("../../migrations/0049_email_annotations.sql"),
+    },
 ];
 
 /// Migrations embedded in THIS binary that the DB has not recorded yet.
