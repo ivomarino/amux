@@ -2951,6 +2951,17 @@
     background: var(--card); border: 1px solid var(--border); border-radius: 6px;
     min-width: 150px; z-index: 200; padding: 6px 0;
     box-shadow: 0 4px 16px rgba(0,0,0,0.2);
+    /* AC-403: 21 rows rendered 680px tall from an anchor at y=342 and ran 222px
+       past an 800px fold. BODY computes to a clipper, so those rows were CLIPPED
+       rather than merely scrolled past, and the menu's boundingBox still looked
+       correct — which is how every box assertion passed while the last rows were
+       invisible. The <=600px bottom-sheet below has had max-height since it was
+       written; this rule never did.
+       --tc-max-h is set from the live anchor by _capTabCustomizerHeight. The
+       60vh fallback is for the no-JS path only and is NOT the fix: from that
+       anchor it lands at 822, still 22px over, which is the number the e2e run
+       reported. */
+    max-height: var(--tc-max-h, 60vh); overflow-y: auto; overscroll-behavior: contain;
   }
   #peek-tab-customizer-menu { position: fixed; z-index: 300; }
   .tab-customizer-item {

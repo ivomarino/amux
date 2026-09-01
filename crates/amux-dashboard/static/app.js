@@ -3970,10 +3970,41 @@ function toggleTabCustomizer() {
   if (_tabCustomizerOpen) {
     _renderTabCustomizerMenu();
     menu.style.display = '';
+    _capTabCustomizerHeight(menu);
     _tabCustBeacon(menu, 'global');
   } else {
     menu.style.display = 'none';
   }
+}
+
+// Keep the open menu inside the viewport (AC-403).
+//
+// The desktop rule had no max-height and no overflow, so 21 rows rendered 680px
+// tall from an anchor at y=342 and ran 222px past an 800px fold. BODY computes
+// to a clipper (overflow-x:clip pairs overflow-y down from visible), so the rows
+// past the fold are not merely below the scroll, they are CLIPPED: the menu's
+// boundingBox still looks correct, which is why every box assertion passed while
+// the last rows were invisible. The mobile bottom-sheet at <=600px got
+// `max-height: 60vh; overflow-y: auto` when it was written; the desktop rule
+// never did.
+//
+// MEASURED, NOT GUESSED AT, because a static cap cannot be right. 60vh from that
+// anchor is 480px and lands at 822, still 22px over — which is exactly the
+// overflow the e2e run reported, so the obvious CSS-only fix reproduces the bug
+// at a smaller size. The cap has to come from where the menu actually opens.
+//
+// Set as a custom property rather than an inline max-height so the media query's
+// bottom-sheet rule still wins on mobile, where the anchor is irrelevant.
+function _capTabCustomizerHeight(menu) {
+  try {
+    const top = menu.getBoundingClientRect().top;
+    // 12px of breathing room at the fold, and the iOS home indicator inset,
+    // which css-mobile.md requires for anything reaching a screen edge.
+    const inset = parseFloat(getComputedStyle(document.documentElement)
+      .getPropertyValue('--safe-bottom')) || 0;
+    const avail = Math.max(120, window.innerHeight - top - 12 - inset);
+    menu.style.setProperty('--tc-max-h', avail + 'px');
+  } catch (e) { /* a cap we cannot compute must not stop the menu opening */ }
 }
 
 function _renderTabCustomizerMenu() {
@@ -8262,7 +8293,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.768';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.769';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
