@@ -1,0 +1,76 @@
+# Woodpecker CI pipeline for amux's Rust workspace.
+#
+# Exists to replace the ad-hoc, hand-rolled `docker --context <host> build`
+# invocations this session ran directly against a remote Docker host all day
+# (see frustrations.md / CLAUDE.local.md, 2026-09-01) with a real, repeatable
+# pipeline: same steps every time, no scratch Dockerfiles, no forgetting to
+# clean up afterward.
+#
+# PREREQUISITE on whatever host runs the Woodpecker agent for this repo:
+# the `amux-rust-base` image must already exist there (built once from
+# Dockerfile.rust-base at the repo root — see that file's own header). This
+# pipeline does NOT build it itself: baking the toolchain + a warm dependency
+# cache into every run is the exact slowness this pipeline exists to avoid.
+# Rebuild it manually whenever Cargo.lock changes enough that the cache goes
+# meaningfully stale.
+#
+# Structural advantages over the ad-hoc `docker build` approach it replaces,
+# worth naming explicitly since they're not obvious from the YAML alone:
+#   - Woodpecker checks out the repo itself (a clean `git clone`), so a step
+#     never sees a machine-local, gitignored file like .cargo/config.toml --
+#     that whole "rm -f .cargo/config.toml" step earlier Dockerfiles needed
+#     is structurally impossible to forget here, because there is nothing to
+#     forget to exclude.
+#   - The checkout is a WORKSPACE VOLUME shared across steps, not re-COPYing
+#     the whole tree into a fresh build context per step -- steps start
+#     instantly instead of paying a multi-second COPY every time.
+#   - Steps run sequentially and stop on first failure by default, so this
+#     mirrors CLAUDE.md's own "Syntax gates... Before push: clippy... Tests"
+#     ordering (cheapest, most-likely-to-fail check first) without extra
+#     config.
+#
+# Left deliberately OUT of this first version, on purpose, not by oversight:
+#   - Any GitHub (or other forge) webhook trigger -- how this pipeline gets
+#     invoked is still an open decision (see the board card this shipped
+#     with). This file works identically whether that ends up being a GitHub
+#     App, a local polling trigger matching rust-auto-build.sh's model, or
+#     both.
+#   - The secret-scan / client-JS-version-bump / CLI-syntax gates
+#     .github/workflows/checks.yml also runs. Kept to the Rust gates only
+#     for this first pass so the "offload the builder" ask lands fast and
+#     small; folding the rest in is a real, separate follow-up, not
+#     forgotten.
+#   - Release-profile build. check + clippy + test cover correctness; a
+#     release build for actual deploy is a distinct pipeline (or a later
+#     step here) once the trigger question is settled, since ONLY that
+#     question determines whether this ever produces a binary meant to be
+#     installed anywhere.
+
+steps:
+  # Cheapest, most-likely-to-fail-fast check first (matches CLAUDE.md's own
+  # local ordering: "Syntax gates: cargo check --workspace").
+  - name: check
+    image: amux-rust-base
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/target
+    commands:
+      - source /root/.cargo/env
+      - cargo check --workspace --all-targets
+
+  - name: clippy
+    image: amux-rust-base
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/target
+    commands:
+      - source /root/.cargo/env
+      - cargo clippy --workspace --all-targets -- -D warnings
+
+  # amux-server only, matching CLAUDE.md's own documented test command --
+  # amux-core/amux-cli have no meaningful test suite of their own yet.
+  - name: test
+    image: amux-rust-base
+    environment:
+      CARGO_TARGET_DIR: /woodpecker/target
+    commands:
+      - source /root/.cargo/env
+      - cargo test -p amux-server --lib
