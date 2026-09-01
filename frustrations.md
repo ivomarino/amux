@@ -3060,3 +3060,46 @@ FIX: none yet. Same interim mitigation as the prior entry (offload,
   sessions plus a full desktop stack plus periodic release builds, or does
   one of those need to move), or giving the builder itself a remote-offload
   path the way this session now does manually for ad hoc verification.
+
+---
+
+## A local `cargo clippy` OOM-kill doesn't just kill the build — it kills the WHOLE interactive session
+AREA: build
+SEVERITY: blocks
+STATUS: open
+DATE: 2026-09-01
+SESSION: amux
+CARD: AMUX-70
+SYMPTOM: Ran `cargo clippy -p amux-server --all-targets` locally in this
+  interactive pane as a fallback when the remote build host's toolchain
+  image kept failing to rebuild (rustup uplink flakiness, already
+  documented in CLAUDE.local.md — host details deliberately omitted here,
+  this file is public). `clippy-driver` grew to ~2GB RSS and got OOM-killed
+  (`dmesg -T`: 08:54:28 and 09:22:32). Confirmed via `journalctl --user`:
+  every process in an interactive amux pane — including the Claude Code
+  process itself — shares ONE systemd scope,
+  `tmux-spawn-<uuid>.scope`. Systemd does not reap just the OOM-killed
+  process: it marks the WHOLE SCOPE `Failed with result 'oom-kill'`
+  (`tmux-spawn-006a872a....scope: Failed with result 'oom-kill' (3.7G
+  memory peak)`), and whatever launches the pane tears it down and starts
+  a brand-new one 26 seconds later (`Started tmux-spawn-baff1e65-...`).
+  The entire interactive session restarted mid-conversation as a result —
+  not the build process, the SESSION. Surfaced to the session only as
+  orphaned background-task notifications ("stopped ... may have been
+  stopped via agent teardown") — nothing points at OOM or the scope
+  failure; that only came from reading `journalctl`/`dmesg` directly.
+COST: This exact session lost an in-flight `git commit` (had to be
+  re-run), an in-flight `cargo clippy` verification pass (had to restart
+  from a fresh session with no memory of the interrupted state until the
+  transcript resumed), and cost real wall-clock time diagnosing "why does
+  amux keep stopping" as a SEPARATE investigation from the work that
+  caused it. Anyone running local cargo/clippy/test/build directly in an
+  interactive pane hits this identically.
+FIX: none in code yet. Documented as a hard rule in this session's own
+  `offload-builds` memory: never run cargo build/check/clippy/test
+  directly in an interactive pane, even as a one-off fallback — that pane
+  IS the session. If local is unavoidable, run it via `systemd-run --user
+  --scope -- cargo ...` so the build gets its OWN scope, not the pane's.
+  AMUX-70 filed for a durable fix (either that wrapper baked into the
+  sanctioned local-build path, or making the remote-offload fallback
+  actually reliable so this is never reached for).
