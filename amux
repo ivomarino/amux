@@ -1921,7 +1921,7 @@ transport failure, not a refused gate. Re-run when the server is back." >&2
   # captured JSON on stdout is untouched.
   if [[ -n "${trigger:-}" ]]; then
     printf '%s\n' "  trigger stored in source_ref (+ last_verified_at). Read it back with:
-      curl -sk \"\$AMUX_URL/api/board/$id\" | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"source_ref\"])'" >&2
+      curl -sk --connect-timeout 2 \"\$AMUX_URL/api/board/$id\" | python3 -c 'import json,sys;print(json.load(sys.stdin)[\"source_ref\"])'" >&2
   fi
   printf '%s' "$_tresp"
 }
