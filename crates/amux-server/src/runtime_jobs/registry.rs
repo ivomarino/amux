@@ -133,6 +133,7 @@ pub const ALL_IDS: &[&str] = &[
     ids::EVENT_PROCESSORS,
     ids::SCAN,
     ids::BOOTSTRAP,
+    ids::EMAIL_THEMES,
     ids::COMMIT_NUDGE,
     ids::COMMIT_MENTION_NOTES,
     ids::SELF_ADOPT,
@@ -211,6 +212,14 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: None,
+    },
+    Doc {
+        id: ids::EMAIL_THEMES,
+        name: "Email theme inference",
+        purpose: "Recomputes the owner's email themes from human message history for the ranked inbox; one meta-model call per 6h at most, and a pass skips when the stored themes are still fresh so a restart does not buy a call.",
+        env: NO_ENV,
+        pref: None,
+        detail: Some("/api/email/themes"),
     },
     Doc {
         id: ids::STEER_DELIVER,
