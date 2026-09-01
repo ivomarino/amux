@@ -559,6 +559,21 @@ jobs:
             set -u
             WANT=$(docker image inspect -f '{{.Id}}' ghcr.io/mixpeek/amux:latest)
             bad=0
+            # AC-407: a recreate stops every tmux session and the rust server does
+            # not restore them (no AMUX_AUTOSTART_SESSIONS). Capture which sessions
+            # were RUNNING per workspace BEFORE the recreate, so the restart below
+            # restores exactly that set — the customer's own running config, not an
+            # imposed one (ethos rule 8). A worker the customer had stopped stays
+            # stopped. Recorded before force-recreate; consumed after verify.
+            declare -A WAS_RUNNING
+            for d in /var/amux/users/*/; do
+              id=$(basename "$d")
+              c="amux-user-${id}"
+              docker ps --format '{{.Names}}' | grep -qx "$c" || continue
+              WAS_RUNNING[$id]=$(docker exec "$c" curl -sk --max-time 5 \
+                "https://localhost:8822/api/sessions" 2>/dev/null \
+                | python3 -c 'import json,sys; print(" ".join(s["name"] for s in json.load(sys.stdin) if s.get("running")))' 2>/dev/null || echo '')
+            done
             for d in /var/amux/users/*/; do
               id=$(basename "$d")
               docker ps --format '{{.Names}}' | grep -qx "amux-user-${id}" || continue
@@ -598,6 +613,27 @@ jobs:
               echo "$wedged" | sed 's/^/  /'
               bad=1
             fi
+            # AC-407: restore the sessions the recreate stopped. Only those that
+            # were running BEFORE (captured above), only on containers that just
+            # proved they serve rust — restarting into a wedged/old container would
+            # be pointless. A restart hiccup is reported but does NOT fail the
+            # deploy: the image swap succeeded, and cloud_autofix re-heals daily.
+            echo ""
+            echo "restoring sessions the recreate stopped (AC-407):"
+            for d in /var/amux/users/*/; do
+              id=$(basename "$d")
+              c="amux-user-${id}"
+              docker ps --format '{{.Names}}' | grep -qx "$c" || continue
+              have=$(docker inspect -f '{{.Image}}' "$c")
+              [ "$have" = "$WANT" ] || { echo "  $id: skipped (not on new image)"; continue; }
+              want_names="${WAS_RUNNING[$id]:-}"
+              [ -n "$want_names" ] || { echo "  $id: nothing was running"; continue; }
+              for name in $want_names; do
+                code=$(docker exec "$c" curl -sk -o /dev/null -w '%{http_code}' --max-time 15 \
+                  -X POST "https://localhost:8822/api/sessions/${name}/start" 2>/dev/null || echo 000)
+                echo "  $id/$name -> $code"
+              done
+            done
             exit "$bad"
           ENDSSH
 
