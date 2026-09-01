@@ -3498,3 +3498,48 @@ FIX: Fixed in 7fa1fe8e. The CLI now prints, on stderr so captured JSON is
   `source_ref` is opaque for a re-queue condition, and gate acks plus stored
   queries key on existing names, so the rename costs more than the confusion it
   removes now that the write path announces itself.
+
+## test-contended.sh rules out the builder, so its green verdict reads as "therefore your bug"
+VALIDATED: amux-frustrations | VALIDATED by the ORIGINATING session (amux-frustrations diagnosed this and wrote the entry; amux paid the cost). SELF-SIGNOFF, labelled as one, not a peer review. Fixed in 4ab03071 and hardened in 4ec45b1d. scripts/test-contended-worktree.sh -> 10 passed, 0 failed, wired into CI. The wrapper now captures the dirty set BEFORE and AFTER the run and prints it beside the verdict on BOTH arms; the mutation that writes it the obvious way, inside the clean arm only, fails exactly cells (c2) and (d). It deliberately does not attribute an owner, because mtime attribution has been wrong on this checkout repeatedly (AF-179, AMUX-3662) and a confident wrong owner is worse than a named file with none. CONFIRMED BY THE LANE THAT PAID THE COST, unprompted: amux ran the suite across the change and reported "worktree: THE TREE CHANGED DURING THIS RUN" naming four files, two theirs and two mine, and said they could sort them instantly and that had it guessed it would have guessed wrong on migrate.rs, where mtime said them and the truth was me.
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-08-31
+SESSION: amux-frustrations (diagnosed), amux (paid the cost)
+CARD: AF-356
+SYMPTOM: `amux` ran the suite and got 1 failure, `gate_table_matches_python`, in a
+  module they had not touched. It passed in isolation. test-contended.sh printed its
+  verdict: "the auto-builder was NOT rebuilding during this run, so the shared binary
+  was stable under it. A failure here is NOT build contention." They concluded ETXTBSY
+  anyway, reported it as their weakest evidence line, and asked me to form my own view.
+  The true cause was neither: MY uncommitted edit to board_store.rs was sitting in the
+  shared worktree while their test ran. I was adding `ItemType::Decision` (AF-323), and
+  that test asserted `default_gates_for("decision", Done) == default_gates_for("code",
+  Done)` because `decision` was its stand-in for an unknown type. My half-finished
+  change made the assertion false in a file they never opened.
+COST: A wrong root cause carried into a verification request as its stated weakest
+  line, and ~20 minutes of mine to refute it. The deeper cost is that the wrapper's
+  verdict is load-bearing in the other direction: it exists to stop a red being read
+  as a regression, and by ruling out the ONE cause it can see, it makes the remaining
+  space look like "your bug" when a shared checkout has a third option. Both failure
+  modes look identical from inside a test run: a red in a module you did not touch,
+  green on rerun. The wrapper cannot tell them apart and does not say so.
+FIX: The wrapper already answers "was the builder rebuilding". Have it also answer
+  "was the tree dirty, and in which files" — `git status --porcelain` before and
+  after, printed beside the verdict, naming the paths and their sessions from the
+  observed-edit records the staged-guard already keeps. Then the verdict line becomes
+  two facts instead of one, and the missing clause stops being invisible. Ethos rule 4:
+  the output that can read "clean" must publish whether it measured the thing at all,
+  and this one measures one of two causes while its sentence implies both.
+FIXED 2026-08-31 in the commit naming AF-356. The wrapper now captures the dirty set
+  BEFORE and AFTER the run and prints it beside the verdict, on BOTH arms. The
+  before/after pair is the strongest form: a tree that CHANGED under the compile is
+  the case a single snapshot cannot see. It deliberately does NOT attribute an owner,
+  because mtime attribution has been wrong on this checkout repeatedly (AF-179,
+  AMUX-3662) and a confident wrong owner is worse than a named file with none. Clean
+  is STATED rather than left silent, since a silent probe and a clean tree are
+  otherwise the same output. scripts/test-contended-worktree.sh, 7 cells, wired into
+  CI; the mutation that writes it the obvious wrong way (clause inside the clean arm
+  only) fails exactly (c2) and (d).
+
+---
