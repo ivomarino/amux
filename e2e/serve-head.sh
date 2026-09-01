@@ -37,13 +37,22 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$HOME/.amux/rust-build-target}"
 # read ON, and reds LOCALLY for every session on this box while clean-env CI
 # passes — a red indistinguishable from a code regression (2026-09-01, found
 # during AC-403's sweep). Keep only what this harness is parameterized by:
-# AMUX_HOME + AMUX_RS_PORT (per-project, from playwright.config.ts),
-# AMUX_NO_SELF_ADOPT (pinned below), and the AMUX_E2E_* opts. Announce the rest
-# by name, since a scrub nobody can see is indistinguishable from no scrub.
+# AMUX_HOME + AMUX_RS_PORT + AMUX_RS_NO_LOOPBACK_BYPASS (per-project, from
+# playwright.config.ts's webServer env), AMUX_NO_SELF_ADOPT (pinned below), and
+# the AMUX_E2E_* opts. Announce the rest by name, since a scrub nobody can see
+# is indistinguishable from no scrub.
+#
+# THE ALLOWLIST MUST COVER EVERY KEY playwright.config.ts PASSES. The first
+# version of this scrub missed AMUX_RS_NO_LOOPBACK_BYPASS and ate it, so every
+# CI e2e server auth-bypassed loopback and 6 bad-token assertions became checks
+# that cannot pass (run 33525151971, the exact failure the config's own comment
+# warns about). tests/e2e_env_allowlist.rs now diffs the config's env keys
+# against this case line, so adding a key there without adding it here fails
+# the check job instead of failing six unrelated specs.
 _scrubbed=""
 for _k in ${!AMUX_@}; do
   case "$_k" in
-    AMUX_HOME|AMUX_RS_PORT|AMUX_NO_SELF_ADOPT|AMUX_E2E_*) ;;
+    AMUX_HOME|AMUX_RS_PORT|AMUX_RS_NO_LOOPBACK_BYPASS|AMUX_NO_SELF_ADOPT|AMUX_E2E_*) ;;
     *) unset "$_k"; _scrubbed="$_scrubbed $_k" ;;
   esac
 done
