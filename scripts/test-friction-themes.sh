@@ -108,6 +108,23 @@ con.commit()
 PY
 
 mkdir -p "$TMP/amux" "$TMP/mixpeek"
+
+# DATES ARE GENERATED, NEVER LITERAL (AF-386). The fixture below feeds
+# `signal_ledger_clusters`, which is a FRESHNESS signal: it fires on entries
+# newer than now minus FRICTION_DAYS (default 1). Written on 2026-08-30 with
+# 2026-08-30 typed in, every cell passed. On 2026-09-01 the cut moved past the
+# fixture, the cluster went inactive, and CI went red across every author's push
+# with neither the test nor its subject having changed since.
+#
+# The cost was not the red. It was that the red said "Mixpeek ledger parser is
+# not reading the real format" while the parser was correct, so it accused
+# innocent code for two days. A literal date in a fixture for a time-windowed
+# signal is a test with a fuse on it.
+#
+# @TODAY@ is substituted after the heredocs rather than interpolated inside
+# them: the bodies carry parentheses and pipes, and a quoted heredoc keeps them
+# literal.
+TODAY="$(date +%Y-%m-%d)"
 cat > "$TMP/amux/frustrations.md" <<'EOF'
 # amux frustrations
 
@@ -118,7 +135,7 @@ cat > "$TMP/amux/frustrations.md" <<'EOF'
 ## A real amux entry about instruments
 AREA: instruments
 STATUS: open
-DATE: 2026-08-30
+DATE: @TODAY@
 SESSION: amux
 CARD: AF-1
 EOF
@@ -128,10 +145,13 @@ EOF
 cat > "$TMP/mixpeek/FRUSTRATIONS.md" <<'EOF'
 # Mixpeek Product Frustrations
 
-- [ ] **2026-08-30 | API/metrics (a latency percentile cannot see failed requests, so it reads fastest when the endpoint is broken)** *(backend)*: body text here.
-- [ ] **2026-08-30 | Engine/instrumentation (the probe reports zero when it never ran)** *(tubescience)*: body text here.
-- [x] **2026-08-30 | API/closed (this one is done and must not be counted)** *(backend)*: body.
+- [ ] **@TODAY@ | API/metrics (a latency percentile cannot see failed requests, so it reads fastest when the endpoint is broken)** *(backend)*: body text here.
+- [ ] **@TODAY@ | Engine/instrumentation (the probe reports zero when it never ran)** *(tubescience)*: body text here.
+- [x] **@TODAY@ | API/closed (this one is done and must not be counted)** *(backend)*: body.
 EOF
+for _f in "$TMP/amux/frustrations.md" "$TMP/mixpeek/FRUSTRATIONS.md"; do
+  sed "s/@TODAY@/$TODAY/g" "$_f" > "$_f.tmp" && mv "$_f.tmp" "$_f"
+done
 cp CLAUDE.md "$TMP/amux/CLAUDE.md" 2>/dev/null || echo "verified deploy tests" > "$TMP/amux/CLAUDE.md"
 mkdir -p "$TMP/amux/.claude/rules"
 cp .claude/rules/ethos.md "$TMP/amux/.claude/rules/" 2>/dev/null || true
@@ -175,6 +195,23 @@ assert 'mixpeek FRUSTRATIONS.md' in d['unreadable_sources']
   ok "B: an unreadable Mixpeek ledger is reported, not counted as clean"
 else
   bad "B: unreadable Mixpeek ledger degraded into a zero"
+fi
+
+# HARNESS SELF-CHECK, before cell C is allowed to render a verdict (AF-386).
+# Cell C reads a FRESHNESS signal, so a fixture whose dates have aged past the
+# window produces exactly the same output as a parser that returns nothing. For
+# two days it printed the parser accusation while the parser was correct. If the
+# dates ever go stale again, this says SETUP and names the cut, so the next
+# reader starts at the fixture instead of at innocent code.
+FRESH_CUT="$(python3 -c "
+import os, time
+print(time.strftime('%Y-%m-%d',
+      time.localtime(time.time() - float(os.environ.get('FRICTION_DAYS', '1')) * 86400)))")"
+n_stale=$(grep -hoE '[0-9]{4}-[0-9]{2}-[0-9]{2}' \
+            "$TMP/amux/frustrations.md" "$TMP/mixpeek/FRUSTRATIONS.md" 2>/dev/null \
+          | awk -v c="$FRESH_CUT" '$0 < c' | wc -l | tr -d ' ')
+if [ "${n_stale:-0}" -gt 0 ]; then
+  bad "SETUP: ${n_stale} fixture date(s) older than the freshness cut ${FRESH_CUT} -- the fixture aged out; cell C is about the fixture, not the parser"
 fi
 
 # ---------------------------------------------------------------------------
