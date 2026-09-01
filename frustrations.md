@@ -2252,3 +2252,49 @@ FIX: The signal already exists and does not reach far enough. The SessionStart
       `install-hooks.sh` already does with `cmp` at the end of its run, moved to
       the place where it would be read.
   Not building either from here without deciding which; carded.
+
+---
+## A field with an unexpected NAME reads as a missing value, even when it is on screen
+AREA: instruments
+SEVERITY: slows
+STATUS: fixed
+DATE: 2026-09-01
+SESSION: mvs-research (hit it and retracted), amux-frustrations (hit it twice, fixed it)
+CARD: AF-379
+SYMPTOM: `amux board backlog <id> --trigger "..."` stores the condition in
+  `source_ref` and stamps `last_verified_at`. The success line says only
+  `<id> -> backlog`, and no key is named `trigger`. FIVE independent probes read
+  that as a lost write, across two lanes in one day:
+    mvs-research  filtered for a key whose NAME matched trigger|block|condition;
+                  `source_ref` does not match, and they read the empty result as
+                  the value being absent.
+    mvs-research  then printed EVERY NON-EMPTY KEY as a fallback. `source_ref` WAS
+                  in that output. They did not read the values. Their own words:
+                  "I had the answer on screen and filed a bug against your tool
+                  anyway."
+    amux-frustrations  searched keys matching /trig/ plus desc and log on AF-367,
+                  found nothing, and nearly confirmed the report against my OWN
+                  card, whose source_ref held my condition the whole time.
+    amux-frustrations  (AF-359, an hour earlier) searched the board LIST payload,
+                  which ships `desc_head` and no `desc`, and got a confident 0
+                  across 370 cards.
+    amux-frustrations  wrote up a "genuine disagreement" between the gate text
+                  "Trigger condition documented on the card" and the CLI, without
+                  checking. `backlog` is not a gated status and that criterion
+                  governs tripwire/watch entering `doing`. Two mechanisms sharing
+                  one word.
+COST: A bug filed against a working tool, propagated to three places (MR-112,
+  MR-19, and a direct message to mvs-infra) before being retracted; roughly an
+  hour across two lanes. The instructive part is that the SECOND probe succeeded
+  and was still misread, so "write a better probe" is not the lesson. The reader
+  had the data and could not see it, because nothing told them which of ~30 keys
+  was the answer.
+FIX: Fixed in 7fa1fe8e. The CLI now prints, on stderr so captured JSON is
+  untouched, `trigger stored in source_ref (+ last_verified_at)` plus the exact
+  command to read it back. NAMING AT WRITE TIME is the fix that works, because
+  every reader-side improvement was already tried in this incident and one of them
+  succeeded without helping.
+  NOT DONE, on the reporter's own judgement and mine: renaming the column.
+  `source_ref` is opaque for a re-queue condition, and gate acks plus stored
+  queries key on existing names, so the rename costs more than the confusion it
+  removes now that the write path announces itself.
