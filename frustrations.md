@@ -2027,3 +2027,40 @@ FIX: The signal already exists and does not reach far enough. The SessionStart
   Not building either from here without deciding which; carded.
 
 ---
+## The freshness hook's `git merge origin/main` exits 2 in the exact state it prescribes it for
+AREA: notices
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-09-01
+SESSION: amux-frustrations (hit and fixed it), mixpeek-frustrations (paid part of the cost)
+CARD: AF-385
+SYMPTOM: SessionStart printed `RECONCILE IT: git merge origin/main (rewrites no
+  SHAs; abort is clean)`. Running it: `error: Your local changes to the following
+  files would be overwritten by merge: crates/amux-server/src/runtime_jobs/
+  commit_nudge.rs / Please commit your changes or stash them before you merge. /
+  Aborting`, exit 2. "abort is clean" describes `git merge --abort`, which never
+  becomes reachable because the merge never begins. Git's own two suggestions are
+  both forbidden on a shared checkout: committing a peer's file lands their work
+  under your name, stashing it takes it out of their worktree while they are in
+  it. No third option was named anywhere (ethos rule 3).
+COST: The checkout stayed unreconciled through two lanes' attempts. mixpeek-
+  frustrations applied and reverted a mutation in that file and deliberately
+  restored to the state it FOUND rather than to HEAD, to protect work that turned
+  out to need no protecting. This lane declined to merge for the same reason and
+  spent the diagnosis. The blocking file was byte-identical to origin's copy the
+  whole time (`diff <(git show 9b556907:<path>) <path>` -> exit 0, zero lines):
+  ts-gke's TG-3343 work, already merged upstream, unstaged only because the
+  checkout was behind. The safe reconcile was one comparison away and nothing
+  said so.
+FIX: e6b80033. The arm now names the files that block the merge and gives each a
+  verdict, asymmetrically on purpose: byte-identical to upstream earns a printed
+  discard command, because the bytes are recoverable from the remote; different
+  earns no destructive command at all, because that is live work and mtime here
+  names whoever was ACTIVE rather than whoever WROTE (AMUX-3662). Log signal:
+  ~/.amux/reconcile-blocked.jsonl. The general shape, and the reason this is the
+  SECOND instance in one day (AMUX-3718 was the first, archived the same
+  morning): a notice that prescribes a procedure must be checked against the
+  state it fires in, because the state that triggers it is exactly the state
+  where the obvious command stops working. `drop_paths_identical_to_origin()`
+  already computed this comparison for the idle nudge; the surface every lane
+  reads at SessionStart did not (ethos rule 1).
