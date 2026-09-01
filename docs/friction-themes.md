@@ -171,9 +171,9 @@ FIRST_SEEN: 2026-08-29
 LAST_SEEN: 2026-09-01
 OCCURRENCES: 3
 SIGNALS: rule-restatement:verification, rule-restatement:evidence
-FIX_SITE: NOT prose, and NOT a new push either. See AF-393: the push exists and is
-unused. The likely fix is that `verified` should WRITE the peer into the `reviewer`
-field, so the gate's own "name them" criterion becomes queryable.
+FIX_SITE: NOT prose, and NOT a new mechanism. See AF-393: the push exists, the
+naming is enforced where a group asks for it, and the open question is whether the
+FLEET DEFAULT gate should ask for a peer at all.
 CARDS: AF-321, AF-393
 EVIDENCE: he re-dictated what verification means 7 times in 34 hours. The gate
 now refuses `done` without evidence in amux. Mixpeek has no equivalent gate, so
@@ -219,6 +219,24 @@ The board cannot answer "who verified this?" as data, which makes every
 verification ratio in this file uncheckable, including the ones above. That is
 ethos rule 4 inside the gate that exists to enforce evidence: the answer is
 required, supplied, and stored where nothing can read it.
+
+CORRECTED TWICE ON 2026-09-01, and the second correction retires the number in the
+first. The "90% of verified cards name no reviewer" figure above compared across
+gates that ask different things. The "name them" criterion exists only in the
+group:amux gate; the fleet default has no peer criterion at all. Read from three of
+today's unnamed cards: TG-3341 and MS-1266 resolve to ["Outcome confirmed to still
+hold"], SP-650 to [CI green, deployed to prod, confirmed working in prod, zero
+regressions]. None asks for a second party, so those lanes are not evading
+anything.
+So 90% measured compliance with a criterion 90% of those cards were never subject
+to: the instrument comparing across populations that are not comparable, committed
+by this sweep, in the file that exists to catch that class.
+WHAT SURVIVES, narrowly: the group:amux gate is enforced and works (amux-cloud's
+first verify today was REFUSED for a missing reviewer and all eight of today's
+verifications carry the field as data). And amux itself is inside group:amux at 3%
+verified over 351 done, so that backlog is a real compliance gap rather than a gate
+mismatch. The theme stays open on that, and on the 4.6x restatement rate, not on
+the 90%.
 
 ## Access and credential gaps surface mid-task, never before
 SCOPE: both
