@@ -642,6 +642,12 @@
      body.no-top-inset / js-bottom-extend toggle — both were retired 2026-07-05. */
   /* board-detail sits above peek when opened from within it */
   #board-detail-overlay { z-index: 150; }
+  /* NOTHING IN NORMAL FLOW MAY OUTRANK THESE TWO (AF-390). #email-approvals-banner
+     carried z-index 200 inline and painted over both, and because it is an in-flow
+     strip in the same screen band as these fixed overlays, it swallowed clicks on
+     the peek tab bar once it grew tall enough. Its z-index is 90 now and the reason
+     is written beside it in index.html. If you add another global strip, put it
+     under 100 too. */
   .overlay {
     padding: 12px; padding-top: max(12px, env(safe-area-inset-top));
     overflow: hidden;

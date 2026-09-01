@@ -170,7 +170,19 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
      (AMUX-3510). Global strip so a pending approval is visible on every tab;
      the approve POST comes from this browser (no worker origin), which is
      exactly what the gate defines as the human context. -->
-<div id="email-approvals-banner" style="display:none;background:#7c2d12;border-bottom:1px solid #f97316;color:#ffedd5;padding:8px 16px;font-size:0.84rem;z-index:200;position:relative;"></div>
+<!-- z-index 90 is DELIBERATE and must stay under 100 (AF-390). This is an
+     in-flow strip at the top of the document; .overlay (peek) is fixed at
+     z-index 100 and #board-detail-overlay at 150, both in the root stacking
+     context, so at 200 this painted OVER them. It occupies the same screen
+     band as the overlay, and once the strip grew past the overlay tab bar it
+     swallowed clicks on #peek-tab-customize: measured with elementFromPoint,
+     banner 246px, button at y=145, hit = a banner DIV. 10 golden e2e
+     scenarios red. AMUX-3997 is what made it grow, by putting grants in the
+     same strip as email approvals.
+     "Visible on every tab" still holds; an overlay is not a tab. If it must
+     show OVER an overlay, raising this is the wrong fix -- the overlays have
+     to start BELOW the banner instead of under it. -->
+<div id="email-approvals-banner" style="display:none;background:#7c2d12;border-bottom:1px solid #f97316;color:#ffedd5;padding:8px 16px;font-size:0.84rem;z-index:90;position:relative;"></div>
 <div id="chrome-tabs-bar" class="chrome-tabs-bar"></div>
 <div id="chrome-tab-frames" class="chrome-tab-frames"></div>
 <div class="header-row">
