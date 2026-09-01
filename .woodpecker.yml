@@ -57,6 +57,23 @@
 when:
   event: [push, pull_request, manual]
 
+# Steer scheduling away from build-02.baar -- confirmed live 2026-09-01 (see
+# the clone-fix comment below) that host's own network egress stalls
+# completely on anything past a couple hundred MB, which a git clone of
+# this repo's ~150MB packed .git reliably triggers. build.home/build.virt04
+# came online the same day with none of that problem (13s clone, vs. 10+
+# minutes hanging on build-02.baar). Every Woodpecker agent auto-provides a
+# `hostname` label; pinning to build.virt04 specifically for now (higher
+# capacity: 4 vs build.home's 2, and it's the one already confirmed working
+# end to end). Woodpecker's label match is a single equality/wildcard per
+# key, not a list -- can't express "either build.home or build.virt04, but
+# not build-02.baar" in one line. If infra adds a shared custom label (e.g.
+# WOODPECKER_AGENT_LABELS="tier=fast") to both good hosts, switch this to
+# `tier: fast` instead so load balances across both and any future
+# fast node picks it up automatically without another edit here.
+labels:
+  hostname: build.virt04
+
 # Found live 2026-09-01, pipeline #1: Woodpecker's default checkout path is
 # /woodpecker/src/<forge-url>, while Dockerfile.rust-base bakes
 # amux-rust-base's warm, already-compiled dependency tree at /build/target
