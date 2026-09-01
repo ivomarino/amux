@@ -181,9 +181,20 @@ pub fn list_pending(home: &Path) -> Vec<Value> {
     let mut out: Vec<Value> = Vec::new();
     for e in rd.flatten() {
         let name = e.file_name().to_string_lossy().to_string();
-        // Only the LIVE file. The .approved/.rejected/.expired siblings are the
-        // audit trail, not the queue.
-        if !name.ends_with(".json") || name.matches('.').count() != 1 {
+        // Only a LIVE GRANT. Two things are excluded and the dot count could only
+        // ever catch one of them:
+        //   * `grn_X.approved.json` etc — the audit trail, not the queue
+        //   * `allow_<origin>__<target>.json` — the ALLOWANCE an approval writes
+        //
+        // The first version filtered on `matches('.').count() != 1`, which an
+        // allowance passes: it ends in .json and has exactly one dot. So an
+        // approved allowance was listed as a pending grant and rendered in the
+        // owner's banner as "? wants to message ? across a group boundary" with
+        // no preview — asking a human to approve something unidentifiable, which
+        // is worse than not asking. Seen live on allow_mvs-infra__ts-gke.json.
+        //
+        // The real discriminator is the `grn_` PREFIX, so use it.
+        if !name.starts_with("grn_") || !name.ends_with(".json") || name.matches('.').count() != 1 {
             continue;
         }
         let Ok(raw) = std::fs::read_to_string(e.path()) else { continue };
@@ -505,6 +516,26 @@ mod tests {
         assert!(list_pending(h.path()).is_empty());
         assert_eq!(fate(h.path(), &id), "rejected");
         assert!(matches!(consume(h.path(), &id), Consume::Gone), "a rejected ask cannot be approved");
+    }
+
+    /// AN ALLOWANCE IS NOT A PENDING GRANT. Both live in the same directory, both
+    /// end in `.json`, and both have exactly one dot — so the original dot-count
+    /// filter listed an approved allowance as an ask, and the owner's banner
+    /// rendered "? wants to message ? across a group boundary" with no preview.
+    #[test]
+    fn an_allowance_file_is_not_listed_as_a_pending_grant() {
+        let h = home();
+        write_allowance(h.path(), "mvs-infra", "ts-gke", "grn_abc");
+        assert!(
+            list_pending(h.path()).is_empty(),
+            "an allowance must never appear in the approval queue"
+        );
+        // CONTROL: a real grant beside it IS listed, or the assertion above
+        // passes for a filter that excludes everything.
+        mint(h.path());
+        let p = list_pending(h.path());
+        assert_eq!(p.len(), 1, "the real ask must still be listed");
+        assert_eq!(p[0]["requested_by"], json!("ts-gke"));
     }
 
     /// The pending list carries what a human needs to decide: who asked, what

@@ -8262,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.766';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.767';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -17089,8 +17089,14 @@ function _emailWhen(d) {
 // One line, tags stripped, whitespace collapsed. A raw body carries invisible
 // padding characters that render as a long blank gap in the preview.
 function _emailSnippet(body) {
-  return String(body || '')
-    .replace(/<[^>]*>/g, ' ')
+  // DECODE ENTITIES FIRST. A mail body is HTML, so an apostrophe arrives as
+  // &#39; and rendered verbatim it reads "We weren&#39;t able to charge your
+  // card" — seen live in the Stripe row. Decoding via a detached textarea is the
+  // standard trick and is safe here because the result is re-escaped by esc()
+  // before it reaches the DOM; it is never assigned as innerHTML.
+  const ta = document.createElement('textarea');
+  ta.innerHTML = String(body || '').replace(/<[^>]*>/g, ' ');
+  return String(ta.value)
     .replace(/[͏​-‍⁠﻿­]/g, '')
     .replace(/\s+/g, ' ')
     .trim()
