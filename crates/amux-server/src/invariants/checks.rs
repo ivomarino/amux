@@ -1313,6 +1313,113 @@ pub struct LaneRunState {
 }
 
 // ---------------------------------------------------------------------------
+// 5d. A pane's whole systemd scope got OOM-killed — the session, not the build.
+// ---------------------------------------------------------------------------
+
+/// INCIDENT (AMUX-70, 2026-09-01): a `cargo clippy` run directly in an
+/// interactive amux pane got OOM-killed. Confirmed via `journalctl --user`:
+/// every process in that pane — the Claude Code session itself included —
+/// shares ONE systemd scope, `tmux-spawn-<uuid>.scope`. Systemd does not
+/// reap just the offending process; it marks the WHOLE SCOPE `Failed with
+/// result 'oom-kill'`, and whatever supervises the pane tears it down and
+/// starts a brand-new one. The entire interactive session restarted
+/// mid-conversation — with every in-flight background task orphaned and
+/// nothing in the session's own view pointing at OOM as the cause (it
+/// surfaces only as "stopped ... may have been stopped via agent
+/// teardown"). `scripts/safe-cargo.sh` is the fix for NEW local cargo runs
+/// (isolates them in their own scope); this check is the log signal for
+/// when the fix wasn't used — the class of incident a sweep should catch,
+/// per this repo's own two-fix rule.
+///
+/// INVARIANT: no `tmux-spawn-*.scope` should show `Failed with result
+/// 'oom-kill'` in the recent systemd journal. A hit means some pane's
+/// entire session was just killed by memory pressure, not merely a
+/// process inside it.
+///
+/// Takes pre-fetched journal lines rather than shelling out itself, so the
+/// check is a pure function over its own negative control below — the
+/// gatherer (`monitor.rs`) owns calling `journalctl`.
+pub fn no_pane_scope_oom_kills(journal_lines: &[String]) -> Vec<InvariantResult> {
+    const ID: &str = "session.pane_scope_not_oom_killed";
+    let hits: Vec<&String> = journal_lines
+        .iter()
+        .filter(|l| l.contains("tmux-spawn-") && l.contains("Failed with result 'oom-kill'"))
+        .collect();
+    if hits.is_empty() {
+        return vec![InvariantResult::pass(ID)];
+    }
+    hits.into_iter()
+        .map(|line| {
+            InvariantResult::fail(
+                ID,
+                "no interactive pane's systemd scope was OOM-killed recently",
+                format!(
+                    "journalctl shows a tmux-spawn scope failed with oom-kill — an \
+                     interactive session (not just a build process inside it) was just \
+                     killed and respawned: {line}"
+                ),
+            )
+            .evidence(json!({
+                "journal_line": line,
+                "class": "pane-scope-oom-kill",
+                "incident": "AMUX-70: a process OOM-killed inside an interactive pane's \
+                             systemd scope takes the WHOLE PANE down, not just itself. \
+                             scripts/safe-cargo.sh isolates new local cargo runs; this \
+                             fired because something (cargo run bare, or another \
+                             memory-heavy process) wasn't isolated.",
+                "fix": "run local cargo through scripts/safe-cargo.sh, or offload to \
+                        remote hardware entirely — see CLAUDE.md's offload-builds \
+                        convention",
+            }))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod pane_scope_oom_kill_tests {
+    use super::*;
+
+    /// Negative control (AMUX-2624): the exact journal line shape confirmed
+    /// live on 2026-09-01 (journalctl --user, this session's own incident) —
+    /// rebuilt here so the check can be shown FAILING on the real specimen,
+    /// not a paraphrase.
+    #[test]
+    fn detects_the_2026_09_01_pane_scope_oom_kill() {
+        let lines = vec![
+            "Sep 01 09:22:32 dev systemd[121]: tmux-spawn-006a872a-28cc-4c3c-878c-7bd85667b915.scope: A process of this unit has been killed by the OOM killer.".to_string(),
+            "Sep 01 09:22:35 dev systemd[121]: tmux-spawn-006a872a-28cc-4c3c-878c-7bd85667b915.scope: Failed with result 'oom-kill'.".to_string(),
+            "Sep 01 09:22:35 dev systemd[121]: tmux-spawn-006a872a-28cc-4c3c-878c-7bd85667b915.scope: Consumed 3min 31.106s CPU time, 3.7G memory peak.".to_string(),
+        ];
+        let results = no_pane_scope_oom_kills(&lines);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Status::Fail);
+        assert_eq!(results[0].evidence["class"], "pane-scope-oom-kill");
+    }
+
+    /// An OOM kill of some OTHER unit (a service, not a pane) must not fire —
+    /// this check is specifically about interactive SESSIONS dying, not
+    /// every OOM kill on the box.
+    #[test]
+    fn an_unrelated_services_oom_kill_does_not_fire() {
+        let lines = vec![
+            "Sep 01 08:54:28 dev systemd[121]: some-other.service: A process of this unit has been killed by the OOM killer.".to_string(),
+            "Sep 01 08:54:28 dev systemd[121]: some-other.service: Failed with result 'oom-kill'.".to_string(),
+        ];
+        let results = no_pane_scope_oom_kills(&lines);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Status::Pass);
+    }
+
+    #[test]
+    fn clean_journal_passes() {
+        let lines = vec!["Sep 01 09:20:50 dev systemd[121]: Starting amux-builder.service".to_string()];
+        let results = no_pane_scope_oom_kills(&lines);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, Status::Pass);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 6. Shared-checkout git guard: does the running hook match its committed source?
 // ---------------------------------------------------------------------------
 

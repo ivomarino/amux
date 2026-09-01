@@ -409,12 +409,16 @@ fi
       { echo "== remote build on '$AMUX_REMOTE_BUILD_HOST' failed, falling back to local:"; \
         cat "$BUILD_OUT"; } > "${BUILD_OUT}.remote" 2>&1
       mv "${BUILD_OUT}.remote" "$BUILD_OUT"
-      if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" cargo build --release -p amux-server) >> "$BUILD_OUT" 2>&1; then
+      # AMUX-70: run the local fallback through its own systemd scope, not
+      # this script's — this unit already gets one via systemd (defense in
+      # depth for the case where rust-auto-build.sh is invoked directly
+      # from an interactive pane instead of via the timer).
+      if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" "$REPO/scripts/safe-cargo.sh" build --release -p amux-server) >> "$BUILD_OUT" 2>&1; then
         BUILD_OK=1
       fi
     fi
   else
-    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" cargo build --release -p amux-server) > "$BUILD_OUT" 2>&1; then
+    if (cd "$WORK" && CARGO_TARGET_DIR="$HOME/.amux/rust-build-target" "$REPO/scripts/safe-cargo.sh" build --release -p amux-server) > "$BUILD_OUT" 2>&1; then
       BUILD_OK=1
     fi
   fi

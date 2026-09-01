@@ -58,6 +58,13 @@ Verify a hook by what it WROTE, not by the settings file.
 - **Client JS: bump `APP_VER` (app.js) + `CACHE` (sw.js) together.**
 - Syntax gates: `cargo check --workspace`. Before push: `cargo clippy --workspace --all-targets -- -D warnings`.
   Tests: `scripts/test-contended.sh -p amux-server` (same args as `cargo test`, same exit status).
+- **Prefer offloading any of the above to remote hardware (see the remote-build convention below)
+  over running them in an interactive pane at all.** If a local run is genuinely unavoidable, run
+  it through `scripts/safe-cargo.sh <cargo args>` instead of bare `cargo` — every process in an
+  interactive amux pane shares one systemd scope, and an OOM-killed `cargo`/`clippy` process
+  inside that scope takes the WHOLE PANE down with it, not just the build (confirmed via
+  journalctl, AMUX-70/frustrations.md 2026-09-01). The wrapper runs cargo in its own sibling
+  scope so an OOM kill there can't cascade into the session.
   **A red suite here is not automatically a regression.** This box builds and tests amux
   continuously, so the auto-builder can rewrite the shared binary while your tests spawn it,
   and the ETXTBSY family surfaces as failures in modules you never touched (AMUX-3853: 8
