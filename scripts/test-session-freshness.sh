@@ -34,7 +34,12 @@ export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=init.defaultBranch GIT_CONFIG_VALUE_0
 
 # Build: a bare origin, a clone, and the hook installed inside the clone.
 # `n_behind` commits land on origin after the clone; `n_ahead` land locally.
-mk() { # $1 name  $2 n_ahead  $3 n_behind
+mk() { # $1 name  $2 n_ahead  $3 n_behind  [$4 local snippet]  [$5 upstream snippet]
+  # $4 runs in the WORK tree after the fetch and before the hook, so a case can
+  # leave files dirty. $5 runs in the upstream clone before its commits, so a
+  # case can have origin modify a file that already exists in the base commit
+  # rather than only adding new ones. Both default to `:`; every case written
+  # before AF-385 passes neither and is unaffected.
   local d="$TMP/$1"
   git init -q --bare -b main "$d/origin.git"
   git clone -q "$d/origin.git" "$d/work" 2>/dev/null
@@ -42,12 +47,17 @@ mk() { # $1 name  $2 n_ahead  $3 n_behind
     git checkout -q -B main
     mkdir -p .claude
     cp "$HOOK" .claude/session-freshness.sh
-    echo seed > seed.txt; git add -A; git commit -qm seed
+    echo seed > seed.txt; echo seed2 > seed2.txt; git add -A; git commit -qm seed
     git push -q -u origin main
   )
   if [ "$3" -gt 0 ]; then   # commits that exist ONLY on origin
     git clone -q "$d/origin.git" "$d/other" 2>/dev/null
     ( cd "$d/other"; git checkout -q -B main origin/main
+      # Before the loop on purpose: the loop commits with `git add -A`, so an
+      # edit left here rides along in up1 and the behind COUNT stays $3. A
+      # snippet that committed for itself would silently break every caller's
+      # self-check.
+      eval "${5:-:}"
       for i in $(seq 1 "$3"); do echo "up$i" > "up$i.txt"; git add -A; git commit -qm "up$i"; done
       git push -q origin main )
   fi
@@ -72,6 +82,9 @@ mk() { # $1 name  $2 n_ahead  $3 n_behind
     # heard of — and case (a) fails on this machine while passing in CI, where
     # no such file exists. A test whose verdict depends on the host's state is
     # not testing the hook.
+    # After the self-check, so a dirty tree can never be mistaken for a setup
+    # failure, and before the hook, which is the whole point.
+    eval "${4:-:}"
     AMUX_RS_BUILD_PROVENANCE="$TMP/no-such-provenance.json" \
       bash .claude/session-freshness.sh 2>&1
   )
@@ -538,6 +551,71 @@ fi
 #     "all clear" and "this copy has nothing to say about that".
 out=$(self_run self_foot modify)
 says "$FOOTMARK" "$out"
+
+# ── Axis 1e: can the reconcile this hook prescribes actually RUN? (AF-385) ────
+#
+# Every case above asserts that the hook SAYS `git merge origin/main`. None of
+# them asks whether that command works. On 2026-09-01 it exited 2 in the real
+# checkout without starting, because a dirty file was also changed upstream, and
+# git's own advice in that state (commit them, or stash them) is forbidden on a
+# tree ~125 lanes share. The hook named a state, named the one command for it,
+# and left no honest way through (ethos rule 3).
+#
+# The property under test is the ASYMMETRY, not the warning. A file whose bytes
+# already match upstream earns a printed discard command, because it is
+# recoverable from the remote. A file that differs earns none, because it is
+# somebody's live work and this hook cannot tell whose. A cell that only checked
+# "does it warn" would pass a version that told a lane to delete a peer's
+# mid-edit file, which is the exact failure mode the arm exists to prevent.
+BLOCKMARK="THAT MERGE CANNOT RUN YET"
+
+# (w) BOTH kinds at once — the shape the real incident had. seed.txt is restored
+#     from origin so its bytes are byte-identical upstream; seed2.txt is edited
+#     to something in no commit at all.
+LOG_W="$TMP/blocked-w.jsonl"
+out=$(AMUX_RECONCILE_BLOCKED_LOG="$LOG_W" mk blocked_both 1 1 \
+  'git show origin/main:seed.txt > seed.txt; printf "MINE\n" > seed2.txt' \
+  'printf "UP\n" > seed.txt; printf "UP\n" > seed2.txt')
+setup_ok blocked_both "$out" && {
+  says "$BLOCKMARK: 2 dirty file(s)" "$out"
+  # Placement, not mere presence: the two verdicts must partition the files.
+  up_half=$(printf '%s\n' "$out" | awk '/ALREADY UPSTREAM/{f=1;next} /GENUINELY DIVERGENT/{f=0} f')
+  dv_half=$(printf '%s\n' "$out" | awk '/GENUINELY DIVERGENT/{f=1;next} f')
+  says "seed.txt"  "$up_half"
+  says "seed2.txt" "$dv_half"
+  # THE CELL THAT STOPS THE DANGEROUS VERSION. Exactly one discard command, and
+  # it must not appear after the divergent heading. Hoisting it out of the
+  # recoverable branch turns this hook into advice to delete a peer's work.
+  n=$(printf '%s\n' "$out" | grep -c "git checkout HEAD --")
+  if [ "$n" -eq 1 ]; then PASS=$((PASS+1)); else
+    FAIL=$((FAIL+1)); echo "FAIL: expected exactly 1 discard command, got $n"; fi
+  lacks "git checkout HEAD --" "$dv_half"
+  # (x) The log signal, so the next occurrence reaches a sweep rather than
+  #     waiting for a lane to hit it. A MISSING file means the probe never ran;
+  #     an existing file with no matching line means it ran and found nothing.
+  if [ -s "$LOG_W" ] && grep -q '"already_upstream":"seed.txt"' "$LOG_W" \
+                     && grep -q '"divergent":"seed2.txt"' "$LOG_W"; then PASS=$((PASS+1)); else
+    FAIL=$((FAIL+1)); echo "FAIL: jsonl must partition the two sets; got: $(cat "$LOG_W" 2>&1)"; fi
+}
+
+# (y) SILENT when the merge would actually run. Behind and diverged, but nothing
+#     dirty — the case that stops this becoming another line to scroll past.
+out=$(mk blocked_clean 1 1)
+setup_ok blocked_clean "$out" && { lacks "$BLOCKMARK" "$out"; says "$MARK" "$out"; }
+
+# (z) A dirty file upstream did NOT touch does not block a merge and must not be
+#     reported as if it did. The false-positive direction: without this, a naive
+#     "is anything dirty" check passes (w) and shouts on every working session.
+out=$(mk blocked_unrelated 1 1 'printf "EDIT\n" > seed2.txt')
+setup_ok blocked_unrelated "$out" && lacks "$BLOCKMARK" "$out"
+
+# (aa) The claim is about GIT, not about this hook's opinion. Run the real merge
+#      in (w)'s fixture and confirm it refuses, so the warning is not a false
+#      alarm about something that would have worked. Ethos rule 4: name what
+#      should appear beside the answer if the probe really ran, and check THAT.
+if ( cd "$TMP/blocked_both/work" && git merge origin/main >/dev/null 2>&1 ); then
+  FAIL=$((FAIL+1)); echo "FAIL: the merge succeeded, so (w)'s warning is a false alarm"
+else PASS=$((PASS+1)); fi
 
 echo
 echo "test-session-freshness: $PASS passed, $FAIL failed"

@@ -112,6 +112,96 @@ if git remote get-url origin >/dev/null 2>&1; then
       out+=$'    then append. If this is the only checkout, reconciling IS the remedy —\n'
       out+=$'    there is no current clone to go log in (.claude/rules/frustrations.md)\n'
     fi
+
+    # ── Axis 1e (AF-385): can the reconcile printed above actually RUN? ───────
+    #
+    # Both arms above hand out `git merge origin/main` as THE remedy. On
+    # 2026-09-01, in this checkout, that command exited 2 without starting:
+    #
+    #   error: Your local changes to the following files would be overwritten by merge:
+    #           crates/amux-server/src/runtime_jobs/commit_nudge.rs
+    #   Please commit your changes or stash them before you merge.
+    #
+    # "abort is clean" describes `git merge --abort`, which never becomes
+    # reachable because the merge never begins. And git's own two suggestions are
+    # both forbidden on a shared checkout: committing a peer's file lands their
+    # work under your name, stashing it takes it out of their worktree while they
+    # are in it. So the hook named a state, named the one command for it, and
+    # that command could not run, with no third option offered anywhere. That is
+    # ethos rule 3, shipped by the hook whose whole job is to prevent a silent
+    # loss.
+    #
+    # A safe third option existed and was one comparison away. The blocking
+    # file's worktree bytes were byte-identical to origin's copy: ts-gke's
+    # TG-3343 work, already merged upstream, unstaged only because this checkout
+    # was behind. Discarding it was provably lossless. Two lanes instead read
+    # those 184 lines as a peer mid-edit and routed around them, and the checkout
+    # stayed unreconciled through both.
+    #
+    # `drop_paths_identical_to_origin()` in commit_nudge.rs already computes this
+    # comparison for the idle nudge. The surface every lane reads at SessionStart
+    # did not (ethos rule 1: capability that exists but does not reach).
+    #
+    # The two verdicts are deliberately asymmetric. IDENTICAL earns a printed
+    # command, because the bytes are recoverable from the remote and the claim is
+    # checkable in one line. DIFFERENT earns no destructive command at all: that
+    # is somebody's live work, and whose it is cannot be derived here — mtime on
+    # this checkout names whoever was ACTIVE, never whoever WROTE (AMUX-3662).
+    if [ "${behind:-0}" -gt 0 ]; then
+      _fr_in="$(git diff --name-only "HEAD...$base" 2>/dev/null || true)"
+      _fr_dirty="$(git diff --name-only HEAD 2>/dev/null || true)"
+      _fr_block="$(comm -12 <(printf '%s\n' "$_fr_in" | sed '/^$/d' | sort -u) \
+                            <(printf '%s\n' "$_fr_dirty" | sed '/^$/d' | sort -u) 2>/dev/null || true)"
+      if [ -n "$_fr_block" ]; then
+        _fr_n="$(printf '%s\n' "$_fr_block" | sed '/^$/d' | wc -l | tr -d ' ')"
+        out+="  - THAT MERGE CANNOT RUN YET: ${_fr_n} dirty file(s) are also changed upstream"$'\n'
+        out+=$'    git refuses before it starts. Do NOT take its advice literally here:\n'
+        out+=$'    committing them lands a peer\'s work under your name, stashing them pulls\n'
+        out+=$'    it out of their worktree while they are still in it.\n'
+        _fr_safe=""; _fr_theirs=""
+        while IFS= read -r _fr_p; do
+          [ -z "$_fr_p" ] && continue
+          _fr_wt="$(git hash-object -- "$_fr_p" 2>/dev/null || echo none)"
+          _fr_up="$(git rev-parse "$base:$_fr_p" 2>/dev/null || echo none)"
+          if [ "$_fr_wt" != none ] && [ "$_fr_wt" = "$_fr_up" ]; then
+            _fr_safe+="      ${_fr_p}"$'\n'
+          else
+            _fr_theirs+="      ${_fr_p}"$'\n'
+          fi
+        done <<FRESHEOF
+$_fr_block
+FRESHEOF
+        if [ -n "$_fr_safe" ]; then
+          out+="    ALREADY UPSTREAM, byte-identical to ${base}, so discarding loses nothing:"$'\n'
+          out+="$_fr_safe"
+          out+=$'    git checkout HEAD -- <those paths>   and then the merge above runs\n'
+          out+="    check it yourself first: git hash-object <p> equals git rev-parse ${base}:<p>"$'\n'
+        fi
+        if [ -n "$_fr_theirs" ]; then
+          out+=$'    GENUINELY DIVERGENT from upstream, so somebody is mid-edit. No command is\n'
+          out+=$'    printed for these on purpose:\n'
+          out+="$_fr_theirs"
+          out+=$'    ask whoever is working there. This hook cannot tell you who, and neither\n'
+          out+=$'    can mtime on a checkout this many lanes share.\n'
+        fi
+        # Two-fix rule: the next occurrence announces itself to a sweep instead of
+        # waiting for a lane to hit it. One line per session start, counts plus the
+        # paths, so `wc -l` answers "how often" and a grep answers "which file".
+        #
+        # A MISSING FILE IS UNMEASURED, NOT ZERO. Nothing is written when the
+        # directory is absent, which is the non-amux case, so a sweep that reads a
+        # missing file as "never blocked" is reading a probe that never ran
+        # (ethos rule 4). Absent means no signal; zero lines in an existing file
+        # means the signal ran and found nothing.
+        _fr_log="${AMUX_RECONCILE_BLOCKED_LOG:-$HOME/.amux/reconcile-blocked.jsonl}"
+        if [ -d "$(dirname "$_fr_log")" ]; then
+          _fr_j() { printf '%s' "$1" | sed 's/^[[:space:]]*//; /^$/d' | tr '\n' ',' | sed 's/,$//; s/["\\]//g'; }
+          printf '{"ts":"%s","session":"%s","behind":%s,"ahead":%s,"blocked":%s,"already_upstream":"%s","divergent":"%s"}\n' \
+            "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${AMUX_SESSION:-unknown}" "${behind:-0}" "${ahead:-0}" \
+            "${_fr_n}" "$(_fr_j "$_fr_safe")" "$(_fr_j "$_fr_theirs")" >> "$_fr_log" 2>/dev/null || true
+        fi
+      fi
+    fi
   fi
 fi
 
