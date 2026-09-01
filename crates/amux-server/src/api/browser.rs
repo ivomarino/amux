@@ -101,6 +101,25 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, Json(body)).into_response()
 }
 
+/// Render an error WITH ITS CAUSES, for any body or log line a human reads.
+///
+/// AMUX-3886. `with_cause(&e)` on an `anyhow::Error` prints the OUTERMOST frame
+/// and silently drops the source chain, and every CDP error in this file was
+/// built that way. For the `reqwest` errors underneath `cdp_list` that outer
+/// frame carries no diagnosis at all:
+///
+///   to_string(): error sending request for url (http://127.0.0.1:49731/json/list)
+///   {e:#}:       error sending request for url (http://127.0.0.1:49731/json/list): \
+///                client error (Connect): tcp connect error: Connection refused (os error 61)
+///
+/// The first string is what two 502s from `general-canvas-apps` left on record
+/// on 2026-08-29, and it is IDENTICAL for a refused connect, a DNS failure and
+/// a 3s timeout — three different faults with three different fixes. The cause
+/// that separates them was one format specifier away the whole time.
+fn with_cause(e: &impl std::fmt::Display) -> String {
+    format!("{e:#}")
+}
+
 /// The ATTRIBUTION resolution: explicit `session` (body/query) →
 /// `X-Amux-Session` header → None. No default constant — amux-cloud's
 /// validation of the takeover guard caught the harm: a header-less curl's
@@ -323,6 +342,100 @@ fn lookup_start_origin(store: &crate::db::SharedStore, started_at: i64) -> Start
     }
 }
 
+#[cfg(test)]
+mod launch_latency_tests {
+    /// AMUX-3832: `profile/create` with a `url` spawns a HEADED Chrome and
+    /// waits for CDP. Seconds is the work, not a fault — its entire purpose is
+    /// opening a window for a human to sign in. A flat 10s threshold filed one
+    /// such request at 10.5s under 1.09x host load.
+    ///
+    /// Same seam as AMUX-3818, and the same rule: PER REQUEST, not per route.
+    #[test]
+    fn only_a_create_the_launch_dominated_declares_itself_slow() {
+        use crate::api::dominated_by_external;
+        // The filed specimen: 10.5s, essentially all of it Chrome starting.
+        assert!(dominated_by_external(10_489, 10_300));
+
+        // CONTROL 1 — a create with NO url launches nothing, so launch_ms is 0
+        // and it can never qualify however slow it is. If profile creation
+        // itself starts taking ten seconds, that is amux and must file.
+        assert!(!dominated_by_external(10_489, 0), "no launch means no excuse");
+
+        // CONTROL 2 — a fast launch inside a slow request leaves time that is
+        // amux's own. Without this the declaration is a route exemption wearing
+        // a per-request header.
+        assert!(!dominated_by_external(11_000, 200));
+    }
+}
+
+#[cfg(test)]
+mod idle_takeover_tests {
+    /// The auto-takeover predicate, as a table (Ethan, 2026-08-28).
+    ///
+    /// He hit the refusal twice in twenty minutes on a browser held 18h with
+    /// ZERO tabs. "Nothing to lose" must not be a conflict — but every other
+    /// case must still refuse, and those are what this pins.
+    fn auto_takes(pages_empty: bool, cdp_answered: bool, held_s: i64, grace_s: i64) -> bool {
+        pages_empty && cdp_answered && held_s > grace_s
+    }
+
+    #[test]
+    fn only_an_idle_browser_with_no_real_pages_is_taken_without_asking() {
+        // Ethan's case: 18.4h, zero real pages, CDP answered.
+        assert!(auto_takes(true, true, 66_240, 600));
+
+        // CONTROL 1 — a single real page is STATE. The refusal's own history is
+        // that "4 tabs" was two omnibox popups, an iframe, and one live Google
+        // sign-in; destroying that is not recoverable by reopening a tab.
+        assert!(!auto_takes(false, true, 66_240, 600), "an open page must still refuse");
+
+        // CONTROL 2 — CDP SILENCE IS NOT ZERO. This file draws that distinction
+        // deliberately ("that is not the same as zero"); unknown must refuse.
+        assert!(!auto_takes(true, false, 66_240, 600), "unknown tab count must still refuse");
+
+        // CONTROL 3 — the grace window. A browser started seconds ago has not
+        // opened its first tab yet; without this, two concurrent starts resolve
+        // by stomping each other.
+        assert!(!auto_takes(true, true, 30, 600), "inside the grace window must still refuse");
+        assert!(!auto_takes(true, true, 600, 600), "at the boundary, not past it");
+        assert!(auto_takes(true, true, 601, 600), "one second past is past");
+    }
+}
+
+#[cfg(test)]
+mod takeover_wording_tests {
+    use super::*;
+
+    /// The refusal must not claim something the code cannot do (Ethan, 2026-08-28).
+    ///
+    /// It used to say a start "would DESTROY its state (staged logins
+    /// included)". A completed staged login lives on disk under
+    /// `playwright-auth/profiles/<name>/` and survives both a stop (SIGTERM, so
+    /// storage flushes) and a takeover — the only `remove_dir_all` on a profile
+    /// is the explicit `delete_profile` verb. Ethan hit that sentence on a
+    /// browser held 18.1h with ZERO tabs, which is how a guard teaches people to
+    /// stop reading guards.
+    #[test]
+    fn the_refusal_names_what_a_takeover_actually_destroys() {
+        let v = takeover_refusal(
+            "default", "tubescience", 1_000, 42, Some(0), &[], 1_000 + 65_160,
+            Some("amux"), StartOrigin::NotLooked,
+        );
+        let err = v["error"].as_str().unwrap_or_default();
+        assert!(
+            !err.contains("staged logins"),
+            "the headline must not claim on-disk logins are lost: {err}"
+        );
+        assert!(err.contains("OPEN TABS"), "it must name what IS lost: {err}");
+        // CONTROLS: the refusal still refuses, and still carries the evidence
+        // that makes it judgeable. A fix that softened it into an approval, or
+        // dropped the idle facts, would pass the assertions above.
+        assert!(err.contains("already running"), "it must still refuse: {err}");
+        assert!(err.contains("ZERO tabs"), "and still carry the evidence: {err}");
+        assert!(err.contains("takeover"), "and still name the deliberate escape: {err}");
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn takeover_refusal(
     profile: &str,
@@ -346,8 +459,10 @@ fn takeover_refusal(
     // pointed the wrong way on the specimen: "4 tab(s)" was two omnibox popups,
     // an iframe, and one live Google sign-in, and "0.0h" read as brand new. Both
     // numbers argued for takeover while the thing at risk was the single most
-    // costly thing to destroy — which the sentence above warns about in the
-    // abstract ("staged logins included") and could not point at.
+    // costly thing to destroy — which the headline could only gesture at in the
+    // abstract and could not point to. (That headline no longer claims staged
+    // logins are lost; they are on disk and survive. See the note at the
+    // refusal itself.)
     let page_list = pages
         .iter()
         .map(|(t, h)| {
@@ -417,11 +532,30 @@ fn takeover_refusal(
         // takeover escape stays here — and "(unattributed)" alone names nobody,
         // supports no decision, and reads identically whether the holder is a
         // script on this box or a person signed in from another host.
+        //
+        // NAMES WHAT IS ACTUALLY AT RISK (Ethan, 2026-08-28). This used to say
+        // "would DESTROY its state (staged logins included)", which is wrong on
+        // its most alarming term and fired regardless of the evidence below it.
+        // A COMPLETED staged login lives on disk in
+        // `playwright-auth/profiles/<name>/` — 24M for `atlas` — and survives
+        // both a stop and a takeover: `stop_as` sends SIGTERM specifically so
+        // storage flushes, SIGKILL is a last resort, and the ONLY
+        // `remove_dir_all` on a profile is the explicit `delete_profile` verb.
+        // Nothing on the start path touches it.
+        //
+        // What a takeover does destroy is open tabs and an auth flow that has
+        // not persisted a cookie yet, which is exactly what the `idle` sentence
+        // already says correctly. The headline overstating it is how a guard
+        // trains people to ignore guards: Ethan hit this on a browser held 18.1h
+        // with ZERO tabs and was told staged logins were at stake.
+        //
+        // The refusal itself is UNCHANGED and still fires. Only the claim is
+        // now one the code can support.
         "error": format!(
-            "a browser is already running under {} — starting yours would DESTROY its \
-             state (staged logins included). It is {idle}. Pass {{\"takeover\": true}} to replace \
-             it deliberately, or drive the running one via session-scoped verbs; `your_options` \
-             below spells out the non-destructive moves.",
+            "a browser is already running under {} — starting yours would replace it, losing \
+             its OPEN TABS and any auth flow mid-completion. It is {idle}. Pass \
+             {{\"takeover\": true}} to replace it deliberately, or drive the running one via \
+             session-scoped verbs; `your_options` below spells out the non-destructive moves.",
             if named {
                 format!("session '{owner}'")
             } else {
@@ -478,7 +612,7 @@ fn driver_err(e: chrome::DriverError) -> Response {
                          browser this server did not launch.",
             }),
         ),
-        chrome::DriverError::Cdp(e) => err(cdp_status(&e), json!({ "error": e.to_string() })),
+        chrome::DriverError::Cdp(e) => err(cdp_status(&e), json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -543,7 +677,7 @@ async fn connect_session(session: &str, create_url: Option<&str>) -> Result<(chr
          did not recover: {first}",
         page.target_id
     );
-    Err(err(StatusCode::BAD_GATEWAY, json!({ "error": first.to_string() })))
+    Err(err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&first) })))
 }
 
 // ---------------------------------------------------------------------------
@@ -636,7 +770,13 @@ async fn start(
     // work they are about to destroy. Adopt first so a browser surviving a
     // server restart is guarded too, not just one this process spawned.
     chrome::adopt_if_orphaned(&home).await;
-    if let Some((r_profile, r_owner, r_started, r_pid, r_port)) = chrome::running_snapshot() {
+    // THIS PROFILE ONLY (AMUX-3828). A browser on a different profile is a
+    // legitimate neighbour: two workers on two profiles must both run, which is
+    // the whole point. The conflict question is per user_data_dir, never global.
+    let want_profile = body.profile.clone();
+    if let Some((r_profile, r_owner, r_started, r_pid, r_port)) =
+        chrome::running_snapshot_for(&want_profile)
+    {
         // Same-session requires BOTH sides attributed and equal. An
         // unattributed caller matches nothing — anonymity forfeits the
         // shortcut, including against an unattributed owner (two anonymous
@@ -659,6 +799,43 @@ async fn start(
                 .and_then(|v| v.as_array())
                 .map(|a| summarize_pages(a))
                 .unwrap_or_default();
+            // NOTHING TO LOSE IS NOT A CONFLICT (Ethan, 2026-08-28 12:39: "the
+            // browser shit needs to be more intuitive"). He hit this refusal
+            // TWICE in twenty minutes against a browser held 18+ hours with
+            // ZERO tabs, and the second time the wording was already accurate.
+            // Accuracy was not the problem: being made to read a paragraph and
+            // adjudicate a judgement call, to open a browser, when the honest
+            // answer to "what would this destroy" is NOTHING.
+            //
+            // The evidence to decide is already in hand three lines up, and
+            // this file already draws the conclusion in prose — the Some(n)
+            // arm of the refusal says "ZERO real pages open ... so there is no
+            // page state to lose". It said it and then refused anyway.
+            //
+            // So: no real pages, CDP answered, and held past the grace window
+            // -> take it over and SAY SO, rather than asking a human to
+            // approve the obvious. Every condition is load-bearing:
+            //   pages.is_empty() — a single real page is state, and the
+            //     tab-count arm of the refusal exists because "4 tabs" was
+            //     once one live Google sign-in.
+            //   tabs.is_some()   — CDP silence is NOT zero (this file's own
+            //     distinction). Unknown means refuse, as before.
+            //   held > grace     — a browser started seconds ago by another
+            //     lane has not opened its first tab yet; without this, a race
+            //     between two starts resolves by stomping.
+            let grace_s = std::env::var("AMUX_BROWSER_IDLE_TAKEOVER_S")
+                .ok()
+                .and_then(|v| v.trim().parse::<i64>().ok())
+                .unwrap_or(600);
+            let held_s = (now_epoch() - r_started).max(0);
+            if pages.is_empty() && tabs.is_some() && held_s > grace_s {
+                tracing::info!(
+                    profile = %r_profile, owner = %r_owner, held_s, pid = r_pid,
+                    requested_by = attrib.as_deref().unwrap_or("(unattributed)"),
+                    "browser: auto-takeover — holder had ZERO real pages and was past the \
+                     idle grace window, so the start proceeded without asking (AMUX-3828)"
+                );
+            } else {
             return err(
                 StatusCode::CONFLICT,
                 takeover_refusal(
@@ -681,6 +858,7 @@ async fn start(
                     },
                 ),
             );
+            }
         }
         if !same {
             tracing::warn!(
@@ -718,7 +896,7 @@ async fn start(
                                     .unwrap_or(Value::Null);
                                 v["viewport"] = json!({ "w": w, "h": h, "measured": seen });
                             }
-                            Err(e) => v["viewport_error"] = json!(e.to_string()),
+                            Err(e) => v["viewport_error"] = json!(with_cause(&e)),
                         }
                     }
                     Err(_) => {
@@ -739,7 +917,7 @@ async fn start(
             }
             Json(v).into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -753,12 +931,15 @@ async fn status() -> Response {
     chrome::adopt_if_orphaned(&chrome::amux_home()).await;
     // Read the registry under the lock, then drop it before any await —
     // holding a std::sync::Mutex across an await point deadlocks the runtime.
-    let snapshot = {
-        let guard = chrome::RUNNING.lock().expect("browser registry poisoned");
-        guard
-            .as_ref()
-            .map(|r| (r.profile.clone(), r.cdp_port, r.started_at, r.started_by.clone()))
-    };
+    // EVERY BROWSER (AMUX-3828). `browsers` is the real answer now; the
+    // top-level single-browser fields below are kept and describe the FIRST
+    // one, because the SPA and the CLI read them and a shape change would break
+    // both. `browser_count` is what tells a reader the top level is a summary
+    // rather than the whole truth (ethos rule 4: an omission announces itself).
+    let all = chrome::running_all();
+    let snapshot = all
+        .first()
+        .map(|(p, o, st, _pid, port, _lv)| (p.clone(), *port, *st, o.clone()));
     // AMUX-3414: why the LAST browser is gone. In-memory, so a server restart
     // clears it — absent means "no exit recorded by this process", not "no
     // exit happened"; the field's note says so rather than letting the two
@@ -769,6 +950,19 @@ async fn status() -> Response {
             "running": false,
             "last_exit": last_exit,
             "last_exit_note": "in-memory: a server restart clears it; null means no exit recorded by THIS server process",
+            // THE COUNTERS BELONG HERE TOO (AMUX-3886 follow-up). Both used to
+            // appear only in the running branch, so they vanished in exactly
+            // the state they describe: a browser that died leaves `running:
+            // false`, and "how many times did a verb find a corpse" is the
+            // question you ask AFTER that, not during. Found by reading the
+            // live endpoint for the evidence on this card's own close and
+            // getting three keys back.
+            "stale_binding_recoveries":
+                chrome::STALE_BINDING_RECOVERIES.load(std::sync::atomic::Ordering::Relaxed),
+            "dead_browser_recoveries":
+                chrome::DEAD_BROWSER_RECOVERIES.load(std::sync::atomic::Ordering::Relaxed),
+            "recoveries_note": "in-memory; a server restart resets both to 0, so 0 means \
+                                \"none since this process started\", not \"never\"",
         }))
         .into_response();
     };
@@ -777,10 +971,60 @@ async fn status() -> Response {
     // different fact from "no tabs" (ethos rule 4).
     let (tabs, tabs_error) = match chrome::cdp_list(cdp_port).await {
         Ok(t) => (t, Value::Null),
-        Err(e) => (Value::Null, json!(e.to_string())),
+        Err(e) => (Value::Null, json!(with_cause(&e))),
     };
+    // THE REAP COUNTDOWN, VISIBLE (AMUX-3829, second pass). It used to live only
+    // in the reaper's process memory, so a reaper about to fire and one that
+    // could never fire looked identical from outside — which is exactly how the
+    // in-memory clock's restart bug survived being shipped.
+    let idle = crate::runtime_jobs::browser_reaper::idle_ages(
+        &chrome::amux_home(),
+        crate::config::now_f64(),
+    );
+    let reap_after = crate::runtime_jobs::browser_reaper::reap_after_s();
+    let ttl = crate::runtime_jobs::browser_reaper::ttl_s();
+    let now_f = crate::config::now_f64();
+    // Per-browser rows, so two workers can each see their own.
+    let mut browsers: Vec<Value> = Vec::new();
+    for (p, o, st, pid, port, last_verb) in &all {
+        let t = chrome::cdp_list(*port).await.ok();
+        let age_s = now_f - *st as f64;
+        let since_verb_s = now_f - *last_verb as f64;
+        let ttl_remaining_s = if ttl > 0 {
+            let r = ttl as f64 - age_s;
+            if r > 0.0 { Some(r.round()) } else { Some(0.0) }
+        } else {
+            None
+        };
+        let activity_reap = crate::runtime_jobs::browser_reaper::activity_reap_s();
+        let activity_reap_val = if activity_reap == 0 { Value::Null } else { json!(activity_reap) };
+        browsers.push(json!({
+            "profile": p,
+            "started_by": o,
+            "started_at": st,
+            "age_s": age_s.round(),
+            "pid": pid,
+            "cdp_port": port,
+            "tabs": t.clone().unwrap_or(Value::Null),
+            "tab_count": t.as_ref().and_then(|v| v.as_array().map(|a| a.len())),
+            // Absent (null) when the profile is not currently empty, which is a
+            // different fact from "empty for 0 seconds" and the one a reader
+            // needs: null here means nothing is counting down.
+            "idle_s": idle.get(p).map(|v| v.round()),
+            "reap_after_s": if reap_after == 0 { Value::Null } else { json!(reap_after) },
+            // TTL countdown: how many seconds until the hard TTL fires.
+            // Null when AMUX_BROWSER_TTL_S=0 (TTL arm disabled).
+            "ttl_remaining_s": ttl_remaining_s,
+            "ttl_s": if ttl == 0 { Value::Null } else { json!(ttl) },
+            // How long since any verb (navigate/screenshot/action) was called.
+            "since_verb_s": since_verb_s.round(),
+            "activity_reap_s": activity_reap_val,
+        }));
+    }
     Json(json!({
         "running": true,
+        "browsers": browsers,
+        "browser_count": all.len(),
         "profile": profile,
         "cdp_port": cdp_port,
         "started_at": started_at,
@@ -801,6 +1045,17 @@ async fn status() -> Response {
         "stale_binding_recoveries_note":
             "tabs Chrome still listed whose CDP socket would not open, so the session was \
              rebound. In-memory; a server restart resets it to 0.",
+        // AMUX-3886. The other half of the same blindness: a browser whose
+        // PROCESS is gone while the registry still names it. The exit monitor
+        // polls at 5s, so every verb in that gap used to 502 with a cause-free
+        // reqwest string; now the verb itself clears the corpse and counts it.
+        // Read it BESIDE `last_exit`: a non-zero count with a `found dead on a
+        // verb` reason means the monitor was not the thing that noticed.
+        "dead_browser_recoveries":
+            chrome::DEAD_BROWSER_RECOVERIES.load(std::sync::atomic::Ordering::Relaxed),
+        "dead_browser_recoveries_note":
+            "verbs that found the registry naming a browser whose process was gone, cleared it, \
+             and answered 409 rather than 502. In-memory; a server restart resets it to 0.",
     }))
     .into_response()
 }
@@ -816,7 +1071,7 @@ async fn stop(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
     // by whoever notices) but LOUD: the log and the response both name owner
     // and actor, so an anonymous stop can no longer read as a mystery death
     // (AMUX-3063's other half — the 09:05 stop had no actor on record).
-    let owner = chrome::running_snapshot().map(|(_, o, _, _, _)| o);
+    let owner = chrome::running_all().into_iter().next().map(|(_, o, _, _, _, _)| o);
     if let Some(o) = owner.as_deref() {
         if attrib.as_deref() != Some(o) {
             tracing::warn!(
@@ -848,10 +1103,63 @@ async fn profiles(Query(q): Query<ProfilesQuery>) -> Response {
     let list =
         match tokio::task::spawn_blocking(move || chrome::list_profiles(&home, with_sizes)).await {
             Ok(l) => l,
-            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+            Err(e) => return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) })),
         };
     let chrome_profiles = chrome::list_chrome_profiles();
-    Json(json!({ "profiles": list, "backends": ["native"], "chrome_profiles": chrome_profiles })).into_response()
+    // THE TTL AND THE COUNTDOWN, BESIDE THE THING THEY DELETE. A reaper whose
+    // only trace is a log line is one nobody knows about until a profile is
+    // gone; `reap_in_days` on each row makes the schedule readable before it
+    // fires, the same reason the idle arm publishes `idle_s`/`reap_after_s`.
+    // Null means exempt, and `reap_exempt_reason` says which of the three
+    // reasons applies rather than leaving the reader to infer it.
+    let ttl_days = crate::runtime_jobs::browser_reaper::profile_ttl_days();
+    let running: std::collections::HashSet<String> =
+        chrome::running_all().into_iter().map(|(p, ..)| p).collect();
+    let now = crate::config::now_f64();
+    let rows: Vec<Value> = list
+        .iter()
+        .map(|p| {
+            let age_days = p.last_used.map(|lu| (now - lu as f64) / 86_400.0);
+            let is_running = running.contains(&p.name);
+            let exempt = if ttl_days == 0 {
+                Some("ttl disabled (AMUX_PROFILE_TTL_DAYS=0)")
+            } else if p.registered {
+                Some("registered — a deliberate save, exempt at any age")
+            } else if is_running {
+                Some("a browser is running on this profile")
+            } else if p.name == "default" {
+                Some("the default profile is never deleted")
+            } else if age_days.is_none() {
+                Some("last-used time could not be read, so age is unknown")
+            } else {
+                None
+            };
+            let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("age_days".into(), json!(age_days.map(|d| (d * 10.0).round() / 10.0)));
+                o.insert("reap_exempt_reason".into(), json!(exempt));
+                o.insert(
+                    "reap_in_days".into(),
+                    json!(match (exempt, age_days) {
+                        (None, Some(d)) => json!(((ttl_days as f64 - d).max(0.0) * 10.0).round() / 10.0),
+                        _ => Value::Null,
+                    }),
+                );
+            }
+            v
+        })
+        .collect();
+    Json(json!({
+        "profiles": rows,
+        "backends": ["native"],
+        "chrome_profiles": chrome_profiles,
+        "profile_ttl_days": ttl_days,
+        "profile_ttl_note": "unregistered profiles unused for this many days are deleted by the \
+                             reaper. Registered profiles (a deliberate save with domains/label) \
+                             are exempt at any age, as is any profile with a browser running on \
+                             it. 0 disables the arm.",
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -864,6 +1172,7 @@ struct CreateBody {
 }
 
 async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Response {
+    let started = std::time::Instant::now();
     let name = body.name.trim().to_string();
     if name.is_empty()
         || !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
@@ -882,15 +1191,23 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
     // it here from now on because the dir exists.
     let dir = home.join("playwright-auth").join("profiles").join(&name);
     if let Err(e) = std::fs::create_dir_all(&dir) {
-        return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() }));
+        return err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) }));
     }
     // A sign-in URL means "open a headed window on the new profile so a
     // human can log in" — same intent as the Python create flow.
     let mut launched = false;
     let mut launch_error = Value::Null;
+    // TIME THE LAUNCH SEPARATELY FROM THE REQUEST (AMUX-3832, the AMUX-3818
+    // pattern). With a `url` this endpoint's work IS spawning a HEADED Chrome
+    // and waiting for CDP — seconds, by construction, since its entire purpose
+    // is opening a window for a human to sign in. A flat 10s threshold files
+    // that as a defect: one such request was reported at 10.5s under 1.09x host
+    // load, which is the work, not a fault.
+    let mut launch_ms: u128 = 0;
     if !body.url.trim().is_empty() {
         let session = resolve_session(body.session.as_deref(), &headers);
         let attrib = explicit_session(body.session.as_deref(), &headers);
+        let launch_started = std::time::Instant::now();
         match chrome::start(&home, &name, body.url.trim(), &session, attrib.as_deref().unwrap_or(""),
             // create-profile launches headfully by definition: its purpose is a
             // human logging in (AMUX-3508's headless is for REUSING the result).
@@ -898,18 +1215,30 @@ async fn profile_create(headers: HeaderMap, Json(body): Json<CreateBody>) -> Res
             .await
         {
             Ok(_) => launched = true,
-            Err(e) => launch_error = json!(e.to_string()),
+            Err(e) => launch_error = json!(with_cause(&e)),
         }
+        launch_ms = launch_started.elapsed().as_millis();
     }
-    Json(json!({
+    let body_v = Json(json!({
         "ok": true,
         "profile": name,
         "path": dir.display().to_string(),
         "launched": launched,
+        "launch_ms": launch_ms,
         "launch_error": launch_error,
         "note": "sign in through the opened window, then POST /api/browser/stop to flush the profile",
     }))
-    .into_response()
+    .into_response();
+    // Declare the wait as the LAUNCH's only when the launch dominated it. A
+    // create that took 11s around a 200ms launch is amux being slow and must
+    // still file — which is what keeps this a per-request declaration rather
+    // than a route exemption. A create with no `url` launches nothing, so
+    // `launch_ms` is 0 and it can never qualify.
+    let total_ms = started.elapsed().as_millis();
+    if crate::api::dominated_by_external(total_ms, launch_ms) {
+        return crate::api::slow_ok(body_v, &format!("chrome-launch {launch_ms}ms"));
+    }
+    body_v
 }
 
 async fn profile_delete(Path(name): Path<String>) -> Response {
@@ -955,6 +1284,7 @@ async fn navigate(headers: HeaderMap, body: Option<Json<NavigateBody>>) -> Respo
     };
     match chrome::navigate_and_settle(&mut cdp, &url).await {
         Ok(mut v) => {
+            crate::integrations::browser::touch_verb_for_session(&session);
             if let Some(o) = v.as_object_mut() {
                 o.insert("backend".into(), json!("native"));
                 o.insert("session".into(), json!(session));
@@ -970,7 +1300,7 @@ async fn navigate(headers: HeaderMap, body: Option<Json<NavigateBody>>) -> Respo
             }
             Json(v).into_response()
         }
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -995,11 +1325,12 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
             // so a log sweep / /api/logs catches "browser session X can't render"
             // without a human noticing the empty viewport first.
             tracing::warn!("[browser] navigate failed for session {session:?} → {u}: {e}");
-            return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }));
+            return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }));
         }
     }
     match chrome::screenshot_to_file(&mut cdp, &chrome::amux_home(), &session).await {
         Ok((path, size)) => {
+            crate::integrations::browser::touch_verb_for_session(&session);
             let url = cdp
                 .eval("location.href", 10)
                 .await
@@ -1008,6 +1339,16 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
                 .unwrap_or(page.url);
             Json(json!({
                 "ok": true,
+                // WHICH SESSION'S BINDING THIS IS (AMUX-3834, tubescience).
+                // `resolve_session` falls back explicit-param -> X-Amux-Session
+                // -> "amux", silently. A caller who omits the header on ONE verb
+                // drives a different binding than their other calls and has no
+                // way to see it: tubescience spent a session on "screenshot and
+                // eval are on different targets" that was two SESSIONS, not two
+                // resolvers, and only found it by curling both ways side by
+                // side. Echoing the resolved name makes the next occurrence
+                // self-evident from a single response.
+                "session": session,
                 "backend": "native",
                 "path": path.display().to_string(),
                 "size": size,
@@ -1025,7 +1366,7 @@ async fn screenshot(headers: HeaderMap, Query(q): Query<ShotQuery>) -> Response 
             // 2026-08-13) — the tab wedged and the viewport went blank. WARN so
             // the failure is visible in the logs, not only as an empty view.
             tracing::warn!("[browser] screenshot capture failed for session {session:?}: {e}");
-            err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }))
+            err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }))
         }
     }
 }
@@ -1071,7 +1412,7 @@ async fn state_payload(cdp: &mut chrome::CdpClient, session: &str) -> Result<Val
     let mut v = cdp
         .eval(&chrome::state_js(), 20)
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })))?;
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })))?;
     let text = v.get("text").and_then(Value::as_str).unwrap_or("").to_string();
     if let Some(o) = v.as_object_mut() {
         o.insert("text".into(), json!(chrome::obs_cap(&text, chrome::obs_state_cap())));
@@ -1088,6 +1429,7 @@ async fn state_verb(headers: HeaderMap, Query(q): Query<SessionQuery>) -> Respon
         Ok(x) => x,
         Err(r) => return r,
     };
+    crate::integrations::browser::touch_verb_for_session(&session);
     match state_payload(&mut cdp, &session).await {
         Ok(v) => Json(v).into_response(),
         Err(r) => r,
@@ -1171,6 +1513,61 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                 return err(StatusCode::BAD_REQUEST, json!({ "error": "wait needs selector or text" }));
             }
         }
+        // TUBES-2343. Validated here with the rest, so a bad request is a 400
+        // whether or not a browser happens to be running and the schema stays
+        // testable without Chrome.
+        "files" => {
+            if get_str("selector").map(|s| s.trim().is_empty()).unwrap_or(true) {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "files needs a selector for the <input type=file>" }),
+                );
+            }
+            let paths = body.get("files").and_then(Value::as_array);
+            let Some(paths) = paths.filter(|a| !a.is_empty()) else {
+                return err(
+                    StatusCode::BAD_REQUEST,
+                    json!({ "error": "files needs a non-empty `files` array of absolute paths" }),
+                );
+            };
+            for p in paths {
+                let Some(p) = p.as_str().map(str::trim).filter(|s| !s.is_empty()) else {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": "every entry in `files` must be a non-empty string path" }),
+                    );
+                };
+                // ABSOLUTE ONLY. CDP resolves a relative path against the
+                // BROWSER's working directory, not the caller's, so a relative
+                // path does not fail — it attaches the wrong file or nothing,
+                // and the upload under test then "passes" against a file the
+                // author never chose.
+                if !std::path::Path::new(p).is_absolute() {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": format!(
+                            "file path must be absolute, got {p:?} — CDP resolves a relative \
+                             path against the browser's working directory, not yours, so it \
+                             would silently attach the wrong file"
+                        ) }),
+                    );
+                }
+                // EXISTENCE, checked before the round trip. `DOM.setFileInputFiles`
+                // accepts a missing path and reports success; the page then sees
+                // an input with a file that has no bytes, which reads as a broken
+                // upload rather than as a bad request.
+                if !std::path::Path::new(p).exists() {
+                    return err(
+                        StatusCode::BAD_REQUEST,
+                        json!({ "error": format!(
+                            "no such file: {p:?} (resolved on the machine running Chrome). \
+                             setFileInputFiles reports success for a missing path, so this is \
+                             refused here rather than surfacing later as a broken upload"
+                        ) }),
+                    );
+                }
+            }
+        }
         "type" | "scroll" | "back" | "extract" => {}
         other => {
             return err(StatusCode::BAD_REQUEST, json!({ "error": format!("unknown action: {other}") }))
@@ -1181,6 +1578,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
         Ok(x) => x,
         Err(r) => return r,
     };
+    crate::integrations::browser::touch_verb_for_session(&session);
     let ten = Duration::from_secs(10);
 
     match action.as_str() {
@@ -1199,7 +1597,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match out {
                 Ok(v) if v.get("error").is_some() => err(StatusCode::BAD_REQUEST, v),
                 Ok(v) => Json(v).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "type" => {
@@ -1207,7 +1605,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match cdp.call("Input.insertText", json!({ "text": text }), ten).await {
                 Ok(_) => Json(json!({ "ok": true, "typed": text.chars().count(), "backend": "native" }))
                     .into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "input" => {
@@ -1222,7 +1620,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             );
             let raw = match cdp.eval(&js, 20).await {
                 Ok(r) => r,
-                Err(e) => return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             };
             if raw.as_str() != Some("FOCUSED") {
                 let v = chrome::click_outcome(
@@ -1235,21 +1633,21 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
             match cdp.call("Input.insertText", json!({ "text": text }), ten).await {
                 Ok(_) => Json(json!({ "ok": true, "index": idx, "typed": text.chars().count() }))
                     .into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "key" => {
             let k = get_str("key").unwrap_or_default();
             match chrome::dispatch_key(&mut cdp, &k).await {
                 Ok(()) => Json(json!({ "ok": true, "key": k })).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "scroll" => {
             let dy = body.get("dy").and_then(Value::as_i64).unwrap_or(500);
             match cdp.eval(&format!("window.scrollBy(0,{dy})"), 10).await {
                 Ok(_) => Json(json!({ "ok": true, "dy": dy })).into_response(),
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "eval" => {
@@ -1295,13 +1693,39 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                 // with the description — Python's eval contract.
                 Err(e) => err(
                     StatusCode::BAD_REQUEST,
-                    json!({ "error": e.to_string(), "backend": "native" }),
+                    json!({ "error": with_cause(&e), "backend": "native" }),
                 ),
+            }
+        }
+        // TUBES-2343: attach local files to an <input type=file>.
+        //
+        // Every other action here drives the page through `Runtime.evaluate`,
+        // and this one CANNOT: `input.files` is not assignable from page script
+        // by design — that restriction is the browser's file-upload security
+        // model, not an oversight to work around. So the only route is the one
+        // the debugger protocol reserves for a driver,
+        // `DOM.setFileInputFiles`, which is also what page.setInputFiles is
+        // built on in Playwright.
+        //
+        // Consequence for the reader: this is the one action whose paths are
+        // resolved on the machine running CHROME, not by the page. Both
+        // validations above (absolute, exists) are about that seam.
+        "files" => {
+            let selector = get_str("selector").unwrap_or_default();
+            let files: Vec<String> = body
+                .get("files")
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(Value::as_str).map(str::to_string).collect())
+                .unwrap_or_default();
+            match chrome::set_input_files(&mut cdp, &selector, &files).await {
+                Ok(v) if v.get("error").is_some() => err(StatusCode::BAD_REQUEST, v),
+                Ok(v) => Json(v).into_response(),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         "back" => match cdp.eval("history.back()", 10).await {
             Ok(_) => Json(json!({ "ok": true })).into_response(),
-            Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+            Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
         },
         "extract" => match state_payload(&mut cdp, &session).await {
             Ok(v) => Json(v).into_response(),
@@ -1345,7 +1769,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                     }
                     Ok(_) => {}
                     Err(e) => {
-                        return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }))
+                        return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }))
                     }
                 }
                 if std::time::Instant::now() >= deadline {
@@ -1383,7 +1807,7 @@ async fn action(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
                     Json(json!({ "ok": true, "viewport": { "w": w, "h": h }, "measured": seen }))
                         .into_response()
                 }
-                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+                Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
             }
         }
         _ => unreachable!("validated above"),
@@ -1441,7 +1865,7 @@ async fn inspect_payload(cdp: &mut chrome::CdpClient, clear: bool, limit: usize)
     let _ = cdp.eval(chrome::CAPTURE_JS, 15).await;
     cdp.eval(&chrome::inspect_js(limit, clear), 15)
         .await
-        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })))
+        .map_err(|e| err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })))
 }
 
 async fn inspect_clear(headers: HeaderMap, body: Option<Json<Value>>) -> Response {
@@ -1475,7 +1899,7 @@ async fn search(Query(sq): Query<SearchQuery>) -> Response {
         Err(r) => return r,
     };
     if let Err(e) = chrome::navigate_and_settle(&mut cdp, &url).await {
-        return err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() }));
+        return err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) }));
     }
     tokio::time::sleep(Duration::from_secs(2)).await;
     let scrape = r#"
@@ -1488,7 +1912,7 @@ async fn search(Query(sq): Query<SearchQuery>) -> Response {
     match cdp.eval(scrape, 30).await {
         Ok(v) if v.is_array() => Json(json!({ "results": v })).into_response(),
         Ok(v) => Json(json!({ "results": [], "raw": v, "note": "scrape matched nothing — google may be showing a consent/challenge page" })).into_response(),
-        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::BAD_GATEWAY, json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -1544,8 +1968,16 @@ async fn save_profile(headers: HeaderMap, body: Option<Json<SaveProfileBody>>) -
         // Python defaults to the session's active profile; natively the one
         // running browser's profile IS that (or 'default' with none running).
         name = {
+            // The SESSION'S browser, not "the" browser (AMUX-3828): with
+            // several running, saving the wrong profile would write one
+            // worker's auth state under another's name.
             let guard = chrome::RUNNING.lock().expect("browser registry poisoned");
-            guard.as_ref().map(|r| r.profile.clone()).unwrap_or_default()
+            guard
+                .values()
+                .find(|r| !session.is_empty() && r.started_by == session)
+                .or_else(|| if guard.len() == 1 { guard.values().next() } else { None })
+                .map(|r| r.profile.clone())
+                .unwrap_or_default()
         };
         if name.trim().is_empty() {
             name = "default".into();
@@ -1574,7 +2006,7 @@ async fn save_profile(headers: HeaderMap, body: Option<Json<SaveProfileBody>>) -
             "label": entry.get("label").cloned().unwrap_or_else(|| json!("")),
         }))
         .into_response(),
-        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": e.to_string() })),
+        Err(e) => err(StatusCode::INTERNAL_SERVER_ERROR, json!({ "error": with_cause(&e) })),
     }
 }
 
@@ -1630,7 +2062,8 @@ fn catalog_body(path: &str) -> Response {
             ],
             "actions": ["click (selector|index|x,y)", "type", "input", "key",
                         "scroll", "eval", "wait", "extract", "back",
-                        "viewport (width+height, or device=iphone|iphone-se|ipad|desktop)"],
+                        "viewport (width+height, or device=iphone|iphone-se|ipad|desktop)",
+                        "files (selector + files[]: absolute paths, sets an <input type=file>)"],
             "eval_contract": "script must be a bare EXPRESSION; a `return` statement yields null",
         })),
     )
@@ -1658,6 +2091,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         Router::new().nest("/api/browser", routes()).with_state(state)
     }
@@ -1682,6 +2116,38 @@ mod tests {
         let bytes = axum::body::to_bytes(res.into_body(), usize::MAX).await.unwrap();
         let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
         (status, v, proxied)
+    }
+
+    /// AMUX-3886. `with_cause` is the renderer every error body in this file
+    /// goes through, and the ONLY thing it has to do is not drop the chain.
+    ///
+    /// `tests/browser_errors_carry_cause.rs` proves the call sites USE it. This
+    /// proves it is worth using: without this, `with_cause` could be rewritten
+    /// to `format!("{e}")` and every check in the pair would stay green while
+    /// the 502 went back to being undiagnosable.
+    #[test]
+    fn with_cause_keeps_the_whole_chain_and_plain_display_does_not() {
+        let e = anyhow::anyhow!("tcp connect error: Connection refused (os error 61)")
+            .context("client error (Connect)")
+            .context("error sending request for url (http://127.0.0.1:49731/json/list)");
+
+        let rendered = with_cause(&e);
+        for frame in [
+            "error sending request for url",
+            "client error (Connect)",
+            "Connection refused (os error 61)",
+        ] {
+            assert!(rendered.contains(frame), "with_cause dropped {frame:?}: {rendered}");
+        }
+        // CONTROL: the thing this replaced keeps ONLY the outermost frame. If
+        // this stops holding, plain Display started carrying causes and the
+        // assertions above no longer distinguish the two renderers.
+        let plain = e.to_string();
+        assert!(
+            !plain.contains("Connection refused"),
+            "the control has stopped holding: plain Display now carries the cause ({plain})"
+        );
+        assert!(rendered.len() > plain.len(), "the chain must ADD to the message");
     }
 
     /// AMUX-3672. A wedged browser and a rejected call must not share a status,
@@ -2002,13 +2468,68 @@ mod tests {
     async fn cross_session_start_refuses_without_takeover_naming_the_owner() {
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::api::settings::test_env::set_home(dir.path());
+
+        // AMUX-3063's incident, and the reason this test changed shape in
+        // AMUX-3828: an anonymous `default` start killed amux-gtm's staged
+        // NetSuite login. That was possible because the browser was a MACHINE
+        // singleton, so any start replaced any browser. It is now impossible by
+        // CONSTRUCTION rather than by refusal — `default` and `netsuite` are
+        // different profiles and do not touch. Structural beats a guard the
+        // caller has to respect.
         chrome::test_seed_running("netsuite", "amux-gtm", 424242);
-        // (AMUX-3610's cells live in `an_unattributed_holder_is_judgeable_from_the_refusal`;
-        // this one keeps pinning the AMUX-3063 property it was written for.)
         let app = app();
-        // The incident's own request shape: anonymous, default profile.
-        let (status, v, _) =
+        let (status, _v, _) =
             send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
+        // The victim is UNHARMED — that is the property AMUX-3063 wanted, and
+        // asserting it is worth more than asserting the 409 that used to stand
+        // in for it.
+        let survivor = chrome::running_snapshot_for("netsuite");
+        assert_eq!(
+            survivor.as_ref().map(|x| x.1.clone()),
+            Some("amux-gtm".to_string()),
+            "a start on ANOTHER profile must leave the staged browser alone (status {status})"
+        );
+        assert_eq!(survivor.map(|x| x.3), Some(424242), "same process, not a replacement");
+
+        // STOP WHAT THIS TEST ACTUALLY STARTED (AMUX-3973).
+        //
+        // The `default` start above is not a stub. `netsuite` is seeded but
+        // `default` is free, so the handler takes the real path and SPAWNS A
+        // HEADED CHROME into `<tempdir>/playwright-auth/profile`. Nothing here
+        // stopped it, so every `cargo test -p amux-server` on a machine with
+        // Chrome installed left one live browser and an ~87 MB profile behind.
+        // Measured 2026-08-31: 66 leaked profile dirs, 5.5 GB, oldest a day old,
+        // and a dock full of empty windows that Ethan reported twice.
+        //
+        // IT IS HERMETIC ON CI AND NOT ON A LAPTOP, which is why it survived.
+        // `chrome_binary()` probes two fixed macOS paths and then PATH; on a
+        // Linux runner it returns None, the launch fails, and the assertions
+        // above still pass because they only inspect the `netsuite` registry
+        // entry. Same shape as AMUX-3962 and AMUX-3969: behaviour that depends
+        // on the machine, green in the place nobody watches.
+        //
+        // Stopping rather than skipping the launch on purpose: the assertions
+        // are about what the REAL start path does to a peer's entry, so
+        // stubbing the spawn would leave them passing over code that no longer
+        // runs. Stop it instead, and the TempDir drop can then remove the
+        // profile it was holding open.
+        let _ = chrome::stop_profile(dir.path(), "default").await;
+        // ASSERTED, not assumed. A cleanup nobody checks is how this started:
+        // the launch was already invisible here, and a silent stop would be too.
+        assert!(
+            chrome::running_snapshot_for("default").is_none(),
+            "this test must not leave a browser running on `default`"
+        );
+
+        // AND THE SAME-PROFILE CASE STILL REFUSES. This is the cell that keeps
+        // the guard honest: two Chromes on one user_data_dir corrupt it, so a
+        // cross-session start onto an OCCUPIED profile must still 409 and name
+        // the owner and the escape. Without this, "multiple browsers" would
+        // have quietly become "no protection at all".
+        chrome::test_clear_running();
+        chrome::test_seed_running("netsuite", "amux-gtm", 424242);
+        let (status, v, _) =
+            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"netsuite"}"#)).await;
         chrome::test_clear_running();
         assert_eq!(status, StatusCode::CONFLICT, "{v}");
         assert_eq!(v["running"]["started_by"], json!("amux-gtm"), "{v}");
@@ -2017,44 +2538,6 @@ mod tests {
             v["error"].as_str().unwrap_or("").contains("takeover"),
             "the refusal must name the escape: {v}"
         );
-        assert_eq!(
-            v["requested_by"],
-            json!("(unattributed)"),
-            "a header-less caller must not be framed as any lane (amux-cloud's catch): {v}"
-        );
-        // amux-cloud's validation catch: the tab-binding default ("amux") must
-        // never become a same-session match. An anonymous caller resolves to
-        // that default for TAB purposes only — against a browser OWNED by the
-        // real amux session it must still refuse, or every anonymous caller
-        // could stomp amux's browsers (and each other's, via the shared
-        // constant).
-        chrome::test_seed_running("default", "amux", 424242);
-        let (st_amux, v_amux, _) =
-            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
-        chrome::test_clear_running();
-        assert_eq!(st_amux, StatusCode::CONFLICT, "anonymous must not match the default bucket: {v_amux}");
-        // Two anonymous callers are not one session: an unattributed OWNER is
-        // matched by nobody, its (anonymous) starter included.
-        chrome::test_seed_running("default", "", 424242);
-        let (st_anon, v_anon, _) =
-            send(&app, "POST", "/api/browser/start", Some(r#"{"profile":"default"}"#)).await;
-        chrome::test_clear_running();
-        assert_eq!(st_anon, StatusCode::CONFLICT, "anonymous-vs-anonymous is not same-session: {v_anon}");
-        assert!(
-            v_anon["error"].as_str().unwrap_or("").to_lowercase().contains("unattributed"),
-            // Was `contains("(unattributed)")`. AF-183 replaced that literal with
-            // a description built from the request log, so the exact parenthetical
-            // is no longer the wording — the PROPERTY it was pinning, that an
-            // unattributed holder is visibly flagged rather than silently blank,
-            // is what this now asserts. Deliberately case-insensitive: pinning
-            // the case would re-break on the next rewording without protecting
-            // anything.
-            "an unattributed owner is flagged as such: {v_anon}"
-        );
-        // The pass-through cases (same session; takeover:true) proceed to a
-        // REAL Chrome launch and so cannot run hermetically — they are
-        // exercised by the live post-deploy verification on the incident's
-        // own machine state, recorded on AMUX-3063's card.
     }
 
     /// The action schema answers 400 for malformed requests BEFORE any
@@ -2070,6 +2553,16 @@ mod tests {
             (r#"{"action":"viewport"}"#, "viewport needs width+height, or device"),
             (r#"{"action":"wait"}"#, "wait needs selector or text"),
             (r#"{"action":"dance"}"#, "unknown action: dance"),
+            // TUBES-2343.
+            (r#"{"action":"files","files":["/tmp/x"]}"#, "files needs a selector"),
+            (r##"{"action":"files","selector":"#f"}"##, "non-empty `files` array"),
+            (r##"{"action":"files","selector":"#f","files":[]}"##, "non-empty `files` array"),
+            (r##"{"action":"files","selector":"#f","files":[""]}"##, "must be a non-empty string"),
+            // RELATIVE PATHS ARE REFUSED, and the message says why: CDP
+            // resolves them against the BROWSER's cwd, so the attach would
+            // silently succeed against the wrong file.
+            (r##"{"action":"files","selector":"#f","files":["fixture.png"]}"##, "must be absolute"),
+            (r##"{"action":"files","selector":"#f","files":["./fixture.png"]}"##, "must be absolute"),
         ] {
             let (status, v, proxied) = send(&app, "POST", "/api/browser/action", Some(body)).await;
             assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {v}");
@@ -2079,6 +2572,45 @@ mod tests {
                 "{body}: {v}"
             );
         }
+        // A MISSING FILE IS A BAD REQUEST, NOT A BROKEN UPLOAD (TUBES-2343).
+        // `DOM.setFileInputFiles` accepts a path that is not there and reports
+        // SUCCESS, leaving the page with an input whose file has no bytes — so
+        // the fault surfaces later, inside whatever upload was under test,
+        // wearing the shape of a product bug. Refused here instead.
+        let missing = std::env::temp_dir().join("tubes-2343-does-not-exist.png");
+        let _ = std::fs::remove_file(&missing);
+        let body = format!(
+            r##"{{"action":"files","selector":"#f","files":[{}]}}"##,
+            json!(missing.to_string_lossy())
+        );
+        let (status, v, _) = send(&app, "POST", "/api/browser/action", Some(&body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{v}");
+        assert!(v["error"].as_str().unwrap_or("").contains("no such file"), "{v}");
+
+        // CONTROL: an existing absolute path passes the SCHEMA and is refused
+        // only for want of a browser. Without this cell the assertions above
+        // would all pass against a handler that rejected every `files` request,
+        // which is a working schema and a dead action.
+        let present = std::env::temp_dir().join("tubes-2343-present.png");
+        std::fs::write(&present, b"x").expect("write fixture");
+        let body = format!(
+            r##"{{"action":"files","selector":"#f","files":[{}]}}"##,
+            json!(present.to_string_lossy())
+        );
+        let (status, v, _) = send(&app, "POST", "/api/browser/action", Some(&body)).await;
+        let _ = std::fs::remove_file(&present);
+        assert_ne!(status, StatusCode::BAD_REQUEST, "a valid files request must clear the schema: {v}");
+
+        // AND THE ACTION IS DISCOVERABLE. An action the contract does not list
+        // reaches nobody, which is the gap this card was filed about — the
+        // reporter read GET /api/browser, found no file verb, and concluded the
+        // upload path could not be driven (ethos rule 1).
+        let (_, v, _) = send(&app, "GET", "/api/browser", None).await;
+        assert!(
+            v["actions"].as_array().map(|a| a.iter().any(|x| x.as_str().unwrap_or("").starts_with("files"))).unwrap_or(false),
+            "the contract must list `files`: {v}"
+        );
+
         // start's viewport validation runs BEFORE any Chrome launch (AMUX-3403),
         // so a bad request is hermetic too.
         for (body, needle) in [

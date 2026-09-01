@@ -180,6 +180,13 @@ pub(crate) fn unique_tmp_path(path: &Path) -> std::path::PathBuf {
 }
 
 impl EnvFile {
+    /// The key names this file defines, in file order. Names only: the VALUES
+    /// are credentials (these files are 0600), and every caller so far wants to
+    /// know which file defines a key rather than what it holds.
+    pub(crate) fn keys(&self) -> Vec<String> {
+        self.pairs.iter().map(|(k, _)| k.clone()).collect()
+    }
+
     fn load(path: &Path) -> Self {
         let mut pairs = Vec::new();
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -402,6 +409,16 @@ fn load_meta(name: &str) -> Map<String, Value> {
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
         .and_then(|v| v.as_object().cloned())
         .unwrap_or_default()
+}
+
+/// Epoch seconds since this lane's composer has held unsubmitted text, or 0.
+///
+/// Stamped by `rate_limit_sweep`, and read here by `autofix`'s stuck-composer
+/// detector, which needs the AGE: `ghost_rescue` can say a lane holds a
+/// collapsed paste right now but not for how long, and "held for six days" is
+/// the whole difference between noise and a card (AMUX-3885).
+pub(crate) fn composer_stuck_since(name: &str) -> i64 {
+    meta_i64(&load_meta(name), "composer_stuck_since")
 }
 
 fn save_meta(name: &str, meta: &Map<String, Value>) {
@@ -1031,6 +1048,129 @@ pub(crate) fn is_rate_limited_credit_banner(footer: &str) -> bool {
         // was answered wrong. Matched through the interpunct separator (a
         // sentence no lane emits as prose), footer-scoped like the others.
         || clean.contains("usage limit reached \u{00b7} continuing automatically at")
+}
+
+/// WHEN the limit in [`is_rate_limited_credit_banner`]'s banner lifts, as an
+/// epoch — or `None` when the banner does not say (AMUX-3815).
+///
+/// The banner Claude renders carries the answer in the same sentence the
+/// detector above already matches:
+///
+/// ```text
+/// You've hit your session limit · resets 8:30pm (America/New_York)
+/// ⚠ Usage limit reached · continuing automatically at 8:30pm · esc to cancel
+/// ```
+///
+/// amux read the first half of that line and threw the second half away. The
+/// cost is a wrong CLAIM, not just a missing field: `rate_limited_until` was
+/// only ever read, never written, so it was a permanent zero, and the steering
+/// detector told the board "this queue will not drain on its own" about a lane
+/// that was going to resume by itself in 35 minutes. `lane_block_reason_from`
+/// says the opposite in a comment three files away ("a rate limit is by
+/// definition temporary. The row waits, which is the whole point of the card").
+///
+/// `None` is a real answer and must stay distinguishable from "resets at the
+/// epoch": a credit cap has no reset clock at all, and a caller that reads a
+/// missing time as zero re-creates exactly the bug above.
+///
+/// Local time, because the server and its lanes share a machine and a clock. A
+/// parsed time already past is tomorrow's — Claude writes "resets 2am" at
+/// 11pm — with a two-minute grace so a reset landing exactly now does not jump
+/// a day.
+pub(crate) fn parse_rate_limit_reset(footer: &str) -> Option<i64> {
+    parse_rate_limit_reset_at(footer, chrono::Local::now())
+}
+
+/// `8:30pm` / `2am` / `12am` at the head of `s`, as (hour24, minute).
+///
+/// 12-HOUR ONLY, deliberately. A bare `20:30` is ambiguous against `8:30` once
+/// the meridiem is optional, and Claude does not emit 24-hour times here.
+/// Refusing to read one is honest; guessing would put a silent 12-hour error
+/// into a field the steering detector suppresses cards on.
+fn parse_clock12(s: &str) -> Option<(u32, u32)> {
+    let mut chars = s.chars().peekable();
+    let mut hour = String::new();
+    while chars.peek().is_some_and(char::is_ascii_digit) {
+        hour.push(chars.next()?);
+    }
+    if hour.is_empty() || hour.len() > 2 {
+        return None;
+    }
+    let mut minute = 0u32;
+    if chars.peek() == Some(&':') {
+        chars.next();
+        let m: String = chars.by_ref().take(2).collect();
+        if m.len() != 2 || !m.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        minute = m.parse().ok()?;
+    }
+    while chars.peek() == Some(&' ') {
+        chars.next();
+    }
+    let mer: String = chars.take(2).collect();
+    let mut h: u32 = hour.parse().ok()?;
+    if !(1..=12).contains(&h) || minute > 59 {
+        return None;
+    }
+    match mer.as_str() {
+        "am" => {
+            if h == 12 {
+                h = 0
+            }
+        }
+        "pm" => {
+            if h != 12 {
+                h += 12
+            }
+        }
+        _ => return None,
+    }
+    Some((h, minute))
+}
+
+/// [`parse_rate_limit_reset`] against a caller-supplied "now", so the rollover
+/// and the already-past cases are testable without waiting for a clock.
+pub(crate) fn parse_rate_limit_reset_at(
+    footer: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<i64> {
+    use chrono::TimeZone;
+    let clean = strip_ansi(footer).to_lowercase().replace('\u{2019}', "'");
+    // Both phrasings. "resets" is the wording of the session-limit line,
+    // "continuing automatically at" of the footer warning; a pane often shows
+    // both and they agree. Most specific FIRST, and each candidate is parsed
+    // rather than merely located: "resets at 8pm" matches the bare "resets "
+    // too, leaving "at 8pm", which must lose to the marker that leaves "8pm".
+    let (h24, minute) = ["continuing automatically at ", "resets at ", "resets "]
+        .iter()
+        .filter_map(|m| clean.find(m).map(|i| &clean[i + m.len()..]))
+        .find_map(parse_clock12)?;
+    let (h, minute) = (h24, minute);
+
+    let today = now.date_naive();
+    let at = |d: chrono::NaiveDate| -> Option<i64> {
+        let naive = d.and_hms_opt(h, minute, 0)?;
+        match chrono::Local.from_local_datetime(&naive) {
+            chrono::offset::LocalResult::Single(t) => Some(t.timestamp()),
+            // A DST spring-forward can make a wall-clock time not exist and a
+            // fall-back can make it exist twice. Take the earliest candidate
+            // rather than dropping the reading: an hour of error beats
+            // reporting "no reset time known" and re-filing the card.
+            chrono::offset::LocalResult::Ambiguous(a, _) => Some(a.timestamp()),
+            chrono::offset::LocalResult::None => Some(
+                chrono::Local
+                    .from_local_datetime(&d.and_hms_opt(h.min(22) + 1, minute, 0)?)
+                    .earliest()?
+                    .timestamp(),
+            ),
+        }
+    };
+    let ts = at(today)?;
+    if ts < now.timestamp() - 120 {
+        return at(today.succ_opt()?);
+    }
+    Some(ts)
 }
 
 /// The policy for what amux does with a rate-limit menu (ethos D2).
@@ -1729,14 +1869,20 @@ pub async fn debug_context_health() -> Response {
         }));
     }
     lanes.sort_by_key(|l| std::cmp::Reverse(l.get("generations").and_then(Value::as_u64).unwrap_or(0)));
-    j200(json!({
+    let n_lanes = lanes.len();
+    j200(crate::api::measured::measured(
+        json!({
         "note": "compaction generations per lane: how many times this conversation has been \
                  summarized away. A raw `claude` in a terminal sits at 0; an amux lane resumes \
                  forever, so it answers from a summary of a summary. Measured 2026-08-26 across \
                  every transcript active since 08-05: amux median 8 / max 215, raw median 0 / \
                  max 32 — same models, same effort, same first-turn token baseline.",
         "sessions": lanes.len(),
-        "measured": measured,
+        // RENAMED for AF-320. This was `measured`, an integer, on the one
+        // endpoint that already had the right instinct — and the contract needs
+        // `measured` to be the boolean "did this probe run". Two meanings on one
+        // key is worse than either, so the count takes the specific name.
+        "lanes_measured": measured,
         "unmeasurable": unmeasurable,
         "over_warn_threshold": over,
         "warn_at": GENERATIONS_WARN_AT,
@@ -1744,7 +1890,9 @@ pub async fn debug_context_health() -> Response {
                    starts its conversation over. Never automatic: the conversation is the lane's \
                    accumulated work, so discarding it is the owner's call (ethos rule 8).",
         "lanes": lanes,
-    }))
+        }),
+        n_lanes,
+    ))
 }
 
 /// The display name a transcript CURRENTLY carries — the last `customTitle` /
@@ -3049,7 +3197,7 @@ pub(crate) async fn emit_event_store(store: &crate::db::SharedStore, session: &s
 /// The secret-redaction pass Python applies before any chat text lands in a
 /// DB row (py:8676 _cmd_hist_record / py:8655 steer history — AMUX-2525).
 /// Same pattern family as the pipe-pane redactor (py:21478).
-fn redact_secrets(text: &str) -> String {
+pub(crate) fn redact_secrets(text: &str) -> String {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
@@ -3380,6 +3528,13 @@ fn mint_capture_card(
             } else {
                 vec![]
             },
+            // Not an ask: this producer files ordinary cards, and a card
+            // filed into needsyou without one is what AMUX-3929 is about.
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            // AF-367: an auto-captured human prompt — the population AF-367 is about.
+            source: Some("capture".into()),
         },
         now_ms / 1000,
     )?;
@@ -3401,6 +3556,37 @@ fn mint_capture_card(
     // notifier never re-announces a prompt the worker already received live.
     conn.execute("UPDATE issues SET notified = 1 WHERE id = ?1", rusqlite::params![row.id])?;
     Ok(Some(row))
+}
+
+/// The most recent row for (session, text) that was actually DELIVERED, newer
+/// than `since_ms`. `(id, ts)`, or None.
+///
+/// Extracted so the duplicate-delivery detector and its test run the SAME
+/// query. It was inline, and a test could only restate it — a restatement stays
+/// green when the shipped query changes, which is the "check pinning the wrong
+/// layer" shape (ethos rule 7).
+///
+/// # `stuck` rows are excluded, and that is the point
+///
+/// Failed sends became rows in AMUX-3903. A send that never left the composer
+/// is exactly what a caller SHOULD retry, so counting it as a prior delivery
+/// would flag the correct response as a double delivery and train people to
+/// ignore the one warning that exists for real duplicates. A QUEUED row carries
+/// no verdict and IS delivered at the next boundary, so it still counts.
+fn prior_delivered(
+    conn: &rusqlite::Connection,
+    session: &str,
+    text: &str,
+    since_ms: i64,
+) -> Option<(i64, i64)> {
+    conn.query_row(
+        "SELECT id, ts FROM cmd_history WHERE session=?1 AND text=?2 \
+         AND ts > ?3 AND COALESCE(submit_verdict,'') != 'stuck' \
+         ORDER BY ts DESC LIMIT 1",
+        rusqlite::params![session, text, since_ms],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .ok()
 }
 
 pub(crate) async fn cmd_hist_record_full(
@@ -3438,20 +3624,9 @@ pub(crate) async fn cmd_hist_record_full(
     // deliberate, and silently dropping one would turn a visible annoyance into
     // an invisible data-loss bug — strictly worse. It announces, and lets a
     // human or a sweep decide.
-    let dup_prior: Option<(i64, i64)> = {
-        let session_q = session.clone();
-        let text_q = text.clone();
-        match state.store.read() {
-            Ok(conn) => conn
-                .query_row(
-                    "SELECT id, ts FROM cmd_history WHERE session=?1 AND text=?2 \
-                     AND ts > ?3 ORDER BY ts DESC LIMIT 1",
-                    rusqlite::params![session_q, text_q, now_ms - DUP_DELIVERY_WINDOW_MS],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
-                .ok(),
-            Err(_) => None,
-        }
+    let dup_prior: Option<(i64, i64)> = match state.store.read() {
+        Ok(conn) => prior_delivered(&conn, &session, &text, now_ms - DUP_DELIVERY_WINDOW_MS),
+        Err(_) => None,
     };
     if let Some((prior_id, prior_ts)) = dup_prior {
         let age_s = (now_ms - prior_ts) as f64 / 1000.0;
@@ -3509,8 +3684,16 @@ pub(crate) async fn cmd_hist_record_full(
     // separate `steering_history` table IS stamped at real delivery by the
     // deliverer — which is also where the timestamp for the eventual backfill
     // will come from.
+    // A STUCK ROW IS NOT A DELIVERY (AMUX-3903). `delivery` says which PATH was
+    // taken and `Direct` is true of a stuck send — amux typed straight into the
+    // pane — so the mode alone would stamp `delivered_at`, which is the exact
+    // AMUX-3541 defect (a column populated 100% of the time is believable, and
+    // wrong) reintroduced through a new door. The verdict is what says whether
+    // the text landed, so it decides this column too.
+    let landed = !matches!(submit_verdict.as_deref(), Some("stuck"));
     let delivered_at_ms = match meta.delivery {
         Some(Delivery::Queued) => None,
+        _ if !landed => None,
         _ => Some(now_ms),
     };
     let msg_row_id_w = msg_row_id.clone();
@@ -3548,7 +3731,13 @@ pub(crate) async fn cmd_hist_record_full(
     // not auto-captured as ledger cards. It has no session/URL to run `amux
     // board`, so a card minted here would name work nobody can drive, and the
     // accountability sweep is likewise told to skip it.
-    if is_user && !skip_board && !session_is_isolated(&cap_session) {
+    // AND NOT FOR A PROMPT THE LANE NEVER RECEIVED (AMUX-3903). A ledger card
+    // asserts "this lane was given this task", and a stuck send means it was
+    // not: the text is sitting in the composer. Minting one would hand the
+    // accountability sweep a lane to chase over work nobody delivered. The
+    // message ROW still goes in, because the delivery attempt is the fact worth
+    // keeping; the card is a consequence that did not happen.
+    if is_user && landed && !skip_board && !session_is_isolated(&cap_session) {
         let row_id = msg_row_id.load(std::sync::atomic::Ordering::SeqCst);
         if row_id > 0 {
             let minted: std::sync::Arc<std::sync::Mutex<Option<String>>> =
@@ -3614,8 +3803,48 @@ fn steer_row_source(conn: &rusqlite::Connection, id: &str) -> (Option<String>, O
     .unwrap_or((None, None))
 }
 
+/// Guards whose messages CARRY CONTENT instead of asserting a re-evaluated
+/// state. These never coalesce: a second one is a SECOND MESSAGE, not a fresher
+/// version of the first.
+///
+/// The guard field does three jobs at once — it is the isolation discriminator,
+/// the producer label, and the coalescing key — and only the third is wrong for
+/// a note. Coalescing is right for a nudge: auto-compact re-evaluates the same
+/// condition 300 times and the reader wants one pending answer with current
+/// content (AMUX-3557). It is wrong for a peer's note, which is a message with
+/// a body that nobody else will ever send again.
+///
+/// MEASURED (AMUX-3938). Every board note enqueues under `board-progress`, and
+/// the lookup below is `WHERE session=? AND guard=?` — no card, no text. So
+/// while one note sat pending for a lane's next turn boundary, the NEXT board
+/// note to that lane overwrote its text, from any sender, about any card. Live
+/// specimen: three notes posted to AMUX-3935 within one second produced exactly
+/// one steer, and it carried note 1's `queued_at` with note 2's text, which is
+/// the signature of the in-place UPDATE. The lane read one of two distinct notes
+/// and had no way to know a first one existed.
+///
+/// This is the SAME defect as AMUX-3935 one layer down, and strictly wider: that
+/// one needed the same card and the same author, this one needs neither. Fixing
+/// the dedupe key alone left it in place, which is why the reporter's live test
+/// passed while a note still went missing.
+///
+/// Membership is by producer, not by heuristic, so adding a content-bearing
+/// producer is a deliberate edit here rather than something that has to be
+/// noticed later.
+const NON_COALESCING_GUARDS: &[&str] = &["board-progress"];
+
+/// Whether `guard` names a content-bearing producer (see
+/// [`NON_COALESCING_GUARDS`]). Guards stay non-empty for these, so the isolation
+/// gate above still refuses them into a raw-agent lane — the coalescing is what
+/// is switched off, not the producer identity.
+fn non_coalescing(guard: &str) -> bool {
+    NON_COALESCING_GUARDS.contains(&guard)
+}
+
 /// py:8595 _steer_enqueue — durable queue row + message.queued event.
-/// Dedup-on-enqueue: identical text (or same guard) replaces, never stacks.
+/// Dedup-on-enqueue: identical text replaces, never stacks. A shared `guard`
+/// ALSO replaces, except for the content-bearing producers in
+/// [`NON_COALESCING_GUARDS`].
 ///
 /// `sender` is the origin lane (the server-verified `X-Amux-Session` stamp) or
 /// "" for an automated producer, which the `guard` already identifies. It is
@@ -3797,7 +4026,7 @@ pub(crate) async fn steer_enqueue_precond(
             // been waiting since it was first queued. The newest TEXT wins
             // because that is the guard's purpose (one pending answer, current
             // content); the age is not part of the content.
-            let existing: Option<String> = if guard_s.is_empty() {
+            let existing: Option<String> = if guard_s.is_empty() || non_coalescing(&guard_s) {
                 None
             } else {
                 conn.query_row(
@@ -4121,11 +4350,48 @@ fn dim_mask(line: &str) -> (String, String) {
                 for c2 in chars.by_ref() {
                     if c2.is_ascii_alphabetic() {
                         if c2 == 'm' {
-                            for code in body.split(';') {
-                                match code.trim() {
-                                    "2" => is_dim = true,
-                                    "0" | "" | "22" => is_dim = false,
-                                    _ => {}
+                            // AN EXTENDED COLOUR'S PARAMETERS ARE NOT SGR CODES
+                            // (AMUX-3889). This was a flat scan over every
+                            // semicolon-separated field, which reads the `2` in
+                            // `48;2;95;95;95` — the marker that says "truecolor
+                            // follows" — as SGR 2, DIM. One such sequence turns
+                            // the rest of the line dim, and `composer_state`
+                            // reports dim text as a PLACEHOLDER rather than as
+                            // pending input.
+                            //
+                            // It survived because Claude Code paints in 256
+                            // colour (`38;5;N`), where the second field is 5 and
+                            // the bug cannot fire. Gemini paints in truecolor,
+                            // so on a gemini lane EVERY typed message read as a
+                            // placeholder — and `read_frame` turns "no pending
+                            // input" into `Cleared`, i.e. SUBMITTED. The sender
+                            // is told a message landed while it sits in the box,
+                            // which is the AMUX-3876 failure with a different
+                            // cause.
+                            //
+                            // So the parameters are CONSUMED, walking the list
+                            // rather than scanning it: `38;5;n` takes one,
+                            // `38;2;r;g;b` takes three.
+                            let codes: Vec<&str> = body.split(';').collect();
+                            let mut i = 0;
+                            while i < codes.len() {
+                                match codes[i].trim() {
+                                    "38" | "48" | "58" => {
+                                        i += match codes.get(i + 1).map(|c| c.trim()) {
+                                            Some("5") => 3,
+                                            Some("2") => 5,
+                                            _ => 1,
+                                        }
+                                    }
+                                    "2" => {
+                                        is_dim = true;
+                                        i += 1;
+                                    }
+                                    "0" | "" | "22" => {
+                                        is_dim = false;
+                                        i += 1;
+                                    }
+                                    _ => i += 1,
                                 }
                             }
                         }
@@ -4150,6 +4416,77 @@ fn dim_mask(line: &str) -> (String, String) {
         }
     }
     (plain, dim)
+}
+
+/// Gemini CLI's composer, or `None` when this frame is not one.
+///
+/// # Why this is its own reader rather than another glyph in the scan
+///
+/// The obvious patch is to add `*` to the prompt-glyph set beside the two the
+/// scan already knows. That would be a disaster on Claude Code panes, where a
+/// line beginning `*` is an ordinary prose bullet and would read as pending
+/// input in any lane that happened to be writing markdown.
+///
+/// So the anchor is the CHROME, matched positively: gemini draws its input box
+/// as a half-block sandwich, a run of U+2584 above and a run of U+2580 below,
+/// and nothing else in any supported TUI draws those. Text between them is the
+/// composer by construction, and prose cannot fake a border.
+///
+/// # The placeholder is COLOURED, not dim
+///
+/// Claude Code's suggestion is SGR-2, which is why [`dim_mask`] exists and why
+/// `Placeholder` can be told from `Typed` without reading the words. Gemini
+/// paints its hint in grey (38;2;175;175;175), an ordinary foreground colour
+/// indistinguishable from real text by attribute alone, so this one case has to
+/// match the words.
+///
+/// IT FAILS TOWARD `Typed`, deliberately, and the asymmetry is the reason to
+/// say so here. Reading a placeholder as typed costs a send that reports
+/// not-confirmed when the lane is actually clear: annoying, and self-correcting
+/// on the next frame. Reading typed text as a placeholder makes `read_frame`
+/// return `Cleared`, which means SUBMITTED — the sender is told the message
+/// landed while it sits in the box, which is the AMUX-3876 defect this module
+/// already carries a variant for. So only gemini's own hint sentence is a
+/// placeholder; anything else is somebody's message.
+fn gemini_composer_state(raw_lines: &[&str], stripped: &[String]) -> Option<ComposerState> {
+    /// Gemini's own hint text. Matched on the stable head of the sentence
+    /// rather than the whole of it, because the `@path/to/file` tail is the
+    /// part most likely to be reworded, and a hint that stops matching fails
+    /// toward `Typed` (see above) rather than toward a false confirmation.
+    const HINT: &str = "type your message";
+    let is_run = |l: &str, ch: char| {
+        let t = l.trim();
+        t.chars().filter(|c| *c == ch).count() >= 4 && t.chars().all(|c| c == ch)
+    };
+    // The LAST box in the frame: scrollback can hold an older one.
+    let top = stripped.iter().rposition(|l| is_run(l, '\u{2584}'))?;
+    let bottom = stripped.iter().skip(top + 1).position(|l| is_run(l, '\u{2580}'))? + top + 1;
+    if bottom <= top + 1 {
+        // A drawn box with no body line: painted, and empty.
+        return Some(ComposerState::Empty);
+    }
+    let mut plain = String::new();
+    for (n, raw) in raw_lines[top + 1..bottom].iter().enumerate() {
+        let (mut p, _) = dim_mask(raw);
+        if n == 0 {
+            // Drop the prompt glyph and the reverse-video cursor cell: chrome,
+            // never content.
+            p = p.trim_start().trim_start_matches(['*', ' ', '\u{a0}', '\t']).to_string();
+        }
+        plain.extend(p.split_whitespace());
+    }
+    if plain.is_empty() {
+        return Some(ComposerState::Empty);
+    }
+    // Compared against the SPACE-STRIPPED hint, because `plain` is built with
+    // `split_whitespace` and concatenated — the same shape that makes
+    // `is_collapsed_paste` match `[Pastedtext#137+44lines]` rather than the
+    // spaced form a human reads off the pane.
+    let hint_squashed: String = HINT.split_whitespace().collect();
+    if plain.to_lowercase().starts_with(&hint_squashed) {
+        return Some(ComposerState::Placeholder(plain));
+    }
+    Some(ComposerState::Typed(plain))
 }
 
 pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
@@ -4186,6 +4523,16 @@ pub(crate) fn composer_state(raw_frame: &str) -> ComposerState {
     // form so the ❯ scan is unchanged from python.
     let raw_lines: Vec<&str> = raw_frame.lines().filter(|l| !strip_ansi(l).trim().is_empty()).collect();
     let stripped: Vec<String> = raw_lines.iter().map(|l| strip_ansi(l)).collect();
+    // GEMINI DRAWS A DIFFERENT BOX, AND IT IS NOT A PROMPT GLYPH (AMUX-3889).
+    // Tried before the scan below because gemini's frame contains neither
+    // glyph at all, so that scan returned `NotVisible` for a composer that is
+    // plainly drawn — and `read_frame` maps `NotVisible` to `NoUi`, which
+    // `final_frame_confirms` refuses by design. Every send to a gemini lane
+    // therefore spun its twelve no-ui looks and reported `Unverified` while the
+    // message sat delivered in the lane.
+    if let Some(state) = gemini_composer_state(&raw_lines, &stripped) {
+        return state;
+    }
     let Some(idx) = stripped
         .iter()
         .rposition(|l| matches!(l.trim().chars().next(), Some('\u{276f}') | Some('\u{203a}')))
@@ -4452,6 +4799,70 @@ pub(crate) enum FrameRead {
     /// Our text is still sitting in the composer with the lane idle. Nothing is
     /// going to submit it.
     StillThereIdle,
+    /// The composer holds a COLLAPSED PASTE (`[Pasted text #12 +4 lines]`), so
+    /// the text itself is not in the frame and cannot be compared to ours.
+    ///
+    /// Its own variant rather than folded into `NoUi` (AMUX-3880), because the
+    /// two want opposite handling and folding them cost a real delivery.
+    /// `NoUi` means "Claude Code has not painted yet", and the right response is
+    /// to WAIT. This means "the composer is painted and holding something
+    /// unsubmitted", and waiting is exactly wrong — the Enter needs pressing
+    /// again.
+    ///
+    /// AMUX-3876 mapped this to `NoUi` to stop it reading as `Cleared`, which
+    /// fixed the false CONFIRMED and left the message stranded: the retry lives
+    /// past the `StillThereIdle` arm, and a waiting arm never reaches it.
+    ///
+    /// WHY THE SEND MAY ACT ON THIS WHERE `ghost_rescue` MAY NOT. That sweep
+    /// refuses to submit a collapsed paste because it cannot prove the content
+    /// is the message it means, and it is right: it runs minutes later, holding
+    /// no lock. Inside `send_text` the claim is provable — `session_send_lock`
+    /// is held across paste, Enter and verify precisely so nothing else can type
+    /// into the pane (its own doc says the sweep must never fire an Enter into a
+    /// pane a send is mid-way through), and we pasted seconds ago. Same evidence
+    /// standard, different evidence available.
+    CollapsedPaste,
+}
+
+/// Does the FINAL frame — the one read after the retry loop gives up — PROVE
+/// the message was submitted?
+///
+/// `false` does not mean "not submitted". It means this frame did not prove it,
+/// and the durable JSONL record is the arbiter instead.
+///
+/// # This was `!matches!(frame, StillThereIdle)`, and that is a bug (AMUX-3870)
+///
+/// Negating ONE variant of FOUR sends the other three to Confirmed. Two belong
+/// there. The third is [`FrameRead::NoUi`], whose own doc says "NOT
+/// \"submitted\" (AC-271)" — so the variant documented as not-submitted was
+/// reported as submitted, at the very site the retry loop's own `NoUi` arm
+/// exists to prevent. That arm carries the incident: a schedule fired into a
+/// container that was still waking, send reported sent, `_run_schedule`
+/// recorded ok, and the worker never ran. Nine workers across three customer
+/// envs (amux-cloud, 2026-08-06). The loop refused to claim it; the
+/// fall-through claimed it anyway.
+///
+/// THE DEFECT IS THE SHAPE, NOT THE OVERSIGHT. AC-271 *added* `NoUi` to the
+/// enum, and a negative match silently absorbs every variant added after it is
+/// written — no compiler error, no test, and the new variant lands on whichever
+/// side the author of the negation never considered. Matching exhaustively is
+/// what makes the next addition fail to compile here so a human decides.
+pub(crate) fn final_frame_confirms(frame: FrameRead) -> bool {
+    match frame {
+        // The composer is drawn and no longer holds our text: it went in.
+        FrameRead::Cleared => true,
+        // Still in the box while the lane generates. That is queued input and
+        // the turn boundary submits it, so Confirmed is right.
+        FrameRead::StillThereGenerating => true,
+        // We cannot read our own message back, so the frame proves nothing in
+        // either direction. Defer to the durable record.
+        FrameRead::NoUi => false,
+        // Sitting in an idle composer: nothing is going to submit it.
+        FrameRead::StillThereIdle => false,
+        // A collapsed paste is something UNSUBMITTED in a painted composer.
+        // Never a confirmation, whatever else is done about it.
+        FrameRead::CollapsedPaste => false,
+    }
 }
 
 pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
@@ -4460,6 +4871,33 @@ pub(crate) fn read_frame(raw: &str, tail_sq: &str) -> FrameRead {
     // manager): we cannot read our own message back, so we assert nothing.
     if matches!(state, ComposerState::NotVisible | ComposerState::BackgroundManager) {
         return FrameRead::NoUi;
+    }
+    // A COLLAPSED PASTE HIDES OUR OWN MESSAGE (AMUX-3876).
+    //
+    // Claude Code renders a large or multi-line paste as `[Pasted text #54 +8
+    // lines]`. The real text is not in the frame, so the `contains(tail_sq)`
+    // test below cannot find it and falls to `Cleared` — which means SUBMITTED.
+    // The message is sitting in the box, and the sender is told it went.
+    //
+    // Live specimen: paid-social -> gtm-playbooks at 13:15:41, recorded
+    // `submit_verdict = confirmed`, and the lane still held
+    // `[Pastedtext#54+8lines]` unsubmitted fifty minutes later. Not rare by
+    // construction either: `must_paste` chooses this path whenever the lane is
+    // generating OR the text is over 400 chars, which is most inter-worker
+    // traffic.
+    //
+    // `NoUi` is the honest verdict and its doc already says exactly this: "we
+    // cannot read our own message back, so we assert nothing". It routes to the
+    // durable JSONL check (AMUX-3870), which CAN tell a landed message from a
+    // stranded one, instead of guessing from a frame that is hiding the answer.
+    //
+    // Deliberately not `StillThereIdle`: that asserts the text IS ours, and the
+    // TUI has hidden the content that would prove it. `ghost_rescue` reaches the
+    // same conclusion from the other side and refuses to submit on a guess —
+    // this is the same refusal, one layer earlier, where it can still be
+    // reported to the sender rather than only logged.
+    if state.typed().is_some_and(crate::runtime_jobs::ghost_rescue::is_collapsed_paste) {
+        return FrameRead::CollapsedPaste;
     }
     // Only REAL input counts as "still there". A dim suggestion that happens to
     // repeat our text is not our message sitting unsent — and treating it as
@@ -4650,8 +5088,25 @@ async fn verify_submitted(
             // ran — 9 workers across 3 customer envs.
             FrameRead::NoUi => {
                 no_ui_looks += 1;
+                // THE 12 IS UNREACHABLE AND THE COMMENT OVERSTATED THE GRACE
+                // (AMUX-3870). `continue` goes back to `for _ in 0..5`, so each
+                // NoUi look SPENDS an iteration and this counter can never pass
+                // 5. The branch below it is dead code, and the real cold-start
+                // window is ~3s (300ms at the loop top plus 300ms here, five
+                // times) rather than the ~4s more this line used to claim on top
+                // of the loop's own.
+                //
+                // Left at 12 deliberately rather than "corrected" to 5: the
+                // number a reader should see is the one the author INTENDED,
+                // and lowering it would encode the cap as the design. Whether
+                // to actually give a cold Claude Code its 12 looks is a timing
+                // change on every send in the fleet and wants its own
+                // measurement, so it stays on the card and not in this fix.
+                //
+                // What made it dangerous was never the short window; it was
+                // what waited at the end of it. That is fixed below: falling
+                // out of this loop no longer reports NoUi as submitted.
                 if no_ui_looks <= 12 {
-                    // ~4s more; a cold Claude Code needs it
                     sleep_ms(300).await;
                     continue;
                 }
@@ -4676,6 +5131,18 @@ async fn verify_submitted(
             // interrupt).
             FrameRead::StillThereGenerating => return (Submission::Confirmed, retried),
             FrameRead::StillThereIdle => {}
+            // TREATED AS "still there", because it IS (AMUX-3880). The composer
+            // is painted and holding something unsubmitted; the text is merely
+            // hidden behind the TUI's chip. Falling through here is the whole
+            // fix: the Escape+Enter retry lives below, and the previous
+            // `NoUi` mapping waited instead of reaching it, so a pasted message
+            // was correctly reported stuck and then left in the box.
+            //
+            // Ownership is provable at THIS site and only at this site: the
+            // send lock is held from paste through verify, and we pasted
+            // seconds ago. `ghost_rescue` cannot make that claim and correctly
+            // does not try.
+            FrameRead::CollapsedPaste => {}
         }
         cleared_once = false;
         // ONE stuck look is not proof either: for ~1s after a successful submit
@@ -4724,11 +5191,16 @@ async fn verify_submitted(
         stuck_looks = 0;
     }
     let raw = tmux_capture(name, 25).await;
-    if !matches!(read_frame(&raw, &tail_sq), FrameRead::StillThereIdle) {
+    if final_frame_confirms(read_frame(&raw, &tail_sq)) {
         return (Submission::Confirmed, retried);
     }
     // Last resort before reporting a failure (which makes callers re-send):
     // trust the durable JSONL record over a possibly-torn final frame.
+    //
+    // This is also why routing `NoUi` here is safe rather than merely stricter.
+    // A re-send now happens only when the message is genuinely absent from the
+    // durable record, which is precisely when re-sending is the right move; the
+    // old path traded that for a silent drop.
     if sent_at > 0.0 && jsonl_user_msg_since(name, text, sent_at) {
         (Submission::Confirmed, retried)
     } else {
@@ -7456,7 +7928,11 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
         }));
     }
 
-    j200(json!({
+    // AF-320. `healthy: true` over zero rows is the dangerous reading here: a
+    // sweep reads that one boolean, and an empty fleet and an unlistable one
+    // both produce it. n_considered is the lanes actually examined.
+    j200(crate::api::measured::measured(
+        json!({
         "checked_at": now,
         "stale_s": stale_s,
         // Panes named amux-* that amux does not manage (no session env file).
@@ -7475,7 +7951,9 @@ pub async fn debug_logs(RawQuery(q): RawQuery) -> Response {
         // The whole point of the endpoint: a sweep reads this one boolean.
         "healthy": stale == 0 && unpiped == 0,
         "sessions": rows,
-    }))
+        }),
+        rows.len(),
+    ))
 }
 
 fn mark_pending_log_reload(name: &str, reason: &str) {
@@ -7983,6 +8461,25 @@ fn list_session_transcripts(name: &str) -> Vec<Value> {
 const MEM_MARKER: &str = "<!-- amux:session-memory -->";
 const MEM_TOPIC_FILE: &str = "amux-api.md";
 
+/// The roster's preamble and table header, split out of `fleet_roster` so a test
+/// can read it without a live fleet on disk (ethos rule 7 — `fleet_roster()`
+/// returns an empty string when no peers exist, so a test that only called it
+/// would pass on an empty machine while asserting nothing).
+///
+/// EVERY LINE HERE STARTS AT COLUMN 0 IN THE OUTPUT. Rust keeps a plain
+/// multi-line literal's indentation, so each source line ends with a `\`
+/// continuation. Without it the leading spaces are baked into the value, and
+/// this string is written into every worker's MEMORY.md: the two prose lines
+/// shipped indented by nine spaces, and so did the table HEADER, which in
+/// markdown is an indented code block and breaks the table it heads (AMUX-3810).
+const FLEET_ROSTER_HEADER: &str = "\n## Fleet — who else is running (auto-generated, do not edit)\n\n\
+     Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
+     this directory, so it cannot omit the reader. You are the one whose name matches \
+     $AMUX_SESSION.\n\n\
+     Reach any of them with `amux send <name> --stdin` (origin-stamped). Peek before \
+     interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n\
+     | worker | groups | description |\n|---|---|---|\n";
+
 /// The fleet roster every worker gets, regenerated on each write.
 ///
 /// Ethan: "make sure all workers are always aware of each others: name, groups,
@@ -8047,11 +8544,7 @@ fn fleet_roster() -> String {
     if rows.is_empty() {
         return String::new();
     }
-    let mut out = String::from(
-        "\n## Fleet — who else is running (auto-generated, do not edit)\n\n         Every live worker is listed, INCLUDING YOU — this file is shared by every lane in \
-this directory, so it cannot omit the reader. You are the one whose name matches $AMUX_SESSION.\n\n\
-Reach any of them with `amux send <name> --stdin` (origin-stamped).          Peek before interrupting: `curl -sk $AMUX_URL/api/sessions/<name>/peek?lines=200`.\n\n         | worker | groups | description |\n|---|---|---|\n",
-    );
+    let mut out = String::from(FLEET_ROSTER_HEADER);
     for (n, g, d) in rows.iter().take(120) {
         let d = d.replace('|', "\\|").chars().take(110).collect::<String>();
         out.push_str(&format!("| `{n}` | {} | {} |\n", if g.is_empty() { "—" } else { g }, if d.is_empty() { "—" } else { &d }));
@@ -8117,11 +8610,71 @@ fn compose_worker_block(name: &str, session_content: &str) -> String {
         return String::new();
     }
     format!(
-        "## Worker memory — `{name}`\n\n         <!-- Written by the {name} lane. If you are not {name}, this is a peer's \
+        "## Worker memory — `{name}`\n\n\
+         <!-- Written by the {name} lane. If you are not {name}, this is a peer's \
          memory: useful context, not your own notes. Your own is at \
          ~/.amux/memory/<your-worker>.md and reaches this file when you write it. -->\n\n{}",
         session_content.trim()
     )
+}
+
+/// The composed MEMORY.md text, separated from writing it (AF-296).
+///
+/// Extracted so the composition is testable WITHOUT touching real data.
+/// `claude_home()` reads `$HOME`, which the test harness does not redirect (only
+/// `AMUX_HOME`), so a test that called `write_claude_memory` would overwrite the
+/// developer's own `~/.claude/.../MEMORY.md`. Everything this function reads is
+/// rooted at `AMUX_HOME`, so it is safe to exercise directly.
+fn compose_memory_doc(name: &str, global_content: &str, session_content: &str) -> String {
+    let mut parts = Vec::new();
+    // RULES FIRST (AF-297). Binding constraints buried under prose are
+    // constraints the model has to go looking for, which is the python call
+    // site's own reason for this ordering.
+    let rules = compose_rules_block(name);
+    if !rules.is_empty() {
+        parts.push(rules);
+    }
+    if !global_content.trim().is_empty() {
+        parts.push(format!(
+            "- [amux inter-session API]({MEM_TOPIC_FILE}) — \
+             sessions/peek/send, board, notes, CRM, browser, Drive. Read it when you \
+             need the call shapes; it is also in ~/.claude/CLAUDE.md."
+        ));
+    }
+    parts.push(MEM_MARKER.to_string());
+    // GROUP MEMORY, between global and worker (AF-296).
+    //
+    // `/api/scope` advertises `memory` at [global, group, worker] and the scope
+    // UI writes all three, but this composer read only two — so a group-level
+    // write saved `memory/tags/<group>.md` and nothing ever consulted it. The
+    // setting appeared to save and changed nothing, which is ethos rule 1's
+    // exact shape and the SAME defect the docstring on `scope_env_layers`
+    // records for env. env was fixed; memory was not.
+    //
+    // Groups come from `lane_groups`, the same CC_TAGS source `scope_env_layers`
+    // uses, rather than a second spelling. BTreeSet gives a stable order, so a
+    // lane in two groups composes the same way on every write.
+    //
+    // A lane with no groups, or whose group files do not exist, appends NOTHING
+    // and the output is byte-identical to before this change. That is what makes
+    // a fleet-wide composition change safe to land: today no `memory/tags/`
+    // directory exists at all, so this is inert until someone uses the level.
+    for g in lane_groups(name) {
+        let gf = memory_dir().join("tags").join(format!("{g}.md"));
+        let gc = std::fs::read_to_string(&gf).unwrap_or_default();
+        if !gc.trim().is_empty() {
+            parts.push(format!(
+                "## Group memory — `{g}`\n\n                 <!-- Written at the GROUP level in the scope UI. It reaches every lane \
+                 tagged `{g}`, so it is shared context rather than any one lane's notes. -->\n\n{}",
+                gc.trim()
+            ));
+        }
+    }
+    let worker_block = compose_worker_block(name, session_content);
+    if !worker_block.is_empty() {
+        parts.push(worker_block);
+    }
+    parts.join("\n\n") + "\n"
 }
 
 fn write_claude_memory(name: &str, work_dir: &str) {
@@ -8132,20 +8685,7 @@ fn write_claude_memory(name: &str, work_dir: &str) {
     let global_content = std::fs::read_to_string(&global_file).unwrap_or_default();
     let session_content = std::fs::read_to_string(&session_file).unwrap_or_default();
 
-    let mut parts = Vec::new();
-    if !global_content.trim().is_empty() {
-        parts.push(format!(
-            "- [amux inter-session API]({MEM_TOPIC_FILE}) — \
-             sessions/peek/send, board, notes, CRM, browser, Drive. Read it when you \
-             need the call shapes; it is also in ~/.claude/CLAUDE.md."
-        ));
-    }
-    parts.push(MEM_MARKER.to_string());
-    let worker_block = compose_worker_block(name, &session_content);
-    if !worker_block.is_empty() {
-        parts.push(worker_block);
-    }
-    let composed = parts.join("\n\n") + "\n";
+    let composed = compose_memory_doc(name, &global_content, &session_content);
 
     let claude_mem_dir = claude_home().join("projects").join(&pname).join("memory");
     let claude_mem_file = claude_mem_dir.join("MEMORY.md");
@@ -8473,6 +9013,47 @@ pub(crate) async fn lane_block_reason(name: &str) -> Option<&'static str> {
     lane_block_reason_from(env_exists, archived, running, rate_limited)
 }
 
+/// When this lane's rate limit lifts, or 0 if unknown (AMUX-3815).
+///
+/// The companion to [`lane_block_reason`]'s `rate-limited`, kept separate
+/// because that predicate returns a `&'static str` by design — one shared
+/// answer, no per-lane text. This is the WHEN, and it is deliberately NOT part
+/// of the block decision: the sweep's presence-based `rate_limited_since` is
+/// what says the lane is limited RIGHT NOW, and gating delivery on a clock
+/// instead would resurrect the bug the presence-based clear fixed.
+///
+/// 0 means "no reset time known", never "resets at the epoch". A credit cap has
+/// no clock at all, so a caller that reads 0 as a past time would treat every
+/// capped lane as overdue.
+/// WHICH kind of limit this lane is under: `"menu"` (the usage-limit selector,
+/// which carries a reset time), `"credit-banner"` (a credit cap, which has none),
+/// or `""` when unknown (MC-1458).
+///
+/// [`lane_rate_limit_reset`] returning 0 cannot answer this and never could. A
+/// zero there means "no reset time known", and the two ways to arrive at it want
+/// OPPOSITE responses: a cap has no clock to read and there is nothing to fix,
+/// while a menu does have one and a zero means the parse failed. The steering
+/// detector was asserting the second about every instance of the first, which is
+/// a false lead pointed at real code (`parse_rate_limit_reset`).
+///
+/// EMPTY IS "UNKNOWN", NOT "CAP". A lane stamped before this field existed, or
+/// one whose meta predates the current sweep, has no value here, and a reader
+/// that defaults it to either kind manufactures the certainty this exists to
+/// remove.
+pub(crate) fn lane_rate_limit_kind(name: &str) -> String {
+    if !env_path(name).exists() {
+        return String::new();
+    }
+    meta_str(&load_meta(name), "rate_limited_by")
+}
+
+pub(crate) fn lane_rate_limit_reset(name: &str) -> i64 {
+    if !env_path(name).exists() {
+        return 0;
+    }
+    meta_i64(&load_meta(name), "rate_limited_until")
+}
+
 /// The sentence a sender gets. It states what will HAPPEN, not merely what is
 /// wrong: "queued" on its own is the string that manufactured the false belief,
 /// and replacing it with a bare reason code would leave the sender to guess
@@ -8646,11 +9227,40 @@ pub(crate) fn steer_dead_letter_s() -> f64 {
 /// for 6.5h and every queued row delivered on restart, and no age threshold
 /// can tell that outage from a dead lane.
 pub(crate) fn steer_dead_letter_verdict(reason: &str, age_s: f64) -> Option<&'static str> {
+    if !reason_is_reapable(reason) {
+        return None;
+    }
+    if age_s <= steer_dead_letter_s() {
+        return None;
+    }
     match reason {
-        "no-env-file" if age_s > steer_dead_letter_s() => Some("no-env-file"),
-        "archived" if age_s > steer_dead_letter_s() => Some("archived"),
+        "no-env-file" => Some("no-env-file"),
+        "archived" => Some("archived"),
         _ => None,
     }
+}
+
+/// Which block reasons the reaper will EVER act on, regardless of age.
+///
+/// Split out because the reaper is not the only consumer (AMUX-3814): the
+/// `queue.has_live_consumer` invariant reports a row as "PAST the dead-letter
+/// deadline and the reaper did not reap it", and it was computing reapability
+/// on its own by treating every reason except `not-running` as permanent. That
+/// swept in `rate-limited`, which the reaper deliberately never reaps, so the
+/// invariant went red for 56 evaluations over 8 days on a lane doing exactly
+/// what it should — waiting out a limit that lifts by itself.
+///
+/// That is ethos rule 1, and this function's own docstring had already named
+/// the shape: AMUX-3473 fixed the same view/predicate split for a different
+/// reason and enumerated rather than shared, so the next reason re-broke it.
+/// One list, two consumers.
+///
+/// PERMANENT ONLY. `not-running` cannot be told from a 6.5h outage by age (the
+/// 2026-08-19 panic: 41 registered lanes down, every queued row delivered on
+/// restart), and `rate-limited` lifts on a clock Claude publishes in its own
+/// banner (AMUX-3815).
+pub(crate) fn reason_is_reapable(reason: &str) -> bool {
+    matches!(reason, "no-env-file" | "archived")
 }
 
 /// THE DELIVERY DECISION (AMUX-2642). Pure, so the case that matters — a lane
@@ -9153,10 +9763,18 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                                 ensure_fleet_tables(conn)?;
                                 let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                                // OUTCOME IS NOT OPTIONAL ON A VOID PATH (AMUX-3919).
+                                // This row is a message that was deliberately NOT
+                                // delivered, and it used to write no outcome at all —
+                                // so the one row where the column carries the most
+                                // information was the row that left it NULL, reading
+                                // identically to a delivered message whose outcome
+                                // simply went unrecorded. Every NULL written by the
+                                // live code path on 2026-08-30 was one of these.
                                 conn.execute(
-                                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                                     VALUES(?,?,?,?,?,?,?)",
-                                    rusqlite::params![id2, sess2, hist_text, queued_at, now, src_guard, src_sender],
+                                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                                     VALUES(?,?,?,?,?,?,?,?)",
+                                    rusqlite::params![id2, sess2, hist_text, queued_at, now, "void:pickup-stale", src_guard, src_sender],
                                 )?;
                                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
                             })
@@ -9333,15 +9951,20 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                         ensure_fleet_tables(conn)?;
                         let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
+                        // Same as the pickup-stale void above (AMUX-3919): a
+                        // deliberately undelivered message must say so in the
+                        // column, not only in the text prefix. `[VOIDED: ...]` in
+                        // the body is prose; `outcome` is what a query can group by.
                         conn.execute(
-                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                             VALUES(?,?,?,?,?,?,?)",
+                            "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                             VALUES(?,?,?,?,?,?,?,?)",
                             rusqlite::params![
                                 id2,
                                 sess2,
                                 format!("[VOIDED: picker gone] {}", redact_secrets(&text2)),
                                 queued_at,
                                 now_f64(),
+                                "void:picker-gone",
                                 src_guard,
                                 src_sender
                             ],
@@ -9390,6 +10013,24 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
         }
         // Delivered — move the row to history under the SAME contract the
         // manual deliver path uses (redacted text, queued_at preserved).
+        // COLUMN THE WRITERS FORGOT (Ethan, 2026-08-29: "why are you sending
+        // unsubmitted text?"). `outcome` has existed on this table since it was
+        // created and 5 of its 6 writers omitted it, so 10,957 of 10,989 rows
+        // carry a blank verdict. That is why nobody noticed a lane holding an
+        // unsubmitted message: amux does not record whether its own sends
+        // submitted, so it cannot count, alert on, or even answer the question.
+        // `msg` is already bound above (it is what the delivery log prints as
+        // `detail=`) — the value was in scope the whole time.
+        //
+        // SCOPE, precisely: this insert is reached only when `ok`, so what it
+        // captures is the DELIVERED outcomes, including
+        // "sent (Enter was dropped; submitted on retry)" — the leading
+        // indicator that a lane's keystroke path is failing. A HARD-stuck send
+        // returns ok=false, takes the `continue` above, and never reaches this
+        // table at all: its row stays in `steering_queue` and the only record
+        // is `skip()`, which writes DEBUG and an in-process map that a restart
+        // erases. That remaining hole is named on the card, not fixed here.
+        let outcome2 = msg.clone();
         let (id2, sess2, text2) = (id.clone(), session.clone(), text.clone());
         let _ = state
             .store
@@ -9405,9 +10046,9 @@ pub async fn steer_deliver_tick(state: &AppState) -> usize {
                 let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
                 conn.execute(
-                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                     VALUES(?,?,?,?,?,?,?)",
-                    rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), src_guard, src_sender],
+                    "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                     VALUES(?,?,?,?,?,?,?,?)",
+                    rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), outcome2, src_guard, src_sender],
                 )?;
                 Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
             })
@@ -9530,6 +10171,34 @@ fn steer_skips() -> &'static std::sync::Mutex<BTreeMap<String, SkipRecord>> {
     static M: std::sync::OnceLock<std::sync::Mutex<BTreeMap<String, SkipRecord>>> =
         std::sync::OnceLock::new();
     M.get_or_init(|| std::sync::Mutex::new(BTreeMap::new()))
+}
+
+/// Per-lane `(last_skip_reason, seconds_since_that_skip)` for the autofix
+/// detector (AMUX-3927).
+///
+/// The drain loop already records WHY it last declined to deliver each lane's
+/// oldest row, and `/api/debug/steering` already publishes it. Nothing else
+/// read it, so every stall card ever filed omitted the one field that separates
+/// a HUNG DRAIN LOOP from a lane that is simply mid-turn. On the live
+/// mixpeek-studio lane it read "not-at-turn-boundary (within max age)" with an
+/// age of 2 seconds: the loop had evaluated that lane two seconds earlier and
+/// correctly deferred, while the card said the queue was stalled.
+///
+/// ABSENCE IS NOT EVIDENCE. This map is in-memory and empty after a restart —
+/// which is exactly when someone reads it — so a missing entry means UNMEASURED,
+/// never "the loop is dead". Callers must distinguish those; the detector
+/// suppresses with `why_unmeasured` rather than filing.
+pub(crate) fn steer_skip_snapshot() -> BTreeMap<String, (String, f64)> {
+    let now = now_f64();
+    steer_skips()
+        .lock()
+        .map(|m| {
+            m.iter()
+                .filter(|(_, (_, _, at))| *at > 0.0)
+                .map(|(k, (_, reason, at))| (k.clone(), (reason.clone(), now - at)))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Has this exact stall already been LOGGED in this hour, for this lane and this
@@ -9750,14 +10419,30 @@ async fn warn_on_stalled_lanes(state: &AppState) {
 /// every 5 seconds for four hours looked exactly like a lane with nothing to do.
 async fn steering_debug(State(state): State<AppState>) -> Response {
     let rows: Vec<(String, f64, i64, String)> = {
+        // Both arms carry the AF-320 contract: an error body with no `lanes`
+        // key renders as "nothing is queued" in any tolerant reader, and the
+        // steer-queue age is a number other jobs subtract from.
         let Ok(conn) = state.store.read() else {
-            return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": "store unavailable"}));
+            return jresp(
+                StatusCode::SERVICE_UNAVAILABLE,
+                crate::api::measured::unmeasured(
+                    json!({"error": "store unavailable", "lanes": []}),
+                    "the store could not be opened, so the steering queue was never read",
+                ),
+            );
         };
         let Ok(mut stmt) = conn.prepare(
             "SELECT session, MIN(queued_at), COUNT(*), COALESCE(GROUP_CONCAT(DISTINCT sender),'') \
              FROM steering_queue GROUP BY session",
         ) else {
-            return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "query failed"}));
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::api::measured::unmeasured(
+                    json!({"error": "query failed", "lanes": []}),
+                    "steering_queue could not be queried — the schema is older than this \
+                     binary expects, so an empty `lanes` is unmeasured, not idle",
+                ),
+            );
         };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
             .map(|it| it.flatten().collect())
@@ -9777,6 +10462,14 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
         // reason at all. This one is computed on the spot from the same
         // predicate the deliverer uses.
         let blocked = lane_block_reason(&session).await;
+        // WHEN a `rate-limited` block lifts (AMUX-3815). Published beside the
+        // reason because this endpoint is what the stall card tells the reader
+        // to check, and the autofix detector now SUPPRESSES a card on a known
+        // future reset — a suppression whose input is invisible here would be
+        // indistinguishable from a detector that never ran. Null, never 0, when
+        // no time is known: a credit cap has no reset clock, and 0 would read
+        // as a reset in 1970.
+        let reset = lane_rate_limit_reset(&session);
         lanes.push(json!({
             "session": session,
             "queued": count,
@@ -9785,19 +10478,31 @@ async fn steering_debug(State(state): State<AppState>) -> Response {
             "overdue": now - oldest >= steer_max_age_s(),
             "deliverable": blocked.is_none(),
             "blocked_reason": blocked,
+            "rate_limit_resets_at": if reset > 0 { json!(reset) } else { Value::Null },
+            "rate_limit_resets_local": if reset > 0 {
+                json!(crate::api::request_log::local_when(reset as f64))
+            } else {
+                Value::Null
+            },
             "senders": senders.split(',').map(str::trim).filter(|s| !s.is_empty()).collect::<Vec<_>>(),
             "last_skip_id": last_id,
             "last_skip_reason": reason,
             "last_skip_age_s": if at > 0.0 { json!((now - at) as i64) } else { Value::Null },
         }));
     }
-    j200(json!({
+    // AF-320: an empty `lanes` means either nothing is queued anywhere or the
+    // queue was never read, and the steer-queue age is exactly the number other
+    // jobs subtract from.
+    j200(crate::api::measured::measured(
+        json!({
         "lanes": lanes,
         "stall_warn_s": steer_stall_warn_s(),
         "max_age_s": steer_max_age_s(),
         "max_age_env": "AMUX_STEER_MAX_AGE_S",
         "note": "last_skip_* is in-memory and resets when the server restarts; queued/oldest_age_s are durable",
-    }))
+        }),
+        lanes.len(),
+    ))
 }
 
 /// Deliver the oldest queued steering message for ONE specific session.
@@ -9862,6 +10567,24 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
     }
     let Some((msg, age)) = sent else { return false };
     steer_skips().lock().unwrap().remove(session);
+    // COLUMN THE WRITERS FORGOT (Ethan, 2026-08-29: "why are you sending
+    // unsubmitted text?"). `outcome` has existed on this table since it was
+    // created and 5 of its 6 writers omitted it, so 10,957 of 10,989 rows
+    // carry a blank verdict. That is why nobody noticed a lane holding an
+    // unsubmitted message: amux does not record whether its own sends
+    // submitted, so it cannot count, alert on, or even answer the question.
+        // `msg` is already bound above (it is what the delivery log prints as
+    // `detail=`) — the value was in scope the whole time.
+    //
+    // SCOPE, precisely: this insert is reached only when `ok`, so what it
+    // captures is the DELIVERED outcomes, including
+    // "sent (Enter was dropped; submitted on retry)" — the leading
+    // indicator that a lane's keystroke path is failing. A HARD-stuck send
+    // returns ok=false, takes the `continue` above, and never reaches this
+    // table at all: its row stays in `steering_queue` and the only record
+    // is `skip()`, which writes DEBUG and an in-process map that a restart
+    // erases. That remaining hole is named on the card, not fixed here.
+    let outcome2 = msg.clone();
     let (id2, sess2, text2) = (id.clone(), session_s.clone(), text.clone());
     let _ = state
         .store
@@ -9877,9 +10600,9 @@ pub async fn steer_deliver_for_session(state: &AppState, session: &str) -> bool 
             let (src_guard, src_sender) = steer_row_source(conn, &id2);
                 conn.execute("DELETE FROM steering_queue WHERE id=?", [&id2])?;
             conn.execute(
-                "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                 VALUES(?,?,?,?,?,?,?)",
-                rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), src_guard, src_sender],
+                "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                 VALUES(?,?,?,?,?,?,?,?)",
+                rusqlite::params![id2, sess2, redact_secrets(&text2), queued_at, now_f64(), outcome2, src_guard, src_sender],
             )?;
             Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
         })
@@ -10197,11 +10920,50 @@ async fn rate_limit_sweep(state: &AppState) -> usize {
             // Presence-based, and both signals are footer/menu-scoped, so scrollback
             // ABOUT limits never flags and a lane clears as soon as its banner goes.
             if meta_i64(&load_meta(name), "rate_limited_since") > 0 {
-                update_meta(name, &[("rate_limited_since", json!(0))]);
+                // Clear the reset time with the flag it qualifies. A stale
+                // `rate_limited_until` beside a cleared `since` is a lane that
+                // reads as "limited until 8:30pm" while it is already working.
+                update_meta(
+                    name,
+                    &[
+                        ("rate_limited_since", json!(0)),
+                        ("rate_limited_until", json!(0)),
+                        ("rate_limited_by", json!("")),
+                    ],
+                );
             }
             continue;
         }
         found += 1;
+        // WHEN it lifts, from the banner the check above already matched
+        // (AMUX-3815). Re-read every tick, not only on first detection: Claude
+        // rewrites the line when the window moves, and a reset time that cannot
+        // be refreshed is worse than none once it goes stale. `None` stays 0 —
+        // a credit cap has no reset clock, and callers must be able to tell
+        // "no reset time" from "resets at the epoch".
+        let reset = parse_rate_limit_reset(&footer).unwrap_or(0);
+        if meta_i64(&load_meta(name), "rate_limited_until") != reset {
+            update_meta(name, &[("rate_limited_until", json!(reset))]);
+        }
+        // WHICH KIND OF LIMIT, PERSISTED (MC-1458). This loop already knows:
+        // `menu` is the usage-limit selector, which CARRIES a reset time, and
+        // the credit banner is a cap that has none. Until now that fact went
+        // only into the `session.rate_limited` event payload as `detected_by`
+        // and was dropped, so every downstream reader saw the same
+        // `rate_limited_until = 0` for both and could not tell "no clock exists"
+        // from "a clock exists and amux failed to read it".
+        //
+        // The cost was a card that pointed at real code on evidence that cannot
+        // indicate the fault: the steering silent-detector told readers a zero
+        // meant "the banner wording changed and `parse_rate_limit_reset` needs
+        // it", which is true only in the menu case and wrong in the far more
+        // common cap case. Written on EVERY tick, not only on first detection,
+        // because a lane can move from a cap to a session limit without the
+        // stamp clearing in between.
+        let kind = if menu { "menu" } else { "credit-banner" };
+        if meta_str(&load_meta(name), "rate_limited_by") != kind {
+            update_meta(name, &[("rate_limited_by", json!(kind))]);
+        }
         if meta_i64(&load_meta(name), "rate_limited_since") == 0 {
             update_meta(
                 name,
@@ -10292,7 +11054,21 @@ pub fn routes() -> Router<AppState> {
         // reaches machines that reinstall, while the route fixes every already
         // installed copy at once (ethos rule 1 — capability has to actually
         // reach everyone, not just exist).
-        .route("/api/workers/{name}/{*verb}", any(session_verb_handler))
+        // /api/workers/{name}/{*verb} RETIRED 2026-08-28 (AF-204). Kept in
+        // history rather than silently dropped, because the reason it existed is
+        // still true: the INSTALLED `amux send` posts to /api/workers/<n>/send,
+        // and after the python cutover that 405'd and the CLI fell back to raw
+        // tmux keystrokes — unstamped, unaudited, two long messages confirmed
+        // lost the same afternoon. That is why send was PROMOTED (AF-202) rather
+        // than left to a wildcard. Every verb any caller reaches by this spelling
+        // now has its own route in api/workers.rs; measured repo-wide before the
+        // deletion, they were peek, send, start, stop and dead-letters.
+        //
+        // The wildcard is what made the surface unable to answer "is this
+        // capability implemented": an unrouted verb returned whatever it returned
+        // instead of 404ing. Everything it used to serve is still reachable at
+        // /api/sessions/{name}/{verb} below — aliases.rs:82 exempts that path
+        // from the alias layer, so this deletion changes the SPELLING only.
         // Long prompts ride /send bodies; axum's 2MB default is Python's cap
         // too (none), so disable rather than invent one.
         .layer(axum::extract::DefaultBodyLimit::disable())
@@ -10647,7 +11423,11 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
     for r in &rows {
         *by_session.entry(r["session"].as_str().unwrap_or("").to_string()).or_insert(0) += 1;
     }
-    j200(json!({
+    // AF-320. `total: 0` reads as "no duplicates" whether the query ran or
+    // silently returned nothing; `unwrap_or_default()` above makes that a real
+    // path rather than a hypothetical one.
+    j200(crate::api::measured::measured(
+        json!({
         "hours": hours,
         "window_ms": DUP_DELIVERY_WINDOW_MS,
         "total": rows.len(),
@@ -10656,7 +11436,9 @@ async fn debug_duplicate_deliveries(State(state): State<AppState>, RawQuery(q): 
         "note": "a duplicate is the SAME text recorded twice for one lane inside window_ms. \
                  Deliveries are never suppressed on this signal — two identical sends can be \
                  deliberate, and dropping one would turn a visible annoyance into silent loss.",
-    }))
+        }),
+        rows.len(),
+    ))
 }
 
 fn qs_first<'a>(qs: &'a [(String, String)], key: &str, default: &'a str) -> &'a str {
@@ -10723,23 +11505,7 @@ async fn get_dispatch(
             )
             .await
         }
-        "peek" => {
-            let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
-            let live_only = qs_flag(qs, "live");
-            let no_trim = qs_flag(qs, "notrim");
-            // Geometry is attached HERE rather than inside peek_response because
-            // that function has six return points (live_only, alt-screen, normal,
-            // short-output, empty…) and a key added to one of them is a key the
-            // reader cannot rely on. One injection site covers every shape.
-            let mut resp = peek_response(name, lines, live_only, no_trim).await;
-            if let (Some((cols, rows)), Some(obj)) =
-                (tmux_pane_geometry(name).await, resp.as_object_mut())
-            {
-                obj.insert("pane_cols".into(), json!(cols));
-                obj.insert("pane_rows".into(), json!(rows));
-            }
-            j200(resp)
-        }
+        "peek" => peek_verb(name, qs).await,
         "transcript" => {
             // Codex/Ollama run a native TUI whose raw mirror is what Ethan saw
             // looked nothing like Claude (AMUX-3201). They also write a
@@ -10851,38 +11617,9 @@ async fn get_dispatch(
                 "raw": std::fs::read_to_string(env_path(name)).unwrap_or_default(),
             }))
         }
-        "instructions" => j200(json!({
-            "name": name,
-            "instructions": meta_str(&load_meta(name), "instructions").trim(),
-        })),
-        "dirty" => {
-            let wd = session_work_dir(name);
-            let files = if wd.is_empty() { vec![] } else { session_dirty_files(name, &wd).await };
-            j200(json!({
-                "name": name,
-                "dirty": !files.is_empty(),
-                "count": files.len(),
-                "files": files.iter().take(50).collect::<Vec<_>>(),
-            }))
-        }
-        "commit-guard" => {
-            let cfg = parse_env(name);
-            let per = cfg.get_or("AMUX_COMMIT_GUARD_SESSION", "").trim().to_lowercase();
-            let global = !matches!(
-                std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            );
-            let override_v: Value = if per.is_empty() {
-                Value::Null
-            } else {
-                json!(!matches!(per.as_str(), "0" | "false" | "off" | "no"))
-            };
-            let enabled = match &override_v {
-                Value::Bool(b) => *b,
-                _ => global,
-            };
-            j200(json!({"name": name, "enabled": enabled, "global": global, "override": override_v}))
-        }
+        "instructions" => instructions_get_verb(name),
+        "dirty" => dirty_verb(name).await,
+        "commit-guard" => commit_guard_verb(name),
         "meta" => {
             // py:75162 — merged meta + env-derived fields.
             let cfg = parse_env(name);
@@ -10942,27 +11679,13 @@ async fn get_dispatch(
             }
             j200(json!({"transcripts": list_session_transcripts(name)}))
         }
-        "tracked-files" => {
-            let meta = load_meta(name);
-            j200(json!({"files": meta.get("tracked_files").cloned().unwrap_or(json!([]))}))
-        }
+        "tracked-files" => tracked_files_verb(name),
         "stats" => {
             let cfg = parse_env(name);
             j200(get_claude_stats(cfg.get_or("CC_DIR", "")))
         }
         "git" => git_get(name, subid, qs).await,
-        "memory" => {
-            let mf = mem_file(name);
-            let content = std::fs::read_to_string(&mf).unwrap_or_default();
-            let wd = session_work_dir(name);
-            j200(json!({
-                "content": content,
-                "path": mf.to_string_lossy(),
-                "work_dir": wd,
-                "claude_project": if wd.is_empty() { String::new() } else { project_name(&wd) },
-                "shared_with": memory_shared_with(name),
-            }))
-        }
+        "memory" => memory_get_verb(name),
         "memory-inherited" => {
             let wd = session_work_dir(name);
             let names: Vec<String> = qs_first(qs, "file", "")
@@ -11028,72 +11751,26 @@ async fn get_dispatch(
             };
             jresp(status, Value::Object(out))
         }
-        "steer" => {
-            let conn = match state.store.read() {
-                Ok(c) => c,
-                Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
-            };
-            if qs_first(qs, "history", "0") == "1" {
-                let mut out = vec![];
-                if let Ok(mut stmt) = conn.prepare(
-                    "SELECT id, text, queued_at, delivered_at FROM steering_history \
-                     WHERE session=? ORDER BY delivered_at DESC LIMIT 100",
-                ) {
-                    if let Ok(rows) = stmt.query_map([name], |r| {
-                        Ok(json!({
-                            "id": r.get::<_, String>(0)?,
-                            "text": r.get::<_, String>(1)?,
-                            "queued_at": r.get::<_, Option<f64>>(2)?,
-                            "delivered_at": r.get::<_, f64>(3)?,
-                        }))
-                    }) {
-                        out = rows.flatten().collect();
-                    }
-                }
-                return j200(json!(out));
-            }
-            let mut out: Vec<Value> = vec![];
-            if let Ok(mut stmt) = conn.prepare(
-                "SELECT id, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') FROM steering_queue \
-                 WHERE session=? ORDER BY queued_at ASC",
-            ) {
-                if let Ok(rows) = stmt.query_map([name], |r| {
-                    Ok(json!({
-                        "id": r.get::<_, String>(0)?,
-                        "text": r.get::<_, String>(1)?,
-                        "queued_at": r.get::<_, f64>(2)?,
-                        "guard": r.get::<_, String>(3)?,
-                        "sender": r.get::<_, String>(4)?,
-                    }))
-                }) {
-                    out = rows.flatten().collect();
-                }
-            }
-            drop(conn);
-            // AGE AND REACHABILITY PER ROW (AMUX-2785). A queue listing that
-            // shows only text and a timestamp cannot answer the one question a
-            // sender staring at it has — "is this coming, or is it stuck?" —
-            // and the caller cannot compute it, because whether the lane can
-            // receive at all is not in the row. Same predicate as the drain
-            // loop, so the list cannot claim what the loop will not do.
-            let blocked = lane_block_reason(name).await;
-            let max_age = steer_max_age_s();
-            let now = now_f64();
-            for row in out.iter_mut() {
-                let age = now - row["queued_at"].as_f64().unwrap_or(now);
-                row["age_s"] = json!(age as i64);
-                row["overdue"] = json!(age >= max_age);
-                row["deliverable"] = json!(blocked.is_none());
-                row["blocked_reason"] = json!(blocked);
-            }
-            j200(json!(out))
-        }
-        "env-explain" | "memory-explain" => jresp(
+        "steer" => steer_history_verb(state, name, qs).await,
+        "env-explain" => env_explain_verb(name, qs),
+        // STILL 501, and now for a REASON rather than a port gap. `memory` and
+        // `rules` are advertised at [global, group, worker] and the scope UI
+        // writes all three, but `write_claude_memory` composes only global +
+        // worker: `memory/tags/<group>.md` is written by scope and read by
+        // nothing (AF-296). An explain built today would have to report that
+        // one of the three advertised levels is inert, which is a defect
+        // report, not an explanation. Fix the composition, then explain what
+        // actually happens.
+        "memory-explain" => jresp(
             StatusCode::NOT_IMPLEMENTED,
             json!({
-                "error": format!("{action} is not ported to the rust origin yet"),
-                "python_source": "amux-server.py:74901 (env-explain) / 74957 (memory-explain)",
-                "note": "layered env/memory composition is a named residual gap in api/session_verbs.rs",
+                "error": "memory-explain is not implemented",
+                "why": "the composition it would explain is itself incomplete: group-level \
+                        memory is written by /api/scope and read by no consumer (AF-296)",
+                "meanwhile": format!("GET /api/sessions/{name}/memory-inherited shows the \
+                                      CLAUDE.md inheritance, which is a DIFFERENT layering \
+                                      (loaded by Claude Code, not composed by amux)"),
+                "card": "AF-296",
             }),
         ),
         _ => not_found(),
@@ -11197,7 +11874,7 @@ fn log_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
 /// GET git (+ commits / commit-detail / diff), py:75277-75361. The
 /// _install_amux_commit_hook side effect is not ported (Python still owns
 /// hook installation during coexistence).
-async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
+pub(crate) async fn git_get(name: &str, subid: &str, qs: &[(String, String)]) -> Response {
     let wd = session_work_dir(name);
     match subid {
         "commits" => {
@@ -11402,6 +12079,63 @@ impl ConvAdopt {
 /// So the cross-link refusal is kept, and it is LOUD. A reported id that another
 /// lane's meta already claims is the one shape that cannot be a benign restart,
 /// and silently dropping it would leave the lane blind with no trace of why.
+/// How long a conversation claim survives without its OWNER re-confirming it.
+///
+/// A live lane's hooks report their conversation id every few seconds, so this
+/// window is hundreds of missed reports, not a couple.
+fn conv_claim_stale_s() -> i64 {
+    std::env::var("AMUX_CONV_CLAIM_STALE_S")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(1800)
+}
+
+/// What to do about a claim another lane holds on the id we were just handed.
+///
+/// PURE ON PURPOSE (AMUX-3897). The effectful version reads and writes meta
+/// files under the real `~/.amux`, and the property under test is the DECISION.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ConvClaim {
+    /// The owner confirmed recently. Their claim stands; stay blind.
+    Refuse,
+    /// The claim predates confirmation tracking, so its age is unknown. Start
+    /// the clock and refuse THIS time. A live owner re-confirms within seconds
+    /// and never ages out; a dead one ages out exactly once.
+    StampAndRefuse,
+    /// The owner has not re-confirmed for a full window. Take it.
+    Takeover,
+}
+
+/// `confirmed_at` is the last time the OWNER itself reported this id.
+///
+/// AMUX-3897. The refusal this gates is correct and had no expiry: a lane that
+/// restarts onto a different conversation keeps holding the old id, and the
+/// lane actually running that conversation can never take it. Measured live on
+/// 2026-08-30: `desktop` went idle on 08-28 still holding
+/// 15819f9b-aaf6-46fb-889d-175a8e134a4d, and `ts-gke` — whose hooks report that
+/// id every ~5s because it is genuinely ts-gke's conversation — was refused 205
+/// times and stayed blind to the staged guard throughout.
+///
+/// The card proposed keying staleness on "the claimant STARTED after the claim
+/// was stamped", and correctly declined to ship it: a RESUMED lane keeps its id
+/// across a restart, so that test cannot tell an abandoned claim from a resumed
+/// one, and two live lanes could ping-pong an id against a mechanism whose own
+/// doc says cross-linking is worse than blindness.
+///
+/// Confirmation time does not have that failure. A resumed lane reports the id
+/// it still holds, which refreshes the stamp, so it never goes stale and the
+/// ping-pong cannot start. Only a lane that has STOPPED reporting an id ages
+/// out of it, which is the actual condition being detected.
+pub(crate) fn conv_claim_verdict(confirmed_at: i64, now: i64, window_s: i64) -> ConvClaim {
+    if confirmed_at <= 0 {
+        return ConvClaim::StampAndRefuse;
+    }
+    if now - confirmed_at >= window_s {
+        return ConvClaim::Takeover;
+    }
+    ConvClaim::Refuse
+}
+
 pub(crate) fn adopt_reported_conv_id(name: &str, reported: &str) -> ConvAdopt {
     let reported = reported.trim();
     // A transcript stem is a UUID. Anything else is a caller mistake, not an id;
@@ -11413,23 +12147,75 @@ pub(crate) fn adopt_reported_conv_id(name: &str, reported: &str) -> ConvAdopt {
     if !plausible {
         return ConvAdopt::Unchanged;
     }
-    let was = meta_str(&load_meta(name), "cc_conversation_id");
+    let meta = load_meta(name);
+    let was = meta_str(&meta, "cc_conversation_id");
     if was == reported {
+        // THE OWNER RE-CONFIRMING ITS OWN CLAIM (AMUX-3897). This path used to
+        // write nothing, which is why a claim had no age and therefore no way
+        // to expire. Throttled: a lane reports every few seconds and this is a
+        // file write, so refresh only once a minute. The staleness window is
+        // measured in tens of minutes, so a stamp up to 60s behind changes no
+        // verdict.
+        let now = crate::config::now_f64() as i64;
+        if now - meta_i64(&meta, "cc_conversation_confirmed_at") >= 60 {
+            update_meta(name, &[("cc_conversation_confirmed_at", json!(now))]);
+        }
         return ConvAdopt::Unchanged;
     }
     let owner = conversation_owned_by_other(reported, name);
     if !owner.is_empty() {
-        tracing::warn!(
-            target: "staged_guard",
-            "[conv-adopt/AMUX-2936] session={} reported conv_id={} but lane '{}' already claims \
-             it — REFUSED. Two lanes pointing at one conversation both resume it, and the \
-             staged guard would attribute one lane's edits to the other. '{}' stays blind \
-             until the conflict is resolved.",
-            name, reported, owner, name,
-        );
-        return ConvAdopt::Conflict { owner: owner.clone() };
+        let now = crate::config::now_f64() as i64;
+        let confirmed_at = meta_i64(&load_meta(&owner), "cc_conversation_confirmed_at");
+        match conv_claim_verdict(confirmed_at, now, conv_claim_stale_s()) {
+            ConvClaim::StampAndRefuse => {
+                // A claim from before confirmation tracking. Its age is unknown,
+                // and "unknown" must not read as "stale" — that would hand a
+                // live lane's conversation away on the first report after a
+                // deploy. Start the clock and refuse; a live owner refreshes it
+                // within seconds, a dead one ages out once.
+                update_meta(&owner, &[("cc_conversation_confirmed_at", json!(now))]);
+                tracing::warn!(
+                    target: "staged_guard",
+                    "[conv-adopt/AMUX-3897] session={} reported conv_id={} claimed by '{}', whose \
+                     claim predates confirmation tracking — clock started, REFUSED for now. If \
+                     '{}' is not really on that conversation this clears itself in {}s.",
+                    name, reported, owner, owner, conv_claim_stale_s(),
+                );
+                return ConvAdopt::Conflict { owner: owner.clone() };
+            }
+            ConvClaim::Takeover => {
+                tracing::warn!(
+                    target: "staged_guard",
+                    "[conv-adopt/AMUX-3897] TAKEOVER: session={} adopted conv_id={} from lane \
+                     '{}', which had not re-confirmed it for {}s (window {}s). A live lane \
+                     reports its id every few seconds, so '{}' is no longer on this \
+                     conversation. '{}' was blind to the staged guard until now.",
+                    name, reported, owner, now - confirmed_at, conv_claim_stale_s(), owner, name,
+                );
+                update_meta(&owner, &[("cc_conversation_id", json!(""))]);
+            }
+            ConvClaim::Refuse => {
+                tracing::warn!(
+                    target: "staged_guard",
+                    "[conv-adopt/AMUX-2936] session={} reported conv_id={} but lane '{}' already \
+                     claims it and re-confirmed {}s ago — REFUSED. Two lanes pointing at one \
+                     conversation both resume it, and the staged guard would attribute one \
+                     lane's edits to the other. '{}' stays blind until the conflict is resolved.",
+                    name, reported, owner, now - confirmed_at, name,
+                );
+                return ConvAdopt::Conflict { owner: owner.clone() };
+            }
+        }
     }
-    update_meta(name, &[("cc_conversation_id", json!(reported))]);
+    update_meta(
+        name,
+        &[
+            ("cc_conversation_id", json!(reported)),
+            // Adoption IS a confirmation, and without this the freshly adopted
+            // claim would read as age-unknown to the next lane that reports it.
+            ("cc_conversation_confirmed_at", json!(crate::config::now_f64() as i64)),
+        ],
+    );
     // Countable, because "how many lanes healed and how many are still blind" is
     // the question AMUX-2936 could not answer for want of a trace. `was.empty()`
     // is the discriminator that matters: it means a lane the guard could not see
@@ -11449,7 +12235,7 @@ pub(crate) fn adopt_reported_conv_id(name: &str, reported: &str) -> ConvAdopt {
     ConvAdopt::Adopted { was }
 }
 
-fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
+pub(crate) fn tracked_files_mutate(name: &str, method: &Method, body: &Value) -> Response {
     let mut meta = load_meta(name);
     let mut tracked: Vec<String> = meta
         .get("tracked_files")
@@ -11512,7 +12298,7 @@ pub(crate) fn steer_guard_is_system(guard: &str) -> bool {
     !guard.is_empty() && guard != "selector-answer"
 }
 
-async fn steer_mutate(
+pub(crate) async fn steer_mutate(
     state: &AppState,
     name: &str,
     method: &Method,
@@ -11562,12 +12348,20 @@ async fn steer_mutate(
                 }
                 if let Some((text, queued_at)) = sent_row.filter(|_| sent) {
                     let hid = id2.clone();
+                    // AMUX-3919: the sixth writer, and the last one that left
+                    // `outcome` NULL. This row IS a delivery — the caller asked
+                    // for the queued row to be sent as it was dequeued — so it
+                    // must not be indistinguishable from a void or from a
+                    // delivery whose outcome went unrecorded. Named for the path
+                    // rather than a bare "sent", because the turn-boundary
+                    // drain and an operator sending a row by hand are different
+                    // facts and a reader grouping by outcome should see both.
                     conn.execute(
-                        "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, guard, sender) \
-                         VALUES(?,?,?,?,?,?,?)",
+                        "INSERT OR REPLACE INTO steering_history(id, session, text, queued_at, delivered_at, outcome, guard, sender) \
+                         VALUES(?,?,?,?,?,?,?,?)",
                         rusqlite::params![
                             hid, session, redact_secrets(&text), queued_at, now_f64(),
-                            sent_src.0, sent_src.1
+                            "sent (dequeued by request)", sent_src.0, sent_src.1
                         ],
                     )?;
                 }
@@ -11722,150 +12516,17 @@ async fn post_dispatch(
             None => j200(json!({"ok": false, "message": "nothing to backup"})),
         },
         "send" => send_post(state, name, headers, body).await,
-        "instructions" => {
-            let mut saved = false;
-            if let Some(instr) = body.get("instructions") {
-                let v = instr.as_str().unwrap_or("").trim().to_string();
-                update_meta(name, &[("instructions", json!(v))]);
-                saved = true;
-            }
-            let mut applied = false;
-            if body.get("apply").map(py_truthy).unwrap_or(false) {
-                let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
-                if !instr.is_empty() {
-                    if is_running(name).await {
-                        let _ = send_text(state, name, &instr, false, SendOrigin::Owner).await;
-                    } else {
-                        let st2 = state.clone();
-                        let n = name.to_string();
-                        tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
-                    }
-                    applied = true;
-                }
-            }
-            j200(json!({
-                "ok": true,
-                "instructions": meta_str(&load_meta(name), "instructions").trim(),
-                "saved": saved,
-                "applied": applied,
-            }))
-        }
-        "keys" => {
-            let keys = body_str(body, "keys");
-            if keys.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'keys'"}));
-            }
-            let (ok, msg) = send_keys_op(name, &keys).await;
-            let code = if ok {
-                update_meta(name, &[("last_send", json!(now_i64()))]);
-                StatusCode::OK
-            } else if msg == "not running" {
-                StatusCode::CONFLICT
-            } else if msg.contains("not in allowed set") {
-                // 400 so the offline queue drops it instead of retrying
-                // forever (py:75700, 2026-07-18).
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            jresp(code, json!({"ok": ok, "message": msg}))
-        }
-        "resize" => {
-            let cols = body.get("cols").and_then(|v| v.as_i64());
-            let rows = body.get("rows").and_then(|v| v.as_i64()).unwrap_or(50);
-            let Some(cols) = cols else {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols/rows must be integers"}));
-            };
-            if cols == 0 {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols required"}));
-            }
-            if !is_running(name).await {
-                return jresp(StatusCode::CONFLICT, json!({"ok": false, "message": "not running"}));
-            }
-            let (ok, msg) = resize_pane(name, cols, rows).await;
-            j200(json!({"ok": true, "resized": ok, "message": msg}))
-        }
+        "instructions" => instructions_post_verb(state, name, body).await,
+        "keys" => keys_verb(name, body).await,
+        "resize" => resize_verb(name, body).await,
         // "agent-nav" DELETED (ARE-7): it drove Claude Code's subagents panel
         // by pane-verified keystrokes, keyed on a "⏺ main" row the TUI no
         // longer renders — 0 of 50 sessions matched, so the verb was wired
         // end-to-end and reached nobody. The durable replacement is
         // GET .../subagents (AMUX-2635). Resurrection: git log -S agent_nav.
-        "memory" => {
-            let content = body_str(body, "content");
-            let mf = mem_file(name);
-            let _ = std::fs::create_dir_all(memory_dir());
-            if std::fs::write(&mf, content).is_err() {
-                return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write memory file"}));
-            }
-            let wd = session_work_dir(name);
-            if !wd.is_empty() {
-                write_claude_memory(name, &wd);
-            }
-            j200(json!({"ok": true}))
-        }
-        "git" => {
-            let branch = body_str(body, "branch").trim().to_string();
-            let create = body.get("create").map(py_truthy).unwrap_or(false)
-                || (body.get("worktree").map(py_truthy).unwrap_or(false)
-                    && body.get("create").map(py_truthy).unwrap_or(false));
-            let wd = session_work_dir(name);
-            if wd.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "session has no directory"}));
-            }
-            if branch.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "branch name required"}));
-            }
-            let re = cached_re!(r"^[a-zA-Z0-9_./@\-]+$");
-            if !re.is_match(&branch) {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid branch name"}));
-            }
-            let mut args: Vec<&str> = vec!["-C", &wd, "checkout"];
-            if create {
-                args.push("-b");
-            }
-            args.push(&branch);
-            match run_cmd("git", &args, Duration::from_secs(10)).await {
-                Some(o) if o.status.success() => j200(json!({"ok": true, "branch": branch})),
-                Some(o) => {
-                    let err = String::from_utf8_lossy(if o.stderr.is_empty() { &o.stdout } else { &o.stderr })
-                        .trim()
-                        .to_string();
-                    jresp(StatusCode::BAD_REQUEST, json!({"ok": false, "error": err}))
-                }
-                None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "git timed out"})),
-            }
-        }
-        "git-push" => {
-            if !is_running(name).await {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "session not running — start it first"}));
-            }
-            let cfg = parse_env(name);
-            let branch = cfg.get_or("CC_BRANCH", "").to_string();
-            let msg = if !branch.is_empty() && branch != "none" {
-                format!(
-                    "Deploy now. Your branch is `{branch}`. Run these steps:\n\
-                     1. `git stash` (if needed to allow checkout)\n\
-                     2. `git checkout {branch}` and `git stash pop` (if stashed)\n\
-                     3. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified.\n\
-                     4. `git commit` with a good commit message summarizing YOUR changes only\n\
-                     5. `git checkout main && git pull --ff-only origin main`\n\
-                     6. `git merge {branch}` (resolve conflicts if any)\n\
-                     7. `git push origin main`\n\
-                     8. `git checkout {branch}` (go back to your branch)\n\
-                     Do all steps now. If any step fails, fix it and continue."
-                )
-            } else {
-                "Deploy now. You are on `main`. Run these steps:\n\
-                 1. `git pull --ff-only origin main`\n\
-                 2. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified. Review `git diff` and only add files related to your task.\n\
-                 3. `git commit` with a good commit message summarizing YOUR changes only\n\
-                 4. `git push origin main`\n\
-                 Do all steps now. If any step fails, fix it and continue."
-                    .to_string()
-            };
-            let _ = send_text(state, name, &msg, false, SendOrigin::Owner).await;
-            j200(json!({"ok": true, "message": "deploy instructions sent to session"}))
-        }
+        "memory" => memory_post_verb(name, body),
+        "git" => git_checkout_verb(name, body).await,
+        "git-push" => git_push_verb(state, name).await,
         "start" => {
             // RESPOND BEFORE THE CHOREOGRAPHY (AMUX-2557): validations
             // inline, launch in the background, instant 202.
@@ -11946,49 +12607,8 @@ async fn post_dispatch(
             });
             jresp(StatusCode::ACCEPTED, json!({"ok": true, "message": "stopping"}))
         }
-        "clear" => {
-            let ptq = pt(name);
-            match tmux(&["clear-history", "-t", &ptq]).await {
-                Some(_) => j200(json!({"ok": true, "message": "cleared"})),
-                None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "message": "tmux clear-history timed out"})),
-            }
-        }
-        "duplicate" => {
-            let new_name = body_str(body, "new_name").trim().to_string();
-            if new_name.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
-            }
-            let re = cached_re!(r"[^a-zA-Z0-9_-]");
-            let new_name = re.replace_all(&new_name, "-").into_owned();
-            let new_file = env_path(&new_name);
-            if new_file.exists() {
-                return jresp(StatusCode::CONFLICT, json!({"error": format!("session '{new_name}' already exists")}));
-            }
-            if std::fs::copy(env_path(name), &new_file).is_err() {
-                return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
-            }
-            let registered = match register_twin(state, name, &new_name) {
-                Ok(applied) => applied,
-                // FAIL WHOLE, NOT HALF. Leaving the copied env file behind after
-                // a failed insert would produce exactly the unregistered twin
-                // this code exists to prevent, and it would do so on the error
-                // path where nobody looks.
-                Err(e) => {
-                    let _ = std::fs::remove_file(&new_file);
-                    return jresp(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        json!({"error": format!("could not register '{new_name}' in the worker store; the duplicate was rolled back rather than left invisible: {e}")}),
-                    );
-                }
-            };
-            j200(json!({
-                "ok": true,
-                "message": format!("duplicated as {new_name}"),
-                // Say which shape happened, so a caller can tell a registered
-                // twin from a plain env-file copy without going to the store.
-                "registered": registered,
-            }))
-        }
+        "clear" => clear_verb(name).await,
+        "duplicate" => duplicate_verb(state, name, body),
         "clone" => clone_post(state, name, body).await,
         "archive" => {
             if !session_destructive_allowed(state, headers) {
@@ -12001,130 +12621,11 @@ async fn post_dispatch(
             let (ok, msg) = archive_session(state, name).await;
             verb_resp(ok, msg)
         }
-        "wake" => {
-            let (ok, msg) = wake_session(state, name).await;
-            verb_resp(ok, msg)
-        }
-        "reset" => {
-            let (ok, msg) = reset_session(state, name).await;
-            verb_resp(ok, msg)
-        }
-        "commit-report" => {
-            // Attach the commit to the in-flight card (py:76233-76246). The
-            // cross-session sweep notice (py:76008-76230) is a named gap.
-            let sha: String = body_str(body, "sha").trim().chars().take(16).collect();
-            let subj: String = body_str(body, "subject").trim().chars().take(140).collect();
-            if sha.is_empty() {
-                return jresp(StatusCode::BAD_REQUEST, json!({"error": "sha required"}));
-            }
-            let session = name.to_string();
-            let sha2 = sha.clone();
-            let reply = state
-                .store
-                .write_async(move |conn| {
-                    let row: Option<String> = conn
-                        .query_row(
-                            "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                             AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                             AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                            [&session],
-                            |r| r.get(0),
-                        )
-                        .ok();
-                    let Some(issue_id) = row else {
-                        return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                    };
-                    let log: String = conn
-                        .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
-                        .unwrap_or_default();
-                    let ts = chrono::Local::now().format("%H:%M");
-                    let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}", log.trim_end()).trim().to_string();
-                    conn.execute(
-                        "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
-                        rusqlite::params![new_log, now_i64(), issue_id],
-                    )?;
-                    Ok(crate::db::WriteOutcome {
-                        applied: true,
-                        events: vec![crate::db::PendingEvent {
-                            entity_type: amux_core::revision::EntityType::Other("issue".into()),
-                            entity_id: issue_id,
-                            mutation: amux_core::revision::MutationKind::Updated,
-                            payload: None,
-                        }],
-                    })
-                })
-                .await;
-            match reply {
-                Ok(r) if !r.applied => j200(json!({"ok": true, "attached": Value::Null})),
-                Ok(_) => {
-                    // Re-read the card id for the response (the write closure
-                    // cannot return it through WriteReply).
-                    let attached: Option<String> = state.store.read().ok().and_then(|conn| {
-                        conn.query_row(
-                            "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
-                             AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
-                             AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
-                            [name],
-                            |r| r.get(0),
-                        )
-                        .ok()
-                    });
-                    j200(json!({"ok": true, "attached": attached, "sha": sha}))
-                }
-                Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
-            }
-        }
+        "wake" => wake_verb(state, name).await,
+        "reset" => reset_verb(state, name).await,
+        "commit-report" => commit_report_verb(state, name, body).await,
         "report" => report_post(state, name, headers, body).await,
-        "apply-template" => {
-            let re = cached_re!(r"[^a-z0-9\-]");
-            let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
-            let work_dir = body_str(body, "dir").trim().to_string();
-            // Two different failures, two different messages. They shared one
-            // string until 2026-08-11, and that is precisely why a dead
-            // templates_dir() went unnoticed: "template not found" reads as
-            // "you asked for a template that doesn't exist", so nobody
-            // suspected the ROOT was missing. Name which one it is.
-            let Some(tmpl_root) = templates_dir() else {
-                return jresp(
-                    StatusCode::NOT_FOUND,
-                    json!({"error": "no templates directory on this machine",
-                           "hint": "set AMUX_TEMPLATES_DIR, or install templates/ to ~/.amux/templates (install.sh does this)",
-                           "tried": [std::env::var("AMUX_TEMPLATES_DIR").unwrap_or_default(),
-                                     home().join("templates").display().to_string()]}),
-                );
-            };
-            let tmpl_path = tmpl_root.join(&tmpl_id);
-            if tmpl_id.is_empty() || !tmpl_path.is_dir() {
-                return jresp(
-                    StatusCode::NOT_FOUND,
-                    json!({"error": format!("no template '{tmpl_id}'"),
-                           "templates_dir": tmpl_root.display().to_string()}),
-                );
-            }
-            if !work_dir.is_empty() {
-                let work = expanduser(&work_dir);
-                let _ = std::fs::create_dir_all(&work);
-                if let Ok(meta_text) = std::fs::read_to_string(tmpl_path.join("template.json")) {
-                    if let Ok(meta) = serde_json::from_str::<Value>(&meta_text) {
-                        for d in meta["dirs"].as_array().cloned().unwrap_or_default() {
-                            if let Some(d) = d.as_str() {
-                                let _ = std::fs::create_dir_all(work.join(d));
-                            }
-                        }
-                    }
-                }
-                let claude_file = tmpl_path.join("CLAUDE.md");
-                if claude_file.exists() {
-                    let dest = work.join("CLAUDE.md");
-                    if !dest.exists() {
-                        if let Ok(t) = std::fs::read_to_string(&claude_file) {
-                            let _ = std::fs::write(&dest, t);
-                        }
-                    }
-                }
-            }
-            j200(json!({"ok": true}))
-        }
+        "apply-template" => apply_template_verb(body),
         "delete" => delete_post(state, name, headers).await,
         // CONVENTIONAL SPELLINGS, routed to the SAME handlers (AMUX-2669/2665).
         //
@@ -12545,8 +13046,58 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         } else if !origin.is_empty() && origin != name {
             cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
         }
-    } else if !msg_id.is_empty() {
-        send_dedup_forget(state, name, &msg_id).await;
+    } else {
+        // A FAILED DELIVERY IS A DELIVERY EVENT (AMUX-3903).
+        //
+        // This whole record was inside `if ok`, so a send that typed the text
+        // and could not submit it wrote NO ROW AT ALL. Not a row marked failed:
+        // absent. The consequences compound, because every consumer of this
+        // table reads a population with the failures already removed —
+        // `submit_verdict` had never been `stuck` in 9,494 rows fleet-wide, the
+        // success rate computed from it is 100% by construction, and the
+        // duplicate-delivery detector, the sender-attribution trail and any
+        // sweep over "what was this lane told" all inherit the same blind spot.
+        // A wrong answer that is not wrong-looking is ethos rule 4's whole
+        // subject.
+        //
+        // A REFUSAL IS NOT A FAILED DELIVERY, and the distinction is the reason
+        // this is not simply `else`. "not running", archived, invalid name, the
+        // resume picker, an isolated lane, the background-conversation view:
+        // amux never typed anything, the caller got an error naming the next
+        // step, and recording them here would bury the real failures under
+        // thousands of rows about messages that were never attempted.
+        //
+        // `submit_verdict_of` is the discriminator and it already exists —
+        // reused rather than re-derived, so this cannot drift from the verdict
+        // the response reports (ethos rule 1). On the failure branch it returns
+        // Some only for "not submitted", which means the text IS in the lane's
+        // composer; every refusal maps to None.
+        if let Some(verdict) = submit_verdict_of(&msg) {
+            // LOUD, for the same reason ghost-rescue is: keystroke delivery
+            // failing is a defect, and until now it left the process without a
+            // trace anywhere durable.
+            tracing::warn!(
+                session = %name, verdict = %verdict,
+                preview = %chars_truncate(&text, 80),
+                "send FAILED to submit — recording it (AMUX-3903); the text is in the lane's \
+                 composer and was never delivered"
+            );
+            let meta = DeliveryMeta {
+                delivery: Some(Delivery::Direct),
+                queued_at_ms: None,
+                submit_verdict: Some(verdict),
+            };
+            if record_history {
+                let email =
+                    headers.get("x-amux-user-email").and_then(|v| v.to_str().ok()).unwrap_or("");
+                cmd_hist_record_full(state, name, &orig_text, "user", email, skip_board, meta).await;
+            } else if !origin.is_empty() && origin != name {
+                cmd_hist_record_full(state, name, &orig_text, "session", &origin, false, meta).await;
+            }
+        }
+        if !msg_id.is_empty() {
+            send_dedup_forget(state, name, &msg_id).await;
+        }
     }
     // A REFUSAL IS NOT A SERVER ERROR (AMUX-2681). This used to be
     // `if msg == "not running" { 409 } else { 500 }`, so every other honest
@@ -12595,6 +13146,748 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
     // credit-gate state (_session_auto_actions) — process state this origin
     // does not hold; named gap.
     jresp(code, resp)
+}
+
+/// `reset` as a callable verb, so the promoted `/api/workers/{id}/reset`
+/// route and the legacy `/api/sessions/{name}/reset` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn reset_verb(state: &AppState, name: &str) -> Response {
+    let (ok, msg) = reset_session(state, name).await;
+    verb_resp(ok, msg)
+}
+
+/// `wake` as a callable verb, so the promoted `/api/workers/{id}/wake`
+/// route and the legacy `/api/sessions/{name}/wake` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn wake_verb(state: &AppState, name: &str) -> Response {
+    let (ok, msg) = wake_session(state, name).await;
+    verb_resp(ok, msg)
+}
+
+/// `clear` as a callable verb, so the promoted `/api/workers/{id}/clear`
+/// route and the legacy `/api/sessions/{name}/clear` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn clear_verb(name: &str) -> Response {
+    let ptq = pt(name);
+    match tmux(&["clear-history", "-t", &ptq]).await {
+        Some(_) => j200(json!({"ok": true, "message": "cleared"})),
+        None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "message": "tmux clear-history timed out"})),
+    }
+}
+
+/// `resize` as a callable verb, so the promoted `/api/workers/{id}/resize`
+/// route and the legacy `/api/sessions/{name}/resize` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn resize_verb(name: &str, body: &Value) -> Response {
+    let cols = body.get("cols").and_then(|v| v.as_i64());
+    let rows = body.get("rows").and_then(|v| v.as_i64()).unwrap_or(50);
+    let Some(cols) = cols else {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols/rows must be integers"}));
+    };
+    if cols == 0 {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "cols required"}));
+    }
+    if !is_running(name).await {
+        return jresp(StatusCode::CONFLICT, json!({"ok": false, "message": "not running"}));
+    }
+    let (ok, msg) = resize_pane(name, cols, rows).await;
+    j200(json!({"ok": true, "resized": ok, "message": msg}))
+}
+
+/// `keys` as a callable verb, so the promoted `/api/workers/{id}/keys`
+/// route and the legacy `/api/sessions/{name}/keys` spelling run ONE
+/// implementation instead of a route alias and a re-implementation (AF-288).
+pub(crate) async fn keys_verb(name: &str, body: &Value) -> Response {
+    let keys = body_str(body, "keys");
+    if keys.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing 'keys'"}));
+    }
+    let (ok, msg) = send_keys_op(name, &keys).await;
+    let code = if ok {
+        update_meta(name, &[("last_send", json!(now_i64()))]);
+        StatusCode::OK
+    } else if msg == "not running" {
+        StatusCode::CONFLICT
+    } else if msg.contains("not in allowed set") {
+        // 400 so the offline queue drops it instead of retrying
+        // forever (py:75700, 2026-07-18).
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    jresp(code, json!({"ok": ok, "message": msg}))
+}
+
+/// `apply-template` as a callable verb.
+///
+/// IT TAKES NO SESSION, and that is the finding rather than an oversight in the
+/// extraction: the arm reads its target directory from the BODY (`dir`) and
+/// never consults the name it was addressed to. The compiler said so — `name`
+/// was unused the moment this became a function — which is why the parameter is
+/// gone rather than underscored.
+///
+/// So `apply-template` is not an operation on a worker as a resource, and it is
+/// reclassified out of RESOURCE on AF-203 rather than promoted (AF-288).
+/// Mounting it at `/api/workers/{id}/apply-template` would make the id
+/// decorative and freeze that fiction into the supported API, which is the
+/// specific failure AF-201 says a one-for-one promotion causes.
+pub(crate) fn apply_template_verb(body: &Value) -> Response {
+    let re = cached_re!(r"[^a-z0-9\-]");
+    let tmpl_id = re.replace_all(&body_str(body, "template_id"), "").into_owned();
+    let work_dir = body_str(body, "dir").trim().to_string();
+    // Two different failures, two different messages. They shared one
+    // string until 2026-08-11, and that is precisely why a dead
+    // templates_dir() went unnoticed: "template not found" reads as
+    // "you asked for a template that doesn't exist", so nobody
+    // suspected the ROOT was missing. Name which one it is.
+    let Some(tmpl_root) = templates_dir() else {
+        return jresp(
+            StatusCode::NOT_FOUND,
+            json!({"error": "no templates directory on this machine",
+                   "hint": "set AMUX_TEMPLATES_DIR, or install templates/ to ~/.amux/templates (install.sh does this)",
+                   "tried": [std::env::var("AMUX_TEMPLATES_DIR").unwrap_or_default(),
+                             home().join("templates").display().to_string()]}),
+        );
+    };
+    let tmpl_path = tmpl_root.join(&tmpl_id);
+    if tmpl_id.is_empty() || !tmpl_path.is_dir() {
+        return jresp(
+            StatusCode::NOT_FOUND,
+            json!({"error": format!("no template '{tmpl_id}'"),
+                   "templates_dir": tmpl_root.display().to_string()}),
+        );
+    }
+    if !work_dir.is_empty() {
+        let work = expanduser(&work_dir);
+        let _ = std::fs::create_dir_all(&work);
+        if let Ok(meta_text) = std::fs::read_to_string(tmpl_path.join("template.json")) {
+            if let Ok(meta) = serde_json::from_str::<Value>(&meta_text) {
+                for d in meta["dirs"].as_array().cloned().unwrap_or_default() {
+                    if let Some(d) = d.as_str() {
+                        let _ = std::fs::create_dir_all(work.join(d));
+                    }
+                }
+            }
+        }
+        let claude_file = tmpl_path.join("CLAUDE.md");
+        if claude_file.exists() {
+            let dest = work.join("CLAUDE.md");
+            if !dest.exists() {
+                if let Ok(t) = std::fs::read_to_string(&claude_file) {
+                    let _ = std::fs::write(&dest, t);
+                }
+            }
+        }
+    }
+    j200(json!({"ok": true}))
+}
+
+/// The GET half of `steer`: the lane's steering queue, annotated per row with
+/// age and whether the lane can actually receive (AMUX-2785).
+///
+/// Extracted for the promoted `/api/workers/{id}/steer` route (AF-288).
+/// `steer` is READ AND WRITE, which is worth stating because the GET arm alone
+/// reads like an observability endpoint: every non-GET method on this action
+/// goes to `steer_mutate` instead, so a promoted route has to carry both or it
+/// silently drops the half that queues work.
+pub(crate) async fn steer_history_verb(
+    state: &AppState,
+    name: &str,
+    qs: &[(String, String)],
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return jresp(StatusCode::SERVICE_UNAVAILABLE, json!({"error": e.to_string()})),
+    };
+    if qs_first(qs, "history", "0") == "1" {
+        let mut out = vec![];
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT id, text, queued_at, delivered_at FROM steering_history \
+             WHERE session=? ORDER BY delivered_at DESC LIMIT 100",
+        ) {
+            if let Ok(rows) = stmt.query_map([name], |r| {
+                Ok(json!({
+                    "id": r.get::<_, String>(0)?,
+                    "text": r.get::<_, String>(1)?,
+                    "queued_at": r.get::<_, Option<f64>>(2)?,
+                    "delivered_at": r.get::<_, f64>(3)?,
+                }))
+            }) {
+                out = rows.flatten().collect();
+            }
+        }
+        return j200(json!(out));
+    }
+    let mut out: Vec<Value> = vec![];
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, text, queued_at, COALESCE(guard,''), COALESCE(sender,'') FROM steering_queue \
+         WHERE session=? ORDER BY queued_at ASC",
+    ) {
+        if let Ok(rows) = stmt.query_map([name], |r| {
+            Ok(json!({
+                "id": r.get::<_, String>(0)?,
+                "text": r.get::<_, String>(1)?,
+                "queued_at": r.get::<_, f64>(2)?,
+                "guard": r.get::<_, String>(3)?,
+                "sender": r.get::<_, String>(4)?,
+            }))
+        }) {
+            out = rows.flatten().collect();
+        }
+    }
+    drop(conn);
+    // AGE AND REACHABILITY PER ROW (AMUX-2785). A queue listing that
+    // shows only text and a timestamp cannot answer the one question a
+    // sender staring at it has — "is this coming, or is it stuck?" —
+    // and the caller cannot compute it, because whether the lane can
+    // receive at all is not in the row. Same predicate as the drain
+    // loop, so the list cannot claim what the loop will not do.
+    let blocked = lane_block_reason(name).await;
+    let max_age = steer_max_age_s();
+    let now = now_f64();
+    for row in out.iter_mut() {
+        let age = now - row["queued_at"].as_f64().unwrap_or(now);
+        row["age_s"] = json!(age as i64);
+        row["overdue"] = json!(age >= max_age);
+        row["deliverable"] = json!(blocked.is_none());
+        row["blocked_reason"] = json!(blocked);
+    }
+    j200(json!(out))
+}
+
+/// `memory` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/memory` route (AF-293).
+pub(crate) fn memory_post_verb(name: &str, body: &Value) -> Response {
+    let content = body_str(body, "content");
+    let mf = mem_file(name);
+    let _ = std::fs::create_dir_all(memory_dir());
+    if std::fs::write(&mf, content).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write memory file"}));
+    }
+    let wd = session_work_dir(name);
+    if !wd.is_empty() {
+        write_claude_memory(name, &wd);
+    }
+    j200(json!({"ok": true}))
+}
+
+/// `instructions` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/instructions` route (AF-293).
+pub(crate) async fn instructions_post_verb(state: &AppState, name: &str, body: &Value) -> Response {
+    let mut saved = false;
+    if let Some(instr) = body.get("instructions") {
+        let v = instr.as_str().unwrap_or("").trim().to_string();
+        update_meta(name, &[("instructions", json!(v))]);
+        saved = true;
+    }
+    let mut applied = false;
+    if body.get("apply").map(py_truthy).unwrap_or(false) {
+        let instr = meta_str(&load_meta(name), "instructions").trim().to_string();
+        if !instr.is_empty() {
+            if is_running(name).await {
+                let _ = send_text(state, name, &instr, false, SendOrigin::Owner).await;
+            } else {
+                let st2 = state.clone();
+                let n = name.to_string();
+                tokio::spawn(async move { send_after_ready(st2, n, instr, 60, SendOrigin::Owner).await });
+            }
+            applied = true;
+        }
+    }
+    j200(json!({
+        "ok": true,
+        "instructions": meta_str(&load_meta(name), "instructions").trim(),
+        "saved": saved,
+        "applied": applied,
+    }))
+}
+
+/// `memory` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/memory` route (AF-293).
+pub(crate) fn memory_get_verb(name: &str) -> Response {
+    let mf = mem_file(name);
+    let content = std::fs::read_to_string(&mf).unwrap_or_default();
+    let wd = session_work_dir(name);
+    j200(json!({
+        "content": content,
+        "path": mf.to_string_lossy(),
+        "work_dir": wd,
+        "claude_project": if wd.is_empty() { String::new() } else { project_name(&wd) },
+        "shared_with": memory_shared_with(name),
+    }))
+}
+
+/// `instructions` as a callable verb, extracted for the promoted
+/// `/api/workers/{id}/instructions` route (AF-293).
+pub(crate) fn instructions_get_verb(name: &str) -> Response {
+    j200(json!({
+        "name": name,
+        "instructions": meta_str(&load_meta(name), "instructions").trim(),
+    }))
+}
+
+/// `env-explain` — which env layer supplied a worker's value, and which did not.
+///
+/// The scope API advertises `env` at [global, group, worker] and names this
+/// endpoint as the per-worker "why did I get this value" answer (SCOPE_CAPS's
+/// `explain` field). It answered 501 until AF-295. The layering itself was never
+/// the missing part: `scope_env_layers` already resolves the same ordered files
+/// every consumer reads, so this walks THAT list rather than re-deriving one,
+/// which is the only way the answer can stay true when the resolver changes.
+///
+/// VALUES ARE NEVER RETURNED, and that is a security property rather than a
+/// convenience. These files are 0600 because they carry credentials
+/// (`api/scope.rs`'s own storage note says so), and an explain that echoed them
+/// would turn a documentation endpoint into a credential read over HTTP. Key
+/// NAMES are returned, matching the repo's existing line — `docs/credentials.md`
+/// is a committed inventory of names, and the values live only in server.env.
+///
+/// "Which layer won" is the whole question anyway. A caller who needs the value
+/// already has it; what they cannot see is which of three files produced it.
+pub(crate) fn env_explain_verb(name: &str, qs: &[(String, String)]) -> Response {
+    let h = home();
+    let key = qs_first(qs, "key", "").trim().to_string();
+    let layers = scope_env_layers(&h, name);
+    let level_of = |p: &std::path::Path| -> &'static str {
+        if p.file_name().map(|f| f == "amux.env").unwrap_or(false) {
+            "global"
+        } else if p.parent().map(|d| d.ends_with("env")).unwrap_or(false) {
+            "group"
+        } else {
+            "worker"
+        }
+    };
+    let mut rows = Vec::new();
+    let mut winner: Option<Value> = None;
+    for p in &layers {
+        let ef = EnvFile::load(p);
+        let level = level_of(p);
+        let mut row = json!({
+            "level": level,
+            "path": p.to_string_lossy(),
+            "keys": ef.keys().len(),
+        });
+        if !key.is_empty() {
+            // PRESENT-BUT-EMPTY IS NOT ABSENT, the same distinction
+            // `effective_env` had to learn the hard way: an empty value is a
+            // deliberate clear, and reporting it as "does not define" would send
+            // a reader looking for a layer that is doing exactly its job.
+            let defines = ef.get(&key).is_some();
+            let empty = ef.get(&key).map(|v| v.trim().is_empty()).unwrap_or(false);
+            row["defines"] = json!(defines);
+            row["empty"] = json!(empty);
+            if defines {
+                // LAST writer wins: the list is least-specific first, so this
+                // keeps overwriting and ends on the most specific layer.
+                winner = Some(json!({"level": level, "path": p.to_string_lossy()}));
+            }
+        } else {
+            let mut names: Vec<String> = ef.keys();
+            names.sort();
+            row["defined_keys"] = json!(names);
+        }
+        rows.push(row);
+    }
+    j200(json!({
+        "worker": name,
+        "key": if key.is_empty() { Value::Null } else { json!(key) },
+        "order": ["global", "group", "worker"],
+        "layers": rows,
+        "winner": winner,
+        "values_withheld": true,
+        "note": "Values are never returned: these files are 0600 and carry credentials. \
+                 This answers WHICH layer supplied the value, which is the part a caller \
+                 cannot see for themselves.",
+        "resolver": "scope_env_layers — the same ordered list every consumer reads",
+    }))
+}
+
+/// `commit-report` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) async fn commit_report_verb(state: &AppState, name: &str, body: &Value) -> Response {
+    // Attach the commit to the in-flight card (py:76233-76246). The
+    // cross-session sweep notice (py:76008-76230) is a named gap.
+    let sha: String = body_str(body, "sha").trim().chars().take(16).collect();
+    let subj: String = body_str(body, "subject").trim().chars().take(140).collect();
+    if sha.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "sha required"}));
+    }
+    // DID THE COMMIT CONTAIN ANYTHING (AMUX-3837). See `commit_shape`
+    // for why this lives here. The verdict is computed BEFORE the card
+    // write so it can ride the same log line the commit already adds:
+    // a second write would put the warning somewhere other than where
+    // the session goes to read what it shipped.
+    let dir = body_str(body, "dir");
+    let shape = read_commit_shape(&dir, &sha).await;
+    let empty = matches!(shape, commit_shape::Shape::Empty);
+    // WHAT THE HOOK SAW, held by the staged-guard (AMUX-3837).
+    // amux-frustrations demonstrated the mechanism: git writes the tree
+    // AFTER the hooks return, so anything that empties the index during
+    // our 30-90s pre-commit window (cargo check + clippy, on an index
+    // every lane shares) yields a zero-file commit reporting success.
+    // The hook already reports its staged set and this endpoint already
+    // knows what landed; joining them turns a forensic reconstruction
+    // into a stated pair. 300s, because the window is the pre-commit
+    // build, not a session.
+    let staged_at_hook =
+        crate::api::git_guard::staged_seen(name, &dir, crate::config::now_f64(), 300.0);
+    if empty {
+        tracing::warn!(
+            session = %name, sha = %sha, subject = %subj,
+            staged_at_hook = staged_at_hook.map(|n| n as i64).unwrap_or(-1),
+            // The gloss follows what THIS line actually carries. It used
+            // to explain the -1 sentinel unconditionally, so a line
+            // reading `staged_at_hook=1` came with a sentence about a
+            // value it did not have. Caught by probing the arm rather
+            // than by reading the code.
+            "commit-report: EMPTY COMMIT — this sha contains no files, so the change it \
+             claims is still uncommitted in the working tree (AMUX-3837). On a shared \
+             checkout any peer's checkout or stash destroys it, and a card closed citing \
+             this sha is citing nothing. {}",
+            empty_commit_hook_gloss(staged_at_hook)
+        );
+    }
+    let session = name.to_string();
+    let sha2 = sha.clone();
+    // Named so the log line can say WHY it is silent: absent because
+    // the commit was fine, versus absent because nothing looked.
+    let shape_note = match shape {
+        commit_shape::Shape::Empty => empty_commit_card_note(staged_at_hook),
+        commit_shape::Shape::Unchecked(why) => format!(" (not checked for content: {why})"),
+        _ => String::new(),
+    };
+    let reply = state
+        .store
+        .write_async(move |conn| {
+            let row: Option<String> = conn
+                .query_row(
+                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
+                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
+                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
+                    [&session],
+                    |r| r.get(0),
+                )
+                .ok();
+            let Some(issue_id) = row else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            let log: String = conn
+                .query_row("SELECT COALESCE(log,'') FROM issues WHERE id=?", [&issue_id], |r| r.get(0))
+                .unwrap_or_default();
+            let ts = chrono::Local::now().format("%H:%M");
+            let new_log = format!("{}\n`{ts}` commit {sha2} — {subj}{shape_note}", log.trim_end())
+                .trim()
+                .to_string();
+            conn.execute(
+                "UPDATE issues SET log=?, rev=COALESCE(rev,0)+1, updated=? WHERE id=?",
+                rusqlite::params![new_log, now_i64(), issue_id],
+            )?;
+            Ok(crate::db::WriteOutcome {
+                applied: true,
+                events: vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("issue".into()),
+                    entity_id: issue_id,
+                    mutation: amux_core::revision::MutationKind::Updated,
+                    payload: None,
+                }],
+            })
+        })
+        .await;
+    match reply {
+        // The emptiness verdict rides BOTH arms. A session with no
+        // in-flight card is exactly the one whose commit lands with no
+        // trail, so it is the last place the warning may be dropped.
+        Ok(r) if !r.applied => {
+            j200(json!({"ok": true, "attached": Value::Null, "empty_commit": empty,
+                       "staged_at_hook": staged_at_hook}))
+        }
+        Ok(_) => {
+            // Re-read the card id for the response (the write closure
+            // cannot return it through WriteReply).
+            let attached: Option<String> = state.store.read().ok().and_then(|conn| {
+                conn.query_row(
+                    "SELECT id FROM issues WHERE session=? AND deleted IS NULL \
+                     AND COALESCE(archived,0)=0 AND status IN ('doing','review') \
+                     AND owner_type='agent' ORDER BY updated DESC LIMIT 1",
+                    [name],
+                    |r| r.get(0),
+                )
+                .ok()
+            });
+            j200(json!({"ok": true, "attached": attached, "sha": sha, "empty_commit": empty,
+                        "staged_at_hook": staged_at_hook}))
+        }
+        Err(e) => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": e.to_string()})),
+    }
+}
+
+/// `git-push` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) async fn git_push_verb(state: &AppState, name: &str) -> Response {
+    if !is_running(name).await {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "session not running — start it first"}));
+    }
+    let cfg = parse_env(name);
+    let branch = cfg.get_or("CC_BRANCH", "").to_string();
+    let msg = if !branch.is_empty() && branch != "none" {
+        format!(
+            "Deploy now. Your branch is `{branch}`. Run these steps:\n\
+             1. `git stash` (if needed to allow checkout)\n\
+             2. `git checkout {branch}` and `git stash pop` (if stashed)\n\
+             3. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified.\n\
+             4. `git commit` with a good commit message summarizing YOUR changes only\n\
+             5. `git checkout main && git pull --ff-only origin main`\n\
+             6. `git merge {branch}` (resolve conflicts if any)\n\
+             7. `git push origin main`\n\
+             8. `git checkout {branch}` (go back to your branch)\n\
+             Do all steps now. If any step fails, fix it and continue."
+        )
+    } else {
+        "Deploy now. You are on `main`. Run these steps:\n\
+         1. `git pull --ff-only origin main`\n\
+         2. IMPORTANT: Only stage files YOU changed in this session — do NOT use `git add -A`. Use `git add <specific files>` for each file you modified. Review `git diff` and only add files related to your task.\n\
+         3. `git commit` with a good commit message summarizing YOUR changes only\n\
+         4. `git push origin main`\n\
+         Do all steps now. If any step fails, fix it and continue."
+            .to_string()
+    };
+    let _ = send_text(state, name, &msg, false, SendOrigin::Owner).await;
+    j200(json!({"ok": true, "message": "deploy instructions sent to session"}))
+}
+
+/// `tracked-files` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) fn tracked_files_verb(name: &str) -> Response {
+    let meta = load_meta(name);
+    j200(json!({"files": meta.get("tracked_files").cloned().unwrap_or(json!([]))}))
+}
+
+/// `commit-guard` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) fn commit_guard_verb(name: &str) -> Response {
+    let cfg = parse_env(name);
+    let per = cfg.get_or("AMUX_COMMIT_GUARD_SESSION", "").trim().to_lowercase();
+    let global = !matches!(
+        std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    );
+    let override_v: Value = if per.is_empty() {
+        Value::Null
+    } else {
+        json!(!matches!(per.as_str(), "0" | "false" | "off" | "no"))
+    };
+    let enabled = match &override_v {
+        Value::Bool(b) => *b,
+        _ => global,
+    };
+    j200(json!({"name": name, "enabled": enabled, "global": global, "override": override_v}))
+}
+
+/// `dirty` as a callable verb, for the grouped
+/// `/api/workers/{id}/git/...` surface (AF-291).
+pub(crate) async fn dirty_verb(name: &str) -> Response {
+    let wd = session_work_dir(name);
+    let files = if wd.is_empty() { vec![] } else { session_dirty_files(name, &wd).await };
+    j200(json!({
+        "name": name,
+        "dirty": !files.is_empty(),
+        "count": files.len(),
+        "files": files.iter().take(50).collect::<Vec<_>>(),
+    }))
+}
+
+/// The mutating half of `commit-guard`, for the grouped git surface (AF-291).
+pub(crate) fn commit_guard_patch_verb(name: &str, body: &Value) -> Response {
+    let global = !matches!(
+        std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
+        "0" | "false" | "off" | "no"
+    );
+    let raw = body.get("enabled");
+    let override_v = match raw {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(py_truthy(v)),
+    };
+    let f = env_path(name);
+    let mut cfg = parse_env(name);
+    match override_v {
+        None => cfg.remove("AMUX_COMMIT_GUARD_SESSION"),
+        Some(b) => cfg.set("AMUX_COMMIT_GUARD_SESSION", if b { "1" } else { "0" }),
+    }
+    if cfg.write(&f).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
+    }
+    let enabled = override_v.unwrap_or(global);
+    j200(json!({
+        "ok": true, "enabled": enabled, "global": global,
+        "override": override_v.map(Value::Bool).unwrap_or(Value::Null),
+    }))
+}
+
+/// The mutating half of `git`, for the grouped git surface (AF-291).
+pub(crate) async fn git_checkout_verb(name: &str, body: &Value) -> Response {
+    let branch = body_str(body, "branch").trim().to_string();
+    let create = body.get("create").map(py_truthy).unwrap_or(false)
+        || (body.get("worktree").map(py_truthy).unwrap_or(false)
+            && body.get("create").map(py_truthy).unwrap_or(false));
+    let wd = session_work_dir(name);
+    if wd.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "session has no directory"}));
+    }
+    if branch.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "branch name required"}));
+    }
+    let re = cached_re!(r"^[a-zA-Z0-9_./@\-]+$");
+    if !re.is_match(&branch) {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "invalid branch name"}));
+    }
+    let mut args: Vec<&str> = vec!["-C", &wd, "checkout"];
+    if create {
+        args.push("-b");
+    }
+    args.push(&branch);
+    match run_cmd("git", &args, Duration::from_secs(10)).await {
+        Some(o) if o.status.success() => j200(json!({"ok": true, "branch": branch})),
+        Some(o) => {
+            let err = String::from_utf8_lossy(if o.stderr.is_empty() { &o.stdout } else { &o.stderr })
+                .trim()
+                .to_string();
+            jresp(StatusCode::BAD_REQUEST, json!({"ok": false, "error": err}))
+        }
+        None => jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"ok": false, "error": "git timed out"})),
+    }
+}
+
+/// The binding rules section, composed global -> group -> worker (AF-297).
+///
+/// NOT A NEW DESIGN. `rules` shipped complete in the python server and the rust
+/// port kept the WRITER and dropped the READER: scope.rs still writes
+/// `memory/_rules.md`, `memory/tags/<g>.rules.md` and `memory/<worker>.rules.md`,
+/// and until this function nothing in the repo read any of them. Measured
+/// repo-wide before the fix: two hits for `.rules.md`, both in scope.rs's own
+/// path builder. So a user setting binding rules at any level got a saved file
+/// and zero effect, and `merge: concat` in SCOPE_CAPS described a composition
+/// no code performed.
+///
+/// The meaning is RECOVERED, not guessed — `_compose_rules_block` at
+/// `792ce1f^:amux-server.py:21955`. Three properties come from there and are
+/// worth keeping deliberately:
+///
+/// - Each rule is LABELLED with the layer that set it, so a session can see why
+///   it is constrained without reading source. The python docstring names the
+///   incident: a GEMINI.md that told a lane to bypass gates was invisible for
+///   exactly this reason.
+/// - A more specific layer ADDS to the ones above rather than replacing them,
+///   which is what `merge: concat` has been claiming all along.
+/// - Rules go FIRST in the document. The python call site says why: "a
+///   constraint buried under prose is a constraint the model has to go looking
+///   for."
+fn compose_rules_block(name: &str) -> String {
+    let mut layers: Vec<(String, String)> = Vec::new();
+    let mut take = |label: String, path: std::path::PathBuf| {
+        if let Ok(t) = std::fs::read_to_string(&path) {
+            if !t.trim().is_empty() {
+                layers.push((label, t.trim().to_string()));
+            }
+        }
+    };
+    take("global".to_string(), memory_dir().join("_rules.md"));
+    for g in lane_groups(name) {
+        take(format!("tag:{g}"), memory_dir().join("tags").join(format!("{g}.rules.md")));
+    }
+    take(format!("session:{name}"), memory_dir().join(format!("{name}.rules.md")));
+    if layers.is_empty() {
+        return String::new();
+    }
+    let body = layers
+        .iter()
+        .map(|(l, t)| format!("<!-- from {l} -->\n{t}"))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    format!(
+        "# Rules — binding\n\n         These are constraints, not notes. They are composed from your scope \
+         (global, then any tags, then this session); a more specific layer adds to the \
+         ones above it rather than replacing them. If a rule here conflicts with \
+         something you infer, the rule wins — and if a rule cannot be followed \
+         honestly, say so rather than working around it.\n\n{body}"
+    )
+}
+
+/// Is `name` a fleet lane? The env file is the definition — it is what
+/// `lane_groups` reads for CC_TAGS and what `scope_env_layers` treats as the
+/// worker layer, so this is not a fourth spelling of "does a lane exist".
+pub(crate) fn lane_env_exists(name: &str) -> bool {
+    env_path(name).is_file()
+}
+
+/// `peek` against the FLEET SUBSTRATE, by name (AF-298).
+///
+/// The promoted `/api/workers/{id}/peek` resolves through the worker STORE and
+/// 404s on a miss. The fleet is ~50 env-file-plus-tmux lanes and only one of
+/// them is a store row, so that route answered 404 for essentially every lane
+/// it was asked about. `send` never had the problem because it falls back to
+/// the key and lands here; this is the same landing spot for peek.
+pub(crate) async fn peek_verb(name: &str, qs: &[(String, String)]) -> Response {
+    let lines: i64 = qs_first(qs, "lines", "80").parse().unwrap_or(80);
+    let live_only = qs_flag(qs, "live");
+    let no_trim = qs_flag(qs, "notrim");
+    // Geometry is attached HERE rather than inside peek_response because
+    // that function has six return points (live_only, alt-screen, normal,
+    // short-output, empty…) and a key added to one of them is a key the
+    // reader cannot rely on. One injection site covers every shape.
+    let mut resp = peek_response(name, lines, live_only, no_trim).await;
+    if let (Some((cols, rows)), Some(obj)) =
+        (tmux_pane_geometry(name).await, resp.as_object_mut())
+    {
+        obj.insert("pane_cols".into(), json!(cols));
+        obj.insert("pane_rows".into(), json!(rows));
+    }
+    j200(resp)
+}
+
+/// `duplicate` as a callable verb, so the canonical `/api/workers/{id}/duplicate`
+/// route and the legacy `/api/sessions/{name}/duplicate` spelling run the SAME
+/// code instead of one being a re-implementation of the other (AF-288).
+///
+/// Extracted rather than copied for the reason #137 (@tsukimiya) made explicit
+/// about this verb: the rollback on a failed `register_twin` is what stops a
+/// duplicate existing as an env file the worker store cannot see. A second
+/// implementation of that ordering is a second place for it to be wrong, on the
+/// error path, where nobody looks.
+pub(crate) fn duplicate_verb(state: &AppState, name: &str, body: &Value) -> Response {
+    let new_name = body_str(body, "new_name").trim().to_string();
+    if new_name.is_empty() {
+        return jresp(StatusCode::BAD_REQUEST, json!({"error": "missing new_name"}));
+    }
+    let re = cached_re!(r"[^a-zA-Z0-9_-]");
+    let new_name = re.replace_all(&new_name, "-").into_owned();
+    let new_file = env_path(&new_name);
+    if new_file.exists() {
+        return jresp(StatusCode::CONFLICT, json!({"error": format!("session '{new_name}' already exists")}));
+    }
+    if std::fs::copy(env_path(name), &new_file).is_err() {
+        return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "copy failed"}));
+    }
+    let registered = match register_twin(state, name, &new_name) {
+        Ok(applied) => applied,
+        // FAIL WHOLE, NOT HALF. Leaving the copied env file behind after
+        // a failed insert would produce exactly the unregistered twin
+        // this code exists to prevent, and it would do so on the error
+        // path where nobody looks.
+        Err(e) => {
+            let _ = std::fs::remove_file(&new_file);
+            return jresp(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                json!({"error": format!("could not register '{new_name}' in the worker store; the duplicate was rolled back rather than left invisible: {e}")}),
+            );
+        }
+    };
+    j200(json!({
+        "ok": true,
+        "message": format!("duplicated as {new_name}"),
+        // Say which shape happened, so a caller can tell a registered
+        // twin from a plain env-file copy without going to the store.
+        "registered": registered,
+    }))
 }
 
 /// Give a copied session its own `_amux_workers` row, when the source has one.
@@ -12942,7 +14235,7 @@ async fn subagent_event_post(state: &AppState, name: &str, ev: &str) -> Response
     }
 }
 
-async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
+pub(crate) async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Value) -> Response {
     // ATTRIBUTION (AMUX-2646). A self-report is the one write in amux that is
     // ONLY ever legitimate from inside the session it describes: the hooks
     // that produce it run in that process and post to
@@ -13407,31 +14700,7 @@ async fn report_post(state: &AppState, name: &str, headers: &HeaderMap, body: &V
 
 async fn patch_dispatch(state: &AppState, name: &str, action: &str, body: &Value) -> Response {
     match action {
-        "commit-guard" => {
-            let global = !matches!(
-                std::env::var("AMUX_COMMIT_GUARD").unwrap_or_else(|_| "1".into()).trim().to_lowercase().as_str(),
-                "0" | "false" | "off" | "no"
-            );
-            let raw = body.get("enabled");
-            let override_v = match raw {
-                None | Some(Value::Null) => None,
-                Some(v) => Some(py_truthy(v)),
-            };
-            let f = env_path(name);
-            let mut cfg = parse_env(name);
-            match override_v {
-                None => cfg.remove("AMUX_COMMIT_GUARD_SESSION"),
-                Some(b) => cfg.set("AMUX_COMMIT_GUARD_SESSION", if b { "1" } else { "0" }),
-            }
-            if cfg.write(&f).is_err() {
-                return jresp(StatusCode::INTERNAL_SERVER_ERROR, json!({"error": "could not write session env"}));
-            }
-            let enabled = override_v.unwrap_or(global);
-            j200(json!({
-                "ok": true, "enabled": enabled, "global": global,
-                "override": override_v.map(Value::Bool).unwrap_or(Value::Null),
-            }))
-        }
+        "commit-guard" => commit_guard_patch_verb(name, body),
         "config" => config_patch(state, name, body).await,
         _ => not_found(),
     }
@@ -14246,7 +15515,7 @@ async fn apply_live_config_change(
 /// several branches write one field and then reject a second. Clearing a cache
 /// that did not need clearing costs one rebuild; NOT clearing one that did is
 /// the bug this fixes.
-async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
+pub(crate) async fn config_patch(state: &AppState, name: &str, body: &Value) -> Response {
     let out = config_patch_inner(state, name, body).await;
     crate::api::sessions_legacy::invalidate_sessions_cache();
     out
@@ -14788,7 +16057,7 @@ async fn config_patch_inner(state: &AppState, name: &str, body: &Value) -> Respo
 // share (py:65953-65999) — token CRUD over the shared share_tokens table.
 // ---------------------------------------------------------------------------
 
-async fn share_handler(
+pub(crate) async fn share_handler(
     state: &AppState,
     name: &str,
     method: &Method,
@@ -15309,6 +16578,59 @@ mod tests {
     /// after install, panicked, and the server stopped answering entirely —
     /// TCP still accepted from the kernel backlog while nothing serviced the
     /// TLS hello, which is why it presented as a hang rather than a crash.
+    /// AMUX-3897. The refusal was right and had no expiry, so a claim outlived
+    /// the life that made it and blocked the lane actually on that conversation
+    /// forever.
+    ///
+    /// Every arm carries the control it must not produce, because each is only
+    /// meaningful against the wrong answer next to it. `Refuse` on a fresh claim
+    /// is the load-bearing one: the mechanism's own doc says cross-linking two
+    /// live lanes is strictly WORSE than one lane staying blind, so a change
+    /// that took over eagerly would fix this card by causing the harm the card
+    /// is careful about.
+    #[test]
+    fn a_conversation_claim_expires_only_when_its_owner_stops_confirming_it() {
+        const W: i64 = 1800;
+        let now = 1_000_000i64;
+
+        // The live desktop/ts-gke shape: owner last confirmed two days ago.
+        assert_eq!(
+            conv_claim_verdict(now - 2 * 86_400, now, W),
+            ConvClaim::Takeover,
+            "an owner silent for two days is not on this conversation; a live lane reports \
+             its id every few seconds"
+        );
+        // CONTROL, and the one that matters most: an owner that confirmed a
+        // moment ago keeps its claim. A resumed lane refreshes the stamp on
+        // every report, so this is also what stops two live lanes ping-ponging
+        // an id, which is why the card declined to ship the start-time test.
+        assert_eq!(
+            conv_claim_verdict(now - 5, now, W),
+            ConvClaim::Refuse,
+            "a lane still reporting its own id must keep it — taking it would cross-link two \
+             live lanes, which is worse than the blindness being fixed"
+        );
+        // Exactly at the window: stale. Named so the boundary is a decision
+        // rather than an accident of `>` versus `>=`.
+        assert_eq!(conv_claim_verdict(now - W, now, W), ConvClaim::Takeover);
+        assert_eq!(conv_claim_verdict(now - W + 1, now, W), ConvClaim::Refuse);
+
+        // A claim from before this tracking existed. Its age is UNKNOWN, and
+        // unknown must not read as stale: that would hand a live lane's
+        // conversation away on the first report after a deploy. Start the clock,
+        // refuse once.
+        assert_eq!(
+            conv_claim_verdict(0, now, W),
+            ConvClaim::StampAndRefuse,
+            "an unconfirmed claim is age-unknown, not stale"
+        );
+        assert_eq!(
+            conv_claim_verdict(-1, now, W),
+            ConvClaim::StampAndRefuse,
+            "a junk stamp is treated as unknown, not as infinitely old"
+        );
+    }
+
     #[test]
     fn meta_i64_absent_key_is_zero_not_a_panic() {
         assert_eq!(meta_i64(&pre_cutover_map(), "rate_limited_since"), 0);
@@ -16063,6 +17385,7 @@ mod tests {
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
                 auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
             dir,
         )
@@ -16105,6 +17428,128 @@ mod tests {
             del_d, Some(ts_d),
             "a DIRECT send really was delivered when it was recorded — blanking this too \
              would throw away true information instead of removing false information"
+        );
+    }
+
+    // ── AMUX-3903: a failed send is a fact worth keeping ────────────────────
+
+    /// THE DISCRIMINATOR THE NEW BRANCH RESTS ON. `send_post` records a failed
+    /// send only when `submit_verdict_of` claims it, so that predicate has to
+    /// separate "amux typed the text and it did not submit" from "amux declined
+    /// and typed nothing" across the WHOLE refusal vocabulary. Get it wrong in
+    /// one direction and the failures stay invisible; wrong in the other and
+    /// every unreachable lane files rows about messages never attempted.
+    #[test]
+    fn only_a_send_that_actually_typed_something_is_recorded_as_failed() {
+        // The one failure that put text in the lane.
+        assert_eq!(
+            submit_verdict_of(
+                "not submitted — text is sitting in the input box (autocomplete popup ate the Enter?)"
+            ),
+            Some("stuck"),
+            "this is the row the ledger was missing"
+        );
+
+        // REFUSALS. amux never typed; the caller got a next step. Every one of
+        // these is a real message from `send_text`/`send_failure_status`.
+        for refusal in [
+            "not running",
+            "session 'nope' not found",
+            "invalid session name",
+            "auto-wake failed: session is archived; wake it first",
+            "target is an isolated (raw-agent) worker",
+            "herdr-backed session start is not ported",
+            "iTerm2-backed sessions are not supported",
+            &bg_view_refusal(false),
+            &bg_view_refusal(true),
+        ] {
+            assert_eq!(
+                submit_verdict_of(refusal),
+                None,
+                "a refusal typed nothing and must not become a delivery-failure row: {refusal:?}"
+            );
+        }
+
+        // And the success wordings keep their own verdicts, so widening the
+        // failure branch cannot have quietly reclassified them.
+        assert_eq!(submit_verdict_of("sent"), Some("confirmed"));
+        assert_eq!(submit_verdict_of("sent (Enter was dropped; submitted on retry)"), Some("retried"));
+        assert_eq!(
+            submit_verdict_of(
+                "sent (keys delivered; submission could not be verified — no input box was drawn)"
+            ),
+            Some("unverified")
+        );
+    }
+
+    /// A STUCK ROW MUST NOT CLAIM A DELIVERY TIME. `delivery` says which path
+    /// was taken and Direct is true of a stuck send, so the mode alone stamps
+    /// `delivered_at` — which would re-create AMUX-3541's defect through a new
+    /// door: a column populated on every row reads as a working instrument.
+    #[tokio::test]
+    async fn a_stuck_row_records_the_attempt_and_not_a_delivery() {
+        let (st, _d) = state();
+        cmd_hist_record_full(
+            &st,
+            "lane-stuck",
+            "a message that never submitted",
+            "user",
+            "",
+            false,
+            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") },
+        )
+        .await;
+        let (ts, delivered) = last_row(&st);
+        assert!(ts > 0, "the ATTEMPT is the fact worth keeping — the row must exist");
+        assert_eq!(
+            delivered, None,
+            "the text is in the composer, not in the lane; a delivered_at here is a lie \
+             the same shape as AMUX-3541's"
+        );
+        let verdict: Option<String> = st
+            .store
+            .read()
+            .unwrap()
+            .query_row("SELECT submit_verdict FROM cmd_history ORDER BY id DESC LIMIT 1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(verdict.as_deref(), Some("stuck"), "the value that had never once been written");
+    }
+
+    /// RETRYING AN UNDELIVERED MESSAGE IS NOT A DUPLICATE DELIVERY.
+    ///
+    /// Recording failures gives the duplicate detector rows it never saw. Its
+    /// query matches on (session, text) inside a window, so without this the
+    /// correct response to a failed send — send it again — would be warned
+    /// about as a double delivery, which trains people to ignore the one
+    /// warning that exists for real duplicates.
+    #[tokio::test]
+    async fn a_retry_after_a_failed_send_is_not_flagged_as_a_duplicate() {
+        let (st, _d) = state();
+        let text = "please look at the report";
+        // The failed attempt.
+        cmd_hist_record_full(
+            &st, "lane-dup", text, "user", "", false,
+            DeliveryMeta { delivery: Some(Delivery::Direct), queued_at_ms: None, submit_verdict: Some("stuck") },
+        )
+        .await;
+        // The detector's own query, verbatim, against the seeded table.
+        // THE SHIPPED QUERY, not a restatement of it: a copy here would stay
+        // green if the detector's own SQL changed underneath it.
+        let prior = |st: &AppState| -> Option<(i64, i64)> {
+            prior_delivered(&st.store.read().unwrap(), "lane-dup", text, 0)
+        };
+        assert_eq!(
+            prior(&st),
+            None,
+            "a message that never left the composer is not a prior DELIVERY"
+        );
+
+        // CONTROL: a real delivery of the same text IS a prior, or the filter
+        // above has simply switched the detector off.
+        cmd_hist_record_full(&st, "lane-dup", text, "user", "", false, DeliveryMeta::direct()).await;
+        assert!(
+            prior(&st).is_some(),
+            "a genuine prior delivery must still be found, or the duplicate detector is dead"
         );
     }
 
@@ -16616,6 +18061,48 @@ mod tests {
         }
         // Without this the assertion above is vacuous the day someone renames
         // the statement: zero matches, zero failures, green.
+        assert!(seen >= 6, "expected to inspect at least 6 history inserts, saw {seen}");
+    }
+
+    /// AMUX-3919. Every one of those six inserts must also name an OUTCOME.
+    ///
+    /// Two of them did not, and both were VOID paths — a message deliberately
+    /// NOT delivered. So the rows where the column carries the most information
+    /// were exactly the rows that left it NULL, and a void became
+    /// indistinguishable from a delivery whose outcome went unrecorded. Every
+    /// NULL written by the live code path on 2026-08-30 was one of these: 9 of
+    /// 9, all `[VOIDED: card X left 'doing' -> Y]`.
+    ///
+    /// The information was never missing, only unqueryable: it sat in an
+    /// `[VOIDED: ...]` prefix inside the message TEXT, where no `group by` can
+    /// reach it. Prose in a body is not a field.
+    ///
+    /// Source-level for the same reason as the producer check above: a
+    /// behavioural test proves one path writes an outcome and says nothing
+    /// about the other five, and "five stay right and one silently stops" is
+    /// how this happened in the first place.
+    #[test]
+    fn every_steering_history_insert_names_an_outcome() {
+        let src = include_str!("session_verbs.rs");
+        let mut seen = 0;
+        for (i, _) in src.match_indices("INSERT OR REPLACE INTO steering_history(") {
+            let rest = &src[i..];
+            let end = rest.find(')').expect("an INSERT names its columns");
+            let cols = &rest[..end];
+            // Skip this test's own search literal (see the note above).
+            if !cols.contains("id, session") {
+                continue;
+            }
+            seen += 1;
+            assert!(
+                cols.contains("outcome"),
+                "a steering_history INSERT omits `outcome`, so the row it writes cannot say \
+                 whether the message was delivered, voided or dropped — and a NULL there reads \
+                 identically to all three (AMUX-3919). Columns: {cols}"
+            );
+        }
+        // Same anti-vacuity guard as the producer check: zero matches would be
+        // zero failures and a green run.
         assert!(seen >= 6, "expected to inspect at least 6 history inserts, saw {seen}");
     }
 
@@ -17240,11 +18727,17 @@ mod tests {
         // applies its OWN session check. 404 is the proof the guard let go —
         // and it keeps the test from auto-waking a session and launching a
         // terminal on the machine running it.
+        // The /api/workers/hw/{peek,send} rows are GONE with the catch-all
+        // (AF-204): this router no longer mounts that spelling, so asserting on
+        // it here would pin an axum 404 rather than the exemption. The same
+        // property at the workers spelling is covered where the routes now
+        // live — api::workers::tests::send_route_resolves_a_worker_id_to_its_
+        // session_name and peek_reads_the_live_terminal_and_names_every_non_answer.
+        // Naming them because deleting a row without saying what still covers it
+        // is how a check quietly stops checking (ethos rule 7).
         for (method, path) in [
             ("GET", "/api/sessions/hw/peek"),
             ("POST", "/api/sessions/hw/send"),
-            ("GET", "/api/workers/hw/peek"),
-            ("POST", "/api/workers/hw/send"),
         ] {
             let body = (method == "POST").then(|| json!({"text": "hi"}));
             let (st, v) = call(&app, method, path, body).await;
@@ -17916,6 +19409,71 @@ mod tests {
             CONV3,
             "adoption must happen above the subagent early-return"
         );
+
+        // 7. AMUX-3897: A CLAIM EXPIRES WHEN ITS OWNER STOPS CONFIRMING IT, and
+        //    not before. Step 3 above already covered the first half — `sib`'s
+        //    claim had no confirmation stamp, so it was age-UNKNOWN and the
+        //    refusal stood. Here is the rest of the lifecycle, end to end through
+        //    the real endpoint and real meta files.
+        //
+        //    The live shape this comes from: `desktop` went idle on 2026-08-28
+        //    still holding a conversation that was actually `ts-gke`'s, and
+        //    ts-gke was refused 205 times and stayed blind to the staged guard
+        //    the whole time.
+
+        //    7a. THE OWNER RE-CONFIRMS, so its claim is fresh and still wins.
+        //    This is the control for the ping-pong the card was worried about: a
+        //    RESUMED lane reports the same id, which refreshes the stamp, so it
+        //    can never age out from under itself.
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/sib/report",
+            Some(json!({"state": "idle", "session_id": SIB_CONV})),
+        )
+        .await;
+        assert_eq!(v["conv_id"]["adopted"], json!(false), "owner re-reporting is not an adopt: {v}");
+        let stamped = meta_i64(&load_meta("sib"), "cc_conversation_confirmed_at");
+        assert!(stamped > 0, "an owner re-reporting its own id must stamp a confirmation");
+
+        let (_, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "session_id": SIB_CONV})),
+        )
+        .await;
+        assert_eq!(v["conv_id"]["conflict_with"], json!("sib"), "a FRESH claim must still win: {v}");
+
+        //    7b. THE OWNER GOES SILENT. Backdate the stamp past the window —
+        //    the same state `desktop` was in, two days without a report.
+        let mut sib_meta = load_meta("sib");
+        sib_meta.insert(
+            "cc_conversation_confirmed_at".into(),
+            json!(crate::config::now_f64() as i64 - conv_claim_stale_s() - 1),
+        );
+        std::fs::write(meta_path("sib"), Value::Object(sib_meta).to_string()).unwrap();
+
+        let (st, v) = call(
+            &app,
+            "POST",
+            "/api/sessions/blindy/report",
+            Some(json!({"state": "idle", "session_id": SIB_CONV})),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(
+            v["conv_id"]["adopted"],
+            json!(true),
+            "an owner that stopped confirming must lose the claim, or the blocked lane stays \
+             blind forever — which is the whole of AMUX-3897: {v}"
+        );
+        assert_eq!(meta_str(&load_meta("blindy"), "cc_conversation_id"), SIB_CONV);
+        assert_eq!(
+            meta_str(&load_meta("sib"), "cc_conversation_id"),
+            "",
+            "the stale claim must be RELEASED, not left behind to block the next lane too"
+        );
     }
 }
 
@@ -17932,6 +19490,7 @@ mod steer_boundary_tests {
                 started: std::time::Instant::now(),
                 build_hash: "test".into(),
                 auth_token: None,
+            reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             },
             dir,
         )
@@ -17995,6 +19554,11 @@ mod steer_boundary_tests {
                         gate: vec![],
                         depends_on: vec![],
                         tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        // AF-367: an auto-captured human prompt — the population AF-367 is about.
+                        source: Some("capture".into()),
                     },
                     now_ms / 1000,
                 )?;
@@ -18455,6 +20019,7 @@ mod hot_model_switch_tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let out = deliver_hot_config(&state, "amux-no-such-session-2617", "/model sonnet", CC_MODEL_ACK).await;
         match out {
@@ -18670,6 +20235,112 @@ mod submission_gate_tests {
         assert_eq!(read_frame(&frame_stuck_idle("[06:50 PM] something else"), &t), FrameRead::Cleared);
     }
 
+    /// A COLLAPSED PASTE MUST NOT READ AS SUBMITTED (AMUX-3876).
+    ///
+    /// Claude Code renders a large or multi-line paste as `[Pasted text #54 +8
+    /// lines]`, so the message text is not in the frame at all. The
+    /// `contains(tail_sq)` test therefore fails and the old code fell to
+    /// `Cleared`, which means submitted — while the message sat in the box.
+    ///
+    /// The live specimen this was found from: paid-social sent to gtm-playbooks
+    /// at 13:15:41, `submit_verdict` recorded `confirmed`, and the lane still
+    /// held `[Pastedtext#54+8lines]` unsubmitted fifty minutes later. Ethan
+    /// noticed it as "workers are receiving text in their chat that is
+    /// unsubmitted".
+    ///
+    /// It is not an edge case: `must_paste` picks the paste path whenever the
+    /// lane is generating OR the text exceeds 400 chars, which is most
+    /// worker-to-worker traffic.
+    #[test]
+    fn a_collapsed_paste_is_never_read_as_a_cleared_composer() {
+        let t = tail_sq(GHOST);
+        // The TUI shows the placeholder, never the text we sent.
+        for chip in [
+            "[Pasted text #54 +8 lines]",
+            "[Pasted text #137 +44 lines]",
+        ] {
+            let f = read_frame(&frame_stuck_idle(chip), &t);
+            assert_eq!(
+                f,
+                FrameRead::CollapsedPaste,
+                "a collapsed paste is its OWN verdict: the composer is painted and holding \
+                 something unsubmitted. Folding it into NoUi (AMUX-3876) stopped the false \
+                 CONFIRMED and left the message stranded, because the retry lives past the \
+                 StillThereIdle arm and a waiting arm never reaches it — got {f:?} for {chip:?}"
+            );
+            assert!(
+                !final_frame_confirms(f),
+                "and it must never confirm the send: the message is still in the box"
+            );
+            assert_ne!(
+                f,
+                FrameRead::NoUi,
+                "specifically NOT NoUi: that means 'not painted yet, wait', which is the \
+                 opposite of what an unsubmitted paste needs (AMUX-3880)"
+            );
+        }
+        // CONTROL: an ordinary composer holding our text is unchanged, so the
+        // guard above cannot be passing by swallowing every frame.
+        assert_eq!(
+            read_frame(&frame_stuck_idle(GHOST), &t),
+            FrameRead::StillThereIdle,
+            "a normal unsent message must still read as StillThereIdle"
+        );
+        // CONTROL: a genuinely empty composer still means submitted.
+        assert_eq!(read_frame(&frame_cleared(), &t), FrameRead::Cleared);
+    }
+
+    /// The FINAL frame, after the retry loop gives up, must not confirm a send
+    /// the composer never showed (AMUX-3870).
+    ///
+    /// WHY THIS IS NOT COVERED BY `no_ui_is_never_reported_as_submitted` below,
+    /// which is named for exactly this property and passes. That test calls
+    /// `send_outcome(Submission::Unverified, ..)` and pins the WORDING once the
+    /// submission is already classified. The bug was upstream of it: the
+    /// fall-through decided `NoUi` meant `Confirmed`, so the Unverified branch
+    /// that test guards was never reached. A check pinning the wrong layer is
+    /// exactly as green as one pinning the right layer (ethos rule 7), and this
+    /// pair is the demonstration.
+    ///
+    /// Driven through the REAL reader and the REAL fixtures rather than by
+    /// constructing variants, because frame -> verdict is the path the incident
+    /// took.
+    #[test]
+    fn the_final_frame_does_not_confirm_a_composer_that_never_painted() {
+        let t = tail_sq(GHOST);
+        assert!(
+            !final_frame_confirms(read_frame(&frame_no_ui(), &t)),
+            "an unpainted composer proves nothing; confirming it here is the AC-271 incident \
+             (9 workers across 3 customer envs) reached from the fall-through"
+        );
+        // CONTROLS, so the assertion above cannot be satisfied by a function
+        // that simply returns false for everything.
+        assert!(
+            final_frame_confirms(read_frame(&frame_cleared(), &t)),
+            "a drawn, empty composer IS a submitted send and must stay confirmed"
+        );
+        assert!(
+            final_frame_confirms(read_frame(&frame_stuck_active(GHOST), &t)),
+            "text queued while the lane generates submits at the turn boundary"
+        );
+
+        // EXHAUSTIVE over the enum. The original defect was a negative match
+        // absorbing a variant added later, so the guard has to be that every
+        // variant is a decision somebody made, not that today's four are right.
+        for (frame, confirms) in [
+            (FrameRead::Cleared, true),
+            (FrameRead::StillThereGenerating, true),
+            (FrameRead::NoUi, false),
+            (FrameRead::StillThereIdle, false),
+        ] {
+            assert_eq!(
+                final_frame_confirms(frame),
+                confirms,
+                "{frame:?} must be a deliberate decision at this site"
+            );
+        }
+    }
+
     #[test]
     fn no_ui_is_never_reported_as_submitted() {
         // AC-271: an empty pane is "not ready", not "delivered". `ok` stays
@@ -18806,6 +20477,132 @@ mod composer_state_tests {
     /// NOT the lane's: the placeholder literally says "describe a task for a
     /// new session", and its status bar replaces the normal one.
     const LIVE_BG_MANAGER: &str = "Your conversation moved to the background \u{2014} enter opens it \u{b7} esc returns to it \u{b7} ctrl+c twice quits\n\nNeeds input\n \u{273b} current session     send a prompt to start\n\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[39m\u{276f}\u{a0}\u{1b}[2mdescribe a task for a new session\u{1b}[0m\n\u{2500}\u{2500}\u{2500}\u{2500}\n  \u{23f5}\u{23f5} bypass permissions \u{b7} enter to collapse \u{b7} ctrl+x to delete all \u{b7} ? for shortcuts\n";
+
+    /// `photo-analysis`, a live GEMINI lane, captured 2026-08-30. Verbatim
+    /// `tmux capture-pane -e`, with the border runs shortened and nothing else
+    /// touched.
+    ///
+    /// GEMINI DRAWS A COMPLETELY DIFFERENT COMPOSER and this fixture is the
+    /// whole of AMUX-3889. There is no `\u{276f}` and no `\u{203a}` anywhere in
+    /// the frame: the prompt glyph is `*`, the box is a half-block sandwich
+    /// (`\u{2584}` above, `\u{2580}` below) rather than `\u{2500}` rules, and the
+    /// placeholder is COLOURED grey (38;2;175;175;175) rather than SGR-2 dim,
+    /// so the dim discriminator cannot see it either.
+    const LIVE_GEMINI_PLACEHOLDER: &str = "                                                                                                                                                                                                            \u{1b}[38;2;175;175;175m? for shortcuts\u{1b}[39m\n\u{1b}[2m\u{1b}[38;2;135;135;135m\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\u{2500}\n\u{1b}[0m \u{1b}[38;2;255;135;175mYOLO\u{1b}[38;2;175;175;175m Ctrl+Y\u{1b}[39m                                                                                                                                                                                               \u{1b}[38;2;175;175;175m1 GEMINI.md file\u{1b}[39m\n\u{1b}[38;2;95;95;95m\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\u{2584}\n\u{1b}[39m\u{1b}[48;2;95;95;95m \u{1b}[38;2;255;135;175m* \u{1b}[7m\u{1b}[39m \u{1b}[0m\u{1b}[38;2;175;175;175m\u{1b}[48;2;95;95;95m Type your message or @path/to/file\u{1b}[39m\n\u{1b}[38;2;95;95;95m\u{1b}[49m\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\u{2580}\n\u{1b}[39m \u{1b}[38;2;175;175;175mworkspace (/directory)\u{1b}[39m                                                       \u{1b}[38;2;175;175;175mbranch\u{1b}[39m                                                       \u{1b}[38;2;175;175;175msandbox\u{1b}[39m                                                                   \u{1b}[38;2;175;175;175m/model\u{1b}[39m\n \u{1b}[38;2;255;255;255m~/Dev/ethan.dev-minimal\u{1b}[39m                                                      \u{1b}[38;2;255;255;255mmain\u{1b}[39m                                                         \u{1b}[38;2;255;135;175mno sandbox\u{1b}[39m                                                      \u{1b}[38;2;255;255;255mgemini-2.5-flash\u{1b}[39m\n";
+
+    /// The same lane with a message actually typed in. Built from the frame
+    /// above by the one substitution the TUI makes: the grey placeholder is
+    /// replaced by the user's text in the normal foreground colour.
+    fn gemini_typed(text: &str) -> String {
+        LIVE_GEMINI_PLACEHOLDER.replace(
+            "\u{1b}[38;2;175;175;175m\u{1b}[48;2;95;95;95m Type your message or @path/to/file",
+            &format!("\u{1b}[48;2;95;95;95m {text}"),
+        )
+    }
+
+    /// AMUX-3889: `amux send` reported a DELIVERED message as FAILED on every
+    /// gemini lane, because the verdict scraper only knew Claude Code's box.
+    ///
+    /// `composer_state` finds the composer by `rposition`-ing a line whose
+    /// first character is `\u{276f}` or `\u{203a}`. Gemini has neither, so every
+    /// gemini frame returned `NotVisible`, `read_frame` mapped that to `NoUi`,
+    /// `final_frame_confirms(NoUi)` is false by design, and the retry loop
+    /// spun its twelve looks before returning `Unverified`. The message was in
+    /// the lane the whole time.
+    ///
+    /// The four cells are the ones that behave differently downstream.
+    /// AMUX-3889, the defect UNDER the reported one and the more dangerous of
+    /// the two.
+    ///
+    /// `dim_mask` scanned every semicolon-separated field of an SGR sequence
+    /// and treated a `2` as DIM. In `48;2;95;95;95` that `2` is the marker
+    /// saying "a truecolor triple follows", not SGR 2 — so one background-colour
+    /// sequence turned the rest of the line dim, and `composer_state` reports
+    /// dim text as a placeholder rather than as pending input.
+    ///
+    /// The direction is what makes it worse than the headline bug. A placeholder
+    /// means "nothing pending", `read_frame` turns that into `Cleared`, and
+    /// `Cleared` means SUBMITTED. The sender is told the message landed while it
+    /// is sitting in the box.
+    ///
+    /// It hid because Claude Code paints in 256 colour (`38;5;N`), where the
+    /// second field is 5 and the bug cannot fire. Every fixture in this module
+    /// was 256-colour, so the whole file agreed with itself.
+    #[test]
+    fn a_truecolor_parameter_is_not_the_dim_code() {
+        // The live specimen: gemini's composer background, then ordinary text.
+        let (plain, dim) = dim_mask("\u{1b}[48;2;95;95;95m hello\u{1b}[39m");
+        assert_eq!(plain.trim(), "hello", "truecolor must not dim the line");
+        assert!(dim.is_empty(), "nothing here is dim, got {dim:?}");
+
+        // Foreground truecolor, same shape.
+        let (plain, dim) = dim_mask("\u{1b}[38;2;175;175;175mgrey text\u{1b}[39m");
+        assert_eq!(plain, "grey text");
+        assert!(dim.is_empty(), "got {dim:?}");
+
+        // 256-colour still parses (the form every Claude Code fixture uses),
+        // including the `5` that must be consumed rather than read as a code.
+        let (plain, dim) = dim_mask("\u{1b}[38;5;153m/compact\u{1b}[39m");
+        assert_eq!(plain, "/compact");
+        assert!(dim.is_empty(), "got {dim:?}");
+
+        // THE CONTROL. Real SGR 2 must STILL dim, or this "fix" deletes the
+        // discriminator that separates Claude Code's suggestion from a typed
+        // message — the whole point of `dim_mask`.
+        let (plain, dim) = dim_mask("\u{1b}[2mcontinue with the queue\u{1b}[0m");
+        assert!(plain.is_empty(), "SGR 2 must still mean dim, got plain {plain:?}");
+        assert_eq!(dim, "continue with the queue");
+
+        // And real dim must survive a truecolor sequence in the same run, which
+        // is the combination a naive consume-everything fix would break.
+        let (plain, dim) = dim_mask("\u{1b}[38;2;1;2;3m\u{1b}[2mhint\u{1b}[0m done");
+        assert_eq!(dim, "hint");
+        assert_eq!(plain.trim(), "done");
+    }
+
+    #[test]
+    fn a_gemini_composer_is_read_rather_than_reported_as_no_ui() {
+        // 1. THE BUG. An empty gemini composer is a composer, not an absence.
+        assert_ne!(
+            composer_state(LIVE_GEMINI_PLACEHOLDER),
+            ComposerState::NotVisible,
+            "gemini's box is a drawn composer; NotVisible routes the send to NoUi \
+             and a delivered message is reported as failed"
+        );
+        assert_eq!(
+            composer_state(LIVE_GEMINI_PLACEHOLDER).typed(),
+            None,
+            "the grey `Type your message` hint is a placeholder, and reporting it as \
+             pending input would make every send read as still-in-the-box"
+        );
+
+        // 2. THE CONSEQUENCE, at the site the card is about. An empty composer
+        // after a send means it went in.
+        assert_eq!(
+            read_frame(LIVE_GEMINI_PLACEHOLDER, "somemessagetail"),
+            FrameRead::Cleared,
+            "this is the verdict that was reporting NoUi"
+        );
+        assert!(final_frame_confirms(read_frame(LIVE_GEMINI_PLACEHOLDER, "somemessagetail")));
+
+        // 3. THE CONTROL, and it is the one that must not regress. Real typed
+        // text must still read as real, or the fix trades a false FAILED for a
+        // false CONFIRMED — which is strictly worse (AMUX-3876: the sender is
+        // told it landed and it is sitting in the box).
+        let typed = gemini_typed("[10:24AM] please look at the ranking report");
+        assert_eq!(
+            composer_state(&typed).typed(),
+            Some("[10:24AM]pleaselookattherankingreport"),
+            "frame was: {typed:?}"
+        );
+        assert_eq!(read_frame(&typed, "rankingreport"), FrameRead::StillThereIdle);
+        assert!(!final_frame_confirms(read_frame(&typed, "rankingreport")));
+
+        // 4. A frame with no composer at all is still NotVisible. Without this
+        // the gemini branch could satisfy cell 1 by returning Empty for
+        // everything, which would confirm sends into a pane that never painted.
+        assert_eq!(composer_state("just some scrollback\nand more\n"), ComposerState::NotVisible);
+    }
 
     #[test]
     fn a_dim_suggestion_is_not_pending_input() {
@@ -19286,6 +21083,67 @@ mod steer_max_age_tests {
         ));
     }
 
+    /// AMUX-3815: the banner that says a lane IS limited also says WHEN it
+    /// lifts, and amux read the first half and dropped the second.
+    ///
+    /// The live specimen is `tubescience` at 19:55 on 2026-08-27, whose queue
+    /// got a "will not drain on its own" card while its pane said it would
+    /// resume at 8:30pm. Both phrasings are asserted because a pane shows both.
+    #[test]
+    fn the_rate_limit_banner_yields_the_time_it_says_it_resets() {
+        use chrono::TimeZone;
+        let noon = chrono::Local.with_ymd_and_hms(2026, 8, 27, 12, 0, 0).unwrap();
+        let at = |h, m| chrono::Local.with_ymd_and_hms(2026, 8, 27, h, m, 0).unwrap().timestamp();
+
+        // The live specimen, both lines of it.
+        let live = "\u{2b9d}  You've hit your session limit \u{b7} resets 8:30pm (America/New_York)\n\
+                    \u{26a0} Usage limit reached \u{b7} continuing automatically at 8:30pm \u{b7} esc to cancel";
+        assert_eq!(parse_rate_limit_reset_at(live, noon), Some(at(20, 30)));
+        // Each phrasing alone, and the bare-hour form.
+        assert_eq!(
+            parse_rate_limit_reset_at("resets 8:30pm (America/New_York)", noon),
+            Some(at(20, 30))
+        );
+        assert_eq!(
+            parse_rate_limit_reset_at("continuing automatically at 2pm \u{b7} esc", noon),
+            Some(at(14, 0))
+        );
+        // "resets at 8pm" must not be read by the bare "resets " marker, which
+        // would leave "at 8pm" and parse to nothing. Most specific wins.
+        assert_eq!(parse_rate_limit_reset_at("resets at 8pm", noon), Some(at(20, 0)));
+        // Midnight and noon are the two the 12-hour conversion gets wrong if
+        // written the obvious way.
+        assert_eq!(parse_rate_limit_reset_at("resets 12am", noon), Some(at(0, 0) + 86_400));
+        assert_eq!(parse_rate_limit_reset_at("resets 12pm", noon), Some(at(12, 0)));
+
+        // A time already past today is TOMORROW's — Claude writes "resets 2am"
+        // at 11pm, and reading that as 21 hours ago would mark the lane overdue
+        // the instant it was detected.
+        let eleven_pm = chrono::Local.with_ymd_and_hms(2026, 8, 27, 23, 0, 0).unwrap();
+        assert_eq!(
+            parse_rate_limit_reset_at("continuing automatically at 2am", eleven_pm),
+            Some(at(2, 0) + 86_400)
+        );
+
+        // THE CONTROLS. `None` must stay distinguishable from a time, because
+        // the steering detector suppresses a card on a known future reset and
+        // a `None` read as 0 would suppress every credit-capped lane forever.
+        assert_eq!(parse_rate_limit_reset_at("Usage limit reached", noon), None, "no time at all");
+        assert_eq!(
+            parse_rate_limit_reset_at("/usage-credits to finish what you're working on", noon),
+            None,
+            "the credit-cap banner has no reset clock"
+        );
+        assert_eq!(
+            parse_rate_limit_reset_at("resets 20:30", noon),
+            None,
+            "24-hour is ambiguous against 8:30 once the meridiem is optional; refuse it"
+        );
+        assert_eq!(parse_rate_limit_reset_at("resets 13pm", noon), None, "not a 12-hour hour");
+        assert_eq!(parse_rate_limit_reset_at("resets 8:99pm", noon), None, "not a minute");
+        assert_eq!(parse_rate_limit_reset_at("resets soon", noon), None, "no digits");
+    }
+
 
     /// The policy is the human's, set once (D2). Default is `wait` — press 1 —
     /// because a human pressing 1 on sixty lanes is not a workflow and the
@@ -19749,6 +21607,107 @@ mod delivery_mode_tests {
 }
 
 #[cfg(test)]
+mod steer_coalescing_tests {
+    use super::*;
+    use crate::db::Store;
+    use std::sync::Arc;
+
+    /// A store with lane "lane" REGISTERED. The chokepoint refuses a target it
+    /// cannot resolve ("no-env-file"), which is correct and is why the first
+    /// version of this fixture failed: a lane that does not exist is not a lane
+    /// whose coalescing you can test. `_amux_workers` is the resolution path for
+    /// a rust-managed worker with no env file on disk.
+    async fn store() -> (crate::db::SharedStore, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Arc::new(Store::open(&dir.path().join("steer-test.db")).unwrap());
+        s.write_async(|conn| {
+            conn.execute(
+                "INSERT INTO _amux_workers (id, display_name, created_at, updated_at)
+                 VALUES ('wrk_test_lane', 'lane', 0, 0)",
+                [],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: false, events: vec![] })
+        })
+        .await
+        .unwrap();
+        (s, dir)
+    }
+
+    fn pending(st: &crate::db::SharedStore, session: &str) -> Vec<String> {
+        let conn = st.read().unwrap();
+        let mut q = conn
+            .prepare("SELECT text FROM steering_queue WHERE session=?1 ORDER BY queued_at")
+            .unwrap();
+        let rows: Vec<String> =
+            q.query_map([session], |r| r.get(0)).unwrap().filter_map(|r| r.ok()).collect();
+        rows
+    }
+
+    /// THE CELL THAT WOULD HAVE CAUGHT AMUX-3938. Two DIFFERENT board notes,
+    /// both pending for a lane that has not hit its turn boundary yet.
+    ///
+    /// The coalescing lookup is `WHERE session=? AND guard=?` — no card, no
+    /// text — and every board note enqueues under `board-progress`, so the
+    /// second note overwrote the first IN PLACE. The lane then read one of two
+    /// distinct messages with nothing saying a first had existed. Live
+    /// specimen: three notes to AMUX-3935 inside one second produced one steer
+    /// carrying note 1's `queued_at` and note 2's text.
+    #[tokio::test]
+    async fn two_different_board_notes_both_survive_until_delivery() {
+        let (st, _d) = store().await;
+        steer_enqueue_store(&st, "lane", "note one: context", "board-progress", "peer")
+            .await
+            .unwrap();
+        steer_enqueue_store(&st, "lane", "note two: the verdict", "board-progress", "peer")
+            .await
+            .unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 2, "both notes must be pending, got {got:?}");
+        assert!(got.contains(&"note one: context".to_string()), "the FIRST note survived");
+        assert!(got.contains(&"note two: the verdict".to_string()), "and so did the second");
+    }
+
+    /// CONTROL 1, and the reason this is an allowlist rather than a deletion:
+    /// coalescing is CORRECT for a nudge. auto-compact re-evaluates one
+    /// condition hundreds of times and the reader wants one pending answer with
+    /// current content (AMUX-3557). If this arm ever goes green with two rows,
+    /// the fix has removed coalescing instead of scoping it.
+    #[tokio::test]
+    async fn a_re_evaluated_nudge_still_coalesces_to_one_row() {
+        let (st, _d) = store().await;
+        steer_enqueue_store(&st, "lane", "context is at 12%", "auto-compact", "").await.unwrap();
+        steer_enqueue_store(&st, "lane", "context is at 7%", "auto-compact", "").await.unwrap();
+        let got = pending(&st, "lane");
+        assert_eq!(got.len(), 1, "a guarded nudge must collapse, got {got:?}");
+        assert_eq!(got[0], "context is at 7%", "and the NEWEST text wins");
+    }
+
+    /// CONTROL 2: flood protection at THIS layer is text-based and still works.
+    /// Two byte-identical notes are one message however they are guarded, so
+    /// making board notes non-coalescing must not let a repeat stack.
+    #[tokio::test]
+    async fn an_identical_board_note_still_does_not_stack() {
+        let (st, _d) = store().await;
+        steer_enqueue_store(&st, "lane", "same text", "board-progress", "peer").await.unwrap();
+        steer_enqueue_store(&st, "lane", "same text", "board-progress", "peer").await.unwrap();
+        assert_eq!(pending(&st, "lane").len(), 1, "an identical repeat must not stack");
+    }
+
+    /// CONTROL 3: the guard stays NON-EMPTY for board notes, so the isolation
+    /// gate still refuses them into a raw-agent lane. Switching off coalescing
+    /// by passing an empty guard would have looked identical here and would
+    /// have broken "isolated = zero amux harness" (Ethan, 2026-08-26).
+    #[test]
+    fn a_non_coalescing_guard_is_still_a_guard() {
+        assert!(non_coalescing("board-progress"));
+        assert!(!NON_COALESCING_GUARDS.iter().any(|g| g.is_empty()),
+                "an empty guard would bypass the isolation gate at the chokepoint");
+        assert!(!non_coalescing("auto-compact"), "nudges must keep coalescing");
+        assert!(!non_coalescing(""), "the owner's own send is not a producer");
+    }
+}
+
+#[cfg(test)]
 mod refusal_status_tests {
     use super::*;
 
@@ -20053,6 +22012,46 @@ mod roster_tests {
         assert!(b.contains("remember: the thing"), "content must survive labelling");
     }
 
+    /// Nothing amux writes into MEMORY.md may carry SOURCE indentation (AMUX-3810).
+    ///
+    /// A plain multi-line Rust literal keeps its indentation, so a forgotten `\`
+    /// bakes the code's leading spaces into the value. Both of these strings had
+    /// one, and the damage is not cosmetic: the roster's TABLE HEADER shipped
+    /// with nine leading spaces, which markdown reads as an indented code block,
+    /// so the header of the fleet table was not part of the table in any of the
+    /// ~224 MEMORY.md files that carry it.
+    ///
+    /// This asserts the OUTPUT rather than the source, so it survives any future
+    /// reflow of the literal. The control is the last cell: a check that only
+    /// looked for leading spaces would miss the mid-line run, and a check that
+    /// only looked mid-line would miss the table header.
+    #[test]
+    fn memory_blocks_carry_no_baked_in_source_indentation() {
+        for (what, text) in [
+            ("fleet roster header", FLEET_ROSTER_HEADER.to_string()),
+            ("worker memory block", compose_worker_block("amux", "note")),
+        ] {
+            for (i, line) in text.lines().enumerate() {
+                assert!(
+                    !line.starts_with(' '),
+                    "{what} line {i} is indented, which markdown reads as a code block: {line:?}"
+                );
+                assert!(
+                    !line.contains("   "),
+                    "{what} line {i} carries a swallowed line-continuation: {line:?}"
+                );
+            }
+        }
+        // CONTROL: the assertion above can fail. A literal written the broken way
+        // trips both arms, so neither is decorative.
+        let broken = "ok\n         indented\nrun    of    spaces";
+        assert!(broken.lines().any(|l| l.starts_with(' ')));
+        assert!(broken.lines().any(|l| l.contains("   ")));
+        // And the header still says the things it exists to say.
+        assert!(FLEET_ROSTER_HEADER.contains("| worker | groups | description |"));
+        assert!(FLEET_ROSTER_HEADER.contains("INCLUDING YOU"));
+    }
+
     /// A header over nothing is itself a claim ("this lane recorded nothing").
     #[test]
     fn no_worker_memory_block_when_the_lane_recorded_nothing() {
@@ -20081,6 +22080,455 @@ mod roster_tests {
     fn a_roster_with_no_peers_is_the_empty_string() {
         let r = super::fleet_roster();
         assert!(r.is_empty() || r.contains("| `"), "header without rows: {r}");
+    }
+
+}
+
+/// The gloss that belongs beside THIS `staged_at_hook` value (AMUX-3837).
+///
+/// Written as a function because the first version hardcoded the explanation of
+/// the `-1` sentinel into the message, so a WARN carrying `staged_at_hook=1`
+/// arrived with a sentence about a value it did not have. A live probe of the
+/// arm found it; reading the code had not.
+pub fn empty_commit_hook_gloss(staged_at_hook: Option<usize>) -> &'static str {
+    match staged_at_hook {
+        Some(n) if n > 0 => {
+            "The pre-commit hook saw files staged for this commit, so the index was emptied \
+             between the hook and the write."
+        }
+        Some(_) => "The pre-commit hook also saw nothing staged, so the index was already empty.",
+        None => "staged_at_hook=-1 means the hook did not report, which is not the same as it \
+                 having seen nothing.",
+    }
+}
+
+/// The line an empty commit adds to its card's log.
+///
+/// Pure and separate so the SENTENCE has cells. amux-frustrations' review noted
+/// that the `Some(n)` arm had never rendered in production and that manufacturing
+/// an `--allow-empty` commit in the shared checkout to see it would leave debris
+/// outliving the test. That is right, and it is also the reason the sentence
+/// should not depend on production to be checked at all.
+pub fn empty_commit_card_note(staged_at_hook: Option<usize>) -> String {
+    let seen = match staged_at_hook {
+        Some(n) if n > 0 => format!(
+            " The pre-commit hook saw {n} staged file(s) and this commit has none, so the index \
+             was emptied between the hook and the write."
+        ),
+        Some(_) => " The pre-commit hook also saw nothing staged.".to_string(),
+        None => " (The hook did not report a staged count, so what it saw is unknown rather \
+                 than zero.)"
+            .to_string(),
+    };
+    format!(" — **EMPTY: this commit contains no files. Your change is still uncommitted.**{seen}")
+}
+
+/// Did the commit that just reported itself actually contain anything?
+///
+/// AMUX-3837. `2ee153e2` carried a correct subject, a correct card id, and ZERO
+/// files. `git commit` printed a success line, `git log` showed the commit, and
+/// the change stayed dirty in a SHARED checkout where any lane's `checkout` or
+/// `stash` would have destroyed it. The card was then closed citing that sha.
+/// The defect is not that one commit was wrong: it is that every instrument a
+/// session reaches for to confirm work shipped (the success line, the log, the
+/// card's own commit trail) reads the MESSAGE, and none of them reads the diff.
+///
+/// So the check belongs where a commit already announces itself, which is this
+/// endpoint. That covers any lane, any shell form, and any way the commit was
+/// produced, rather than one hook in one checkout.
+pub mod commit_shape {
+    /// What the reported commit turned out to be.
+    #[derive(Debug, PartialEq, Eq)]
+    pub enum Shape {
+        /// Non-merge, touched at least one path. The ordinary case.
+        Normal(usize),
+        /// Non-merge and touched NOTHING.
+        Empty,
+        /// A merge carries no diff against its first parent here, and that is
+        /// correct rather than suspicious. Seven of the eight zero-file commits
+        /// in this repo's last 120 were merges, so a check that did not carve
+        /// them out would be almost entirely false alarm.
+        Merge,
+        /// The check DID NOT RUN, with the reason. Deliberately distinct from
+        /// `Empty`: a zero we could not measure must never be published as a
+        /// zero we measured (ethos rule 4).
+        Unchecked(&'static str),
+    }
+
+    /// Pure classifier, so the rule has cells without needing a repo on disk.
+    pub fn classify(parents: usize, files: Option<usize>) -> Shape {
+        if parents > 1 {
+            return Shape::Merge;
+        }
+        match files {
+            None => Shape::Unchecked("git did not answer"),
+            Some(0) => Shape::Empty,
+            Some(n) => Shape::Normal(n),
+        }
+    }
+
+    /// A sha we are willing to hand to git. The value arrives from a hook over
+    /// HTTP, so it is validated rather than trusted; `git` is invoked without a
+    /// shell, and this keeps a hostile value from being a plausible ref at all.
+    pub fn usable_sha(sha: &str) -> bool {
+        (7..=40).contains(&sha.len()) && sha.chars().all(|c| c.is_ascii_hexdigit())
+    }
+}
+
+/// Read the shape of `sha` in `dir`. Never panics and never blocks the report:
+/// an unreadable repo yields `Unchecked`, which says so rather than passing.
+pub async fn read_commit_shape(dir: &str, sha: &str) -> commit_shape::Shape {
+    use commit_shape::Shape;
+    if dir.trim().is_empty() {
+        return Shape::Unchecked("no repo dir in the report");
+    }
+    if !commit_shape::usable_sha(sha) {
+        return Shape::Unchecked("sha is not a plain hex object name");
+    }
+    if !std::path::Path::new(dir).is_dir() {
+        return Shape::Unchecked("reported dir is not a directory here");
+    }
+    let git = |args: Vec<String>| {
+        let dir = dir.to_string();
+        async move {
+            tokio::process::Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(args)
+                .output()
+                .await
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        }
+    };
+    // Parent count first: a merge is classified without ever counting files, so
+    // the expensive walk only runs where its answer can mean something.
+    let Some(parents) = git(vec!["show".into(), "-s".into(), "--format=%P".into(), sha.into()]).await
+    else {
+        return Shape::Unchecked("git could not read the commit");
+    };
+    let parents = parents.split_whitespace().count();
+    if parents > 1 {
+        return Shape::Merge;
+    }
+    // `--root` IS LOAD-BEARING. Without it `diff-tree` prints nothing for a
+    // commit with no parent, because there is no parent to diff against, and
+    // the very first commit of any repo would be reported as empty. The live
+    // test below caught exactly that, which is the reason it exercises this
+    // function rather than only the classifier.
+    let files = git(vec![
+        "diff-tree".into(),
+        "--no-commit-id".into(),
+        "--name-only".into(),
+        "-r".into(),
+        "--root".into(),
+        sha.into(),
+    ])
+    .await
+    .map(|out| out.lines().filter(|l| !l.trim().is_empty()).count());
+    commit_shape::classify(parents, files)
+}
+
+#[cfg(test)]
+mod commit_shape_tests {
+    use super::commit_shape::{classify, usable_sha, Shape};
+
+    /// The SENTENCE, which amux-frustrations' review flagged as never having
+    /// rendered in production — and which they were right to refuse to
+    /// manufacture, since an `--allow-empty` commit in a shared checkout to see
+    /// a warning is debris that outlives the test. So it gets cells instead.
+    #[test]
+    fn the_empty_commit_note_says_which_of_the_three_things_it_knows() {
+        use super::{empty_commit_card_note, empty_commit_hook_gloss};
+
+        // THE PAIR. This is the arm the join exists for: N staged at the hook,
+        // zero in the commit, so the index emptied in between.
+        let pair = empty_commit_card_note(Some(3));
+        assert!(pair.contains("saw 3 staged file(s)"), "{pair}");
+        assert!(pair.contains("emptied between the hook and the write"), "{pair}");
+
+        // NOTHING STAGED EITHER. A different fact, and not evidence of the
+        // mid-window emptying.
+        let none_staged = empty_commit_card_note(Some(0));
+        assert!(none_staged.contains("also saw nothing staged"), "{none_staged}");
+        assert!(!none_staged.contains("emptied between"), "must not claim the pair: {none_staged}");
+
+        // NEVER MEASURED. Must not read as either of the above.
+        let unknown = empty_commit_card_note(None);
+        assert!(unknown.contains("unknown rather"), "{unknown}");
+        assert!(!unknown.contains("emptied between"), "{unknown}");
+        assert!(!unknown.contains("also saw nothing"), "{unknown}");
+
+        // All three still lead with the fact that matters to the author.
+        for n in [pair, none_staged, unknown] {
+            assert!(n.contains("still uncommitted"), "{n}");
+        }
+
+        // AND THE WARN GLOSS FOLLOWS THE VALUE IT IS PRINTED BESIDE. The
+        // original explained the -1 sentinel unconditionally, so a line reading
+        // `staged_at_hook=1` carried a sentence about a value it did not have.
+        assert!(empty_commit_hook_gloss(None).contains("staged_at_hook=-1"));
+        assert!(!empty_commit_hook_gloss(Some(3)).contains("-1"), "the -1 gloss is for -1 only");
+        assert!(!empty_commit_hook_gloss(Some(0)).contains("-1"));
+    }
+
+    /// The three states are three states. Collapsing `Unchecked` into `Empty`
+    /// would turn "we could not look" into "your work is missing", which is the
+    /// false alarm that gets a warning ignored.
+    #[test]
+    fn an_unmeasured_commit_is_not_an_empty_one() {
+        assert_eq!(classify(1, Some(3)), Shape::Normal(3));
+        assert_eq!(classify(1, Some(0)), Shape::Empty);
+        assert!(matches!(classify(1, None), Shape::Unchecked(_)));
+        // A merge has no diff of its own here and is never the alarm, even
+        // though its file count is the same zero.
+        assert_eq!(classify(2, Some(0)), Shape::Merge);
+        assert_eq!(classify(3, Some(0)), Shape::Merge);
+        // A root commit has zero parents and IS checkable.
+        assert_eq!(classify(0, Some(0)), Shape::Empty);
+        assert_eq!(classify(0, Some(1)), Shape::Normal(1));
+    }
+
+    /// The sha reaches `git` from an HTTP body, so it is validated, not trusted.
+    #[test]
+    fn only_a_plain_hex_object_name_is_handed_to_git() {
+        assert!(usable_sha("2ee153e2"));
+        assert!(usable_sha("2ee153e26242d9cdbcf5de555e27a8ec513e53b7"));
+        assert!(!usable_sha(""), "empty");
+        assert!(!usable_sha("2ee153"), "too short to be an object name");
+        assert!(!usable_sha("HEAD"), "a ref is not an object name");
+        assert!(!usable_sha("main; rm -rf /"), "no shell metacharacters");
+        assert!(!usable_sha("../../etc/passwd"), "no path traversal");
+        assert!(!usable_sha(&"a".repeat(41)), "longer than any object name");
+    }
+
+    /// THE SHIPPED PATH, against a real git repo, because the pure classifier
+    /// above would stay green if `read_commit_shape` counted the wrong thing or
+    /// never ran git at all. This is the layer the incident happened at.
+    #[tokio::test]
+    async fn a_real_empty_commit_is_told_apart_from_a_real_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let d = tmp.path().to_str().expect("utf8 path").to_string();
+        let git = |args: Vec<&str>| {
+            let d = d.clone();
+            let args: Vec<String> = args.into_iter().map(str::to_string).collect();
+            async move {
+                let out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&d)
+                    .args(&args)
+                    .output()
+                    .await
+                    .expect("git runs");
+                assert!(out.status.success(), "git {args:?} failed");
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            }
+        };
+        git(vec!["init", "-q", "--initial-branch=main", "."]).await;
+        git(vec!["config", "user.email", "t@t"]).await;
+        git(vec!["config", "user.name", "t"]).await;
+        std::fs::write(tmp.path().join("f.txt"), "one\n").expect("write");
+        git(vec!["add", "f.txt"]).await;
+        git(vec!["commit", "-qm", "real"]).await;
+        let real = git(vec!["rev-parse", "HEAD"]).await;
+        // The specimen: a commit that reports success and contains nothing.
+        git(vec!["commit", "-q", "--allow-empty", "-m", "empty"]).await;
+        let empty = git(vec!["rev-parse", "HEAD"]).await;
+        // And a merge, whose identical zero must NOT read as the alarm.
+        git(vec!["checkout", "-q", "-b", "side", &real]).await;
+        std::fs::write(tmp.path().join("g.txt"), "two\n").expect("write");
+        git(vec!["add", "g.txt"]).await;
+        git(vec!["commit", "-qm", "side"]).await;
+        git(vec!["checkout", "-q", "main"]).await;
+        git(vec!["merge", "-q", "--no-ff", "-m", "merge", "side"]).await;
+        let merge = git(vec!["rev-parse", "HEAD"]).await;
+
+        // `real` is also the ROOT commit, which has no parent to diff against. It
+        // read as Empty until `--root` was added, so this cell is the root case.
+        assert_eq!(super::read_commit_shape(&d, &real).await, Shape::Normal(1));
+        assert_eq!(
+            super::read_commit_shape(&d, &empty).await,
+            Shape::Empty,
+            "an empty commit must be caught by the code that actually runs"
+        );
+        assert_eq!(
+            super::read_commit_shape(&d, &merge).await,
+            Shape::Merge,
+            "a merge's zero is not the alarm"
+        );
+        // AND THE REFUSALS SAY SO RATHER THAN PASSING. Each of these would be a
+        // silent `Normal`/`Empty` if the guard clauses were dropped.
+        assert!(matches!(super::read_commit_shape("", &real).await, Shape::Unchecked(_)));
+        assert!(matches!(super::read_commit_shape(&d, "HEAD").await, Shape::Unchecked(_)));
+        assert!(matches!(
+            super::read_commit_shape(&format!("{d}/nope"), &real).await,
+            Shape::Unchecked(_)
+        ));
+        // A well-formed sha that is not in THIS repo is unreadable, not empty.
+        assert!(matches!(
+            super::read_commit_shape(&d, &"0".repeat(40)).await,
+            Shape::Unchecked(_)
+        ));
+    }
+
+    /// AF-295: `env-explain` answers WHICH layer supplied a value, and never the
+    /// value itself.
+    ///
+    /// The secret-leak assertion is the point of the endpoint's design, so it
+    /// carries a CONTROL: the key NAME must appear. Without that, "no secret in
+    /// the body" passes just as well on an error response, an empty body, or a
+    /// 404 — which is the failure mode this whole session has been about.
+    #[tokio::test]
+    async fn env_explain_names_the_winning_layer_and_never_the_value() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("sessions")).unwrap();
+        std::fs::create_dir_all(h.join("env")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(h);
+
+        std::fs::write(h.join("amux.env"), "SECRETKEY=global-sekrit\n").unwrap();
+        std::fs::write(h.join("env/alpha.env"), "SECRETKEY=group-sekrit\n").unwrap();
+        std::fs::write(
+            h.join("sessions/explainee.env"),
+            "CC_TAGS=\"alpha\"\nSECRETKEY=worker-sekrit\n",
+        )
+        .unwrap();
+
+        let qs = vec![("key".to_string(), "SECRETKEY".to_string())];
+        let resp = super::env_explain_verb("explainee", &qs);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let text = v.to_string();
+
+        // CONTROL FIRST: if this fails the assertions below prove nothing.
+        assert!(
+            text.contains("SECRETKEY"),
+            "premise gone — the key name is absent, so a leak check would pass on an empty \
+             answer: {v}"
+        );
+        assert_eq!(
+            v["winner"]["level"],
+            serde_json::json!("worker"),
+            "the most specific layer that defines the key must win: {v}"
+        );
+        assert_eq!(
+            v["layers"].as_array().map(|a| a.len()),
+            Some(3),
+            "all three layers must be walked, global/group/worker: {v}"
+        );
+        for secret in ["global-sekrit", "group-sekrit", "worker-sekrit"] {
+            assert!(
+                !text.contains(secret),
+                "env-explain leaked a value from a 0600 credential file ({secret}): {v}"
+            );
+        }
+    }
+
+
+    /// AF-296: group-level memory reaches the composed document, and its ABSENCE
+    /// changes nothing.
+    ///
+    /// The second half is what makes a fleet-wide composition change safe to
+    /// land. Every lane's MEMORY.md is rebuilt by this code, so the claim that
+    /// matters is not "the group block appears" but "nothing appears when there
+    /// is no group file" — today no `memory/tags/` directory exists anywhere, so
+    /// the change must be inert until someone uses the level.
+    ///
+    /// Ordering is asserted by INDEX, not by presence: global, then group, then
+    /// worker. A composer that appended the group block last would satisfy a
+    /// contains() check while inverting the precedence the scope UI advertises.
+    #[tokio::test]
+    async fn group_memory_composes_between_global_and_worker_and_is_inert_when_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("sessions")).unwrap();
+        std::fs::create_dir_all(h.join("memory/tags")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(h);
+        std::fs::write(h.join("sessions/memtest.env"), "CC_TAGS=\"alpha\"\n").unwrap();
+
+        // CONTROL FIRST: no group file yet, so the composition must be exactly
+        // what it was before this change.
+        let before = super::compose_memory_doc("memtest", "GLOBALTEXT", "WORKERTEXT");
+        assert!(
+            before.contains("WORKERTEXT"),
+            "premise gone — the worker block is missing, so the absence check below would \
+             pass on an empty document: {before}"
+        );
+        assert!(
+            !before.contains("Group memory"),
+            "a lane whose group file does not exist must compose no group block: {before}"
+        );
+
+        std::fs::write(h.join("memory/tags/alpha.md"), "GROUPTEXT").unwrap();
+        let after = super::compose_memory_doc("memtest", "GLOBALTEXT", "WORKERTEXT");
+        let gi = after.find("GROUPTEXT").expect("group memory must reach the document");
+        let wi = after.find("WORKERTEXT").expect("worker memory must still be there");
+        assert!(
+            gi < wi,
+            "group memory must precede worker memory, matching the [global, group, worker] \
+             precedence /api/scope advertises: {after}"
+        );
+        assert!(after.contains("alpha"), "the group must be named in its block: {after}");
+    }
+
+
+    /// AF-297: binding rules compose from all three layers, labelled, and FIRST.
+    ///
+    /// Inert-when-absent is asserted first and is the safety property: no
+    /// `.rules.md` file exists anywhere on this machine, so restoring the
+    /// dropped consumer must change nothing until someone uses the capability.
+    ///
+    /// The LABELS are asserted because they are the point, not decoration. The
+    /// python original records why: a GEMINI.md that told a lane to bypass gates
+    /// was invisible precisely because nothing said which layer a constraint came
+    /// from.
+    #[tokio::test]
+    async fn binding_rules_compose_labelled_and_first_and_are_inert_when_absent() {
+        let home = tempfile::tempdir().unwrap();
+        let h = home.path();
+        std::fs::create_dir_all(h.join("sessions")).unwrap();
+        std::fs::create_dir_all(h.join("memory/tags")).unwrap();
+        let _g = crate::api::settings::test_env::set_home(h);
+        std::fs::write(h.join("sessions/ruled.env"), "CC_TAGS=\"alpha\"\n").unwrap();
+
+        let before = super::compose_memory_doc("ruled", "GLOBALTEXT", "WORKERTEXT");
+        assert!(
+            before.contains("WORKERTEXT"),
+            "premise gone — an empty document would pass the absence check below: {before}"
+        );
+        assert!(
+            !before.contains("Rules — binding"),
+            "no .rules.md exists, so restoring the consumer must compose nothing: {before}"
+        );
+
+        std::fs::write(h.join("memory/_rules.md"), "GLOBALRULE").unwrap();
+        std::fs::write(h.join("memory/tags/alpha.rules.md"), "GROUPRULE").unwrap();
+        std::fs::write(h.join("memory/ruled.rules.md"), "WORKERRULE").unwrap();
+        let after = super::compose_memory_doc("ruled", "GLOBALTEXT", "WORKERTEXT");
+
+        assert!(
+            after.starts_with("# Rules — binding"),
+            "rules must come FIRST: a constraint buried under prose is one the model has to \
+             go looking for: {after}"
+        );
+        for (label, text) in [
+            ("<!-- from global -->", "GLOBALRULE"),
+            ("<!-- from tag:alpha -->", "GROUPRULE"),
+            ("<!-- from session:ruled -->", "WORKERRULE"),
+        ] {
+            assert!(after.contains(text), "{text} did not reach the document: {after}");
+            assert!(
+                after.contains(label),
+                "{text} is present but unlabelled — a session cannot see WHICH layer \
+                 constrained it, which is the defect the labels exist for: {after}"
+            );
+        }
+        let (gi, wi) = (
+            after.find("GLOBALRULE").unwrap(),
+            after.find("WORKERRULE").unwrap(),
+        );
+        assert!(gi < wi, "layers compose least-specific first: {after}");
     }
 
 }

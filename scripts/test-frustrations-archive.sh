@@ -213,5 +213,37 @@ resolved=$(amux url 2>/dev/null)
 want "(z) the tool resolves amux-url to the CLOSED port, not the live server" \
      "$resolved" "https://127.0.0.1:9"
 
+# ---- (r) THE CARRY RETRIES A TRANSPORT FAILURE (AF-362) ---------------------
+# The entry MOVE is a local file write and always succeeds; only the card carry
+# can fail. So a server that is merely MID-RESTART produced a half-done
+# retirement: entry gone from frustrations.md, SYMPTOM and COST never reaching
+# the card that AF-38's rule keeps them for. Measured live on 2026-08-31, where
+# AMUX-3887 and AMUX-3723 both returned `NOT carried (curl exit 7, 0 bytes)`
+# while /api/health showed uptime_s=11 moments later. This box swaps the server
+# binary on every commit, so a batch archive reliably straddles one.
+#
+# The observable is TIME. Against the closed port every attempt fails fast, so a
+# single attempt returns in well under a second and three attempts cannot return
+# before the two 2s sleeps between them have elapsed. A floor, never a ceiling:
+# asserting "under N seconds" would be the flaky direction.
+#
+# It still must REPORT the failure rather than swallow it — a retry that ended in
+# a false success would be worse than no retry, and cell (r2) is that control.
+R=$TMP/retry; build "$R"
+RLN=$(cd "$R" && python3 scripts/frustrations-archive.py --list | grep -F "TARGET entry" | awk '{print $1}' | tr -d 'L')
+_t0=$(date +%s)
+( cd "$R" && python3 scripts/frustrations-archive.py "$RLN" tester --evidence-stdin >"$R/out.txt" 2>&1 <<'EV'
+validated: the carry is being exercised against a closed port on purpose
+EV
+)
+_t1=$(date +%s)
+_elapsed=$((_t1 - _t0))
+if [ "$_elapsed" -ge 4 ]; then
+  ok "(r) the carry retries a transport failure (took ${_elapsed}s, floor 4s for 3 attempts)"
+else
+  bad "(r) the carry returned in ${_elapsed}s — too fast to have retried; a single attempt against a closed port is instant"
+fi
+has "(r2) and an unreachable server is still REPORTED, not swallowed" "NOT carried" "$R/out.txt"
+
 printf '\n  %d passed, %d failed\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || exit 1

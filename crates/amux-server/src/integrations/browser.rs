@@ -292,6 +292,10 @@ pub struct RunningBrowser {
     pub user_data_dir: PathBuf,
     pub cdp_port: u16,
     pub started_at: i64,
+    /// Unix timestamp of the last navigate/screenshot/action verb. Stamped by
+    /// `touch_verb` on every driver call so the reaper can detect stale browsers
+    /// that have pages open but nobody driving them (2026-08-30).
+    pub last_verb_at: i64,
     /// Always known. `child` is None for a browser ADOPTED after a server
     /// restart — we did not spawn it, so we have no handle, but we can still
     /// speak CDP to it and still kill it by pid.
@@ -314,13 +318,70 @@ pub struct RunningBrowser {
 /// A caller told only "someone else holds this" must choose between blocking
 /// forever and destroying possibly-live state, which is a shared single-instance
 /// resource whose only escape hatch is destructive.
-pub fn running_snapshot() -> Option<(String, String, i64, u32, u16)> {
+/// One profile's browser, if it is running.
+pub fn running_snapshot_for(profile: &str) -> Option<(String, String, i64, u32, u16)> {
     RUNNING
         .lock()
         .expect("browser registry poisoned")
-        .as_ref()
+        .get(profile)
         .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port))
 }
+
+/// Every running browser, newest first. The status verb renders all of them;
+/// nothing may assume a single one (AMUX-3828).
+/// Tuple: (profile, started_by, started_at, pid, cdp_port, last_verb_at)
+pub fn running_all() -> Vec<(String, String, i64, u32, u16, i64)> {
+    let mut v: Vec<_> = RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .values()
+        .map(|r| (r.profile.clone(), r.started_by.clone(), r.started_at, r.pid, r.cdp_port, r.last_verb_at))
+        .collect();
+    v.sort_by_key(|r| std::cmp::Reverse(r.2));
+    v
+}
+
+/// Stamp the current time as the last verb on a profile. Called by every
+/// driver verb (navigate, screenshot, action, state) so the reaper can tell
+/// "browser with open page but nobody driving it" from "browser in active use".
+pub fn touch_verb(profile: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if let Ok(mut g) = RUNNING.lock() {
+        if let Some(b) = g.get_mut(profile) {
+            b.last_verb_at = now;
+        }
+    }
+}
+
+/// Like `touch_verb` but looks up the browser by `started_by` == session.
+/// Mirrors the `port_for_session` fallback: if no owner matches but exactly
+/// one browser is running, that browser gets the stamp (it is the one being
+/// driven). Called from API verb handlers where we have the session name.
+pub fn touch_verb_for_session(session: &str) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    if let Ok(mut g) = RUNNING.lock() {
+        // Prefer the browser owned by this session.
+        if !session.is_empty() {
+            if let Some(b) = g.values_mut().find(|b| b.started_by == session) {
+                b.last_verb_at = now;
+                return;
+            }
+        }
+        // Single-browser fallback: mirrors port_for_session.
+        if g.len() == 1 {
+            if let Some(b) = g.values_mut().next() {
+                b.last_verb_at = now;
+            }
+        }
+    }
+}
+
 
 /// Why the last browser is gone (AMUX-3414: a silent Chrome exit left NOTHING
 /// on record — no API call in the window, no exit reason anywhere, and two
@@ -350,7 +411,17 @@ fn spawn_exit_monitor() {
             type DeadBrowser = (String, u32, String, Option<i32>, Option<i32>);
             let dead: Option<DeadBrowser> = {
                 let mut g = RUNNING.lock().expect("browser registry poisoned");
-                match g.as_mut() {
+                // FIRST dead browser this tick, if any. One per tick is fine at
+                // a 5s cadence and keeps the borrow simple; the next tick takes
+                // the next corpse (AMUX-3828).
+                let mut dead_key: Option<String> = None;
+                for (k, rb) in g.iter_mut() {
+                    if rb.child.as_mut().is_some_and(|c| matches!(c.try_wait(), Ok(Some(_)))) {
+                        dead_key = Some(k.clone());
+                        break;
+                    }
+                }
+                match dead_key.and_then(|k| g.get_mut(&k)) {
                     None => None,
                     Some(rb) => match rb.child.as_mut() {
                         Some(child) => match child.try_wait() {
@@ -369,9 +440,18 @@ fn spawn_exit_monitor() {
             };
             // Adopted browser (no child handle): poll liveness outside the lock.
             let adopted_dead = if dead.is_none() {
-                let snap = running_snapshot();
+                // The first ADOPTED browser (no child handle) whose pid is
+                // gone. Checked one per tick like the spawned case above; with
+                // several browsers the next tick takes the next (AMUX-3828).
+                let snap = running_all().into_iter().find(|(p, _, _, _, _, _)| {
+                    RUNNING
+                        .lock()
+                        .expect("browser registry poisoned")
+                        .get(p)
+                        .is_some_and(|r| r.child.is_none())
+                });
                 match snap {
-                    Some((profile, owner, _, pid, _)) => {
+                    Some((profile, owner, _, pid, _, _)) => {
                         let alive = tokio::process::Command::new("kill")
                             .args(["-0", &pid.to_string()])
                             .status()
@@ -380,7 +460,11 @@ fn spawn_exit_monitor() {
                             .unwrap_or(true); // cannot poll ≠ dead
                         // Only report dead if the registry STILL names this pid
                         // (a stop/start between poll and here changes the pid).
-                        if !alive && running_snapshot().map(|(_, _, _, p, _)| p) == Some(pid) {
+                        // Still the SAME pid under THIS profile (a stop/start
+                        // between poll and here changes it).
+                        if !alive
+                            && running_snapshot_for(&profile).map(|(_, _, _, p, _)| p) == Some(pid)
+                        {
                             Some((profile, pid, owner, None, None))
                         } else {
                             None
@@ -406,8 +490,8 @@ fn spawn_exit_monitor() {
                     "code": code,
                     "signal": signal,
                 }));
-                *RUNNING.lock().expect("browser registry poisoned") = None;
-                clear_running(&amux_home());
+                RUNNING.lock().expect("browser registry poisoned").remove(&profile);
+                clear_running_for(&amux_home(), &profile);
             }
         }
     });
@@ -417,11 +501,20 @@ fn spawn_exit_monitor() {
 /// exercise the refusal WITHOUT launching a Chrome. `child` stays None.
 #[cfg(test)]
 pub fn test_seed_running(profile: &str, started_by: &str, pid: u32) {
-    *RUNNING.lock().expect("browser registry poisoned") = Some(RunningBrowser {
+    test_seed_running_port(profile, started_by, pid, 1)
+}
+
+/// Seed with an explicit CDP port. Two seeded browsers must be able to DIFFER
+/// in port, or a test asserting that two workers get different browsers passes
+/// vacuously against a registry that hands both the same one (AMUX-3828).
+#[cfg(test)]
+pub fn test_seed_running_port(profile: &str, started_by: &str, pid: u32, port: u16) {
+    RUNNING.lock().expect("browser registry poisoned").insert(profile.to_string(), RunningBrowser {
         profile: profile.into(),
         user_data_dir: PathBuf::new(),
-        cdp_port: 1,
+        cdp_port: port,
         started_at: 0,
+        last_verb_at: 0,
         pid,
         started_by: started_by.into(),
         child: None,
@@ -429,7 +522,7 @@ pub fn test_seed_running(profile: &str, started_by: &str, pid: u32) {
 }
 #[cfg(test)]
 pub fn test_clear_running() {
-    *RUNNING.lock().expect("browser registry poisoned") = None;
+    RUNNING.lock().expect("browser registry poisoned").clear();
 }
 
 /// Where the handle survives a restart (AC-325).
@@ -449,18 +542,72 @@ fn running_state_path(home: &Path) -> PathBuf {
     home.join("browser-running.json")
 }
 
-fn persist_running(home: &Path, profile: &str, dir: &Path, port: u16, pid: u32, started: i64, started_by: &str) {
-    let v = serde_json::json!({
-        "profile": profile,
-        "user_data_dir": dir.to_string_lossy(),
-        "cdp_port": port,
-        "pid": pid,
-        "started_at": started,
-        "started_by": started_by,
-    });
-    let _ = std::fs::write(running_state_path(home), v.to_string());
+/// The running-file, as a MAP keyed by profile (AMUX-3828).
+///
+/// One file holding every browser, rather than one file per profile: profile
+/// names are user input and would have to be sanitised into filenames, and a
+/// traversal bug in a path built from a profile name is a worse failure than
+/// anything this file is protecting. Rewritten whole on every change, always
+/// under the RUNNING lock, so two concurrent starts cannot interleave a
+/// read-modify-write.
+///
+/// READS TOLERATE THE LEGACY SHAPE. Before this change the file was a single
+/// bare object; a server that upgrades mid-flight must still adopt the browser
+/// it left behind rather than orphaning a live Chrome nobody can stop.
+fn read_running_file(home: &Path) -> std::collections::HashMap<String, serde_json::Value> {
+    let Ok(raw) = std::fs::read_to_string(running_state_path(home)) else {
+        return Default::default();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else {
+        return Default::default();
+    };
+    // Legacy: a bare record with a `pid` at the top level.
+    if v.get("pid").is_some() {
+        let profile =
+            v.get("profile").and_then(serde_json::Value::as_str).unwrap_or("default").to_string();
+        return std::collections::HashMap::from([(profile, v)]);
+    }
+    v.as_object()
+        .map(|o| o.iter().map(|(k, x)| (k.clone(), x.clone())).collect())
+        .unwrap_or_default()
 }
 
+fn write_running_file(home: &Path, map: &std::collections::HashMap<String, serde_json::Value>) {
+    let obj: serde_json::Map<String, serde_json::Value> =
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let _ = std::fs::write(running_state_path(home), serde_json::Value::Object(obj).to_string());
+}
+
+fn persist_running(home: &Path, profile: &str, dir: &Path, port: u16, pid: u32, started: i64, started_by: &str) {
+    let mut map = read_running_file(home);
+    map.insert(
+        profile.to_string(),
+        serde_json::json!({
+            "profile": profile,
+            "user_data_dir": dir.to_string_lossy(),
+            "cdp_port": port,
+            "pid": pid,
+            "started_at": started,
+            "started_by": started_by,
+        }),
+    );
+    write_running_file(home, &map);
+}
+
+/// Drop ONE profile's record. The others must survive — clearing the whole file
+/// on a single browser's death is how the remaining ones become unadoptable
+/// orphans after a restart.
+fn clear_running_for(home: &Path, profile: &str) {
+    let mut map = read_running_file(home);
+    map.remove(profile);
+    if map.is_empty() {
+        let _ = std::fs::remove_file(running_state_path(home));
+    } else {
+        write_running_file(home, &map);
+    }
+}
+
+#[allow(dead_code)]
 fn clear_running(home: &Path) {
     let _ = std::fs::remove_file(running_state_path(home));
 }
@@ -472,11 +619,24 @@ fn clear_running(home: &Path) {
 /// that would replace an honest "not running" with a confident wrong handle,
 /// which is worse than the bug being fixed.
 pub async fn adopt_if_orphaned(home: &Path) -> bool {
-    if RUNNING.lock().expect("browser registry poisoned").is_some() {
-        return false;
+    // EVERY persisted record, not the first (AMUX-3828). With N browsers a
+    // restart leaves N orphans, and adopting only one leaves the rest live but
+    // unmanaged — running Chromes nobody can stop, holding profiles nobody can
+    // reuse. Each is judged on its own liveness.
+    let mut adopted_any = false;
+    for (prof_key, v) in read_running_file(home) {
+        if RUNNING.lock().expect("browser registry poisoned").contains_key(&prof_key) {
+            continue;
+        }
+        if adopt_one(home, &v).await {
+            adopted_any = true;
+        }
     }
-    let Ok(raw) = std::fs::read_to_string(running_state_path(home)) else { return false };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) else { return false };
+    adopted_any
+}
+
+/// Adopt ONE persisted record if its browser is genuinely alive.
+async fn adopt_one(home: &Path, v: &serde_json::Value) -> bool {
     let port = v.get("cdp_port").and_then(serde_json::Value::as_u64).unwrap_or(0) as u16;
     let pid = v.get("pid").and_then(serde_json::Value::as_u64).unwrap_or(0) as u32;
     if port == 0 || pid == 0 {
@@ -511,7 +671,7 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
             "code": serde_json::Value::Null,
             "signal": serde_json::Value::Null,
         }));
-        clear_running(home);
+        clear_running_for(home, profile);
         return false;
     }
     let profile = v.get("profile").and_then(serde_json::Value::as_str).unwrap_or("default").to_string();
@@ -523,11 +683,12 @@ pub async fn adopt_if_orphaned(home: &Path) -> bool {
     let started = v.get("started_at").and_then(serde_json::Value::as_i64).unwrap_or(0);
     let started_by =
         v.get("started_by").and_then(serde_json::Value::as_str).unwrap_or("").to_string();
-    *RUNNING.lock().expect("browser registry poisoned") = Some(RunningBrowser {
+    RUNNING.lock().expect("browser registry poisoned").insert(profile.clone(), RunningBrowser {
         profile,
         user_data_dir: dir,
         cdp_port: port,
         started_at: started,
+        last_verb_at: started,
         pid,
         started_by,
         child: None,
@@ -656,9 +817,16 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     // Runs LAST and unconditionally, including after `adopt_if_orphaned`
     // returned early — the adopted one is a legitimate tenant and is excluded
     // by pid, but its co-tenants are not.
-    let adopted = running_snapshot().map(|(_, _, _, pid, _)| pid).unwrap_or(0);
-    let strays: Vec<u32> =
-        live_chromes_on_dir(home, target_dir).into_iter().filter(|p| *p != adopted).collect();
+    // EVERY registered pid is a legitimate tenant, not just one (AMUX-3828).
+    // With N browsers, filtering on a single pid would have this loop kill its
+    // own siblings — the exact "two Chromes on one dir" harm it exists to stop,
+    // caused by the fix for it.
+    let adopted: std::collections::HashSet<u32> =
+        running_all().into_iter().map(|(_, _, _, pid, _, _)| pid).collect();
+    let strays: Vec<u32> = live_chromes_on_dir(home, target_dir)
+        .into_iter()
+        .filter(|p| !adopted.contains(p))
+        .collect();
     for pid in &strays {
         tracing::warn!(
             pid, dir = %target_dir.display(),
@@ -681,7 +849,20 @@ async fn reconcile_orphan_before_launch(home: &Path, target_dir: &Path) {
     }
 }
 
-pub static RUNNING: LazyLock<Mutex<Option<RunningBrowser>>> = LazyLock::new(|| Mutex::new(None));
+/// EVERY RUNNING BROWSER, KEYED BY PROFILE (AMUX-3828; Ethan: "multiple
+/// browsers shouldnt be an issue").
+///
+/// One slot per PROFILE, not per machine and not per session, because the
+/// invariant this registry exists to protect is a filesystem one: two Chrome
+/// processes on one `user_data_dir` corrupt it. Profiles are separate
+/// directories under `playwright-auth/profiles/`, so N browsers on N profiles
+/// is safe by construction — and keying by SESSION would have permitted the one
+/// arrangement that is not.
+///
+/// The map is the guard: an occupied key IS the refusal, so the safety property
+/// cannot drift from the data structure the way a separate check would.
+pub static RUNNING: LazyLock<Mutex<std::collections::HashMap<String, RunningBrowser>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 /// Locate a Chrome/Chromium binary. None is an honest answer the API
 /// surfaces as 501 — not a fallback to some other browser.
@@ -975,11 +1156,13 @@ pub async fn start(
     let target = launch_target(home, &chrome_user_data_dir(), profile);
     reconcile_orphan_before_launch(home, &target.user_data_dir).await;
 
-    // One running browser: replace, never silently stack a second Chrome on the
-    // same profile (two Chromes on one user-data-dir corrupt it). After the
-    // reconcile above, a live orphan is adopted into RUNNING and stopped here.
-    if RUNNING.lock().expect("browser registry poisoned").is_some() {
-        let _ = stop(home).await;
+    // ONE BROWSER PER PROFILE, and only this profile (AMUX-3828). This used to
+    // stop whatever was running, which is what made the browser a machine
+    // singleton. The invariant was never "one Chrome" — it is "one Chrome per
+    // user_data_dir", because that is what corrupts. A browser on a DIFFERENT
+    // profile is a legitimate neighbour and is left alone.
+    if RUNNING.lock().expect("browser registry poisoned").contains_key(profile) {
+        let _ = stop_profile(home, profile).await;
     }
 
     if is_amux_owned(home, &target.user_data_dir) {
@@ -1196,11 +1379,12 @@ pub async fn start(
     // `kill` would interpret as the whole process group.
     let pid_num = pid.ok_or_else(|| anyhow::anyhow!("chrome spawned without a pid"))?;
     let udd_for_state = target.user_data_dir.clone();
-    *RUNNING.lock().expect("browser registry poisoned") = Some(RunningBrowser {
+    RUNNING.lock().expect("browser registry poisoned").insert(profile.to_string(), RunningBrowser {
         profile: profile.to_string(),
         user_data_dir: target.user_data_dir,
         cdp_port: port,
         started_at,
+        last_verb_at: started_at,
         pid: pid_num,
         // Ownership is the EXPLICIT attribution, never the tab-binding
         // default ("amux") — an anonymous start records "" so the guard can
@@ -1234,11 +1418,31 @@ pub async fn stop(home: &Path) -> StopReport {
     stop_as(home, "").await
 }
 
+/// Stop ONE profile's browser, leaving every other running (AMUX-3828).
+pub async fn stop_profile(home: &Path, profile: &str) -> StopReport {
+    stop_profile_as(home, profile, "").await
+}
+
 /// Stop, recording WHO in last_exit (AMUX-3063: an unattributed stop is half
 /// of how a staged login died anonymously; the request log had the row but
 /// nothing browser-side named the actor or the owner it took the browser from).
 pub async fn stop_as(home: &Path, stopped_by: &str) -> StopReport {
-    let running = RUNNING.lock().expect("browser registry poisoned").take();
+    // No profile named: stop the OLDEST, which is the closest honest reading of
+    // a bare `stop` now that there can be several (AMUX-3828). The API layer
+    // always names one; this arm exists for internal callers and tests.
+    let oldest = {
+        let g = RUNNING.lock().expect("browser registry poisoned");
+        g.values().min_by_key(|r| r.started_at).map(|r| r.profile.clone())
+    };
+    let Some(profile) = oldest else {
+        return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
+    };
+    stop_profile_as(home, &profile, stopped_by).await
+}
+
+/// [`stop_as`] for one named profile.
+pub async fn stop_profile_as(home: &Path, profile: &str, stopped_by: &str) -> StopReport {
+    let running = RUNNING.lock().expect("browser registry poisoned").remove(profile);
     let Some(mut running) = running else {
         return StopReport { stopped: false, profile: None, clean_exit: None, locks_cleaned: vec![] };
     };
@@ -1564,6 +1768,223 @@ pub async fn resolve_page(session: &str, create_url: Option<&str>) -> Result<Dri
 pub static STALE_BINDING_RECOVERIES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// The registry row for a CDP port: (profile, started_by, pid).
+///
+/// READS THE STRUCT BY FIELD NAME, deliberately, rather than going through
+/// `running_all()`. That helper returns a positional tuple which peers widen as
+/// the reaper grows — it gained a sixth element on 2026-08-30, mid-edit, and
+/// every destructuring call site broke at once for a field none of them wanted.
+/// Naming the three fields this path actually needs makes the next widening a
+/// non-event here.
+fn registry_row_for_port(port: u16) -> Option<(String, String, u32)> {
+    RUNNING
+        .lock()
+        .expect("browser registry poisoned")
+        .values()
+        .find(|r| r.cdp_port == port)
+        .map(|r| (r.profile.clone(), r.started_by.clone(), r.pid))
+}
+
+/// How many times a verb found the registry naming a browser whose PROCESS is
+/// gone (AMUX-3886). Read by `GET /api/browser/status`.
+pub static DEAD_BROWSER_RECOVERIES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Is `pid` a currently-live process? `kill(pid, 0)` sends no signal but
+/// performs the existence+permission check — Ok/EPERM means alive, ESRCH means
+/// gone.
+fn pid_alive(pid: u32) -> bool {
+    // SAFETY: kill with signal 0 is the canonical liveness probe; it touches
+    // no memory and cannot affect the target.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// What a `/json/list` failure on a registered port MEANS. Pure on purpose.
+///
+/// PURE FOR THE SAME REASON AS `choose_target`. The effectful version has to
+/// clear the registry, rewrite the running-file under `~/.amux` and record a
+/// corpse; a test that drove it would reach the REAL `~/.amux` and could clear
+/// a live lane's browser (AF-111 is exactly this hazard). Splitting the
+/// decision out is what makes the check runnable in CI at all, rather than an
+/// `#[ignore]`d live test that never fails because it never executes.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum CdpListVerdict {
+    /// The registry no longer names this port — a stop raced us. Nothing to
+    /// clear, no pid to judge; report the CDP fault with its cause.
+    Unregistered,
+    /// The process is ALIVE and its CDP port did not answer: wedged or
+    /// refusing, not gone. A real 502, and the pid is what makes it diagnosable.
+    Wedged { pid: u32, profile: String },
+    /// The process is GONE while the registry still named it. The caller's
+    /// fixable state, not amux failing.
+    Gone { pid: u32, profile: String, started_by: String },
+}
+
+/// The rule, separated from its side effects. `entry` is the registry row for
+/// the port (profile, started_by, pid), `alive` its `kill -0` result.
+pub(crate) fn classify_cdp_list_failure(
+    entry: Option<(String, String, u32)>,
+    alive: bool,
+) -> CdpListVerdict {
+    match entry {
+        None => CdpListVerdict::Unregistered,
+        Some((profile, _, pid)) if alive => CdpListVerdict::Wedged { pid, profile },
+        Some((profile, started_by, pid)) => CdpListVerdict::Gone { pid, profile, started_by },
+    }
+}
+
+/// `/json/list` failed on a port the registry says is ours. SAY WHICH FAULT
+/// THIS IS before handing it back.
+///
+/// AMUX-3886. Two 502s from `general-canvas-apps` on 2026-08-29 carried
+/// `error sending request for url (http://127.0.0.1:49731/json/list)` and
+/// nothing else, and the server log had NO line for either — the whole
+/// `cdp_list` failure path was silent. Three different faults reach this point
+/// and the old code could not tell them apart, because the one string it
+/// produced is identical for a refused connect, a DNS failure and a timeout.
+///
+/// A GONE process must not wear a 5xx: that is the caller's fixable state
+/// (start a browser), which is the card's own instruction — "if this is really
+/// a refusal, the fix is the STATUS CODE, not the caller". The corpse is
+/// recorded exactly as `adopt_one` records it, and the registry cleared, so the
+/// next verb says `NotRunning` instead of retrying a dead port.
+///
+/// The exit monitor polls every 5s and would eventually notice a dead pid; this
+/// runs on the REQUEST, so the caller that hits the gap gets the answer rather
+/// than a 502 that reads as a mystery.
+async fn cdp_list_failure(session: &str, port: u16, e: anyhow::Error) -> DriverError {
+    let entry = registry_row_for_port(port);
+    let alive = entry.as_ref().is_some_and(|(_, _, pid)| pid_alive(*pid));
+    match classify_cdp_list_failure(entry, alive) {
+        CdpListVerdict::Unregistered => {
+            tracing::warn!(
+                session, port, cause = %format!("{e:#}"),
+                "browser: /json/list failed on a port no longer in the registry (AMUX-3886)"
+            );
+            DriverError::Cdp(e)
+        }
+        CdpListVerdict::Wedged { pid, profile } => {
+            tracing::warn!(
+                session, port, pid, profile, cause = %format!("{e:#}"),
+                "browser: Chrome is ALIVE but its CDP port did not answer — wedged or refusing, \
+                 not gone; the registry is left intact (AMUX-3886)"
+            );
+            DriverError::Cdp(e.context(format!(
+                "Chrome pid {pid} (profile {profile:?}) is ALIVE but its CDP port {port} did not \
+                 answer /json/list, so the browser is wedged or refusing rather than gone. \
+                 POST /api/browser/stop then /api/browser/start to replace it"
+            )))
+        }
+        CdpListVerdict::Gone { pid, profile, started_by } => {
+            tracing::warn!(
+                session, port, pid, profile, started_by = %started_by, cause = %format!("{e:#}"),
+                "browser: the registry named a browser whose PROCESS IS GONE — recording \
+                 last_exit, clearing the registry, and answering the caller with the fixable \
+                 state instead of a 502 (AMUX-3886)"
+            );
+            *LAST_EXIT.lock().expect("last-exit poisoned") = Some(serde_json::json!({
+                "ts": chrono::Utc::now().timestamp(),
+                "reason": "found dead on a verb (the registry still named it; CDP and the pid are both gone)",
+                "profile": profile,
+                "pid": pid,
+                "started_by": started_by,
+                "code": serde_json::Value::Null,
+                "signal": serde_json::Value::Null,
+            }));
+            RUNNING.lock().expect("browser registry poisoned").remove(&profile);
+            NATIVE_TARGETS.lock().expect("native targets poisoned").remove(session);
+            clear_running_for(&amux_home(), &profile);
+            DEAD_BROWSER_RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DriverError::NotRunning
+        }
+    }
+}
+
+#[cfg(test)]
+mod cdp_list_failure_tests {
+    use super::*;
+
+    /// THE DEFECT AMUX-3886 IS ABOUT, pinned against a real socket.
+    ///
+    /// `to_string()` on the error `cdp_list` returns prints the outermost frame
+    /// only. That frame names the URL and NOTHING about the fault, so a refused
+    /// connect, a DNS failure and a timeout all render as the same bytes — which
+    /// is why two 502s on 2026-08-29 were undiagnosable four hours later.
+    ///
+    /// Asserts BOTH directions on purpose. Without the negative arm this test
+    /// would still pass if `{:#}` silently started behaving like `{}`, and the
+    /// whole fix would be gone with the check still green.
+    #[tokio::test]
+    async fn cdp_list_error_keeps_its_cause_only_in_the_alternate_form() {
+        // Bind then drop, so the port is certainly closed and the connect is
+        // REFUSED rather than timing out (the 2026-08-29 samples answered in
+        // ~1ms, which is a refusal, not the 3s timeout).
+        let l = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = l.local_addr().expect("addr").port();
+        drop(l);
+
+        let e = cdp_list(port).await.expect_err("a closed port must fail");
+        let plain = e.to_string();
+        let with_cause = format!("{e:#}");
+
+        assert!(
+            !plain.to_lowercase().contains("refused"),
+            "the CONTROL has stopped holding: `to_string()` now carries the cause, so this test \
+             no longer proves anything. Got: {plain}"
+        );
+        assert!(
+            with_cause.to_lowercase().contains("refused"),
+            "the alternate form must carry the cause that separates a refusal from a timeout. \
+             Got: {with_cause}"
+        );
+        assert!(
+            with_cause.len() > plain.len(),
+            "cause chain must ADD to the message: plain={plain:?} alt={with_cause:?}"
+        );
+    }
+
+    /// A GONE process is the caller's fixable state, not amux failing.
+    #[test]
+    fn a_gone_process_is_not_running_and_a_live_one_is_wedged() {
+        let entry = || Some(("default".to_string(), "some-lane".to_string(), 4242u32));
+
+        assert_eq!(
+            classify_cdp_list_failure(entry(), false),
+            CdpListVerdict::Gone {
+                pid: 4242,
+                profile: "default".into(),
+                started_by: "some-lane".into()
+            },
+            "pid gone => the registry is stale; the caller can fix it by starting a browser"
+        );
+        // CONTROL: same registry row, live pid. A change that answered `Gone`
+        // for everything would pass the assertion above and clear a HEALTHY
+        // browser out from under its owner.
+        assert_eq!(
+            classify_cdp_list_failure(entry(), true),
+            CdpListVerdict::Wedged { pid: 4242, profile: "default".into() },
+            "a live pid must never be swept as a corpse"
+        );
+        // A stop that raced us leaves no row to judge.
+        assert_eq!(classify_cdp_list_failure(None, false), CdpListVerdict::Unregistered);
+        assert_eq!(classify_cdp_list_failure(None, true), CdpListVerdict::Unregistered);
+    }
+
+    /// `pid_alive` must actually discriminate, or the classifier above is fed a
+    /// constant and every arm of it is decoration.
+    #[test]
+    fn pid_alive_separates_this_process_from_a_reaped_one() {
+        assert!(pid_alive(std::process::id()), "this very process must read as alive");
+        // A child we spawn and reap: its pid is genuinely gone, and unlike a
+        // made-up number it cannot accidentally belong to something else.
+        let mut c = std::process::Command::new("true").spawn().expect("spawn");
+        let pid = c.id();
+        c.wait().expect("wait");
+        assert!(!pid_alive(pid), "a reaped child (pid {pid}) must read as gone");
+    }
+}
+
 /// `resolve_page`, but refusing to hand back `avoid`.
 ///
 /// AMUX-3708. The bound-tab branch below already falls through when the tab is
@@ -1587,14 +2008,13 @@ pub async fn resolve_page_avoiding(
     create_url: Option<&str>,
     avoid: Option<&str>,
 ) -> Result<DriverPage, DriverError> {
-    let port = {
-        let guard = RUNNING.lock().expect("browser registry poisoned");
-        match guard.as_ref() {
-            Some(r) => r.cdp_port,
-            None => return Err(DriverError::NotRunning),
-        }
+    let Some(port) = port_for_session(session) else {
+        return Err(DriverError::NotRunning);
     };
-    let tabs_v = cdp_list(port).await.map_err(DriverError::Cdp)?;
+    let tabs_v = match cdp_list(port).await {
+        Ok(v) => v,
+        Err(e) => return Err(cdp_list_failure(session, port, e).await),
+    };
     let empty = vec![];
     let tabs = tabs_v.as_array().unwrap_or(&empty);
     let page_of = |t: &Value| -> Option<DriverPage> {
@@ -1693,24 +2113,79 @@ pub(crate) fn choose_target(
         })
     };
     let stale = bound.is_some() && bound == avoid;
+    let blank_url = |u: &str| u.is_empty() || u == "about:blank" || u.starts_with("chrome://");
+    let is_blank_tab = |tid: &str| {
+        tabs.iter().any(|t| {
+            id_of(t).as_deref() == Some(tid)
+                && blank_url(t.get("url").and_then(Value::as_str).unwrap_or(""))
+        })
+    };
+    let real_page_available = tabs.iter().any(|t| {
+        t.get("type").and_then(Value::as_str) == Some("page")
+            && t.get("webSocketDebuggerUrl").is_some()
+            && !blank_url(t.get("url").and_then(Value::as_str).unwrap_or(""))
+            && id_of(t).is_some_and(|id| !claimed_by_others.contains(&id))
+            && (avoid.is_none() || id_of(t).as_deref() != avoid)
+    });
     if let Some(tid) = bound {
         // A bound tab that is GONE from /json/list was already handled before
         // this card: it falls through and rebinds. The case this adds is a tab
         // still LISTED whose socket will not open, which /json/list reports
         // identically to a healthy one — only the failing caller knows.
-        if !stale && listed(tid) {
+        //
+        // A BLANK BINDING DOES NOT SURVIVE A REAL PAGE (AMUX-3834, second pass).
+        // The first fix taught the REBIND to prefer a real page, which stops the
+        // drift happening — and does nothing for a session ALREADY stuck on a
+        // blank tab, because a blank tab is listed and this arm kept it forever.
+        // tubescience was right to walk back the fix: their binding was already
+        // stuck, so preventing future drift could not help them, and I confirmed
+        // it here — screenshot and eval BOTH returned about:blank on this
+        // machine, agreeing with each other and both wrong.
+        //
+        // So: keep a blank binding only while there is nothing better. That
+        // makes a stuck session self-heal on its next verb rather than needing a
+        // navigate to break it out.
+        if !stale && listed(tid) && !(is_blank_tab(tid) && real_page_available) {
             return (TargetChoice::KeepBound(tid.to_string()), false);
         }
     }
+    // PREFER A REAL PAGE OVER A BLANK ONE (AMUX-3834, tubescience).
+    //
+    // This used to take the FIRST listed page, and `/json/list` order is
+    // Chrome's, not ours. So when a bound tab died while a fresh `about:blank`
+    // was open — a new-tab page, a popup, an opener Chrome spawned — the rebind
+    // took the blank one, and because a blank tab IS listed the `KeepBound` arm
+    // above then held the session there permanently. Screenshot and eval both
+    // read that binding and both showed a blank page; only `navigate` escaped,
+    // because it passes a URL and re-targets. That asymmetry is what made this
+    // look like "screenshot resolves differently from action" when in fact every
+    // verb shared one drifted binding.
+    //
+    // The cost of the old behaviour was not a blank screenshot. It was a
+    // screenshot that LOOKS like evidence: tubescience cross-checked with eval
+    // and caught it, and someone who did not would have concluded their UI
+    // change did not render.
+    //
+    // A PREFERENCE, NOT A FILTER. If the only tab is blank, bind to it — the
+    // alternative is opening tabs forever when blank is genuinely all there is.
+    let is_blank = |t: &Value| {
+        let u = t.get("url").and_then(Value::as_str).unwrap_or("");
+        u.is_empty() || u == "about:blank" || u.starts_with("chrome://")
+    };
+    let usable = |t: &&Value| {
+        t.get("type").and_then(Value::as_str) == Some("page")
+            && id_of(t).is_some_and(|id| !claimed_by_others.contains(&id))
+            // Never rebind to the target the caller just told us is
+            // unreachable. Dropping the binding makes it "unclaimed", so
+            // without this the rebind picks straight back up the tab we are
+            // abandoning.
+            && (avoid.is_none() || id_of(t).as_deref() != avoid)
+            && t.get("webSocketDebuggerUrl").is_some()
+    };
     let pick = tabs
         .iter()
-        .filter(|t| t.get("type").and_then(Value::as_str) == Some("page"))
-        .filter(|t| id_of(t).is_some_and(|id| !claimed_by_others.contains(&id)))
-        // Never rebind to the target the caller just told us is unreachable.
-        // Dropping the binding makes it "unclaimed", so without this the rebind
-        // picks straight back up the tab we are abandoning.
-        .filter(|t| avoid.is_none() || id_of(t).as_deref() != avoid)
-        .find(|t| t.get("webSocketDebuggerUrl").is_some())
+        .find(|t| usable(t) && !is_blank(t))
+        .or_else(|| tabs.iter().find(usable))
         .and_then(id_of);
     match pick {
         Some(tid) => (TargetChoice::Rebind(tid), stale),
@@ -1718,26 +2193,120 @@ pub(crate) fn choose_target(
     }
 }
 
+/// WHICH BROWSER A SESSION MEANS (AMUX-3828).
+///
+/// 1. The one it STARTED. That is what a lane means by "my browser", and it is
+///    what makes two workers on two profiles independent without either naming
+///    a profile on every verb.
+/// 2. Otherwise, if exactly one is running, that one — an unambiguous situation
+///    should not require a parameter.
+/// 3. Otherwise None. With several browsers and no claim on any of them, a
+///    guess would drive somebody else's page; the caller must name a profile.
+///
+/// Ethan's requirement is BOTH shapes: workers on DIFFERENT browsers are served
+/// by (1), and workers SHARING one are served by (2) — the second worker did
+/// not start it, exactly one is up, so it drives the same browser rather than
+/// being refused.
+pub fn port_for_session(session: &str) -> Option<u16> {
+    let g = RUNNING.lock().expect("browser registry poisoned");
+    if !session.is_empty() {
+        if let Some(r) = g.values().find(|r| r.started_by == session) {
+            return Some(r.cdp_port);
+        }
+    }
+    if g.len() == 1 {
+        return g.values().next().map(|r| r.cdp_port);
+    }
+    None
+}
+
+/// Every running browser's CDP port.
+pub fn all_ports() -> Vec<u16> {
+    RUNNING.lock().expect("browser registry poisoned").values().map(|r| r.cdp_port).collect()
+}
+
+#[cfg(test)]
+mod multi_browser_tests {
+    use super::*;
+
+    /// ETHAN'S ACCEPTANCE CRITERION, 2026-08-28 12:50: "make sure multiple
+    /// workers can use same and different browsers in amux that should be a
+    /// test verified criteria."
+    ///
+    /// BOTH shapes, because they are different mechanisms:
+    ///   DIFFERENT browsers — two profiles coexist in the registry, and each
+    ///     worker's verbs resolve to its OWN browser. This is what the
+    ///     single-slot registry made impossible.
+    ///   SAME browser — a second worker that started nothing still resolves to
+    ///     the running one, so two workers share it rather than one being
+    ///     refused. That is the case the takeover refusal used to eat.
+    ///
+    /// Uses the registry seam rather than launching Chrome: the property under
+    /// test is the SELECTION rule, and a test that needed two real Chromes
+    /// would not run in CI.
+    /// ONE TEST, NOT TWO, DELIBERATELY. `RUNNING` is process-global, so two
+    /// #[test] fns exercising it run concurrently under the default harness and
+    /// clobber each other's seeds — which is exactly how the first draft of
+    /// this failed: "two profiles must coexist" saw three, and "a profile is a
+    /// slot" saw a neighbour's entry. Serial by construction beats a flake.
+    #[test]
+    fn multiple_workers_can_use_same_and_different_browsers() {
+        test_clear_running();
+        test_seed_running_port("alpha", "worker-a", 111, 9001);
+        test_seed_running_port("beta", "worker-b", 222, 9002);
+
+        // DIFFERENT BROWSERS: both coexist, and each worker gets its OWN.
+        assert_eq!(running_all().len(), 2, "two profiles must coexist");
+        let a = port_for_session("worker-a").expect("worker-a has a browser");
+        let b = port_for_session("worker-b").expect("worker-b has a browser");
+        assert_ne!(a, b, "two workers on two profiles must not share a port");
+        assert_eq!(running_snapshot_for("alpha").map(|x| x.1), Some("worker-a".into()));
+        assert_eq!(running_snapshot_for("beta").map(|x| x.1), Some("worker-b".into()));
+
+        // A third worker owning nothing, with TWO running: ambiguous, so it
+        // must name a profile rather than be pointed at someone else's page.
+        assert_eq!(port_for_session("worker-c"), None, "ambiguous must not guess");
+
+        // SAME BROWSER: with exactly one running, a worker that started nothing
+        // still resolves to it — sharing, not refusal.
+        test_clear_running();
+        test_seed_running_port("shared", "worker-a", 111, 9003);
+        let owner = port_for_session("worker-a").expect("the owner resolves");
+        let guest = port_for_session("worker-b").expect("a guest resolves to the same one");
+        assert_eq!(owner, guest, "two workers must be able to drive ONE browser");
+
+        // THE INVARIANT THE PROFILE KEY EXISTS FOR: never two entries for one
+        // profile, because two Chromes on one user_data_dir corrupt it.
+        test_clear_running();
+        test_seed_running_port("same", "worker-a", 111, 9004);
+        test_seed_running_port("same", "worker-b", 222, 9005);
+        assert_eq!(running_all().len(), 1, "a profile is a slot, not a list");
+        assert_eq!(running_snapshot_for("same").map(|x| x.3), Some(222), "last write replaces");
+
+        // CONTROL: with nothing running nobody resolves — the rule must not
+        // manufacture a browser, or "not running" becomes an invalid port.
+        test_clear_running();
+        assert_eq!(port_for_session("worker-a"), None);
+        assert!(running_all().is_empty());
+    }
+}
+
 /// Session bindings for GET /api/browser/sessions: (name, target, alive?).
 pub async fn session_bindings() -> Vec<(String, String, bool)> {
-    let port = {
-        let guard = RUNNING.lock().expect("browser registry poisoned");
-        guard.as_ref().map(|r| r.cdp_port)
-    };
-    let live: std::collections::HashSet<String> = match port {
-        Some(p) => match cdp_list(p).await {
-            Ok(v) => v
-                .as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-            Err(_) => Default::default(),
-        },
-        None => Default::default(),
-    };
+    // UNION ACROSS EVERY BROWSER (AMUX-3828). A binding is live if its target
+    // exists in ANY running browser; scoping to one would report a worker's
+    // perfectly good tab as dead because a different worker's browser was
+    // consulted.
+    let mut live: std::collections::HashSet<String> = Default::default();
+    for p in all_ports() {
+        if let Ok(v) = cdp_list(p).await {
+            if let Some(a) = v.as_array() {
+                live.extend(
+                    a.iter().filter_map(|t| t.get("id").and_then(Value::as_str).map(str::to_string)),
+                );
+            }
+        }
+    }
     let map = NATIVE_TARGETS.lock().expect("native targets poisoned").clone();
     let mut out: Vec<(String, String, bool)> =
         map.into_iter().map(|(name, tid)| (name, tid.clone(), live.contains(&tid))).collect();
@@ -2056,6 +2625,129 @@ pub fn click_outcome(raw: &Value, what: &str, hint: &str) -> Value {
 }
 
 /// Click by CSS selector (Python `_bu_click_selector`).
+/// Attach local files to an `<input type=file>` (TUBES-2343).
+///
+/// # Why this is not an `eval`
+///
+/// Every other verb in this module drives the page with `Runtime.evaluate`.
+/// This one cannot: `input.files` is not assignable from page script, and that
+/// is the browser's file-upload security model rather than a gap to route
+/// around. `DOM.setFileInputFiles` is the seam the debugger protocol reserves
+/// for a driver, and it is what Playwright's `page.setInputFiles` is built on.
+///
+/// # The element is checked BEFORE the protocol call
+///
+/// `DOM.setFileInputFiles` against a non-file element fails with a protocol
+/// error that names neither the selector nor what was wrong with it, and
+/// against a MISSING path it reports SUCCESS — the page then holds an input
+/// whose file has no bytes, which reads as a broken upload rather than a bad
+/// request. The caller's paths are validated by the handler; the element is
+/// validated here, in one round trip, so both failures name themselves.
+///
+/// Returns `{"error": ...}` for a caller mistake (no such element, wrong
+/// element type) and `Err` only for a transport fault, matching
+/// [`click_selector`]'s split.
+pub async fn set_input_files(
+    c: &mut CdpClient,
+    selector: &str,
+    files: &[String],
+) -> anyhow::Result<Value> {
+    let ten = std::time::Duration::from_secs(10);
+    // One probe, returning a verdict rather than a bare boolean, so a wrong
+    // element type can say WHAT it found instead of "not found".
+    let probe = format!(
+        "(()=>{{const el=document.querySelector({sel});if(!el)return 'NOELEMENT';\
+         if(el.tagName!=='INPUT'||(el.type||'').toLowerCase()!=='file')\
+         return 'NOTFILE:'+el.tagName+'/'+(el.type||'');\
+         return el.multiple?'OK:multiple':'OK:single';}})()",
+        sel = json!(selector)
+    );
+    let verdict = c.eval(&probe, 20).await?;
+    let verdict = verdict.as_str().unwrap_or("");
+    if verdict == "NOELEMENT" {
+        return Ok(json!({
+            "error": format!("no element matches {selector:?}"),
+            "fix": "check the selector against GET /api/browser/state",
+        }));
+    }
+    if let Some(found) = verdict.strip_prefix("NOTFILE:") {
+        return Ok(json!({
+            "error": format!(
+                "{selector:?} matched a <{found}>, which is not an <input type=file>"
+            ),
+            "fix": "point the selector at the file input itself — a label or a styled \
+                    wrapper is a common miss, and the real input is often visually hidden",
+        }));
+    }
+    // MULTIPLE FILES NEED `multiple`. Chrome silently keeps only the first
+    // otherwise, so the test would attach one file and report N.
+    if files.len() > 1 && verdict == "OK:single" {
+        return Ok(json!({
+            "error": format!(
+                "{} files given but {selector:?} is a single-file input (no `multiple` \
+                 attribute) — Chrome would keep only the first and report success",
+                files.len()
+            ),
+            "fix": "send one file, or point at an input that has `multiple`",
+        }));
+    }
+    // Now the objectId, which is what setFileInputFiles needs and what an eval
+    // result cannot give us.
+    let resolved = c
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!("document.querySelector({})", json!(selector)),
+                "returnByValue": false,
+            }),
+            ten,
+        )
+        .await?;
+    let Some(object_id) = resolved
+        .get("result")
+        .and_then(|r| r.get("objectId"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    else {
+        // The probe just saw the element, so losing it here is a page that
+        // navigated or re-rendered underneath us, not a caller mistake.
+        return Ok(json!({
+            "error": format!("{selector:?} resolved to no remote object — the page changed between the probe and the attach"),
+            "fix": "retry; if it repeats, the element is being re-rendered and needs a `wait` first",
+        }));
+    };
+    // DOM domain must be enabled before setFileInputFiles; idempotent.
+    let _ = c.call("DOM.enable", json!({}), ten).await;
+    c.call(
+        "DOM.setFileInputFiles",
+        json!({ "files": files, "objectId": object_id }),
+        ten,
+    )
+    .await?;
+    // READ THE INPUT BACK. setFileInputFiles returns an empty result and
+    // reports success for a path the browser could not use, so the only honest
+    // confirmation is what the page now holds — and that is also what the
+    // upload under test will read.
+    let attached = c
+        .eval(
+            &format!(
+                "(()=>{{const el=document.querySelector({sel});\
+                 return el&&el.files?Array.from(el.files).map(f=>f.name+':'+f.size):[];}})()",
+                sel = json!(selector)
+            ),
+            20,
+        )
+        .await?;
+    Ok(json!({
+        "ok": true,
+        "selector": selector,
+        "requested": files,
+        // name:size per file, straight off the input. A zero size is the shape
+        // a missing or unreadable path leaves behind.
+        "attached": attached,
+    }))
+}
+
 pub async fn click_selector(c: &mut CdpClient, selector: &str) -> anyhow::Result<Value> {
     let raw = c.eval(&selector_click_js(selector), 20).await?;
     let mut v = click_outcome(
@@ -2371,6 +3063,110 @@ mod tests {
     /// FOUR CELLS, and the last two are the ones that keep this honest. Without
     /// the no-avoid cell, dropping every binding unconditionally would pass. Without
     /// the peer cell, avoiding a target by hijacking a peer's tab would pass.
+    /// AMUX-3834 (tubescience): a rebind must not land on a blank tab while a
+    /// real page is available, because a blank binding is PERMANENT.
+    ///
+    /// THE TRAP IS THE `KeepBound` ARM. Once the session is bound to an
+    /// about:blank, that tab IS listed, so every later resolve keeps it — the
+    /// binding never recovers on its own. Closing the blank tabs did not help
+    /// the reporter, because Chrome respawns one and the next rebind takes it
+    /// again.
+    ///
+    /// AND WHY IT LOOKED LIKE A SCREENSHOT BUG: screenshot, eval and action all
+    /// resolve through this one rule, so all three showed the blank page. Only
+    /// `navigate` escaped, because it passes a URL and re-targets. The reporter
+    /// read that asymmetry as "screenshot resolves differently from action";
+    /// their own follow-up disproved it when eval hit the blank origin too.
+    #[test]
+    fn a_rebind_prefers_a_real_page_over_a_blank_one() {
+        let t = |id: &str, url: &str| {
+            json!({"id": id, "type": "page",
+                   "webSocketDebuggerUrl": format!("ws://127.0.0.1:9/devtools/page/{id}"),
+                   "url": url, "title": ""})
+        };
+        let none = std::collections::HashSet::new();
+
+        // The reporter's shape: a blank tab listed FIRST, the real page after.
+        // Chrome's /json/list order is Chrome's, not ours.
+        let tabs = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let (choice, _) = choose_target(&tabs, None, &none, None);
+        assert_eq!(
+            choice,
+            TargetChoice::Rebind("STUDIO".into()),
+            "a real page must win over a blank one regardless of list order"
+        );
+
+        // chrome:// internals are blank-equivalent: a new-tab page is not what
+        // a caller means either.
+        let tabs = vec![t("NEWTAB", "chrome://newtab/"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        assert_eq!(
+            choose_target(&tabs, None, &none, None).0,
+            TargetChoice::Rebind("STUDIO".into()),
+            "chrome:// internals lose to a real page too"
+        );
+
+        // A PREFERENCE, NOT A FILTER. If blank is all there is, bind to it —
+        // the alternative is opening tabs forever when the browser genuinely
+        // has nothing else.
+        let only_blank = vec![t("BLANK", "about:blank")];
+        assert_eq!(
+            choose_target(&only_blank, None, &none, None).0,
+            TargetChoice::Rebind("BLANK".into()),
+            "with nothing else, a blank tab is still usable"
+        );
+
+        // THE SECOND PASS (AMUX-3834). Preventing bad rebinds does nothing for
+        // a session ALREADY bound to a blank tab: that tab is listed, so the
+        // KeepBound arm held it forever and only an explicit navigate escaped.
+        // tubescience walked back the first fix on exactly this, correctly — I
+        // then reproduced it here, with screenshot and eval BOTH returning
+        // about:blank, agreeing with each other and both wrong.
+        let stuck = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        let (choice, stale) = choose_target(&stuck, Some("BLANK"), &none, None);
+        assert_eq!(
+            choice,
+            TargetChoice::Rebind("STUDIO".into()),
+            "a session stuck on blank must self-heal when a real page exists"
+        );
+        assert!(!stale, "self-healing off a blank tab is not the wedged-target case");
+
+        // AND IT MUST NOT CHURN. With nothing better available the blank
+        // binding is KEPT, or every verb rebinds on every call and the session
+        // never holds still.
+        let only_blank = vec![t("BLANK", "about:blank"), t("OTHER", "about:blank")];
+        assert_eq!(
+            choose_target(&only_blank, Some("BLANK"), &none, None).0,
+            TargetChoice::KeepBound("BLANK".into()),
+            "with nothing better, a blank binding is kept rather than churned"
+        );
+
+        // A REAL binding is never disturbed. This rule only ever demotes BLANK.
+        let two_real = vec![t("A", "https://a.com/"), t("B", "https://b.com/")];
+        assert_eq!(
+            choose_target(&two_real, Some("A"), &none, None).0,
+            TargetChoice::KeepBound("A".into()),
+            "a good binding must survive the presence of other pages"
+        );
+
+        // THE CONTROLS, so the preference cannot quietly override the rules it
+        // sits inside. `avoid` still wins: a real page the caller just proved
+        // unreachable must NOT be picked over a blank one.
+        let tabs = vec![t("BLANK", "about:blank"), t("DEAD", "https://studio.mixpeek.com/x")];
+        assert_eq!(
+            choose_target(&tabs, Some("DEAD"), &none, Some("DEAD")).0,
+            TargetChoice::Rebind("BLANK".into()),
+            "an unreachable real page loses to a usable blank one"
+        );
+        // And a peer's claim still wins over the preference.
+        let claimed: std::collections::HashSet<String> = ["STUDIO".to_string()].into();
+        let tabs = vec![t("BLANK", "about:blank"), t("STUDIO", "https://studio.mixpeek.com/x")];
+        assert_eq!(
+            choose_target(&tabs, None, &claimed, None).0,
+            TargetChoice::Rebind("BLANK".into()),
+            "a real page claimed by a peer must not be hijacked for being real"
+        );
+    }
+
     #[test]
     fn a_listed_but_unreachable_target_is_abandoned_and_not_picked_up_again() {
         let tab = |id: &str| {
@@ -3019,11 +3815,11 @@ mod tests {
             // (AC-325) and the registry must still name the process it is
             // acting on. Asserting through the Option would pass vacuously the
             // day adoption is exercised here.
-            let reg_pid = guard.as_ref().map(|r| r.pid);
+            let reg_pid = guard.values().next().map(|r| r.pid);
             assert_eq!(reg_pid, info.pid, "acting Chrome is the registry's process");
             assert!(reg_pid.is_some());
             assert!(
-                guard.as_ref().and_then(|r| r.child.as_ref()).is_some(),
+                guard.values().next().and_then(|r| r.child.as_ref()).is_some(),
                 "a browser this test SPAWNED must carry its Child handle"
             );
         }

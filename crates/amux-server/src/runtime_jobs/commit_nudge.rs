@@ -38,9 +38,19 @@ use std::collections::{BTreeMap, BTreeSet};
 ///
 /// Deliberately NOT constructible from a working tree: it exists only to carry
 /// an answer the guard already gave.
+///
+/// Sentinel for a foreign path whose OWNER did not resolve — a running cotenant
+/// with no transcript. Distinct from an absent entry (which means nobody's edit
+/// record claims the path) because the two lead to different actions: one says
+/// there is a peer to go and find, the other says there is not (AMUX-3816).
+pub(crate) const UNRESOLVED_OWNER: &str = "\u{0}unresolved";
+
 #[derive(Debug, Default, Clone)]
 pub struct Ownership {
     /// A peer edited it and this session did NOT. Never commit these.
+    ///
+    /// The owner may be [`UNRESOLVED_OWNER`]: the path IS a peer's, and the
+    /// guard could not put a name to them.
     pub foreign: Vec<(String, String)>, // (path, owner)
     /// Both edited it. Contested, not forbidden.
     pub shared: Vec<(String, String)>, // (path, other owner)
@@ -315,7 +325,24 @@ pub fn build(
         let mut other: Vec<String> = Vec::new();
         for p in paths {
             if let Some(o) = foreign_owner.get(*p) {
-                other.push(format!("  {p}  [{o}'s]\n"));
+                // THREE STATES, THREE STRINGS (AMUX-3816). A foreign path whose
+                // owner did not resolve is neither `[<name>'s]` nor
+                // `[no edit record of yours]`: the first invents a name, the
+                // second says nobody owns it. mixpeek-frustrations hit exactly
+                // this — they needed a peer's name to warn them before a
+                // destructive commit, and `['s]` could not tell them whether
+                // there was anyone to warn.
+                //
+                // The row states the ACTION (hands off, and you will not get
+                // the name here). It deliberately does NOT name a cause: the
+                // row has not measured one, and `degraded` already carries the
+                // real reason when the guard knows it. Formatting something the
+                // row does not know is the defect this fixes.
+                if *o == UNRESOLVED_OWNER {
+                    other.push(format!("  {p}  [a peer's, name unresolved]\n"));
+                } else {
+                    other.push(format!("  {p}  [{o}'s]\n"));
+                }
             } else if unknown_owner.contains(*p) {
                 other.push(format!("  {p}  [no edit record of yours]\n"));
             } else {
@@ -349,8 +376,22 @@ pub fn build(
              `git checkout origin/main -- <path>` reverts YOUR landed commits — and the \
              find-object restore-safety check PASSES while it does, because locally-committed \
              content is reachable-from-a-commit too (that is how the mixpeek MG-1483 push guard \
-             was silently disarmed, 2026-08-20). MERGE the two versions, or hand the path to its owner. Do \
-             not clear these with any single-arm command."
+             was silently disarmed, 2026-08-20). Do not clear these with any single-arm command.\n\n\
+             THREE-WAY MERGE, per path, non-destructive (AMUX-3718 — this arm used to say \
+             \"MERGE the two versions, or hand the path to its owner\" and stop, while every \
+             other arm here carries something runnable; of 16 paths one lane was told to merge, \
+             they merged none):\n\
+             \x20 B=$(git merge-base HEAD origin/main)\n\
+             \x20 git show $B:<path>          > /tmp/base\n\
+             \x20 git show origin/main:<path> > /tmp/theirs\n\
+             \x20 git merge-file -p <path> /tmp/base /tmp/theirs > /tmp/merged; echo \"conflicts=$?\"\n\
+             `-p` writes the merge to STDOUT and leaves <path> untouched, which matters on a \
+             shared checkout where an in-place merge is a whole-file write over a peer's live \
+             edit. The exit status is the conflict COUNT: 0 means git merged it cleanly and you \
+             can move /tmp/merged into place; non-zero means real judgment is needed and the \
+             markers show exactly where. Handing it to the owner stays the right answer when the \
+             conflicts are not yours to resolve — but now you know how many there are before you \
+             decide that."
         ));
     }
 
@@ -786,7 +827,12 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
              is not yours it is a peer's mid-edit: hands off either way. Do NOT use \
              `git cat-file -e $(git hash-object <path>)` for this: blob existence cannot separate \
              an OLD revision from a CURRENT one that is merely unpushed, so on a checkout ahead \
-             of origin it calls the whole tree STALE and its remedy reverts it. \
+             of origin it calls the whole tree STALE and its remedy reverts it. It also answers \
+             YES for a never-committed mid-edit, because `git add` writes the blob into the \
+             object DB without committing — and THIS arm is where that matters most, since \
+             ownership being unknown is exactly the state a peer's uncommitted work is in \
+             (cold-outbound, 2026-08-17: a file mid-keystroke and in no commit on any ref, which \
+             that recipe answered yes for; the restore it green-lit would have deleted it). \
              Stage only what you recognise as your work AND whose ancestry test prints nothing.",
             if n == 1 { "it" } else { "them" },
             if n == 1 { "it is" } else { "they are" },
@@ -825,8 +871,14 @@ fn commit_worthy_body(dir: &str, dirty: &[String], own: &Ownership) -> Option<St
          `git log --oneline origin/main..HEAD -- <path>` prints NOTHING.\n\
          \u{2022} if BOTH directions print commits, the path has DIVERGED — novel AND stale at \
          once — and commit and restore each destroy one side's landed work while every test \
-         above passes as prescribed. MERGE the two versions (or hand the path to its owner); \
-         neither single-arm remedy is safe. Live specimen 2026-08-20: mixpeek \
+         above passes as prescribed. Neither single-arm remedy is safe; three-way merge it, \
+         non-destructively (AMUX-3718 — this line used to stop at 'MERGE the two versions' with \
+         no procedure): `B=$(git merge-base HEAD origin/main); git show $B:<path> >/tmp/base; \
+         git show origin/main:<path> >/tmp/theirs; git merge-file -p <path> /tmp/base \
+         /tmp/theirs >/tmp/merged; echo conflicts=$?` — `-p` leaves <path> untouched (an \
+         in-place merge is a whole-file write over a peer's live edit) and the exit status is \
+         the conflict COUNT, so you know whether it is yours to resolve before you hand it to \
+         the owner. Live specimen 2026-08-20: mixpeek \
          .githooks/pre-push, origin carrying 96ea161803 and HEAD carrying the MG-1483 guard \
          chain — the one-direction protocol read it STALE and the prescribed restore silently \
          disarmed a data-loss push guard.\n\
@@ -1098,10 +1150,50 @@ async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> (Vec<S
     (kept, provenance)
 }
 
-/// `git status --porcelain` under `dir`, as repo-relative paths.
+/// Most files a lane could sensibly be mid-edit on inside ONE untracked
+/// directory. Past this the expansion below stops rather than flooding a nudge.
+///
+/// Truncating loses a warning about the files past the cap, which is the
+/// tolerable direction: the reader is not told to act on them at all. Emitting
+/// the DIRECTORY instead would hand them a restore target that deletes every
+/// file under it, which is the direction that is not recoverable.
+const MAX_UNTRACKED_DIR_EXPANSION: usize = 200;
+
+/// `git status --porcelain` under `dir`, as repo-relative paths — FILES ONLY.
 ///
 /// Supplies the LIST only. Whose they are is the guard's answer, never this
 /// function's — see the module docs for what re-deriving it cost.
+///
+/// WHY THE EXPANSION (ts-gke, 2026-09-01). `--untracked-files=normal` collapses
+/// a wholly-untracked directory to ONE entry with a trailing slash, and nothing
+/// downstream of here has ever looked for that slash. So a directory flowed the
+/// whole length of the pipeline dressed as a file: classified as one path,
+/// labelled STALE as one path, and rendered with `git checkout origin/main --
+/// <path>` as its remedy.
+///
+/// Measured on the mixpeek checkout, where two such directories were emitted:
+///
+///   clients/providers/rtsp/__init__.py                       matches origin
+///   tests/unit/clients/providers/rtsp/__init__.py            matches origin
+///   clients/providers/rtsp/sync_provider.py                  novel, in NO commit
+///   tests/unit/clients/providers/rtsp/test_sync_provider.py  novel, in NO commit
+///
+/// Two of four needed no action and two were novel mid-edit work. The directory
+/// verdict was "behind origin", true of the directory and false of half its
+/// contents, and the remedy stated at that granularity deletes the other half.
+///
+/// The proof recipe the nudge itself prescribes cannot rescue the reader,
+/// which is what makes this worth fixing here rather than in the wording:
+/// `git hash-object` on a directory ERRORS, and an error is DO-NOT-RESTORE by
+/// the nudge's own rule. So a careful reader gets stuck and a hurried one
+/// restores the directory. Only a per-file list makes the prescribed check
+/// runnable at all.
+///
+/// `normal` is kept for the listing itself. `all` would walk every untracked
+/// tree in the repo on every run to answer a question about the few that are
+/// dirty; expanding only the directories actually reported pays for what is
+/// used. `--exclude-standard` keeps the expansion to exactly what `git status`
+/// would itself have shown, so an ignored tree cannot enter through this door.
 async fn dirty_paths(dir: &str) -> Vec<String> {
     let out = tokio::process::Command::new("git")
         .args(["-C", dir, "status", "--porcelain", "--untracked-files=normal"])
@@ -1111,7 +1203,7 @@ async fn dirty_paths(dir: &str) -> Vec<String> {
     if !out.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&out.stdout)
+    let raw: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
             // "XY path" or "XY old -> new"; take the destination.
@@ -1119,7 +1211,64 @@ async fn dirty_paths(dir: &str) -> Vec<String> {
             Some(rest.rsplit(" -> ").next().unwrap_or(rest).trim_matches('"').to_string())
         })
         .filter(|p| !p.is_empty())
+        .collect();
+
+    let mut paths = Vec::with_capacity(raw.len());
+    for p in raw {
+        if !p.ends_with('/') {
+            paths.push(p);
+            continue;
+        }
+        // A directory is NEVER passed through. When it cannot be enumerated it
+        // is DROPPED, losing the warning, because the alternative is emitting a
+        // restore target whose blast radius is every file beneath it. That is
+        // the same asymmetry the nudge already states to its reader: a declined
+        // restore is recoverable and a deleted keystroke is not.
+        paths.extend(expand_untracked_dir(dir, &p).await);
+    }
+    paths
+}
+
+/// The untracked, non-ignored files under one directory, repo-relative.
+///
+/// Empty on any failure — see the caller for why that is the safe direction.
+async fn expand_untracked_dir(dir: &str, subdir: &str) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", dir, "ls-files", "--others", "--exclude-standard", "-z", "--", subdir])
+        .output()
+        .await;
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    // `-z` because a path may contain a newline, and this list feeds a remedy
+    // the reader runs. Splitting on '\n' would hand them half a filename.
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .take(MAX_UNTRACKED_DIR_EXPANSION)
+        .map(str::to_string)
         .collect()
+}
+
+/// The owner named in one guard entry, or [`UNRESOLVED_OWNER`] (AMUX-3816).
+///
+/// A free function rather than a closure inside the parse so it has a test that
+/// does not need an HTTP call to the guard (ethos rule 7). The bug it fixes was
+/// exactly one `unwrap_or` away and shipped to every row of a nudge:
+/// `unwrap_or` fires only on a MISSING key, so the guard's `owner: ""` for an
+/// unresolvable cotenant sailed through into a possessive template.
+fn owner_name(entry: &Value) -> String {
+    entry
+        .get("owner")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        // `?` was the old fallback and is the same defect one step later:
+        // `[?'s]` renders as a name, and looks deliberate while being none.
+        .filter(|s| !s.is_empty() && *s != "?")
+        .unwrap_or(UNRESOLVED_OWNER)
+        .to_string()
 }
 
 /// Ownership for `paths`, from the staged-guard ITSELF — called as a function,
@@ -1157,7 +1306,15 @@ async fn ownership_from_guard(session: &str, dir: &str, paths: &[String]) -> Opt
                     .filter_map(|f| {
                         Some((
                             f.get("path")?.as_str()?.to_string(),
-                            f.get("owner").and_then(Value::as_str).unwrap_or("?").to_string(),
+                            // EMPTY IS UNRESOLVED, NOT A NAME (AMUX-3816). The
+                            // guard reports `owner: ""` for a peer it could not
+                            // resolve — a running cotenant with no transcript —
+                            // and `unwrap_or` fires only on a MISSING key, so
+                            // `Some("")` sailed through and the possessive
+                            // template rendered a whole list as `['s]`. `"?"`
+                            // was the same defect one step later and worse,
+                            // because `[?'s]` looks deliberate.
+                            owner_name(f),
                         ))
                     })
                     .collect()
@@ -2190,10 +2347,63 @@ mod tests {
             m.contains("reachable-from-a-commit too"),
             "must say WHY the restore-safety check cannot catch this: {m}"
         );
-        assert!(m.contains("MERGE the two versions"), "the only safe exit must be named: {m}");
+        // AMUX-3718. This used to assert the phrase "MERGE the two versions", and a
+        // directive is not a procedure: mixpeek-frustrations was told to merge 16
+        // paths and merged none, because every other arm of this nudge carries
+        // something runnable and this one carried a sentence.
+        //
+        // The phrase assertion could not even see the change that fixed it. The
+        // replacement text QUOTES the old directive while describing it as former
+        // behaviour, so `contains("MERGE the two versions")` stayed green across a
+        // rewrite that removed the prescription entirely. A check that a quotation
+        // satisfies is pinning the words, not the property (ethos rule 7).
+        assert!(
+            m.contains("git merge-file -p"),
+            "the merge must be RUNNABLE, not just prescribed: {m}"
+        );
+        assert!(
+            m.contains("merge-base HEAD origin/main"),
+            "a three-way merge needs its base named or the recipe cannot be run: {m}"
+        );
+        assert!(
+            m.contains("conflicts=$?"),
+            "the reader must learn the conflict COUNT — that is what decides whether \
+             this is theirs to resolve or the owner's: {m}"
+        );
         assert!(
             !m.contains("STALE:"),
             "a diverged path must not also render the STALE restore recipe: {m}"
+        );
+    }
+
+    /// THE SAME BARE DIRECTIVE EXISTED TWICE, and fixing one arm would have left
+    /// the other (AMUX-3718, mixpeek-frustrations 2026-08-31).
+    ///
+    /// `commit_worthy_body`'s decision protocol walks the reader through both
+    /// direction tests and then, on the DIVERGED branch, used to stop at "MERGE
+    /// the two versions (or hand the path to its owner)" — a verdict with no
+    /// procedure, in a block whose every other bullet ends in a runnable command.
+    /// The DIVERGED section and this protocol are rendered by different functions,
+    /// so the section's cell could not see this one.
+    #[test]
+    fn the_protocols_diverged_bullet_carries_the_merge_it_prescribes() {
+        let dirty = vec!["src/thing.rs".to_string()];
+        // Commit-worthy: in `dirty` and in none of the other buckets, which is
+        // what makes `commit_worthy_body` render at all.
+        let fresh = Freshness::default();
+        let m = build("/repo", &dirty, &Ownership::default(), &fresh, "S")
+            .expect("a commit-worthy path must render the protocol");
+        assert!(
+            m.contains("if BOTH directions print commits"),
+            "premise: the decision protocol must be the block under test: {m}"
+        );
+        assert!(
+            m.contains("git merge-file -p"),
+            "the protocol's DIVERGED branch must carry the merge, not just name it: {m}"
+        );
+        assert!(
+            m.contains("conflicts=$?"),
+            "and the conflict count, which is what decides whose problem it is: {m}"
         );
     }
 
@@ -2416,6 +2626,110 @@ mod tests {
         assert!(!kept.contains(&"landed.txt".to_string()), "untracked-but-on-origin is a phantom");
         assert!(kept.contains(&"mywip.txt".to_string()), "real WIP must never be dropped");
         assert!(provenance.contains("origin/main"), "must state what it compared against");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A WHOLLY-UNTRACKED DIRECTORY MUST NEVER REACH A READER AS ONE PATH.
+    ///
+    /// `--untracked-files=normal` collapses it to one entry with a trailing
+    /// slash, and no consumer downstream of `dirty_paths` looks for that slash,
+    /// so it was classified, labelled and rendered as though it were a file --
+    /// with `git checkout origin/main -- <path>` as the remedy. Aimed at a
+    /// directory that deletes every file beneath it.
+    ///
+    /// The fixture is the incident: an rtsp provider directory where one file
+    /// matches origin exactly and one carries novel uncommitted work. That mix
+    /// is the whole point. A directory-level verdict can only be right about
+    /// one of them, and the remedy it licenses destroys the other.
+    ///
+    /// This asserts the PREMISE first. Without it the test passes trivially the
+    /// day git stops collapsing directories, and a green would mean nothing.
+    #[tokio::test]
+    async fn an_untracked_directory_is_expanded_to_files() {
+        let root =
+            std::env::temp_dir().join(format!("amux-nudge-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (bare, work) = (root.join("origin.git"), root.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "base"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // A peer lands the directory on origin. Local HEAD never gets it, which
+        // is why git calls the whole directory untracked below.
+        let peer = root.join("peer");
+        std::process::Command::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap()])
+            .arg(&peer)
+            .output()
+            .unwrap();
+        git(&peer, &["config", "user.email", "t@t"]);
+        git(&peer, &["config", "user.name", "t"]);
+        std::fs::create_dir_all(peer.join("rtsp")).unwrap();
+        std::fs::write(peer.join("rtsp/__init__.py"), "shipped\n").unwrap();
+        std::fs::write(peer.join("rtsp/sync_provider.py"), "shipped\n").unwrap();
+        git(&peer, &["add", "-A"]);
+        git(&peer, &["commit", "-m", "rtsp"]);
+        git(&peer, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin", "main"]);
+
+        std::fs::create_dir_all(work.join("rtsp")).unwrap();
+        std::fs::write(work.join("rtsp/__init__.py"), "shipped\n").unwrap();
+        // ...and one file mid-edit, in no commit on any ref. A restore aimed at
+        // the DIRECTORY deletes exactly this.
+        std::fs::write(work.join("rtsp/sync_provider.py"), "my novel wip\n").unwrap();
+
+        let dir = work.to_str().unwrap();
+        let porcelain = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C", dir, "status", "--porcelain", "--untracked-files=normal"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            porcelain.contains("?? rtsp/"),
+            "PREMISE: git must still collapse the directory, else this test proves nothing: {porcelain}"
+        );
+
+        let paths = dirty_paths(dir).await;
+
+        assert!(
+            !paths.iter().any(|p| p.ends_with('/')),
+            "a directory reached the caller as a restore target: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"rtsp/sync_provider.py".to_string()),
+            "the novel mid-edit file must be named, or nobody is warned about it: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"rtsp/__init__.py".to_string()),
+            "expansion must list every file, not a guess at which ones matter: {paths:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2725,6 +3039,23 @@ mod tests {
         assert!(msg.contains("new.rs"), "the commit-worthy path must be listed: {msg}");
     }
 
+    /// AMUX-3816, the PARSE half. The render is only half the fix; if an empty
+    /// owner still reaches `foreign` as a name, every consumer has to re-handle
+    /// it. Tested on the shipped function rather than a paraphrase of it.
+    #[test]
+    fn an_owner_the_guard_could_not_resolve_never_becomes_a_name() {
+        assert_eq!(owner_name(&json!({"owner": ""})), UNRESOLVED_OWNER, "empty string");
+        assert_eq!(owner_name(&json!({"owner": "   "})), UNRESOLVED_OWNER, "whitespace");
+        assert_eq!(owner_name(&json!({"owner": "?"})), UNRESOLVED_OWNER, "the old fallback");
+        assert_eq!(owner_name(&json!({})), UNRESOLVED_OWNER, "absent key");
+        assert_eq!(owner_name(&json!({"owner": null})), UNRESOLVED_OWNER, "explicit null");
+        // THE CONTROL: a real name must survive untouched, trimmed. A
+        // normaliser that swallowed every owner would pass all five assertions
+        // above and delete the field's entire purpose.
+        assert_eq!(owner_name(&json!({"owner": "ts-onboard"})), "ts-onboard");
+        assert_eq!(owner_name(&json!({"owner": " peer-lane "})), "peer-lane");
+    }
+
     /// MG-1484 (mixpeek-general's 3-vs-20): the STALE header said "of your
     /// dirty file(s)" over a set with no ownership filter, so a regen bot's
     /// churn on a shared checkout was addressed to whoever the nudge reached —
@@ -2754,6 +3085,35 @@ mod tests {
         );
         assert!(msg.contains("[no edit record of yours]"), "{msg}");
         assert!(msg.contains("[peer-lane's]"), "the known owner must be named: {msg}");
+
+        // AMUX-3816 — THE THIRD STATE. A foreign path whose owner did not
+        // resolve rendered as a bare possessive with an empty name: `['s]`,
+        // on every row of a whole nudge. The guard reports `owner: ""` for a
+        // running cotenant with no transcript, and `unwrap_or` fires only on a
+        // MISSING key, so `Some("")` reached the possessive template.
+        //
+        // Reported by mixpeek-frustrations with the case that makes it matter:
+        // they needed a peer's name to warn them before a destructive commit,
+        // and `['s]` could not tell them whether there was anyone to warn.
+        let own_unresolved = Ownership {
+            foreign: vec![("sdk/model_b.py".into(), UNRESOLVED_OWNER.into())],
+            ..Default::default()
+        };
+        let msg = build("/repo", &dirty, &own_unresolved, &fresh, "test-provenance").unwrap();
+        assert!(
+            msg.contains("[a peer's, name unresolved]"),
+            "an unresolved owner is a peer WITHOUT a name, not a nameless possessive: {msg}"
+        );
+        // THE CONTROLS, one per way this can go wrong. The first is the bug
+        // itself; the second is the render that would replace it with a
+        // different lie (nobody owns this); the third is the `?` spelling,
+        // which is worse than the empty one because it looks deliberate.
+        assert!(!msg.contains("['s]"), "the empty possessive must be gone: {msg}");
+        assert!(
+            !msg.contains("[no edit record of yours]"),
+            "an unresolved OWNER is not an ABSENT owner — that is a different action: {msg}"
+        );
+        assert!(!msg.contains("[?'s]"), "{msg}");
         // The all-bot firing (the 20-shape with zero of yours): the header
         // must say NONE carries the recipient's record.
         let own_none = Ownership {
@@ -4019,4 +4379,116 @@ mod tests {
             "LEADING whitespace is content wherever indentation carries meaning"
         );
     }
+
+    /// The restore-safety discriminator must be pinned in EVERY arm that
+    /// prescribes a restore, not only the STALE renderer.
+    ///
+    /// `stale_section_prescribes_find_object_never_blob_existence` pins ONE
+    /// copy of the recipe. The advice is emitted from at least three places
+    /// (`build`, `append_only_note`, `commit_worthy_body`), and on 2026-08-28 a
+    /// mutation reverting `commit_worthy_body`'s copy to
+    /// `git cat-file -e $(git hash-object <path>)` left all 40 tests green,
+    /// while the commit-worthy and DIVERGED arms went to ZERO guards and went
+    /// on prescribing `git checkout origin/main -- <path>` 3 and 4 times each.
+    /// That is DESKT-10's own defect one arm over: a check pinning the wrong
+    /// layer is exactly as green as one pinning the right layer (ethos rule 7,
+    /// AF-161). The recipe it would restore to deletes never-committed
+    /// mid-edits, which is the cold-outbound near-miss of 2026-08-17.
+    ///
+    /// Asserted per arm rather than over the concatenation, because a guard in
+    /// the STALE section does not reach a reader in the commit-worthy one. The
+    /// restore prescription itself is the CONTROL: an arm that stopped
+    /// prescribing a restore would make the guard assertion vacuous, so it
+    /// fails there instead of passing quietly.
+    #[test]
+    fn every_arm_that_prescribes_a_restore_carries_the_find_object_guard() {
+        let dirty = s(&["FRUSTRATIONS.md", "a.rs"]);
+        // TWO AXES, because the advice is branched on BOTH and a matrix over
+        // one of them leaves whole message bodies unreachable. The first
+        // version of this test varied freshness only; `commit_worthy_body`
+        // emits an entirely separate recipe under `mine.is_empty()` (the
+        // OWNERSHIP IS UNKNOWN arm), so a mutation planted there rendered in no
+        // cell and the suite stayed green (amux, 2026-08-28).
+        let freshness: [(&str, Freshness); 4] = [
+            ("commit-worthy", Freshness::default()),
+            ("diverged", Freshness { diverged: s(&["a.rs"]), ..Default::default() }),
+            ("stale", Freshness { stale: s(&["a.rs"]), ..Default::default() }),
+            ("revived", Freshness { revived: s(&["a.rs"]), ..Default::default() }),
+        ];
+        let ownership: [(&str, Ownership); 2] = [
+            ("mine", Ownership::default()),
+            ("unknown-owner", Ownership { unclaimed: s(&["a.rs", "FRUSTRATIONS.md"]), ..Default::default() }),
+        ];
+        for ((fname, fresh), (oname, own)) in freshness
+            .iter()
+            .flat_map(|f| ownership.iter().map(move |o| (f, o)))
+        {
+            let arm = format!("{fname}/{oname}");
+            let arm = arm.as_str();
+            let m = build("/repo", &dirty, own, fresh, "S")
+                .unwrap_or_else(|| panic!("{arm}: must render"));
+            assert!(
+                m.contains("git checkout origin/main -- <path>"),
+                "{arm}: premise gone — this arm no longer prescribes a restore, so the guard \
+                 assertion below would pass vacuously: {m}"
+            );
+            assert!(
+                m.contains("--find-object=$(git hash-object <path>)"),
+                "{arm}: prescribes `git checkout origin/main -- <path>` with NO find-object \
+                 restore-safety check in the same message. Blob existence answers yes for a \
+                 `git add`ed mid-edit that is in no commit, so the restore it green-lights is an \
+                 irreversible delete: {m}"
+            );
+            // NOT asserted universally. The unknown-ownership arm prescribes the
+            // correct find-object check and never names the wrong recipe at all,
+            // so requiring the warning here would fail on code that is right.
+            // Whether that arm SHOULD carry the warning is amux's call on their
+            // own message text; reported, not decided here (ethos rule 8). The
+            // STALE section's warning is pinned by
+            // `stale_section_prescribes_find_object_never_blob_existence`, so
+            // dropping it from this loop loses no coverage.
+            // EVERY occurrence, not merely one somewhere in the arm (amux,
+            // 2026-08-28). The `contains` checks above pin "this arm mentions
+            // the guard at least once". The advice is emitted from SIX
+            // production strings, so mutating one back to blob-existence left
+            // a sibling occurrence satisfying them and 41 tests stayed green.
+            //
+            // Counting guards against restore prescriptions does NOT work and
+            // was measured before being rejected: the restore command also
+            // appears in prose and in do-not warnings, so today's CORRECT code
+            // reads 3 prescriptions to 1 guard (commit-worthy), 4 to 1
+            // (diverged), 5 to 2 (stale), 4 to 2 (revived). That invariant is
+            // false on code that is right.
+            //
+            // This is the rule the section actually follows, and it holds with
+            // zero slack in all four arms: blob existence may appear ONLY
+            // inside a do-not warning. An occurrence outside one is a
+            // prescription, and a correct guard sitting paragraphs away does
+            // not reach a reader acting on the line in front of them, which is
+            // this test's own rationale applied within an arm instead of
+            // across arms.
+            // Matched by PROXIMITY, not by one exact phrasing. The first
+            // version keyed on "Do NOT substitute `git cat-file -e" and the
+            // unknown-ownership arm says "Do NOT use" — correct text, flagged
+            // as a live prescription. A matcher pinned to one wording reports
+            // the arms that phrase it differently, which is the same
+            // wrong-layer error this test exists to catch, pointed at prose.
+            let blob_total = m.matches("cat-file -e").count();
+            let blob_warned = m
+                .match_indices("cat-file -e")
+                .filter(|(i, _)| m[i.saturating_sub(40)..*i].contains("Do NOT"))
+                .count();
+            assert_eq!(
+                blob_total, blob_warned,
+                "{arm}: {} of {} blob-existence mention(s) are NOT inside a do-not warning, so \
+                 at least one is prescribed as a check. `git add` writes the blob without \
+                 committing, so that recipe green-lights an irreversible delete of a mid-edit \
+                 that is in no commit: {m}",
+                blob_total - blob_warned, blob_total
+            );
+        }
+    }
+
+
+
 }

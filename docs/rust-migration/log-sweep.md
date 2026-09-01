@@ -57,6 +57,19 @@ fallback when a finding needs row-level inspection.
      self-hosted install should do — the comment above the first call says so.
      A 404 here means "self-hosted", not "broken".
 
+   **Known-benign 400s — same rule, different status.**
+
+   - `POST /api/git/staged-guard` -> 400 `{"error":"dir required"}` (~4/day,
+     unattributed, `Python-urllib`). This is `scripts/install-hooks.sh:315`
+     PROBING that the route exists: it posts an empty `{}` body on purpose and
+     treats **400 or 200 as success** (`ok server routes POST
+     /api/git/staged-guard (HTTP $code)`), because a 404 there means the guard is
+     unrouted and therefore inert — the AMUX-1730 failure. The 400 IS the pass
+     signal. The real guard cannot produce this row: `amux-staged-guard` computes
+     `top` as `git rev-parse --show-toplevel ... or os.getcwd()`, so `dir` is
+     never empty on the enforcing path. Read the count as "how many lanes ran
+     install-hooks.sh today", not as a malformed client.
+
    Add to this list rather than re-deriving it. AF-32 was filed on this endpoint
    after checking only that it 404s on both origins — a true fact that supported
    the wrong conclusion, because the discriminator is not "does any origin serve

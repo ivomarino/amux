@@ -349,11 +349,13 @@ async fn async_main() {
         tracing::info!(dir = %dir.display(), locks = ?removed, "cleaned stale Chrome profile locks");
     }
 
+    let reconciled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let state = api::AppState {
         store: store.clone(),
         started: Instant::now(),
         build_hash: build_hash(),
         auth_token,
+        reconciled: reconciled.clone(),
     };
     // EVERY BACKGROUND LOOP BELOW GOES THROUGH `registry::spawn_loop`, and
     // that is not a style preference. Three of these were dead or had never
@@ -460,6 +462,7 @@ async fn async_main() {
     drop(runtime_jobs::heartbeat::spawn(store.clone()));
     drop(runtime_jobs::storage::spawn(state.clone()));
     drop(runtime_jobs::disk_watch::spawn(state.clone()));
+    drop(runtime_jobs::queue_disposition::spawn(state.clone()));
     drop(runtime_jobs::tailnet_watch::spawn());
     // Telegram long-poll (idles with no error when TELEGRAM_BOT_TOKEN is
     // unset — see runtime_jobs::telegram_poll's module doc for why polling,
@@ -562,18 +565,36 @@ async fn async_main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(amux_core::provider_fleet::DEFAULT_RESUME_STAGGER_SECS),
     });
-    match runtime.reconcile_on_startup().await {
-        Ok(report) => tracing::info!(
-            interrupted = report.interrupted.len(),
-            stale = report.stale_backend.len(),
-            probe_failures = report.backend_probe_failures.len(),
-            "startup reconciliation complete"
-        ),
-        Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
+    // AMUX-3969b: reconciliation runs in the BACKGROUND so the listener can
+    // bind immediately. The old sequence blocked here for ~88s (50 lanes ×
+    // 2 sequential tmux calls each), during which the port was not listening
+    // and the entire fleet got connection-refused. Now the fleet gets 503s
+    // (via the `reconciled` flag on /health) while reconciliation finishes
+    // in the background, and the orch tick loop starts only after it completes.
+    {
+        let runtime = runtime.clone();
+        let store = store.clone();
+        let reconciled = reconciled.clone();
+        tokio::spawn(async move {
+            match runtime.reconcile_on_startup().await {
+                Ok(report) => tracing::info!(
+                    interrupted = report.interrupted.len(),
+                    stale = report.stale_backend.len(),
+                    probe_failures = report.backend_probe_failures.len(),
+                    "startup reconciliation complete"
+                ),
+                Err(e) => tracing::warn!(error = %e, "startup reconciliation failed"),
+            }
+            crate::api::reclaim::reap_orphaned_scans(&store);
+            reconciled.store(true, std::sync::atomic::Ordering::Release);
+            let orch_tick_secs = runtime.tick_secs.max(1);
+            jobs::spawn_loop(
+                jobs::ids::ORCH_RUNTIME,
+                Some(secs(orch_tick_secs)),
+                runtime.clone().run(),
+            );
+        });
     }
-    crate::api::reclaim::reap_orphaned_scans(&store);
-    let orch_tick_secs = runtime.tick_secs.max(1);
-    jobs::spawn_loop(jobs::ids::ORCH_RUNTIME, Some(secs(orch_tick_secs)), runtime.clone().run());
 
     // Worker event processors (RR-0065, AMUX-2613 gap 1): the durable
     // subscriber to protocol.events(). Without this spawn the whole event
@@ -711,6 +732,32 @@ async fn async_main() {
             }
         });
     }
+
+    // RELEASE IDLE BROWSERS (AMUX-3829, Ethan: "it should clean up
+    // automatically after idle use"). Nothing reaped one before, which is how a
+    // browser sat 18.1h with zero tabs and blocked him.
+    runtime_jobs::browser_reaper::spawn();
+
+    // MAC PROCESS HEALTH (2026-08-30). Reaps orphaned Ray workers and logs
+    // when the claude-process count exceeds the ceiling. Neither the browser
+    // reaper nor disk_watch covers these.
+    drop(runtime_jobs::mac_health::spawn());
+
+    // AUTO-START THE TUNNEL RELAY, and only with an explicit target port
+    // (AMUX-2888, py:78089). Both halves are required: a token alone would
+    // default the target to amux's OWN port, and this port has no request auth
+    // — publishing it is unauthenticated RCE on a YOLO lane. `maybe_boot_start`
+    // owns that decision and returns what it did, so the log records a fact
+    // rather than an intention.
+    //
+    // Not a `spawn_loop`: it is a one-shot that ADOPTS the relay's own task
+    // under `ids::TUNNEL` if it manages to start one.
+    tokio::spawn(async {
+        let outcome = runtime_jobs::tunnel::maybe_boot_start().await;
+        if outcome != "no token" && outcome != "no AMUX_TUNNEL_PORT" {
+            tracing::info!(outcome, "tunnel: boot autostart");
+        }
+    });
 
     // THE LEGACY 8822 BIND IS GONE (Ethan, 2026-08-11: "no more 8822 just rust").
     //

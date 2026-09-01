@@ -649,6 +649,12 @@ async fn apply(
                         gate: vec![],
                         depends_on: vec![],
                         tags: vec![],
+                        // Not an ask: this producer files ordinary cards.
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        // AF-367: seeded by a fleet-config apply, not authored by anyone.
+                        source: Some("config".into()),
                     };
                     let row = crate::db::board_store::create_issue(conn, &new, now)?;
                     if !epic.is_empty() {

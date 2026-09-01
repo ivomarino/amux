@@ -282,7 +282,7 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
               <span class="theme-track"><span class="theme-thumb"></span></span>
             </label>
           </div>
-          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Send /compact when context &lt; 50%</div>
+          <div style="font-size:0.68rem;color:var(--dim);margin-top:3px;">Send /compact when context &lt; 15% remaining</div>
           <div class="settings-row" style="justify-content:space-between;align-items:center;margin-top:10px;">
             <span style="font-size:0.85rem;">YOLO by default for new workers</span>
             <label class="theme-toggle">
@@ -605,6 +605,18 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
         <button id="bv-session" class="bv-btn" onclick="setBoardView('worker')" title="Group by worker">&#x25A4;</button>
       <button id="bv-status" class="bv-btn" onclick="setBoardView('status')" title="Group by status">&#x2630;</button>
     </div>
+    <!-- Export the CURRENT view. Reuses .board-view-toggle so it inherits the
+         group styling and the 44px mobile touch targets already tuned for it,
+         rather than introducing a second control shape in the same toolbar. -->
+    <div class="board-view-toggle" id="board-export">
+      <button class="bv-btn" onclick="exportBoard('md')" title="Export the issues currently shown (filters applied) as Markdown">MD</button>
+      <button class="bv-btn" onclick="exportBoard('json')" title="Export the issues currently shown (filters applied) as JSON">JSON</button>
+    </div>
+    <!-- Nudges toggle — sets CC_STANDING_ORDERS at global/group/worker scope -->
+    <div class="board-view-toggle" style="position:relative;">
+      <button class="bv-btn" id="nudges-btn" onclick="_nudgesTogglePanel(event)" title="Enable or disable board nudges fleet-wide or per scope">Nudges</button>
+      <div id="nudges-panel" style="display:none;position:absolute;right:0;top:calc(100% + 6px);z-index:200;background:var(--surface);border:1px solid var(--border);border-radius:8px;padding:12px 14px;min-width:220px;box-shadow:0 4px 16px rgba(0,0,0,0.25);font-size:0.78rem;"></div>
+    </div>
   </div>
   <div class="board-views" id="board-views"></div>
   <div class="board-filters" id="board-filters"></div>
@@ -891,6 +903,58 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       values are written to <code>~/.amux/server.env</code> and never shown again. Adding a new connector is one registry row.
     </div>
     <div id="connectors-accounts"></div>
+    <!-- AMUX-3993: declare a connector without a rebuild. The registry is a const
+         table in connectors.rs; adding a row there needs a commit and a deploy
+         before a key can be pasted. This form writes the DEFINITION (names only)
+         and then sets scope through the existing /api/scope capability. -->
+    <div class="conn-add">
+      <button class="btn" id="conn-add-toggle" onclick="_connAddToggle()">＋ Add connector</button>
+      <div id="conn-add-form" style="display:none;margin-top:10px;">
+        <div class="conn-add-grid">
+          <label>Name <input id="conn-new-label" placeholder="Linear"></label>
+          <label>Id <input id="conn-new-id" placeholder="linear"></label>
+          <label>Kind
+            <select id="conn-new-kind" onchange="_connAddKind()">
+              <option value="api_key">API key</option>
+              <option value="oauth2">OAuth2</option>
+            </select>
+          </label>
+          <label>Scope
+            <select id="conn-new-scope-level" onchange="_connAddScope()">
+              <option value="global" selected>Global (all workers)</option>
+              <option value="group">Group</option>
+              <option value="worker">Worker</option>
+            </select>
+          </label>
+          <label id="conn-new-scope-name-wrap" style="display:none;">Group / worker
+            <input id="conn-new-scope-name" placeholder="amux">
+          </label>
+        </div>
+        <div class="conn-add-grid" id="conn-new-apikey">
+          <label>Env var <input id="conn-new-key-env" placeholder="LINEAR_API_KEY"></label>
+          <label>Test URL (optional) <input id="conn-new-test-url" placeholder="https://api.linear.app/graphql"></label>
+        </div>
+        <div class="conn-add-grid" id="conn-new-oauth" style="display:none;">
+          <label>Client id env <input id="conn-new-cid-env" placeholder="LINEAR_CLIENT_ID"></label>
+          <label>Client secret env <input id="conn-new-csec-env" placeholder="LINEAR_CLIENT_SECRET"></label>
+          <label>Authorize URL <input id="conn-new-auth-url" placeholder="https://linear.app/oauth/authorize"></label>
+          <label>Token URL <input id="conn-new-token-url" placeholder="https://api.linear.app/oauth/token"></label>
+          <label>Scopes <input id="conn-new-scopes" placeholder="read,write"></label>
+        </div>
+        <div class="conn-add-grid">
+          <label>Setup note (optional) <input id="conn-new-note" placeholder="Create the key under Settings → API"></label>
+          <label>Docs URL (optional) <input id="conn-new-docs" placeholder="https://developers.linear.app"></label>
+        </div>
+        <div style="margin-top:8px;display:flex;gap:8px;align-items:center;">
+          <button class="btn" onclick="_connCreate()">Create</button>
+          <span id="conn-add-msg" class="dim"></span>
+        </div>
+        <div class="dim" style="margin-top:6px;font-size:.85em;">
+          Names only — no secret is entered here. After creating, paste the value in the
+          connector's own row; it goes to <code>~/.amux/server.env</code> and is never shown again.
+        </div>
+      </div>
+    </div>
     <div id="connectors-list"></div>
   </div>
 </div>
@@ -2189,6 +2253,11 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
             <button type="button" onclick="_peekMoreClose();setPeekTab('dictation')">&#128220; Dictation history</button>
             <button type="button" onclick="_peekMoreClose();_readLatestMessage(peekSession)" title="Read the worker's most recent full message aloud">&#x1F50A; Read aloud latest</button>
             <button type="button" onclick="_peekMoreClose();setPeekTab('readalouds')">&#x1F50A; Read-aloud history</button>
+            <!-- Last, and separated: the only DESTRUCTIVE entry in this menu.
+                 Everything above opens something; this throws work away, so it
+                 does not sit where a thumb lands by accident reaching for
+                 "Attach file" at the top. -->
+            <button type="button" class="peek-more-danger" onclick="_peekMoreClose();_peekClearInput()" title="Clear the composer: text, saved draft, and any staged attachments">&#x1F5D1; Clear input</button>
           </div>
           <!-- Compact recording popup: live volume bars + timer, right above the
                composer. Stop → transcribe → text lands in the input. -->
@@ -2297,6 +2366,16 @@ setTimeout(function(){var f=document.getElementById('js-fallback');if(f&&f.style
       </div>
       <button id="piv-scope" class="btn" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;" onclick="togglePeekIssuesAll()" title="Toggle between this worker's issues and all workers'">This worker</button>
       <span id="peek-issues-count" style="flex:0 0 auto;font-size:0.78rem;color:var(--dim);align-self:center;white-space:nowrap;"></span>
+      <!-- Export THIS worker's board, FULL descriptions, straight from the
+           server (AMUX-3868). Not the main Board tab's client-side export:
+           that one can only carry desc_head, because GET /api/board never
+           sends desc. Honours the "This worker / All workers" toggle above.
+           flex:0 0 auto like every other control here, so it wraps below 600px
+           rather than squeezing the search input. -->
+      <div class="board-view-toggle" id="peek-board-export" style="flex:0 0 auto;">
+        <button class="bv-btn" onclick="exportPeekBoard('md')" title="Export this worker's board as Markdown, with complete descriptions">MD</button>
+        <button class="bv-btn" onclick="exportPeekBoard('json')" title="Export this worker's board as JSON, with complete descriptions">JSON</button>
+      </div>
       <button id="piv-filter" class="btn pbt-compact" onclick="_bfOpenMenu(event,'peek')" title="Add a filter" style="flex:0 0 auto;font-size:0.72rem;padding:4px 9px;"><span class="pbt-text">+ Filter</span><span class="pbt-ico" aria-hidden="true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 5h18l-7 8v6l-4 2v-8z"/></svg></span></button>
       <span class="board-search-wrap" style="flex:1 1 160px;min-width:0;display:flex;position:relative;">
         <input id="peek-issues-search" class="search-input" type="text" style="width:100%;min-width:0;"

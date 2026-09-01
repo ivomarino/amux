@@ -204,6 +204,62 @@ fn capture_pane_bounded(pt: &str, lane: &str) -> Option<String> {
 /// being bounded is the part that can be wrong, so the mechanism is what the
 /// test drives — with `sh -c "sleep 30"`, which hangs for real rather than
 /// standing in for hanging.
+/// The budget for the fleet-list PROBES — `tmux list-sessions`, the two
+/// `tmux list-panes`, and the per-shell-pane `pgrep` (AF-301).
+///
+/// Separate from `AMUX_PANE_CAPTURE_TIMEOUT_S` because they answer different
+/// questions: pane capture reads ONE lane's screen and 3s is generous, while
+/// these enumerate the whole fleet and a slow-but-working tmux should not be
+/// mistaken for a wedged one.
+fn probe_budget() -> std::time::Duration {
+    std::time::Duration::from_secs_f64(env_secs("AMUX_SESSIONS_PROBE_TIMEOUT_S", 5.0))
+}
+
+/// `run_bounded`, but returning the whole `Output` so a caller can read
+/// `status` and `stderr` (AF-301).
+///
+/// `run_bounded` returns stdout only, which is why `tmux list-sessions` at the
+/// call site below kept using bare `.output()`: it WARNs with the exit status
+/// and stderr when tmux fails, and converting it to the stdout-only helper
+/// would have silently dropped that diagnostic to buy the timeout. Widening the
+/// helper keeps both.
+fn run_bounded_output(
+    mut cmd: std::process::Command,
+    budget: std::time::Duration,
+    lane: &str,
+) -> Option<std::process::Output> {
+    let mut child = cmd.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if start.elapsed() >= budget {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    PANE_CAPTURE_TIMEOUTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Ok(mut l) = PANE_CAPTURE_LAST_TIMEOUT.lock() {
+                        *l = Some((lane.to_string(), crate::config::now_f64()));
+                    }
+                    tracing::warn!(
+                        target: "amux::sessions",
+                        lane = %lane,
+                        budget_s = budget.as_secs_f64(),
+                        "fleet-list probe exceeded its budget and was killed (AF-301). Before \
+                         this bound the same call was a bare `.output()` with no timeout, and a \
+                         wedged tmux held GET /api/sessions for as long as tmux took — 697s on \
+                         2026-08-28, which starved the runtime and 500'd the dashboard."
+                    );
+                    return None;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
+    child.wait_with_output().ok()
+}
+
 fn run_bounded(
     mut cmd: std::process::Command,
     budget: std::time::Duration,
@@ -319,6 +375,26 @@ fn pane_cache() -> &'static std::sync::Mutex<(f64, BTreeMap<String, String>)> {
 /// 1 is a parked pane; 2 can be one legitimate single repaint (a notification
 /// landing, a human's pasted line); 3+ inside a minute is something REDRAWING.
 const CHURN_MIN_DISTINCT: usize = 3;
+
+/// Distinct content-frames required inside a window that STARTS AT A LANE'S OWN
+/// `idle` CLAIM (AMUX-3896). Two, not three, and the difference is the window.
+///
+/// [`CHURN_MIN_DISTINCT`]'s 3 buys margin over a fixed 60s window where a
+/// legitimate single repaint (a notification, a pasted line) is common. Here the
+/// window is bounded by the age of the claim and the frames are the only ones
+/// recorded AFTER it, so the thing being excluded is different: a stale
+/// post-Stop frame, which is FROZEN and therefore contributes exactly one
+/// content hash however many times it is sampled. Two distinct contents means
+/// the pane changed after the lane said it was done, which a frozen frame cannot
+/// do — and the gate additionally requires a spinner in the same frame.
+///
+/// It also carries a floor for free. Captures sit behind a 2s response cache, so
+/// N distinct frames cannot exist in less than ~2*(N-1) seconds; 2 means the
+/// claim is at least a couple of seconds old, which is the repaint lag the
+/// contradiction window was written for. Raising this to 3 would push the
+/// earliest possible correction to ~4-8s at real sampling rates and miss the
+/// shorter live specimens (4.4s, 8.1s) outright.
+const CHURN_MIN_SINCE_CLAIM: usize = 2;
 
 /// lane -> recent (ts, content-hash) observations.
 type ChurnMap = BTreeMap<String, Vec<(f64, u64)>>;
@@ -637,22 +713,28 @@ impl FleetSignals {
         // field's doc for the measurement. It resolves to the session's
         // CURRENT window; amux creates one window per session, and the agent
         // runs in it.
-        let tmux_out = std::process::Command::new("tmux")
-            .args([
-                "list-sessions",
-                "-F",
-                "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}",
-            ])
-            .output();
+        // BOUNDED (AF-301). This was a bare `.output()`, which blocks until the
+        // child exits with no timeout; a wedged tmux held this request open for
+        // 697s on 2026-08-28. `run_bounded_output` rather than `run_bounded`
+        // because the WARN below needs `status` and `stderr`.
+        let mut lsc = std::process::Command::new("tmux");
+        lsc.args([
+            "list-sessions",
+            "-F",
+            "#{session_name}:#{session_activity}:#{session_created}:#{window_activity}",
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+        let tmux_out = run_bounded_output(lsc, probe_budget(), "list-sessions").ok_or(());
         match &tmux_out {
             Ok(o) if !o.status.success() => tracing::warn!(
                 status = %o.status,
                 stderr = %String::from_utf8_lossy(&o.stderr).trim(),
                 "tmux list-sessions failed — fleet will read as not-running"
             ),
-            Err(e) => tracing::warn!(
-                error = %e,
-                "tmux spawn failed — fleet will read as not-running"
+            Err(_) => tracing::warn!(
+                "tmux list-sessions did not answer within the probe budget, or failed to \
+                 spawn — fleet will read as not-running (AF-301)"
             ),
             _ => {}
         }
@@ -680,11 +762,16 @@ impl FleetSignals {
         // running lanes have no tmux session", which was absurd on its face and
         // entirely an artifact. A liveness filter that can empty the fleet is
         // worse than the bug it fixes.
-        let all_panes_dead = std::process::Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"])
-            .output()
-            .map(|o| sessions_with_all_panes_dead(&String::from_utf8_lossy(&o.stdout)))
-            .unwrap_or_default();
+        // BOUNDED (AF-301) — was a bare `.output()`.
+        let all_panes_dead = {
+            let mut c = std::process::Command::new("tmux");
+            c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_dead}"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            run_bounded(c, probe_budget(), "list-panes/dead")
+                .map(|out| sessions_with_all_panes_dead(&out))
+                .unwrap_or_default()
+        };
         if !all_panes_dead.is_empty() {
             tracing::warn!(
                 target: "sessions",
@@ -717,10 +804,15 @@ impl FleetSignals {
         // and a stopped lane shows as `bash`. A session with several panes
         // counts as shell-only only if EVERY pane is a shell.
         let mut shell_only = BTreeSet::new();
-        if let Ok(o) = std::process::Command::new("tmux")
-            .args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"])
-            .output()
-        {
+        // BOUNDED (AF-301) — was a bare `.output()`.
+        let panes_probe = {
+            let mut c = std::process::Command::new("tmux");
+            c.args(["list-panes", "-a", "-F", "#{session_name}:#{pane_pid}:#{pane_current_command}"])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null());
+            run_bounded(c, probe_budget(), "list-panes/pids")
+        };
+        if let Some(o) = panes_probe {
             const SHELLS: [&str; 8] = ["bash", "zsh", "sh", "fish", "dash", "ksh", "tcsh", "csh"];
             let mut any_live: BTreeSet<String> = BTreeSet::new();
             let mut seen: BTreeSet<String> = BTreeSet::new();
@@ -728,7 +820,7 @@ impl FleetSignals {
             // an agent as a CHILD: (session, pane_pid). Collected here and probed
             // below only for sessions not already proven live by another pane.
             let mut shell_panes: Vec<(String, String)> = Vec::new();
-            for l in String::from_utf8_lossy(&o.stdout).lines() {
+            for l in o.lines() {
                 // format is session:pid:cmd, but a session NAME can contain ':',
                 // so split from the RIGHT twice: cmd, then pid.
                 let Some((rest, cmd)) = l.rsplit_once(':') else { continue };
@@ -748,15 +840,108 @@ impl FleetSignals {
             // fleet list agrees with it instead of hiding a running lane behind a
             // shell it never actually returned to. Bounded: only shell-foreground
             // panes whose session is not already proven live by another pane.
+            // BOUNDED PER CALL *AND* IN TOTAL (AF-301). This was a bare
+            // `.output()` inside a per-shell-pane loop, so a 50-lane fleet did
+            // ~50 unbounded subprocess spawns per cache miss (TTL 2s) — the
+            // densest place in the request for a wedge to start. A per-call
+            // bound alone is not enough: 50 calls each just under budget is
+            // still minutes, so the LOOP carries its own deadline.
+            //
+            // Skipping is disclosed rather than silent (ethos rule 4). A lane
+            // dropped here is simply not proven live by its children, which
+            // reads as shell-only — so the count has to be visible or the fleet
+            // quietly looks idler than it is.
+            // ONE `ps`, NOT N `pgrep`s (AMUX-3894, 2026-08-29).
+            //
+            // The loop deadline above did its job and then BECAME the defect. Every
+            // amux lane is launched as `bash -c "... ; claude ..."`, so its pane's
+            // `#{pane_current_command}` is `bash` and essentially EVERY lane needs
+            // this child rescue — the rescue is the common path, not the rare one.
+            // At 57 lanes the cumulative 5s budget ran out partway through, and the
+            // remainder were counted as unproven, which reads as shell-only, which
+            // reads as `running: false`.
+            //
+            // Measured 2026-08-29 21:00, load 25, 57 tmux sessions and 122 live
+            // claude processes: `skipped=22 budget_s=5.0`, and three consecutive
+            // GETs of /api/sessions returned 40, 37 and 32 running out of 58, with a
+            // DIFFERENT set each time. Nothing had died. The set flapped because
+            // which lanes fell past the deadline depended on scheduling.
+            //
+            // That is not cosmetic. `steering skipped session=<x> reason=not-running`
+            // appeared 143 times in the same window, so queued steering was being
+            // dropped for lanes that were alive and idle — which is exactly the
+            // `queue.has_live_consumer` invariant firing on AMUX-3883 ("a live
+            // consumer sitting IDLE with an old item in front of it"). One bad
+            // liveness read produced a false fleet view, silent message loss, and a
+            // failing invariant that read as a delivery bug.
+            //
+            // The budget was the right instinct against a wedge and the wrong shape
+            // for the load: N sequential subprocesses cannot be made safe by timing
+            // them, only by not being N. `pgrep -P <pid>` asks "does this pid have a
+            // child"; `ps -eo ppid=` answers that for EVERY pid in one call, so the
+            // whole question costs one subprocess regardless of fleet size. That is
+            // the same move already made directly above for the per-session tmux
+            // calls ("One tmux call, not one per session").
+            //
+            // FAILS DISCLOSED, not silent (ethos rule 4). If the single probe fails
+            // there is no partial answer to misread: nothing is proven live by
+            // children, the WARN says so once, and the count it reports is the whole
+            // shell-pane set rather than a scheduling-dependent slice of it.
+            let mut ppids_with_children: std::collections::BTreeSet<String> =
+                std::collections::BTreeSet::new();
+            let ps_probe = {
+                let mut c = std::process::Command::new("ps");
+                c.args(["-eo", "ppid="])
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::null());
+                run_bounded(c, probe_budget(), "ps/ppid")
+            };
+            match &ps_probe {
+                Some(out) => {
+                    for line in out.lines() {
+                        let t = line.trim();
+                        if !t.is_empty() {
+                            ppids_with_children.insert(t.to_string());
+                        }
+                    }
+                }
+                None => tracing::warn!(
+                    target: "amux::sessions",
+                    budget_s = probe_budget().as_secs_f64(),
+                    "child-process liveness probe (ps -eo ppid=) did not answer — no lane can be \
+                     proven live by its children this pass, so shell-foreground lanes will read \
+                     as shell-only (AMUX-3894)"
+                ),
+            }
+            let mut pgrep_skipped = 0usize;
             for (sess, pid) in shell_panes {
                 if any_live.contains(&sess) || pid.is_empty() {
                     continue;
                 }
-                if let Ok(ch) = std::process::Command::new("pgrep").args(["-P", &pid]).output() {
-                    if !ch.stdout.iter().all(|b| b.is_ascii_whitespace()) {
-                        any_live.insert(sess.clone());
-                    }
+                if ps_probe.is_none() {
+                    pgrep_skipped += 1;
+                    continue;
                 }
+                if ppids_with_children.contains(&pid) {
+                    any_live.insert(sess.clone());
+                }
+            }
+            // Reached only when the single `ps` probe itself failed, so the count is
+            // now the WHOLE shell-pane set rather than a scheduling-dependent slice
+            // of it. That distinction is the point of AMUX-3894: this number used to
+            // vary run to run on a healthy machine, which made it unreadable as a
+            // signal. A non-zero count here now means one thing — `ps` did not
+            // answer — and the advice is no longer "raise the timeout", because
+            // there is no longer a per-lane cost for a timeout to be too small for.
+            if pgrep_skipped > 0 {
+                tracing::warn!(
+                    target: "amux::sessions",
+                    unproven = pgrep_skipped,
+                    "child-process liveness could not be established for these shell-foreground \
+                     lanes because `ps -eo ppid=` did not answer; they will read as shell-only \
+                     (and therefore not-running) this pass. This is a wedged/absent ps, NOT a \
+                     budget that needs raising (AMUX-3894)."
+                );
             }
             for s in seen {
                 if !any_live.contains(&s) {
@@ -1020,6 +1205,24 @@ impl FleetSignals {
         pane_churn_distinct(name, self.now, self.contradiction_window()) >= CHURN_MIN_DISTINCT
     }
 
+    /// Distinct content-frames observed in the last `age_s` seconds — i.e.
+    /// SINCE a claim made that long ago (AMUX-3896).
+    ///
+    /// [`Self::pane_churning`] asks "is this lane redrawing?" over the fixed
+    /// contradiction window. This asks the narrower question the fresh-idle
+    /// gate needs: "has it redrawn since it told us it was DONE?" The window
+    /// has to start at the claim, or the count includes frames from the turn
+    /// the lane just finished and every stop-hook would look like live work.
+    ///
+    /// Zero when the pane is inadmissible, same as `pane_churning` — no
+    /// captured frames means no evidence, never "therefore idle".
+    pub(crate) fn pane_churn_since(&self, name: &str, age_s: f64) -> usize {
+        if self.pane_of(name).is_none() {
+            return 0;
+        }
+        pane_churn_distinct(name, self.now, age_s.max(0.0))
+    }
+
     /// Capture the panes that could contradict a report.
     ///
     /// Only lanes that painted inside the contradiction window — typically a
@@ -1262,14 +1465,65 @@ impl FleetSignals {
         // costs a late correction, never a false "busy".
         let idle_gate_open =
             idle_report_age.map(|a| a > self.contradiction_window()).unwrap_or(true);
+        // ...AND A FRESH ONE IS FALSIFIABLE TOO, BY EVIDENCE THE RACE CANNOT
+        // MANUFACTURE (AMUX-3896). The window above is one number doing two
+        // jobs, and its own doc says so: "one number for both halves because it
+        // is one question". They are two questions. How recent must a frame be
+        // to be admissible wants 60s. How long does a lane's own word survive
+        // contrary evidence wants ~1s — the repaint lag after a Stop hook is
+        // the entire race the window was written for.
+        //
+        // Conflating them costs the normal amux flow: a lane ends a turn
+        // (stop-hook -> idle) and immediately starts another (auto-continue,
+        // standing orders, input queued at the boundary), then reads IDLE until
+        // 60s pass or its first tool call fires a tool-hook. Ethan, 22:54
+        // 2026-08-29: "tubescience worker says idle but its not". The specimen
+        // is in that lane's own status-explain history — status=idle,
+        // decided_by=report, report age 8.8s, over pane detect=active with 20
+        // distinct content frames. It sat that way for 49s. Sampling every
+        // running lane found the same shape on 8 of 57, all stop-hook, ages
+        // 0.6s to 34s.
+        //
+        // So: keep the window for weak evidence (a bar phrase, a single
+        // spinner-shaped frame — a stale frame can show either), and add one
+        // narrow gate for evidence a frozen frame cannot produce. The pane must
+        // show a spinner AND have REDRAWN since the claim: `CHURN_MIN_DISTINCT`
+        // distinct content-frames inside a window that starts at the report's
+        // own timestamp. A stale frame is by definition one frame and stops
+        // there; a lane really working repaints ~6x/s. That flips the 8.8s,
+        // 16.3s and 34.0s specimens and leaves the 0.6s and 0.7s ones — which
+        // ARE the repaint race — exactly as they are.
+        //
+        // Measured in the same window as the claim, never a fixed one: at age
+        // 3s only the last 3s of frames may vote, so the evidence can never
+        // include the turn the lane just finished.
+        let churn_since_claim = idle_report_age.map(|a| self.pane_churn_since(name, a)).unwrap_or(0);
+        let fresh_idle_contradicted = !idle_gate_open
+            && churn_since_claim >= CHURN_MIN_SINCE_CLAIM
+            && self
+                .pane_of(name)
+                .map(crate::api::session_verbs::detect_claude_status)
+                .as_deref()
+                == Some("active");
         ex.insert(
             "idle_report_age_s".into(),
             idle_report_age.map(|a| json!(a)).unwrap_or(serde_json::Value::Null),
         );
         ex.insert("idle_contradiction_gate_open".into(), json!(idle_gate_open));
-        if status == "idle" && idle_gate_open && self.pane_says_working(name) {
+        ex.insert("churn_since_claim".into(), json!(churn_since_claim));
+        ex.insert("churn_since_claim_threshold".into(), json!(CHURN_MIN_SINCE_CLAIM));
+        ex.insert("fresh_idle_contradicted".into(), json!(fresh_idle_contradicted));
+        if status == "idle" && (idle_gate_open || fresh_idle_contradicted) && self.pane_says_working(name)
+        {
             status = "active".into();
-            decided = "contradiction_pane_generating";
+            // NAMED APART from the aged path, because the two rest on different
+            // evidence and a sweep that cannot tell them apart cannot tell
+            // whether this gate is earning its keep or firing on the race.
+            decided = if idle_gate_open {
+                "contradiction_pane_generating"
+            } else {
+                "contradiction_pane_redrew_since_claim"
+            };
         }
         // A PICKER CONTRADICTS IDLE TOO (AMUX-2952's status half). The rule
         // above only ever flips idle -> active on a GENERATING pane, so a lane
@@ -1798,7 +2052,30 @@ pub async fn list_sessions_legacy(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    match legacy_sessions_array(&state.store) {
+    // OFF THE ASYNC RUNTIME (AF-300). `legacy_sessions_array` is synchronous and
+    // shells out — `tmux list-sessions`, two `tmux list-panes`, and a `pgrep`
+    // PER SESSION — so awaiting it inline blocks a tokio WORKER thread, and
+    // there are only as many of those as CPUs. On 2026-08-28 eight concurrent
+    // requests from one iPhone each ran ~696s (18:17:19 -> 18:28:58); while
+    // they held worker threads, every other read failed `timed out waiting for
+    // connection` at 30s — 22 x 500 across /api/sessions, /api/board,
+    // /api/board/statuses and /api/board/session-gates, all dashboard UAs. The
+    // same burst happened on 08-24 (29 rows). This is the most-polled endpoint
+    // in the system (81,935 requests in 24h), so it is the worst possible place
+    // to block on a subprocess.
+    //
+    // `spawn_blocking` moves it to the blocking pool (512 threads by default),
+    // where a hung tmux costs one pool thread instead of starving the runtime.
+    // NOT A NEW PATTERN: api/graph.rs:123 already calls this exact function this
+    // exact way. The fix existed on the LOW-traffic caller and was missing on
+    // the hot one.
+    //
+    // It does not stop a single request taking 11 minutes — the four unbounded
+    // `.output()` calls in this file are AF-301 — but it stops one client's slow
+    // request from taking the server down for everyone else.
+    let store = state.store.clone();
+    let built = tokio::task::spawn_blocking(move || legacy_sessions_array(&store)).await;
+    match built.unwrap_or_else(|e| Err(anyhow::anyhow!("sessions build panicked: {e}"))) {
         Ok(json) => {
             let body = filter_isolated_for_peer(&json, &headers);
             // CONTENT-hash ETag (AMUX-3504), not a store-rev one: this payload
@@ -2740,10 +3017,16 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                     .map(|d| {
                         let d = d.clone();
                         std::thread::spawn(move || {
-                            let out = std::process::Command::new("git")
-                                .args(["-C", &d, "rev-parse", "--abbrev-ref", "HEAD"])
-                                .output()
-                                .ok()?;
+                            // BOUNDED (AF-301). `git rev-parse` on a repo whose
+                            // index is locked, or on a network filesystem, blocks
+                            // as long as git does — and this runs per checkout on
+                            // a spawned thread, so the join below waits for the
+                            // slowest one.
+                            let mut gc = std::process::Command::new("git");
+                            gc.args(["-C", &d, "rev-parse", "--abbrev-ref", "HEAD"])
+                                .stdout(std::process::Stdio::piped())
+                                .stderr(std::process::Stdio::null());
+                            let out = run_bounded_output(gc, probe_budget(), "git-branch")?;
                             out.status.success().then(|| {
                                 (d, String::from_utf8_lossy(&out.stdout).trim().to_string())
                             })
@@ -2815,11 +3098,15 @@ pub(crate) fn build_array(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<s
                         std::thread::spawn(move || {
                             if running {
                                 let pt = pane_target(&format!("amux-{n}"));
-                                let out = std::process::Command::new("tmux")
-                                    .args(["capture-pane", "-t", &pt, "-p", "-e", "-S", "-30"])
-                                    .output()
-                                    .ok()?;
-                                Some((n, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+                                // BOUNDED (AF-301). This was a bare `.output()`
+                                // capture-pane — the exact operation
+                                // `capture_pane_bounded` exists to bound, done
+                                // unbounded, in the same file. It runs on a
+                                // spawned thread rather than the async runtime,
+                                // so a wedge here blocks the `h.join()` below
+                                // instead of a worker; still unbounded, still
+                                // holds the request open.
+                                Some((n.clone(), capture_pane_bounded(&pt, &n)?))
                             } else {
                                 let raw = stopped_session_raw(&n);
                                 (!raw.is_empty()).then_some((n, raw))
@@ -3799,6 +4086,115 @@ Claude usage limit reached. Your limit will reset at 3pm.
         assert_eq!(ex["decided_by"], json!("not_running"));
     }
 
+    // ── AMUX-3896: a FRESH idle claim is falsifiable too ────────────────────
+    //
+    // Ethan, 2026-08-29 22:54: "tubescience worker says idle but its not". That
+    // lane's own status-explain history holds the derivation: status=idle,
+    // decided_by=report, a stop-hook `idle` 8.8s old, over a pane with a spinner
+    // and 20 distinct content frames. It read idle for 49s while generating,
+    // because the contradiction window (60s) refuses the pane's evidence until
+    // the claim is a minute old — and the normal amux flow (turn ends, next turn
+    // starts at once from queued input or standing orders) lives entirely inside
+    // that minute. 8 of 57 running lanes carried the same shape when sampled.
+    //
+    // These three cases are the whole discriminator: work redraws AFTER the
+    // claim, a stale post-Stop frame does not, and frames from BEFORE the claim
+    // are the finished turn's and may never vote.
+
+    /// One planted frame per element, spaced 1s apart, ending `newest_age_s`
+    /// ago. Distinct `body` values are what make a frame count as a redraw —
+    /// `pane_content_hash` ignores the bottom bar, so the varying line has to be
+    /// above it.
+    fn plant_frames(lane: &str, now: f64, bodies: &[&str], newest_age_s: f64) {
+        for (i, b) in bodies.iter().rev().enumerate() {
+            let frame = format!(
+                "{b}\n\u{273b} Doing\u{2026} (3m 56s \u{b7} \u{2193} 6.8k tokens)\n\
+                 \u{2500}\u{2500}\u{2500}\u{2500}\n\u{276f}\n\u{2500}\u{2500}\u{2500}\u{2500}\n\
+                 \u{23f5}\u{23f5} bypass permissions on \u{b7} esc to interrupt \u{b7} \u{2190} 2 agents"
+            );
+            super::note_pane_frame(lane, &frame, now - newest_age_s - i as f64, 600.0);
+        }
+    }
+
+    fn fresh_idle_lane(lane: &str, claim_age_s: f64) -> FleetSignals {
+        let mut s = signals();
+        s.activity.insert(format!("amux-{lane}"), (s.now - 1.0) as i64);
+        s.running.insert(format!("amux-{lane}"));
+        s.reports = json!({lane: {"state": "idle", "ts": s.now - claim_age_s, "source": "stop-hook"}});
+        s.panes.insert(lane.into(), WORKING_BAR.into());
+        s
+    }
+
+    /// THE FIX. A spinner plus two distinct frames recorded since the claim is
+    /// evidence a frozen frame cannot manufacture, so the lane reads working —
+    /// and the verdict names the narrow rule, not the aged one.
+    #[test]
+    fn a_fresh_idle_claim_loses_to_a_pane_that_redrew_since_the_claim() {
+        let lane = "t3896-redrew";
+        let s = fresh_idle_lane(lane, 9.0);
+        plant_frames(lane, s.now, &["frame one", "frame two"], 1.0);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "active", "a generating lane must not read idle: {ex}");
+        assert_eq!(ex["decided_by"], json!("contradiction_pane_redrew_since_claim"), "{ex}");
+        assert_eq!(ex["idle_contradiction_gate_open"], json!(false), "the 60s gate is still shut: {ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(true), "{ex}");
+        assert!(ex["churn_since_claim"].as_u64().unwrap() >= 2, "{ex}");
+    }
+
+    /// THE RACE THE WINDOW EXISTS FOR, WHICH MUST KEEP WINNING. The live
+    /// specimens at 0.6s and 0.7s are a stop-hook landing while the just-drawn
+    /// frame is still on screen. A frozen frame hashes the same however often it
+    /// is sampled, so it can never reach two distinct contents.
+    #[test]
+    fn a_frozen_post_stop_frame_does_not_falsify_a_fresh_idle_claim() {
+        let lane = "t3896-frozen";
+        let s = fresh_idle_lane(lane, 0.7);
+        // Sampled four times, same content every time — which is what "stale"
+        // means. Planting one distinct body four times is the point.
+        plant_frames(lane, s.now, &["same", "same", "same", "same"], 0.1);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "a stale frame must not read as work: {ex}");
+        assert_eq!(ex["decided_by"], json!("report"), "{ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(false), "{ex}");
+        assert_eq!(ex["churn_since_claim"], json!(1), "{ex}");
+    }
+
+    /// THE WINDOW HAS TO START AT THE CLAIM. Frames from before it belong to the
+    /// turn the lane just finished; counting them would make every stop-hook
+    /// look like live work and turn the fix into "no idle status at all".
+    #[test]
+    fn frames_from_before_the_claim_do_not_count_as_redrawing_since_it() {
+        let lane = "t3896-before";
+        let s = fresh_idle_lane(lane, 5.0);
+        // Four distinct frames, all older than the 5s-old claim.
+        plant_frames(lane, s.now, &["a", "b", "c", "d"], 8.0);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(status, "idle", "the finished turn's own frames are not evidence: {ex}");
+        assert_eq!(ex["churn_since_claim"], json!(0), "{ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(false), "{ex}");
+    }
+
+    /// A REDRAWING PANE IS NOT ENOUGH ON ITS OWN. Churn is content-only and a
+    /// human typing at the composer also changes content; the gate requires a
+    /// SPINNER in the same frame, so a genuinely idle lane whose pane is
+    /// changing stays idle. Without this the fix would flip lanes that just
+    /// finished and are being typed into.
+    #[test]
+    fn churn_without_a_spinner_does_not_falsify_a_fresh_idle_claim() {
+        let lane = "t3896-nospinner";
+        let mut s = fresh_idle_lane(lane, 9.0);
+        s.panes.insert(lane.into(), IDLE_WITH_AGENTS.into());
+        plant_frames(lane, s.now, &["frame one", "frame two", "frame three"], 1.0);
+        let (status, ex) = s.derive_status_explain(lane, true);
+        assert_eq!(
+            crate::api::session_verbs::detect_claude_status(IDLE_WITH_AGENTS),
+            "idle",
+            "fixture guard: this pane must not detect as active, or the test proves nothing"
+        );
+        assert_eq!(status, "idle", "content churn alone is not a generating turn: {ex}");
+        assert_eq!(ex["fresh_idle_contradicted"], json!(false), "{ex}");
+    }
+
     /// AMUX-3756. The status badge and the turn-boundary gate must reach the
     /// same verdict about the same stored report.
     ///
@@ -4174,6 +4570,19 @@ Claude usage limit reached. Your limit will reset at 3pm.
                                 };
                                 let got = run(&c);
                                 checked += 1;
+                                // THE NAME OVER-CLAIMS, AND THIS LINE IS WHERE
+                                // (AMUX-3896). A totalizing title with a
+                                // carve-out reads as a total guarantee to
+                                // everyone who greps it, and the carve-out was
+                                // the bug: a lane starting its next turn read
+                                // idle for up to 60s. The window is now
+                                // falsifiable by a pane that REDREW since the
+                                // claim, which this table cannot express — it
+                                // plants no frames, so churn_since_claim is 0
+                                // in every row here. The discriminator is
+                                // pinned by the four `*_since_the_claim` tests
+                                // above; grace stays permissive so both
+                                // outcomes are legal here.
                                 let grace = st == "idle" && age <= 60.0;
                                 assert!(
                                     got != "idle" || grace,

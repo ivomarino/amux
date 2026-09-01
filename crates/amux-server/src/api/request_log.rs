@@ -825,7 +825,11 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
         }
         _ => 0.0,
     };
-    Json(json!({
+    // AF-320: `count: 0` is ambiguous on its own — no matching events, or a
+    // window nobody read. n_considered is the matched population, which is the
+    // number that disambiguates it.
+    Json(crate::api::measured::measured(
+        json!({
         "events": events,
         "count": events.len(),
         "total_matched": total,
@@ -840,7 +844,9 @@ async fn get_logs(State(state): State<AppState>, Query(q): Query<HashMap<String,
              Page backward with `until=<the oldest ts in this page>`, or read \
              `total_matched` for volume. Do not describe this page as the window."
         } else { "" },
-    }))
+        }),
+        total.max(0) as usize,
+    ))
     .into_response()
 }
 
@@ -924,8 +930,25 @@ async fn get_logs_raw(
         .clamp(1, 5000);
     let log_path = super::settings::amux_home().join("logs").join("server-rs.log");
     match raw_payload(&log_path, lines_n, &state) {
-        Ok(v) => Json(v).into_response(),
-        Err(e) => internal(e),
+        Ok(v) => {
+            // n_considered is the whole tailable population (log file lines +
+            // request-log rows), not the page returned — `lines: []` with a
+            // large population is a filter result, with a zero it is an empty
+            // log, and the page length cannot tell them apart (AF-320).
+            let n = v.get("total").and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
+            Json(crate::api::measured::measured(v, n)).into_response()
+        }
+        // A 500 here used to answer with no `lines` key at all, which any
+        // tolerant reader renders as "no log lines". Keep the status, and say
+        // in the body that nothing was read.
+        Err(e) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            Json(crate::api::measured::unmeasured(
+                json!({ "lines": [], "total": 0, "error": e.to_string() }),
+                "the log tail could not be built, so no line was read",
+            )),
+        )
+            .into_response(),
     }
 }
 
@@ -1058,6 +1081,7 @@ const ANY: &[&str] = &["*"];
 pub const ROUTE_TABLE: &[RouteEntry] = &[
     // -- public (outside require_bearer)
     RouteEntry { path: "/health", methods: &["GET"] },
+    RouteEntry { path: "/api/health", methods: &["GET"] },
     RouteEntry { path: "/manifest.json", methods: &["GET"] },
     RouteEntry { path: "/api/calendar.ics", methods: &["GET"] },
     RouteEntry { path: "/api/debug/tmux", methods: &["GET"] },
@@ -1079,12 +1103,22 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/events", methods: &["GET"] },
     // -- board
     RouteEntry { path: "/api/board", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/board/export", methods: &["GET"] },
     RouteEntry { path: "/api/board/statuses", methods: &["GET", "POST"] },
     RouteEntry { path: "/api/board/statuses/reorder", methods: &["PUT"] },
     RouteEntry { path: "/api/board/statuses/{sid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/session-gates", methods: &["GET", "PATCH"] },
+    RouteEntry { path: "/api/board/nudges", methods: &["GET", "PATCH"] },
     RouteEntry { path: "/api/board/clear-done", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}", methods: &["GET", "PATCH", "DELETE"] },
+    // The workflow-engine landing (board.rs:80-83) mounted these four and did
+    // not add them here, which is what reddened `rust`. Methods read off the
+    // router, not guessed: capsule/verifications are GET, artifacts is
+    // GET+POST, artifacts/{aid} is PATCH+DELETE.
+    RouteEntry { path: "/api/board/{id}/capsule", methods: &["GET"] },
+    RouteEntry { path: "/api/board/{id}/verifications", methods: &["GET"] },
+    RouteEntry { path: "/api/board/{id}/artifacts", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/board/{id}/artifacts/{aid}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/board/{id}/archive", methods: &["POST"] },
     RouteEntry { path: "/api/board/{id}/restore", methods: &["POST"] },
     // -- workers (+dead-letters merge)
@@ -1094,6 +1128,35 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/workers/{id}/stop", methods: &["POST"] },
     RouteEntry { path: "/api/workers/{id}/peek", methods: &["GET"] },
     RouteEntry { path: "/api/workers/{id}/send", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/duplicate", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/wake", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/reset", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/clear", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/resize", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/keys", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/report", methods: &["POST"] },
+    // `*`, not GET/POST/DELETE: the route is mounted with `any`, so the router
+    // advertises no Allow set and the table must say what the ROUTER accepts,
+    // not what the verb happens to implement. Mounting the three explicitly
+    // would 405 a PATCH the catch-all currently passes through to steer_mutate,
+    // which forks the promoted spelling's behaviour from the legacy one.
+    RouteEntry { path: "/api/workers/{id}/steer", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/config", methods: &["PATCH"] },
+    RouteEntry { path: "/api/workers/{id}/share", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/instructions", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/memory", methods: &["*"] },
+    // The checkout sub-resource (AF-291). Listed per sub-verb on purpose: a
+    // wildcard would make the table unable to say which parts exist, which is
+    // the defect AF-204 retires the catch-all for.
+    RouteEntry { path: "/api/workers/{id}/git", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/git/commits", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/commit-detail", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/diff", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/dirty", methods: &["GET"] },
+    RouteEntry { path: "/api/workers/{id}/git/push", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/git/commit-report", methods: &["POST"] },
+    RouteEntry { path: "/api/workers/{id}/git/tracked-files", methods: &["*"] },
+    RouteEntry { path: "/api/workers/{id}/git/commit-guard", methods: &["*"] },
     RouteEntry { path: "/api/workers/{id}/dead-letters", methods: &["GET"] },
     // -- memories / messages / schedules / verify / prefs / criteria
     RouteEntry { path: "/api/memories", methods: &["GET", "POST"] },
@@ -1242,6 +1305,8 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // completeness test learned to follow .nest() (AMUX-2917); it previously
     // scanned only api/mod.rs's own .route() calls.
     RouteEntry { path: "/api/board/contract", methods: &["GET"] },
+    RouteEntry { path: "/api/board/ready", methods: &["GET"] },
+    RouteEntry { path: "/api/board/needsyou", methods: &["GET"] },
     RouteEntry { path: "/api/schedules/{id}/skip", methods: &["POST"] },
     RouteEntry { path: "/api/search", methods: &["GET"] },
     RouteEntry { path: "/api/search/status", methods: &["GET"] },
@@ -1263,7 +1328,9 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     // Connectors (integrations): registry + status, credential paste, OAuth
     // begin/callback, live Test, and the DWD token mint (AMUX-3362). `list` is
     // GET; credentials/auth/test/token are POST; callback is the GET landing.
-    RouteEntry { path: "/api/connectors", methods: &["GET"] },
+    // POST declares a connector at runtime, DELETE forgets one (AMUX-3993).
+    RouteEntry { path: "/api/connectors", methods: &["GET", "POST"] },
+    RouteEntry { path: "/api/connectors/{id}", methods: &["DELETE"] },
     RouteEntry { path: "/api/connectors/accounts", methods: &["GET"] },
     RouteEntry { path: "/api/connectors/{id}/credentials", methods: &["POST"] },
     RouteEntry { path: "/api/connectors/{id}/auth", methods: &["POST"] },
@@ -1279,6 +1346,13 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/proxies/{id}", methods: &["PATCH", "DELETE"] },
     RouteEntry { path: "/api/proxies/{id}/start", methods: &["POST"] },
     RouteEntry { path: "/api/proxies/{id}/stop", methods: &["POST"] },
+    // AMUX-2888: mounted ahead of the tunnel client port so the SPA panel and
+    // `amux tunnel` stop getting a 404 (status) and a 405 (the POSTs, from the
+    // GET-only SPA catch-all) — neither of which a caller can tell from "amux
+    // is broken".
+    RouteEntry { path: "/api/tunnel/status", methods: &["GET"] },
+    RouteEntry { path: "/api/tunnel/start", methods: &["POST"] },
+    RouteEntry { path: "/api/tunnel/stop", methods: &["POST"] },
     // The D1-exit pair. Reached by the bash CLI's own curl, which the caller
     // census does not enumerate — so these 405'd for the whole cutover while
     // every layer that mentions them kept routing sessions at them.
@@ -1401,7 +1475,7 @@ pub const ROUTE_TABLE: &[RouteEntry] = &[
     RouteEntry { path: "/api/debug/board-drive", methods: &["GET"] },
     RouteEntry { path: "/api/debug/autofix", methods: &["GET"] },
     RouteEntry { path: "/api/debug/storage", methods: &["GET"] },
-    RouteEntry { path: "/api/workers/{name}/{*verb}", methods: &["*"] },
+
 ];
 
 /// Match `path` against an axum-style pattern, returning a specificity score
@@ -1450,16 +1524,64 @@ pub fn normalize_target(path: &str) -> String {
     if let Some(e) = best_route(path) {
         return e.path.to_string();
     }
-    let id_ish = |seg: &str| {
-        seg.contains('%')
-            || seg.len() >= 24
-            || seg.chars().any(|c| c.is_ascii_digit())
-    };
     path.split('/')
         .enumerate()
         .map(|(i, seg)| if i >= 3 && !seg.is_empty() && id_ish(seg) { "{id}" } else { seg })
         .collect::<Vec<_>>()
         .join("/")
+}
+
+/// Is this path segment an identifier rather than a route word?
+///
+/// Lifted out of `normalize_target`'s closure so `normalize_target_verb` below
+/// applies the SAME rule. Two spellings of "is this an id" would drift, and the
+/// one that drifts is the one that decides whether a target fragments per id.
+fn id_ish(seg: &str) -> bool {
+    seg.contains('%') || seg.len() >= 24 || seg.chars().any(|c| c.is_ascii_digit())
+}
+
+/// `normalize_target`, with a WILDCARD route's first tail segment restored.
+///
+/// # Why a second normalizer instead of changing the first (AMUX-3869)
+///
+/// `normalize_target` returns the route-table pattern, which is right for
+/// request-log grouping: a thousand ids fold into one row. But a `{*wildcard}`
+/// route folds *verbs* too, and verbs are not interchangeable the way ids are.
+/// Measured over 7 days, `/api/sessions/{name}/{*verb}` is ONE target holding
+/// `peek` (424,888 rows), `report` (82,313 at a 21ms mean), `send` (625 at a
+/// 1216ms mean, long by design) and `wake` (3 at 5302ms). A latency floor
+/// judged against that group is judged against `peek`, so `send`'s ordinary
+/// p99 tail files cards while a genuinely sick `report` would need ~475x its
+/// own mean to trip.
+///
+/// Only the FIRST tail segment is taken, and only when it is not id-shaped.
+/// Both guards exist to bound cardinality: the SPA shell is `GET /{*path}`, and
+/// restoring its whole tail would mint a target per URL. One non-id segment
+/// keeps this at the number of VERBS a route has, which is what the caller
+/// wants a baseline per.
+///
+/// This is deliberately NOT what `normalize_target` does, because the request
+/// log's own rollups want the coarse shape. Only latency outlier detection
+/// needs the finer axis.
+pub fn normalize_target_verb(path: &str) -> String {
+    let target = normalize_target(path);
+    let tsegs: Vec<&str> = target.split('/').collect();
+    let Some(wi) = tsegs.iter().position(|s| s.starts_with("{*")) else {
+        return target;
+    };
+    // Strip a query string before reading the segment: `?` is not a path
+    // separator, so it would otherwise ride along into the target.
+    let clean = path.split(['?', '#']).next().unwrap_or(path);
+    let psegs: Vec<&str> = clean.split('/').collect();
+    let Some(verb) = psegs.get(wi) else {
+        return target;
+    };
+    if verb.is_empty() || id_ish(verb) {
+        return target;
+    }
+    let mut out: Vec<&str> = tsegs[..wi].to_vec();
+    out.push(verb);
+    out.join("/")
 }
 
 /// The literal values sitting where the matched route declares a `{param}`.
@@ -1882,7 +2004,11 @@ async fn analyze(
         })
         .collect();
 
-    Json(json!({
+    // AF-320. `total_errors: 0` is the reading this endpoint most often serves
+    // and the one it can least afford to serve ambiguously: no errors in the
+    // window, or a window that was never scanned. n_considered is rows scanned.
+    Json(crate::api::measured::measured(
+        json!({
         "since_h": since_h,
         "window_start": cutoff, "window_start_local": local_when(cutoff),
         "generated_at": unix_now(),
@@ -1896,7 +2022,9 @@ async fn analyze(
         "groups_total": groups_total,
         "verdicts": verdicts,
         "route_table_size": ROUTE_TABLE.len(),
-    }))
+        }),
+        scanned as usize,
+    ))
     .into_response()
 }
 
@@ -2227,7 +2355,11 @@ async fn stats(
 
     let now = unix_now();
     let actual_window_h = oldest_ts.map(|ots| (now - ots) / 3600.0);
-    Json(json!({
+    // AF-320. `window_rows` is the true pre-sample population, which is exactly
+    // the n_considered this contract asks for: a families list that comes back
+    // empty over 0 rows and over 40,000 rows are different answers.
+    Json(crate::api::measured::measured(
+        json!({
         "since_h": since_h,
         "actual_window_h": actual_window_h.map(round2),
         "oldest_row_ts": oldest_ts,
@@ -2270,7 +2402,9 @@ async fn stats(
             "restart_spanning_excluded": spanned,
         },
         "slow_outliers": outliers.into_iter().map(|(_, v)| v).collect::<Vec<_>>(),
-    }))
+        }),
+        window_rows as usize,
+    ))
     .into_response()
 }
 
@@ -2337,7 +2471,11 @@ pub async fn debug_routes() -> axum::Json<Value> {
             path == f.family || (path.starts_with(f.family) && path[f.family.len()..].starts_with('/'))
         })
     };
-    axum::Json(json!({
+    // AF-320: the population here is the route table itself, so a truncated or
+    // empty listing is readable as such rather than as "the server mounts
+    // nothing".
+    axum::Json(crate::api::measured::measured(
+        json!({
         "count": ROUTE_TABLE.len(),
         "routes": ROUTE_TABLE.iter().map(|e| json!({
             "family": family_of(e.path),
@@ -2357,7 +2495,9 @@ pub async fn debug_routes() -> axum::Json<Value> {
                        honest both directions by tests/route_table.rs against the real \
                        router composition",
         },
-    }))
+        }),
+        ROUTE_TABLE.len(),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -2406,6 +2546,56 @@ mod tests {
                 "a {{*wildcard}} segment must not be reported as a param literal ({p} -> {l:?})"
             );
         }
+    }
+
+    /// `normalize_target_verb` splits a wildcard by verb WITHOUT fragmenting
+    /// per id (AMUX-3869).
+    ///
+    /// The two failure modes pull in opposite directions and both are here.
+    /// Refine too little and `send` keeps sharing a latency baseline with
+    /// `peek`, which is the bug. Refine too much and `GET /{*path}` (the SPA
+    /// shell) mints one target per URL, so the request log grows a target per
+    /// visitor and the rollups stop meaning anything.
+    #[test]
+    fn normalize_target_verb_splits_by_verb_but_never_by_id() {
+        use super::{normalize_target, normalize_target_verb as nv};
+
+        // THE POINT: one wildcard route, distinct targets per verb.
+        assert_eq!(nv("/api/sessions/amux/send"), "/api/sessions/{name}/send");
+        assert_eq!(nv("/api/sessions/gtm-ticker/send"), "/api/sessions/{name}/send");
+        assert_eq!(nv("/api/sessions/amux/peek"), "/api/sessions/{name}/peek");
+        assert_ne!(nv("/api/sessions/amux/send"), nv("/api/sessions/amux/peek"));
+
+        // The lane name still folds. Splitting by VERB must not reintroduce a
+        // target per session, which is what `normalize_target` exists to stop.
+        assert_eq!(nv("/api/sessions/a/send"), nv("/api/sessions/b/send"));
+
+        // A query string is not a path segment and must not ride along.
+        assert_eq!(nv("/api/sessions/amux/peek?lines=200"), "/api/sessions/{name}/peek");
+
+        // NON-WILDCARD ROUTES ARE UNTOUCHED: this is a strictly additive axis,
+        // so everything else must agree with `normalize_target` exactly.
+        for p in ["/api/board/AMUX-9999", "/api/health", "/api/sessions"] {
+            assert_eq!(nv(p), normalize_target(p), "non-wildcard target changed for {p}");
+        }
+
+        // THE CARDINALITY GUARD. An id-shaped tail refuses to refine, so a
+        // wildcard route carrying ids collapses instead of exploding into one
+        // target per id.
+        //
+        // Specimen chosen so it actually reaches the wildcard branch: an
+        // earlier version used `/api/fs/12345`, which never gets there because
+        // `best_route` does not match it and `normalize_target`'s fallback
+        // collapse returns `/api/fs/{id}`. The guard held; the assertion about
+        // HOW was testing a path the code had not taken.
+        let a = nv("/api/sessions/amux/12345");
+        let b = nv("/api/sessions/amux/67890");
+        assert_eq!(a, b, "id-shaped wildcard tails must not each become their own target");
+        assert_eq!(
+            a,
+            normalize_target("/api/sessions/amux/12345"),
+            "an id-shaped tail must leave the target exactly as normalize_target had it: {a}"
+        );
 
         // CONTROL: a fully-static routed path has no literals, so the detector
         // is silent on the majority of traffic instead of flagging all of it.
@@ -2547,6 +2737,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 

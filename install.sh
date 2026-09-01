@@ -459,6 +459,48 @@ PLIST
   say "launchd agent loaded: $BUILDER_LABEL (rebuilds + redeploys on new commits in $SCRIPT_DIR)"
 fi
 
+# ── Fleet cold-start ────────────────────────────────────────────────────────
+#
+# launchd brought back the SERVER after a reboot and nothing brought back the
+# WORKERS. On 2026-08-29 a restart left 56 of 58 non-archived workers down,
+# holding 69 cards in `doing`, until a human noticed hours later and started
+# them by hand. Every service in this installer had an owner at boot except the
+# processes the whole system exists to run (AMUX-3887).
+#
+# RunAtLoad + no KeepAlive: this is a cold-start, not a supervisor. A worker a
+# human deliberately stopped must stay stopped (ethos rule 8), and the watchdog
+# deliberately owns liveness for the server alone. Set AMUX_NO_FLEET_START=1 to
+# skip installing it.
+if [[ "${AMUX_NO_FLEET_START:-}" != "1" ]]; then
+  FLEET_LABEL="com.amux.fleet-start"
+  FLEET_PLIST="$PLIST_DIR/$FLEET_LABEL.plist"
+  cat > "$FLEET_PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$FLEET_LABEL</string>
+  <key>ProgramArguments</key>
+  <array><string>$SCRIPT_DIR/scripts/fleet-boot.sh</string></array>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AMUX_BIN</key><string>$SCRIPT_DIR/amux</string>
+    <key>AMUX_HOME</key><string>$AMUX_HOME</string>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$LAUNCHD_PATH</string>
+  </dict>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><false/>
+  <key>StandardOutPath</key><string>$AMUX_HOME/logs/fleet-boot.log</string>
+  <key>StandardErrorPath</key><string>$AMUX_HOME/logs/fleet-boot.log</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$UID_N/$FLEET_LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID_N" "$FLEET_PLIST"
+  say "launchd agent loaded: $FLEET_LABEL (starts every non-archived worker at login; log: $AMUX_HOME/logs/fleet-boot.log)"
+fi
+
 # ── 6. Wait for /health ─────────────────────────────────────────────────────
 echo ""
 echo "Waiting for the server on https://localhost:$PORT …"

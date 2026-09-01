@@ -49,6 +49,7 @@
 
 pub mod autofix;
 pub mod board_drive;
+pub mod browser_reaper;
 pub mod commit_mention_notes;
 pub mod commit_nudge;
 pub mod context_health;
@@ -56,15 +57,18 @@ pub mod status_history;
 pub mod disk_watch;
 pub mod ghost_rescue;
 pub mod heartbeat;
+pub mod mac_health;
 pub mod pane_size;
 /// The live registry of the jobs below — see [`registry`] for why it is
 /// derived from the spawn sites rather than declared alongside them.
+pub mod queue_disposition;
 pub mod registry;
 pub mod scheduler;
 pub mod storage;
 pub mod tailnet_watch;
 pub mod telegram_poll;
 pub mod telegram_relay;
+pub mod tunnel;
 pub mod token_ledger;
 
 pub use scheduler::{

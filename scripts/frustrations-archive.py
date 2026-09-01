@@ -35,6 +35,7 @@ EXECUTED before this script sees them (AMUX-1888).
     scripts/frustrations-archive.py --list
 """
 import json
+import time
 import re
 import subprocess
 import sys
@@ -160,11 +161,32 @@ def carry_to_card(block, who, superseded=False):
                 "Kept here so a RECURRENCE is recognisable from this card alone.\n\n"
                 f"SYMPTOM: {sym}\n\nCOST: {cost}")
     api = _api()
-    r = subprocess.run(["curl", "-sk", "--connect-timeout", "5", "-X", "PATCH",
-                        "-H", "Content-Type: application/json",
-                        "-H", "X-Amux-Session: amux-frustrations",
-                        "-d", json.dumps({"desc_append": note}),
-                        f"{api}/api/board/{card}"], capture_output=True, text=True)
+    # RETRY A TRANSPORT FAILURE, because the common cause is not the card being
+    # unreachable, it is the server being MID-RESTART (AF-362).
+    #
+    # This box rebuilds and swaps the server binary on every commit, so a batch
+    # archive — 20 entries in one run tonight — reliably straddles a restart. The
+    # ENTRY MOVE is a local file write and always succeeds; only this call can
+    # fail. The result is a half-done retirement: the entry is gone from
+    # frustrations.md and the card it pointed at never received the SYMPTOM and
+    # COST, which is precisely what AF-38's rule keeps them for. Measured live:
+    # AMUX-3887 and AMUX-3723 both came back `NOT carried (curl exit 7, 0 bytes)`
+    # while /api/health showed uptime_s=11 a moment later.
+    #
+    # Three tries over ~6s covers a binary swap. Anything longer is a server that
+    # is actually down, and the honest answer there is still to report NOT
+    # carried rather than to block the archive.
+    r = None
+    for attempt in range(3):
+        r = subprocess.run(["curl", "-sk", "--connect-timeout", "5", "-X", "PATCH",
+                            "-H", "Content-Type: application/json",
+                            "-H", "X-Amux-Session: amux-frustrations",
+                            "-d", json.dumps({"desc_append": note}),
+                            f"{api}/api/board/{card}"], capture_output=True, text=True)
+        if r.returncode == 0 and r.stdout.strip():
+            break
+        if attempt < 2:
+            time.sleep(2)
     # DO NOT INFER SUCCESS FROM THE ABSENCE OF AN ERROR STRING — with the server
     # unreachable curl exits 7 and prints NOTHING, so a substring test on stdout
     # reports success for a write that never happened (the AF-150 shape that bit

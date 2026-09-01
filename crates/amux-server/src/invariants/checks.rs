@@ -65,26 +65,48 @@ pub(crate) fn gateway_owned(path: &str) -> bool {
 }
 
 /// Families whose ABSENCE is a documented product state with a GUARDED caller
-/// (AMUX-3468). `/api/tunnel/*`: the python-era tunnel API was never ported;
-/// the one caller (`amux tunnel`, AF-63) PREFLIGHTS /api/tunnel/status and
-/// prints "not available in this server build" instead of failing blind — so
-/// the census's own why_it_matters ("silent capability loss unless the client
-/// fails loudly") does not apply, and a permanent red here trains readers to
-/// skim the rows that matter (the AF-132 lesson). Entries are prefixes ending
-/// in `/`. The exclusion is SELF-EXPIRING both ways: if the family gets
-/// mounted, the stale entry FAILS the census naming itself for deletion; and
-/// if the guarded caller is ever removed, the call site disappears from the
-/// census with it. Porting-or-removing tunnel is a product call (Ethan's),
-/// tracked on AMUX-3468.
-const CALLER_GUARDED_ABSENT: &[&str] = &["/api/tunnel/"];
+/// (AMUX-3468). Entries are prefixes ending in `/`. The exclusion is
+/// SELF-EXPIRING both ways: if the family gets mounted, the stale entry FAILS
+/// the census naming itself for deletion; and if the guarded caller is ever
+/// removed, the call site disappears from the census with it.
+///
+/// EMPTY SINCE 2026-08-27, and the way it emptied is the point. Its one entry
+/// was `/api/tunnel/`, exempted because the python-era tunnel API was never
+/// ported and `amux tunnel` preflighted `/api/tunnel/status` rather than
+/// failing blind. c703c34b mounted that family — status answers 200 with
+/// `ported:false`, start/stop answer an honest 501 — so the exemption went
+/// stale, and the census did exactly what this doc-comment promised: it failed,
+/// 62504 evaluations deep, naming itself for deletion (AMUX-3812). A guard that
+/// describes its own retirement condition and then executes it is worth keeping
+/// even with nothing in it.
+///
+/// The family is now MOUNTED but still not PORTED — the relay client is
+/// unwritten and AMUX-2888 carries it. That is a capability gap, not a routing
+/// one, and the census is the wrong instrument for it: these routes exist and
+/// answer honestly, which is all this invariant asks.
+const CALLER_GUARDED_ABSENT: &[&str] = &[];
 
-fn caller_guarded_absent(path: &str) -> bool {
-    CALLER_GUARDED_ABSENT.iter().any(|p| path.starts_with(p))
-}
+
 
 pub fn route_callers_have_routes(
     mounted: &[(&str, &[&str])],
     callers: &[CallerPath],
+) -> Vec<InvariantResult> {
+    route_callers_have_routes_with(mounted, callers, CALLER_GUARDED_ABSENT)
+}
+
+/// The same census with the exempt list INJECTED (AMUX-3812).
+///
+/// The negative control for the self-expiring exemption used to read the live
+/// `CALLER_GUARDED_ABSENT` and hardcode `/api/tunnel/` as its fixture. When that
+/// entry retired — because the family got mounted, exactly as designed — the
+/// test went red, and it went red about production DATA rather than about the
+/// behaviour it exists to pin. A control that breaks when an unrelated constant
+/// changes is not testing the mechanism.
+pub fn route_callers_have_routes_with(
+    mounted: &[(&str, &[&str])],
+    callers: &[CallerPath],
+    guarded_absent: &[&str],
 ) -> Vec<InvariantResult> {
     const ID: &str = "route.callers_have_routes";
     if callers.is_empty() {
@@ -121,7 +143,7 @@ pub fn route_callers_have_routes(
         // EXPECTED state and passes with the license named; anything else
         // (the family got mounted, or a verb mismatch) means the exclusion
         // is STALE and must fail so the entry gets deleted.
-        if caller_guarded_absent(&c.path) {
+        if guarded_absent.iter().any(|p| c.path.starts_with(p)) {
             match verdict {
                 RouteMatch::Missing => {
                     out.push(InvariantResult::pass(ID).entity(format!("{} {}", c.method, c.path)));
@@ -131,7 +153,8 @@ pub fn route_callers_have_routes(
                         ID,
                         format!("{} stays in CALLER_GUARDED_ABSENT only while unrouted", c.path),
                         format!(
-                            "{} now has a mounted route — the CALLER_GUARDED_ABSENT entry is                              STALE; delete it so the census guards this family again",
+                            "{} now has a mounted route — the CALLER_GUARDED_ABSENT entry is \
+                             STALE; delete it so the census guards this family again",
                             c.path
                         ),
                     )
@@ -463,6 +486,12 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // exclude or admit the wrong rows. Verified against 174 live rows: 0 with
     // boot_at > ts, and the magnitude is 1.78e9 (seconds), not 1.78e12.
     ("_amux_request_log", "boot_at", false),
+    // AF-319's nudge feedback state. SECONDS: written from `now_f64()` in
+    // `drive_lane`, the same clock every other board_drive timestamp uses.
+    // Declared the hour it shipped, because this invariant caught it — the
+    // migration landed at 04:1x and the check was red by the next sweep, which
+    // is the check doing exactly what it exists for.
+    ("board_drive_nudge_state", "last_nudge_at", false),
     ("cmd_history", "delivered_at", true),
     ("cmd_history", "queued_at", true),
     ("cmd_history", "ts", true),
@@ -476,6 +505,15 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     // which the caller stamps in seconds, and backfilled through
     // `strftime('%s', ...)` which yields seconds (AMUX-3609).
     ("issues", "closed_at", false),
+    // SECONDS, same as every other `issues` timestamp and for the same reason:
+    // `entered_state_at_for_write` stamps `row.updated`, and `create_issue`
+    // stamps the same `now` it writes to `created`/`updated`. Nothing backfilled
+    // it, so there is no second unit to reconcile (AMUX-3947).
+    //
+    // Declared in the SAME COMMIT as the migration would have been better. It
+    // was not, and the invariant filed AMUX-3952 four evaluations later: adding
+    // a timestamp column is a two-part change and this file is the second part.
+    ("issues", "entered_state_at", false),
     ("issues", "last_verified_at", false),
     ("layout_presets", "created_at", false),
     ("logs", "ts", false),
@@ -488,6 +526,11 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
     ("owner_alerts", "ts", false),
     ("proxies", "created_at", false),
     ("reclaim_quarantine", "created_at", false),
+    // SECONDS, and MEASURED rather than assumed from the sibling convention:
+    // `disk_watch::record_sample` passes an `f64` wall-clock and the one live
+    // row reads 1787960274.53855 against a `now` of 1787961628 — seconds, with a
+    // fractional part, not milliseconds (AMUX-3858).
+    ("regenerable_samples", "ts", false),
     ("reclaim_quarantine", "purged_at", false),
     ("reclaim_scans", "finished_at", false),
     ("reclaim_scans", "started_at", false),
@@ -518,10 +561,17 @@ pub const TIMESTAMP_COLUMNS: &[(&str, &str, bool)] = &[
 /// `undeclared` is any timestamp-shaped column the schema has and
 /// [`TIMESTAMP_COLUMNS`] does not. Those fail: an undeclared unit is exactly the
 /// state that produced every incident above.
+/// `sampled` is how many of the newest rows each `observed` value was taken
+/// from, or 0 for the whole table. It exists so a `None` says what it actually
+/// means: after AMUX-3836 the probe reads the newest rows rather than scanning
+/// the table, and "empty" and "nothing in the newest N rows" are different
+/// claims about the schema. Reporting the first when you measured the second is
+/// the shape ethos rule 4 is about, and the caller is the only one that knows.
 pub fn timestamp_units_are_what_readers_assume(
     observed: &[(String, Option<f64>)],
     undeclared: &[String],
     now: f64,
+    sampled: usize,
 ) -> Vec<InvariantResult> {
     const ID: &str = "schema.timestamp_units_declared";
     // Generous: a year ahead for clock skew, ten years back for old rows. The
@@ -549,10 +599,15 @@ pub fn timestamp_units_are_what_readers_assume(
             .map(|(_, _, ms)| *ms);
         let Some(is_millis) = declared else { continue };
         let Some(v) = *max else {
-            out.push(
-                InvariantResult::unknown(ID, format!("{name} is empty — no rows to check the unit against"))
-                    .entity(name),
-            );
+            let why = if sampled > 0 {
+                format!(
+                    "{name} has no value in the newest {sampled} rows — nothing to check the unit \
+                     against. This is a bounded probe, so it is not a claim that the table is empty"
+                )
+            } else {
+                format!("{name} is empty — no rows to check the unit against")
+            };
+            out.push(InvariantResult::unknown(ID, why).entity(name));
             continue;
         };
         let as_declared = if is_millis { v / 1000.0 } else { v };
@@ -758,11 +813,18 @@ pub fn queue_has_live_consumer(
             continue;
         }
         match it.block_reason.as_deref() {
-            // A registered-but-stopped lane KEEPS its queue by design (the
-            // 08-19 panic lesson above); the sender was told "queued" at send
-            // time. Not a failure — a failing invariant on a deliberate state
-            // is the AF-132 shape.
-            Some("not-running") => {
+            // A reason the reaper will NEVER act on. Waiting is the design, so
+            // there is no deadline to be past and nothing for the reaper to
+            // have failed at (AMUX-3814).
+            //
+            // This arm exists because the one below claimed the reaper had
+            // failed on `rate-limited` rows, which the reaper deliberately
+            // never reaps: 56 failing evaluations over 8 days on a lane doing
+            // exactly the right thing. `not-running` used to be special-cased
+            // here by name and is now covered by the same predicate the reaper
+            // uses, so the next reason cannot re-break it the way AMUX-3473's
+            // enumerate-don't-share fix let this one through.
+            Some(reason) if !crate::api::session_verbs::reason_is_reapable(reason) => {
                 out.push(InvariantResult::pass(ID).entity(&it.target));
             }
             // no-env-file / archived: the dead-letter reaper OWNS this row's
@@ -1857,6 +1919,45 @@ pub struct SessionPromptStats {
 ///   "filter that matches everything" trap.
 /// - `carded == 0`: one card proves the pipeline works for this lane; a low
 ///   ratio is a separate, quieter concern, not this outage.
+#[cfg(test)]
+mod capture_isolation_tests {
+    use super::*;
+
+    /// AMUX-3824: the check must not fire on a lane the mint deliberately skips.
+    ///
+    /// The mint's gate is `is_user && !skip_board && !session_is_isolated(..)`.
+    /// The monitor's loop replicated only the first, so an ISOLATED lane — a raw
+    /// agent with no session or URL to run `amux board`, whose prompts are left
+    /// off the board on purpose because a card there would name work nobody can
+    /// drive — read as a lane whose board leg had been silently dropped. `self`
+    /// failed it 67 times over 13 days while behaving exactly as specified.
+    ///
+    /// The exclusion itself lives in the monitor (it needs the session env that
+    /// this pure function deliberately does not read). What is pinned HERE is
+    /// the shape the monitor must feed it: an isolated lane must not reach this
+    /// function at all, and a NON-isolated lane with the same numbers must still
+    /// fail — otherwise the fix is a blanket mute rather than an exclusion.
+    #[test]
+    fn a_lane_with_uncarded_prompts_still_fails_when_it_is_not_isolated() {
+        let s = |session: &str| SessionPromptStats {
+            session: session.to_string(),
+            cardable: 3,
+            carded: 0,
+            span_s: 933,
+        };
+        // The specimen's exact numbers, for a lane the monitor DID pass through.
+        let rs = user_prompts_produce_cards(&[s("a-real-lane")], 3, 45);
+        assert_eq!(rs[0].status, Status::Fail, "a genuine dropped board leg must still fire");
+        assert!(rs[0].observed.contains("0 carded"), "{}", rs[0].observed);
+
+        // CONTROL: an isolated lane is filtered UPSTREAM, so this function never
+        // sees it. Passing an empty slice is what that looks like here, and it
+        // must PASS rather than produce a spurious entity-less failure.
+        let rs = user_prompts_produce_cards(&[], 3, 45);
+        assert!(rs.iter().all(|r| r.status == Status::Pass), "no stats is not a failure: {rs:?}");
+    }
+}
+
 pub fn user_prompts_produce_cards(
     stats: &[SessionPromptStats],
     min_cardable: i64,
@@ -3262,6 +3363,40 @@ mod negative_controls {
             rs.iter().all(|r| r.status == Status::Pass),
             "a stopped-but-registered lane keeps its queue deliberately: {rs:?}"
         );
+
+        // AMUX-3814: rate-limited is the reason AMUX-3473's fix did not
+        // enumerate, so this check claimed "the reaper did not reap it" about
+        // rows the reaper deliberately never reaps — 56 failing evaluations
+        // over 8 days on a lane doing exactly the right thing, waiting out a
+        // limit that lifts by itself.
+        //
+        // THE PREDICATE IS NOW SHARED, so the loop below is over the reaper's
+        // own answer rather than a list copied here. A new non-reapable reason
+        // added to `reason_is_reapable` cannot re-break this the way
+        // `rate-limited` did.
+        for reason in ["rate-limited", "not-running"] {
+            assert!(
+                !crate::api::session_verbs::reason_is_reapable(reason),
+                "{reason} must not be reapable, or this cell proves nothing"
+            );
+            let rs = queue_has_live_consumer(&[mk(reason, 0.0)], 7_560.0, 300.0, 3_600.0);
+            assert!(
+                rs.iter().all(|r| r.status == Status::Pass),
+                "{reason} waits by design at any age, so there is no deadline to be past: {rs:?}"
+            );
+        }
+        // THE CONTROL, restated against the shared predicate: the reasons the
+        // reaper DOES act on must still fail past the deadline. A version that
+        // passed everything would satisfy every assertion above and delete the
+        // wedge detection this invariant exists for.
+        for reason in ["no-env-file", "archived"] {
+            assert!(crate::api::session_verbs::reason_is_reapable(reason), "{reason} is reapable");
+            let rs = queue_has_live_consumer(&[mk(reason, 0.0)], 7_560.0, 300.0, 3_600.0);
+            assert!(
+                rs.iter().any(|r| r.status == Status::Fail),
+                "{reason} past the deadline is a wedged reaper and must still fail: {rs:?}"
+            );
+        }
     }
 
     /// AMUX-3084 / AMUX-3111: a target that is not a live consumer at all (its
@@ -3642,7 +3777,10 @@ mod negative_controls {
             CallerPath { method: "GET".into(), path: "/api/tunnel2/x".into(),
                          source: "amux-cli".into(), interpolated: false, method_known: true },
         ];
-        let rs = route_callers_have_routes(&mounted, &callers);
+        // Its OWN exempt list, not the live one: this pins the MECHANISM, and
+        // the live list legitimately empties as families get mounted.
+        let guarded: &[&str] = &["/api/tunnel/"];
+        let rs = route_callers_have_routes_with(&mounted, &callers, guarded);
         let by_ent = |e: &str| rs.iter().find(|r| r.entity_key == e).unwrap();
         assert_eq!(by_ent("POST /api/tunnel/start").status, Status::Pass,
                    "documented absence with a preflighting caller must not be a permanent red");
@@ -3651,7 +3789,7 @@ mod negative_controls {
         // Mount the family: the exclusion is now stale and must SAY SO.
         let mounted2: Vec<(&str, &[&str])> =
             vec![("/api/board", &["GET"]), ("/api/tunnel/start", &["POST"])];
-        let rs2 = route_callers_have_routes(&mounted2, &callers);
+        let rs2 = route_callers_have_routes_with(&mounted2, &callers, guarded);
         let row = rs2.iter().find(|r| r.entity_key == "POST /api/tunnel/start").unwrap();
         assert_eq!(row.status, Status::Fail);
         assert!(row.observed.contains("STALE"), "{}", row.observed);
@@ -3983,6 +4121,7 @@ mod negative_controls {
             ],
             &[],
             now,
+            0,
         );
         assert!(ok.iter().all(|r| r.status == Status::Pass), "{ok:?}");
         assert_eq!(ok.len(), 2, "every declared column reports, not just the bad ones");
@@ -3994,6 +4133,7 @@ mod negative_controls {
             &[("_amux_request_log.ts".into(), Some(now * 1000.0))],
             &[],
             now,
+            0,
         );
         assert_eq!(bad[0].status, Status::Fail, "{bad:?}");
         assert!(bad[0].observed.contains("MILLISECONDS"), "name the reading that fits: {:?}", bad[0].observed);
@@ -4003,6 +4143,7 @@ mod negative_controls {
             &[("cmd_history.ts".into(), Some(now))],
             &[],
             now,
+            0,
         );
         assert_eq!(bad2[0].status, Status::Fail, "{bad2:?}");
         assert!(bad2[0].observed.contains("SECONDS"), "{:?}", bad2[0].observed);
@@ -4014,14 +4155,47 @@ mod negative_controls {
             &[("token_ledger.ts".into(), None)],
             &[],
             now,
+            0,
         );
         assert_eq!(empty[0].status, Status::Unknown, "{empty:?}");
+        assert!(
+            empty[0].observed.contains("is empty"),
+            "an unbounded probe's None IS a claim the table is empty: {:?}",
+            empty[0].observed
+        );
+
+        // AND A BOUNDED PROBE'S None IS A DIFFERENT CLAIM (AMUX-3836). Same
+        // input, same Unknown verdict, different sentence: the caller sampled
+        // the newest rows, so it did not learn that the table is empty and must
+        // not say so. Reading "token_ledger.ts is empty" off a probe that only
+        // looked at 5000 rows sends the reader to the schema for a fact nobody
+        // measured.
+        let sampled = timestamp_units_are_what_readers_assume(
+            &[("token_ledger.ts".into(), None)],
+            &[],
+            now,
+            5_000,
+        );
+        assert_eq!(sampled[0].status, Status::Unknown, "{sampled:?}");
+        // The CLAIM form, not the substring: the bounded sentence ends by
+        // disclaiming emptiness, so `contains("is empty")` matches its own
+        // denial. Assert on "<name> is empty", which only the unbounded arm says.
+        assert!(
+            !sampled[0].observed.contains("token_ledger.ts is empty"),
+            "a bounded probe must not claim the table is empty: {:?}",
+            sampled[0].observed
+        );
+        assert!(
+            sampled[0].observed.contains("newest 5000 rows"),
+            "and it must say what it DID look at: {:?}",
+            sampled[0].observed
+        );
 
         // An UNDECLARED timestamp column fails. This is the half that keeps
         // working as the schema grows: a sixth table with a bare `ts` inherits
         // the trap silently, and only a check that goes red makes its author
         // state the unit.
-        let undecl = timestamp_units_are_what_readers_assume(&[], &["new_table.ts".into()], now);
+        let undecl = timestamp_units_are_what_readers_assume(&[], &["new_table.ts".into()], now, 0);
         assert_eq!(undecl[0].status, Status::Fail, "{undecl:?}");
         assert!(undecl[0].entity_key.contains("new_table"), "{:?}", undecl[0]);
 
@@ -4039,6 +4213,7 @@ mod negative_controls {
             &[("_amux_request_log.ts".into(), Some(now - 86_400.0 * 3_000.0))],
             &[],
             now,
+            0,
         );
         assert_eq!(oldrow[0].status, Status::Pass, "a 3000-day-old row is old, not mis-united: {oldrow:?}");
     }
@@ -4379,5 +4554,110 @@ mod schedule_kind_tests {
             let out = schedule_cost_titles_match_kind(&[row("S", t, "tmux")]);
             assert_eq!(out[0].status, Status::Fail, "{t} asserts zero cost and runs as tmux");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// N. Nonterminal cards have a disposition (actionable next_action).
+// ---------------------------------------------------------------------------
+
+pub struct DispositionRow {
+    pub id: String,
+    pub status: String,
+    pub next_action: Option<String>,
+    pub session: Option<String>,
+    pub item_type: String,
+}
+
+pub fn nonterminal_has_disposition(cards: &[DispositionRow]) -> Vec<InvariantResult> {
+    const ID: &str = "board.nonterminal_has_disposition";
+    if cards.is_empty() {
+        return vec![InvariantResult::unknown(ID, "no cards to check")];
+    }
+    let nonterminal: Vec<_> = cards
+        .iter()
+        .filter(|c| !matches!(c.status.as_str(), "done" | "verified" | "discarded" | "backlog"))
+        .collect();
+    if nonterminal.is_empty() {
+        return vec![InvariantResult::pass(ID)
+            .evidence(serde_json::json!({"checked": 0, "reason": "no nonterminal cards"}))];
+    }
+    let missing: Vec<_> = nonterminal
+        .iter()
+        .filter(|c| c.next_action.as_ref().is_none_or(|s| s.trim().is_empty()))
+        .collect();
+    if missing.is_empty() {
+        vec![InvariantResult::pass(ID)
+            .evidence(serde_json::json!({"checked": nonterminal.len()}))]
+    } else {
+        let sample: Vec<_> = missing
+            .iter()
+            .take(5)
+            .map(|c| serde_json::json!({"id": c.id, "status": c.status, "session": c.session}))
+            .collect();
+        vec![InvariantResult::fail(
+            ID,
+            "nonterminal cards carry a next_action".to_string(),
+            format!(
+                "{} of {} nonterminal cards have no next_action",
+                missing.len(),
+                nonterminal.len()
+            ),
+        )
+        .evidence(serde_json::json!({
+            "missing_count": missing.len(),
+            "nonterminal_count": nonterminal.len(),
+            "sample": sample,
+        }))]
+    }
+}
+
+#[cfg(test)]
+mod disposition_tests {
+    use super::*;
+
+    fn row(id: &str, status: &str, next_action: Option<&str>) -> DispositionRow {
+        DispositionRow {
+            id: id.into(),
+            status: status.into(),
+            next_action: next_action.map(Into::into),
+            session: Some("test".into()),
+            item_type: "code".into(),
+        }
+    }
+
+    #[test]
+    fn all_nonterminal_with_disposition_passes() {
+        let cards = vec![
+            row("A-1", "doing", Some("implement the thing")),
+            row("A-2", "todo", Some("pick this up")),
+        ];
+        assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Pass);
+    }
+
+    #[test]
+    fn terminal_cards_without_disposition_still_pass() {
+        let cards = vec![
+            row("A-1", "done", None),
+            row("A-2", "verified", None),
+            row("A-3", "discarded", None),
+        ];
+        assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Pass);
+    }
+
+    #[test]
+    fn nonterminal_without_disposition_fails() {
+        let cards = vec![
+            row("A-1", "doing", None),
+            row("A-2", "todo", Some("pick up")),
+        ];
+        let out = nonterminal_has_disposition(&cards);
+        assert_eq!(out[0].status, Status::Fail);
+    }
+
+    #[test]
+    fn empty_next_action_counts_as_missing() {
+        let cards = vec![row("A-1", "doing", Some("  "))];
+        assert_eq!(nonterminal_has_disposition(&cards)[0].status, Status::Fail);
     }
 }

@@ -37,6 +37,8 @@ use std::sync::{Arc, Mutex};
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/", get(list_board).post(create_item))
+        // Static /export outranks /{id}, same as /statuses below.
+        .route("/export", get(export_board))
         // Static segment outranks /{id} in axum: /statuses never collides.
         .route("/statuses", get(list_statuses).post(create_status))
         // Static /reorder outranks /{sid}; both outrank /api/board/{id}.
@@ -51,6 +53,11 @@ pub fn routes() -> Router<AppState> {
             get(list_session_gates).patch(patch_session_gates),
         )
         .route("/contract", get(get_contract))
+        // Static /ready outranks /{id}. The read side of the dependency graph
+        // (AMUX-3948) — READY is a query, never a stored status.
+        .route("/ready", get(ready_frontier))
+        // Static /needsyou outranks /{id}. The one owner view (AF-318).
+        .route("/needsyou", get(needsyou_queue))
         // DELETE was never registered, so the SPA's own Delete button on a
         // card 405'd — and `deleteBoardItem` removes the card optimistically
         // BEFORE the request, so the card vanished, the server kept it, and it
@@ -70,6 +77,402 @@ pub fn routes() -> Router<AppState> {
         // SPA catch-all (405) and the CLI (pre-fix) exited 0 with the card
         // untouched — AMUX-2140 one layer down. Same mechanism auto-pickup uses.
         .route("/{id}/claim", post(claim_item))
+        .route("/{id}/capsule", get(capsule))
+        .route("/{id}/verifications", get(list_verifications))
+        .route("/{id}/artifacts", get(list_artifacts).post(create_artifact))
+        .route("/{id}/artifacts/{aid}", axum::routing::patch(patch_artifact).delete(delete_artifact))
+}
+
+/// GET /api/board/needsyou — THE owner view, capped (AF-318).
+///
+/// One view, ten rows, and the rest hidden until those clear. A queue no human
+/// can drain is the same as no queue: 445 cards at a median age of 15 days is
+/// not a backlog anybody triages, it is a place cards go. Ten is a number a
+/// person finishes in a sitting, which is the only property that makes the
+/// eleventh card reachable at all.
+///
+/// Ranked by `age_days * blast_radius`, not by age alone. Age alone re-creates
+/// the same list in a different order and puts the 58-day card nobody is
+/// waiting on above the two-day card three lanes are blocked behind. Blast
+/// radius is a count of open cards depending on this one, so the ranking is by
+/// what CLEARING it releases — the only importance signal the board actually
+/// holds rather than infers.
+///
+/// `?all=1` returns the hidden remainder, for the sweep that wants the whole
+/// backlog. The cap is a default, not a wall: hiding rows with no way to ask
+/// for them would be the instrument lying about its own population, which is
+/// exactly the AF-320 shape.
+async fn needsyou_queue(
+    State(state): State<AppState>,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let want_all = q.get("all").is_some_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let cap: usize = q
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(NEEDSYOU_VIEW_CAP)
+        .clamp(1, 500);
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(crate::api::measured::unmeasured(
+                    json!({"error": e.to_string(), "queue": []}),
+                    "the store could not be opened, so no needsyou card was read",
+                )),
+            )
+                .into_response()
+        }
+    };
+    let rows = match bs::list_issues(
+        &conn,
+        &["needsyou".to_string()],
+        &[],
+        ArchivedFilter::ActiveOnly,
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(crate::api::measured::unmeasured(
+                    json!({"error": e.to_string(), "queue": []}),
+                    "the needsyou query failed, so an empty queue here is unmeasured",
+                )),
+            )
+                .into_response()
+        }
+    };
+    let now = crate::config::now_f64();
+    let mut scored: Vec<(f64, Value)> = rows
+        .iter()
+        .map(|r| {
+            let age_days = ((now - r.created as f64) / 86_400.0).max(0.0);
+            let radius = bs::blast_radius(&conn, &r.id);
+            // radius + 1, so a card nobody depends on still ranks by age
+            // instead of scoring zero and sinking below every card forever.
+            let score = age_days * (radius + 1) as f64;
+            let mut v = list_body(r, true, false);
+            if let Some(o) = v.as_object_mut() {
+                o.insert("age_days".into(), json!((age_days * 10.0).round() / 10.0));
+                o.insert("blast_radius".into(), json!(radius));
+                o.insert("score".into(), json!((score * 10.0).round() / 10.0));
+                // The ask, or the fact that there is not one. A card that
+                // predates AF-318 is NULL here, which is a different thing from
+                // a card that answered the gate — and the owner triaging this
+                // list is exactly who needs to tell them apart.
+                o.insert("has_typed_ask".into(), json!(r.ask_type.is_some()));
+            }
+            (score, v)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let total = scored.len();
+    let shown: Vec<Value> = if want_all {
+        scored.into_iter().map(|(_, v)| v).collect()
+    } else {
+        scored.into_iter().take(cap).map(|(_, v)| v).collect()
+    };
+    let hidden = total.saturating_sub(shown.len());
+    let untyped = rows.iter().filter(|r| r.ask_type.is_none()).count();
+    Json(crate::api::measured::measured(
+        json!({
+            "queue": shown,
+            "total": total,
+            "shown": shown.len(),
+            "hidden": hidden,
+            "cap": if want_all { Value::Null } else { json!(cap) },
+            "untyped_legacy": untyped,
+            "ranked_by": "age_days * (blast_radius + 1), highest first",
+            "note": "THE owner view: the cards a human is actually blocking, capped so the \
+                     list can be finished. `hidden` is the remainder, reachable with ?all=1 \
+                     — the cap is a default, not a hiding place. `untyped_legacy` counts \
+                     cards that predate the typed-ask gate (AF-318); they were never \
+                     required to name a human act, so a NULL ask_type there means \
+                     unrecorded, not junk.",
+        }),
+        total,
+    ))
+    .into_response()
+}
+
+/// The creator name the queue-disposition job files under (AF-317).
+///
+/// Exempt from the todo WIP limit BY NAME. Its card is the one that has to
+/// arrive precisely when a lane's queue is too long, so refusing it for queue
+/// depth would make the mechanism suppress its own alarm.
+pub const QUEUE_DISPOSITION_CREATOR: &str = "queue-disposition";
+
+/// How many needsyou cards the owner view shows before hiding the rest.
+const NEEDSYOU_VIEW_CAP: usize = 10;
+
+/// Why a candidate is NOT on the ready frontier, or `None` if it is ready.
+///
+/// EXTRACTED so a test can drive it (AMUX-3949). The first version of this logic
+/// lived inline in the handler, which needs `AppState`, so the only cells that
+/// could reach it tested the STORE instead -- and a mutant that disabled the
+/// blocked-on arm entirely left them all green. A predicate the tests cannot
+/// call is a predicate nothing pins.
+///
+/// Dependency blocking is NOT here: it needs a `Connection` and is already the
+/// shared `deps_blocking`. This covers the two per-row facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrontierExclusion {
+    /// Carries the `blocked_on` dimension (AMUX-3949).
+    Blocked,
+    /// The continuation gate is on for this lane and the card cannot satisfy it
+    /// (AMUX-3946), so `doing` would refuse it.
+    NoContinuation,
+}
+
+pub(crate) fn frontier_exclusion(
+    row: &bs::IssueRow,
+    gate_on: bool,
+) -> Option<FrontierExclusion> {
+    // BOTH SPELLINGS OF BLOCKED. `blocked_on` is the dimension; `status='blocked'`
+    // is the legacy status still carried by 66 cards belonging to other lanes,
+    // which this work deliberately did not rewrite (ethos rule 8). A consumer
+    // honouring only the new one would silently make every legacy blocked card
+    // workable, which is worse than the position-destroying status it replaces
+    // because at least that one was visible.
+    if row.blocked_on.as_deref().is_some_and(|b| !b.trim().is_empty()) {
+        return Some(FrontierExclusion::Blocked);
+    }
+    if bs::parse_status(&row.status) == Some(TaskStatus::Blocked) {
+        return Some(FrontierExclusion::Blocked);
+    }
+    if gate_on
+        && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
+            != bs::ContinuationVerdict::Ok
+    {
+        return Some(FrontierExclusion::NoContinuation);
+    }
+    None
+}
+
+#[cfg(test)]
+mod frontier_exclusion_tests {
+    use super::*;
+
+    fn row(status: &str) -> bs::IssueRow {
+        let conn = crate::db::migrate::test_memdb();
+        let new = bs::NewIssue {
+            title: "t".into(),
+            desc: String::new(),
+            status: status.into(),
+            session: Some("lane".into()),
+            item_type: "code".into(),
+            creator: "lane".into(),
+            owner_type: "agent".into(),
+            due: None,
+            due_time: None,
+            reviewer: None,
+            shepherd: None,
+            depends_on: vec![],
+            gate: vec![],
+            tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
+            source: Some("agent".into()),
+        };
+        bs::create_issue(&conn, &new, 1000).expect("create")
+    }
+
+    /// AMUX-3949. The frontier must honour BOTH spellings of blocked.
+    ///
+    /// This cell exists because a mutant that disabled the blocked-on arm
+    /// entirely left every other cell green: the logic was inline in a handler
+    /// that needs AppState, so nothing could reach it. A predicate the tests
+    /// cannot call is a predicate nothing pins.
+    #[test]
+    fn the_frontier_excludes_both_spellings_of_blocked() {
+        // Ready: a plain todo with a continuation, gate on.
+        let mut r = row("todo");
+        r.next_action = Some("Run the compatibility suite against KubeRay 1.4".into());
+        assert_eq!(frontier_exclusion(&r, true), None, "this one is genuinely ready");
+
+        // The DIMENSION excludes it, without changing its position.
+        let mut d = r.clone();
+        d.blocked_on = Some("waiting on the KubeRay answer".into());
+        assert_eq!(frontier_exclusion(&d, true), Some(FrontierExclusion::Blocked));
+        assert_eq!(d.status, "todo", "and it is still a todo, which is the point");
+
+        // The LEGACY STATUS excludes it too. 66 cards owned by other lanes still
+        // use this spelling and were deliberately not rewritten.
+        let mut l = r.clone();
+        l.status = "blocked".into();
+        assert_eq!(frontier_exclusion(&l, true), Some(FrontierExclusion::Blocked));
+
+        // Whitespace is not a block. `blocked_on: "  "` is an empty field, and
+        // treating it as a blocker would park a card on a typo forever.
+        let mut w = r.clone();
+        w.blocked_on = Some("   ".into());
+        assert_eq!(frontier_exclusion(&w, true), None, "an empty string is not a block");
+    }
+
+    /// The continuation arm, and the control that it only fires when the gate is
+    /// ON for the lane. 51 lanes have not opted in, and excluding their cards
+    /// would empty every one of their frontiers.
+    #[test]
+    fn the_continuation_arm_only_fires_for_an_opted_in_lane() {
+        let r = row("todo"); // no next_action
+        assert_eq!(
+            frontier_exclusion(&r, true),
+            Some(FrontierExclusion::NoContinuation),
+            "with the gate on, a card `doing` would refuse must not be offered"
+        );
+        assert_eq!(
+            frontier_exclusion(&r, false),
+            None,
+            "with the gate OFF this card is workable, and excluding it would empty \
+             the frontier of every lane that has not opted in"
+        );
+    }
+}
+
+/// GET /api/board/ready — what this lane can actually work right now.
+///
+/// AMUX-3948, G3 in docs/design/task-workflow-engine.md. `depends_on` was
+/// already CONSUMED (board_drive parks on it, auto-promotes off it, has a prose
+/// fallback) and answered no QUESTION. So auto-pickup selected by queue age,
+/// and a lane could be handed a card whose blocker was still open.
+///
+/// The plan's own cards demonstrated it while this was being built: pickup
+/// claimed P4 twice, whose control needs P3, which did not exist.
+///
+/// READY IS A QUERY, NOT A STATUS (decision 2 on AMUX-3945). "Gates pass and it
+/// is claimable" is derived from four facts that each move on their own; storing
+/// it would store a fact that goes stale the moment any one of them changes.
+///
+/// EVERY EXCLUSION IS COUNTED. An empty frontier has at least five distinct
+/// causes -- nothing queued, all of it blocked, the WIP cap is full, the lane
+/// has no cards, the probe never ran -- and they call for opposite responses.
+/// `measured` plus `n_considered` plus the `excluded` histogram is what lets a
+/// reader tell them apart (AF-320; the diagnostic contract).
+async fn ready_frontier(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(q): Query<std::collections::HashMap<String, String>>,
+) -> Response {
+    let lane = q
+        .get("session")
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| actor_from_headers(&headers).1);
+    if lane.trim().is_empty() {
+        return Json(crate::api::measured::unmeasured(
+            json!({"ready": [], "session": null}),
+            "no lane: pass ?session=<worker> or send X-Amux-Session. A frontier with no \
+             lane would be every lane's work at once, which is not an answer to \
+             'what can I work'.",
+        ))
+        .into_response();
+    }
+    let limit: usize = q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(20).clamp(1, 200);
+
+    let Ok(conn) = state.store.read() else {
+        return Json(crate::api::measured::unmeasured(
+            json!({"ready": [], "session": lane}),
+            "the board store could not be read, so nothing was examined. This is NOT an \
+             empty frontier.",
+        ))
+        .into_response();
+    };
+
+    // CAPACITY, from the same predicate the `doing` gate refuses on: same status,
+    // same type exclusions, same archived/deleted filter. A frontier that
+    // disagreed with the gate would offer cards the gate then refuses, which is
+    // the view/mechanism split ethos rule 1 is about.
+    let holding: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session = ?1 AND status = 'doing' \
+               AND deleted IS NULL AND COALESCE(archived,0) = 0 \
+               AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') ORDER BY id",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![lane], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    let cap = crate::runtime_jobs::board_drive::wip_cap().max(0) as usize;
+    let available = cap.saturating_sub(holding.len());
+
+    // Candidates: claimable cards this lane owns. `todo` only — `backlog` is
+    // parked on a trigger and `review` is somebody else's turn.
+    let ids: Vec<String> = conn
+        .prepare(
+            "SELECT id FROM issues WHERE session = ?1 AND status = 'todo' \
+               AND deleted IS NULL AND COALESCE(archived,0) = 0 \
+               AND COALESCE(type,'') NOT IN ('tripwire','watch','epic') \
+             ORDER BY COALESCE(created,0) ASC",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![lane], |r| r.get::<_, String>(0))
+                .map(|rows| rows.filter_map(Result::ok).collect())
+        })
+        .unwrap_or_default();
+    let n_considered = ids.len();
+
+    let gate_on = bs::continuation_required(Some(&lane));
+    let (mut blocked_by_deps, mut missing_continuation) = (0usize, 0usize);
+    let mut ready: Vec<Value> = Vec::new();
+    let now = crate::config::now_f64();
+
+    for id in &ids {
+        let Ok(Some(row)) = bs::get_issue(&conn, id) else { continue };
+        // THE SHARED PREDICATE, not a second spelling of it (AMUX-3814).
+        let blockers = crate::runtime_jobs::board_drive::deps_blocking(&conn, &row);
+        if !blockers.is_empty() {
+            blocked_by_deps += 1;
+            continue;
+        }
+        match frontier_exclusion(&row, gate_on) {
+            Some(FrontierExclusion::Blocked) => {
+                blocked_by_deps += 1;
+                continue;
+            }
+            Some(FrontierExclusion::NoContinuation) => {
+                missing_continuation += 1;
+                continue;
+            }
+            None => {}
+        }
+        ready.push(json!({
+            "id": row.id,
+            "title": row.title,
+            "type": row.item_type,
+            "next_action": row.next_action,
+            "epic": row.epic,
+            // Time-in-state, now that it exists (AMUX-3947). NULL means the card
+            // predates migration 0040 and has not moved since: not measured,
+            // never zero.
+            "entered_state_at": row.entered_state_at,
+            "time_in_state_s": row.entered_state_at.map(|e| (now as i64 - e).max(0)),
+            "age_s": (now as i64 - row.created).max(0),
+        }));
+    }
+    ready.truncate(limit);
+
+    let body = json!({
+        "session": lane,
+        // Cards that pass every computable precondition, oldest first. Capacity
+        // is reported BESIDE this rather than emptying it: "nothing is ready" and
+        // "you are at the cap holding something" are different answers and a
+        // caller that wants to know what is next while finishing a card deserves
+        // the real list.
+        "ready": ready,
+        "claimable_now": available.min(ready.len()),
+        "wip": {"doing": holding.len(), "cap": cap, "available": available, "holding": holding},
+        "excluded": {
+            "blocked_by_deps": blocked_by_deps,
+            "missing_continuation": missing_continuation,
+            "continuation_gate_on": gate_on,
+        },
+    });
+    Json(crate::api::measured::measured(body, n_considered)).into_response()
 }
 
 /// GET /api/board/contract — the gate table, types, and CLI syntax.
@@ -209,6 +612,42 @@ async fn get_contract(
             "accepts": "a URL, a repo file path (a/b.ext), a commit sha, or a #PR/issue reference, in the card's desc or history",
             "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
             "override": "set AMUX_DONE_LINK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+        },
+        // Global done constraint (AF-321). Sits IN FRONT of the asset-link rule
+        // above, which it does not replace: that one is a shape check over the
+        // whole desc and the card's own problem statement satisfies it (843 of
+        // 1372 open cards, measured 2026-08-29). Published here for the AF-112
+        // reason the `verified` block gives below.
+        "done_requires_evidence": {
+            "rule": "a card entering done must carry `evidence`: what was actually run or produced",
+            "why": "the asset-link rule looks for a path-shaped token anywhere in the desc, which the FILING supplies — a card that names the file it intends to edit passes its own done gate before anyone touches that file",
+            "accepts": "a command (backticked, or on a `$ ` line), a repo file path, a URL, a commit sha, a #PR — or `none: <reason>` (3+ words) when the card genuinely produced no artifact",
+            "field": "`evidence`, writable on its own so it can be recorded BEFORE the transition that needs it",
+            "enforced": "server-validated on any transition to done; force bypasses it (logged); gate_ack cannot",
+            "override": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "what_to_run": "the repo's VERIFY.md names the proof for each surface",
+        },
+        // Global `needsyou` constraint (AF-318). Published for the AF-112
+        // reason: a gate you can only learn by tripping it teaches nobody.
+        "needsyou_requires_typed_ask": {
+            "rule": "a card entering needsyou must carry `ask_type`, `ask_question` and `ask_unblocks`",
+            "why": "389 live cards were parked here at a median age of 15 days and 51% of them were not blocked on a human at all — `needsyou` was the only status that cost a worker nothing and stopped the nudge, so the ~20 real asks became unfindable",
+            "ask_types": bs::ASK_TYPE_HELP.iter().map(|(k, v)| json!({"type": k, "means": v})).collect::<Vec<_>>(),
+            "fields": "`ask_question` is what you are asking, `ask_unblocks` is what ends the block — both a sentence (3+ words). All three writable on their own, so a refused transition cannot discard them",
+            "enforced": "server-validated on any transition to needsyou; force bypasses it (logged); gate_ack cannot",
+            "override": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in a worker's / group's / global scope env (Scope tab) to opt that scope out",
+            "not_retroactive": "the 445 existing cards are untouched — the gate is on the transition. They drain by being re-asked, not by a sweep guessing on their behalf",
+            "owner_view": "GET /api/board/needsyou — ranked by age x blast radius, capped at 10, ?all=1 for the remainder",
+        },
+        // Global `verified` constraint (Ethan, 2026-08-29). Published HERE and
+        // not only in the 409, because a gate you can only learn by tripping it
+        // is the AF-112 shape — the reader who most needs it is the one about
+        // to be refused.
+        "verified_requires_gate_checked": {
+            "rule": "a multi-criterion verified gate must be acknowledged criterion by criterion; gate_ack: true is refused",
+            "why": "the four default criteria fail in different ways and are checked by different acts; one boolean asserts all of them and records which you looked at nowhere",
+            "enforced": "server-validated on any transition to verified whose effective gate has 2+ criteria; force bypasses it (logged and attributed)",
+            "not_enforced_on": "single-criterion gates (acking one criterion is identical to checking it) and every other status, `done` included — done carries the machine-checked asset link instead",
         },
         "how_to_ack": {
             "cli": "amux board <status> <id> --checked \"criterion 1\" \"criterion 2\"",
@@ -716,44 +1155,30 @@ async fn delete_status(
                 .query_map([&sid_w], |r| r.get::<_, String>(0))?
                 .filter_map(Result::ok)
                 .collect();
-            let stamp = hhmm();
             let mut events = Vec::new();
             for card in &moved {
-                let line = format!(
+                let log_line = format!(
                     "status: {sid_w} -> todo (column '{sid_w}' deleted by {actor})"
                 );
-                conn.execute(
-                    "UPDATE issues SET log = ?1 WHERE id = ?2",
-                    rusqlite::params![
-                        bs::append_log(
-                            conn.query_row(
-                                "SELECT log FROM issues WHERE id = ?1",
-                                [card],
-                                |r| r.get::<_, Option<String>>(0),
-                            )?
-                            .as_deref(),
-                            &stamp,
-                            &line,
-                        ),
-                        card
-                    ],
-                )?;
-                events.push(PendingEvent {
-                    entity_type: EntityType::Task,
-                    entity_id: card.clone(),
-                    mutation: MutationKind::StatusChanged {
-                        from: sid_w.clone(),
-                        to: "todo".into(),
+                let result = crate::db::advance::advance(
+                    conn,
+                    card,
+                    "todo",
+                    &actor,
+                    &crate::db::advance::AdvanceOpts {
+                        force: true,
+                        expected_from: Some(sid_w.clone()),
+                        log_line: Some(log_line),
+                        skip_continuation: true,
+                        ..crate::db::advance::AdvanceOpts::default()
                     },
-                    payload: None,
-                });
+                )?;
+                if let Ok(outcome) = result {
+                    events.extend(outcome.events);
+                }
             }
             conn.execute(
                 "DELETE FROM statuses WHERE id = ?1 AND is_builtin = 0",
-                [&sid_w],
-            )?;
-            conn.execute(
-                "UPDATE issues SET status = 'todo' WHERE status = ?1 AND deleted IS NULL",
                 [&sid_w],
             )?;
             *out_w.lock().expect("status slot poisoned") = Some(moved);
@@ -913,33 +1338,55 @@ fn fold_capture_for_worker_card(
     let Some((cap_id, cap_rev)) = cap else {
         return Ok(None);
     };
-    let Some(mut c) = bs::get_issue(conn, &cap_id)? else {
+    use crate::db::advance::{self as adv, AdvanceOpts};
+    let result = adv::advance(
+        conn,
+        &cap_id,
+        "discarded",
+        sess,
+        &AdvanceOpts {
+            force: true,
+            expected_from: Some("doing".into()),
+            log_line: Some(format!("capture folded into {}", new.id)),
+            skip_continuation: true,
+            ..AdvanceOpts::default()
+        },
+    )?;
+    let Ok(outcome) = result else {
         return Ok(None);
     };
-    c.status = "discarded".into();
-    c.desc = format!(
-        "{}\n\n_Folded into {} — the worker carded this work directly (AMUX-3391)._",
-        c.desc, new.id
-    );
-    c.log = Some(bs::append_log(
-        c.log.as_deref(),
-        &hhmm(),
-        &format!("capture folded into {}", new.id),
-    ));
-    c.rev = cap_rev + 1;
-    c.version += 1;
-    c.updated = now;
-    bs::save_patched(conn, &mut c)?;
-    // Two-fixes rule: the fold leaves a trace, so a sweep can confirm it fires —
-    // and can compare fold-count against capture cards STILL discarded by hand (a
-    // fold that should have fired but did not). grep "ledger: capture folded".
+    // advance() handled status + version + log + save_patched. Update desc
+    // and rev (Python optimistic-concurrency counter) separately.
+    conn.execute(
+        "UPDATE issues SET \"desc\" = ?1, rev = ?2 WHERE id = ?3 AND deleted IS NULL",
+        rusqlite::params![
+            format!(
+                "{}\n\n_Folded into {} — the worker carded this work directly (AMUX-3391)._",
+                outcome.row.desc, new.id
+            ),
+            cap_rev + 1,
+            cap_id,
+        ],
+    )?;
     tracing::info!(
         session = %sess,
         capture = %cap_id,
         folded_into = %new.id,
         "ledger: capture folded into worker card (AMUX-3391)"
     );
-    Ok(Some((cap_id, ev_snap(&c, MutationKind::Updated))))
+    let event = outcome.events.into_iter().next().unwrap_or_else(|| {
+        let snap = bs::get_issue(conn, &cap_id)
+            .ok()
+            .flatten()
+            .map(|r| r.snapshot());
+        PendingEvent {
+            entity_type: amux_core::revision::EntityType::Task,
+            entity_id: cap_id.clone(),
+            mutation: MutationKind::Updated,
+            payload: snap,
+        }
+    });
+    Ok(Some((cap_id, event)))
 }
 
 fn now_secs() -> i64 {
@@ -1472,6 +1919,183 @@ mod truncation_caller_tests {
     }
 }
 
+/// `GET /api/board/export?format=md|json[&worker=][&status=][&archived=]`
+///
+/// # Why this is a SERVER endpoint and not more client code (AMUX-3868)
+///
+/// The dashboard already exports the view you are looking at (AMUX-3873), and
+/// it cannot ever be a FULL export: `GET /api/board` omits `desc` entirely and
+/// sends `desc_head` + `desc_len` instead, so the browser does not hold the
+/// text. Getting it client-side means one request per card, which at the
+/// current board is over 1,500.
+///
+/// `IssueRow.desc` is the complete string, so reading it here costs one query.
+///
+/// SCOPE IS STATED IN THE OUTPUT, never implied by its absence. A scoped export
+/// that does not say it was scoped is indistinguishable from a whole-board one,
+/// and it is the version that gets pasted somewhere as evidence. Both formats
+/// carry the filters that ran and the count, and the unscoped case says so in
+/// its own words rather than by staying quiet (ethos rule 4).
+#[derive(serde::Deserialize, Default)]
+pub struct ExportParams {
+    format: Option<String>,
+    worker: Option<String>,
+    status: Option<String>,
+    archived: Option<String>,
+}
+
+pub async fn export_board(
+    State(state): State<AppState>,
+    Query(p): Query<ExportParams>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return internal(e),
+    };
+    let statuses: Vec<String> = p
+        .status
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    let workers: Vec<String> = p
+        .worker
+        .as_deref()
+        .map(|s| s.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect())
+        .unwrap_or_default();
+    // Default ActiveOnly: an export is a working document, and silently
+    // including archived cards would overstate the board. `archived=all`
+    // opts in, and the header below always says which was used.
+    let arch = match p.archived.as_deref().unwrap_or("") {
+        "all" => ArchivedFilter::All,
+        "1" | "true" | "yes" | "only" => ArchivedFilter::ArchivedOnly,
+        _ => ArchivedFilter::ActiveOnly,
+    };
+    let rows = match bs::list_issues(&conn, &statuses, &workers, arch) {
+        Ok(r) => r,
+        Err(e) => return internal(e),
+    };
+    drop(conn);
+
+    let scope = {
+        let mut parts: Vec<String> = Vec::new();
+        if !workers.is_empty() {
+            parts.push(format!("worker = {}", workers.join(", ")));
+        }
+        if !statuses.is_empty() {
+            parts.push(format!("status = {}", statuses.join(", ")));
+        }
+        match arch {
+            ArchivedFilter::All => parts.push("including archived".into()),
+            ArchivedFilter::ArchivedOnly => parts.push("archived only".into()),
+            ArchivedFilter::ActiveOnly => {}
+        }
+        parts
+    };
+    let stamp = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let want_md = matches!(p.format.as_deref(), Some("md") | Some("markdown"));
+
+    let (body, mime, ext) = if want_md {
+        let mut md = String::new();
+        md.push_str("# amux board\n\n");
+        md.push_str(&format!(
+            "_{} issue(s) · full descriptions · exported {}_\n\n",
+            rows.len(),
+            chrono::Local::now().format("%Y-%m-%d %H:%M")
+        ));
+        if scope.is_empty() {
+            md.push_str("> Whole board: every active issue, no worker or status filter.\n");
+        } else {
+            md.push_str(&format!(
+                "> **Scoped export.** {}. This is not the whole board.\n",
+                scope.join(" · ")
+            ));
+        }
+        // Grouped by status, the order the board itself reads in.
+        let order = [
+            "doing", "review", "todo", "backlog", "done", "verified", "discarded",
+        ];
+        let mut seen: Vec<String> = Vec::new();
+        for s in order.iter() {
+            seen.push((*s).to_string());
+        }
+        for r in &rows {
+            if !seen.iter().any(|s| s == &r.status) {
+                seen.push(r.status.clone());
+            }
+        }
+        for st in seen {
+            let group: Vec<&IssueRow> = rows.iter().filter(|r| r.status == st).collect();
+            if group.is_empty() {
+                continue;
+            }
+            md.push_str(&format!("\n## {} ({})\n\n", st, group.len()));
+            for r in group {
+                md.push_str(&format!("### {} — {}\n\n", r.id, r.title));
+                md.push_str(&format!(
+                    "- worker: {} · type: {} · created: {}\n",
+                    r.session.as_deref().unwrap_or("—"),
+                    r.item_type,
+                    r.created
+                ));
+                if let Some(g) = r.gate.as_deref().filter(|g| !g.is_empty()) {
+                    md.push_str(&format!("- gate: {g}\n"));
+                }
+                if !r.depends_on.is_empty() {
+                    md.push_str(&format!("- depends_on: {}\n", r.depends_on.join(", ")));
+                }
+                // The whole point of this endpoint: the COMPLETE description,
+                // not a head. No truncation note, because nothing is truncated.
+                if !r.desc.trim().is_empty() {
+                    md.push_str(&format!("\n{}\n", r.desc.trim()));
+                }
+                md.push('\n');
+            }
+        }
+        (md, "text/markdown; charset=utf-8", "md")
+    } else {
+        let issues: Vec<Value> = rows
+            .iter()
+            .map(|r| {
+                json!({
+                    "id": r.id, "title": r.title, "desc": r.desc, "status": r.status,
+                    "session": r.session, "type": r.item_type, "creator": r.creator,
+                    "gate": r.gate, "depends_on": r.depends_on, "reviewer": r.reviewer,
+                    "created": r.created, "updated": r.updated, "archived": r.archived,
+                    "owner_type": r.owner_type, "pinned": r.pinned,
+                })
+            })
+            .collect();
+        let v = json!({
+            "exported_at": chrono::Local::now().to_rfc3339(),
+            "count": issues.len(),
+            "scoped": !scope.is_empty(),
+            "scope": scope,
+            // Said explicitly so nobody has to compare this against /api/board
+            // to discover the difference.
+            "desc": "complete — unlike GET /api/board, which sends desc_head/desc_len only",
+            "issues": issues,
+        });
+        (
+            serde_json::to_string_pretty(&v).unwrap_or_else(|_| "{}".into()),
+            "application/json; charset=utf-8",
+            "json",
+        )
+    };
+
+    (
+        StatusCode::OK,
+        [
+            (axum::http::header::CONTENT_TYPE, mime.to_string()),
+            (
+                axum::http::header::CONTENT_DISPOSITION,
+                format!("attachment; filename=\"amux-board-{stamp}.{ext}\""),
+            ),
+        ],
+        body,
+    )
+        .into_response()
+}
+
 pub async fn list_board(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1851,6 +2475,69 @@ const VALID_STATUSES: [&str; 11] = [
 
 // ---- POST /api/board -----------------------------------------------------
 
+/// The typed-ask refusal, for BOTH doors into `needsyou` (AMUX-3929).
+///
+/// The transition gate shipped first and worked: `amux board status <id>
+/// needsyou` and `PATCH {"status":"needsyou"}` are both refused without a typed
+/// ask. CREATION was never gated, and creation is the door most of this traffic
+/// uses — "I found something the human must decide" is naturally expressed by
+/// filing the card already parked, not by filing it in `todo` and moving it.
+///
+/// Measured by mixpeek-general on the live board: 491 in `needsyou`, 68 typed,
+/// 423 untyped (86%), untyped median age 16 days, oldest 59. Still leaking at
+/// the time of measurement — 13 untyped created in 24h against 15 typed, 40 in
+/// 72h, 106 in 7d — across every lane (backend 53, amux 53, ts-gke 41,
+/// gtm-engine 39, ETHAN 33), which is what makes it the API and not a habit.
+///
+/// ONE BUILDER, TWO CALLERS, on purpose. A second copy of this vocabulary would
+/// drift from the first, and the caller must learn the SAME contract at whichever
+/// door they arrive at — a create-path message that differed from the
+/// transition-path message would teach two contracts for one rule.
+fn needsyou_ask_refusal(verdict: bs::AskVerdict, id: &str, session: Option<&str>) -> Response {
+    let (why, code) = match verdict {
+        bs::AskVerdict::NoType => (
+            "This card does not say what KIND of human act it is waiting on. 86% of the cards already parked here are not blocked on a human at all (423 of 491, live, untyped median age 16 days) — they are work someone stopped doing, and they are why the real asks go unanswered.",
+            "needsyou_requires_ask_type",
+        ),
+        bs::AskVerdict::UnknownType => (
+            "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
+            "needsyou_ask_type_unknown",
+        ),
+        bs::AskVerdict::NoQuestion => (
+            "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
+            "needsyou_ask_has_no_question",
+        ),
+        bs::AskVerdict::NoUnblocks => (
+            "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
+            "needsyou_ask_has_no_exit",
+        ),
+        bs::AskVerdict::Ok => unreachable!("Ok is not a refusal"),
+    };
+    tracing::warn!(
+        "needsyou_ask_gate: blocked {} -> needsyou for session {} (verdict {:?})",
+        id,
+        session.unwrap_or("-"),
+        verdict
+    );
+    err(
+        StatusCode::CONFLICT,
+        json!({
+            "error": "needsyou requires a typed ask",
+            "code": code,
+            "ok": false,
+            "blocked": true,
+            "item": id,
+            "why": why,
+            "ask_types": bs::ASK_TYPES,
+            "how_to_fix": {
+                "fields": "ask_type (one of the five), ask_question (the question, in a sentence), ask_unblocks (what ends the block).",
+                "cli": "amux board needsyou <ID> --ask-type <type> --ask-question \"...\" --ask-unblocks \"...\"",
+                "not_an_ask": "If nobody is actually waiting on a person, this is not a needsyou card — put it back in todo/backlog, or discard it.",
+            },
+        }),
+    )
+}
+
 pub async fn create_item(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1884,6 +2571,29 @@ pub async fn create_item(
     };
 
     let status_in = body_str(&map, "status").unwrap_or_else(|| "todo".into());
+    // THE SAME PREDICATE ON THE CREATE DOOR (AMUX-3929). The transition gate
+    // held — `PATCH {"status":"needsyou"}` and `amux board status <id> needsyou`
+    // are both refused — while `POST {"status":"needsyou"}` returned 201 with
+    // ask_type NULL. Reproduced before fixing: the same card refused on PATCH
+    // that had just been created in that state.
+    //
+    // `force` is not read here: creation has no `force` parameter and inventing
+    // one would add a bypass the transition door does not have.
+    if bs::parse_status(&status_in) == Some(TaskStatus::NeedsYou) {
+        let session_for_gate = body_str(&map, "session")
+            .or_else(|| Some(actor_from_headers(&headers).1))
+            .filter(|s| !s.trim().is_empty());
+        if bs::needsyou_ask_required(session_for_gate.as_deref()) {
+            let verdict = bs::ask_verdict(
+                body_str(&map, "ask_type").unwrap_or_default().as_str(),
+                body_str(&map, "ask_question").unwrap_or_default().as_str(),
+                body_str(&map, "ask_unblocks").unwrap_or_default().as_str(),
+            );
+            if verdict != bs::AskVerdict::Ok {
+                return needsyou_ask_refusal(verdict, "(new card)", session_for_gate.as_deref());
+            }
+        }
+    }
     // AMUX-2609: a status outside the typed vocabulary may still be a real
     // user-created column. The `statuses` table is the vocabulary for those —
     // see the long note in `patch_item` for why `TaskStatus` stays closed.
@@ -1994,6 +2704,62 @@ pub async fn create_item(
         .cloned()
         .collect();
 
+    // AF-317: THE WIP LIMIT HAS TO COVER CREATION, or it is decorative.
+    //
+    // `amux board add` is how a lane files its own work and it creates directly
+    // in `todo`, so gating only the PATCH transition would leave the path that
+    // actually grew the queues untouched (ethos rule 7: a check pinning the
+    // wrong layer is exactly as green as one pinning the right layer).
+    //
+    // Two exemptions, both named rather than silent. Detector cards carry
+    // `session: None` and are outside the count by construction — a fault
+    // report is never dropped because a lane was full. And a card from the
+    // queue-disposition job is exempt BY NAME: it is the one card whose whole
+    // purpose is to arrive when the queue is too long, so refusing it for queue
+    // depth would be the mechanism suppressing its own alarm.
+    if status_raw == "todo" && owner_type == "agent" && !session.is_empty() && creator != QUEUE_DISPOSITION_CREATOR {
+        let limit = bs::todo_wip_limit(Some(&session));
+        if limit > 0 {
+            let held_and_stalest = state.store.read().ok().map(|c| {
+                (bs::todo_wip_count(&c, &session, ""), bs::stalest_todos(&c, &session, 5))
+            });
+            if let Some((held, stalest)) = held_and_stalest {
+                if held >= limit {
+                    tracing::warn!(
+                        "todo_wip_gate: refused a new todo for lane {} (holding {}, limit {})",
+                        session, held, limit
+                    );
+                    return (
+                        StatusCode::CONFLICT,
+                        Json(json!({
+                            "error": "todo queue is at its limit for this lane",
+                            "code": "todo_wip_limit_reached",
+                            "ok": false,
+                            "blocked": true,
+                            "session": session,
+                            "holding": held,
+                            "limit": limit,
+                            "why": format!(
+                                "{session} already holds {held} todo card(s) and the limit is {limit}. \
+                                 `todo` is the dispatch queue: filing here is a claim that \
+                                 the card is next."
+                            ),
+                            "close_these_first": stalest.iter().map(|(id, title, days)| json!({
+                                "id": id, "title": title, "days_since_touched": days,
+                                "already_undispatchable": *days >= 7,
+                            })).collect::<Vec<_>>(),
+                            "how_to_fix": {
+                                "file_it_anyway_but_not_as_next": "POST with {\"status\":\"backlog\"} — unbounded on purpose, and where a real card that is not NEXT belongs",
+                                "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it"
+                            }
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
+    }
+
     let new = bs::NewIssue {
         title,
         desc: body_str(&map, "desc").unwrap_or_default(),
@@ -2009,6 +2775,12 @@ pub async fn create_item(
         gate,
         depends_on,
         tags,
+        ask_type: body_str(&map, "ask_type"),
+        ask_question: body_str(&map, "ask_question"),
+        ask_unblocks: body_str(&map, "ask_unblocks"),
+        // AF-367: the HTTP create path — a real POST /api/board from a lane or
+        // a human, as opposed to a card a daemon filed.
+        source: Some("agent".into()),
     };
 
     enum Out {
@@ -2077,6 +2849,40 @@ pub async fn create_item(
             if let Some(cap_id) = folded.lock().expect("folded slot poisoned").take() {
                 v["folded_capture"] = json!(cap_id);
             }
+            // AF-366: RECORD WHO CALLED, not only what the row now says.
+            //
+            // A card's `creator` is derived from a header the CALLER supplies, and
+            // until now nothing anywhere recorded the request itself: a successful
+            // create logged NOTHING, and the state-event payload stores the
+            // resulting `creator` field, which is the very value in question. So a
+            // card attributed to the wrong lane was unforensicable by anyone,
+            // including the lane wearing the attribution.
+            //
+            // Found live: AF-363 "Test card from tubescience" and AF-364 "[ts-gke]
+            // tenant-deploy engine skipped" were both stamped
+            // creator=amux-frustrations, and auto-pickup then handed a lane another
+            // team's deploy card to work. Neither their origin nor their intent can
+            // be recovered from any record that exists.
+            //
+            // The board's READ path already logs `caller_ua` and `caller_session`
+            // on its truncation WARN. The WRITE path logged nothing, which is
+            // backwards: the read is recoverable by reading again, the write is not.
+            // Reuses `truncation_caller` rather than re-deriving the pair, so the
+            // honest fallbacks ("(none)", "(unattributed)") stay identical across
+            // both sites instead of one growing a silent blank.
+            //
+            // INFO, not WARN: creating a card is the normal path and this is a
+            // ledger line, not a complaint. `grep 'board card created'` is the
+            // forensic index that did not exist.
+            let (cua, csess) = truncation_caller(&headers);
+            tracing::info!(
+                card = %row.id,
+                caller_session = %csess,
+                caller_ua = %cua,
+                stamped_creator = %(if row.creator.is_empty() { "(none)" } else { row.creator.as_str() }),
+                owner_session = %row.session.as_deref().unwrap_or("(none)"),
+                "board card created"
+            );
             (StatusCode::CREATED, Json(v)).into_response()
         }
     }
@@ -2240,7 +3046,7 @@ fn chars_truncate_log(s: &str, n: usize) -> String {
     format!("{}…", s.chars().take(n).collect::<String>())
 }
 
-const PATCH_WRITABLE: [&str; 19] = [
+const PATCH_WRITABLE: [&str; 32] = [
     "title", "desc", "status", "session", "type", "depends_on", "tags", "reviewer", "shepherd",
     "epic", // AMUX-2992: assign/clear the epic a card rolls up under
     "due", "due_time", "owner_type", "pinned", "pos", "gate", "source_ref", "archived",
@@ -2252,6 +3058,36 @@ const PATCH_WRITABLE: [&str; 19] = [
     // good trigger and nothing ever re-checks it — "parking without it buys
     // silence with no expiry", which is the flag's own promise inverted.
     "last_verified_at",
+    // AF-321: what was actually run/produced. Writable as its own field so it
+    // can be recorded BEFORE the transition that needs it (the two-write shape
+    // `--outcome` already uses, so a refused `done` cannot discard the very
+    // text the retry needs).
+    "evidence",
+    // AF-318: the typed ask. Writable on their own for the same reason as
+    // `evidence` — a refused `needsyou` must not discard the ask the retry
+    // needs, and a lane that writes the ask first can then move the card in a
+    // second call that cannot fail on content.
+    "ask_type",
+    "ask_question",
+    "ask_unblocks",
+    // The continuation contract (AMUX-3946). Writable on their own for the same
+    // reason the ask fields are: a lane can write the continuation first and
+    // then move the card in a second call that cannot fail on content, so a
+    // refused transition never discards what the author just wrote.
+    "next_action",
+    "last_result",
+    "unresolved",
+    // AMUX-3949. A dimension, so it is set and cleared independently of any
+    // status move: blocking and unblocking a card must not require pretending
+    // it changed position.
+    "blocked_on",
+    // Workflow engine fields (Phase 2). acceptance_criteria is a JSON array of
+    // measurable conditions; decision_* fields structure type=decision cards.
+    "acceptance_criteria",
+    "decision_question",
+    "decision_rationale",
+    "decision_supersedes",
+    "waiting_on",
 ];
 /// Control keys: consumed by the PATCH protocol itself, never "ignored".
 /// `authorized_by` is the cross-lane archive authorizer (AMUX-2492).
@@ -2273,9 +3109,15 @@ const PATCH_CONTROL: [&str; 9] = [
     "desc_shrink_ack",
 ];
 
-/// One owner-notice per (owner, card, author) per 10 minutes (AVE-36): a burst
-/// of appends collapses to one turn-boundary message; the notes themselves all
-/// land on the card regardless.
+/// One owner-notice per (owner, card, author, NOTE TEXT) per 10 minutes: a burst
+/// of IDENTICAL appends collapses to one turn-boundary message; the notes
+/// themselves all land on the card regardless.
+///
+/// AVE-36 set the window. AMUX-3935 added the note text, because without it the
+/// key could not tell a repeat from a follow-up, and a review conversation is
+/// always a follow-up: context, then the verdict that rests on it. Two measured
+/// instances dropped a blocking review condition and a verification result, both
+/// times the later and higher-value message.
 fn progress_notify_once(key: &str) -> bool {
     use std::sync::Mutex;
     static SEEN: Mutex<Option<std::collections::HashMap<String, f64>>> = Mutex::new(None);
@@ -2290,6 +3132,51 @@ fn progress_notify_once(key: &str) -> bool {
     }
     m.insert(key.to_string(), now);
     true
+}
+
+#[cfg(test)]
+mod progress_notify_dedupe_tests {
+    use super::progress_notify_once;
+
+    /// AMUX-3935. The dedupe key was (owner, card, author) over a 10-minute
+    /// window, which cannot tell "the same note twice" from "a second, DIFFERENT
+    /// note about the same card".
+    ///
+    /// A review conversation is always the second kind — context, then the
+    /// verdict that rests on it — so the LATER message is systematically the
+    /// higher-value one and it was the one dropped. Two measured instances on
+    /// 2026-08-30, both from the same peer, both with that ordering: a review
+    /// verdict carrying a blocking condition, and a verification result. The
+    /// second suppressed note was their close-out on this very defect.
+    ///
+    /// Both directions asserted. Without the collapse arm this is
+    /// indistinguishable from deleting the dedupe, which would restore the
+    /// notification flood AVE-36 added the window for.
+    #[test]
+    fn a_different_note_delivers_and_an_identical_one_still_collapses() {
+        let k = |note: &str| format!("owner|CARD-1|peer|{note}");
+
+        assert!(progress_notify_once(&k("context: here is what I measured")),
+                "the first note delivers");
+        assert!(
+            progress_notify_once(&k("verdict: ACCEPT with one blocking condition")),
+            "a DIFFERENT note from the same author on the same card must deliver — this is \
+             the verdict that was dropped twice"
+        );
+        // CONTROL: the flood protection still works. A burst of identical
+        // appends is what the window exists for.
+        assert!(
+            !progress_notify_once(&k("context: here is what I measured")),
+            "an IDENTICAL repeat inside the window must still collapse, or the fix has \
+             removed flood protection rather than narrowing it"
+        );
+        // CONTROL: the key still separates cards and owners, so the content hash
+        // has not swallowed the rest of the key.
+        assert!(progress_notify_once("owner|CARD-2|peer|context: here is what I measured"),
+                "the same text on a DIFFERENT card is a different notice");
+        assert!(progress_notify_once("other|CARD-1|peer|context: here is what I measured"),
+                "the same text to a DIFFERENT owner is a different notice");
+    }
 }
 
 enum PatchOut {
@@ -2328,6 +3215,14 @@ enum PatchOut {
         /// happens gains its consequence: a named consumer (the owner), at
         /// the next turn boundary, deduped.
         progress_notify: Option<(String, String, String)>,
+        /// The REVIEWER a note in `review` is actually for (AMUX-3771). Separate
+        /// from `progress_notify` because owner and reviewer are different roles
+        /// and the workaround this replaces was to conflate them.
+        ///
+        /// Boxed: adding a third String triple pushed this variant past clippy's
+        /// `large_enum_variant` threshold, and `NotFound` is a unit variant that
+        /// would have paid for it on every return.
+        reviewer_notify: Option<Box<(String, String, String)>>,
     },
 }
 
@@ -3038,6 +3933,19 @@ pub async fn patch_item(
             set_opt("epic", &mut next.epic, &mut changed); // AMUX-2992: assign/clear a card's epic
             set_opt("due", &mut next.due, &mut changed);
             set_opt("due_time", &mut next.due_time, &mut changed);
+            set_opt("evidence", &mut next.evidence, &mut changed);
+            set_opt("ask_type", &mut next.ask_type, &mut changed);
+            set_opt("ask_question", &mut next.ask_question, &mut changed);
+            set_opt("ask_unblocks", &mut next.ask_unblocks, &mut changed);
+            set_opt("next_action", &mut next.next_action, &mut changed);
+            set_opt("last_result", &mut next.last_result, &mut changed);
+            set_opt("unresolved", &mut next.unresolved, &mut changed);
+            set_opt("blocked_on", &mut next.blocked_on, &mut changed);
+            set_opt("acceptance_criteria", &mut next.acceptance_criteria, &mut changed);
+            set_opt("decision_question", &mut next.decision_question, &mut changed);
+            set_opt("decision_rationale", &mut next.decision_rationale, &mut changed);
+            set_opt("decision_supersedes", &mut next.decision_supersedes, &mut changed);
+            set_opt("waiting_on", &mut next.waiting_on, &mut changed);
             // A TRIGGER MUST NOT EAT AN AUTOFIX SIGNATURE (AMUX-3686).
             //
             // `source_ref` has two owners. autofix stores its fault signature
@@ -3512,6 +4420,8 @@ pub async fn patch_item(
                         format!("{actor_name}: {from_raw} -> {target_raw} (user column)")
                     };
                     next.log = Some(bs::append_log(next.log.as_deref(), &stamp, &line));
+                    // Gap 4: waiting_on side effects before status change.
+                    crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                     next.status = target_raw.clone();
                     next.version += 1;
                     status_event = Some((from_raw, target_raw));
@@ -3690,8 +4600,37 @@ pub async fn patch_item(
                         && target == TaskStatus::Done
                         && bs::done_link_required(next.session.as_deref());
                     if link_required {
+                        // EVIDENCE COUNTS AS THE LINK, because it is one
+                        // (AMUX-3914). This gate scanned desc and log only,
+                        // while `--evidence` — which AF-321 SEPARATELY REQUIRES
+                        // on the same call — writes its own column. So the two
+                        // verbs a lane reaches for first, `status-update` and
+                        // `--evidence`, both wrote where this gate could not
+                        // look, and it refused cards whose artifact was already
+                        // recorded in the sanctioned place. Measured three times
+                        // on 2026-08-30: mixpeek-general on MG-1538 (outcome in
+                        // log, desc_len 0), and twice by amux, the second with a
+                        // real commit sha sitting in --evidence.
+                        //
+                        // Reuses `evidence_verdict` rather than testing the text
+                        // again here. That function already decides what counts
+                        // as an artifact — URL, path, sha, #N, a command, or
+                        // `none: <reason>` — and a second opinion in this file
+                        // would be the drift its own doc warns about. It also
+                        // means the DOCUMENTED escape finally works: CLAUDE.md
+                        // says `none: <reason>` "is stored and counted, not a
+                        // bypass", and until now this gate refused it, so an
+                        // honest close had to go through `--force` and was
+                        // logged as an override. That corrupted the override
+                        // signal itself — an audit of forced closes found two
+                        // that were the correct path.
+                        let evidence_names_artifact = next
+                            .evidence
+                            .as_deref()
+                            .is_some_and(|e| bs::evidence_verdict(e) == bs::EvidenceVerdict::Ok);
                         let has_link = bs::has_asset_link(&next.desc)
-                            || next.log.as_deref().is_some_and(bs::has_asset_link);
+                            || next.log.as_deref().is_some_and(bs::has_asset_link)
+                            || evidence_names_artifact;
                         if !has_link {
                             // Surfaces so a sweep catches the next one without a
                             // human noticing (two-fixes rule): grep
@@ -3717,7 +4656,370 @@ pub async fn patch_item(
                                         "why": "A card cannot be marked done without pointing at the artifact it produced: a URL, a repo file path, a commit sha, or a #PR/issue. This is a global constraint and gate_ack cannot satisfy it.",
                                         "how_to_fix": {
                                             "add_link": "PATCH /api/board/<id> with a desc containing the URL / file path / commit / #PR, then retry done.",
+                                            "or_evidence": "--evidence naming the artifact satisfies this gate too (a command, path, URL, sha or #PR). This card's evidence is empty or has nothing checkable in it.",
+                                            "no_artifact": "If the work genuinely produced none, say so: evidence starting `none: <reason>` (three words or more) is accepted and counted, not a bypass.",
                                             "override_for_this_worker": "set AMUX_DONE_LINK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-321 sits BEHIND the link rule above, deliberately. The link check is a SHAPE
+                    // check over the whole desc, so the card's own PROBLEM
+                    // STATEMENT satisfies it: measured on the live board
+                    // 2026-08-29, 843 of 1372 open cards (61%) passed it on
+                    // their filed text with no work done, because a card that
+                    // names the file it intends to edit contains a path. The
+                    // evidence column cannot be filled that way — nobody has
+                    // written it yet when the card is filed. Same opt-out
+                    // ladder, same `force` bypass, both audited.
+                    //
+                    // ORDER MATTERS: the coarser rule answers first, so a card
+                    // with no artifact anywhere still gets the older, broader
+                    // message it has always got, and this narrower one fires
+                    // only once that has been satisfied.
+                    let evidence_required = !force
+                        && target == TaskStatus::Done
+                        && bs::done_evidence_required(next.session.as_deref());
+                    if evidence_required {
+                        let ev = next.evidence.clone().unwrap_or_default();
+                        let verdict = bs::evidence_verdict(&ev);
+                        if verdict != bs::EvidenceVerdict::Ok {
+                            let (why, code) = match verdict {
+                                bs::EvidenceVerdict::Missing => (
+                                    "This card records nothing that was run or produced. `done` is where work stops on this board (3302 done against 3631 verified), so closing one has to name the proof: the command, the URL exercised, the screenshot path, the commit.",
+                                    "done_requires_evidence",
+                                ),
+                                bs::EvidenceVerdict::NoArtifact => (
+                                    "The evidence on this card is prose with nothing in it to check. Name the artifact: a command in backticks, a repo path, a URL, a commit sha, or a #PR.",
+                                    "done_evidence_has_no_artifact",
+                                ),
+                                bs::EvidenceVerdict::UnexplainedNone => (
+                                    "`none:` is the honest answer when a card genuinely produced no artifact, but it needs the reason after it — that text is what makes the escape countable instead of a blind spot.",
+                                    "done_evidence_none_unexplained",
+                                ),
+                                bs::EvidenceVerdict::Ok => unreachable!(),
+                            };
+                            // Two-fixes rule: grep `done_evidence_gate` in
+                            // server-rs.log, and the structured `code` splits
+                            // these from other 409s in /api/logs/analyze.
+                            tracing::warn!(
+                                "done_evidence_gate: blocked {} -> done for session {} (verdict {:?})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-"),
+                                verdict
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "done requires evidence of what was run",
+                                        "code": code,
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "why": why,
+                                        "recorded_evidence": next.evidence,
+                                        "how_to_fix": {
+                                            "cli": format!("amux board done {} --evidence-stdin  (heredoc; inline text is evaluated by YOUR shell)", next.id),
+                                            "api": "PATCH /api/board/<id> with {\"evidence\": \"...\"} — writable on its own, so record it first and the transition cannot discard it",
+                                            "accepted": [
+                                                "a command, in backticks or on a `$ ` line",
+                                                "a repo file path, a URL, a commit sha, or #PR",
+                                                "`none: <reason>` when the card genuinely produced no artifact (stored and counted, not a bypass)"
+                                            ],
+                                            "what_to_run": "the repo's VERIFY.md names the proof for each surface",
+                                            "override_for_this_worker": "set AMUX_DONE_EVIDENCE_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-317 (a): A LANE'S `todo` IS A DISPATCH QUEUE, NOT A PILE.
+                    //
+                    // Ethan, 2026-08-29: "some workers have an infinite # of
+                    // growing backlogs and todo then they go idle."
+                    //
+                    // AF-317's "median age 28.8 days" counted ARCHIVED cards and
+                    // does not hold: live it is 88 todo cards at a median of 0.8
+                    // days. What justifies a ceiling is DEPTH on a few lanes —
+                    // 22 lanes hold a live todo, 4 are over 5 (11, 9, 8, 6).
+                    //
+                    // The refusal LISTS THE STALEST CARDS FIRST, and that is not
+                    // a nicety. `board_drive` already stops dealing any todo
+                    // nobody has touched in 7 days, and measured 2026-08-30, 4
+                    // of the 72 live agent todo cards were already past that
+                    // edge — counted in a pickup trace that only prints when the
+                    // queue is otherwise EMPTY, so a lane with one live card
+                    // never saw it. Those cards are the answer to "what do I
+                    // close first" because they are already not being worked.
+                    let wip_limit = if force || target != TaskStatus::Todo {
+                        0
+                    } else {
+                        bs::todo_wip_limit(next.session.as_deref())
+                    };
+                    // owner_type is checked here and not folded into the count:
+                    // a human-owned card is not the dispatcher's to deal, so
+                    // capping it would be capping the owner's own queue.
+                    let lane = next.session.clone().unwrap_or_default();
+                    if wip_limit > 0 && !lane.is_empty() && next.owner_type == "agent" {
+                        let held = bs::todo_wip_count(conn, &lane, &next.id);
+                        if held >= wip_limit {
+                            let stalest = bs::stalest_todos(conn, &lane, 5);
+                            tracing::warn!(
+                                "todo_wip_gate: blocked {} -> todo for lane {} (holding {}, limit {})",
+                                next.id,
+                                lane,
+                                held,
+                                wip_limit
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "todo queue is at its limit for this lane",
+                                        "code": "todo_wip_limit_reached",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "session": lane,
+                                        "holding": held,
+                                        "limit": wip_limit,
+                                        "why": format!(
+                                            "{lane} already holds {held} todo card(s) and the limit is {wip_limit}. \
+                                             `todo` is the dispatch queue: a card here is a \
+                                             claim that it is next. `backlog` is unbounded and \
+                                             is where a real card that is not NEXT belongs."
+                                        ),
+                                        // NOT a generic "close something". These are the
+                                        // specific cards the dispatcher has already stopped
+                                        // dealing, newest-untouched last.
+                                        "close_these_first": stalest.iter().map(|(id, title, days)| json!({
+                                            "id": id,
+                                            "title": title,
+                                            "days_since_touched": days,
+                                            "already_undispatchable": *days >= 7,
+                                        })).collect::<Vec<_>>(),
+                                        "how_to_fix": {
+                                            "not_next": format!("amux board backlog <ID> --trigger \"<what re-arms it>\" — `backlog` is unbounded on purpose and is where a real card that is not NEXT belongs"),
+                                            "not_a_unit_of_work": "amux board discard <ID>",
+                                            "finish_one": "amux board done <ID> --evidence-stdin",
+                                            "raise_it": "set AMUX_TODO_WIP_LIMIT=<n> in this worker's / group's / global scope env (Scope tab); 0 disables it",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-317 (b): `blocked` MUST NAME WHAT IT IS WAITING ON.
+                    //
+                    // Measured 2026-08-30 over LIVE cards (AF-317's 70 counted
+                    // archived rows; live it is 32): 31 of the 32 open blocked
+                    // cards are older than a week, 16 name a `depends_on` and 19
+                    // carry a trigger. A block with no named condition has
+                    // nobody watching for the unblock, so it is not blocked, it
+                    // is abandoned with a nicer status. This is the one AF-317
+                    // statistic that survived re-measurement.
+                    let blocked_gate = !force
+                        && target == TaskStatus::Blocked
+                        && bs::blocked_needs_watch(next.session.as_deref());
+                    if blocked_gate {
+                        let has_dep = !next.depends_on.is_empty();
+                        // `--trigger` lands in source_ref (AMUX-3686); a trigger
+                        // there is a condition something re-checks.
+                        let has_trigger =
+                            next.source_ref.as_deref().is_some_and(|t| t.split_whitespace().count() >= 3);
+                        if !has_dep && !has_trigger {
+                            tracing::warn!(
+                                "blocked_watch_gate: blocked {} -> blocked for session {} (no depends_on, no trigger)",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-")
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "blocked must name what it is waiting on",
+                                        "code": "blocked_needs_a_watch",
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "why": "A block with no named condition has nobody watching for the unblock. Measured 2026-08-30 over live cards: 31 of the 32 open blocked cards are older than a week — which is what a status with no exit looks like.",
+                                        "how_to_fix": {
+                                            "on_another_card": "PATCH {\"depends_on\": [\"<ID>\"]} — the card that has to land first",
+                                            "on_a_condition": "amux board backlog <ID> --trigger \"<the condition that re-arms it>\" — re-checked, so the card comes back on its own",
+                                            "on_a_person": "amux board needsyou <ID> --ask <type> --question \"...\" --unblocks \"...\" (AF-318)",
+                                            "override_for_this_worker": "set AMUX_BLOCKED_NEEDS_WATCH=0 in this worker's / group's / global scope env (Scope tab).",
+                                            "force": "true (explicit bypass; logged)"
+                                        }
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+
+                    // AF-318: `needsyou` MUST NAME THE HUMAN ACT IT IS WAITING ON.
+                    //
+                    // Measured 2026-08-29: 445 cards parked here, median 15 days,
+                    // oldest 58 — and 227 of them (51%) are not human-blocked at
+                    // all. Their titles are plain engineering work ("Compute
+                    // Utilization Audit", "Fix Namespace Pollution"). The cause is
+                    // that `needsyou` is the only status which costs a worker
+                    // nothing and stops the idle nudge, so it collects everything a
+                    // worker decided to stop doing, and the ~20 real asks become
+                    // unfindable inside the rest.
+                    //
+                    // The gate is on the TRANSITION, never on the 445 already
+                    // there: a retroactive sweep would be this same guess made
+                    // once more, at scale, by the party least able to check it
+                    // (ethos rule 8). They drain by being re-asked.
+                    // THE CONTINUATION GATE, on the same door and by the same
+                    // shape (AMUX-3946). A card entering `doing` must say what
+                    // the next actor should DO, so that a reader arriving with
+                    // no conversation history can act on it.
+                    //
+                    // Measured in one session, eight cards claimed cold: the two
+                    // carrying a reproduction and a stated next step closed in a
+                    // single pass; AMUX-3854 reads "make it so this is all
+                    // automatic" against a deleted screenshot and cannot be
+                    // worked by anyone, including its author.
+                    //
+                    // `force` bypasses it, exactly as it bypasses the ask gate.
+                    // A gate with no truthful escape is one people route around
+                    // (ethos rule 3), and every force is already audited.
+                    //
+                    // ON THE TRANSITION, never retroactively on cards already in
+                    // `doing`. Same reasoning AF-318 recorded for the 445: a
+                    // retroactive sweep is a guess made at scale by the party
+                    // least able to check it.
+                    let continuation_required = !force
+                        && bs::continuation_applies(target)
+                        && bs::continuation_required(next.session.as_deref());
+                    if continuation_required {
+                        let verdict =
+                            bs::continuation_verdict(next.next_action.as_deref().unwrap_or(""));
+                        if verdict != bs::ContinuationVerdict::Ok {
+                            let (why, code) = match verdict {
+                                bs::ContinuationVerdict::Missing => (
+                                    "This card does not say what to DO next. Claiming it means someone will arrive here later, possibly you after a compaction, with no conversation history — and `desc` describes the problem, not the next move. One sentence.",
+                                    "doing_requires_next_action",
+                                ),
+                                bs::ContinuationVerdict::NotASentence => (
+                                    "`next_action` has to be a sentence a stranger could act on. \"wip\" and \"continue\" name no action; three words is the floor at which somebody has had to think about the reader.",
+                                    "doing_next_action_not_a_sentence",
+                                ),
+                                bs::ContinuationVerdict::Ok => unreachable!(),
+                            };
+                            // Two-fix rule, same shape as `needsyou_ask_gate`
+                            // below: grep `continuation_gate` in server-rs.log,
+                            // and the structured `code` splits these out in
+                            // /api/logs/analyze. A gate whose refusals are
+                            // invisible cannot tell you it is too strict.
+                            tracing::warn!(
+                                "continuation_gate: blocked {} -> doing for session {} (verdict {:?})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-"),
+                                verdict
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::BAD_REQUEST,
+                                    json!({
+                                        "error": code,
+                                        "why": why,
+                                        "how": "amux board next <ID> \"<what the next actor should do>\"",
+                                        "fields": "next_action is what to do next; last_result is what the previous attempt produced; unresolved is what is still open. Only next_action is gated — a card should not have to invent an open question to be claimable.",
+                                        "escape": "amux board doing <ID> --force  (audited, and it is the honest move when the next action genuinely is not knowable yet)",
+                                        "scope": "This gate is on `doing` only, and only for lanes that have opted in.",
+                                        "override_for_this_worker": "set AMUX_CONTINUATION_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
+                                    }),
+                                ),
+                                no_write(),
+                            );
+                        }
+                    }
+                    let ask_required = !force
+                        && target == TaskStatus::NeedsYou
+                        && bs::needsyou_ask_required(next.session.as_deref());
+                    if ask_required {
+                        let verdict = bs::ask_verdict(
+                            next.ask_type.as_deref().unwrap_or(""),
+                            next.ask_question.as_deref().unwrap_or(""),
+                            next.ask_unblocks.as_deref().unwrap_or(""),
+                        );
+                        if verdict != bs::AskVerdict::Ok {
+                            let (why, code) = match verdict {
+                                bs::AskVerdict::NoType => (
+                                    "This card does not say what KIND of human act it is waiting on. 51% of the cards already parked here are not blocked on a human at all (389 of them, live, median age 15 days) — they are work someone stopped doing, and they are why the real asks go unanswered.",
+                                    "needsyou_requires_ask_type",
+                                ),
+                                bs::AskVerdict::UnknownType => (
+                                    "That is not one of the five kinds of human act. The vocabulary is closed on purpose: a block that fits none of them is not a block on a person.",
+                                    "needsyou_ask_type_unknown",
+                                ),
+                                bs::AskVerdict::NoQuestion => (
+                                    "`ask_question` has to be an actual question, in a sentence. \"Blocked on Ethan\" with no question is not an ask — that phrasing is most of what is sitting in this queue today.",
+                                    "needsyou_ask_has_no_question",
+                                ),
+                                bs::AskVerdict::NoUnblocks => (
+                                    "`ask_unblocks` has to say what ENDS the block, in a sentence. Without it nobody but you can tell whether an answer has landed, so the card cannot leave this queue except by you noticing.",
+                                    "needsyou_ask_has_no_exit",
+                                ),
+                                bs::AskVerdict::Ok => unreachable!(),
+                            };
+                            // Two-fixes rule: grep `needsyou_ask_gate` in
+                            // server-rs.log; the structured `code` splits these
+                            // from other 409s in /api/logs/analyze.
+                            tracing::warn!(
+                                "needsyou_ask_gate: blocked {} -> needsyou for session {} (verdict {:?})",
+                                next.id,
+                                next.session.as_deref().unwrap_or("-"),
+                                verdict
+                            );
+                            return finish(
+                                &slot_w,
+                                PatchOut::Refused(
+                                    StatusCode::CONFLICT,
+                                    json!({
+                                        "error": "needsyou requires a typed ask",
+                                        "code": code,
+                                        "ok": false,
+                                        "blocked": true,
+                                        "item": next.id,
+                                        "attempted_status": target_raw,
+                                        "why": why,
+                                        "recorded_ask": {
+                                            "ask_type": next.ask_type,
+                                            "ask_question": next.ask_question,
+                                            "ask_unblocks": next.ask_unblocks,
+                                        },
+                                        "ask_types": bs::ASK_TYPE_HELP.iter()
+                                            .map(|(k, v)| json!({"type": k, "means": v}))
+                                            .collect::<Vec<_>>(),
+                                        "how_to_fix": {
+                                            "cli": format!("amux board needsyou {} --ask <type> --question-stdin --unblocks \"...\"", next.id),
+                                            "api": "PATCH /api/board/<id> with {\"ask_type\":\"...\",\"ask_question\":\"...\",\"ask_unblocks\":\"...\"} — all three writable on their own, so record them first and the transition cannot discard them",
+                                            "if_it_is_not_human_blocked": "then it is not `needsyou`. Use `backlog --trigger \"<condition>\"` for an external wait that re-arms itself, or leave it in `doing` and work the blocker.",
+                                            "override_for_this_worker": "set AMUX_NEEDSYOU_ASK_REQUIRED=0 in this worker's (or its group's, or the global) scope env — Scope tab.",
                                             "force": "true (explicit bypass; logged)"
                                         }
                                     }),
@@ -3829,6 +5131,93 @@ pub async fn patch_item(
                             }
                             ack_via = Some(format!("gate_checked ({}/{})", gc.len(), eff_gate.len()));
                         } else if map.get("gate_ack").and_then(Value::as_bool).unwrap_or(false) {
+                            // ONE BOOLEAN CANNOT STAND FOR FOUR CLAIMS AT
+                            // `verified` (Ethan, 2026-08-29: "i thought our
+                            // gates per status were clear, maybe make them
+                            // stronger enforced").
+                            //
+                            // `verified` is the board's highest claim and its
+                            // default gate is four INDEPENDENT assertions — CI
+                            // green, deployed, confirmed in prod, zero
+                            // regressions — that fail in different ways and are
+                            // checked by different acts. `gate_ack: true`
+                            // asserts all four with a single bit, and nothing
+                            // afterwards records which of them the acker
+                            // actually looked at. That is the "name which
+                            // clause you tested" failure the frustrations rule
+                            // names, one status down.
+                            //
+                            // Measured before shipping, fleet-wide, on every
+                            // ack this board has ever recorded:
+                            //
+                            //   target    gate_checked  gate_ack  ack share
+                            //   done              2881       342      10.6%
+                            //   verified          1303       302      18.8%
+                            //   review             428        31       6.8%
+                            //   doing              342        16       4.5%
+                            //
+                            // So 81% of verifications already enumerate, and
+                            // this refuses the other 19% — a real number with a
+                            // cheap truthful remedy, not a wall (ethos rule 3).
+                            // The remedy is walkable with sanctioned tooling,
+                            // checked by reading the CLI rather than assuming:
+                            // `amux`'s refusal printer keys on `gate` being in
+                            // the error text and echoes `d["gate"]` back as a
+                            // ready `--checked "..." "..."` line, so this body
+                            // carries both and the operator gets the exact
+                            // command. Refusing on a gate whose remedy needed a
+                            // hand-rolled PATCH would manufacture the
+                            // unattributed writes this system depends on being
+                            // attributed (AMUX-2325).
+                            //
+                            // TWO DELIBERATE NARROWINGS, both so the check
+                            // cannot fire where it would only be ceremony:
+                            //
+                            // 1. `verified` only. `done` carries 10.6% and is
+                            //    already machine-gated on an asset link, so it
+                            //    has a check a blanket ack cannot fake. Leaving
+                            //    it out is a decision, not an oversight.
+                            // 2. Multi-criterion gates only. Blanket-acking a
+                            //    ONE-criterion gate is byte-identical to
+                            //    checking it — the non-code default at
+                            //    `verified` is the single "Outcome confirmed to
+                            //    still hold", and refusing that would extract a
+                            //    retype of the same sentence for no information.
+                            if target == TaskStatus::Verified && eff_gate.len() > 1 {
+                                tracing::warn!(
+                                    "verified_blanket_ack: blocked {} -> verified for session {} ({} criteria acked with one boolean)",
+                                    next.id,
+                                    next.session.as_deref().unwrap_or("-"),
+                                    eff_gate.len()
+                                );
+                                return finish(
+                                    &slot_w,
+                                    PatchOut::Refused(
+                                        StatusCode::CONFLICT,
+                                        json!({
+                                            "error": "verified needs the gate checked criterion by criterion, not a blanket gate_ack",
+                                            "code": "verified_requires_gate_checked",
+                                            "ok": false,
+                                            "blocked": true,
+                                            "item": next.id,
+                                            "item_type": next.item_type,
+                                            "attempted_status": target_raw,
+                                            "gate": eff_gate,
+                                            "why": format!(
+                                                "these {} criteria fail in different ways and are checked by different acts; one boolean asserts all of them and records which you looked at nowhere",
+                                                eff_gate.len()
+                                            ),
+                                            "how_to_fix": {
+                                                "cli": format!("amux board verified {} --checked <each criterion>", next.id),
+                                                "api": "PATCH with gate_checked: [ ...every criterion... ]",
+                                                "if_one_is_not_true": "do not ack it. If the criterion does not fit the work, the TYPE is wrong — fix the type, not the truth.",
+                                                "force": "true with a reason (explicit bypass; logged and attributed)",
+                                            },
+                                        }),
+                                    ),
+                                    no_write(),
+                                );
+                            }
                             ack_via = Some("gate_ack".into());
                         }
                         match &ack_via {
@@ -4016,8 +5405,44 @@ pub async fn patch_item(
                             // the permissive case the invisible case.
                             next.log =
                                 Some(bs::append_log(next.log.as_deref(), &stamp, &authz_line));
+                            // Gap 4: waiting_on side effects before status change.
+                            crate::db::advance::apply_status_side_effects(&mut next, &target_raw);
                             next.status = target_raw.clone();
                             next.version = i64::try_from(updated.version).unwrap_or(next.version + 1);
+
+                            // REVISIT DATE ON THE TWO STATUSES NOTHING DRAINS
+                            // (Ethan, 2026-08-29: "some workers have an
+                            // infinite # of growing backlogs and todo then they
+                            // go idle"). `backlog` and `needsyou` are the only
+                            // statuses with no gate AND no exit an automated
+                            // loop can produce, and they held 963 of the 1029
+                            // open cards. A card entering either without a date
+                            // is a decision nobody made; see
+                            // `bs::default_revisit_days` for the measurement
+                            // and for why this is a default rather than a gate.
+                            //
+                            // A caller-supplied `due` in this same PATCH is
+                            // already in `next.due` (`set_opt` runs well above
+                            // this block), so this only ever fills a blank —
+                            // it cannot overwrite a date someone chose.
+                            if next.due.as_deref().unwrap_or("").trim().is_empty() {
+                                if let Some(days) =
+                                    bs::default_revisit_days(target, next.session.as_deref())
+                                {
+                                    let when = bs::revisit_date(days);
+                                    next.log = Some(bs::append_log(
+                                        next.log.as_deref(),
+                                        &stamp,
+                                        &format!(
+                                            "revisit {when} (default {days}d for {target_raw}): a \
+                                             {target_raw} card with no revisit date is one nobody \
+                                             looks at again — change or clear it if that is wrong"
+                                        ),
+                                    ));
+                                    next.due = Some(when);
+                                    changed.push("due".into());
+                                }
+                            }
                             status_event = Some((from_raw, target_raw));
                             changed.push("status".into());
                         }
@@ -4318,19 +5743,106 @@ pub async fn patch_item(
             // AVE-36: a non-owner's append earns the owner a notice. Self-notes
             // and unattributed callers notify nobody (the automation that
             // appends server-side carries no session header on purpose).
+            // WHO ACTUALLY NEEDS THIS NOTE (AMUX-3771, two fresh instances from
+            // backend).
+            //
+            // This targeted the OWNER and only the owner, so a card in `review`
+            // with a cross-group reviewer notified nobody: the owner posting a
+            // review request IS the caller, `owner != caller_lane` is false, and
+            // the reviewer was never considered. BACKE-3467 sat in `review`
+            // reading healthy while waiting on no one, and was only caught when a
+            // human pointed it out. The workaround was to reassign card
+            // OWNERSHIP to the reviewer, which conflates the two roles.
+            //
+            // A reviewer is the party the note is FOR when a card is in review.
+            // Notifying them is not a second feature; it is the first one
+            // addressed correctly.
+            let appended_note_for_reviewer = appended_note.clone();
+            let reviewer_target = next
+                .reviewer
+                .clone()
+                .map(|r| r.trim().to_string())
+                .filter(|r| !r.is_empty() && *r != caller_lane)
+                .filter(|r| Some(r.as_str()) != next.session.as_deref())
+                .filter(|_| bs::parse_status(&next.status) == Some(TaskStatus::Review));
             let progress_notify = appended_note.and_then(|note| {
                 let owner = next.session.clone().unwrap_or_default();
                 (!owner.is_empty() && !caller_lane.is_empty() && owner != caller_lane)
                     .then(|| (owner, next.title.clone(), note))
             });
+            // A NOTE ON AN ARCHIVED CARD REACHES NOBODY, AND THE WRITE SUCCEEDS
+            // (ts-gke, 2026-08-31).
+            //
+            // Archiving hides a card from every board view AND every autonomy
+            // loop. Appending to one still returns 200, so the sender gets a
+            // success with no signal that the card is invisible. That is the
+            // failure this whole family is about: recorded, reported as
+            // delivered, reaching nobody.
+            //
+            // Measured by ts-gke across the board: 1,334 ARCHIVED cards were
+            // updated in the last 3 days and 1,199 archived cards are
+            // amux-owned, so this is happening at volume rather than as an edge
+            // case. Three of my own cards were hit by it last night --
+            // AMUX-3771, AMUX-3119 and AMUX-3780 all took peer notes while
+            // archived by a board sweep, and two of them carried live findings I
+            // only saw because the peer chased me.
+            //
+            // WARN, NOT REFUSE. The note itself is worth keeping: it is the
+            // record, and refusing the write would lose content to protect a
+            // notification. Their framing, and it is the right trade: turn a
+            // SILENT loss into a VISIBLE one.
+            let mut body = detail_body(&next);
+            if appended_note_for_reviewer.is_some() && next.archived == 1 {
+                body["note_reaches_nobody"] = json!(true);
+                body["archived_warning"] = json!(
+                    "this card is ARCHIVED: the note is saved, but the card is hidden from \
+                     every board view and every autonomy loop, so nobody will see it. \
+                     `amux board unarchive <id>` if the note needs an audience."
+                );
+                tracing::warn!(
+                    note_on_archived_card = %next.id,
+                    owner = %next.session.as_deref().unwrap_or("-"),
+                    caller = %caller_lane,
+                    "board note appended to an ARCHIVED card — write succeeded, nobody will see it"
+                );
+            }
             finish(
                 &slot_w,
                 PatchOut::Applied {
-                    body: detail_body(&next),
+                    body,
                     ignored,
                     diverted,
                     status_transition: st,
                     progress_notify,
+                    // FIRE ON THE TRANSITION INTO REVIEW, not only on a note
+                    // append (AMUX-3771, second pass, found by backend).
+                    //
+                    // The first version was `.zip(appended_note)`, so it fired
+                    // ONLY when somebody appended prose to a card already in
+                    // review. The natural act is the opposite one: set a
+                    // reviewer and MOVE the card to review, which appends no
+                    // note. backend re-ran their BACKE-3467 shape both ways --
+                    // raw PATCH {status:review} and `amux board review` -- and
+                    // my code emitted nothing at all: not the notify, not the
+                    // refusal, not the report. I had fixed the rarer trigger.
+                    //
+                    // Entering review is the request. A note on an
+                    // already-in-review card is a follow-up, and both should
+                    // reach the reviewer.
+                    reviewer_notify: reviewer_target.clone().and_then(|r| {
+                        let entering_review = status_event
+                            .as_ref()
+                            .is_some_and(|(f, t)| f != t && t == "review");
+                        match (appended_note_for_reviewer.clone(), entering_review) {
+                            (Some(note), _) => Some(Box::new((r, next.title.clone(), note))),
+                            (None, true) => Some(Box::new((
+                                r,
+                                next.title.clone(),
+                                String::new(),
+                            ))),
+                            (None, false) => None,
+                        }
+                    }),
                 },
                 WriteOutcome {
                     applied: true,
@@ -4384,6 +5896,7 @@ pub async fn patch_item(
             diverted,
             status_transition,
             progress_notify,
+            reviewer_notify,
         }) => {
             body["applied"] = json!(true);
             body["global_rev"] = json!(reply.rev.0);
@@ -4412,11 +5925,40 @@ pub async fn patch_item(
                          nobody was told; re-run `amux board ask {id}` when they are up if it \
                          needs their attention"
                     ));
-                } else if !progress_notify_once(&format!("{owner}|{id}|{caller_for_notify}")) {
+                // THE NOTE'S CONTENT IS PART OF THE KEY (AMUX-3935).
+            //
+            // The key was (owner, card, author) with a 10-minute window, which
+            // collapses "the same note twice" and "a second, DIFFERENT note
+            // about the same card" into one case. A review conversation is
+            // necessarily the second kind: context first, then the verdict that
+            // rests on it — so the later message is systematically the
+            // higher-value one, and it is the one that was dropped.
+            //
+            // Two instances on 2026-08-30, both from mixpeek-homepage-claude,
+            // both with that ordering. The first dropped a review verdict
+            // carrying a BLOCKING condition on how AMUX-3920 should close; it
+            // reached me only because they appended a pointer to a third card.
+            // The second dropped a verification result on AMUX-3933 — and the
+            // note it suppressed was their close-out on THIS defect, which is
+            // as self-demonstrating as it gets.
+            //
+            // Flood protection is preserved exactly: a burst of IDENTICAL
+            // appends still collapses to one notice. What no longer collapses is
+            // a note that says something new.
+            } else if !progress_notify_once(&format!(
+                "{owner}|{id}|{caller_for_notify}|{:x}",
+                {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    note.hash(&mut h);
+                    h.finish()
+                }
+            )) {
                     body["owner_notified"] = json!(false);
                     body["owner_notify_reason"] = json!(
-                        "owner was already notified about your notes on this card in the last \
-                         10 minutes (deduped); the note itself is saved"
+                        "an IDENTICAL note from you on this card was already delivered in the \
+                         last 10 minutes (deduped); the note itself is saved. A note with \
+                         different text always delivers (AMUX-3935)."
                     );
                 } else {
                     let prompt = format!(
@@ -4432,17 +5974,149 @@ pub async fn patch_item(
                          is delivery of a peer's note, not a status request.)",
                         title.chars().take(60).collect::<String>()
                     );
-                    let _ = crate::api::session_verbs::steer_enqueue(
+                    // REPORT WHAT THE ENQUEUE ACTUALLY DID (AMUX-3938). This
+                    // was `let _ =` followed by an unconditional
+                    // `owner_notified: true`, so the sender was told the owner
+                    // had been notified even when the chokepoint REFUSED — an
+                    // isolated lane, an archived lane, a permanently blocked
+                    // target. That is the same sender/recipient disagreement
+                    // this card family is about: from the sender it looked
+                    // delivered, from the owner it never arrived, and neither
+                    // side could see the mismatch. `steer_enqueue` is
+                    // `#[must_use]` precisely so this is a decision, not an
+                    // oversight; the honest handling is to pass the refusal on.
+                    match crate::api::session_verbs::steer_enqueue(
                         &state,
                         &owner,
                         &prompt,
                         "board-progress",
                         &caller_for_notify,
                     )
-                    .await;
-                    body["owner_notified"] = json!(true);
-                    body["owner_notify_note"] =
-                        json!(format!("{owner} will see the note at their next turn boundary"));
+                    .await
+                    {
+                        Ok(_) => {
+                            body["owner_notified"] = json!(true);
+                            body["owner_notify_note"] = json!(format!(
+                                "{owner} will see the note at their next turn boundary"
+                            ));
+                        }
+                        Err(reason) => {
+                            body["owner_notified"] = json!(false);
+                            body["owner_notify_reason"] = json!(format!(
+                                "the note is saved on the card, but {owner} could NOT be \
+                                 notified: {reason}"
+                            ));
+                            tracing::warn!(
+                                board_note_undelivered = %owner,
+                                card = %id,
+                                sender = %caller_for_notify,
+                                reason = reason,
+                                "board note saved but owner not notified"
+                            );
+                        }
+                    }
+                }
+            }
+            // DELIVER TO THE REVIEWER (AMUX-3771). A card in `review` names the
+            // party the note is for; notifying only the owner is how BACKE-3467
+            // sat reading healthy while waiting on nobody.
+            //
+            // REACHABILITY IS CHECKED AND REPORTED, never silently skipped. The
+            // whole defect class here is a request that looks delivered from one
+            // side and never arrived on the other, so a refusal that produced
+            // silence would be the same bug wearing a fix.
+            if let Some(boxed) = reviewer_notify {
+                let (reviewer, title, note) = *boxed;
+                let owner_for_check = body
+                    .get("session")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string();
+                match crate::api::session_verbs::reviewer_unreachable_reason(
+                    &owner_for_check,
+                    &reviewer,
+                ) {
+                    Some(why) => {
+                        body["reviewer_notified"] = json!(false);
+                        body["reviewer_notify_reason"] = json!(format!(
+                            "the note is on the card, but reviewer '{reviewer}' could NOT be \
+                             told: {why}"
+                        ));
+                        tracing::warn!(
+                            reviewer_unreachable = %reviewer,
+                            owner = %owner_for_check,
+                            "board note: reviewer named on a card in review cannot be reached"
+                        );
+                    }
+                    None => {
+                        // SELF-CHECKING RATHER THAN PRECONDITIONED, and the
+                        // rejected alternative is the point (amux-frustrations,
+                        // 2026-08-31).
+                        //
+                        // Steering waits for a turn boundary: measured mean lag
+                        // 166s, max 3607s, 32% over a minute. So a review
+                        // request can sit pending for hours while the card is
+                        // reviewed and closed, and arrive asserting a premise
+                        // that has expired.
+                        //
+                        // `steer_enqueue_precond` exists for exactly that and is
+                        // WRONG HERE. It drops on any `rev` change, and its own
+                        // docstring says why that is safe for its callers:
+                        // "every producer here is a periodic trigger, so if the
+                        // condition still holds it fires again on the next tick".
+                        // A review request is not periodic. Dropped means gone,
+                        // so preconditioning it would silently swallow requests
+                        // whenever anybody appended a note -- recreating the
+                        // exact defect this card reports.
+                        //
+                        // A message that survives and explains itself beats one
+                        // that might vanish. The cost of a stale arrival is one
+                        // reader glancing at a closed card; the cost of a
+                        // dropped request is a review that reaches nobody.
+                        let body_line = if note.trim().is_empty() {
+                            "The card has just been moved into review.".to_string()
+                        } else {
+                            note.clone()
+                        };
+                        let prompt = format!(
+                            "[review requested on {}: {}] {caller_for_notify} is waiting on \
+                             YOUR review:\n{body_line}\n(You are named REVIEWER on this card. The \
+                             full note is on it. This was queued when the card entered review \
+                             and delivers at your next turn boundary, so if it has since left \
+                             `review` it was already handled and you can ignore this.)",
+                            body.get("id").and_then(Value::as_str).unwrap_or(""),
+                            title.chars().take(60).collect::<String>()
+                        );
+                        match crate::api::session_verbs::steer_enqueue(
+                            &state,
+                            &reviewer,
+                            &prompt,
+                            "board-progress",
+                            &caller_for_notify,
+                        )
+                        .await
+                        {
+                            Ok(_) => {
+                                body["reviewer_notified"] = json!(true);
+                                body["reviewer_notify_note"] = json!(format!(
+                                    "{reviewer} will see the review request at their next turn \
+                                     boundary"
+                                ));
+                            }
+                            Err(reason) => {
+                                body["reviewer_notified"] = json!(false);
+                                body["reviewer_notify_reason"] = json!(format!(
+                                    "the note is on the card, but reviewer '{reviewer}' could \
+                                     NOT be notified: {reason}"
+                                ));
+                                tracing::warn!(
+                                    reviewer_undelivered = %reviewer,
+                                    reason = reason,
+                                    "board note: review request not delivered"
+                                );
+                            }
+                        }
+                    }
                 }
             }
             // REACTIVE PICKUP: when a card transitions to a terminal state,
@@ -4955,6 +6629,273 @@ fn card_refs(text: &str) -> Vec<String> {
         }
     }
     out
+}
+
+// ---------------------------------------------------------------------------
+// Capsule endpoint (Phase 2a): L1 context for agent consumption.
+// ---------------------------------------------------------------------------
+
+/// GET /api/board/{id}/capsule
+///
+/// Returns the L1 continuation capsule: the minimal structured context an agent
+/// needs to pick up a task with zero conversation history. Deliberately small
+/// (300-800 tokens), designed for agent context windows.
+async fn capsule(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    let row = match bs::get_issue(&conn, &id) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response()
+        }
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let ac = row.acceptance_criteria.as_deref()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+        .unwrap_or(Value::Null);
+    let files: Vec<String> = conn
+        .prepare("SELECT path FROM issue_files WHERE issue_id = ?1")
+        .and_then(|mut stmt| {
+            stmt.query_map(rusqlite::params![id], |r| r.get(0))?
+                .collect::<Result<Vec<String>, _>>()
+        })
+        .unwrap_or_default();
+    let deps_status: Vec<Value> = row.depends_on.iter().filter_map(|dep_id| {
+        bs::get_issue(&conn, dep_id).ok().flatten().map(|d| {
+            json!({"id": d.id, "title": d.title, "status": d.status})
+        })
+    }).collect();
+    let verifications = crate::db::verification_store::list_for_task(&conn, &id)
+        .unwrap_or_default();
+    let last_verification = verifications.first().map(|v| {
+        json!({"verdict": v.verdict, "actor": v.actor, "at": v.created_at})
+    });
+    (
+        StatusCode::OK,
+        Json(json!({
+            "id": row.id,
+            "title": row.title,
+            "type": row.item_type,
+            "status": row.status,
+            "session": row.session,
+            "next_action": row.next_action,
+            "last_result": row.last_result,
+            "unresolved": row.unresolved,
+            "blocked_on": row.blocked_on,
+            "evidence": row.evidence,
+            "acceptance_criteria": ac,
+            "depends_on": deps_status,
+            "artifacts": files,
+            "gate": row.gate_criteria(),
+            "last_verification": last_verification,
+            "entered_state_at": row.entered_state_at,
+            "decision_question": row.decision_question,
+            "decision_rationale": row.decision_rationale,
+        })),
+    )
+        .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Verification history (Phase 1a): structured records of every verify attempt.
+// ---------------------------------------------------------------------------
+
+/// GET /api/board/{id}/verifications
+async fn list_verifications(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    if bs::get_issue(&conn, &id).ok().flatten().is_none() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    let rows = match crate::db::verification_store::list_for_task(&conn, &id) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let items: Vec<Value> = rows.iter().map(|r| {
+        json!({
+            "id": r.id,
+            "task_id": r.task_id,
+            "verdict": r.verdict,
+            "reason": r.reason,
+            "actor": r.actor,
+            "created_at": r.created_at,
+        })
+    }).collect();
+    (StatusCode::OK, Json(json!(items))).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Artifact CRUD (Phase 3a): per-task artifact registry.
+// ---------------------------------------------------------------------------
+
+/// GET /api/board/{id}/artifacts
+async fn list_artifacts(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Response {
+    let conn = match state.store.read() {
+        Ok(c) => c,
+        Err(e) => return (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    };
+    if bs::get_issue(&conn, &id).ok().flatten().is_none() {
+        return (StatusCode::NOT_FOUND, Json(json!({"error": "not found"}))).into_response();
+    }
+    let rows = match crate::db::artifact_store::list_for_task(&conn, &id) {
+        Ok(r) => r,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    };
+    let items: Vec<Value> = rows.iter().map(|r| {
+        json!({
+            "id": r.id,
+            "task_id": r.task_id,
+            "kind": r.kind,
+            "ref": r.ref_value,
+            "state": r.state,
+            "description": r.description,
+            "created_at": r.created_at,
+            "updated_at": r.updated_at,
+        })
+    }).collect();
+    (StatusCode::OK, Json(json!(items))).into_response()
+}
+
+/// POST /api/board/{id}/artifacts
+async fn create_artifact(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<Value>,
+) -> Response {
+    let kind = match body.get("kind").and_then(|v| v.as_str()) {
+        Some(k) => k.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "kind required"}))).into_response()
+        }
+    };
+    let ref_value = match body.get("ref").and_then(|v| v.as_str()) {
+        Some(r) => r.to_string(),
+        None => {
+            return (StatusCode::BAD_REQUEST, Json(json!({"error": "ref required"}))).into_response()
+        }
+    };
+    let state_val = body.get("state").and_then(|v| v.as_str()).unwrap_or("created").to_string();
+    let desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let now = chrono::Utc::now().timestamp();
+    let aid = format!("ART-{}", ulid::Ulid::new().to_string().to_lowercase());
+    let row = crate::db::artifact_store::ArtifactRow {
+        id: aid.clone(),
+        task_id: id.clone(),
+        kind,
+        ref_value,
+        state: state_val,
+        description: desc,
+        created_at: now,
+        updated_at: now,
+    };
+    let aid_out = aid.clone();
+    let write = state.store.write_async(move |conn| {
+        if bs::get_issue(conn, &id).ok().flatten().is_none() {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        crate::db::artifact_store::insert(conn, &row)?;
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: aid.clone(),
+                mutation: amux_core::revision::MutationKind::Created,
+                payload: None,
+            }],
+        })
+    }).await;
+    match write {
+        Ok(_) => (StatusCode::CREATED, Json(json!({"id": aid_out}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// PATCH /api/board/{id}/artifacts/{aid}
+async fn patch_artifact(
+    State(state): State<AppState>,
+    Path((id, aid)): Path<(String, String)>,
+    Json(body): Json<Value>,
+) -> Response {
+    let new_state = body.get("state").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let new_desc = body.get("description").and_then(|v| v.as_str()).map(|s| s.to_string());
+    if new_state.is_none() && new_desc.is_none() {
+        return (StatusCode::BAD_REQUEST, Json(json!({"error": "nothing to update"}))).into_response();
+    }
+    let now = chrono::Utc::now().timestamp();
+    let write = state.store.write_async(move |conn| {
+        let existing = crate::db::artifact_store::get(conn, &aid)?
+            .ok_or(rusqlite::Error::QueryReturnedNoRows)?;
+        if existing.task_id != id {
+            return Err(rusqlite::Error::QueryReturnedNoRows);
+        }
+        if let Some(ref s) = new_state {
+            if !crate::db::artifact_store::ARTIFACT_STATES.contains(&s.as_str()) {
+                return Err(rusqlite::Error::InvalidParameterName(
+                    format!("invalid state: {s}"),
+                ));
+            }
+            crate::db::artifact_store::update_state(conn, &aid, s, now)?;
+        }
+        if let Some(ref d) = new_desc {
+            conn.execute(
+                "UPDATE _amux_task_artifacts SET description = ?1, updated_at = ?2 WHERE id = ?3",
+                rusqlite::params![d, now, aid],
+            )?;
+        }
+        Ok(crate::db::WriteOutcome {
+            applied: true,
+            events: vec![crate::db::PendingEvent {
+                entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                entity_id: aid.clone(),
+                mutation: amux_core::revision::MutationKind::Updated,
+                payload: None,
+            }],
+        })
+    }).await;
+    match write {
+        Ok(_) => (StatusCode::OK, Json(json!({"ok": true}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+/// DELETE /api/board/{id}/artifacts/{aid}
+async fn delete_artifact(
+    State(state): State<AppState>,
+    Path((_id, aid)): Path<(String, String)>,
+) -> Response {
+    let write = state.store.write_async(move |conn| {
+        let n = crate::db::artifact_store::delete(conn, &aid)?;
+        Ok(crate::db::WriteOutcome {
+            applied: n > 0,
+            events: if n > 0 {
+                vec![crate::db::PendingEvent {
+                    entity_type: amux_core::revision::EntityType::Other("artifact".into()),
+                    entity_id: aid.clone(),
+                    mutation: amux_core::revision::MutationKind::Deleted,
+                    payload: None,
+                }]
+            } else {
+                vec![]
+            },
+        })
+    }).await;
+    match write {
+        Ok(_) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
 }
 
 #[cfg(test)]
@@ -5556,24 +7497,7 @@ mod slim_tests {
     // ---- AMUX-3391: auto-fold the silent capture card into the worker's own ----
 
     fn fold_db() -> rusqlite::Connection {
-        let conn = rusqlite::Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
-                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
-                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
-                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
-                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
-                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, closed_at INTEGER, deleted INTEGER);
-             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
-                PRIMARY KEY (issue_id, tag));
-             CREATE TABLE issue_counters (prefix TEXT PRIMARY KEY, next_n INTEGER NOT NULL);",
-        )
-        .unwrap();
-        conn
+        crate::db::migrate::test_memdb()
     }
 
     fn fold_card(creator: &str, status: &str, desc: &str, session: &str) -> bs::NewIssue {
@@ -5592,6 +7516,11 @@ mod slim_tests {
             gate: vec![],
             depends_on: vec![],
             tags: vec![],
+            ask_type: None,
+            ask_question: None,
+            ask_unblocks: None,
+            // AF-367: the HTTP create path: a real POST /api/board from a lane or a human.
+            source: Some("agent".into()),
         }
     }
 

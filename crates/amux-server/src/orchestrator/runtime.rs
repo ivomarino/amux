@@ -1384,6 +1384,13 @@ impl Runtime {
                         } else {
                             vec![]
                         },
+                        // Not an ask: this producer files ordinary cards, and a card
+                        // filed into needsyou without one is what AMUX-3929 is about.
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        // AF-367: minted by the orchestrator runtime.
+                        source: Some("orchestrator".into()),
                     },
                     now.timestamp(),
                 )?;
@@ -1927,6 +1934,11 @@ mod adherence_tests {
                         gate: vec![],
                         depends_on: vec![],
                         tags: vec![],
+                        ask_type: None,
+                        ask_question: None,
+                        ask_unblocks: None,
+                        // AF-367: minted by the orchestrator runtime.
+                        source: Some("orchestrator".into()),
                     },
                     1_700_000_000,
                 )?;

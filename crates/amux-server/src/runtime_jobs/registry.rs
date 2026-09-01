@@ -99,6 +99,8 @@ pub mod ids {
     pub const COMMIT_NUDGE: &str = "commit-nudge";
     pub const COMMIT_MENTION_NOTES: &str = "commit-mention-notes";
     pub const SELF_ADOPT: &str = "self-adoption";
+    pub const TUNNEL: &str = "tunnel-relay";
+    pub const BROWSER_REAPER: &str = "browser-idle-reaper";
     // The PeriodicTask ids below are NOT referenced by any spawn site — they
     // register themselves through `spawn_periodic_every` under the name their
     // own module passes. They are listed here only so CATALOG rows and tests
@@ -112,6 +114,8 @@ pub mod ids {
     pub const TAILNET_WATCH: &str = "tailnet-watch";
     pub const TELEGRAM_POLL: &str = "telegram-poll";
     pub const TELEGRAM_RELAY: &str = "telegram-relay";
+    pub const QUEUE_DISPOSITION: &str = "queue-disposition";
+    pub const MAC_HEALTH: &str = "mac-health";
 }
 
 /// Every id above, enumerated. `mod ids` is a set of constants and Rust cannot
@@ -133,6 +137,8 @@ pub const ALL_IDS: &[&str] = &[
     ids::COMMIT_NUDGE,
     ids::COMMIT_MENTION_NOTES,
     ids::SELF_ADOPT,
+    ids::TUNNEL,
+    ids::BROWSER_REAPER,
     ids::AUTOFIX,
     ids::BOARD_DRIVE,
     ids::GHOST_RESCUE,
@@ -142,6 +148,8 @@ pub const ALL_IDS: &[&str] = &[
     ids::TAILNET_WATCH,
     ids::TELEGRAM_POLL,
     ids::TELEGRAM_RELAY,
+    ids::QUEUE_DISPOSITION,
+    ids::MAC_HEALTH,
 ];
 
 /// An env var this job reads at startup. It is a READOUT, never a switch: a
@@ -272,6 +280,18 @@ pub const CATALOG: &[Doc] = &[
         detail: Some("/api/debug/downtime"),
     },
     Doc {
+        id: ids::QUEUE_DISPOSITION,
+        name: "Queue disposition",
+        purpose: "Tells a lane which of its todo cards auto-pickup has already stopped offering, and asks for one of three dispositions. Files ONE card per lane and updates it; it never retires or retypes a card itself.",
+        env: &[EnvControl {
+            var: "AMUX_QUEUE_DISPOSITION_SECS",
+            effect: "sweep seconds; 0 stops the sweep",
+            off: Some("0"),
+        }],
+        pref: None,
+        detail: None,
+    },
+    Doc {
         id: ids::STORAGE,
         name: "Storage retention",
         purpose: "Prunes seven append-only tables and three cache directories on a timer, and rotates the server log.",
@@ -376,6 +396,74 @@ pub const CATALOG: &[Doc] = &[
         detail: None,
     },
     Doc {
+        id: ids::BROWSER_REAPER,
+        name: "Browser idle reaper",
+        purpose: "Releases browsers that are abandoned: no verb activity in 5 min (activity arm), no real page for 1 hour (idle arm), or older than 4 hours (TTL arm). Logins survive on disk; only a relaunch is lost.",
+        env: &[
+            EnvControl {
+                var: "AMUX_BROWSER_ACTIVITY_REAP_S",
+                effect: "seconds since last verb (navigate/screenshot/action) before release (default 300 = 5 min); 0 disables this arm",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_BROWSER_IDLE_REAP_S",
+                effect: "seconds a profile must be continuously empty (no real pages) before release (default 3600); 0 disables this arm",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_BROWSER_TTL_S",
+                effect: "hard age ceiling — any browser older than this is released even with open pages (default 14400 = 4 h); 0 disables",
+                off: Some("0"),
+            },
+            EnvControl {
+                var: "AMUX_BROWSER_REAP_TICK_S",
+                effect: "how often to check (default 120)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/browser/status"),
+    },
+    Doc {
+        id: ids::TUNNEL,
+        name: "Tunnel relay",
+        purpose: "Long-polls the amux cloud gateway and serves each public request from a local port, so a localhost app is reachable without an inbound port. Registered only while a tunnel is running — absent here means no tunnel is up, which is also the default.",
+        env: &[
+            EnvControl {
+                var: "AMUX_TUNNEL_TOKEN",
+                effect: "the amux-cloud token the gateway authenticates; without it no tunnel can start at all",
+                off: Some(OFF_WHEN_UNSET),
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_PORT",
+                effect: "the local port to auto-target at boot. UNSET means no auto-start: defaulting to amux's own port would publish an unauthenticated control plane",
+                off: Some(OFF_WHEN_UNSET),
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_GATEWAY",
+                effect: "gateway base URL (default https://cloud.amux.io); point at your own for the self-hosted OSS gateway",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_RATE_PER_MIN",
+                effect: "public request cap per sliding minute, shed as 429 before the local app is touched (default 180)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_MAX_CONCURRENT",
+                effect: "simultaneous local fetches; excess waits 8s then gets a 503 (default 8)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_TUNNEL_ALLOW_SELF",
+                effect: "1 = permit tunnelling amux's OWN port. Refused by default: this port has no request auth and /api/sessions/<n>/send is ungated",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: Some("/api/tunnel/status"),
+    },
+    Doc {
         id: ids::SELF_ADOPT,
         name: "Self-adoption watch",
         purpose: "Exits 0 when the installed binary changes on disk so launchd relaunches the new build instead of serving stale code.",
@@ -414,6 +502,30 @@ pub const CATALOG: &[Doc] = &[
         }],
         pref: None,
         detail: Some("/api/telegram/status"),
+    },
+    Doc {
+        id: ids::MAC_HEALTH,
+        name: "Mac process health",
+        purpose: "Reaps orphaned Ray workers (ray:: processes with no live raylet), and warns when the claude process count exceeds the ceiling. Runs every 30 minutes.",
+        env: &[
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_TICK_S",
+                effect: "sweep interval in seconds (default 1800 = 30 min)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_MAX_CLAUDE",
+                effect: "claude process count that triggers a WARN (default 60)",
+                off: None,
+            },
+            EnvControl {
+                var: "AMUX_MAC_HEALTH_RAY_GRACE_S",
+                effect: "minimum age (seconds) before an orphaned ray:: worker is killed (default 120)",
+                off: None,
+            },
+        ],
+        pref: None,
+        detail: None,
     },
 ];
 
@@ -738,6 +850,18 @@ pub fn outcome_for(id: &str) -> Option<String> {
         ids::BOARD_DRIVE => super::board_drive::last_report().map(|r| {
             format!("{} assigned, {} nudged across {} lane(s)", r.assigned, r.nudged, r.lanes.len())
         }),
+        // Was `None`, so the one job whose entire purpose is finding
+        // unsubmitted messages reported nothing about whether it had found any.
+        ids::GHOST_RESCUE => super::ghost_rescue::last_report().map(|r| {
+            format!(
+                "{} lane(s) examined, {} rescued, {} left alone ({} holding a collapsed paste the sweep cannot claim), {} empty composer(s)",
+                r.examined,
+                r.rescued.len(),
+                r.left_alone.len(),
+                r.chips.len(),
+                r.placeholders
+            )
+        }),
         ids::STORAGE => super::storage::last_report().map(|r| {
             format!(
                 "{} table(s) swept, {} file(s) removed, {} freed",
@@ -806,7 +930,7 @@ fn env_json(d: &Doc) -> (Vec<Value>, bool) {
         out.push(json!({
             "kind": "env",
             "var": e.var,
-            "value": val,
+            "value": redact_env(e.var, val.as_deref()),
             "effect": e.effect,
             "off_value": match e.off {
                 None => Value::Null,
@@ -821,6 +945,47 @@ fn env_json(d: &Doc) -> (Vec<Value>, bool) {
         }));
     }
     (out, disabled)
+}
+
+/// Env vars whose NAME says the value is a credential. Matched as substrings of
+/// the uppercased name, so a var nobody has written yet is covered too.
+const SECRET_ENV_MARKERS: &[&str] = &["TOKEN", "SECRET", "PASSWORD", "PASSWD", "_KEY", "APIKEY", "CREDENTIAL"];
+
+/// Is this env var's VALUE a credential that must never be rendered?
+pub fn is_secret_env(var: &str) -> bool {
+    let up = var.to_ascii_uppercase();
+    SECRET_ENV_MARKERS.iter().any(|m| up.contains(m))
+}
+
+/// What `/api/system-jobs` may publish for an env var (AMUX-3817).
+///
+/// FOUND LIVE: adding `AMUX_TUNNEL_TOKEN` to a job's CATALOG entry made this
+/// endpoint print the token in plaintext, because every env control rendered
+/// its raw value and until then none of them held a secret. That is a
+/// credential leaving `~/.amux/server.env`, which is the one place values are
+/// supposed to live, through an endpoint whose job is documentation.
+///
+/// A SET SECRET REPORTS AS SET, NOT AS ABSENT. The `off_now` flag beside it is
+/// computed from the real value and is the fact the UI needs; blanking the
+/// field to `null` would make a configured token indistinguishable from a
+/// missing one, which is the ethos-4 failure and would send someone to set a
+/// var that is already set.
+///
+/// Matched on the NAME rather than a per-entry flag on purpose: a flag is a
+/// thing to remember, and the next person adding a `*_TOKEN` to a catalog entry
+/// should not have to.
+fn redact_env(var: &str, val: Option<&str>) -> Value {
+    match val {
+        None => Value::Null,
+        Some(v) if is_secret_env(var) => {
+            if v.trim().is_empty() {
+                json!("")
+            } else {
+                json!(format!("(set, {} chars, redacted)", v.chars().count()))
+            }
+        }
+        Some(v) => json!(v),
+    }
 }
 
 /// The live switch, if this job has one. A pref is re-read by the job on every
@@ -953,6 +1118,40 @@ pub fn routes() -> axum::Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AMUX-3817: `/api/system-jobs` printed AMUX_TUNNEL_TOKEN in plaintext.
+    ///
+    /// Every env control rendered its raw value, which was harmless until a
+    /// catalog entry named a credential — then a documentation endpoint became
+    /// a way to read a secret out of `~/.amux/server.env`. Caught by reading a
+    /// live response, not by any test, which is why this one exists.
+    #[test]
+    fn a_secret_env_var_reports_as_set_without_reporting_its_value() {
+        let r = redact_env("AMUX_TUNNEL_TOKEN", Some("lcjRDtvwLhyVp9wZ"));
+        let s = r.as_str().unwrap_or_default();
+        assert!(!s.contains("lcjRDtvw"), "the value must not appear: {r}");
+        // SET, not absent. Blanking it to null would make a configured token
+        // indistinguishable from a missing one and send someone to set a var
+        // that is already set (ethos rule 4).
+        assert!(s.contains("set"), "a configured secret must still read as configured: {r}");
+        assert!(s.contains("16"), "length is a useful, non-disclosing fact: {r}");
+
+        // Every shape of name that carries a credential.
+        for v in ["AMUX_TUNNEL_TOKEN", "OPENAI_API_KEY", "DB_PASSWORD", "x_secret", "MY_CREDENTIAL"] {
+            assert!(is_secret_env(v), "{v} names a credential");
+        }
+        // THE CONTROLS. A matcher that flagged everything would pass the whole
+        // block above and blank the readouts this endpoint exists for.
+        for v in ["AMUX_TUNNEL_PORT", "AMUX_RS_SCHEDULER", "AMUX_BOARD_DRIVE_SECS", "AMUX_TUNNEL_GATEWAY"] {
+            assert!(!is_secret_env(v), "{v} is a knob, not a secret");
+            assert_eq!(redact_env(v, Some("180")), json!("180"), "{v} must render its value");
+        }
+        // Unset stays null and empty stays empty, for both kinds: `off_now` is
+        // computed from the real value, and these two are what the UI reads to
+        // tell "not configured" from "configured".
+        assert_eq!(redact_env("AMUX_TUNNEL_TOKEN", None), Value::Null);
+        assert_eq!(redact_env("AMUX_TUNNEL_TOKEN", Some("  ")), json!(""));
+    }
 
     const T: f64 = 1_000_000.0;
 

@@ -102,7 +102,7 @@ const DECOMPOSE_COOLDOWN_S: f64 = 6.0 * 3600.0;
 /// starved card — and when it does exclude a todo, `select_pickup` now says so
 /// in the trace instead of the card silently vanishing from auto-pickup.
 const PICKUP_FRESHNESS_S_DEFAULT: i64 = 7 * 86400;
-fn pickup_freshness_s() -> i64 {
+pub(crate) fn pickup_freshness_s() -> i64 {
     std::env::var("AMUX_PICKUP_FRESHNESS_S")
         .ok()
         .and_then(|v| v.parse::<i64>().ok())
@@ -152,6 +152,28 @@ const BACKLOG_TRIAGE_COOLDOWN_S: f64 = 72.0 * 3600.0;
 const BACKLOG_TRIAGE_THRESHOLD: usize = 10;
 /// Cards older than this (created_at) are considered stale backlog.
 const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
+/// A `source_ref` trigger not re-verified within this window is STALE, and the
+/// idle-drain gate now treats it exactly like no trigger at all. Matches the
+/// dashboard's `is:sourcestale` definition (app.js) so "detectable by search"
+/// and "detectable by the drain nudge" agree on what stale means.
+///
+/// Without this, `--trigger` is a one-way switch: a lane nudged to drain its
+/// backlog can silence the nudge forever by writing ANY text into source_ref —
+/// including a self-note ("do this later") rather than a genuine external
+/// blocker — because `parked_on_live_trigger`-style checks only ever asked
+/// "is source_ref non-empty", never "is it still true". Measured 2026-08-27:
+/// 509 of 514 fleet-wide backlog cards carried a source_ref, 450 of those
+/// (88%) had gone unverified >24h, several past 50 days — the idle-drain gate
+/// built for exactly this stall (AMUX-3006) had been silently defeated by its
+/// own escape hatch on nearly the whole fleet's backlog. This constant does
+/// NOT touch `parked_on_live_trigger` (the depends_on auto-promotion guard,
+/// board_drive.rs:1102) — that path stays conservative on purpose (MG-1388,
+/// 2026-08-15: auto-promoting a parked card re-activated it five times against
+/// the owner's explicit re-park). This only widens what counts as
+/// un-drained for a NON-destructive NUDGE, which the owning session can
+/// answer by either re-confirming the trigger (bumps `last_verified_at`) or
+/// finally acting on the card — never by an automated status change.
+const SOURCE_REF_STALE_S: i64 = 24 * 3600;
 /// Idle-backlog DRAIN nudge cooldown, SCALED TO THE BACKLOG SIZE. Distinct from
 /// the 72h stale-triage above — this fires when a lane is idle (no doing) with an
 /// empty todo and a non-empty backlog OF ANY AGE, the "board doesn't drive to
@@ -166,6 +188,99 @@ const BACKLOG_STALE_AGE_S: i64 = 14 * 86400;
 /// and in what order (the ethos line: amux surfaces the stall, the model drives);
 /// only the reminder frequency scales, never any server-side auto-promotion.
 /// A hard `AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S` override still wins for tuning.
+/// AF-334 follow-up, AF-333-adjacent: the lane-activity map, computed ONCE per
+/// tick instead of once per lane.
+///
+/// The first cut ran the activity query inside `drive_lane`, so it executed
+/// once for each of ~50 lanes. Measured on the live DB: 62ms per lane against
+/// 32,569 `task` rows, whether the lane was active or not, because the
+/// `(entity_type, entity_id)` index selects on entity_type and `at` is not
+/// indexed. That is ~3.1 SECONDS of DB work per tick, held under a read lock,
+/// on a box where `/api/board` p95 is already 4.5s and AF-333's leading
+/// hypothesis for that latency is "a cache or a lock". Adding three seconds of
+/// lock-held scanning while investigating a lock-shaped latency bug is the
+/// kind of thing that gets found later and attributed to something else.
+///
+/// One GROUP BY answers every lane in 68ms, so the cache exists to turn N
+/// queries into one. The TTL only has to outlive a single tick's pass over the
+/// lanes; 15s against a 30-minute window is a staleness of 0.8%, which cannot
+/// flip the `> 0` test that consumes it.
+static LANE_ACTIVITY: std::sync::Mutex<Option<(f64, std::collections::HashMap<String, i64>)>> =
+    std::sync::Mutex::new(None);
+
+const LANE_ACTIVITY_CACHE_TTL_S: f64 = 15.0;
+
+fn lane_card_activity(
+    conn: &rusqlite::Connection,
+    window_min: i64,
+) -> std::collections::HashMap<String, i64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0);
+    if let Ok(g) = LANE_ACTIVITY.lock() {
+        if let Some((at, map)) = g.as_ref() {
+            if now - at < LANE_ACTIVITY_CACHE_TTL_S {
+                return map.clone();
+            }
+        }
+    }
+    let mut map = std::collections::HashMap::new();
+    // datetime() on BOTH sides: `at` is RFC3339 with an explicit +00:00, and
+    // comparing it to a localtime string applies a silent 4-hour skew that
+    // reads every lane as inactive (see the AF-334 note at the call site).
+    let rows = conn
+        .prepare(
+            "SELECT i.session, COUNT(*) FROM _amux_state_events e \
+             JOIN issues i ON i.id = e.entity_id \
+             WHERE e.entity_type='task' AND datetime(e.at) > datetime('now', ?1) \
+             GROUP BY i.session",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![format!("-{window_min} minutes")], |r| {
+                Ok((r.get::<_, Option<String>>(0)?.unwrap_or_default(), r.get::<_, i64>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+        });
+    match rows {
+        Ok(v) => {
+            for (sess, n) in v {
+                map.insert(sess, n);
+            }
+            if let Ok(mut g) = LANE_ACTIVITY.lock() {
+                *g = Some((now, map.clone()));
+            }
+        }
+        // A failed probe must not read as "every lane is idle", which would
+        // restore the exact over-nudging this fixes. Return an empty map WITHOUT
+        // caching it, so the next tick retries rather than inheriting a blank.
+        Err(e) => {
+            tracing::warn!(
+                target: "board_drive",
+                "[drain-nudge AF-334] lane-activity probe failed: {e}. Lanes will \
+                 read as inactive this tick, so drain nudges may over-fire."
+            );
+        }
+    }
+    map
+}
+
+/// AF-334: does the drain nudge fire? Pure, and extracted for the reason
+/// AF-342 taught the hard way two hours earlier: a correct decision living as
+/// one line inside an async job is a decision no test can reach, and that is
+/// exactly where a fix ships inert with a green suite.
+///
+/// The fourth term is the new one. The first three are the original predicate
+/// and they conflate "no card is in `doing`" with "the lane is doing nothing".
+pub(crate) fn should_drain_nudge(
+    doing_count: i64,
+    eligible: i64,
+    drainable_backlog: i64,
+    recent_card_events: i64,
+) -> bool {
+    doing_count == 0 && eligible == 0 && drainable_backlog > 0 && recent_card_events == 0
+}
+
 fn idle_backlog_drain_cooldown_s(drainable_backlog: i64) -> f64 {
     if let Some(v) = std::env::var("AMUX_IDLE_BACKLOG_DRAIN_COOLDOWN_S")
         .ok()
@@ -179,6 +294,225 @@ fn idle_backlog_drain_cooldown_s(drainable_backlog: i64) -> f64 {
         env_f64("AMUX_IDLE_BACKLOG_DRAIN_FLOOR_S", 20.0 * 60.0),
         env_f64("AMUX_IDLE_BACKLOG_DRAIN_PER", 25.0),
     )
+}
+
+/// Per-lane nudge feedback state plus the cost the loop is actually charging.
+///
+/// `unheeded` is the count this tick would act on; `suppressed` is the set the
+/// cap has silenced. `chars_24h` is the number that made AF-319 a card rather
+/// than an opinion — drain nudges were 42% of all fleet messages over 34 hours,
+/// and nothing in amux could say so without reading cmd_history by hand.
+fn nudge_feedback_report(conn: &Connection) -> Value {
+    let mut lanes: Vec<Value> = Vec::new();
+    if let Ok(mut st) = conn.prepare(
+        "SELECT session, COALESCE(unheeded,0), COALESCE(escalated_card,''), \
+         COALESCE(last_nudge_at,0) FROM board_drive_nudge_state ORDER BY unheeded DESC, session",
+    ) {
+        if let Ok(rows) = st.query_map([], |r| {
+            let card: String = r.get(2)?;
+            Ok(json!({
+                "session": r.get::<_, String>(0)?,
+                "unheeded": r.get::<_, i64>(1)?,
+                // Null, not "", so "never escalated" and "escalated to a card
+                // whose id we lost" are not the same value.
+                "escalated_card": if card.is_empty() { Value::Null } else { json!(card) },
+                "last_nudge_at": r.get::<_, f64>(3)?,
+            }))
+        }) {
+            lanes.extend(rows.flatten());
+        }
+    }
+    let cap = nudge_unheeded_cap();
+    let suppressed = lanes
+        .iter()
+        .filter(|l| l["unheeded"].as_i64().unwrap_or(0) >= cap)
+        .count();
+    // The cost, from the message ledger. `ts` there is MILLISECONDS — reading it
+    // as seconds silently matches all history and reports ~3x the real volume,
+    // which is exactly the mistake made while measuring this card.
+    let cutoff_ms = (crate::config::now_f64() - 24.0 * 3600.0) * 1000.0;
+    let (msgs, chars): (i64, i64) = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(LENGTH(text)),0) FROM cmd_history \
+             WHERE ts > ?1 AND (text LIKE '%[amux]%Idle with%' \
+                 OR text LIKE '%[amux auto-pickup]%' OR text LIKE '%[amux auto-continue]%')",
+            rusqlite::params![cutoff_ms],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap_or((0, 0));
+    let all_24h: i64 = conn
+        .query_row("SELECT COUNT(*) FROM cmd_history WHERE ts > ?1", rusqlite::params![cutoff_ms], |r| r.get(0))
+        .unwrap_or(0);
+    crate::api::measured::measured(
+        json!({
+            "cap": cap,
+            "suppressed_lanes": suppressed,
+            "tracked_lanes": lanes.len(),
+            "nudges_24h": msgs,
+            "chars_24h": chars,
+            "share_of_fleet_messages_24h": if all_24h > 0 {
+                json!(((msgs as f64 / all_24h as f64) * 1000.0).round() / 10.0)
+            } else {
+                Value::Null
+            },
+            "lanes": lanes,
+            "note": "`unheeded` counts consecutive drain nudges after which NO card in the \
+                     lane changed. At `cap` the loop stops nudging and files one escalation \
+                     card instead; any card movement resets it to 0 and nudging resumes with \
+                     no action needed. Cadence doubles per unheeded repeat rather than \
+                     staying at the 20m floor (AF-319).",
+        }),
+        all_24h.max(0) as usize,
+    )
+}
+
+/// File the ONE card that replaces a nudge nobody is reading (AF-319).
+///
+/// Owner is the LANE, because the lane is who can dispose of its own backlog —
+/// but the card is `chore` and says plainly that the nudging has stopped, so a
+/// human reading the board sees a queue that has been declared stuck rather
+/// than a lane that has merely gone quiet.
+///
+/// Exactly one per stuck stretch: `escalated_card` gates it, and the counter
+/// resets to 0 the moment any card in the lane moves, which clears the gate.
+async fn file_nudge_escalation(state: &AppState, lane: &str, backlog: i64, unheeded: i64) {
+    let title = format!("{lane}'s backlog has not moved across {unheeded} nudges — nudging stopped");
+    let desc = format!(
+        "board_drive nudged this lane {unheeded} times in a row about its {backlog}-card \
+         backlog and not one card changed in between. It has stopped nudging.\n\n\
+         That is deliberate. Measured fleet-wide over 34h to 2026-08-30, drain nudges were \
+         42% of all messages (419 of 988, ~143k tokens), and the hardest-nudged lanes moved \
+         ZERO cards while the two least-nudged lanes did all the work. More nudges was not \
+         the missing ingredient.\n\n\
+         Nudging resumes automatically the moment ANY card in this lane changes. Nothing \
+         here needs to be answered to restore it.\n\n\
+         If the backlog is real work, pull one card. If it is not, this is the moment to say \
+         so:\n\n\
+         \x20 amux board discard <ID>                       not a unit of work\n\
+         \x20 amux board backlog <ID> --trigger \"<cond>\"    real, waiting on something\n\
+         \x20 amux board doing <ID>                         you are picking it up\n"
+    );
+    let new = crate::db::board_store::NewIssue {
+        title,
+        desc,
+        status: "todo".into(),
+        session: Some(lane.to_string()),
+        // `chore`: nothing to implement or merge, so a code gate could not be
+        // satisfied honestly (ethos rule 3).
+        item_type: "chore".into(),
+        // Exempt from the AF-317 todo WIP limit by name, for the same reason the
+        // queue-disposition card is: this card exists BECAUSE the queue is too
+        // long, so refusing it for queue depth would suppress its own alarm.
+        creator: crate::api::board::QUEUE_DISPOSITION_CREATOR.into(),
+        owner_type: "agent".into(),
+        due: None,
+        due_time: None,
+        reviewer: None,
+        shepherd: None,
+        gate: vec![],
+        depends_on: vec![],
+        tags: vec!["nudge:escalated".to_string()],
+        // Not an ask: this producer files ordinary cards, and a card
+        // filed into needsyou without one is what AMUX-3929 is about.
+        ask_type: None,
+        ask_question: None,
+        ask_unblocks: None,
+        // AF-367: filed by the board drive loop.
+        source: Some("board_drive".into()),
+    };
+    let l = lane.to_string();
+    let _ = state
+        .store
+        .write_async(move |conn| {
+            let row = crate::db::board_store::create_issue(conn, &new, crate::config::now_f64() as i64)?;
+            conn.execute(
+                "UPDATE board_drive_nudge_state SET escalated_card=?1 WHERE session=?2",
+                rusqlite::params![row.id, l],
+            )?;
+            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+        })
+        .await;
+}
+
+/// After this many consecutive drain nudges that moved nothing, STOP nudging
+/// the lane and escalate once (AF-319).
+///
+/// Three, because the first repeat is a reasonable retry and the second is a
+/// reasonable doubt.
+///
+/// SCOPE, corrected 2026-08-30: this catches a genuinely DEAD lane, and it is
+/// NOT what drives the measured nudge volume. The claim it originally cited —
+/// "mvs-infra took 80 nudges and moved 0 cards" — came from joining
+/// `_amux_state_events` on entity_type='issue' (87 rows fleet-wide) when card
+/// events are entity_type='task' (6,777). Corrected, mvs-infra logged 3,682
+/// card events against 72 nudges and is the busiest board user in the fleet.
+/// The hardest-nudged lanes are the most ACTIVE ones, so this cap will rarely
+/// fire on them — by design, not by accident.
+fn nudge_unheeded_cap() -> i64 {
+    env_f64("AMUX_NUDGE_UNHEEDED_CAP", 3.0) as i64
+}
+
+/// The lane's board watermark: the newest `updated` across the cards a drain
+/// nudge is asking it to work.
+///
+/// This is the FEEDBACK SIGNAL, and it is deliberately "did anything at all
+/// change" rather than "did a card change status". A lane that retitled, retyped
+/// or commented on one of its cards has engaged with the queue, and nudging it
+/// again on the same cadence would be punishing a response we asked for.
+fn lane_board_mark(conn: &Connection, lane: &str) -> i64 {
+    conn.query_row(
+        "SELECT COALESCE(MAX(updated),0) FROM issues WHERE session=?1 \
+         AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent'",
+        rusqlite::params![lane],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// What the nudge loop knows about a lane between ticks.
+#[derive(Debug, Clone, Copy, Default)]
+struct NudgeState {
+    unheeded: i64,
+    board_mark: i64,
+    has_escalated: bool,
+}
+
+fn read_nudge_state(conn: &Connection, lane: &str) -> NudgeState {
+    conn.query_row(
+        "SELECT COALESCE(unheeded,0), COALESCE(board_mark,0), \
+         COALESCE(LENGTH(escalated_card),0) > 0 \
+         FROM board_drive_nudge_state WHERE session=?1",
+        rusqlite::params![lane],
+        |r| Ok(NudgeState { unheeded: r.get(0)?, board_mark: r.get(1)?, has_escalated: r.get(2)? }),
+    )
+    .unwrap_or_default()
+}
+
+/// Decide what this tick means, given the watermark then and now.
+///
+/// Split from the IO so the curve is testable without a store — the same reason
+/// `drain_cooldown_scaled` is split out just below.
+///
+/// Returns (unheeded_after, moved). A first sighting (`prev_mark == 0`) counts
+/// as movement so a lane is never escalated on the strength of a tick that had
+/// nothing to compare against — ethos rule 4, applied to this function's own
+/// first run.
+fn nudge_feedback(prev_mark: i64, mark_now: i64, unheeded_before: i64) -> (i64, bool) {
+    if prev_mark == 0 || mark_now > prev_mark {
+        (0, true)
+    } else {
+        (unheeded_before + 1, false)
+    }
+}
+
+/// Back off while the lane is not responding, instead of speeding up.
+///
+/// The bug this closes: cadence scaled with backlog SIZE and nothing scaled with
+/// the OUTCOME, so the largest backlogs pinned themselves to the 20-minute floor
+/// and stayed there. Doubling per unheeded repeat means an ignored lane goes
+/// 20m, 40m, 80m and then stops, rather than 20m forever.
+fn unheeded_backoff(cooldown_s: f64, unheeded: i64) -> f64 {
+    cooldown_s * 2f64.powi(unheeded.clamp(0, 8) as i32)
 }
 
 /// Pure scaling: gentle `base` for a small backlog, halving roughly every `per`
@@ -195,7 +529,11 @@ use crate::config::env_f64;
 use crate::config::env_i64;
 
 /// py:14453 `AMUX_MAX_DOING_PER_SESSION`.
-fn wip_cap() -> i64 {
+///
+/// PUBLIC so the ready-frontier query reports the SAME capacity the drive loop
+/// enforces (AMUX-3948). A frontier computing its own cap would offer a card the
+/// gate then refuses, which is the view/mechanism split ethos rule 1 names.
+pub(crate) fn wip_cap() -> i64 {
     env_i64("AMUX_MAX_DOING_PER_SESSION", 1).max(1)
 }
 /// py:13387 `AMUX_ADVANCE_CARD_BUDGET`.
@@ -288,6 +626,16 @@ pub struct DriveReport {
     /// look like it "wouldn't stay parked" was invisible in this report until
     /// the field existed (ethos rule 4).
     pub held_on_trigger: usize,
+    /// Cards re-activated this tick because their own revisit date arrived.
+    pub promoted_due: usize,
+    /// Every backlog card whose revisit date has arrived, promoted or not.
+    /// Published beside `promoted_due` because the two come apart on purpose:
+    /// the drain fills a lane's `todo` to a ceiling and stops, so a large
+    /// `revisit_due_total` with a small `promoted_due` is the rate limit
+    /// working, and is indistinguishable from a broken scan without this field
+    /// (ethos rule 4 — a count that can read zero must publish whether the
+    /// measurement ran).
+    pub revisit_due_total: usize,
     pub lanes: Vec<LaneTrace>,
 }
 
@@ -625,6 +973,53 @@ pub fn prose_dependency(blob: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+mod drain_trigger_tests {
+    use super::should_drain_nudge;
+
+    /// AF-334, with the MEASURED numbers rather than invented ones.
+    ///
+    /// The defect: the trigger read `doing_count == 0 && eligible == 0 &&
+    /// drainable_backlog > 0`, which a lane that works fast and keeps `todo`
+    /// drained satisfies continuously. Measured 2026-08-30 at the 30-minute
+    /// resolution the trigger actually runs at: mvs-infra's last six drain
+    /// nudges each landed with 63-79 card events in the preceding half hour.
+    /// Told it was idle every 16 minutes while mutating a card every ~25s.
+    ///
+    /// THE CONTROL IS THE HALF THAT MATTERS. A term that simply silenced the
+    /// nudge would pass a test that only checks the busy case, and would
+    /// re-open the bug this nudge exists for (tubescience: 51 backlog / 0 todo
+    /// / 0 doing, idle forever because board-drive dispatches only `todo`).
+    /// Both cells below are real observations from the same window.
+    #[test]
+    fn a_demonstrably_working_lane_is_not_told_it_is_idle() {
+        // mvs-infra, nudge at 19:07:49Z: 79 card events in the prior 30 min.
+        assert!(
+            !should_drain_nudge(0, 0, 40, 79),
+            "a lane mutating a card every ~25s must not be told it is idle"
+        );
+        // This session, 2 of its 4 nudges in the same window: 25-27 events.
+        assert!(!should_drain_nudge(0, 0, 10, 27));
+
+        // CONTROL 1 — the genuinely stalled lane the nudge was built for.
+        // Same three original terms, zero activity: it MUST still fire.
+        assert!(
+            should_drain_nudge(0, 0, 51, 0),
+            "tubescience's 51-backlog/0-todo/0-doing case must still be nudged"
+        );
+        // CONTROL 2 — this session's OTHER 2 nudges, which were correct: the
+        // lane had 0 card events because it was waiting on a build. Those are
+        // not false positives and must survive the fix.
+        assert!(should_drain_nudge(0, 0, 10, 0));
+
+        // The original three terms still gate: nothing to drain, or already
+        // working a card, or a dispatchable todo exists.
+        assert!(!should_drain_nudge(0, 0, 0, 0), "no drainable backlog");
+        assert!(!should_drain_nudge(1, 0, 10, 0), "already has a card in doing");
+        assert!(!should_drain_nudge(0, 1, 10, 0), "has a dispatchable todo");
+    }
+}
+
+#[cfg(test)]
 mod prose_direction_tests {
     use super::prose_dependency;
 
@@ -791,6 +1186,45 @@ fn reviewer_acted_since_review(log: &str, reviewer: &str) -> bool {
     lines[entered.min(lines.len())..]
         .iter()
         .any(|l| l.contains(&needle))
+}
+
+/// Did the REVIEWER themselves move this card out of `review`? (AMUX-3820)
+///
+/// The other end of [`reviewer_acted_since_review`], and of the
+/// `reviewer_unreachable` WARN. Both of those watch a card sitting IN `review`.
+/// A reviewer who rejects work and then moves the card to `doing` — which is the
+/// honest state, and exactly what AF-214 argued for — leaves that predicate BY
+/// CONSTRUCTION, and nothing re-nudges them when the author is done.
+///
+/// THE SPECIMEN IS THIS FUNCTION'S AUTHOR. On AF-203 I wrote "ping me and I will
+/// ack it the same turn", moved it review -> doing, and acked four days later
+/// only because the author came and asked. Nothing in amux told me, and the card
+/// read `doing` and looked healthy the whole time.
+///
+/// NARROW ON PURPOSE. The REVIEWER moving the card out is a promise to return;
+/// the AUTHOR moving it out is ordinary work, and firing on that would nag every
+/// in-progress card that ever named a reviewer. The needle carries the trailing
+/// colon for the same reason `reviewer_acted_since_review` does — without it
+/// `amux` matches every `amux-frustrations` line and the promise is attributed
+/// to the wrong party.
+fn reviewer_left_review(log: &str, reviewer: &str) -> bool {
+    let rev = reviewer.trim();
+    if rev.is_empty() {
+        return false;
+    }
+    let lines: Vec<&str> = log.lines().collect();
+    // Scope to the CURRENT round, like the AF-214 needle: a card can be
+    // reviewed, sent back, reworked and re-reviewed, and only the latest exit is
+    // an outstanding promise.
+    let entered = lines
+        .iter()
+        .rposition(|l| l.contains("-> review"))
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let needle = format!("` {rev}:");
+    lines[entered.min(lines.len())..]
+        .iter()
+        .any(|l| l.contains(&needle) && l.contains("review ->"))
 }
 
 fn card_event_count(conn: &Connection, etype: &str, card: &str, since: f64) -> i64 {
@@ -979,7 +1413,11 @@ fn status_applies(conn: &Connection, status_id: &str, session: &str, tags: &[Str
 /// py:14189 `_deps_blocking` — card ids in `depends_on` that are still OPEN.
 /// Deleted or absent ids do NOT block: an id that resolves to nothing cannot be
 /// worked, and treating it as a blocker parks the holder forever.
-fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
+/// PUBLIC so the ready-frontier query reuses THIS predicate rather than
+/// re-deriving it (AMUX-3948). AMUX-3814 is the specimen for why: a parallel
+/// re-derivation of "which reasons are terminal" swept in `rate-limited` and
+/// reddened an invariant for 8 days. One list, two consumers.
+pub(crate) fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
     row.depends_on
         .iter()
         .filter(|d| {
@@ -999,6 +1437,30 @@ fn deps_blocking(conn: &Connection, row: &bs::IssueRow) -> Vec<String> {
                 Some(_) => true,
                 None => false,
             }
+        })
+        .cloned()
+        .collect()
+}
+
+/// For a set of blocking dep ids, return the subset that are `backlog` cards
+/// owned by `session`. These are self-resolvable: the lane can promote them
+/// to `todo` itself without any human or cross-lane action.
+fn self_owned_backlog_blockers(conn: &Connection, dep_ids: &[String], session: &str) -> Vec<String> {
+    dep_ids
+        .iter()
+        .filter(|d| {
+            let row: Option<(String, Option<String>)> = conn
+                .query_row(
+                    "SELECT status, session FROM issues WHERE id=?1 AND deleted IS NULL",
+                    rusqlite::params![d],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()
+                .ok()
+                .flatten();
+            matches!(row, Some((ref st, Some(ref sess)))
+                if sess == session
+                    && matches!(bs::parse_status(st), Some(TaskStatus::Backlog)))
         })
         .cloned()
         .collect()
@@ -1121,6 +1583,181 @@ fn parked_on_live_trigger(row: &bs::IssueRow) -> bool {
 /// parsing cannot drift from the canonical decode. Runs once per tick; the
 /// cost profile matches a single dashboard board refresh, of which there are
 /// already many per minute.
+/// Which rule licensed a `backlog` -> `todo` promotion. Both arms share one
+/// write path (`promote_ready_backlog` / `promote_due_backlog` differ only in
+/// their scan), so the re-check under the write lock and the card's log line
+/// cannot drift apart from the rule that selected the card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PromoteArm {
+    /// Every `depends_on` reached a terminal status.
+    DepsCleared,
+    /// The card's own revisit date arrived.
+    RevisitDue,
+}
+
+impl PromoteArm {
+    fn log_line(self) -> &'static str {
+        match self {
+            Self::DepsCleared => {
+                "Re-activated: all depends_on dependencies reached a terminal status"
+            }
+            Self::RevisitDue => "Re-activated: the revisit date on this card arrived",
+        }
+    }
+}
+
+/// Re-check under the write lock that this card is STILL promotable by `arm`.
+/// It could have been moved, archived, deleted, retyped or re-parked between
+/// the read scan and here; `WHERE status='backlog'` on the UPDATE makes the
+/// swap atomic against a concurrent move, and this makes it correct.
+///
+/// The two arms share every clause except the one that licensed them, which is
+/// the point of routing both through one function: a new common rule (a type
+/// exclusion, an ownership rule) lands on both arms or neither.
+fn still_promotable(conn: &Connection, row: &bs::IssueRow, arm: PromoteArm) -> bool {
+    if row.status != "backlog"
+        || row.owner_type != "agent"
+        || row.archived != 0
+        || is_dormant_type(&row.item_type)
+    {
+        return false;
+    }
+    match arm {
+        PromoteArm::DepsCleared => {
+            !parked_on_live_trigger(row) && promotable_deps(conn, row).is_some()
+        }
+        // A REVISIT DATE OUTRANKS A `source_ref` TRIGGER, deliberately.
+        //
+        // The deps arm lets any non-empty `source_ref` hold a card, and that
+        // escape hatch was measured covering essentially the whole fleet's
+        // backlog: 509 of 514 cards carried one, 450 of them stale (see
+        // `SOURCE_REF_STALE_S`). Honouring it here would mean the revisit date
+        // reaches 1% of the cards it exists to drain, which is ethos rule 1's
+        // failure exactly — a capability that exists without reaching anything.
+        //
+        // A due date is also a STRICTLY more specific statement than a trigger:
+        // "look at this again on the 12th" names a date, "wake me when X" names
+        // a condition nothing re-verifies. So the date wins, and the card
+        // arrives in `todo` where its owner can re-park it with a new date.
+        //
+        // Unmet dependencies still hold it. A date cannot make a blocker
+        // finish, and promoting a card whose blocker is open would put
+        // unworkable work in front of a lane — the thing this whole module
+        // exists to stop.
+        PromoteArm::RevisitDue => {
+            revisit_due_now(row)
+                && (row.depends_on.is_empty() || promotable_deps(conn, row).is_some())
+        }
+    }
+}
+
+/// Has this card's own revisit date arrived, in local time?
+fn revisit_due_now(row: &bs::IssueRow) -> bool {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    bs::revisit_arrived(row.due.as_deref(), &today)
+}
+
+/// How deep a lane's `todo` column may be filled by the revisit drain.
+///
+/// The drain exists to stop a lane idling on hundreds of parked cards; it must
+/// not create the other half of the same complaint by emptying 219 backlog
+/// cards into `todo`. So it fills to a ceiling and stops, and next tick it
+/// fills whatever the lane worked off. The backlog then drains at exactly the
+/// rate the lane completes work, which is the only rate that is ever right.
+///
+/// `AMUX_BACKLOG_DRAIN_TODO_CEIL` moves it; `0` disables the drain entirely.
+fn drain_todo_ceiling() -> i64 {
+    std::env::var("AMUX_BACKLOG_DRAIN_TODO_CEIL")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(5)
+        .max(0)
+}
+
+/// Pure: given due-dated candidates (already ordered most-overdue first) and
+/// each lane's current `todo` depth, which may promote this tick?
+///
+/// Split out as a pure function because the rate limit is the part that can be
+/// wrong in a way no integration test would notice: an off-by-one that lets
+/// every candidate through still promotes cards, still logs, still looks
+/// healthy, and floods the column it was written to protect.
+fn due_drain_plan(
+    candidates: &[(String, String)],
+    todo_depth: &std::collections::BTreeMap<String, i64>,
+    ceiling: i64,
+) -> Vec<String> {
+    if ceiling <= 0 {
+        return Vec::new();
+    }
+    let mut room: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    let mut out = Vec::new();
+    for (card, lane) in candidates {
+        let left = room
+            .entry(lane.clone())
+            .or_insert_with(|| ceiling - todo_depth.get(lane).copied().unwrap_or(0));
+        if *left > 0 {
+            *left -= 1;
+            out.push(card.clone());
+        }
+    }
+    out
+}
+
+/// Scan for backlog cards whose revisit date has arrived, most overdue first,
+/// and apply the per-lane ceiling. Returns `(to_promote, due_total)` — the
+/// second number is every card whose date has arrived, promoted or not, so the
+/// report can say "12 due, 3 promoted, the rest are waiting on a full column"
+/// rather than leaving a held card indistinguishable from no card (rule 4).
+fn backlog_due_promotions(conn: &Connection) -> (Vec<String>, usize) {
+    let rows = bs::list_issues(
+        conn,
+        &["backlog".to_string()],
+        &[],
+        bs::ArchivedFilter::ActiveOnly,
+    )
+    .unwrap_or_default();
+    let mut cands: Vec<(String, String, String)> = Vec::new();
+    for r in rows {
+        if r.owner_type != "agent" || is_dormant_type(&r.item_type) {
+            continue;
+        }
+        if !revisit_due_now(&r) {
+            continue;
+        }
+        if !r.depends_on.is_empty() && promotable_deps(conn, &r).is_none() {
+            continue;
+        }
+        let lane = r.session.clone().unwrap_or_default();
+        if lane.is_empty() {
+            // An unowned card has no lane to drain into and no todo depth to
+            // measure. Skipping it is not a silent drop: it stays `backlog`
+            // with its date visibly past, which is what an unowned overdue
+            // card is.
+            continue;
+        }
+        cands.push((r.id.clone(), lane, r.due.clone().unwrap_or_default()));
+    }
+    // Most overdue first, then by id so the order is total and a tie cannot
+    // make two ticks disagree about which card got the last slot.
+    cands.sort_by(|a, b| a.2.cmp(&b.2).then_with(|| a.0.cmp(&b.0)));
+    let due_total = cands.len();
+    let mut todo_depth: std::collections::BTreeMap<String, i64> = std::collections::BTreeMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT COALESCE(session,''), COUNT(*) FROM issues \
+         WHERE status='todo' AND deleted IS NULL AND COALESCE(archived,0)=0 \
+         GROUP BY COALESCE(session,'')",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))) {
+            for kv in rows.flatten() {
+                todo_depth.insert(kv.0, kv.1);
+            }
+        }
+    }
+    let pairs: Vec<(String, String)> =
+        cands.into_iter().map(|(id, lane, _)| (id, lane)).collect();
+    (due_drain_plan(&pairs, &todo_depth, drain_todo_ceiling()), due_total)
+}
+
 fn backlog_dep_promotions(conn: &Connection) -> (Vec<(String, Vec<String>)>, usize) {
     let rows = bs::list_issues(
         conn,
@@ -1171,69 +1808,7 @@ async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
     };
     let mut promoted = 0;
     for (card, deps) in candidates {
-        let card_w = card.clone();
-        let reply = state
-            .store
-            .write_async(move |conn| {
-                // Re-check under the write lock. The card must STILL be a
-                // dependency-parked agent backlog card whose deps are all
-                // terminal — it could have been moved, archived, deleted, or
-                // its deps changed between the read scan and here. `WHERE
-                // status='backlog'` makes the swap atomic against a concurrent
-                // move (mirrors claim_card's `WHERE status='todo'`).
-                let Some(row) = bs::get_issue(conn, &card_w)? else {
-                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                };
-                if row.status != "backlog"
-                    || row.owner_type != "agent"
-                    || row.archived != 0
-                    || is_dormant_type(&row.item_type)
-                    || parked_on_live_trigger(&row)
-                    || promotable_deps(conn, &row).is_none()
-                {
-                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                }
-                let now = now_f64() as i64;
-                let existing: Option<String> = conn
-                    .query_row(
-                        "SELECT log FROM issues WHERE id=?1",
-                        rusqlite::params![card_w],
-                        |r| r.get(0),
-                    )
-                    .optional()?
-                    .flatten();
-                let hhmm = chrono::Local::now().format("%H:%M").to_string();
-                let log = bs::append_log(
-                    existing.as_deref(),
-                    &hhmm,
-                    "Re-activated: all depends_on dependencies reached a terminal status",
-                );
-                let n = conn.execute(
-                    "UPDATE issues SET status='todo', updated=?1, log=?2 \
-                     WHERE id=?3 AND status='backlog'",
-                    rusqlite::params![now, log, card_w],
-                )?;
-                if n == 0 {
-                    return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-                }
-                // The post-mutation snapshot the SSE/replay journal carries —
-                // the identical shape board.rs emits on a status PATCH, so the
-                // fan-out is a real StatusChanged, not a bare revision bump.
-                let next = bs::get_issue(conn, &card_w)?
-                    .expect("row present immediately after its own promote");
-                let event = crate::db::PendingEvent {
-                    entity_type: amux_core::revision::EntityType::Task,
-                    entity_id: next.id.clone(),
-                    mutation: amux_core::revision::MutationKind::StatusChanged {
-                        from: "backlog".into(),
-                        to: "todo".into(),
-                    },
-                    payload: Some(next.snapshot()),
-                };
-                Ok(crate::db::WriteOutcome { applied: true, events: vec![event] })
-            })
-            .await;
-        if matches!(reply, Ok(r) if r.applied) {
+        if promote_card(state, &card, PromoteArm::DepsCleared).await {
             promoted += 1;
             let cleared = deps.join(",");
             tracing::info!(
@@ -1243,6 +1818,70 @@ async fn promote_ready_backlog(state: &AppState) -> (usize, usize) {
         }
     }
     (promoted, held_on_trigger)
+}
+
+/// The revisit-date arm: promote `backlog` cards whose own due date arrived,
+/// up to the per-lane `todo` ceiling. Returns `(promoted, due_total)`.
+///
+/// This is the half that answers "workers have an infinite # of growing
+/// backlogs and todo then they go idle". The deps arm above only ever fires
+/// for a card someone explicitly wired to a blocker (34 of 589 backlog cards
+/// fleet-wide carried any `depends_on` at all), so before this arm existed the
+/// overwhelming majority of parked work had NO automated exit whatsoever.
+async fn promote_due_backlog(state: &AppState) -> (usize, usize) {
+    let (candidates, due_total) = match state.store.read() {
+        Ok(conn) => backlog_due_promotions(&conn),
+        Err(_) => return (0, 0),
+    };
+    let mut promoted = 0;
+    for card in candidates {
+        if promote_card(state, &card, PromoteArm::RevisitDue).await {
+            promoted += 1;
+            tracing::info!(
+                target: "amux::board_drive", %card,
+                "board_drive: re-activated {card} — its revisit date arrived"
+            );
+        }
+    }
+    (promoted, due_total)
+}
+
+/// The one `backlog` -> `todo` write, shared by both promotion arms.
+///
+/// Re-checks the arm's own predicate under the write lock and emits the SAME
+/// `StatusChanged` event a status PATCH from the board API emits (with the
+/// post-mutation snapshot), so SSE clients refetch and the card is dispatchable
+/// in this same tick's lane loop.
+async fn promote_card(state: &AppState, card: &str, arm: PromoteArm) -> bool {
+    let card_w = card.to_string();
+    let reply = state
+        .store
+        .write_async(move |conn| {
+            // Pre-check: the card could have been moved, archived, deleted,
+            // retyped or re-parked between the read scan and here.
+            let Some(row) = bs::get_issue(conn, &card_w)? else {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            };
+            if !still_promotable(conn, &row, arm) {
+                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
+            }
+            // Route through the single transition engine.
+            let opts = crate::db::advance::AdvanceOpts {
+                expected_from: Some("backlog".into()),
+                log_line: Some(arm.log_line().to_string()),
+                skip_continuation: true,
+                ..Default::default()
+            };
+            match crate::db::advance::advance(conn, &card_w, "todo", "board_drive", &opts)? {
+                Ok(outcome) => Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: outcome.events,
+                }),
+                Err(_) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+            }
+        })
+        .await;
+    matches!(reply, Ok(r) if r.applied)
 }
 
 fn card_needsyou_asked_at(conn: &Connection, card: &str) -> Option<f64> {
@@ -1388,6 +2027,7 @@ fn reviewer_has_responded(conn: &Connection, card: &str, reviewer: &str) -> Opti
 // ---------------------------------------------------------------------------
 
 /// A pickup decision: either a claim to make, or the reason there is none.
+#[derive(Debug)]
 pub enum Pickup {
     /// Claim this card and send this prompt.
     Claim { card: String, prompt: String },
@@ -1396,6 +2036,12 @@ pub enum Pickup {
     /// not a unit of work; the fix is the session SPLITTING it, which is
     /// judgment a model does well, not the card rotting.
     Decompose { ids: Vec<String>, text: String },
+    /// Every candidate is blocked, but all blockers are this session's own
+    /// `backlog` cards — self-resolvable without human or cross-lane action.
+    /// board_drive promotes them to `todo` automatically and re-runs pickup.
+    /// `blocked_card` is the todo that was waiting; `promoted` are the backlog
+    /// ids that were promoted. The lane receives no nudge — it just gets work.
+    PromoteDeps { blocked_card: String, promoted: Vec<String> },
     /// Nothing to do, with the reason and the detail for the trace.
     None { reason: &'static str, detail: String },
 }
@@ -1495,7 +2141,34 @@ fn stale_gate_excluded_todos(conn: &Connection, session: &str, fresh_cut: i64) -
 /// Select the next board task for `session`, or say why not. Pure over the
 /// connection: no sends, no writes — so a test can assert the DECISION without
 /// a fleet, and the caller owns the ordering of claim-then-deliver.
+/// [`select_pickup_with`] resolving the continuation flag from the lane's config.
+///
+/// The production entry point. Tests use the `_with` form so a lane's ON-DISK
+/// scope env cannot decide whether a unit test passes.
 pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
+    select_pickup_with(conn, session, now, bs::continuation_required(Some(session)))
+}
+
+/// [`select_pickup`] with the continuation gate passed in rather than read from
+/// the lane's scope env (AMUX-3771 fallout).
+///
+/// THE FLAG HAD TO COME OUT OF HERE. `select_pickup` is otherwise a pure
+/// function of a Connection, and reading `~/.amux/sessions/<lane>.env` inside it
+/// made unit tests depend on the machine's real lane config. Opting the `amux`
+/// lane into the continuation gate immediately failed
+/// `pickup_offers_a_card_only_to_its_session_owner`, which uses "amux" as its
+/// fixture lane name -- a shared test broken by one operator's personal config,
+/// in isolation, with nothing in the failure naming the cause.
+///
+/// Same seam and same reasoning as `detect_latency_at`, whose docstring already
+/// says it: with only the config-reading entry point, "that is not a seam, it is
+/// a coin flip on test order".
+pub fn select_pickup_with(
+    conn: &Connection,
+    session: &str,
+    now: f64,
+    continuation_gate: bool,
+) -> Pickup {
     // WIP cap (py:14449). Pickup claimed via raw UPDATE, bypassing the limit the
     // PATCH path enforces — one session accumulated TWELVE doing cards, a lie
     // every other session reads. Archived cards do NOT hold WIP (Ethan, primis
@@ -1694,7 +2367,43 @@ pub fn select_pickup(conn: &Connection, session: &str, now: f64) -> Pickup {
 
         let blocking = deps_blocking(conn, &row);
         if !blocking.is_empty() {
+            // Self-resolvable: all blockers are this session's own backlog cards.
+            // Promote them immediately so pickup can succeed on the next pass —
+            // the lane gets work without a nudge, and the log says why.
+            let self_owned = self_owned_backlog_blockers(conn, &blocking, session);
+            if !self_owned.is_empty() && self_owned.len() == blocking.len() {
+                return Pickup::PromoteDeps {
+                    blocked_card: id.clone(),
+                    promoted: self_owned,
+                };
+            }
             skipped.push(format!("{id} blocked by {}", blocking.join(",")));
+            continue;
+        }
+        // THE CONTINUATION GATE APPLIES TO THIS DOOR TOO (AMUX-3948, closing a
+        // gap AMUX-3946 opened hours earlier).
+        //
+        // `claim_card` swaps todo->doing with a direct SQL CAS, so it never
+        // passes the PATCH gate. A card with no `next_action` was therefore
+        // refused when a lane ran `amux board doing`, and CLAIMED SILENTLY when
+        // auto-pickup did it — same card, same lane, opposite answers, with the
+        // automated path being the permissive one. That is AMUX-3929's shape
+        // exactly: the gate held on the doors I checked and not on the one I
+        // did not.
+        //
+        // Skipping rather than claiming is the honest arm. Pickup's whole
+        // promise is "work it now", and a card that cannot say what to do next
+        // is the one case where that prompt has nothing behind it.
+        //
+        // The skip is RECORDED in the trace, and /api/board/ready counts the
+        // same population as `missing_continuation`, so a lane that goes quiet
+        // because of this can find out why in one request instead of looking
+        // idle for no visible reason.
+        if continuation_gate
+            && bs::continuation_verdict(row.next_action.as_deref().unwrap_or(""))
+                != bs::ContinuationVerdict::Ok
+        {
+            skipped.push(format!("{id} has no next_action (continuation gate)"));
             continue;
         }
         // Prose fallback fires ONLY when the structured field is empty.
@@ -1929,7 +2638,11 @@ fn stale_backlog_candidates(
 fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String, String, i64)> {
     // DRAINABLE only — mirror the exclusions in the idle_drain gate so the cards
     // the nudge lists are exactly the ones it claims are un-worked: no dormant
-    // types (tripwire/watch) and no card parked on a live source_ref trigger.
+    // types (tripwire/watch) and no card parked on a LIVE source_ref trigger.
+    // "Live" means re-verified within SOURCE_REF_STALE_S — a trigger nobody has
+    // re-checked in 24h+ is treated as if it were never set, so `--trigger`
+    // cannot be used to permanently exit the drain nudge on a card the owner
+    // is not actually revisiting (see SOURCE_REF_STALE_S doc for the incident).
     // OLDEST-first (AMUX-3779): the idle-drain nudge now lists the same
     // oldest-first order the todo scorer works in, so "what gets attention next"
     // reads one way across todo and backlog instead of newest-here/oldest-there.
@@ -1937,11 +2650,12 @@ fn backlog_candidates(conn: &Connection, session: &str, now: i64) -> Vec<(String
         "SELECT id, title, created FROM issues \
          WHERE session=?1 AND status='backlog' AND deleted IS NULL \
          AND COALESCE(archived,0)=0 AND owner_type='agent' \
-         AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')='' \
+         AND type NOT IN ('tripwire','watch','epic') \
+         AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2) \
          ORDER BY created ASC LIMIT 8",
     )
     .and_then(|mut st| {
-        st.query_map(rusqlite::params![session], |r| {
+        st.query_map(rusqlite::params![session, now - SOURCE_REF_STALE_S], |r| {
             let created: i64 = r.get(2)?;
             let age_days = (now - created) / 86400;
             Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, age_days))
@@ -1970,6 +2684,7 @@ fn backlog_drain_text(cards: &[(String, String, i64)], drainable: i64) -> String
     // work"). Bounded 3..10 so the worker is never asked to bite off more than it
     // can honestly triage.
     let batch = (drainable / 10).clamp(3, 10);
+    let stale_h = SOURCE_REF_STALE_S / 3600;
     format!(
         "[amux] You are idle with {drainable} drainable card(s) in `backlog` and nothing in \
          `todo` or `doing`. board-drive only dispatches `todo`, so this queue will not move \
@@ -1980,10 +2695,14 @@ fn backlog_drain_text(cards: &[(String, String, i64)], drainable: i64) -> String
          relevant, say so and move it (review / done / archive). A card genuinely parked on a \
          condition (a dependency, an owner decision, a dedicated focused turn) belongs in \
          `backlog` WITH a trigger: `amux board <status> <id> --trigger \"what unblocks it\"` \
-         records the condition and EXCLUDES the card from this nudge, so escalation counts only \
-         un-parked work — reach for it instead of leaving a parked card to be re-listed. Do not \
-         leave the whole backlog sitting while you idle — drain it. This nudge repeats faster \
-         the larger your DRAINABLE backlog is, until it moves."
+         records the condition and EXCLUDES the card from this nudge for {stale_h}h, so escalation \
+         counts only un-parked work — reach for it instead of leaving a parked card to be \
+         re-listed. That exclusion EXPIRES: a trigger you have not re-confirmed in {stale_h}h is \
+         treated as un-set and the card returns here, because a trigger is a claim someone is \
+         still watching for the condition, not a permanent opt-out. If it is still genuinely \
+         blocked, re-run `--trigger` to refresh it; if not, act on the card. Do not leave the \
+         whole backlog sitting while you idle — drain it. This nudge repeats faster the larger \
+         your DRAINABLE backlog is, until it moves."
     )
 }
 
@@ -2036,6 +2755,62 @@ fn backlog_triage_text(
 
 /// Outstanding non-terminal cards for a session: (blocked_count, done_count,
 /// blocked_cards [(id, title)], done_cards [(id, title)]).
+/// A card's `(status, depends_on)`, or `None` when the id does not resolve.
+/// Named rather than inlined so the walk's signature says what it reads.
+type CardLink = Option<(String, Vec<String>)>;
+
+/// How far up a `depends_on` chain to look before giving up. Generous: the
+/// deepest live chain is 3 hops (MG-1356 -> MG-1355 -> MG-1354 -> MG-1369).
+const DEPENDS_ON_MAX_DEPTH: usize = 12;
+
+/// Does this blocked card's `depends_on` chain root in a card that is waiting on
+/// the human? Returns that card's id.
+///
+/// AMUX-3775, reported by mixpeek-general after the SAME seven cards were
+/// surfaced four times in one session. The nudge asks a lane to "re-assess each
+/// blocker", the lane does, nothing has moved because the root is waiting on
+/// Ethan, and the nudge fires again identically. Complying buys nothing, which
+/// selects against complying, and then a card that genuinely DID unblock goes
+/// unnoticed. The relationship was already in the data; nothing walked it.
+///
+/// Pure, over a lookup, so the walk has cells without a database. `lookup`
+/// returns `(status, depends_on)` or `None` for an id that does not resolve.
+///
+/// A DANGLING OR CYCLIC CHAIN IS NOT HUMAN-BLOCKED. Both return `None`, which
+/// leaves the card in the ordinary nudge — the honest default, since a chain
+/// this cannot follow is a chain it has learned nothing about. Treating an
+/// unresolvable id as "waiting on Ethan" would silence a card nobody is waiting
+/// on, which is the failure this fix exists to avoid in the other direction.
+fn human_blocked_root(
+    start: &str,
+    lookup: &dyn Fn(&str) -> CardLink,
+    max_depth: usize,
+) -> Option<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut frontier = vec![start.to_string()];
+    for _ in 0..max_depth {
+        let mut next = Vec::new();
+        for id in frontier {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            let Some((status, deps)) = lookup(&id) else { continue };
+            // The START card is `blocked`, not `needsyou`; only an ANCESTOR
+            // counts. Checking the start would make any card a lane retyped to
+            // needsyou silence itself.
+            if id != start && status == "needsyou" {
+                return Some(id);
+            }
+            next.extend(deps);
+        }
+        if next.is_empty() {
+            return None;
+        }
+        frontier = next;
+    }
+    None
+}
+
 #[allow(clippy::type_complexity)]
 /// `done` cards carry their REVIEWER (AMUX-3561): whether a card can be moved
 /// toward `verified` by the lane that owns it depends entirely on whether a peer
@@ -2043,7 +2818,7 @@ fn backlog_triage_text(
 fn outstanding_work(
     conn: &Connection,
     session: &str,
-) -> (i64, i64, Vec<(String, String)>, Vec<(String, String, String)>) {
+) -> (i64, i64, Vec<(String, String)>, Vec<(String, String, String)>, Vec<(String, String, String)>) {
     let query = |status: &str| -> (i64, Vec<(String, String)>) {
         let count: i64 = conn
             .query_row(
@@ -2068,7 +2843,44 @@ fn outstanding_work(
             .unwrap_or_default();
         (count, cards)
     };
-    let (bc, blocked) = query("blocked");
+    // BLOCKED IS PARTITIONED, not counted (AMUX-3775). Every blocked card is
+    // fetched rather than the first 8, because the split has to be exact: "7
+    // blocked" over one listed line is worse than either honest number. Blocked
+    // counts are small (the reporting lane's own worst case was 7).
+    let all_blocked: Vec<(String, String)> = conn
+        .prepare(
+            "SELECT id, title FROM issues WHERE session=?1 AND status='blocked' \
+             AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
+             ORDER BY updated DESC",
+        )
+        .and_then(|mut st| {
+            st.query_map(rusqlite::params![session], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+            })
+            .map(|rows| rows.flatten().collect())
+        })
+        .unwrap_or_default();
+    let lookup = |id: &str| -> CardLink {
+        conn.query_row(
+            "SELECT status, COALESCE(depends_on,'') FROM issues WHERE id=?1 AND deleted IS NULL",
+            rusqlite::params![id],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+        )
+        .ok()
+        .map(|(status, deps)| {
+            (status, serde_json::from_str::<Vec<String>>(&deps).unwrap_or_default())
+        })
+    };
+    let mut blocked: Vec<(String, String)> = Vec::new();
+    let mut human_blocked: Vec<(String, String, String)> = Vec::new();
+    for (id, title) in all_blocked {
+        match human_blocked_root(&id, &lookup, DEPENDS_ON_MAX_DEPTH) {
+            Some(root) => human_blocked.push((id, title, root)),
+            None => blocked.push((id, title)),
+        }
+    }
+    let bc = blocked.len() as i64;
+    blocked.truncate(8);
     let (dc, done_plain) = query("done");
     let done: Vec<(String, String, String)> = done_plain
         .into_iter()
@@ -2083,7 +2895,7 @@ fn outstanding_work(
             (id, title, rv.trim().to_string())
         })
         .collect();
-    (bc, dc, blocked, done)
+    (bc, dc, blocked, done, human_blocked)
 }
 
 /// The `{blocked, done}` the LAST continue-nudge reported for this lane, or
@@ -2115,7 +2927,7 @@ mod continue_nudge_ask_tests {
             ("D-1".to_string(), "shipped a thing".to_string(), String::new()),
             ("D-2".to_string(), "shipped another".to_string(), String::new()),
         ];
-        let t = continue_nudge_text(1, 2, &blocked, &done);
+        let t = continue_nudge_text(1, 2, &blocked, &done, &[]);
 
         assert!(
             t.contains("amux board reviewer"),
@@ -2137,12 +2949,50 @@ mod continue_nudge_ask_tests {
             "shipped".to_string(),
             "amux-frustrations".to_string(),
         )];
-        let t2 = continue_nudge_text(1, 1, &blocked, &reviewed);
+        let t2 = continue_nudge_text(1, 1, &blocked, &reviewed, &[]);
         assert!(t2.contains("reviewer: amux-frustrations"), "name the peer: {t2}");
         assert!(
             t2.contains("amux board ask") && !t2.contains("amux board reviewer"),
             "with a reviewer named, the ask becomes chasing THEM, not naming one: {t2}"
         );
+    }
+
+    /// AMUX-3819: `done` is a resting place, and the drive must not say
+    /// otherwise.
+    ///
+    /// The closing sentence read "keep going until everything is verified,
+    /// archived, or genuinely blocked", which is STRICTER THAN THE RULE IT
+    /// ENFORCES — the owner's wording is "you MAY move an issue to `verified`
+    /// only after ALL of these hold". Permission with a bar, not an obligation.
+    /// Enforcing the stricter reading converts an opt-in ladder into a standing
+    /// debt: amux-frustrations reported 143 done cards of which ~112 name no
+    /// reviewer and therefore cannot advance at all, and asked what routes them
+    /// to a peer. Nothing should. Nobody decided those 112 warranted a peer's
+    /// time; this sentence decided it for them.
+    #[test]
+    fn the_drive_does_not_demand_verification_of_every_done_card() {
+        let done: Vec<(String, String, String)> =
+            (0..3).map(|i| (format!("D-{i}"), "shipped".into(), String::new())).collect();
+        let t = continue_nudge_text(0, 3, &[], &done, &[]);
+
+        assert!(t.contains("done, verified, archived"), "`done` must be a listed terminal: {t}");
+        assert!(
+            t.contains("legitimate resting place") && t.contains("not a backlog"),
+            "and the done section must say so, or the closing line is the only signal: {t}"
+        );
+        // THE CONTROL, and the reason this is not just deleting the ask: the
+        // step a lane CAN take is still named, and still framed as a judgement
+        // about which cards warrant a peer rather than as coverage of all of
+        // them. A version that dropped the reviewer mechanics entirely would
+        // pass both assertions above and remove the only path to `verified`.
+        assert!(t.contains("amux board reviewer"), "the mechanics stay available: {t}");
+        assert!(
+            t.contains("worth a peer's time"),
+            "framed as judgement, not as a quota to clear: {t}"
+        );
+        // And the count is still REPORTED. Hiding the number would be the
+        // opposite failure to demanding it be zero.
+        assert!(t.contains("3 of the 3") || t.contains("name no reviewer"), "{t}");
     }
 }
 
@@ -2167,6 +3017,7 @@ fn continue_nudge_text(
     done_count: i64,
     blocked: &[(String, String)],
     done: &[(String, String, String)],
+    human_blocked: &[(String, String, String)],
 ) -> String {
     let mut sections = Vec::new();
 
@@ -2187,6 +3038,37 @@ fn continue_nudge_text(
              work it. If genuinely still blocked, leave it but ensure the blocker \
              is named in the desc.\n{}",
             lines.join("\n")
+        ));
+    }
+
+    // REPORTED, NOT ASKED (AMUX-3775). These are excluded from the re-assess ask
+    // because their chain roots in a card waiting on the human, so re-assessing
+    // them cannot change anything and asking again every cycle is what taught
+    // the reporting lane to ignore the nudge. They are still NAMED, with the
+    // root, because silently dropping them would replace a nudge that cannot be
+    // satisfied with a count that cannot be trusted (ethos rule 1).
+    if !human_blocked.is_empty() {
+        let mut roots: Vec<&str> = human_blocked.iter().map(|(_, _, r)| r.as_str()).collect();
+        roots.sort_unstable();
+        roots.dedup();
+        sections.push(format!(
+            "{} blocked card(s) NOT listed above: their depends_on chain roots in {} \
+             ({}), which is waiting on the human. Nothing for you to do — do not \
+             re-assess these, and do not retype them to `needsyou`, which would put \
+             one decision in the owner's queue {} times and destroy the depends_on \
+             link this exclusion reads.\n{}",
+            human_blocked.len(),
+            if roots.len() == 1 { "a card" } else { "cards" },
+            roots.join(", "),
+            human_blocked.len(),
+            human_blocked
+                .iter()
+                .map(|(id, title, root)| {
+                    let t: String = title.chars().take(55).collect();
+                    format!("  {id} {t}   (-> {root})")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         ));
     }
 
@@ -2227,25 +3109,54 @@ fn continue_nudge_text(
         // also produces the exact input the gate requires (12af7ab refuses a
         // `verified` transition with no reviewer), so the nudge starts feeding
         // the gate instead of demanding an output the recipient cannot make.
+        // `done` IS A RESTING PLACE (AMUX-3819). The owner's own rule reads
+        // "You MAY move an issue to `verified` only after ALL of these hold" —
+        // a permission with a bar on it, not an obligation. This nudge used to
+        // tell every lane to name a reviewer for every done card, which turns
+        // an opt-in ladder into a standing debt: amux-frustrations reported 143
+        // done cards of which ~112 name no reviewer, and asked, correctly, what
+        // routes them. Nothing should. Nobody decided those 112 warranted a
+        // peer's time; the nudge decided it for them.
+        //
+        // So the ask is now about JUDGEMENT rather than coverage: which of
+        // these is worth a peer, and the mechanics for that one. A count of
+        // unreviewed cards is still reported, because the number is real and
+        // hiding it would be the opposite failure.
         let unreviewed = done.iter().filter(|(_, _, rv)| rv.is_empty()).count();
         let ask = if unreviewed > 0 {
             format!(
-                "{done_count} done card(s). {unreviewed} of the {} listed name NO reviewer,                  and a card cannot reach `verified` without one — the gate asks for a                  DIFFERENT worker who checked it themselves, which you cannot supply on                  your own. The step that IS yours: name the peer,                  `amux board reviewer <id> <peer-session>`. Archive instead if the work was                  superseded.",
+                "{done_count} done card(s); {unreviewed} of the {} listed name no reviewer. \
+                 `done` is a legitimate resting place and most cards belong there — \
+                 `verified` is for work whose correctness is worth a peer's time, and it \
+                 needs a DIFFERENT worker who checked it themselves, which you cannot \
+                 supply on your own. If any of these IS worth that, name the peer: \
+                 `amux board reviewer <id> <peer-session>`. Archive the ones that were \
+                 superseded. Leaving the rest in `done` is not a backlog.",
                 done.len()
             )
         } else {
             format!(
-                "{done_count} done card(s), each with a reviewer named — ask them to verify                  (`amux board ask <id>`), or verify the ones where YOU are the named                  reviewer. Archive instead if the work was superseded."
+                "{done_count} done card(s), each with a reviewer named — ask them to verify \
+                 (`amux board ask <id>`), or verify the ones where YOU are the named \
+                 reviewer. Archive instead if the work was superseded."
             )
         };
         sections.push(format!("{ask}\n{}", lines.join("\n")));
     }
 
     format!(
+        // `done` IS IN THE LIST NOW (AMUX-3819). This sentence made `verified`
+        // the only non-archive terminal state, which is stricter than the rule
+        // it is enforcing: the owner's own wording is "you MAY move an issue to
+        // `verified` only after ALL of these hold". Permission with a bar, not
+        // an obligation — and a drive that says "keep going until everything is
+        // verified" converts an opt-in ladder into a standing debt for every
+        // lane, which is what produced a 143-card pile with ~112 unreviewable
+        // by construction.
         "[amux auto-continue] Your todo queue is empty but you still have \
          outstanding work:\n\n{}\n\n\
-         Keep going until everything is verified, archived, or genuinely blocked \
-         on someone else. Don't stop between cards.",
+         Keep going until everything is done, verified, archived, or genuinely \
+         blocked on someone else. Don't stop between cards.",
         sections.join("\n\n")
     )
 }
@@ -2868,6 +3779,58 @@ pub fn select_advance_with(
     // is the REVIEWER's work now — pushing the author asks for a self-ack the
     // transition refuses.
     let rev = row.reviewer.clone().unwrap_or_default().trim().to_string();
+
+    // THE REVIEWER'S PROMISE (AMUX-3820). The complement of the edge below, and
+    // the half neither it nor the `reviewer_unreachable` WARN can see: both
+    // watch a card sitting IN `review`, and a reviewer who moves the card out
+    // to unblock the author leaves that predicate by construction.
+    //
+    // That move is CORRECT and this must not undo it — leaving a rejected card
+    // in `review` re-nudges the reviewer to review their own rejection, which
+    // is AF-214's whole subject. The defect is that the honest move drops the
+    // promise on the floor: the card reads `doing`, looks healthy, and nothing
+    // tells the reviewer when the author is done. AF-203 sat that way for four
+    // days and was acked only because its author went and asked.
+    //
+    // Ordered ABOVE the reviewer edge but mutually exclusive with it by
+    // `reviewer_acts_next`, so neither can shadow the other.
+    if !reviewer_acts_next(&status)
+        && !rev.is_empty()
+        && rev != session
+        && reviewer_left_review(row.log.as_deref().unwrap_or(""), &rev)
+    {
+        // Same reachability gate as the edge below: a nudge to a name that is
+        // not a worker goes nowhere, and the card looks healthy either way.
+        if let Some(why) = reviewer_unreachable(session, &rev) {
+            return Advance::None {
+                reason: "reviewer-unreachable",
+                detail: format!("{card_id} names reviewer `{rev}`: {why}"),
+            };
+        }
+        let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
+        if spent >= budget {
+            return Advance::None {
+                reason: "budget-spent",
+                detail: format!("reviewer {rev} nudged {spent}x in 24h on {card_id}"),
+            };
+        }
+        return Advance::Nudge {
+            text: format!(
+                "You reviewed `{card_id}` ({}) and moved it out of `review` yourself, which \
+                 means you owe it a second look — that move is what took it off every list \
+                 that would have reminded you. It now reads `{status}` and its author has \
+                 had it since. Read what landed and either ack it or say what still fails. \
+                 If you are no longer the right reviewer, say so on the card and clear the \
+                 field rather than leaving a promise nobody is tracking.",
+                row.title
+            ),
+            target: rev,
+            card: card_id,
+            status,
+            kind: "review-promised",
+        };
+    }
+
     let mut ball_with_author = String::new();
     if reviewer_acts_next(&status) && !rev.is_empty() && rev != session {
         // A REVIEWER WHO IS NOT A WORKER IS A CARD PARKED FOREVER.
@@ -2913,9 +3876,43 @@ pub fn select_advance_with(
                  cannot reach — the nudge goes nowhere or the conversation about it does, \
                  and the card looks healthy in `review` either way"
             );
-            return Advance::None {
-                reason: "reviewer-unreachable",
-                detail: format!("{card_id} names reviewer `{rev}`: {why}"),
+            // TELL THE AUTHOR, DO NOT JUST WARN (AMUX-3821). This used to
+            // return `Advance::None`, so the one party who can fix it — the
+            // card's owner, who wrote the reviewer field — was the only party
+            // never told. The WARN reached a log; the card sat in `review`
+            // claiming to await a reviewer who will never be reached.
+            //
+            // Measured 2026-08-28: 18 non-terminal cards fleet-wide name
+            // `ethan`, 6 of them sitting in `review`. Naming the human owner is
+            // SEMANTICALLY RIGHT — some work wants his eyes and no peer
+            // substitutes — and mechanically dead, so refusing it at write time
+            // would forbid a true intent and push people to name a peer who is
+            // not the right reviewer (ethos rule 3). The honest move is to say
+            // so and hand over the two ways out.
+            //
+            // `why` already carries both ("reassign to a lane, or move the card
+            // to needsyou if a human owes the review"), which is why this needs
+            // no new vocabulary and covers the typo and renamed-lane cases too
+            // — those were parking just as silently.
+            let spent = card_event_count(conn, "advance.nudged", &card_id, day_ago);
+            if spent >= budget {
+                return Advance::None {
+                    reason: "budget-spent",
+                    detail: format!("{card_id} unreachable-reviewer nudged {spent}x in 24h"),
+                };
+            }
+            return Advance::Nudge {
+                text: format!(
+                    "`{card_id}` ({}) is in `{status}` naming reviewer `{rev}`, and that review \
+                     will never arrive: {why} Nothing is nudging them and nothing was nudging \
+                     you either, so the card has been reading as healthy while waiting on \
+                     nobody. It is YOUR field to correct — you wrote it.",
+                    row.title
+                ),
+                target: session.to_string(),
+                card: card_id,
+                status,
+                kind: "advance-nudged",
             };
         }
         match reviewer_has_responded(conn, &card_id, &rev) {
@@ -3202,8 +4199,13 @@ pub async fn drive_tick<F: Fleet>(state: &AppState, fleet: &F) -> DriveReport {
     // dependency clearing does not care which lane is at a boundary), and FIRST
     // so a freshly promoted card is dispatchable in this same tick's lane loop.
     let (promoted, held_on_trigger) = promote_ready_backlog(state).await;
+    // The revisit arm runs in the same pre-lane-loop position as the deps arm,
+    // so a card whose date arrived this tick is dispatchable in this tick.
+    let (promoted_due, revisit_due_total) = promote_due_backlog(state).await;
     report.promoted = promoted;
     report.held_on_trigger = held_on_trigger;
+    report.promoted_due = promoted_due;
+    report.revisit_due_total = revisit_due_total;
     for lane in fleet.lanes() {
         let trace = drive_lane(state, fleet, &lane).await;
         match trace.outcome.as_str() {
@@ -3416,6 +4418,69 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 .with_counts(eligible, open)
             }
         }
+        Pickup::PromoteDeps { blocked_card, promoted } => {
+            // The blocked todo's only blockers are this session's own backlog
+            // cards. Promote them to todo now so the next select_pickup pass
+            // can claim the unblocked card. No nudge — the lane gets work
+            // silently. Log so the trace is auditable.
+            let to_promote = promoted.clone();
+            let result = state
+                .store
+                .write_async(move |conn| {
+                    let mut promoted_ids: Vec<String> = Vec::new();
+                    let mut all_events = Vec::new();
+                    for dep_id in &to_promote {
+                        let opts = crate::db::advance::AdvanceOpts {
+                            expected_from: Some("backlog".into()),
+                            skip_continuation: true,
+                            log_line: Some("auto-promoted: own backlog dep cleared".into()),
+                            ..Default::default()
+                        };
+                        if let Ok(outcome) = crate::db::advance::advance(conn, dep_id, "todo", "board_drive", &opts)? {
+                            promoted_ids.push(dep_id.clone());
+                            all_events.extend(outcome.events);
+                        }
+                    }
+                    Ok(crate::db::WriteOutcome {
+                        applied: !promoted_ids.is_empty(),
+                        events: all_events,
+                    })
+                })
+                .await;
+            match result {
+                Ok(reply) if reply.applied => {
+                    tracing::info!(
+                        session = lane, blocked = %blocked_card,
+                        deps = ?promoted,
+                        "board_drive: auto-promoted own backlog dep(s) → todo \
+                         (self_owned_backlog_blocker); will dispatch next tick"
+                    );
+                    LaneTrace::acted(
+                        lane,
+                        "promote-deps",
+                        &blocked_card,
+                        format!(
+                            "auto-promoted own backlog dep(s) {} → todo; \
+                             {blocked_card} dispatched next tick",
+                            promoted.join(", ")
+                        ),
+                    )
+                    .with_counts(eligible, open)
+                }
+                Ok(_) => LaneTrace::skip(
+                    lane,
+                    "promote-deps-raced",
+                    format!("deps of {blocked_card} moved before promotion landed"),
+                )
+                .with_counts(eligible, open),
+                Err(e) => LaneTrace::skip(
+                    lane,
+                    "promote-deps-err",
+                    format!("write failed promoting deps of {blocked_card}: {e}"),
+                )
+                .with_counts(eligible, open),
+            }
+        }
         Pickup::Decompose { ids, text } => {
             // DURABLE cooldown (py:14627): the in-memory dict was wiped by the
             // very first reload after shipping and the dispatch re-fired at the
@@ -3551,15 +4616,20 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 // none of which have an honest path to `todo`). Exclude the same
                 // two things auto-pickup excludes: the dormant/armed types
                 // (tripwire, watch — they fire on an event, `is:armed`), and any
-                // card with a live `source_ref` trigger (parked on an external
-                // condition). If nothing drainable remains, the lane's backlog is
-                // all correctly parked and the drain nudge must stay quiet.
+                // card with a LIVE `source_ref` trigger (parked on an external
+                // condition, re-verified within SOURCE_REF_STALE_S). A trigger
+                // older than that is treated as un-set — see SOURCE_REF_STALE_S
+                // for why a fleet-wide sweep found this had gone to ~0 drainable
+                // almost everywhere despite hundreds of un-worked backlog cards.
+                // If nothing drainable remains, the lane's backlog is all
+                // correctly and CURRENTLY parked, and the drain nudge stays quiet.
                 let drainable_backlog: i64 = conn
                     .query_row(
                         "SELECT COUNT(*) FROM issues WHERE session=?1 AND status='backlog' \
                          AND deleted IS NULL AND COALESCE(archived,0)=0 AND owner_type='agent' \
-                         AND type NOT IN ('tripwire','watch','epic') AND COALESCE(source_ref,'')=''",
-                        rusqlite::params![lane],
+                         AND type NOT IN ('tripwire','watch','epic') \
+                         AND (COALESCE(source_ref,'')='' OR COALESCE(last_verified_at,0) < ?2)",
+                        rusqlite::params![lane, now_i - SOURCE_REF_STALE_S],
                         |r| r.get(0),
                     )
                     .unwrap_or(0);
@@ -3573,15 +4643,92 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 //    `backlog`, so a lane handed only backlog sits idle forever
                 //    (tubescience: 51 backlog / 0 todo / 0 doing). Short cooldown
                 //    so a lane that stays idle keeps getting nudged until it drains.
-                let idle_drain = doing_count == 0 && eligible == 0 && drainable_backlog > 0;
+                // AF-334. `doing_count == 0` means "no card is in `doing`",
+                // NOT "the lane is doing nothing", and the comment above
+                // conflates them. A lane that works fast, keeps `todo` drained
+                // and holds backlog satisfies all three terms CONTINUOUSLY
+                // while being the most productive lane in the fleet.
+                //
+                // Measured 2026-08-30, at the 30-minute resolution the trigger
+                // actually operates at rather than in aggregate: mvs-infra's
+                // last six drain nudges each landed with 63-79 card events in
+                // the preceding half hour. It was told it was idle every 16
+                // minutes while mutating a card every ~25 seconds. Fleet-wide
+                // the drain nudge was 42% of all messages.
+                //
+                // So the trigger gets a term for whether the lane is DEMONSTRABLY
+                // WORKING. This does not weaken the case it was built for: a
+                // genuinely stalled lane produces no card events and is still
+                // nudged. Checked against this session's own nudges in the same
+                // window - 2 of 4 had 25-27 events (suppressed by this term, and
+                // they were the wrong nudges) and 2 had exactly 0 (still fire,
+                // and they were correct: the lane was waiting on a build).
+                //
+                // A rotting backlog is NOT hidden by this. `stale_enough` below
+                // is an independent path and still fires at 10+ cards over 14
+                // days, which is the case where a busy lane's backlog needs
+                // attention regardless of how active the lane is.
+                //
+                // datetime(e.at) on BOTH sides: `_amux_state_events.at` is
+                // RFC3339 with an explicit +00:00 offset. Comparing it against a
+                // localtime string silently applies a 4-hour skew, which while
+                // writing this made every lane read as 0 events and nearly
+                // produced a false "the fix does not work" conclusion.
+                let lane_activity_window_min: i64 = std::env::var("AMUX_DRAIN_ACTIVITY_WINDOW_MIN")
+                    .ok()
+                    .and_then(|v| v.trim().parse().ok())
+                    .unwrap_or(30);
+                let recent_card_events: i64 = lane_card_activity(&conn, lane_activity_window_min)
+                    .get(lane)
+                    .copied()
+                    .unwrap_or(0);
+                let lane_working = recent_card_events > 0;
+                let idle_drain =
+                    should_drain_nudge(doing_count, eligible, drainable_backlog, recent_card_events);
+                if doing_count == 0 && eligible == 0 && drainable_backlog > 0 && lane_working {
+                    // Countable, so the suppression cannot become invisible.
+                    // If this fires constantly for a lane whose backlog never
+                    // moves, the term is too generous and the number says so.
+                    tracing::info!(
+                        target: "board_drive",
+                        "[drain-nudge/suppressed AF-334] lane={lane} backlog={drainable_backlog} \
+                         card_events_last_{lane_activity_window_min}min={recent_card_events} \
+                         — the lane is demonstrably working; drain nudge withheld"
+                    );
+                }
                 let stale_enough = (stale_count as usize) >= BACKLOG_TRIAGE_THRESHOLD;
                 if !idle_drain && !stale_enough {
                     break 'triage None;
                 }
-                let (event_type, cooldown_s) = if idle_drain {
+                let (event_type, base_cooldown_s) = if idle_drain {
                     ("backlog.drain_nudge", idle_backlog_drain_cooldown_s(drainable_backlog))
                 } else {
                     ("backlog.triage_nudge", BACKLOG_TRIAGE_COOLDOWN_S)
+                };
+                // AF-319: THE FEEDBACK TERM. Cadence was a function of backlog
+                // SIZE and of nothing else, so the biggest backlogs pinned
+                // themselves to the 20-minute floor and stayed there.
+                //
+                // What this does NOT fix, said here so the next reader does not
+                // over-credit it: the lanes carrying the measured volume are all
+                // ACTIVE (mvs-infra: 72 nudges against 3,682 card events over
+                // 34h), so their watermark moves every tick and they are never
+                // suppressed. That is the correct outcome — they are not stuck —
+                // but it means the 42%-of-fleet-messages cost is a TRIGGER
+                // problem, not a feedback one. Git note on 9d77177e.
+                //
+                // Only the drain nudge is metered. The triage nudge already has
+                // a 72h cooldown and is not what the measurement found.
+                let mark_now = lane_board_mark(&conn, lane);
+                let nudge_state = read_nudge_state(&conn, lane);
+                let (unheeded_after, moved) =
+                    nudge_feedback(nudge_state.board_mark, mark_now, nudge_state.unheeded);
+                let cap = nudge_unheeded_cap();
+                let suppress = idle_drain && unheeded_after >= cap;
+                let cooldown_s = if idle_drain {
+                    unheeded_backoff(base_cooldown_s, unheeded_after)
+                } else {
+                    base_cooldown_s
                 };
                 let recent: bool = conn
                     .query_row(
@@ -3608,6 +4755,56 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     break 'triage None;
                 }
                 drop(conn);
+
+                // Persist the feedback state on EVERY drain decision, nudge or
+                // not — a counter that only advances when we act cannot detect
+                // the case it exists for.
+                if idle_drain {
+                    let (l, esc) = (lane.to_string(), nudge_state.has_escalated || suppress);
+                    let _ = state
+                        .store
+                        .write_async(move |c| {
+                            c.execute(
+                                "INSERT INTO board_drive_nudge_state \
+                                 (session, unheeded, last_nudge_at, board_mark) \
+                                 VALUES (?1, ?2, ?3, ?4) \
+                                 ON CONFLICT(session) DO UPDATE SET \
+                                   unheeded=excluded.unheeded, \
+                                   last_nudge_at=excluded.last_nudge_at, \
+                                   board_mark=excluded.board_mark",
+                                rusqlite::params![l, unheeded_after, now, mark_now],
+                            )?;
+                            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+                        })
+                        .await;
+                    let _ = esc;
+                }
+
+                // THE CAP. Past it the lane is not told again; the QUEUE is
+                // reported once, to its owner, as a card. A nudge that fired 80
+                // times without moving anything is evidence about the queue, not
+                // a message to the worker (AF-319).
+                if suppress {
+                    if !nudge_state.has_escalated {
+                        file_nudge_escalation(state, lane, drainable_backlog, unheeded_after).await;
+                    }
+                    tracing::warn!(
+                        "nudge_unheeded_cap: {lane} ignored {unheeded_after} drain nudge(s) with \
+                         no card movement (cap {cap}); suppressed, backlog {drainable_backlog}"
+                    );
+                    break 'triage Some(format!(
+                        "drain nudge SUPPRESSED — {unheeded_after} consecutive nudges moved no \
+                         card (cap {cap}); escalated to the lane's owner instead"
+                    ));
+                }
+                if idle_drain && !moved && unheeded_after > 0 {
+                    tracing::info!(
+                        "nudge_backoff: {lane} unheeded={unheeded_after} cooldown now {:.0}m \
+                         (base {:.0}m)",
+                        cooldown_s / 60.0,
+                        base_cooldown_s / 60.0
+                    );
+                }
                 let text = if idle_drain {
                     backlog_drain_text(&cards, drainable_backlog)
                 } else {
@@ -3651,7 +4848,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 let Ok(conn) = state.store.read() else {
                     break 'cont None;
                 };
-                let (bc, dc, blocked, done) = outstanding_work(&conn, lane);
+                let (bc, dc, blocked, done, human_blocked) = outstanding_work(&conn, lane);
                 // `done` IS CONTEXT, NOT A TRIGGER (AMUX-2903, second pass).
                 //
                 // I shipped change-detection first and the very next nudge
@@ -3671,8 +4868,21 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                 // blocker is work the lane can actually do. The done count still
                 // rides along in the message as context.
                 if bc == 0 {
+                    // SAY WHAT WAS EXCLUDED (AMUX-3775, ethos rule 1). A skip
+                    // line reading "0 blocked" over a lane holding seven blocked
+                    // cards is the reason this was hard to see: the count and
+                    // the board disagreed and only the board was visible.
+                    let hb = if human_blocked.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " ({} blocked card(s) excluded: their depends_on chain roots in a \
+                             card waiting on the human, so the lane cannot act on them)",
+                            human_blocked.len()
+                        )
+                    };
                     break 'cont Some(format!(
-                        "auto-continue enabled, {dc} done but 0 blocked — done is context, not a trigger"
+                        "auto-continue enabled, {dc} done but 0 actionable blocked — done is context, not a trigger{hb}"
                     ));
                 }
                 let recent: bool = conn
@@ -3717,7 +4927,7 @@ async fn drive_lane<F: Fleet>(state: &AppState, fleet: &F, lane: &str) -> LaneTr
                     ));
                 }
                 drop(conn);
-                let text = continue_nudge_text(bc, dc, &blocked, &done);
+                let text = continue_nudge_text(bc, dc, &blocked, &done, &human_blocked);
                 crate::api::session_verbs::emit_event(
                     state,
                     lane,
@@ -3822,18 +5032,10 @@ pub async fn claim_card_from(
     let reply = state
         .store
         .write_async(move |conn| {
-            let now = now_f64() as i64;
             // Read the PRIOR owner in the same transaction as the swap. The card
             // log must be able to answer "which lane claimed this, and did it
             // already own it", because that is the exact question AF-79 could
-            // NOT answer. A lane created a card, it was auto-picked-up, and the
-            // log said only "Auto-picked up from queue" with no lane; the owner
-            // was then reassigned one second later, so a reader inspecting the
-            // card afterward could not tell the pickup HAD honored ownership and
-            // read it as a cross-owner dispatch. Recording the claimer (and the
-            // prior owner when it differs) makes the card self-explaining and
-            // makes a genuine mis-dispatch (prior != claimer, which every
-            // caller is supposed to prevent) visible in the card's own log.
+            // NOT answer (AMUX-3776).
             let prior_owner: String = conn
                 .query_row(
                     "SELECT COALESCE(session,'') FROM issues WHERE id=?1 AND status=?2",
@@ -3842,29 +5044,9 @@ pub async fn claim_card_from(
                 )
                 .optional()?
                 .unwrap_or_default();
-            let n = conn.execute(
-                "UPDATE issues SET status='doing', session=?1, updated=?2 WHERE id=?3 AND status=?4",
-                rusqlite::params![session_s, now, card_s, from],
-            )?;
-            if n == 0 {
-                // Not todo any more (closed, discarded, already doing, or gone):
-                // do NOT touch the log or claim — applied=false tells the caller.
-                return Ok(crate::db::WriteOutcome { applied: false, events: vec![] });
-            }
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT log FROM issues WHERE id=?1",
-                    rusqlite::params![card_s],
-                    |r| r.get(0),
-                )
-                .optional()?
-                .flatten();
+
             let reassigned = !prior_owner.is_empty() && prior_owner != session_s;
             let entry = if reassigned {
-                // Should be unreachable from every caller (auto-pickup selects on
-                // i.session=lane; manual claim 409s when owner != claimer), so if
-                // it fires it IS the cross-owner claim to investigate, so say so in
-                // the card log AND the server log so a sweep finds it.
                 tracing::warn!(
                     target: "amux::board_drive", claimer = %session_s, prior = %prior_owner, card = %card_s,
                     "claim REASSIGNED a card across owners; every caller is supposed to prevent this; \
@@ -3875,19 +5057,26 @@ pub async fn claim_card_from(
                 }
                 format!("Auto-picked up from queue by {session_s} (reassigned from {prior_owner})")
             } else if from == "backlog" {
-                // A backlog card is never queue-dispatched; this line only ever
-                // means a deliberate manual claim, so say that.
                 format!("Claimed from backlog by {session_s}")
             } else {
                 format!("Auto-picked up from queue by {session_s}")
             };
-            let hhmm = chrono::Local::now().format("%H:%M").to_string();
-            let log = bs::append_log(existing.as_deref(), &hhmm, &entry);
-            conn.execute(
-                "UPDATE issues SET log=?1 WHERE id=?2",
-                rusqlite::params![log, card_s],
-            )?;
-            Ok(crate::db::WriteOutcome { applied: true, events: vec![] })
+
+            let opts = crate::db::advance::AdvanceOpts {
+                expected_from: Some(from.to_string()),
+                assign_to: Some(session_s.clone()),
+                log_line: Some(entry),
+                force: true,
+                skip_continuation: true,
+                ..Default::default()
+            };
+            match crate::db::advance::advance(conn, &card_s, "doing", &session_s, &opts)? {
+                Ok(outcome) => Ok(crate::db::WriteOutcome {
+                    applied: true,
+                    events: outcome.events,
+                }),
+                Err(_refusal) => Ok(crate::db::WriteOutcome { applied: false, events: vec![] }),
+            }
         })
         .await;
     let claimed = matches!(reply, Ok(r) if r.applied);
@@ -3944,11 +5133,13 @@ pub fn spawn(state: AppState) -> super::PeriodicTask {
         async move {
             let fleet = LiveFleet { state: state.clone() };
             let r = drive_tick(&state, &fleet).await;
-            if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 {
+            if r.assigned > 0 || r.nudged > 0 || r.promoted > 0 || r.promoted_due > 0 {
                 tracing::info!(
                     assigned = r.assigned,
                     nudged = r.nudged,
                     promoted = r.promoted,
+                    promoted_due = r.promoted_due,
+                    revisit_due_total = r.revisit_due_total,
                     held_on_trigger = r.held_on_trigger,
                     lanes = r.lanes.len(),
                     "[board-drive] tick"
@@ -3978,8 +5169,13 @@ pub async fn debug_board_drive(
     // now. This is the number that says how much work the loop is responsible
     // for, independent of what the last tick happened to do.
     let mut waiting: Vec<Value> = Vec::new();
+    // AF-320: `backlog: []` means either no lane is waiting or the store was
+    // never opened, and the `if let Ok` below makes the second a silent path.
+    // `lanes_considered` is None exactly when nothing was examined.
+    let mut lanes_considered: Option<usize> = None;
     if let Ok(conn) = state.store.read() {
         let lanes = crate::api::session_verbs::all_lane_names();
+        lanes_considered = Some(lanes.len());
         for lane in lanes {
             let n = eligible_todo_count(&conn, &lane, crate::config::now_f64());
             if n > 0 {
@@ -3993,6 +5189,11 @@ pub async fn debug_board_drive(
         .collect();
     let capture_shells = state.store.read().ok().map(|c| capture_shell_cost(&c));
     let queue_shape = state.store.read().ok().map(|c| fleet_queue_shape(&c));
+    // AF-319: the nudge loop's own cost and its feedback state, on the endpoint
+    // that already answers "what is this loop doing". A throttle nobody can
+    // audit is the shape ethos rule 6 warns about, and the measurement that
+    // motivated this had to be reconstructed from cmd_history by hand.
+    let nudge_feedback = state.store.read().ok().map(|c| nudge_feedback_report(&c));
     let body = json!({
         "note": "per-lane trace of the board -> worker drive loop; `reason` says why a lane \
                  was passed over. A skip that leaves no trace is indistinguishable from a loop \
@@ -4010,7 +5211,16 @@ pub async fn debug_board_drive(
         "distinct_lanes_waiting": seen.len(),
         "capture_shells": capture_shells,
         "queue_shape": queue_shape,
+        "nudge_feedback": nudge_feedback,
     });
+    let body = match lanes_considered {
+        Some(n) => crate::api::measured::measured(body, n),
+        None => crate::api::measured::unmeasured(
+            body,
+            "the store could not be opened, so no lane's eligible-card count was read — \
+             an empty backlog here is the absence of a measurement",
+        ),
+    };
     (axum::http::StatusCode::OK, axum::Json(body)).into_response()
 }
 
@@ -4164,8 +5374,148 @@ fn capture_shell_cost(conn: &rusqlite::Connection) -> Value {
     })
 }
 
+/// GET /api/board/nudges — current CC_STANDING_ORDERS state at every scope.
+///
+/// Returns `{"global": bool, "groups": {"name": bool, ...}, "workers": {"name": bool, ...}}`
+/// where `true` = nudges ON (the default), `false` = disabled at that level.
+///
+/// Reads the env files directly — same source `standing_orders_on_in` reads.
+pub async fn get_nudges() -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let home = crate::api::session_verbs::home();
+
+    let global_val = crate::config::parse_env_file(&home.join("amux.env"))
+        .into_iter()
+        .find(|(k, _)| k == "CC_STANDING_ORDERS")
+        .map(|(_, v)| crate::api::session_verbs::auto_continue_on(Some(v.as_str())));
+
+    // Groups: ~/.amux/env/<name>.env
+    let mut groups: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Ok(rd) = std::fs::read_dir(home.join("env")) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) == Some("env") {
+                let name = p.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                if name.is_empty() { continue; }
+                let val = crate::config::parse_env_file(&p)
+                    .into_iter()
+                    .find(|(k, _)| k == "CC_STANDING_ORDERS")
+                    .map(|(_, v)| crate::api::session_verbs::auto_continue_on(Some(v.as_str())));
+                if let Some(b) = val {
+                    groups.insert(name, Value::Bool(b));
+                }
+            }
+        }
+    }
+
+    // Workers: ~/.amux/workers/<name>/env
+    let mut workers: serde_json::Map<String, Value> = serde_json::Map::new();
+    if let Ok(rd) = std::fs::read_dir(home.join("workers")) {
+        for entry in rd.flatten() {
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let env_path = entry.path().join("env");
+                if env_path.exists() {
+                    let val = crate::config::parse_env_file(&env_path)
+                        .into_iter()
+                        .find(|(k, _)| k == "CC_STANDING_ORDERS")
+                        .map(|(_, v)| crate::api::session_verbs::auto_continue_on(Some(v.as_str())));
+                    if let Some(b) = val {
+                        workers.insert(name, Value::Bool(b));
+                    }
+                }
+            }
+        }
+    }
+
+    (axum::http::StatusCode::OK, axum::Json(json!({
+        "key": "CC_STANDING_ORDERS",
+        "note": "true = nudges on (default), false = disabled. Scopes: global > group > worker.",
+        "global": global_val,
+        "groups": groups,
+        "workers": workers,
+    }))).into_response()
+}
+
+#[derive(serde::Deserialize)]
+pub struct NudgesPatch {
+    pub level: String,          // "global" | "group" | "worker"
+    pub name: Option<String>,   // group or worker name (required unless level=global)
+    pub enabled: bool,
+}
+
+/// PATCH /api/board/nudges — enable or disable board nudges at a scope.
+///
+/// `{"level": "global", "enabled": false}` — silences all nudges fleet-wide.
+/// `{"level": "group", "name": "my-group", "enabled": false}` — group-level.
+/// `{"level": "worker", "name": "ts-gke", "enabled": false}` — per-worker.
+///
+/// Writes/removes CC_STANDING_ORDERS in the appropriate env file, which is the
+/// same file `standing_orders_on` reads. No restart required.
+pub async fn patch_nudges(
+    axum::Json(body): axum::Json<NudgesPatch>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    let home = crate::api::session_verbs::home();
+    let level = body.level.as_str();
+    let name = body.name.as_deref().unwrap_or("");
+
+    if matches!(level, "group" | "worker") && name.is_empty() {
+        return (axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "name is required for group/worker level"}))).into_response();
+    }
+
+    let path = match level {
+        "global" => home.join("amux.env"),
+        "group"  => home.join("env").join(format!("{name}.env")),
+        "worker" => home.join("workers").join(name).join("env"),
+        _ => return (axum::http::StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "level must be global, group, or worker"}))).into_response(),
+    };
+
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": e.to_string()}))).into_response();
+        }
+    }
+
+    // Read current env, set or remove CC_STANDING_ORDERS, write back.
+    let mut env: std::collections::BTreeMap<String, String> = if path.exists() {
+        crate::config::parse_env_file(&path).into_iter().collect()
+    } else {
+        Default::default()
+    };
+
+    if body.enabled {
+        env.remove("CC_STANDING_ORDERS");  // remove = default ON; explicit True is redundant
+    } else {
+        env.insert("CC_STANDING_ORDERS".into(), "False".into());
+    }
+
+    let text: String = env.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
+    if let Err(e) = std::fs::write(&path, text) {
+        return (axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": e.to_string()}))).into_response();
+    }
+
+    (axum::http::StatusCode::OK, axum::Json(json!({
+        "ok": true,
+        "level": level,
+        "name": name,
+        "enabled": body.enabled,
+        "note": if body.enabled {
+            "CC_STANDING_ORDERS removed from env (nudges on by default)"
+        } else {
+            "CC_STANDING_ORDERS=False written to env (nudges disabled)"
+        },
+    }))).into_response()
+}
+
 pub fn routes() -> axum::Router<AppState> {
-    axum::Router::new().route("/api/debug/board-drive", axum::routing::get(debug_board_drive))
+    axum::Router::new()
+        .route("/api/debug/board-drive", axum::routing::get(debug_board_drive))
+        .route("/api/board/nudges", axum::routing::get(get_nudges).patch(patch_nudges))
 }
 
 // ---------------------------------------------------------------------------
@@ -4174,7 +5524,7 @@ pub fn routes() -> axum::Router<AppState> {
 
 #[cfg(test)]
 mod reviewer_renag_tests {
-    use super::reviewer_acted_since_review;
+    use super::{reviewer_acted_since_review, reviewer_left_review};
 
     /// The AF-203 specimen, verbatim in shape: amux is named reviewer, reviews
     /// and rejects, and the log then carries rows that are NOT actor actions.
@@ -4203,6 +5553,115 @@ mod reviewer_renag_tests {
         assert!(
             !reviewer_acted_since_review(log, "amux"),
             "nobody has reviewed it — this is exactly the card the nudge exists for"
+        );
+    }
+
+    /// AMUX-3820: the reviewer moving the card OUT of review is a promise, and
+    /// the promise must be detectable.
+    ///
+    /// The specimen is AF-203. amux reviewed, rejected, and moved it to `doing`
+    /// with an explicit note that `doing` was the true state — correct, and it
+    /// took the card off every list that would have re-nudged amux. It sat four
+    /// days and was acked only because its author asked.
+    #[test]
+    fn a_reviewer_who_moved_the_card_out_of_review_still_owes_it_a_look() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars
+`14:52` amux: review -> doing";
+        assert!(
+            reviewer_left_review(log, "amux"),
+            "amux moved it out themselves — that is a promise to come back"
+        );
+    }
+
+    /// THE CONTROL THAT MATTERS. An AUTHOR moving their own card out of review
+    /// is ordinary work. Firing on that turns this into a nag on every
+    /// in-progress card that ever named a reviewer, which is strictly worse
+    /// than the silence it replaces.
+    #[test]
+    fn an_author_moving_their_own_card_out_of_review_is_not_a_reviewer_promise() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:52` amux-frustrations: review -> doing";
+        assert!(
+            !reviewer_left_review(log, "amux"),
+            "the author withdrew it; the reviewer promised nothing"
+        );
+        // And the prefix trap, which is why the needle carries a trailing colon:
+        // `amux` is a prefix of `amux-frustrations`, so a bare name match would
+        // read the author's own move as the reviewer's promise.
+        assert!(
+            !reviewer_left_review(log, "amux"),
+            "`amux` must not match `amux-frustrations:`"
+        );
+    }
+
+    /// BOTH DIRECTIONS, against REAL card logs (amux-frustrations' suggestion).
+    ///
+    /// The two edges are complements and a synthetic log proves that only for
+    /// the shape I invented. These are the two specimens that actually fired
+    /// today, one per direction:
+    ///
+    /// - AF-203 (above): reviewer LEFT review. The new edge fires, the old one
+    ///   does not, because the card is no longer in `review`.
+    /// - AMUX-3057: card STAYS in review naming `ethan`, who is not a worker.
+    ///   The old edge fires (reviewer-unreachable); the new one must NOT, or a
+    ///   single card gets nudged by both.
+    ///
+    /// AMUX-3057's log is also the reason "is the newest line the reviewer's"
+    /// is the wrong test — its last eight lines are all `commit` rows.
+    #[test]
+    fn the_two_reviewer_edges_are_complements_on_real_logs() {
+        // AMUX-3057 as stored: in review, no actor line since, all commit rows.
+        const STUCK_IN_REVIEW: &str = "\
+`14:20` amux: doing -> review
+`09:46` commit f6a80ece — fix(build): say when the builder log cannot see the range
+`10:07` commit b64236e6 — fix(guard): the OUTDATED HOOK remedy names a path its audience can run";
+        assert!(
+            !reviewer_left_review(STUCK_IN_REVIEW, "ethan"),
+            "nobody left review — this card is the OTHER edge's, and firing both \
+             would nudge one card twice"
+        );
+        assert!(
+            !reviewer_acted_since_review(STUCK_IN_REVIEW, "ethan"),
+            "and the reviewer has not acted either, which is why it parked"
+        );
+        // THE CONTROL: the AF-203 shape must classify the opposite way on both
+        // predicates, or this test would pass against a pair that always
+        // answers false.
+        const LEFT_REVIEW: &str = "\
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars
+`14:52` amux: review -> doing";
+        assert!(reviewer_left_review(LEFT_REVIEW, "amux"));
+        assert!(reviewer_acted_since_review(LEFT_REVIEW, "amux"));
+    }
+
+    /// A card still sitting IN review is the OTHER edge's business. Firing here
+    /// too would double-nudge the reviewer for one card.
+    #[test]
+    fn a_card_still_in_review_is_not_a_promise_to_return() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:33` amux: desc +2140 chars";
+        assert!(!reviewer_left_review(log, "amux"), "nobody has left review yet");
+        // ...and the existing edge DOES see it, so the two are complementary
+        // rather than leaving a gap between them.
+        assert!(reviewer_acted_since_review(log, "amux"));
+    }
+
+    /// A SECOND ROUND clears the old promise: the reviewer's exit from the
+    /// PREVIOUS round is not an outstanding debt once the card re-enters review.
+    #[test]
+    fn a_re_review_supersedes_the_previous_rounds_promise() {
+        let log = "\
+`14:20` amux-frustrations: doing -> review
+`14:52` amux: review -> doing
+`15:10` amux-frustrations: doing -> review";
+        assert!(
+            !reviewer_left_review(log, "amux"),
+            "the card is back in review; the old exit belongs to a closed round"
         );
     }
 
@@ -4248,6 +5707,157 @@ mod reviewer_renag_tests {
 
 #[cfg(test)]
 mod tests {
+    // ---- AF-319: the nudge loop's missing feedback term --------------------
+
+    /// The LOOP CLOSES: a lane that moves a card is forgiven, one that does not
+    /// accumulates, and the very first tick is never counted against it.
+    ///
+    /// That last case is the one worth pinning. On a lane's first drain nudge
+    /// there is no previous watermark to compare against, and treating an
+    /// absent measurement as "no movement" would escalate a lane on the
+    /// strength of a tick that could not have observed anything (ethos rule 4,
+    /// applied to this function's own first run).
+    #[test]
+    fn unheeded_counts_only_when_a_comparison_was_actually_possible() {
+        // First sighting: no prior mark. Counts as movement, never as silence.
+        assert_eq!(nudge_feedback(0, 1_700_000_000, 0), (0, true));
+        assert_eq!(nudge_feedback(0, 1_700_000_000, 7), (0, true), "and it CLEARS a stuck count");
+
+        // A card moved: the watermark advanced.
+        assert_eq!(nudge_feedback(1_700_000_000, 1_700_000_050, 2), (0, true));
+
+        // Nothing moved: accumulate.
+        assert_eq!(nudge_feedback(1_700_000_000, 1_700_000_000, 0), (1, false));
+        assert_eq!(nudge_feedback(1_700_000_000, 1_700_000_000, 2), (3, false));
+    }
+
+    /// The cadence now BACKS OFF while a lane is not responding.
+    ///
+    /// The defect this closes is that the old curve only ever went faster:
+    /// `idle_backlog_drain_cooldown_s` scales with backlog SIZE, so a big
+    /// backlog pinned itself to the 20-minute floor and stayed. Measured over
+    /// 34h to 2026-08-30, mvs-infra sat at a 22-minute gap for 80 nudges and
+    /// moved 0 cards.
+    #[test]
+    fn the_backoff_doubles_and_is_bounded() {
+        let floor = 20.0 * 60.0;
+        assert_eq!(unheeded_backoff(floor, 0), floor, "a responsive lane is untouched");
+        assert_eq!(unheeded_backoff(floor, 1), floor * 2.0);
+        assert_eq!(unheeded_backoff(floor, 2), floor * 4.0);
+        // Bounded, so a long-dead lane cannot overflow the multiplier into a
+        // cooldown that never expires.
+        assert!(unheeded_backoff(floor, 500) <= floor * 256.0);
+        // CONTROL: the OLD behaviour is what this replaces — the floor forever.
+        // If backoff ever became a no-op this equality would hold at every n.
+        assert_ne!(unheeded_backoff(floor, 3), floor);
+    }
+
+    /// A lane that never moves is escalated in a few ticks, not eighty.
+    ///
+    /// The doc here used to cite mvs-infra as an 80-nudge specimen; that was a
+    /// bad join and mvs-infra is in fact the busiest board user in the fleet
+    /// (corrected 2026-08-30). The BOUND is what matters and it stands on its
+    /// own: whatever the lane, silence is answered in `cap` ticks rather than
+    /// indefinitely.
+    #[test]
+    fn a_silent_lane_is_escalated_within_a_few_ticks_not_eighty() {
+        let cap = nudge_unheeded_cap();
+        assert!(cap >= 1, "a cap of 0 would suppress the first nudge, which is not the fix");
+        let mut unheeded = 0;
+        let mark = 1_700_000_000;
+        let mut fired = 0;
+        for _ in 0..80 {
+            let (next, _) = nudge_feedback(mark, mark, unheeded);
+            unheeded = next;
+            if unheeded >= cap {
+                break;
+            }
+            fired += 1;
+        }
+        assert!(
+            fired < 5,
+            "a lane that never moves used to be nudged indefinitely; it now gets {fired} \
+             before the queue is escalated instead"
+        );
+    }
+
+
+    /// amux's review question, made into a test rather than answered in prose:
+    /// "can a card promoted by the revisit arm be distinguished, after the
+    /// fact, from one promoted by the original arm? If both write the same
+    /// shape, the first 'why did this move?' is unanswerable."
+    ///
+    /// The card's own log is where that question gets asked (Ethan: the board
+    /// task is the source of truth for its own history), so the two arms must
+    /// write DIFFERENT lines there — not merely differ in a counter the card
+    /// does not carry.
+    #[test]
+    fn the_two_promotion_arms_are_distinguishable_on_the_card_itself() {
+        let a = PromoteArm::DepsCleared.log_line();
+        let b = PromoteArm::RevisitDue.log_line();
+        assert_ne!(a, b, "both arms would write the same history line");
+        // Each must name its OWN cause, not just differ. "Re-activated" alone
+        // on both would pass assert_ne while leaving the reader no better off.
+        assert!(a.contains("depends_on"), "deps arm must name its cause: {a}");
+        assert!(b.contains("revisit date"), "revisit arm must name its cause: {b}");
+    }
+
+    /// The rate limit is the part that fails INVISIBLY: an off-by-one that
+    /// lets every candidate through still promotes cards, still logs, still
+    /// looks healthy in the report, and floods the column the drain exists to
+    /// protect. One lane on this board held 219 backlog cards.
+    #[test]
+    fn due_drain_fills_a_lane_to_the_ceiling_and_stops() {
+        let cands: Vec<(String, String)> = (0..10)
+            .map(|i| (format!("C-{i}"), "backend".to_string()))
+            .collect();
+        let mut depth = std::collections::BTreeMap::new();
+
+        // Empty column, ceiling 5 -> exactly 5, and they are the FIRST five
+        // (the scan hands them over most-overdue-first, so the order is the
+        // priority and a plan that reorders would drain the wrong cards).
+        depth.insert("backend".to_string(), 0i64);
+        let got = due_drain_plan(&cands, &depth, 5);
+        assert_eq!(got, vec!["C-0", "C-1", "C-2", "C-3", "C-4"]);
+
+        // A column already at the ceiling takes nothing. This is the clause
+        // that makes the backlog drain at the rate the lane completes work.
+        depth.insert("backend".to_string(), 5);
+        assert!(due_drain_plan(&cands, &depth, 5).is_empty());
+
+        // OVER the ceiling is also nothing, not a negative slot count.
+        depth.insert("backend".to_string(), 99);
+        assert!(due_drain_plan(&cands, &depth, 5).is_empty());
+
+        // Partial room takes exactly the remainder.
+        depth.insert("backend".to_string(), 3);
+        assert_eq!(due_drain_plan(&cands, &depth, 5).len(), 2);
+
+        // Ceiling 0 disables the drain entirely — the documented off switch.
+        depth.insert("backend".to_string(), 0);
+        assert!(due_drain_plan(&cands, &depth, 0).is_empty());
+        assert!(due_drain_plan(&cands, &depth, -1).is_empty());
+    }
+
+    /// The ceiling is PER LANE. A shared counter would let one lane's deep
+    /// backlog consume every slot on the board and starve the other 48.
+    #[test]
+    fn due_drain_ceiling_is_per_lane_not_global() {
+        let cands: Vec<(String, String)> = vec![
+            ("A-1".into(), "backend".into()),
+            ("B-1".into(), "mvs-infra".into()),
+            ("A-2".into(), "backend".into()),
+            ("B-2".into(), "mvs-infra".into()),
+        ];
+        let mut depth = std::collections::BTreeMap::new();
+        depth.insert("backend".to_string(), 1i64);
+        // mvs-infra is absent from the map — an unmeasured lane is an EMPTY
+        // one, not a full one. Reading a missing key as "at the ceiling" would
+        // silently exclude every lane with a clean todo column, which is
+        // exactly the set the drain is for.
+        let got = due_drain_plan(&cands, &depth, 2);
+        assert_eq!(got, vec!["A-1", "B-1", "B-2"], "backend gets 1 slot, mvs-infra 2");
+    }
     use super::*;
     use rusqlite::Connection;
 
@@ -4301,8 +5911,8 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str, status: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
-                 VALUES (?1,?2,?3,'me','agent',0,'code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created) \
+                 VALUES (?1,?2,?3,'me','agent',0,'code',100,100)",
                 rusqlite::params![id, format!("card {id}"), status],
             )
             .expect("insert");
@@ -4312,7 +5922,7 @@ mod tests {
         for i in 0..229 {
             ins(&format!("D-{i}"), "done");
         }
-        let (bc, dc, _, _) = outstanding_work(&conn, "me");
+        let (bc, dc, _, _, _) = outstanding_work(&conn, "me");
         assert_eq!((bc, dc), (0, 229));
         // The trigger is `bc > 0`. With no blocked cards there is nothing to
         // nudge about, no matter how large `done` grows.
@@ -4321,9 +5931,159 @@ mod tests {
         // Add one blocked card and it arms — because re-assessing a blocker is
         // work this lane can actually do.
         ins("B-1", "blocked");
-        let (bc2, dc2, blocked, _) = outstanding_work(&conn, "me");
+        let (bc2, dc2, blocked, _, _) = outstanding_work(&conn, "me");
         assert_eq!((bc2, dc2), (1, 229));
         assert_eq!(blocked.len(), 1, "the blocked card is named in the nudge");
+    }
+
+    /// AMUX-3775. The walk itself, over a lookup, so every branch has a cell.
+    #[test]
+    fn the_depends_on_walk_finds_a_human_root_and_refuses_to_guess() {
+        let table: &[(&str, &str, &[&str])] = &[
+            // The reporting lane's real chain: MG-1356 -> 1355 -> 1354 -> 1369.
+            ("MG-1356", "blocked", &["MG-1355"]),
+            ("MG-1355", "blocked", &["MG-1354"]),
+            ("MG-1354", "blocked", &["MG-1369"]),
+            ("MG-1369", "needsyou", &[]),
+            // A chain that roots in ordinary work is NOT human-blocked.
+            ("W-1", "blocked", &["W-2"]),
+            ("W-2", "todo", &[]),
+            // A chain that points at nothing resolvable.
+            ("D-1", "blocked", &["GONE-9"]),
+            // A cycle.
+            ("C-1", "blocked", &["C-2"]),
+            ("C-2", "blocked", &["C-1"]),
+            // A lane that retyped ITSELF to needsyou must not silence itself.
+            ("S-1", "needsyou", &[]),
+        ];
+        let lookup = |id: &str| -> CardLink {
+            table.iter().find(|(i, _, _)| *i == id).map(|(_, s, d)| {
+                (s.to_string(), d.iter().map(|x| x.to_string()).collect())
+            })
+        };
+        assert_eq!(
+            human_blocked_root("MG-1356", &lookup, DEPENDS_ON_MAX_DEPTH),
+            Some("MG-1369".into()),
+            "a three-hop chain to a needsyou card is blocked on the human"
+        );
+        assert_eq!(human_blocked_root("MG-1354", &lookup, DEPENDS_ON_MAX_DEPTH), Some("MG-1369".into()));
+        // THE CONTROLS. Each of these would silence a card nobody is waiting on,
+        // which is the same defect as the nudge that never stops, pointed the
+        // other way.
+        assert_eq!(human_blocked_root("W-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "root is todo");
+        assert_eq!(human_blocked_root("D-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "dangling id");
+        assert_eq!(human_blocked_root("C-1", &lookup, DEPENDS_ON_MAX_DEPTH), None, "a cycle terminates");
+        // NOTE, from amux-frustrations' review: this cycle assertion does NOT
+        // test the seen-set. A two-node cycle keeps the frontier at one element
+        // per level, so the loop runs out of depth and returns None whether or
+        // not `seen` exists — they proved it by deleting the seen-set and
+        // watching the suite stay green. The cell that discriminates is below.
+        assert_eq!(
+            human_blocked_root("S-1", &lookup, DEPENDS_ON_MAX_DEPTH),
+            None,
+            "the START card's own status must not count, or a card retyped to needsyou silences itself"
+        );
+        // The cap holds: one hop is not enough to reach MG-1369 from MG-1356.
+        assert_eq!(human_blocked_root("MG-1356", &lookup, 1), None, "depth is bounded");
+    }
+
+    /// THE SEEN-SET, which the cycle cell above cannot test (amux-frustrations,
+    /// reviewing AMUX-3775). They mutation-tested my three named attacks; three
+    /// failed the suite as intended and DELETING THE SEEN-SET ENTIRELY left it
+    /// green. A two-node cycle terminates by the depth bound, giving the same
+    /// answer by the wrong mechanism.
+    ///
+    /// What `seen` actually buys is protection against RE-EXPANSION IN A
+    /// DIAMOND, which no cycle can exercise. This builds a lattice where every
+    /// level's nodes both point at both of the next level's, so the frontier
+    /// doubles per level without dedup: 2^12 expansions at the default depth.
+    /// The assertion is on the CALL COUNT, because the return value is `None`
+    /// either way — the defect is cost, not correctness, and only a counter can
+    /// see it.
+    #[test]
+    fn the_seen_set_stops_a_diamond_from_re_expanding() {
+        const LEVELS: usize = 12;
+        let calls = std::cell::Cell::new(0usize);
+        let lookup = |id: &str| -> CardLink {
+            calls.set(calls.get() + 1);
+            // "L<level>-<branch>" -> both nodes of the next level.
+            let (lvl, _) = id.split_once('-').and_then(|(l, b)| {
+                Some((l.strip_prefix('L')?.parse::<usize>().ok()?, b))
+            })?;
+            if lvl >= LEVELS {
+                return Some(("blocked".to_string(), vec![]));
+            }
+            Some((
+                "blocked".to_string(),
+                vec![format!("L{}-a", lvl + 1), format!("L{}-b", lvl + 1)],
+            ))
+        };
+        assert_eq!(human_blocked_root("L0-a", &lookup, DEPENDS_ON_MAX_DEPTH), None);
+        // With dedup the walk visits at most 2 nodes per level plus the start.
+        // Without it the frontier doubles: 2^12 = 4096 expansions before the
+        // depth bound stops it. The bound is deliberately far below that and far
+        // above the deduped count, so it cannot pass by luck either way.
+        assert!(
+            calls.get() < 64,
+            "the walk expanded {} times on a {LEVELS}-level diamond — the seen-set is not \
+             deduping, and a wide dependency graph will melt the nudge",
+            calls.get()
+        );
+    }
+
+    /// AMUX-3775, through `outstanding_work` — the shipped path, on the shape
+    /// mixpeek-general reported: several blocked cards chaining to one card
+    /// waiting on Ethan, plus one genuinely actionable.
+    #[test]
+    fn blocked_on_a_human_root_is_excluded_from_the_count_and_still_named() {
+        let conn = board_db();
+        let ins = |id: &str, status: &str, dep: Option<&str>| {
+            conn.execute(
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,depends_on,created) \
+                 VALUES (?1,?2,?3,'me','agent',0,'code',100,?4,100)",
+                rusqlite::params![
+                    id,
+                    format!("card {id}"),
+                    status,
+                    dep.map(|d| format!("[\"{d}\"]"))
+                ],
+            )
+            .expect("insert");
+        };
+        ins("MG-1369", "needsyou", None);
+        ins("MG-1354", "blocked", Some("MG-1369"));
+        ins("MG-1355", "blocked", Some("MG-1354"));
+        ins("MG-1356", "blocked", Some("MG-1355"));
+        // No depends_on: its trigger is a fleet state, so the lane CAN re-assess it.
+        ins("MG-1426", "blocked", None);
+
+        let (bc, _dc, blocked, _done, human_blocked) = outstanding_work(&conn, "me");
+        assert_eq!(bc, 1, "only the actionable one arms the nudge, not all four");
+        assert_eq!(blocked.len(), 1);
+        assert_eq!(blocked[0].0, "MG-1426");
+        assert_eq!(human_blocked.len(), 3, "the three chaining to MG-1369 are set aside");
+        assert!(human_blocked.iter().all(|(_, _, root)| root == "MG-1369"));
+
+        // NAMED, NOT DROPPED (ethos rule 1). A version that just filtered them
+        // out would pass every assertion above and leave the lane with a count
+        // that silently disagrees with its own board.
+        let text = continue_nudge_text(bc, 0, &blocked, &[], &human_blocked);
+        assert!(text.contains("MG-1426"), "the actionable one is still asked about: {text}");
+        assert!(text.contains("MG-1369"), "and the human root is named: {text}");
+        assert!(text.contains("MG-1356"), "and the excluded cards are listed: {text}");
+        assert!(
+            text.contains("Nothing for you to do"),
+            "the excluded ones carry no ask: {text}"
+        );
+        // The specific wrong fix, named in the message so nobody reaches for it.
+        assert!(text.contains("do not retype them to `needsyou`"), "{text}");
+
+        // AND WITH NOTHING ACTIONABLE, bc IS ZERO — which is what makes the
+        // nudge stop, since the caller's trigger is `bc > 0`.
+        conn.execute("UPDATE issues SET status='todo' WHERE id='MG-1426'", []).expect("update");
+        let (bc2, _, _, _, hb2) = outstanding_work(&conn, "me");
+        assert_eq!(bc2, 0, "a lane whose every blocker is human-rooted is not nudged");
+        assert_eq!(hb2.len(), 3, "and they are still visible to the caller, not lost");
     }
 
     /// AMUX-2903. The continue-nudge's cooldown is a RATE limit, not an exit,
@@ -4482,8 +6242,8 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str, typ: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
-                 VALUES (?1,?2,'done','me','agent',0,?3,100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created) \
+                 VALUES (?1,?2,'done','me','agent',0,?3,100,100)",
                 rusqlite::params![id, format!("card {id}"), typ],
             )
             .expect("insert");
@@ -4523,7 +6283,7 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str, session: &str, status: &str, owner: &str, arch: i64, del: Option<i64>| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,deleted,type,updated)                  VALUES (?1,?2,?3,?4,?5,?6,?7,'code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,deleted,type,updated,created)                  VALUES (?1,?2,?3,?4,?5,?6,?7,'code',100,100)",
                 rusqlite::params![id, format!("card {id}"), status, session, owner, arch, del],
             )
             .expect("insert");
@@ -4558,8 +6318,8 @@ mod tests {
         let conn = board_db();
         let ins = |id: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated) \
-                 VALUES (?1,?2,'done','me','agent',0,'code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created) \
+                 VALUES (?1,?2,'done','me','agent',0,'code',100,100)",
                 rusqlite::params![id, format!("card {id}")],
             )
             .expect("insert");
@@ -4605,7 +6365,7 @@ mod tests {
         let conn = board_db();
         for i in 0..11 {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated)                  VALUES (?1,?2,'done','me','agent',0,'code',?3)",
+                "INSERT INTO issues (id,title,status,session,owner_type,archived,type,updated,created)                  VALUES (?1,?2,'done','me','agent',0,'code',?3,?3)",
                 rusqlite::params![format!("A-{i}"), format!("card {i}"), i],
             )
             .expect("insert");
@@ -4652,35 +6412,7 @@ mod tests {
 
     /// The live board schema, trimmed to the columns these predicates read.
     fn board_db() -> Connection {
-        let conn = Connection::open_in_memory().expect("memdb");
-        conn.execute_batch(
-            "CREATE TABLE issues (
-                id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '', desc TEXT NOT NULL DEFAULT '',
-                status TEXT NOT NULL DEFAULT 'todo', session TEXT, creator TEXT NOT NULL DEFAULT '',
-                due TEXT, created INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL DEFAULT 0,
-                owner_type TEXT NOT NULL DEFAULT 'agent', due_time TEXT, pinned INTEGER DEFAULT 0,
-                gcal_event_id TEXT, pos REAL DEFAULT 0, notified INTEGER DEFAULT 0, gate TEXT,
-                shepherd TEXT, type TEXT NOT NULL DEFAULT 'code', archived INTEGER DEFAULT 0,
-                depends_on TEXT, reviewer TEXT, log TEXT, rev INTEGER DEFAULT 0,
-                source_ref TEXT, last_verified_at INTEGER, version INTEGER DEFAULT 0,
-                epic TEXT, closed_at INTEGER, deleted INTEGER);
-             CREATE TABLE issue_tags (issue_id TEXT, tag TEXT, added_at REAL,
-                PRIMARY KEY (issue_id, tag));
-             CREATE TABLE session_events (id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL,
-                session TEXT NOT NULL DEFAULT '', type TEXT NOT NULL, data TEXT, idem TEXT,
-                source TEXT NOT NULL DEFAULT '');
-             CREATE TABLE cmd_history (id INTEGER PRIMARY KEY AUTOINCREMENT, text TEXT NOT NULL,
-                type TEXT NOT NULL DEFAULT 'direct', session TEXT NOT NULL DEFAULT '',
-                ts INTEGER NOT NULL, origin TEXT NOT NULL DEFAULT '');
-             CREATE TABLE interaction_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER,
-                kind TEXT, actor TEXT, target TEXT, action TEXT, url TEXT, detail TEXT,
-                before TEXT, result TEXT, ok INTEGER, ms INTEGER, seq INTEGER);
-             CREATE TABLE statuses (id TEXT PRIMARY KEY, label TEXT, position INTEGER,
-                is_builtin INTEGER DEFAULT 1, gate TEXT, mode TEXT DEFAULT 'implicit');
-             CREATE TABLE status_scope (status TEXT, scope_type TEXT, scope_value TEXT);",
-        )
-        .expect("schema");
-        conn
+        crate::db::migrate::test_memdb()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -4752,7 +6484,7 @@ mod tests {
         let now = 1_000_000.0;
         add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 3 * 86400, -1024.0, 0);
         add_full(&conn, "NEW", "lane", "todo", "code", now as i64, -99999.0, 0); // topmost pos
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("OLD"), "the 3-day-old card must be worked before the fresh one");
     }
 
@@ -4762,7 +6494,7 @@ mod tests {
         let now = 1_000_000.0;
         add_full(&conn, "OLD", "lane", "todo", "code", now as i64 - 5 * 86400, -1024.0, 0);
         add_full(&conn, "PIN", "lane", "todo", "code", now as i64, -50.0, 1); // pinned, fresh
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("PIN"), "a pinned card is the hard human override");
     }
 
@@ -4773,7 +6505,7 @@ mod tests {
         add_full(&conn, "CHORE", "lane", "todo", "chore", now as i64 - 2 * 86400, -1024.0, 0);
         add_full(&conn, "BUG", "lane", "todo", "bug", now as i64, -50.0, 0);
         tag(&conn, "BUG", "p0", now);
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("BUG"), "a fresh p0 bug must outrank a 2-day-old chore");
     }
 
@@ -4785,7 +6517,7 @@ mod tests {
         add_full(&conn, "DEP", "lane", "todo", "code", now as i64, -50.0, 0);
         add_dependent(&conn, "D1", "DEP");
         add_dependent(&conn, "D2", "DEP");
-        let p = select_pickup(&conn, "lane", now);
+        let p = select_pickup_with(&conn, "lane", now, false);
         assert_eq!(claimed(&p), Some("DEP"), "the card two others depend on must lead");
     }
 
@@ -4803,7 +6535,7 @@ mod tests {
     fn an_eligible_todo_is_selected_and_the_prompt_names_the_card() {
         let conn = board_db();
         add_card(&conn, "T-1", "lane", "todo", "Fix the parser", "SCOPE: real work\n- [ ] do it");
-        let p = select_pickup(&conn, "lane", now_f64());
+        let p = select_pickup_with(&conn, "lane", now_f64(), false);
         assert_eq!(claimed(&p), Some("T-1"), "an eligible todo must be claimed");
         let Pickup::Claim { prompt, .. } = &p else { unreachable!() };
         assert!(prompt.contains("T-1"), "the prompt must name the card id: {prompt}");
@@ -4818,7 +6550,7 @@ mod tests {
             let conn = board_db();
             add_card(&conn, "T-1", "lane", "todo", "Ask Ethan about pricing", "SCOPE: x\n- [ ] y");
             tag(&conn, "T-1", t, now_f64());
-            let p = select_pickup(&conn, "lane", now_f64());
+            let p = select_pickup_with(&conn, "lane", now_f64(), false);
             assert!(claimed(&p).is_none(), "{t} must exempt the card from pickup");
             assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 0, "{t} must not count as eligible");
         }
@@ -4859,9 +6591,10 @@ mod tests {
 
         // CORRECTLY-PARKED backlog is NOT drainable (mixpeek-autopilot, AMUX-3006):
         // a standing tripwire (fires on a condition, no honest path to todo) and a
-        // card armed on a live source_ref trigger must NOT appear as drain
-        // candidates — nudging them churns a compliant lane with no exit but a
-        // false close. Add both to a fresh lane whose ONLY other cards are parked.
+        // card armed on a FRESH (recently re-verified) source_ref trigger must NOT
+        // appear as drain candidates — nudging them churns a compliant lane with no
+        // exit but a false close. Add both to a fresh lane whose ONLY other cards
+        // are parked. CH-1's last_verified_at is `now`, i.e. re-confirmed today.
         conn.execute(
             "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type) \
              VALUES ('TW-1','burn>=90% page watch','x','backlog','parked',?1,?1,'agent','tripwire')",
@@ -4869,15 +6602,34 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,source_ref) \
-             VALUES ('CH-1','chore blocked on a credential','x','backlog','parked',?1,?1,'agent','chore','clickhouse://blocked')",
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,source_ref,last_verified_at) \
+             VALUES ('CH-1','chore blocked on a credential','x','backlog','parked',?1,?1,'agent','chore','clickhouse://blocked',?1)",
             rusqlite::params![now as i64],
         )
         .unwrap();
         let parked = backlog_candidates(&conn, "parked", now as i64);
         assert!(
             parked.is_empty(),
-            "a tripwire and a source_ref-triggered card are correctly parked, not drainable: {parked:?}"
+            "a tripwire and a FRESHLY-verified source_ref-triggered card are correctly parked, not drainable: {parked:?}"
+        );
+
+        // SOURCE_REF_STALE_S: a trigger nobody has re-checked in 24h+ is NOT a
+        // live park — it must return as a drain candidate exactly like an
+        // unset source_ref would (AMUX-2984 shape: a card sat 56 days behind a
+        // `--trigger` nobody ever refreshed, invisible to this nudge the whole
+        // time). CH-2 carries a source_ref but NO last_verified_at at all
+        // (NULL — never even stamped once), which must count as stale, not live.
+        conn.execute(
+            "INSERT INTO issues (id,title,desc,status,session,created,updated,owner_type,type,source_ref) \
+             VALUES ('CH-2','self-noted, not an external trigger','x','backlog','parked',?1,?1,'agent','chore','do this later when convenient')",
+            rusqlite::params![now as i64],
+        )
+        .unwrap();
+        let parked_with_stale = backlog_candidates(&conn, "parked", now as i64);
+        assert_eq!(
+            parked_with_stale.iter().map(|(id, _, _)| id.as_str()).collect::<Vec<_>>(),
+            vec!["CH-2"],
+            "a source_ref never re-verified must drain like an unset one, and CH-1/TW-1 must stay excluded: {parked_with_stale:?}"
         );
     }
 
@@ -4954,8 +6706,8 @@ mod tests {
         // Dependencies in the states that matter.
         let dep = |id: &str, status: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
-                 VALUES (?1,?1,?2,'me','agent','code',100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,type,updated,created) \
+                 VALUES (?1,?1,?2,'me','agent','code',100,100)",
                 rusqlite::params![id, status],
             )
             .expect("dep");
@@ -4967,8 +6719,8 @@ mod tests {
         // Parked backlog cards of every shape (owner_type='agent').
         let parked = |id: &str, typ: &str, deps: &str| {
             conn.execute(
-                "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
-                 VALUES (?1,?1,'backlog','me','agent',?2,?3,100)",
+                "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated,created) \
+                 VALUES (?1,?1,'backlog','me','agent',?2,?3,100,100)",
                 rusqlite::params![id, typ, deps],
             )
             .expect("parked");
@@ -4980,15 +6732,15 @@ mod tests {
         parked("E-epic", "epic", r#"["A-verified"]"#); // NOT: container type
         // A triggers-only park: NULL depends_on, terminal-deps irrelevant.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
-             VALUES ('P-nodeps','P-nodeps','backlog','me','agent','code',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,updated,created) \
+             VALUES ('P-nodeps','P-nodeps','backlog','me','agent','code',100,100)",
             [],
         )
         .unwrap();
         // A human's card with a completed dep — ethos rule 8, never swept.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
-             VALUES ('H-1','H-1','backlog','me','human','code','[\"A-done\"]',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated,created) \
+             VALUES ('H-1','H-1','backlog','me','human','code','[\"A-done\"]',100,100)",
             [],
         )
         .unwrap();
@@ -5020,30 +6772,30 @@ mod tests {
     fn a_live_trigger_holds_a_card_even_when_its_deps_are_terminal() {
         let conn = board_db();
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,updated) \
-             VALUES ('A-done','A-done','done','me','agent','code',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,updated,created) \
+             VALUES ('A-done','A-done','done','me','agent','code',100,100)",
             [],
         )
         .unwrap();
         // The MG-1388 shape: a terminal dep AND a live source_ref trigger.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated) \
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated,created) \
              VALUES ('T-armed','T-armed','backlog','me','agent','investigation','[\"A-done\"]',\
-                     'some namespace holds both an archive- and a competitor-shaped collection',100)",
+                     'some namespace holds both an archive- and a competitor-shaped collection',100,100)",
             [],
         )
         .unwrap();
         // Control: same terminal dep, NO trigger -> still promotes.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated) \
-             VALUES ('T-plain','T-plain','backlog','me','agent','code','[\"A-done\"]',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,updated,created) \
+             VALUES ('T-plain','T-plain','backlog','me','agent','code','[\"A-done\"]',100,100)",
             [],
         )
         .unwrap();
         // A whitespace-only source_ref is NOT a live trigger -> promotes.
         conn.execute(
-            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated) \
-             VALUES ('T-blank','T-blank','backlog','me','agent','code','[\"A-done\"]','   ',100)",
+            "INSERT INTO issues (id,title,status,session,owner_type,type,depends_on,source_ref,updated,created) \
+             VALUES ('T-blank','T-blank','backlog','me','agent','code','[\"A-done\"]','   ',100,100)",
             [],
         )
         .unwrap();
@@ -5223,7 +6975,7 @@ mod tests {
         tag(&conn, "T-3", "needs:you", now_f64());
         conn.execute("UPDATE issues SET archived=1 WHERE id='T-2'", []).expect("archive");
         assert_eq!(eligible_todo_count(&conn, "lane", 1_000_000.0), 1);
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     /// AMUX-2983 (gtm-videos): the auto-pickup claimed GV-648 while it was
@@ -5242,6 +6994,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let ins = |id: &str, status: &str| {
             let (id, status) = (id.to_string(), status.to_string());
@@ -5292,6 +7045,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         store
             .write(move |conn| {
@@ -5344,13 +7098,59 @@ mod tests {
     /// to amux one second AFTER the claim; the predicate never disagreed with the
     /// owner. Control: the owner IS offered exactly the card, so the assertion can
     /// fail.
+    /// AMUX-3948/3946. Auto-pickup must not hand a lane a card that `doing`
+    /// would then refuse.
+    ///
+    /// `claim_card` swaps todo->doing with a direct SQL CAS, bypassing the PATCH
+    /// gate entirely, so before this the continuation gate was refusable by hand
+    /// and bypassable by waiting for pickup.
+    ///
+    /// BOTH ARMS, because the gate-on arm alone would pass for a pickup that
+    /// selected nothing at all, and the gate-off arm alone would pass for a
+    /// pickup that ignored the gate. Neither is the property.
+    #[test]
+    fn pickup_skips_a_card_that_cannot_say_what_to_do_next() {
+        let conn = board_db();
+        add_card(&conn, "AF-90", "lane", "todo", "no continuation", "SCOPE: real\n- [ ] do it");
+
+        // GATE OFF: the card is workable and pickup offers it. Without this the
+        // cell below passes for a pickup that is simply broken.
+        assert_eq!(
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
+            Some("AF-90"),
+            "with the gate off this is an ordinary claimable card"
+        );
+
+        // GATE ON, no next_action: skipped, because `doing` would refuse it and
+        // pickup's promise is "work it now".
+        assert!(
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), true)).is_none(),
+            "a card with no next_action must not be handed out as ready to work"
+        );
+
+        // GATE ON, WITH a next_action: offered again. This is the arm that keeps
+        // the gate from being a blanket refusal that empties every opted-in
+        // lane's queue.
+        conn.execute(
+            "UPDATE issues SET next_action='Rerun compatibility test 07 against KubeRay 1.4' \
+             WHERE id='AF-90'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), true)),
+            Some("AF-90"),
+            "satisfying the gate makes it claimable again, or the gate is a mute"
+        );
+    }
+
     #[test]
     fn pickup_offers_a_card_only_to_its_session_owner() {
         let conn = board_db();
         // Owned by `amux`; a different lane created it (as in the incident).
         add_card(&conn, "AF-78", "amux", "todo", "owned by amux", "SCOPE: real\n- [ ] do it");
         assert!(
-            claimed(&select_pickup(&conn, "amux-frustrations", now_f64())).is_none(),
+            claimed(&select_pickup_with(&conn, "amux-frustrations", now_f64(), false)).is_none(),
             "a card owned by 'amux' must never be offered to a non-owner lane"
         );
         assert_eq!(
@@ -5359,7 +7159,7 @@ mod tests {
             "and it must not count as eligible for the non-owner"
         );
         assert_eq!(
-            claimed(&select_pickup(&conn, "amux", now_f64())),
+            claimed(&select_pickup_with(&conn, "amux", now_f64(), false)),
             Some("AF-78"),
             "the owning lane is the only one the card is dispatched to"
         );
@@ -5384,6 +7184,7 @@ mod tests {
             started: std::time::Instant::now(),
             build_hash: "test".into(),
             auth_token: None,
+        reconciled: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         let ins = |id: &str, owner: &str| {
             let (id, owner) = (id.to_string(), owner.to_string());
@@ -5480,7 +7281,7 @@ mod tests {
         let conn = board_db();
         add_card(&conn, "D-1", "lane", "doing", "already working", "SCOPE: x");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { reason, detail } => {
                 assert_eq!(reason, "wip-cap");
                 assert!(detail.contains("D-1"), "the trace must name what is held: {detail}");
@@ -5499,7 +7300,7 @@ mod tests {
         add_card(&conn, "D-1", "lane", "doing", "cleared", "SCOPE: x");
         conn.execute("UPDATE issues SET archived=1 WHERE id='D-1'", []).expect("archive");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     /// AMUX-3757, Ethan 2026-08-26: "why do i need to push @tubescience to
@@ -5526,7 +7327,7 @@ mod tests {
         conn.execute("UPDATE issues SET creator='amux' WHERE id='C-1'", []).expect("mint");
         add_card(&conn, "T-1", "lane", "todo", "next", "SCOPE: x\n- [ ] y");
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now_f64())),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
             Some("T-1"),
             "an unanswered prompt is not work in progress; the lane must still be dealt"
         );
@@ -5538,7 +7339,7 @@ mod tests {
         )
         .expect("reshape");
         conn.execute("UPDATE issues SET status='todo' WHERE id='T-1'", []).expect("reset");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { reason, detail } => {
                 assert_eq!(reason, "wip-cap");
                 assert!(detail.contains("C-1"), "the reshaped card holds the slot: {detail}");
@@ -5726,7 +7527,7 @@ mod tests {
 
         // The MECHANISM: it does not hold the slot.
         let blocks_pickup = matches!(
-            select_pickup(&conn, "lane", now_f64()),
+            select_pickup_with(&conn, "lane", now_f64(), false),
             Pickup::None { reason: "wip-cap", .. }
         );
         assert!(!blocks_pickup, "AMUX-3757: a capture shell must not hold the WIP slot");
@@ -5773,7 +7574,7 @@ mod tests {
             .expect("claim event");
         }
         add_card(&conn, "T-1", "lane", "todo", "fresh work", "SCOPE: x\n- [ ] y");
-        match select_pickup(&conn, "lane", now) {
+        match select_pickup_with(&conn, "lane", now, false) {
             Pickup::None { reason, .. } => assert_eq!(reason, "bounce-loop"),
             _ => panic!("three bounced claims in 2h must stop the deal"),
         }
@@ -5781,7 +7582,7 @@ mod tests {
         // claims whose card is still parked in todo count.
         conn.execute("UPDATE issues SET status='done' WHERE id='B-1'", []).expect("advance");
         assert!(
-            !matches!(select_pickup(&conn, "lane", now), Pickup::None { reason: "bounce-loop", .. }),
+            !matches!(select_pickup_with(&conn, "lane", now, false), Pickup::None { reason: "bounce-loop", .. }),
             "moving a bounced card must release the breaker"
         );
     }
@@ -5801,7 +7602,7 @@ mod tests {
         tag(&conn, "D-1", "needs:you", now - 31.0 * 3600.0);
         add_card(&conn, "T-1", "lane", "todo", "next real work", "SCOPE: x\n- [ ] y");
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now)),
+            claimed(&select_pickup_with(&conn, "lane", now, false)),
             Some("T-1"),
             "a human-blocked doing card must not idle the lane"
         );
@@ -5824,7 +7625,7 @@ mod tests {
         conn.execute("UPDATE issues SET type='tripwire' WHERE id='W-2'", []).expect("type");
         add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now_f64())),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
             Some("T-1"),
             "the watch must not hold WIP and the tripwire must not be dispatched"
         );
@@ -5838,7 +7639,7 @@ mod tests {
         let conn = board_db();
         add_card(&conn, "H-1", "lane", "todo", "Ethan: call the bank", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET owner_type='human' WHERE id='H-1'", []).expect("owner");
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
         assert_eq!(eligible_todo_count(&conn, "lane", now_f64()), 0);
     }
 
@@ -5866,14 +7667,14 @@ mod tests {
         // 1h ago: inside the 2h window -> still exempt.
         claim_at(now_f64() - 3600.0);
         assert!(
-            claimed(&select_pickup(&conn, "lane", now_f64())).is_none(),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none(),
             "a card claimed 1h ago is inside the 2h cooldown and must not re-deal"
         );
         // 3h ago: THE DEAD ZONE. Under the old 24h cooldown this was exempt for
         // 21 more hours and the lane starved; now it is dispatchable.
         claim_at(now_f64() - 3.0 * 3600.0);
         assert_eq!(
-            claimed(&select_pickup(&conn, "lane", now_f64())),
+            claimed(&select_pickup_with(&conn, "lane", now_f64(), false)),
             Some("T-1"),
             "a card claimed 3h ago (past the 2h window) must be re-dealt — this is the AMUX-2987 fix"
         );
@@ -5889,7 +7690,7 @@ mod tests {
             rusqlite::params![now_f64() as i64 - 8 * 86400],
         )
         .expect("age");
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
     }
 
     /// py:14581, AMUX-2128: refusals used to RETURN, so one refusable card at the
@@ -5903,7 +7704,7 @@ mod tests {
         conn.execute("UPDATE issues SET pos=1 WHERE id='S-1'", []).expect("pos");
         add_card(&conn, "T-1", "lane", "todo", "real", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET pos=2 WHERE id='T-1'", []).expect("pos");
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
     }
 
     #[test]
@@ -5917,7 +7718,7 @@ mod tests {
             "cleanup",
             "SCOPE: x\n- [ ] run git reset --hard on the shared checkout",
         );
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
     }
 
     #[test]
@@ -5926,9 +7727,48 @@ mod tests {
         add_card(&conn, "B-1", "other", "doing", "blocker", "SCOPE: x");
         add_card(&conn, "T-1", "lane", "todo", "dependent", "SCOPE: x\n- [ ] y");
         conn.execute("UPDATE issues SET depends_on='[\"B-1\"]' WHERE id='T-1'", []).expect("dep");
-        assert!(claimed(&select_pickup(&conn, "lane", now_f64())).is_none());
+        assert!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)).is_none());
         conn.execute("UPDATE issues SET status='verified' WHERE id='B-1'", []).expect("close");
-        assert_eq!(claimed(&select_pickup(&conn, "lane", now_f64())), Some("T-1"));
+        assert_eq!(claimed(&select_pickup_with(&conn, "lane", now_f64(), false)), Some("T-1"));
+    }
+
+    /// When a todo card is blocked only by the same session's own backlog cards,
+    /// select_pickup returns PromoteDeps so drive_lane can promote them and
+    /// dispatch the todo on the next tick — no human or cross-lane action needed.
+    /// Mirrors the live byo-ray incident (2026-08-30): BR-10 blocked by BR-9
+    /// (own backlog), budget spent, lane idle indefinitely.
+    #[test]
+    fn own_backlog_dep_returns_promote_deps() {
+        let conn = board_db();
+        // Same session owns both cards: the backlog dep and the todo that needs it.
+        add_card(&conn, "D-1", "lane", "backlog", "prerequisite work", "SCOPE: x");
+        add_card(&conn, "D-2", "lane", "todo", "downstream work", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on='[\"D-1\"]' WHERE id='D-2'", [])
+            .expect("dep");
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
+            Pickup::PromoteDeps { blocked_card, promoted } => {
+                assert_eq!(blocked_card, "D-2");
+                assert_eq!(promoted, vec!["D-1"]);
+            }
+            other => panic!("expected PromoteDeps, got {other:?}"),
+        }
+    }
+
+    /// If the dep is another session's card (even if backlog), it is NOT
+    /// self-resolvable — select_pickup must leave it as all-candidates-refused.
+    #[test]
+    fn other_session_backlog_dep_does_not_promote() {
+        let conn = board_db();
+        add_card(&conn, "X-1", "other-lane", "backlog", "other session dep", "SCOPE: x");
+        add_card(&conn, "X-2", "lane", "todo", "blocked card", "SCOPE: x\n- [ ] y");
+        conn.execute("UPDATE issues SET depends_on='[\"X-1\"]' WHERE id='X-2'", [])
+            .expect("dep");
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
+            Pickup::None { reason, .. } => {
+                assert_eq!(reason, "all-candidates-refused");
+            }
+            other => panic!("expected None/all-candidates-refused, got {other:?}"),
+        }
     }
 
     /// Invariant 20: silence is the correct output for an empty board, and the
@@ -5936,7 +7776,7 @@ mod tests {
     #[test]
     fn an_empty_queue_produces_a_reason_not_a_silent_return() {
         let conn = board_db();
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::None { reason, detail } => {
                 assert_eq!(reason, "no-eligible-card");
                 assert!(!detail.is_empty(), "an empty board must still explain itself");
@@ -5950,7 +7790,7 @@ mod tests {
         let conn = board_db();
         add_card(&conn, "S-1", "lane", "todo", "shell one", "**Prompt:** please do a thing");
         add_card(&conn, "S-2", "lane", "todo", "shell two", "capture: session prompt");
-        match select_pickup(&conn, "lane", now_f64()) {
+        match select_pickup_with(&conn, "lane", now_f64(), false) {
             Pickup::Decompose { ids, text } => {
                 assert_eq!(ids.len(), 2);
                 assert!(text.contains("S-1") && text.contains("S-2"), "must name the ids: {text}");
@@ -6091,14 +7931,28 @@ mod tests {
         add_card(&conn, "R-9", "lane", "review", "needs a peer", "SCOPE: x");
         conn.execute("UPDATE issues SET reviewer='amux-rust' WHERE id='R-9'", []).expect("rev");
 
+        // AMUX-3821: the guarantee here is that no nudge is addressed to a
+        // session that does not exist. It used to be enforced by nudging NOBODY,
+        // which left the one party who can fix it — the owner, who wrote the
+        // reviewer field — as the only party never told. The card then read
+        // `review` while waiting on nobody. So the assertion is sharpened
+        // rather than relaxed: the dead reviewer must not be the target, AND
+        // the owner must be.
         match select_advance_with(&conn, "lane", &[], now_f64(), &|_, r| {
             Some(format!("`{r}` is not a registered worker"))
         }) {
-            Advance::None { reason, detail } => {
-                assert_eq!(reason, "reviewer-unreachable");
-                assert!(detail.contains("amux-rust"), "must name the dead reviewer: {detail}");
+            Advance::Nudge { target, text, .. } => {
+                assert_ne!(target, "amux-rust", "never address a session that does not exist");
+                assert_eq!(target, "lane", "the OWNER wrote the field and is the one who can fix it");
+                assert!(text.contains("amux-rust"), "must name the dead reviewer: {text}");
+                assert!(
+                    text.contains("not a registered worker"),
+                    "and must carry the REASON, which already names both ways out: {text}"
+                );
             }
-            Advance::Nudge { kind, target, .. } => panic!("an unreachable reviewer must not be nudged (kind={kind}, target={target})"),
+            Advance::None { reason, detail } => {
+                panic!("silence is what left the author untold ({reason}: {detail})")
+            }
         }
 
         match select_advance_with(&conn, "lane", &[], now_f64(), &|_, n| {
@@ -6344,7 +8198,7 @@ mod tests {
             "Fix the logo",
             "SCOPE: real work\n- [ ] see @/Users/ethan/.amux/uploads/b7965e0b2a8f-image.png",
         );
-        let Pickup::Claim { prompt, .. } = select_pickup(&conn, "lane", now_f64()) else {
+        let Pickup::Claim { prompt, .. } = select_pickup_with(&conn, "lane", now_f64(), false) else {
             panic!("the card is otherwise dispatchable and must still be claimed");
         };
         assert!(prompt.contains("T-1"), "the card id must survive: {prompt}");
@@ -6407,7 +8261,12 @@ mod tests {
     fn verified_is_only_named_for_lanes_it_applies_to() {
         let conn = board_db();
         conn.execute(
-            "INSERT INTO statuses (id,label,position,gate,mode) VALUES ('verified','Verified',6,NULL,'explicit')",
+            // OR REPLACE: the fixture now carries the REAL migrated schema, which
+            // SEEDS the builtin statuses. The hand-rolled one created `statuses`
+            // empty, so this plain INSERT used to be the only row — another way
+            // the old fixture differed from production without saying so (AF-328).
+            "INSERT OR REPLACE INTO statuses (id,label,position,gate,mode) \
+             VALUES ('verified','Verified',6,NULL,'explicit')",
             [],
         )
         .expect("status");

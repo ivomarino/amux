@@ -57,7 +57,32 @@ Verify a hook by what it WROTE, not by the settings file.
 - **Pre-fix specimen: `<your-sha>^`**, never `HEAD~1` (shared checkout).
 - **Client JS: bump `APP_VER` (app.js) + `CACHE` (sw.js) together.**
 - Syntax gates: `cargo check --workspace`. Before push: `cargo clippy --workspace --all-targets -- -D warnings`.
-  Tests: `cargo test -p amux-server`.
+  Tests: `scripts/test-contended.sh -p amux-server` (same args as `cargo test`, same exit status).
+  **A red suite here is not automatically a regression.** This box builds and tests amux
+  continuously, so the auto-builder can rewrite the shared binary while your tests spawn it,
+  and the ETXTBSY family surfaces as failures in modules you never touched (AMUX-3853: 8
+  failures in `opencode::structured`, 15/15 green on an immediate rerun). Plain `cargo test`
+  cannot tell you which kind of run you got, so every green also silently means "and nothing
+  was building" and every red looks like your fault. The wrapper prints that missing clause
+  beside the result, in both directions. Use plain `cargo test` when you want the raw thing.
+
+## Verification
+
+`VERIFY.md` names the proof for each surface: the literal command, and what a
+pass looks like. The board refuses `done` without evidence (AF-321) and its
+refusal points here.
+
+Paste the command AND its result line into `--evidence`. A command with no
+result is a claim that you ran it.
+
+```bash
+amux board done <ID> --evidence-stdin <<'EOF'
+scripts/test-contended.sh -p amux-server -> test result: ok. 1571 passed
+EOF
+```
+
+`none: <reason>` is the honest answer when a card genuinely produced no artifact.
+It is stored and counted, not a bypass.
 
 ## Observability
 
@@ -71,6 +96,14 @@ Use the server's diagnostic endpoints before writing a grep:
 | `GET /api/health/invariants` | Failing invariants (passing ones only visible in `/api/debug/invariants`) |
 | `GET /api/debug/sse?since_h=24` | Is the realtime backbone carrying the fleet, or has it dropped clients onto polling? `live_connections` + `opened_total` (per-PROCESS: the builder restarts this binary on every commit and all SSE connections die with it) joined with `stale_reconnects`, the client-side beacon fired at the 18s zombie trigger. Neither half answers alone — from the server a reconnect looks like a laptop lid; only the client knows it declared the stream stale. A 0 shortly after a deploy is a ramp-up, not a verdict; `live_connections` is the discriminator. |
 | `GET /api/debug/tmux` | Fleet discovery from inside the server |
+
+**Read `measured` before you read the number.** Every diagnostic endpoint
+answers with `measured` (did the probe run) and `n_considered` (how big the
+population was). `total_errors: 0, measured: true, n_considered: 4210` is a
+quiet window; `total_errors: 0, measured: false` is a probe that never ran, and
+`why_unmeasured` says what stopped it. Those two used to be the same payload,
+which is 41 of 83 frustration entries (AF-320). A new diagnostic route without
+both fields fails `tests/diagnostic_contract.rs`.
 
 Raw logs: `~/.amux/logs/server-rs.log`
 

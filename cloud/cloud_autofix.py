@@ -155,13 +155,19 @@ print("restored %%d keys" %% len(merged))
 
 
 def fix_logs():
+    # `truncate -s 0`, NOT open(f,"w").close(). Replacing the file contents out
+    # from under the docker daemon WEDGES `docker logs` for that container until
+    # it is restarted — measured 2026-08-27: an open()-truncate of 7 live json
+    # logs left all 7 `docker logs` hanging, which crashed the backup-freshness
+    # sweep. `truncate` keeps the same inode/offset the daemon is tracking, so the
+    # log reader stays healthy. journald vacuum is unaffected.
     out = ssh(r'''
 import subprocess, glob, os
 n = 0
 for f in glob.glob("/var/lib/docker/containers/*/*-json.log"):
     try:
         if os.path.getsize(f) > 20*1024*1024:
-            open(f, "w").close(); n += 1
+            subprocess.run(["truncate", "-s", "0", f], timeout=10); n += 1
     except Exception: pass
 subprocess.run(["journalctl", "--vacuum-size=100M"], capture_output=True)
 print("truncated %d logs" % n)
@@ -182,15 +188,39 @@ def restart_gateway():
 def escalate_board(summary, detail):
     """Board-only escalation: for problems worth a human's queue but not the owner
     fire-alarm (e.g. cloud serves traffic fine but the env-check instrument is down).
-    escalate() layers the alert on top of this for real outages."""
+    escalate() layers the alert on top of this for real outages.
+
+    DEDUPED by title-prefix: a persistent condition (a multi-day CI freeze, a
+    standing warn) must UPDATE its existing open card, not file a new one every
+    daily run — otherwise the sweep accumulates instead of discriminating (ethos
+    rule 5; the AC-344 freeze escalation would have spawned one card per day)."""
     trace("escalate_board", summary, None)
+    title = "cloud-autofix: %s" % summary
+    # A stable key: the summary up to its first em-dash/number so "FROZEN — 4
+    # commits" and "FROZEN — 5 commits" collapse to one running card.
+    key = title.split("—")[0].strip().rstrip("0123456789 ")
     try:
         base = subprocess.run(["amux", "url"], capture_output=True, text=True, timeout=10).stdout.strip()
-        subprocess.run(["curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
-                        "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
-                        "-d", json.dumps({"title": "cloud-autofix: %s" % summary, "desc": detail,
-                                          "status": "needsyou", "session": "amux-cloud"}),
-                        "%s/api/board" % base], capture_output=True, text=True, timeout=15)
+        existing = None
+        rows = subprocess.run(["curl", "-sk", "%s/api/board" % base],
+                              capture_output=True, text=True, timeout=15).stdout
+        for it in json.loads(rows):
+            t = it.get("title") or ""
+            if t.split("—")[0].strip().rstrip("0123456789 ") == key and it.get("status") in ("needsyou", "todo", "doing"):
+                existing = it.get("id"); break
+        if existing:
+            # Refresh title + append a dated line; keep the human's context intact.
+            subprocess.run(["curl", "-sk", "-X", "PATCH", "-H", "Content-Type: application/json",
+                            "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
+                            "-d", json.dumps({"title": title,
+                                              "desc_append": "\n\n[autofix re-observed %d] %s" % (int(time.time()), detail)}),
+                            "%s/api/board/%s" % (base, existing)], capture_output=True, text=True, timeout=15)
+        else:
+            subprocess.run(["curl", "-sk", "-X", "POST", "-H", "Content-Type: application/json",
+                            "-H", "X-Amux-Session:%s" % os.environ.get("AMUX_SESSION", "cloud-autofix"),
+                            "-d", json.dumps({"title": title, "desc": detail,
+                                              "status": "needsyou", "session": "amux-cloud"}),
+                            "%s/api/board" % base], capture_output=True, text=True, timeout=15)
     except Exception:
         pass
 
@@ -240,6 +270,87 @@ def check_envs(retries=1):
     return last
 
 
+def check_deploy_freshness():
+    """Is the cloud image behind origin/main, and WHY (AC-344). The auto-deploy
+    (deploy-cloud.yml) is gated on green rust CI via workflow_run, so when main CI
+    is RED the deploy shows 'skipped' — byte-identical to 'nothing to deploy'. The
+    image then freezes and falls behind, invisibly, until a human notices; the card
+    records this happening 3x, each caught by hand. This joins the three signals no
+    single view joins — last successful deploy sha, origin/main tip, and rust CI
+    status — and names the cause: FROZEN (behind + CI red) vs normal lag (behind +
+    CI green, auto-deploy will catch up) vs current. Runs locally (gh + git)."""
+    def sh(*a):
+        try:
+            return subprocess.run(a, capture_output=True, text=True, timeout=30, cwd=REPO).stdout.strip()
+        except Exception:
+            return ""
+    sh("git", "fetch", "origin", "-q")
+    deployed = sh("gh", "run", "list", "--workflow=deploy-cloud.yml", "-L", "20",
+                  "--json", "headSha,conclusion", "-q",
+                  'map(select(.conclusion=="success"))[0].headSha')
+    if not deployed:
+        return {"error": "no successful deploy-cloud run found (gh failed?)"}
+    behind = sh("git", "rev-list", "--count", "%s..origin/main" % deployed)
+    behind = int(behind) if behind.isdigit() else -1
+    res = {"deployed": deployed[:12], "behind": behind}
+    if behind <= 0:
+        res["state"] = "current"
+        return res
+    # Behind — is main CI red (frozen) or green (normal lag)?
+    ci = sh("gh", "run", "list", "--workflow=rust.yml", "--branch=main", "-L", "1",
+            "--json", "conclusion,headSha,status", "-q", ".[0]")
+    try:
+        ci = json.loads(ci) if ci else {}
+    except Exception:
+        ci = {}
+    concl = ci.get("conclusion")
+    res["ci_conclusion"] = concl
+    if concl == "failure":
+        res["state"] = "FROZEN"  # behind AND CI red -> auto-deploy is silently skipping
+    elif ci.get("status") in ("in_progress", "queued"):
+        res["state"] = "deploying"  # CI running, catch-up in flight
+    else:
+        res["state"] = "lag"  # behind but CI green -> normal, will catch up
+    return res
+
+
+def check_disk():
+    """Root-disk usage AND a breakdown of the top consumers when it is high.
+    AC-348: the disk-full alarm fires but names no cause, so every incident meant
+    SSHing to run du/docker-system-df by hand (2026-08-27: 94% full, and the 6.7G
+    the tools called 'reclaimable' was actually pinned to running containers, so
+    the honest remedy was not a prune). This makes the NEXT climb self-explain:
+    when disk >= 85% it reports docker image/volume reclaimable, oversized logs,
+    and the same-host backup dir, so a human sees WHERE before deciding what is
+    safe to touch (volumes may be customer data — never auto-pruned, ethos 8)."""
+    out = ssh(r'''
+import json, subprocess, os
+def run(*a):
+    try: return subprocess.run(a, capture_output=True, text=True, timeout=40).stdout.strip()
+    except Exception: return ""
+st = os.statvfs("/")
+pct = round(100.0 * (st.f_blocks - st.f_bfree) / st.f_blocks, 1)
+free_gb = round(st.f_bavail * st.f_frsize / 1e9, 1)
+res = {"pct": pct, "free_gb": free_gb}
+if pct >= 85:
+    top = {}
+    for line in run("docker","system","df","--format","{{.Type}}\t{{.Reclaimable}}").splitlines():
+        p = line.split("\t")
+        if len(p) == 2: top[p[0]] = p[1]
+    res["docker_reclaimable"] = top
+    bk = run("du","-sh","/var/amux/backups")
+    res["backups_dir"] = bk.split()[0] if bk else "0"
+    big = [l for l in run("bash","-c",
+        "find /var/lib/docker/containers -name '*-json.log' -size +20M -exec du -h {} + 2>/dev/null | sort -rh | head -3").splitlines()]
+    res["oversized_logs"] = big
+print(json.dumps(res))
+''', timeout=60)
+    try:
+        return json.loads(out)
+    except Exception:
+        return {"error": (out.strip()[:100] if out and out.strip() else "ssh returned no output (host unreachable or command produced nothing)")}
+
+
 def check_backups():
     """Litestream replication freshness for every RUNNING env. Litestream->S3 is
     the real backup of customer DBs (the nightly backup-cloud.yml workflow made
@@ -259,9 +370,18 @@ now = datetime.datetime.now(datetime.timezone.utc)
 for n in running:
     env = n[len("amux-user-"):]
     ls = "amux-litestream-" + env
-    # litestream logs go to stderr — capture both streams
-    tail = subprocess.run(["docker","logs","--tail","40",ls], capture_output=True, text=True, timeout=30)
-    text = (tail.stdout or "") + (tail.stderr or "")
+    # litestream logs go to stderr — capture both streams. GUARD the call: a
+    # single container whose `docker logs` HANGS (a truncated json-log can wedge
+    # docker's log reader) must not crash the whole sweep — before this guard one
+    # hung sidecar raised TimeoutExpired here and the entire check returned empty,
+    # so 7 healthy envs went unreported (2026-08-27). Short 10s timeout so 8
+    # containers stay well inside the ssh budget.
+    try:
+        tail = subprocess.run(["docker","logs","--tail","40",ls], capture_output=True, text=True, timeout=10)
+        text = (tail.stdout or "") + (tail.stderr or "")
+    except Exception:
+        stale.append(env + " (docker logs timed out — sidecar log reader wedged, restart it)")
+        continue
     if "No such container" in text or not text.strip():
         stale.append(env + " (no litestream sidecar)")
         continue
@@ -286,7 +406,7 @@ print(json.dumps({"running": len(running), "fresh": fresh, "stale": stale}))
     try:
         return json.loads(out)
     except Exception:
-        return {"error": (out or "")[:100]}
+        return {"error": (out.strip()[:100] if out and out.strip() else "ssh returned no output (host unreachable or command produced nothing)")}
 
 
 def check_orphans():
@@ -335,7 +455,7 @@ except Exception as e:
     try:
         return json.loads(out)
     except Exception:
-        return {"error": (out or "")[:100]}
+        return {"error": (out.strip()[:100] if out and out.strip() else "ssh returned no output (host unreachable or command produced nothing)")}
 
 
 def main():
@@ -389,6 +509,42 @@ def main():
         # Backup freshness (AMUX-2802): litestream->S3 is the real customer-DB
         # backup; nine days of silent backup absence is the incident this check
         # exists to make impossible to repeat.
+        # Deploy freshness + WHY-behind (AC-344): a silent freeze self-announces.
+        result["deploy"] = check_deploy_freshness()
+        _dep = result["deploy"]
+        if _dep.get("error"):
+            trace("deploy", "freshness probe: %s" % _dep["error"], None)
+        else:
+            trace("deploy", "deployed=%s behind=%s state=%s%s" % (
+                _dep.get("deployed"), _dep.get("behind"), _dep.get("state"),
+                (" ci=%s" % _dep.get("ci_conclusion")) if _dep.get("ci_conclusion") else ""),
+                _dep.get("state") != "FROZEN")
+            if _dep.get("state") == "FROZEN" and not env_problem:
+                env_problem = ("cloud image FROZEN — %s commits behind, main CI is RED" % _dep.get("behind"),
+                               "deploy-cloud auto-deploy is gated on green rust CI, so a red main freezes the "
+                               "image and shows 'skipped' (looks like nothing-to-deploy). deployed=%s, behind=%s, "
+                               "rust.yml main conclusion=failure. Fix the red main, or dispatch deploy-cloud manually "
+                               "once it is green. This is AC-344's exact failure, now self-announcing."
+                               % (_dep.get("deployed"), _dep.get("behind")))
+
+        # Root-disk usage + top-consumer breakdown when high (AC-348).
+        result["disk"] = check_disk()
+        _disk = result["disk"]
+        if _disk.get("error"):
+            trace("disk", "ERROR: %s" % _disk["error"], False)
+        else:
+            hi = _disk.get("pct", 0) >= 90
+            extra = ""
+            if _disk.get("docker_reclaimable"):
+                extra = " | docker=%s backups=%s" % (_disk.get("docker_reclaimable"), _disk.get("backups_dir"))
+            trace("disk", "root %.1f%% used, %.1fGB free%s" % (_disk.get("pct", 0), _disk.get("free_gb", 0), extra), not hi)
+            if hi and not env_problem:
+                env_problem = ("root disk at %.1f%% (%.1fGB free)" % (_disk.get("pct"), _disk.get("free_gb")),
+                               "Top consumers — docker reclaimable: %s; same-host backups: %s; oversized logs: %s. "
+                               "NOTE: 'reclaimable' images may be pinned to running containers (freed only by a "
+                               "recreate), and unused VOLUMES may be customer data — never auto-prune volumes (ethos 8)."
+                               % (_disk.get("docker_reclaimable"), _disk.get("backups_dir"), _disk.get("oversized_logs")))
+
         result["backups"] = check_backups()
         _stale = result["backups"].get("stale") or []
         if result["backups"].get("error"):

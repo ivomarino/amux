@@ -168,6 +168,108 @@ if [ -f "$TMP/sacrifice/.amux/rust-build-target/marker" ]; then
   bad "(i) the shared target dir should have been deleted below the sacrifice line" "$out5"
 else ok; fi
 
+# ---------------------------------------------------------------------------
+# THE DEBUG-ARTIFACT ARM (AF-303). It shipped with NO coverage here at all,
+# which is how its comment came to say "always safe to remove" two lines below
+# its own statement that fleet sessions' cargo check/test land in debug/. Those
+# artifacts are what every lane is building against; safe for THIS BUILDER does
+# not imply safe. Measured from the live log before the fix: 13 debug clears
+# against 1 clear of the shared release cache, because the release cache is
+# gated behind severe disk pressure and this fired on SIZE alone, every cycle.
+#
+# `-1` as the threshold makes an empty fixture dir exceed it, so these need no
+# multi-GB fixture. HOME is faked, so the real shared target dir is untouched.
+# ---------------------------------------------------------------------------
+dbg_run() { # $1 = fake HOME leaf, $2 = MIN_FREE_GB, $3 = peer-pid override
+  local h="$TMP/$1"; local lg="$h/build.log"
+  mkdir -p "$h/.amux/rust-build-target/debug"
+  : > "$h/.amux/rust-build-target/debug/marker"
+  HOME="$h" \
+  AMUX_RS_BUILD_LOG="$lg" \
+  AMUX_BUILD_MIN_FREE_GB="$2" \
+  AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 \
+  AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
+  AMUX_BUILD_PEER_PIDS_OVERRIDE="$3" \
+  AMUX_RS_DISK_CLEAR_ONLY=1 \
+    bash "$SCRIPT" >/dev/null 2>&1
+  cat "$lg" 2>/dev/null
+}
+
+# (j) A PEER IS BUILDING and disk is healthy: DEFER. This is the whole card.
+out6=$(dbg_run peerbuild 0 "4242")
+if printf '%s\n' "$out6" | grep -q "DEFERRED"; then ok
+else bad "(j) with a peer build in flight and healthy disk the clear must DEFER" "$out6"; fi
+if [ -f "$TMP/peerbuild/.amux/rust-build-target/debug/marker" ]; then ok
+else bad "(j) a peer's debug artifacts must SURVIVE the deferral" "$out6"; fi
+
+# (k) NO peer building: clear as before. Without this, a fix that simply never
+#     cleared would pass (j) while handing back the 229GB unbounded growth.
+out7=$(dbg_run nopeer 0 "")
+if printf '%s\n' "$out7" | grep -q "Clearing"; then ok
+else bad "(k) with no peer build in flight the clear must still happen" "$out7"; fi
+if [ -f "$TMP/nopeer/.amux/rust-build-target/debug/marker" ]; then
+  bad "(k) debug/ should have been removed when no peer is building" "$out7"
+else ok; fi
+
+# (l) A peer IS building but disk is BELOW the fleet floor: ENOSPC outranks the
+#     peer, because running out of disk breaks the lane being protected too.
+#     A deferral with no override is a disk-full outage with better manners.
+out8=$(dbg_run peerbutfull 999999 "4242")
+if printf '%s\n' "$out8" | grep -q "Clearing"; then ok
+else bad "(l) below the fleet floor the clear must override a peer build" "$out8"; fi
+if printf '%s\n' "$out8" | grep -q "ENOSPC outranks"; then ok
+else bad "(l) the override must SAY it overrode a peer, not clear silently" "$out8"; fi
+
+# (m) THE DETECTOR'S PRECISION, exercised for real with NO override. A process
+#     whose COMMAND LINE merely mentions cargo must not read as a build: the
+#     first cut used `pgrep -f` and matched the very shell that ran it, because
+#     that command line contained the word. On this box, where lanes grep for
+#     cargo constantly, that detector defers every cycle forever and quietly
+#     restores the unbounded growth the clear exists to stop.
+#
+#     SKIPPED HONESTLY, never passed, when a real toolchain process is running:
+#     the precondition cannot be established then, and a green under those
+#     conditions would mean nothing.
+# READ THE OUTPUT, NOT THE EXIT CODE. `{ a; b; }` has the exit status of `b`
+# ALONE, so the first cut of this guard reported "a build is running" purely on
+# whether `pgrep -x cargo` matched, ignoring rustc entirely - and rustc is the
+# process that is actually running for most of a build. It skipped when it
+# should have run and would have run when it should have skipped.
+#
+# (An earlier version of this comment claimed macOS `pgrep -x` exits 0 with
+# empty output. That was wrong: measured on an idle host it exits 1, exactly
+# like GNU. The 0 I read came from a sample taken while a build was in flight,
+# and I generalised a platform quirk out of one contaminated measurement.
+# Recorded rather than deleted, because the next reader will be tempted to
+# "fix" this back to an exit-code test.)
+#
+# The shipped detector consumes the output too, so it is unaffected either way.
+_real_builds="$( { pgrep -x rustc; pgrep -x cargo; } 2>/dev/null | tr -d '[:space:]')"
+if [ -n "$_real_builds" ]; then
+  echo "SKIP (m): a real cargo/rustc is running on this host, so the no-peer"
+  echo "         precondition cannot be established. Not counted as a pass."
+else
+  sh -c 'sleep 5 # cargo rustc build' & DECOY=$!
+  sleep 1
+  h="$TMP/decoy"; mkdir -p "$h/.amux/rust-build-target/debug"
+  : > "$h/.amux/rust-build-target/debug/marker"
+  out9=$(HOME="$h" AMUX_RS_BUILD_LOG="$h/build.log" AMUX_BUILD_MIN_FREE_GB=0 \
+    AMUX_BUILD_SACRIFICE_CACHE_BELOW_GB=0 AMUX_BUILD_DEBUG_CLEAR_ABOVE_GB=-1 \
+    AMUX_RS_DISK_CLEAR_ONLY=1 bash "$SCRIPT" >/dev/null 2>&1; cat "$h/build.log" 2>/dev/null)
+  kill "$DECOY" 2>/dev/null; wait "$DECOY" 2>/dev/null
+  # PROVE THE PROBE RAN before believing its negative (ethos rule 4). This cell
+  # asserted only the ABSENCE of "DEFERRED", and a script that died before
+  # reaching the decision produces exactly that log. It did: the first cut of
+  # the detector killed the builder under `set -euo pipefail` on an idle host,
+  # and this cell stayed green through it. The positive that must appear beside
+  # the negative is the clear line itself.
+  if printf '%s\n' "$out9" | grep -q "DEBUG ARTIFACTS"; then ok
+  else bad "(m) the script must REACH the debug decision, not die before it" "$out9"; fi
+  if printf '%s\n' "$out9" | grep -q "DEFERRED"; then
+    bad "(m) a command line that merely MENTIONS cargo must not read as a build" "$out9"
+  else ok; fi
+fi
+
 echo
 echo "test-build-disk-clear: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
