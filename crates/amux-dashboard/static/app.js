@@ -8262,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.763';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.764';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -20751,16 +20751,31 @@ function switchView(view) {
   // Persist the tab to localStorage so it survives iOS evicting the backgrounded
   // PWA (which wipes sessionStorage but keeps localStorage) — restored on load.
   try { localStorage.setItem('amux_ui_view', JSON.stringify({ v: view, ts: Date.now() })); } catch(e) {}
-  const _svIds = ['session', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
-  const _svNames = ['sessions', 'board', 'groups', 'calendar', 'scheduler', 'files', 'mdai', 'proxies', 'logs', 'messages', 'skills', 'sql', 'map', 'metrics', 'cost', 'torrents', 'terminal', 'browser', 'graph', 'connectors'];
-  // MUST stay index-aligned with _svIds/_svNames above (20 entries). It once had
-  // 18 for 19 ids, so 'graph' ran off the end and took the '' fallback by accident.
-  const _svDisplay = ['', '', '', 'flex', '', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', 'flex', '', 'flex', 'flex', 'flex'];
-  for (let i = 0; i < _svIds.length; i++) {
-    const ve = document.getElementById(_svIds[i] + '-view');
-    if (ve) ve.style.display = view === _svNames[i] ? (_svDisplay[i] || '') : 'none';
-    const te = document.getElementById('tab-' + _svNames[i]);
-    if (te) te.classList.toggle('active', view === _svNames[i]);
+  // ONE ROW PER VIEW: [domIdPrefix, tabName, display]. This was three PARALLEL
+  // ARRAYS that had to stay index-aligned, and the alignment had already failed
+  // once — the old comment recorded 18 display entries for 19 ids, so 'graph'
+  // ran off the end and took the '' fallback by accident.
+  //
+  // It failed again adding 'email' (AMUX-3998): the tab and the view existed,
+  // the click fired, and the body stayed blank because the name was in none of
+  // the three lists. A structure where forgetting one of three edits produces a
+  // silently blank screen is the bug, not the omission. Triples cannot
+  // misalign — a new view is one row or it is absent, never half-present.
+  const _svViews = [
+    ['session', 'sessions', ''], ['board', 'board', ''], ['groups', 'groups', ''],
+    ['calendar', 'calendar', 'flex'], ['scheduler', 'scheduler', ''],
+    ['files', 'files', 'flex'], ['mdai', 'mdai', 'flex'], ['proxies', 'proxies', 'flex'],
+    ['logs', 'logs', 'flex'], ['messages', 'messages', 'flex'], ['skills', 'skills', 'flex'],
+    ['sql', 'sql', 'flex'], ['map', 'map', 'flex'], ['metrics', 'metrics', 'flex'],
+    ['cost', 'cost', 'flex'], ['torrents', 'torrents', 'flex'], ['terminal', 'terminal', ''],
+    ['browser', 'browser', 'flex'], ['graph', 'graph', 'flex'],
+    ['email', 'email', 'flex'], ['connectors', 'connectors', 'flex'],
+  ];
+  for (const [domId, name, display] of _svViews) {
+    const ve = document.getElementById(domId + '-view');
+    if (ve) ve.style.display = view === name ? (display || '') : 'none';
+    const te = document.getElementById('tab-' + name);
+    if (te) te.classList.toggle('active', view === name);
   }
   if (view === 'groups') { _renderGroupsTab(); fetchBoard().then(() => _renderGroupsTab()); }
   if (view === 'calendar') { fetchBoard().then(() => { _fcInit(); }); }
