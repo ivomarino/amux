@@ -8262,7 +8262,7 @@ async function saveGlobalMemory() {
   }
 }
 
-const APP_VER = '0.9.761';   // bump together with the sw.js CACHE version
+const APP_VER = '0.9.762';   // bump together with the sw.js CACHE version
 
 // ── No silent failures (Ethan, 2026-08-09: "make sure every action has some
 // kind of response in the ui — i just deleted a worker and nothing happened").
@@ -11582,7 +11582,16 @@ async function _approvalsRefresh() {
     if (!r.ok) return;
     const d = await r.json();
     const pending = Array.isArray(d.pending) ? d.pending : [];
-    if (!pending.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
+    // PERMISSION GRANTS SHARE THIS BANNER (AMUX-3997). Ethan asked for the email
+    // approval flow to be leveraged for other ad-hoc permissions, and "leverage"
+    // has to include the SURFACE: a second banner elsewhere would mean a human
+    // has two places to look before knowing whether anything is waiting.
+    let grants = [];
+    try {
+      const gr = await fetch(API + '/api/grants', { headers: _authHeaders() });
+      if (gr.ok) { const gd = await gr.json(); grants = Array.isArray(gd.pending) ? gd.pending : []; }
+    } catch (e) { /* the email queue still renders if grants are unreachable */ }
+    if (!pending.length && !grants.length) { el.style.display = 'none'; el.innerHTML = ''; return; }
     // COLLAPSIBLE (Ethan, 2026-08-25: "i should be able to collapse this").
     //
     // This is a full-width block at the top of a mobile-first dashboard, and it
@@ -11617,12 +11626,32 @@ async function _approvalsRefresh() {
       + 'title="' + (collapsed ? 'Show the drafts' : 'Collapse') + '">'
       + '<span style="display:inline-block;width:1em;transition:transform .12s;'
       + 'transform:rotate(' + (collapsed ? '-90' : '0') + 'deg);">&#x25BE;</span>'
-      + '<span>&#x2709;&#xFE0F; ' + pending.length + ' external email'
-      + (pending.length === 1 ? '' : 's') + ' held for your approval</span></div>';
+      + '<span>' + _apprHeadline(pending.length, grants.length) + '</span></div>';
     if (collapsed) {
       el.innerHTML = html + '</div>';
       el.style.display = 'block';
       return;
+    }
+    for (const g of grants) {
+      const gp = g.payload || {};
+      const gmins = Math.max(1, Math.round((g.expires_in_s || 0) / 60));
+      html += '<details open style="margin:4px 0;text-align:left;">'
+        + '<summary style="cursor:pointer;display:flex;align-items:center;gap:10px;min-height:34px;">'
+        + '<span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">'
+        + '&#x1F511; <b>' + esc(g.requested_by || '?') + '</b> wants to message <b>'
+        + esc(gp.target || '?') + '</b> across a group boundary</span>'
+        + '<span style="opacity:0.7;font-size:0.76rem;">expires in ' + gmins + 'm</span>'
+        + '<button onclick="event.preventDefault();_grantApprove(\'' + esc(g.id) + '\',this)" '
+        + 'style="background:#16a34a;color:#fff;border:none;border-radius:6px;'
+        + 'padding:8px 14px;font-size:0.8rem;cursor:pointer;min-height:34px;">Allow once</button>'
+        + '<button onclick="event.preventDefault();_grantReject(\'' + esc(g.id) + '\',this)" '
+        + 'style="background:transparent;color:#fff;border:1px solid rgba(255,255,255,0.45);'
+        + 'border-radius:6px;padding:8px 14px;font-size:0.8rem;cursor:pointer;'
+        + 'min-height:34px;min-width:44px;">Deny</button>'
+        + '</summary>'
+        + '<div style="white-space:pre-wrap;word-break:break-word;background:rgba(0,0,0,0.25);'
+        + 'border-radius:6px;padding:8px 10px;margin:6px 0;font-size:0.8rem;max-height:220px;overflow:auto;">'
+        + esc(gp.preview || '(no message preview)') + '</div></details>';
     }
     for (const p of pending) {
       const pv = p.preview || {};
@@ -11655,11 +11684,47 @@ async function _approvalsRefresh() {
         + (pv.cc ? 'cc: ' + esc(pv.cc) + '\n' : '')
         + esc(pv.body || '') + '</div></details>';
     }
-    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">Nothing sends without Approve. Discard drops a draft now and records who dropped it; unapproved drafts also expire on their own.</div></div>';
+    html += '<div style="opacity:0.65;font-size:0.74rem;margin-top:4px;">'
+      + (grants.length ? 'Allow once releases exactly ONE message to that worker, then the wall is back. ' : '')
+      + 'Nothing sends without Approve. Discard drops a draft now and records who dropped it; unapproved drafts also expire on their own.</div></div>';
     el.innerHTML = html;
     el.style.display = 'block';
   } catch (e) {}
 }
+// Says what is waiting WITHOUT flattening two different asks into one noun. An
+// email draft and a permission grant need different decisions from the reader.
+function _apprHeadline(emails, grants) {
+  const parts = [];
+  if (grants) parts.push('\u{1F511} ' + grants + ' permission request' + (grants === 1 ? '' : 's'));
+  if (emails) parts.push('\u2709\uFE0F ' + emails + ' external email' + (emails === 1 ? '' : 's'));
+  return parts.join(' \u00B7 ') + ' held for your approval';
+}
+
+async function _grantApprove(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Allowing…'; }
+  try {
+    // NO auth-session header on purpose: the server reads its absence as "this
+    // is the human". Sending one here would make the dashboard look like a
+    // worker approving its own grant, which is exactly what the gate refuses.
+    const r = await fetch(API + '/api/grants/' + encodeURIComponent(id) + '/approve', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'approve failed'); if (btn) { btn.disabled = false; btn.textContent = 'Allow once'; } return; }
+    showToast(d.note || 'Allowed once');
+  } catch (e) { showToast('approve failed: ' + String(e)); }
+  _approvalsRefresh();
+}
+
+async function _grantReject(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'Denying…'; }
+  try {
+    const r = await fetch(API + '/api/grants/' + encodeURIComponent(id) + '/reject', { method: 'POST' });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok || d.error) { showToast(d.error || 'deny failed'); if (btn) { btn.disabled = false; btn.textContent = 'Deny'; } return; }
+    showToast('Denied');
+  } catch (e) { showToast('deny failed: ' + String(e)); }
+  _approvalsRefresh();
+}
+
 function _apprToggle() {
   const now = localStorage.getItem('amuxApprCollapsed') === '1' ? '0' : '1';
   localStorage.setItem('amuxApprCollapsed', now);

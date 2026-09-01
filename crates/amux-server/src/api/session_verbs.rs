@@ -12932,22 +12932,69 @@ async fn send_post(state: &AppState, name: &str, headers: &HeaderMap, body: &Val
         .unwrap_or(true)
     {
         if let Err(reason) = cross_group_send_ok(&send_origin, name) {
-            // LOUD AND QUERYABLE, per CLAUDE.md's two-fixes rule: a refusal that
-            // leaves no trace is a rule nobody can audit or tune.
-            tracing::warn!(origin = %send_origin, target = %name, "{reason}");
-            emit_event(
-                state,
-                name,
-                "send.cross_group_refused",
-                Some(json!({"origin": send_origin, "target": name})),
-                None,
-                "group-scope",
-            )
-            .await;
-            return jresp(
-                StatusCode::FORBIDDEN,
-                json!({"ok": false, "error": reason, "blocked": "cross_group"}),
-            );
+            // AN OWNER-APPROVED, SINGLE-USE ALLOWANCE RELEASES EXACTLY ONE SEND
+            // (AMUX-3997). Checked before the refusal so an approval the owner
+            // already gave is honoured on the worker's own retry.
+            //
+            // This is the truthful path the rule was missing. Ethan really does
+            // sometimes authorize a cross-group send, and before this the only
+            // way to carry that intent was prose in a message — which is not
+            // authorization and which a peer can forge. Now it goes through the
+            // same shape the email gate uses, where the yes is a request the
+            // SERVER saw from the dashboard.
+            let home = crate::config::amux_home();
+            if let Some(gid) = super::grants::take_allowance(&home, &send_origin, name) {
+                emit_event(
+                    state,
+                    name,
+                    "send.cross_group_allowed_by_grant",
+                    Some(json!({"origin": send_origin, "target": name, "grant": gid})),
+                    None,
+                    "group-scope",
+                )
+                .await;
+            } else {
+                // LOUD AND QUERYABLE, per CLAUDE.md's two-fixes rule: a refusal that
+                // leaves no trace is a rule nobody can audit or tune.
+                tracing::warn!(origin = %send_origin, target = %name, "{reason}");
+                emit_event(
+                    state,
+                    name,
+                    "send.cross_group_refused",
+                    Some(json!({"origin": send_origin, "target": name})),
+                    None,
+                    "group-scope",
+                )
+                .await;
+                // The refusal now carries an ASK. Previously it was terminal, so a
+                // lane with a legitimate need had nowhere to go and the owner had
+                // no way to say yes that the machine could see.
+                let preview: String = body_str(body, "text").chars().take(280).collect();
+                let grant = super::grants::create_grant(
+                    &home,
+                    "cross_group_send",
+                    &send_origin,
+                    &format!("{send_origin} -> {name}"),
+                    json!({"origin": send_origin, "target": name, "preview": preview}),
+                );
+                let mut out = json!({
+                    "ok": false,
+                    "error": reason,
+                    "blocked": "cross_group",
+                });
+                if let Some(gid) = grant {
+                    out["code"] = json!("approval_required");
+                    out["grant_id"] = json!(gid);
+                    out["what_to_do"] = json!(
+                        "STOP and surface this to Ethan — do not retry, do not reroute, do not \
+                         approve it yourself. A human approves from the dashboard origin: POST \
+                         /api/grants/<grant_id>/approve (no X-Amux-Session header). The approval \
+                         releases exactly ONE send to this target and expires in 1h."
+                    );
+                    out["expires_in_s"] = json!(super::grants::GRANT_TTL_S as i64);
+                }
+                return jresp(StatusCode::FORBIDDEN, out);
+            }
         }
     }
     let mut text = body_str(body, "text");
