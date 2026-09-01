@@ -3543,3 +3543,87 @@ FIXED 2026-08-31 in the commit naming AF-356. The wrapper now captures the dirty
   only) fails exactly (c2) and (d).
 
 ---
+
+## The nudge that tells you to union-merge cannot tell you how to do it safely
+VALIDATED: mixpeek-frustrations | mixpeek-frustrations, who ORIGINATED this entry, verified all four criteria itself
+rather than accepting the fixer's report, and asked for it to be archived.
+
+LIVE, NOT MERELY MERGED. It took the commit from the SERVING artifact, not from the
+branch: GET /api/health -> commit 892633a52052, and `git merge-base --is-ancestor
+e0e2d54a 892633a52052` is true. Confirmed independently from amux-frustrations at
+archive time: same health commit, e0e2d54a (2026-08-31) is an ancestor of it, and
+the serving commit's own source carries the recipe at both render sites (4
+occurrences of the merge-file invocation in commit_nudge.rs: 2 rendered, 2
+asserted).
+
+REGRESSION CONTROL, mutation-tested in BOTH directions, which this entry
+specifically demands because its subject is a guard that could not see its own
+subject. Stripping the recipe from build() failed
+diverged_paths_get_their_own_section_and_leave_both_recipes, alone. Stripping it
+from commit_worthy_body() failed
+the_protocols_diverged_bullet_carries_the_merge_it_prescribes, alone. Restored: 6
+passed, 0 failed. Each site has an independent guard and neither passes vacuously.
+
+VALIDATED RATHER THAN SUPERSEDED, on the originator's own reasoning: its note had
+allowed for SUPERSEDED if "hand the path to its owner" were the right terminal
+answer. It is not. `git merge-file -p` computes the merge without writing the file
+and returns the conflict COUNT as its exit status, so handing the path over becomes
+a decision made KNOWING that number instead of in place of knowing it. The entry's
+mechanism was right and the fix is what the entry asked for.
+
+TWO TRANSFERABLE FINDINGS, both from the fixing lane (amux) and neither visible to
+the lane that measured the symptom:
+
+  The same bare directive existed TWICE, rendered by two different functions. The
+  originator measured one arm. Fixing only what was measured would have left the
+  other arm bare, and that arm's own test could not see the second site.
+
+  The existing test asserted contains("MERGE the two versions"). The replacement
+  text QUOTES that directive while describing it as former behaviour, so the
+  assertion stayed green across a rewrite that removed the prescription entirely.
+  Caught by running the test EXPECTING RED and getting ok. A check that a quotation
+  satisfies is pinning the words, not the property.
+
+The fixing lane (amux) is an isolated raw-agent worker and cannot be reached by peer
+send; nothing was needed from it, since the originator is the party whose signature
+the protocol requires.
+
+While verifying, mixpeek-frustrations applied and reverted both mutations in this
+shared checkout and reported it: the file was restored to the state it was FOUND in
+(not to HEAD), `cmp` identical against its backup, leaving ts-gke's 184 uncommitted
+insertions on top of the committed fix untouched.
+AREA: notices
+SEVERITY: blocks
+STATUS: fixed
+DATE: 2026-08-25
+SESSION: mixpeek-frustrations (hit it), amux (fixed it)
+CARD: AMUX-3718
+SYMPTOM: A DIVERGED FRUSTRATIONS.md nudge said `MERGE the two versions (for
+  append-only files, union-merge per .claude/rules/frustrations.md)` and stopped
+  there. Two things were wrong at once. The cited path exists in ~/Dev/amux and
+  NOT in ~/Dev/mixpeek, where the reader was, because commit_nudge is server
+  code that fires into every lane's OWN checkout. And the safe procedure it was
+  pointing at could never have arrived anyway: `build()` defines commit_worthy
+  as the dirty paths that are NOT stale/diverged/revived, and the archive-check
+  note was emitted from inside `commit_worthy_body`, which receives exactly that
+  set. So a DIVERGED append-only file was structurally excluded from the only
+  code that emits the archive check. The one state that prescribes a union-merge
+  was the one state that could not be told how to perform it.
+COST: A near-miss on real data. The lane followed the destructive half verbatim,
+  which would have resurrected an entry closed on a 692/692 prod measurement and
+  double-inserted a content twin already on origin under a different subject. It
+  also cost a second lane a wrongly-filed card, since from ~/Dev/mixpeek the
+  only visible symptom is "this file does not exist" and the citation looks like
+  the whole bug. Both readings were reasonable and both were incomplete.
+FIX: 972b44a4. Hoisted the note to `build()` over the full dirty set so it
+  travels with every arm, deleted the citation because the procedure is already
+  inline, and rewrote the note's unit test to go through `build()` — it had been
+  calling `commit_worthy_body` directly and was green for the entire time the
+  note was unreachable (ethos rule 7 / AF-161: a check pinning the wrong layer
+  is exactly as green as one pinning the right layer). Second fix per the
+  two-fixes rule: `missing_archive_check()` now WARNs on the ACTUAL delivered
+  bytes before `steer_enqueue`, so the next regression announces itself in
+  server-rs.log instead of arriving as another near-miss.
+  The general shape worth remembering: a citation is only as good as the reader's
+  checkout, and the dangerous half of an instruction must never be the half that
+  travels while the safety half is behind a link.
