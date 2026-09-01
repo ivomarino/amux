@@ -1150,10 +1150,50 @@ async fn drop_paths_identical_to_origin(dir: &str, paths: Vec<String>) -> (Vec<S
     (kept, provenance)
 }
 
-/// `git status --porcelain` under `dir`, as repo-relative paths.
+/// Most files a lane could sensibly be mid-edit on inside ONE untracked
+/// directory. Past this the expansion below stops rather than flooding a nudge.
+///
+/// Truncating loses a warning about the files past the cap, which is the
+/// tolerable direction: the reader is not told to act on them at all. Emitting
+/// the DIRECTORY instead would hand them a restore target that deletes every
+/// file under it, which is the direction that is not recoverable.
+const MAX_UNTRACKED_DIR_EXPANSION: usize = 200;
+
+/// `git status --porcelain` under `dir`, as repo-relative paths — FILES ONLY.
 ///
 /// Supplies the LIST only. Whose they are is the guard's answer, never this
 /// function's — see the module docs for what re-deriving it cost.
+///
+/// WHY THE EXPANSION (ts-gke, 2026-09-01). `--untracked-files=normal` collapses
+/// a wholly-untracked directory to ONE entry with a trailing slash, and nothing
+/// downstream of here has ever looked for that slash. So a directory flowed the
+/// whole length of the pipeline dressed as a file: classified as one path,
+/// labelled STALE as one path, and rendered with `git checkout origin/main --
+/// <path>` as its remedy.
+///
+/// Measured on the mixpeek checkout, where two such directories were emitted:
+///
+///   clients/providers/rtsp/__init__.py                       matches origin
+///   tests/unit/clients/providers/rtsp/__init__.py            matches origin
+///   clients/providers/rtsp/sync_provider.py                  novel, in NO commit
+///   tests/unit/clients/providers/rtsp/test_sync_provider.py  novel, in NO commit
+///
+/// Two of four needed no action and two were novel mid-edit work. The directory
+/// verdict was "behind origin", true of the directory and false of half its
+/// contents, and the remedy stated at that granularity deletes the other half.
+///
+/// The proof recipe the nudge itself prescribes cannot rescue the reader,
+/// which is what makes this worth fixing here rather than in the wording:
+/// `git hash-object` on a directory ERRORS, and an error is DO-NOT-RESTORE by
+/// the nudge's own rule. So a careful reader gets stuck and a hurried one
+/// restores the directory. Only a per-file list makes the prescribed check
+/// runnable at all.
+///
+/// `normal` is kept for the listing itself. `all` would walk every untracked
+/// tree in the repo on every run to answer a question about the few that are
+/// dirty; expanding only the directories actually reported pays for what is
+/// used. `--exclude-standard` keeps the expansion to exactly what `git status`
+/// would itself have shown, so an ignored tree cannot enter through this door.
 async fn dirty_paths(dir: &str) -> Vec<String> {
     let out = tokio::process::Command::new("git")
         .args(["-C", dir, "status", "--porcelain", "--untracked-files=normal"])
@@ -1163,7 +1203,7 @@ async fn dirty_paths(dir: &str) -> Vec<String> {
     if !out.status.success() {
         return Vec::new();
     }
-    String::from_utf8_lossy(&out.stdout)
+    let raw: Vec<String> = String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|l| {
             // "XY path" or "XY old -> new"; take the destination.
@@ -1171,6 +1211,44 @@ async fn dirty_paths(dir: &str) -> Vec<String> {
             Some(rest.rsplit(" -> ").next().unwrap_or(rest).trim_matches('"').to_string())
         })
         .filter(|p| !p.is_empty())
+        .collect();
+
+    let mut paths = Vec::with_capacity(raw.len());
+    for p in raw {
+        if !p.ends_with('/') {
+            paths.push(p);
+            continue;
+        }
+        // A directory is NEVER passed through. When it cannot be enumerated it
+        // is DROPPED, losing the warning, because the alternative is emitting a
+        // restore target whose blast radius is every file beneath it. That is
+        // the same asymmetry the nudge already states to its reader: a declined
+        // restore is recoverable and a deleted keystroke is not.
+        paths.extend(expand_untracked_dir(dir, &p).await);
+    }
+    paths
+}
+
+/// The untracked, non-ignored files under one directory, repo-relative.
+///
+/// Empty on any failure — see the caller for why that is the safe direction.
+async fn expand_untracked_dir(dir: &str, subdir: &str) -> Vec<String> {
+    let out = tokio::process::Command::new("git")
+        .args(["-C", dir, "ls-files", "--others", "--exclude-standard", "-z", "--", subdir])
+        .output()
+        .await;
+    let Ok(out) = out else { return Vec::new() };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    // `-z` because a path may contain a newline, and this list feeds a remedy
+    // the reader runs. Splitting on '\n' would hand them half a filename.
+    String::from_utf8_lossy(&out.stdout)
+        .split('\0')
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .take(MAX_UNTRACKED_DIR_EXPANSION)
+        .map(str::to_string)
         .collect()
 }
 
@@ -2548,6 +2626,110 @@ mod tests {
         assert!(!kept.contains(&"landed.txt".to_string()), "untracked-but-on-origin is a phantom");
         assert!(kept.contains(&"mywip.txt".to_string()), "real WIP must never be dropped");
         assert!(provenance.contains("origin/main"), "must state what it compared against");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A WHOLLY-UNTRACKED DIRECTORY MUST NEVER REACH A READER AS ONE PATH.
+    ///
+    /// `--untracked-files=normal` collapses it to one entry with a trailing
+    /// slash, and no consumer downstream of `dirty_paths` looks for that slash,
+    /// so it was classified, labelled and rendered as though it were a file --
+    /// with `git checkout origin/main -- <path>` as the remedy. Aimed at a
+    /// directory that deletes every file beneath it.
+    ///
+    /// The fixture is the incident: an rtsp provider directory where one file
+    /// matches origin exactly and one carries novel uncommitted work. That mix
+    /// is the whole point. A directory-level verdict can only be right about
+    /// one of them, and the remedy it licenses destroys the other.
+    ///
+    /// This asserts the PREMISE first. Without it the test passes trivially the
+    /// day git stops collapsing directories, and a green would mean nothing.
+    #[tokio::test]
+    async fn an_untracked_directory_is_expanded_to_files() {
+        let root =
+            std::env::temp_dir().join(format!("amux-nudge-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let (bare, work) = (root.join("origin.git"), root.join("work"));
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        std::process::Command::new("git")
+            .args(["init", "--bare", "-b", "main"])
+            .arg(&bare)
+            .output()
+            .unwrap();
+        git(&work, &["init", "-b", "main"]);
+        git(&work, &["config", "user.email", "t@t"]);
+        git(&work, &["config", "user.name", "t"]);
+        git(&work, &["remote", "add", "origin", bare.to_str().unwrap()]);
+        std::fs::write(work.join("base.txt"), "base\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(&work, &["commit", "-m", "base"]);
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // A peer lands the directory on origin. Local HEAD never gets it, which
+        // is why git calls the whole directory untracked below.
+        let peer = root.join("peer");
+        std::process::Command::new("git")
+            .args(["clone", "-q", bare.to_str().unwrap()])
+            .arg(&peer)
+            .output()
+            .unwrap();
+        git(&peer, &["config", "user.email", "t@t"]);
+        git(&peer, &["config", "user.name", "t"]);
+        std::fs::create_dir_all(peer.join("rtsp")).unwrap();
+        std::fs::write(peer.join("rtsp/__init__.py"), "shipped\n").unwrap();
+        std::fs::write(peer.join("rtsp/sync_provider.py"), "shipped\n").unwrap();
+        git(&peer, &["add", "-A"]);
+        git(&peer, &["commit", "-m", "rtsp"]);
+        git(&peer, &["push", "-q", "origin", "main"]);
+        git(&work, &["fetch", "-q", "origin", "main"]);
+
+        std::fs::create_dir_all(work.join("rtsp")).unwrap();
+        std::fs::write(work.join("rtsp/__init__.py"), "shipped\n").unwrap();
+        // ...and one file mid-edit, in no commit on any ref. A restore aimed at
+        // the DIRECTORY deletes exactly this.
+        std::fs::write(work.join("rtsp/sync_provider.py"), "my novel wip\n").unwrap();
+
+        let dir = work.to_str().unwrap();
+        let porcelain = String::from_utf8(
+            std::process::Command::new("git")
+                .args(["-C", dir, "status", "--porcelain", "--untracked-files=normal"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert!(
+            porcelain.contains("?? rtsp/"),
+            "PREMISE: git must still collapse the directory, else this test proves nothing: {porcelain}"
+        );
+
+        let paths = dirty_paths(dir).await;
+
+        assert!(
+            !paths.iter().any(|p| p.ends_with('/')),
+            "a directory reached the caller as a restore target: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"rtsp/sync_provider.py".to_string()),
+            "the novel mid-edit file must be named, or nobody is warned about it: {paths:?}"
+        );
+        assert!(
+            paths.contains(&"rtsp/__init__.py".to_string()),
+            "expansion must list every file, not a guess at which ones matter: {paths:?}"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
